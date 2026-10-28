@@ -180,7 +180,7 @@ def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, path_t
     (which can differ — the git-worktree cwd bug). Delete and Move headers take
     ``path_to_entry``: they act on a symlink itself, never on its target.
     """
-    if not _file_ops_uses_host_paths(file_ops):
+    if not current_execution() and not _file_ops_uses_host_paths(file_ops):
         return patch
 
     def _res(raw: str, entry: bool = False) -> str:
@@ -207,6 +207,9 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     Literal first so /dev/stdin is caught before resolving to a terminal path;
     every symlink hop is checked so an alias cannot bypass the guard.
     """
+    if current_execution():
+        from tools.file_backend_state import remote_path
+        return _is_blocked_device_path(filepath) or _is_blocked_device_path(remote_path(filepath))
     expanded = _expand_tilde(filepath)
     if base_dir is not None and not os.path.isabs(expanded):
         expanded = os.path.join(os.fspath(base_dir), expanded)
@@ -352,6 +355,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         with _env_lock:
             if task_id in _active_environments:
                 _last_activity[task_id] = time.time()
+                if current_execution():
+                    cached.env._hermes_owner_tasks.add(current_execution().task_id)
+                    cached.cwd = get_session_cwd(raw_task_id) or cached.cwd
                 return cached
             # Env was cleaned up: rescue its cwd into the session record FILL-ONLY
             # (``cached.cwd`` is the SHARED env's cwd, not this session's own).
@@ -396,26 +402,41 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
 def clear_file_ops_cache(task_id: str | None = None):
     """Clear file-operation state for a finished task, or all tasks."""
+    from hermes_constants import get_hermes_home
+    home = str(get_hermes_home())
+    owner_keys = {tracking_key(task_id)} if task_id else set()
+    with _read_tracker_lock:
+        if task_id:
+            owner_keys.update(key for key, data in _read_tracker.items()
+                              if data.get("node_owner") == task_id and data.get("node_home") == home)
     with _file_ops_lock:
         if task_id:
             _file_ops_cache.pop(task_id, None)
+            for key, ops in list(_file_ops_cache.items()):
+                env = ops.env
+                if (getattr(env, "_hermes_profile_home", None) == home
+                        and task_id in getattr(env, "_hermes_owner_tasks", ())):
+                    _file_ops_cache.pop(key, None)
         else:
             _file_ops_cache.clear()
 
     with _read_tracker_lock:
         if task_id:
-            _read_tracker.pop(task_id, None)
+            for key in owner_keys:
+                _read_tracker.pop(key, None)
         else:
             _read_tracker.clear()
 
     with _patch_failure_lock:
         if task_id:
-            _patch_failure_tracker.pop(task_id, None)
+            for key in owner_keys:
+                _patch_failure_tracker.pop(key, None)
         else:
             _patch_failure_tracker.clear()
 
     if task_id:
-        file_state.get_registry().forget_task(task_id)
+        for key in owner_keys:
+            file_state.get_registry().forget_task(key)
     else:
         file_state.get_registry().clear()
 
@@ -435,7 +456,14 @@ def _special_file_kind(path) -> str | None:
     only; unstattable paths return None and flow to the normal read path.
     """
     try:
-        mode = os.stat(os.fspath(path)).st_mode  # follows symlinks, matching a real read
+        if current_execution():
+            from tools.file_backend_state import remote_state
+            state = remote_state(str(path))
+            if not state.get("exists"):
+                return None
+            mode = state["mode"]
+        else:
+            mode = os.stat(os.fspath(path)).st_mode  # follows symlinks, matching a real read
     except OSError:
         return None
     if stat.S_ISREG(mode) or stat.S_ISDIR(mode):
@@ -570,16 +598,18 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     version = (snapshot or _file_version(resolved_str)) if version_before is not None else None
     stable = version is not None and version[:-1] == version_before == _file_metadata(resolved_str)
     complete = False
+    from tools.file_tools_read_tracking import _backend_mtime
+    try:
+        read_mtime = _backend_mtime(resolved_str)
+    except OSError:
+        read_mtime = None
     with _read_tracker_lock:
         task_data["dedup_hits"].pop(dedup_key, None)
         task_data["dedup_generation_reads"].add(dedup_key)
         task_data["read_history"].add((path, offset, limit))
         count = _bump_consecutive(task_data, ("read", path, offset, limit))
-        try:
-            _mtime_now = os.path.getmtime(resolved_str)
-            task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
-        except OSError:
-            pass
+        if read_mtime is not None:
+            task_data.setdefault("read_timestamps", {})[resolved_str] = read_mtime
         baselines = task_data["full_write_baselines"]
         if stable and version is not None and count < 4:
             task_data["dedup"][dedup_key] = version_before
@@ -607,7 +637,7 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     except Exception:
         logger.debug("file_state.record_read failed", exc_info=True)
 
-    if complete:
+    if complete and not current_execution():
         try:
             # Background-review read-before-write guard integration (#61521): when the self-improvement
             # review fork reads a skill file with read_file (now whitelisted dispatch-side), register the
@@ -650,7 +680,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         _resolved = _resolve_path_for_task(path, task_id)
 
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
-        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+        if current_execution() or _file_ops_uses_host_paths(_get_file_ops(task_id)):
             kind = _special_file_kind(_resolved)
             if kind is not None:
                 return json.dumps({
@@ -669,7 +699,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if block_error:
             return tool_error(block_error)
 
-        extracted = _read_extracted_document(path, _resolved, offset, limit, task_id)
+        extracted = None if current_execution() else _read_extracted_document(path, _resolved, offset, limit, task_id)
         if extracted is not None:
             return extracted
 
@@ -697,7 +727,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         # Same rule as skill_view: the review fork shares the parent's task_id and its
         # read-before-write guard needs a real read, which the stub path never records (#95976).
         file_ops = _get_file_ops(task_id)
-        version_before = _file_metadata(resolved_str) if _file_ops_uses_host_paths(file_ops) else None
+        version_before = _file_metadata(resolved_str) if current_execution() or _file_ops_uses_host_paths(file_ops) else None
         if (cached_version is not None and not _SANDBOX_READ_CONTEXT.get()
                 and not is_background_review()
                 and version_before == cached_version and content_served_in_generation):
@@ -786,6 +816,8 @@ def _resolve_or_none(filepath: str, task_id: str, *, entry: bool = False) -> str
     try:
         return str((_resolve_entry_for_task if entry else _resolve_path_for_task)(filepath, task_id))
     except Exception:
+        if current_execution():
+            raise
         return None
 
 
@@ -1086,8 +1118,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # results doesn't trip the repeated-search guard.
         search_key = ("search", pattern, target, str(path), file_glob or "", limit, offset, order)
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
-                "last_key": None, "consecutive": 0, "read_history": set()})
+            task_data = _task_data(task_id)
             count = _bump_consecutive(task_data, search_key)
 
         if count >= 4:
@@ -1165,6 +1196,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 # Schemas + Registry
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
+from tools.node_execution import current_execution, node_handler, node_schema, tracking_key
 
 
 def _check_file_reqs():
@@ -1330,11 +1362,17 @@ SEARCH_FILES_SCHEMA = {
 }
 
 
+for _schema in (READ_FILE_SCHEMA, WRITE_FILE_SCHEMA, PATCH_SCHEMA, SEARCH_FILES_SCHEMA):
+    _schema["parameters"]["properties"]["node"] = node_schema()
+
+
+@node_handler
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", DEFAULT_READ_LIMIT), task_id=tid)
 
 
+@node_handler
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
@@ -1372,6 +1410,7 @@ def _owned(owner: str, fn, **call_kwargs):
         return fn(**call_kwargs)
 
 
+@node_handler
 def _handle_patch(args, **kw):
     from hermes_cli.observability.shared_metrics_harness import record_file_edit
 
@@ -1386,6 +1425,7 @@ def _handle_patch(args, **kw):
     ))
 
 
+@node_handler
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
     target_map = {"grep": "content", "find": "files"}

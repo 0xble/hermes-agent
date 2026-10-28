@@ -683,4 +683,6 @@ def _format_process_notification_payload(evt: dict) -> str | None:
 def format_process_notification(evt: dict) -> "str | None":
     """Format a completion_queue event with an explicit end to its generated payload."""
     payload = _format_process_notification_payload(evt)
+    if payload is not None and evt.get("node"):
+        payload += f"\nExecution node: {evt['node']} (SSH: {evt.get('ssh', '?')})"
     return f"{payload}\n{PROCESS_NOTIFICATION_END}" if payload is not None else None

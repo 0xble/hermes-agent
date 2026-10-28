@@ -31,7 +31,7 @@ def _create_configured_env(
     (shared by the terminal tool, the file tools and the lazy :func:`ensure_task_env` bring-up)."""
     from tools.terminal_tool_backends import _create_environment
     from tools.terminal_tool_config import _is_container_backend
-    return _create_environment(
+    env = _create_environment(
         env_type=env_type, image=image, cwd=cwd, timeout=timeout,
         ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
         container_config=(
@@ -40,6 +40,13 @@ def _create_configured_env(
         local_config=_local_config_from_config(config) if env_type == "local" else None,
         task_id=task_id, host_cwd=host_cwd,
     )
+    if config.get("ssh_node") is not None:
+        from tools.node_execution import current_execution
+        from hermes_constants import get_hermes_home
+        env._hermes_node = config["ssh_node"]
+        env._hermes_owner_tasks = {current_execution().task_id}
+        env._hermes_profile_home = str(get_hermes_home())
+    return env
 
 
 def _cleanup_env(env: Any, *, force_remove: Optional[bool] = None) -> None:
@@ -156,7 +163,13 @@ def get_active_env(task_id: str):
     from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        from tools.node_execution import current_execution
+        env = _active_environments.get(lookup)
+        if current_execution():
+            if env is not None:
+                env._hermes_owner_tasks.add(current_execution().task_id)
+            return env
+        return env or _active_environments.get(task_id)
 
 
 def ensure_task_env(task_id: Optional[str] = None):
@@ -272,8 +285,26 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     directly, so persist-mode idle envs are likewise no-op'd; only the orphan
     reaper at next startup reclaims them.
     """
-    env = _unregister_env(task_id)
+    from hermes_constants import get_hermes_home
+    from tools.terminal_tool import _active_environments, _env_lock
+    home = str(get_hermes_home())
     _clear_file_ops_cache(task_id)
+    # Preserve raw lifecycle ownership alongside the node/session state key.
+    with _env_lock:
+        selected = []
+        for key, candidate in list(_active_environments.items()):
+            owners = getattr(candidate, "_hermes_owner_tasks", set())
+            if getattr(candidate, "_hermes_profile_home", None) == home and task_id in owners:
+                owners.discard(task_id)
+                if not owners:
+                    selected.append(key)
+    for key in selected:
+        candidate = _unregister_env(key)
+        from tools.file_tools_paths import _ssh_home_failed_at
+        _ssh_home_failed_at.pop(key, None)
+        if candidate is not None:
+            _teardown_env(candidate, key, force_remove=force_remove, done_msg="Cleaned node scope: %s")
+    env = _unregister_env(task_id)
     if env is None:
         return
     _teardown_env(

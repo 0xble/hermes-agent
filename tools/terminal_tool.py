@@ -544,6 +544,12 @@ def _qualify_task_key(key: str) -> str:
     already keys the profile (branches 3/4); this covers the per-session keys. CLI and
     single-profile gateways (no routed home) keep the historical raw key.
     """
+    from tools.node_execution import current_execution
+    execution = current_execution()
+    if execution:
+        return execution.key
+    if key.startswith("node:") and len(key) == 69:
+        return key
     scope = _routed_home_task_key(profile_scoped=True)
     return f"{scope}:{key}" if scope else key
 
@@ -571,6 +577,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
        cannot reach another; else ``"default"``, which subagent ids collapse onto to share
        the parent's container. Sandboxed backends keep their shared-container contract.
     """
+    from tools.node_execution import current_execution
+    execution = current_execution()
+    if execution:
+        return execution.key
+    if task_id and task_id.startswith("node:") and len(task_id) == 69:
+        return task_id
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
@@ -652,6 +664,9 @@ def resolve_task_overrides(task_id: Optional[str]) -> dict[str, Any]:
     session's override is silently dropped. Single source of that lookup so
     the terminal and file layers can't drift apart.
     """
+    from tools.node_execution import current_execution
+    if current_execution():
+        return {}  # Controller workspace/sandbox overrides never describe a physical node.
     raw = task_id or "default"
     return (
         _task_env_overrides.get(_qualify_task_key(raw))
@@ -686,10 +701,15 @@ def _lookup_active_env(effective_task_id: str, task_id: Optional[str]):
     yet an env may already be cached under the originating task_id; honor it
     instead of spawning a duplicate. Refreshes ``_last_activity`` on a hit.
     """
-    for key in (effective_task_id, task_id):
+    from tools.node_execution import current_execution
+    keys = (effective_task_id,) if current_execution() else (effective_task_id, task_id)
+    for key in keys:
         if key and key in _active_environments:
             _last_activity[key] = time.time()
-            return _active_environments[key]
+            env = _active_environments[key]
+            if current_execution():
+                env._hermes_owner_tasks.add(current_execution().task_id)
+            return env
     return None
 
 
@@ -844,7 +864,9 @@ def _get_env_config() -> dict[str, Any]:
     """Resolve the terminal configuration dict from TERMINAL_* env vars."""
     from hermes_cli.config_defaults import DEFAULT_SANDBOX_IMAGE as default_image
     _ensure_terminal_env_bridged()
-    env_type = _tenv("TERMINAL_ENV", "local")
+    from tools.node_execution import current_execution
+    execution = current_execution()
+    env_type = "ssh" if execution else _tenv("TERMINAL_ENV", "local")
     mount_docker_cwd = _tenv_bool("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
 
     # Container/docker-only payloads are parsed only when such a backend is
@@ -866,9 +888,9 @@ def _get_env_config() -> dict[str, Any]:
     else:
         docker_forward_env, docker_volumes, docker_env, docker_extra_args, docker_shm_size = [], [], {}, [], "1g"
 
-    cwd, host_cwd = _resolve_config_cwd(env_type, mount_docker_cwd)
+    cwd, host_cwd = ("~", None) if execution else _resolve_config_cwd(env_type, mount_docker_cwd)
 
-    return {
+    config = {
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(_tenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": _tenv("TERMINAL_DOCKER_IMAGE", default_image),
@@ -912,6 +934,11 @@ def _get_env_config() -> dict[str, Any]:
         "docker_shared_container_key": _tenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip(),
         "docker_orphan_reaper": _tenv_bool("TERMINAL_DOCKER_ORPHAN_REAPER", "true"),
     }
+
+    if execution:
+        config.update(ssh_host=execution.node.ssh, ssh_user="", ssh_port=22, ssh_key="",
+                      ssh_sync_files=False, ssh_node=execution.node)
+    return config
 
 
 def _cleanup_thread_worker():
@@ -1395,7 +1422,8 @@ def _run_foreground(
     is what the shell runs (the heavy-slot rewrite); metrics, exit-code notes, verification
     evidence and redaction keep describing the user's ``command``."""
     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
-    max_retries = 3
+    from tools.node_execution import current_execution
+    max_retries = 0 if current_execution() else 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
     result: dict[str, Any] = {}
 
@@ -1425,6 +1453,11 @@ def _run_foreground(
             )
             break
         except Exception as e:
+            if current_execution():
+                return _error_json(_redact_terminal_error_text(
+                    f"Selected-node command outcome is unknown: {type(e).__name__}: {e}. "
+                    "The command may have taken effect. Inspect this node before retrying, do not replay it."),
+                    status="unknown")
             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
             # is not a terminal outcome; Hermes' own deadline arrives as ``hermes_timed_out``.
             if "timeout" in str(e).lower():
@@ -1782,6 +1815,11 @@ TERMINAL_SCHEMA = {
 }
 
 
+from tools.node_execution import node_handler, node_schema
+TERMINAL_SCHEMA["parameters"]["properties"]["node"] = node_schema()
+
+
+@node_handler
 def _handle_terminal(args, **kw):
     from agent.terminal_approval_batch import validate_prepared_terminal
     validate_prepared_terminal(args)

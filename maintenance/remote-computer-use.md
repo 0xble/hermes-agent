@@ -34,6 +34,34 @@ outcome-unknown failures without write replay. Remote startup policy belongs to
 the node's public-daemon owner, not this adapter or the controller's private
 daemon. Controller approvals are a separate boundary.
 
+## Named Terminal, File And Process Consumers
+
+`tools/node_execution.py` binds the resolver's immutable node for a call, with
+profile/session/connection-qualified mutable state and a per-scope lock. Raw
+`task_id` remains the hook, process-owner and cleanup identity. Named SSH uses
+`sync_files=False`, never a temporary mutation of profile terminal policy.
+`tools/file_backend_state.py` uses the existing SSH file backend for target-side
+realpaths, metadata and hashes. Keep read stamps, patch baselines, compaction
+reset, scope locks and cleanup aligned with that same backend identity.
+Controller twins must not satisfy remote existence or overwrite authorization.
+
+The existing process record carries `SSHProcessBinding`, not another registry.
+Its immutable alias, originating profile home and target-side incarnation UUID
+survive checkpoint and completion receipt serialization. The UUID is a run
+identity, not a new service credential. Profile-filtered list and release sweeps
+must filter before probing remote handles. `tools/process_registry_ssh.py` uses a per-command POSIX
+supervisor holding its unreaped child's identity and a token-scoped receipt. It
+is not a resident service. Stop requests go to that supervisor, never to a bare
+remote PID or local kill helper. Persist the binding before launch, never replay
+on lost acknowledgement, and retain unknown/unavailable state when proof is
+missing. Old SSH checkpoints without the binding remain unverified and cannot
+be turned into local process identities.
+
+Named macOS/Linux execution requires target Bash and Python 3. Remote PTY and
+stdin interaction refuse. ACP named edit proposals refuse before controller
+diff construction. Rich controller document extraction and browser adapters are
+not supplied by this consumer. Preserve legacy behavior with no selected node.
+
 ## Proof And Retirement
 
 Run `scripts/run_tests.sh tests/tools/test_computer_use_nodes.py` with isolated
@@ -45,6 +73,16 @@ Also run the existing computer-use lifecycle, provider, capture, CLI, profile-ca
 and MCP-image suites. Real remote desktop and channel image delivery remain
 promotion-time acceptance checks, not claims inferred from synthetic SSH tests.
 
+Also repeat `tests/tools/test_named_node_execution.py` and
+`tests/tools/test_node_process.py`, plus the existing terminal-scope, SSH,
+file-baseline, process-checkpoint and ACP regressions. The integration fixture
+exercises `model_tools.handle_function_call`, real caches and backend/process/file
+layers on the actual controller OS, replacing only SSH transport with separate
+fixture-owned peer filesystems and processes. This proves source invariants,
+not live VPS/Telegram execution. Exact activation, real Mac command/read/edit
+proof and channel/browser acceptance stay with the migration and Fork Patches
+owners.
+
 Retire this divergence only when upstream provides the same shared-node,
-no-fallback, persistent-session and native-image contracts without requiring a
-new service, and exact-target integration checks still pass.
+no-fallback, persistent-session, node-bound file/process and native-image contracts
+without requiring a new service, and exact-target integration checks still pass.

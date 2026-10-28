@@ -16,6 +16,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from tools.node_execution import current_execution, path_key, tracking_key
 
 # (mtime, read_ts, partial). partial=True when read_file returned a windowed
 # view (offset > 1 or limit < total_lines) — a later write should still warn
@@ -124,7 +125,7 @@ class FileStateRegistry:
             _evict_oldest(self._last_writer, _MAX_GLOBAL_WRITERS)
             self._stamp(task_id, resolved, mtime, now, False)
 
-    def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
+    def check_stale(self, task_id: str, resolved: str, *, current_mtime=...) -> Optional[str]:
         """Model-facing warning if this write would be stale, else ``None``. Severity
         order: sibling wrote after our read > mtime drift / partial read > never read."""
         if _disabled():
@@ -135,7 +136,8 @@ class FileStateRegistry:
 
         if stamp is None and last_writer is None:  # net-new file / first touch
             return None
-        current_mtime = _mtime_or_none(resolved)
+        if current_mtime is ...:
+            current_mtime = _mtime_or_none(resolved)
         if current_mtime is None:
             return None  # file doesn't exist — write creates it; not stale
 
@@ -226,27 +228,45 @@ def get_registry() -> FileStateRegistry:
 
 # Convenience wrappers (short names used at call sites).
 def record_read(task_id: str, resolved_or_path: str | Path, *, partial: bool = False) -> None:
-    _registry.record_read(task_id, str(resolved_or_path), partial=partial)
+    path = str(resolved_or_path)
+    if current_execution():
+        from tools.file_backend_state import mtime
+        value = mtime(path)
+        if value is not None:
+            _registry.record_read(tracking_key(task_id), path_key(path), partial=partial, mtime=value)
+        return
+    _registry.record_read(task_id, path, partial=partial)
 
 
 def note_write(task_id: str, resolved_or_path: str | Path) -> None:
-    _registry.note_write(task_id, str(resolved_or_path))
+    path = str(resolved_or_path)
+    if current_execution():
+        from tools.file_backend_state import mtime
+        value = mtime(path)
+        if value is not None:
+            _registry.note_write(tracking_key(task_id), path_key(path), mtime=value)
+        return
+    _registry.note_write(task_id, path)
 
 
 def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
-    return _registry.check_stale(task_id, str(resolved_or_path))
+    path = str(resolved_or_path)
+    if current_execution():
+        from tools.file_backend_state import mtime
+        return _registry.check_stale(tracking_key(task_id), path_key(path), current_mtime=mtime(path))
+    return _registry.check_stale(task_id, path)
 
 
 def lock_path(resolved_or_path: str | Path):
-    return _registry.lock_path(str(resolved_or_path))
+    return _registry.lock_path(path_key(str(resolved_or_path)))
 
 
 def writes_since(exclude_task_id: str, since_ts: float, paths: Iterable[str | Path]) -> dict[str, list[str]]:
-    return _registry.writes_since(exclude_task_id, since_ts, [str(p) for p in paths])
+    return _registry.writes_since(tracking_key(exclude_task_id), since_ts, [path_key(str(p)) for p in paths])
 
 
 def known_reads(task_id: str) -> list[str]:
-    return _registry.known_reads(task_id)
+    return _registry.known_reads(tracking_key(task_id))
 
 
 __all__ = [

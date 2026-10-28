@@ -1569,6 +1569,11 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         content_verified, verify_error = self._verify_written_hash(path, content_bytes)
         if verify_error is not None:
             return verify_error
+        from tools.nodes import Node
+        if isinstance(getattr(self.env, "_hermes_node", None), Node) and content_verified is not True:
+            return WriteResult(error=(
+                f"Write outcome is unverified on selected node for {path}. "
+                "The write may have taken effect. Re-read this node/path before retrying."))
 
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
         # LSP diagnostics are a separate channel, fired only when the syntax tier is
