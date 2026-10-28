@@ -1,11 +1,38 @@
-# Same-session compression recovery
+# Same-Session Compression Recovery
 
-**Status:** design only. The current gateway still resets the conversation after compression exhaustion. This record describes a proposed lossless recovery boundary and is not proof that the named runtime behavior or verification files exist on `main`.
+## Implemented Exhaustion Boundary
+
+Compression exhaustion is not `/new`. The gateway retains the current session,
+its transcript, topic binding, manual title provenance and conversation-scoped
+settings. It neither resets immediately nor schedules a deferred reset after the
+active admission settles. Already accepted FIFO input stays on the same owner.
+Explicit `/new` and other requested reset operations retain their existing behavior.
+
+A non-deferred messaging failure keeps the agent's failure response and appends
+the existing `gateway.compress.hygiene_failed` notice: history was kept, `/compress`
+can retry, and `/new` is an explicit alternative. Deferred failures keep their
+existing response. API callers keep their existing typed failure and response.
+No successful compression, completed answer or guaranteed next-turn recovery is
+claimed. The next message retries against the retained context and may fail again
+until compression succeeds or the user explicitly changes the context.
+
+The implementation is the gateway exhaustion boundary in
+`gateway/run_turn_persistence.py`, ported narrowly from #546's initial
+`f7f904558377e` change. It does not install #546's mechanical request projection,
+pre-compaction input checkpoint or queue-recovery machinery. In particular, it
+does not change the current context-overflow transcript-persistence policy, and
+does not promise that an input rejected before durable admission is recoverable.
 
 Load this unit when changing hard-window recovery, preflight input admission,
 archive-backed request projection or the gateway exhaustion boundary.
 
-## Proposed behavior
+## Deferred Recovery Design
+
+The remainder of this design describes additional lossless recovery, not shipped
+behavior or proof that the named files exist on `main`. The implemented boundary
+above is the only completed portion of this record.
+
+### Proposed Behavior
 
 Compression failure is not `/new`: never clear the conversation scope, replace
 the durable session, rebind the Telegram topic, or copy a title onto a blank
@@ -177,7 +204,17 @@ MCP excerpts. None is proof of released equivalent behavior.
 
 ## Verification
 
-This is a design-only record. The focused tests below are acceptance targets for a future implementation, not current proof of same-session recovery. Until that implementation lands, source checks must verify only the current-runtime note above; do not claim these files or mechanisms exist on `main`.
+The implemented exhaustion boundary is exercised by
+`tests/gateway/test_compression_exhaustion_keeps_context.py`,
+`tests/gateway/test_native_fifo_context_exhaustion.py`,
+`tests/gateway/test_api_session_compression_exhaustion.py` and the compression
+role-retention case in `tests/gateway/test_model_role_lifecycle.py`.
+`tests/gateway/test_auto_reset_clean_context.py` continues to verify that an
+explicit reset creates an empty context without destroying the old transcript.
+
+The focused tests below are acceptance targets for the deferred recovery design,
+not current proof of lossless input admission or mechanical same-session recovery.
+Do not claim these additional files or mechanisms exist on `main`.
 
 Use `bash scripts/run_tests.sh`; no direct pytest or machine-slot bypass.
 Focused tests: `tests/agent/test_same_session_recovery.py`,
