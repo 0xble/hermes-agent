@@ -4902,8 +4902,8 @@ def _start_gateway_housekeeping(
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner), False))
-    if runner is not None and loop is not None:
-        chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop), False))
+    from gateway.runtime_health import health_notice_chores
+    chores.extend(health_notice_chores(runner, loop))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop), False),
         (60, "Media cache cleanup", _housekeeping_media_caches, False),
