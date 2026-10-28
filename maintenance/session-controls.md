@@ -147,10 +147,26 @@ successor, which retirement neither overwrites nor arms, and later successor
 progress does not invalidate that proof. A failed retirement admits ordinary
 user messages and explains `/retire` retry and `/retire cancel` recovery.
 Keyed native-task lookup reuses the existing task without another add. Its ID,
-key, title and destination creator are read back. Only loop tick/backoff progress
-may differ in the original brief, never its instance, prompt, cadence, limits,
-stop condition, route or authored revisions. Fresh unaccepted task creation
-still requires the complete requested context byte for byte.
+key, title and destination creator are read back. Cron/loop/goal task briefs and
+legacy-brief readback share an authored-definition projection: prompt or goal,
+cadence, limits, stop conditions, skills, model, delivery, routing and authored
+revisions remain exact. Execution output, claims, counters and timestamps are
+not part of that identity. Cron ownership discovery likewise ignores addresses
+mentioned only in execution output. Fresh unaccepted creation still requires
+the complete requested stable context byte for byte.
+
+The task-event contract remains 16,384 bytes. JSON-escaped control briefs use a
+12 KiB budget, leaving room for the task-create envelope and jsonb headers.
+Oversized authored definitions are not truncated: a compact manifest references
+the existing complete saved retirement handoff by profile-local `state_meta`
+key, item ID and handoff generation, with a SHA-256 of its canonical authored
+item. The full original snapshot remains in the retirement record and cron jobs
+are transferred in place, not removed. The manifest includes retrieval and hash
+verification instructions. No new attachment service or ledger schema is needed.
+Legacy context receipts found only in an exact historical error are attached to
+the unique matching saved context destination before retry replaces that error.
+Recovery reads that exact receipt and validates its identity, target and delivery
+status. Missing or ambiguous saved destinations hold retirement without resending.
 
 An unaccepted goal/loop may replace a terminal successor control (`cleared`,
 `done`, `completed` or `stopped`), but never an active, paused or unknown control.
@@ -186,10 +202,13 @@ never queues source preparation, sends a closing message or dispatches another
 delete. Missing read-only lookup support, unsettled work, a successor conflict
 or a rebound route keeps it failed. Finalization idempotently removes partial
 DM and gateway routing bindings and clears the original session's `session_key`
-without deleting the session or transcript.
+without deleting the session or transcript. Its final disposition explicitly
+records `absent_at_finalization`, the observed topic and generation. Missing
+closing acknowledgements remain missing, and historical errors are preserved.
 
 Proof surfaces: `tests/gateway/test_telegram_retire.py`,
-`test_telegram_retire_work.py`, `test_telegram_retire_prepare.py` and
+`test_telegram_retire_work.py`, `test_telegram_retire_context.py`,
+`test_telegram_retire_prepare.py` and
 `test_telegram_retire_finalize.py`, plus the existing topic-tool, topic-mode,
 process-registry, async-delegation and completion-delivery regression suites.
 Live validation must use disposable topics and preserve their session histories.

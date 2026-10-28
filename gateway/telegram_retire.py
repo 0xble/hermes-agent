@@ -115,6 +115,11 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
             and selected_context == previous.get("context", "")):
         state = previous
     else:
+        if existing and existing["phase"] == "failed":
+            from gateway.telegram_retire_work import recover_context_receipt
+            # Do not lose the only existing receipt identity when a user retry
+            # replaces the generation and its historical error text.
+            await recover_context_receipt(runner, source, existing)
         state = {
             "generation": uuid.uuid4().hex, "phase": "pending", "session_id": session_id,
             "session_key": session_key, "target": selected_target, "owners": selected_owners,
@@ -247,6 +252,11 @@ async def _finalize_absent(runner, source, state, bot):
     if (not current or current["phase"] != "failed" or runner._is_session_running(key)
             or await asyncio.to_thread(runner.session_store.peek_session_id, key) not in {None, state["session_id"]}):
         return
+    # This records observed absence, not a claim that a closing send succeeded.
+    # Historical errors and any real closing receipt remain unchanged.
+    current["disposition"] = {"status": "absent_at_finalization", "generation": generation,
+                              "chat_id": str(source.chat_id), "thread_id": str(source.thread_id),
+                              "observed_at": time.time()}
     await _unbind(runner, source, current)
 
 

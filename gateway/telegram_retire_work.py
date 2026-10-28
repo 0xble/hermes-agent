@@ -13,6 +13,7 @@ from dataclasses import replace
 from hermes_platform.resolver import locate_command
 
 from gateway.telegram_retire import save
+from gateway.telegram_retire_context import authored_definition, context_identity, task_context
 
 
 def address(source, session_id):
@@ -95,7 +96,7 @@ async def inventory(runner, source, state) -> list[dict]:
         attached = str(job.get("attach_to_session") or "") == sid
         delivery = any(direct in (job.get(field) if isinstance(job.get(field), list) else [job.get(field)])
                        for field in ("deliver", "failure_deliver"))
-        embedded = origin_address in json.dumps(job)
+        embedded = origin_address in json.dumps(authored_definition(job))
         if points_here or attached or delivery or embedded:
             items.append({"id": "cron:" + job["id"], "kind": "cron", "title": job.get("name") or job["id"],
                           "record": job})
@@ -193,25 +194,18 @@ async def assign_task(runner, source, state, task_id, target, record=None):
 
 
 def same_handoff_context(saved, expected, kind):
-    """Only loop progress may differ in an already-existing keyed task."""
+    """Compare the same authored identity for legacy briefs and compact manifests."""
     if saved == expected:
         return True
-    if kind != "loop":
+    if kind not in {"cron", "loop", "goal"}:
         return False
-    # Keep the instance, definition, limits, route and authored revisions exact.
-    # Tick lifecycle/backoff writes are not a different handoff obligation.
-    progress = {"ticks_fired", "last_fired_at", "next_due_at", "run_generation",
-                "current_delay", "control_generation", "awaiting_response", "claim_phase",
-                "fired_version", "last_response_digest", "last_external_wake_tick",
-                "goal_warning", "backoff_level", "paused_reason", "last_stop_reason",
-                "mutation_id", "tick_id"}
     try:
         prefix, wanted = expected.split("\n", 1)
         saved_prefix, actual = saved.split("\n", 1)
         actual, wanted = json.loads(actual), json.loads(wanted)
-        for item in (actual, wanted):
-            item["record"] = {key: value for key, value in item["record"].items() if key not in progress}
-        return saved_prefix == prefix and actual == wanted
+        if actual.get("definition_ref") and wanted.get("definition_ref"):
+            return saved_prefix == prefix and actual == wanted
+        return saved_prefix == prefix and context_identity(actual) == context_identity(wanted)
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
 
@@ -283,7 +277,7 @@ async def receipt(runner, source, state, item, dest):
                 or await asyncio.to_thread(runner.session_store.peek_session_id, owner_key) != dest["session_id"]):
             raise RuntimeError("Handoff destination binding changed")
         title = f"Retired topic: {item['kind']}"
-        context = "Own the transferred work. Preserve its original limits and report to this topic.\n" + json.dumps(item, ensure_ascii=False)
+        context = task_context(source, state, item)
         key = handoff_key(state, item)
         # Resolve an existing key before add, so only a proven dedupe hit may
         # have older loop progress. A fresh create still requires full content.
@@ -496,7 +490,31 @@ async def transfer(runner, source, state, item, dest):
             raise RuntimeError("Process ownership changed before transfer")
 
 
+async def recover_context_receipt(runner, source, state):
+    """Older failures saved the receipt in error text before saving the map."""
+    match = re.fullmatch(
+        r"Handoff receipt ([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}) "
+        r"is not confirmed at (\S+?)(?:: .*)?", state.get("error") or "")
+    if not match:
+        return
+    receipt_id, target = match.groups()
+    handoffs = state["handoffs"].values()
+    if any(handoff.get("receipt_id") == receipt_id for handoff in handoffs):
+        return
+    candidates = [handoff for handoff in handoffs
+                  if handoff.get("item", {}).get("kind") == "context"
+                  and not handoff.get("receipt_id") and not handoff.get("moved")
+                  and address(source, handoff["destination"]["session_id"]) == target]
+    if len(candidates) != 1:
+        raise RuntimeError(f"Handoff receipt {receipt_id} has no unambiguous saved context destination")
+    # This records an existing receipt identity, not a delivery claim. The normal
+    # exact-target status read below must still confirm delivered/replied.
+    candidates[0].update(receipt_id=receipt_id, address=target)
+    await save(runner, source, state)
+
+
 async def settle_handoffs(runner, source, state):
+    await recover_context_receipt(runner, source, state)
     # Reconcile receipts independently of source inventory. A crash after moving
     # an item must not forget a still-unconfirmed handoff just because it moved.
     for item_id, handoff in state["handoffs"].items():

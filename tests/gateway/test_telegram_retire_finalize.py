@@ -14,13 +14,14 @@ from hermes_state import AsyncSessionDB, SessionDB
 
 
 @pytest.fixture
-def runtime(tmp_path, monkeypatch):
+def runtime(tmp_path, monkeypatch, request):
+    thread_id = getattr(request, "param", "17")
     db = SessionDB(tmp_path / "state.db")
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     store._db = db
-    source = SessionSource(platform=Platform.TELEGRAM, chat_id="101", thread_id="17", chat_type="dm", user_id="101")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="101", thread_id=thread_id, chat_type="dm", user_id="101")
     entry = store.get_or_create_session(source)
-    db.bind_telegram_topic(chat_id="101", thread_id="17", user_id="101",
+    db.bind_telegram_topic(chat_id="101", thread_id=thread_id, user_id="101",
                            session_key=entry.session_key, session_id=entry.session_id)
     db.append_message(entry.session_id, "user", "Keep this transcript.")
     bot = SimpleNamespace(get_me=AsyncMock(return_value=SimpleNamespace(username="bot")),
@@ -132,6 +133,25 @@ async def test_absent_merge_waits_for_existing_receipt_without_replaying_send(ru
     assert r.db.get_session(r.entry.session_id)["session_key"] is None
     assert [call.args[4] for call in command.await_args_list if call.args[2] == "relay"] == ["status", "status"]
     r.adapter.send.assert_not_awaited()
+    r.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime", ["379709", "388380", "357517"], indirect=True)
+async def test_absence_without_closing_receipt_has_truthful_disposition(runtime):
+    r = runtime
+    await retire.save(r.runner, r.source, r.state)
+    await retire.resume_all(r.runner)
+    final = await retire.load(r.runner, r.source)
+    assert final is not None and final["phase"] == "done"
+    assert "closing_receipt" not in final
+    assert final["disposition"]["status"] == "absent_at_finalization"
+    assert final["disposition"]["thread_id"] == r.source.thread_id
+    assert final["disposition"]["chat_id"] == r.source.chat_id
+    assert final["disposition"]["generation"] == r.state["generation"]
+    assert final["error"] == "closing failed"
+    r.adapter.send.assert_not_awaited()
+    r.bot.send_message.assert_not_awaited()
     r.bot.delete_forum_topic.assert_not_awaited()
 
 
