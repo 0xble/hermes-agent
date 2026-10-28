@@ -728,6 +728,9 @@ async def test_pending_ptb_stop_owns_token_until_reconnect_can_start(failure, se
         await adapter._probe_pending_updates(SimpleNamespace(), 1)
         finish_cleanup.set()
         await asyncio.wait_for(adapter._handover_polling_stop_task, 5)
+        # PTB stop completion only starts the remaining disconnect steps. Wait for
+        # the credential owner, not a 50ms race between retirement and the retry.
+        await asyncio.wait_for(asyncio.shield(adapter._platform_lock_retirement_task), 5)
         if not secondary:
             # The retained queue remains eligible after the bounded attempt, no manual re-enqueue.
             await asyncio.wait_for(runner._reconnect_failed_platform(Platform.TELEGRAM, time.monotonic() + 3600), 5)
