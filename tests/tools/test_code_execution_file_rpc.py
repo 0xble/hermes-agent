@@ -73,14 +73,27 @@ def test_non_file_tool_error_envelope_is_returned(transport):
 CALLS = {
     "web_search": {"query": "fixture", "limit": 3},
     "web_extract": {"urls": ["https://example.test"], "char_limit": 3000},
-    "read_file": {"path": "reference", "offset": 2, "limit": 4},
-    "write_file": {"path": "output", "content": "café", "cross_profile": False},
+    "read_file": {"path": "reference", "offset": 2, "limit": 4, "node": "fixture-node"},
+    "write_file": {"path": "output", "content": "café", "cross_profile": False, "node": "fixture-node"},
     "search_files": {"pattern": "x", "target": "files", "path": ".", "file_glob": "*.py",
-                     "limit": 4, "offset": 2, "output_mode": "count", "context": 3, "order": "modified"},
+                     "limit": 4, "offset": 2, "output_mode": "count", "context": 3, "order": "modified", "node": "fixture-node"},
     "patch": {"path": "output", "old_string": "old", "new_string": "new", "replace_all": True,
-              "mode": "replace", "patch": None, "cross_profile": False},
-    "terminal": {"command": "echo fixture", "timeout": 3, "workdir": "/tmp"},
+              "mode": "replace", "patch": None, "cross_profile": False, "node": "fixture-node"},
+    "terminal": {"command": "echo fixture", "timeout": 3, "workdir": "/tmp", "node": "fixture-node"},
 }
+
+
+@pytest.mark.parametrize("transport", ["uds", "file"])
+@pytest.mark.parametrize("name", ["read_file", "write_file", "search_files", "patch", "terminal"])
+def test_generated_node_omission_preserves_legacy_payload(transport, name):
+    namespace = {}
+    exec(generate_hermes_tools_module([name], transport=transport), namespace)
+    calls = []
+    namespace["_call"] = lambda tool, args: calls.append((tool, args)) or {"status": "success"}
+    legacy = {key: value for key, value in CALLS[name].items() if key != "node"}
+
+    assert namespace[name](**legacy) == {"status": "success"}
+    assert calls == [(name, legacy)]
 
 
 @pytest.mark.platforms("posix")
@@ -147,6 +160,7 @@ def test_generated_file_rpc_kwargs_correlation_and_authority(tmp_path, monkeypat
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda i: namespace["terminal"](f"tag-{i}", 3, "/tmp"), range(8)))
         assert [r["args"]["command"] for r in results] == [f"tag-{i}" for i in range(8)]
+        assert all("node" not in result["args"] for result in results)
         assert "not available in execute_code" in namespace["_call"]("unauthorized-tool", {})["error"]
         assert "limit reached" in namespace["terminal"]("over-budget")["error"]
         assert counter == [budget] and len(seen) == len(log) == budget

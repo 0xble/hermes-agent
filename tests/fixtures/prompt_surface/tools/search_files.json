@@ -17,6 +17,10 @@
         "description": "Maximum number of results to return (default: 50)",
         "type": "integer"
       },
+      "node": {
+        "description": "Named execution node from nodes.hosts. Omit to use nodes.default, or the legacy backend when no default is configured. Unknown or unavailable nodes never fall back.",
+        "type": "string"
+      },
       "offset": {
         "default": 0,
         "description": "Skip first N results for pagination (default: 0)",
