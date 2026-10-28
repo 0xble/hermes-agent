@@ -29,7 +29,7 @@ from tests.e2e.core.cli_tmux._classic import PROMPT, ClassicHome, Pane, assert_n
 from tests.fakes.fake_llm_provider import FakeLLMServer, StallMidStream, Text, ToolCall
 
 pytestmark = [
-    pytest.mark.platforms("linux"),  # the harness finds and reaps processes through /proc
+    pytest.mark.platforms("linux", "macos"),
 ]
 
 MARKDOWN_REPLY = ("# Heading Two\n\nSome intro text for the markdown check.\n\n- alpha item\n- beta item\n"

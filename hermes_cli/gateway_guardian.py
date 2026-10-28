@@ -28,6 +28,7 @@ INTERVAL = 30
 MAX_REPAIRS = 3
 STARTUP_SECONDS = 45
 ROLLBACK_SECONDS = 60
+ROLLBACK_DRAIN_SECONDS = 15
 POLL_SECONDS = 5
 
 
@@ -184,6 +185,48 @@ def _launch_state(domain: str, label: str, *, deadline: float | None = None) -> 
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 
 
+def _rollback_owners(home: Path, supervised: int | None):
+    """Pin the gateway incarnation, not just launchd's short-lived wrapper."""
+    import psutil
+    from gateway.status import live_gateway_pid_for_home
+    gateway = live_gateway_pid_for_home(home)
+    owners = []
+    if gateway is not None:
+        try:
+            process = psutil.Process(gateway)
+            # Home identity alone cannot authorize killing a separately supervised process.
+            if supervised is None or (gateway != supervised and
+                                      supervised not in {p.pid for p in process.parents()}):
+                raise RuntimeError('rollback gateway is not owned by the selected launchd service')
+            owners.append(process)
+        except psutil.NoSuchProcess:
+            gateway = None
+    if supervised is not None and supervised != gateway:
+        try:
+            owners.append(psutil.Process(supervised))
+        except psutil.NoSuchProcess:
+            pass
+    return gateway or (supervised if owners else None), owners
+
+
+def _reap_rollback_owners(owners, deadline):
+    """Leave startup time inside the bound even if executor teardown wedges."""
+    import psutil
+    drain_deadline = min(deadline, time.monotonic() + ROLLBACK_DRAIN_SECONDS)
+    for process in owners:
+        try:
+            process.wait(timeout=max(0.0, drain_deadline - time.monotonic()))
+        except psutil.TimeoutExpired:
+            # bootout already sent SIGTERM. Pinned psutil handles reject PID reuse.
+            try:
+                process.kill()
+                process.wait(timeout=_bounded_timeout(2, deadline))
+            except psutil.NoSuchProcess:
+                pass
+        except psutil.NoSuchProcess:
+            pass
+
+
 def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
                     deadline: float | None = None) -> bool:
     """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
@@ -205,20 +248,17 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         body = plistlib.dumps(definition)
     domain = domain or _domain(label, deadline=deadline)
     def reload_target():
-        import psutil
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
         old_pid = _launchctl_supervised_pid(label, timeout=_bounded_timeout(10, deadline))
-        if old_pid is not None:
+        target_pid, owners = _rollback_owners(home, old_pid)
+        if target_pid is not None:
             # The rollback is a reload, not a crash: the gateway takes its bounded restart path.
             from gateway.status import write_planned_restart_marker
-            write_planned_restart_marker(old_pid, hermes_home=home)
+            if not write_planned_restart_marker(target_pid, hermes_home=home):
+                raise RuntimeError('cannot mark the rollback gateway for planned restart')
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
                        timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
-        if old_pid is not None:
-            try:
-                psutil.Process(old_pid).wait(timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
-            except psutil.NoSuchProcess:
-                pass
+        _reap_rollback_owners(owners, deadline)
         # The exact remaining budget: flooring it to a whole second would hand the bootstrap a fresh
         # second past the rollback deadline.
         _launchctl_bootstrap(domain, plist, label, timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))

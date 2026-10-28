@@ -1167,6 +1167,21 @@ automatically requeue the message because doing so without durable ordering and
 idempotency could process it twice. Non-positive values use the 5-second
 default.
 
+## Post-Update Admission Canary
+
+After `hermes update` activates a release and the gateway acknowledges it, update and the gateway guardian watch native message admission for a short window. If the new release refuses too many inbound messages in that window, it is rolled back to the previous release and the update fails:
+
+```yaml
+gateway:
+  guardian:
+    admission_canary:
+      enabled: true          # set false to skip the post-update admission check
+      window_seconds: 180    # observation window after the release is acknowledged (10–300)
+      refusal_threshold: 10  # refusals within the window that trigger rollback (5–1000)
+```
+
+A quiet gateway passes: the canary counts refusals, not missing traffic, so an idle window is not a failure. Isolated invalid input stays below the default threshold.
+
 ## Gateway Restart Drain
 
 When the gateway stops or restarts (SIGTERM, `hermes update`, `hermes gateway stop`, or the final

@@ -81,7 +81,7 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
     fired = []
 
     class _Mgr:
-        state = SimpleNamespace(ticks_fired=1, created_at=1.0, control_generation=0)
+        state = SimpleNamespace(ticks_fired=1, created_at=1.0, control_generation=0, interval_seconds=60.0)
 
         def __init__(self, session_id=None):
             pass
