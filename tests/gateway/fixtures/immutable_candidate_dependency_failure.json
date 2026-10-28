@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "started_at": "2026-10-26T22:31:25.676634+00:00",
+  "finished_at": "2026-10-26T22:32:18.043645+00:00",
+  "argv": [
+    "-c",
+    "update",
+    "--branch",
+    "main",
+    "--gateway"
+  ],
+  "pid": 12345,
+  "outcome": "failed",
+  "pre_update": {
+    "sha": "e8387e275844c09cfd9d7a08b2e895535e64cc30",
+    "short_sha": "e8387e27",
+    "version": "0.20.0",
+    "source": "git",
+    "commit_date": 1792707112
+  },
+  "post_update": {
+    "sha": "e8387e275844c09cfd9d7a08b2e895535e64cc30",
+    "short_sha": "e8387e27",
+    "version": "0.20.0",
+    "source": "git",
+    "commit_date": 1792707112
+  },
+  "steps": [
+    {
+      "name": "pre_update_backup",
+      "ok": true,
+      "detail": "snapshot=redacted-pre-update",
+      "at": "2026-10-26T22:31:26.465554+00:00"
+    },
+    {
+      "name": "pre_update_backup",
+      "ok": true,
+      "detail": "snapshot=redacted-pre-update",
+      "at": "2026-10-26T22:31:26.465609+00:00"
+    }
+  ],
+  "skips": [],
+  "gateway_restart": {},
+  "fleet": [],
+  "update_id": "redacted-update-id",
+  "correlation_id": null,
+  "action_id": null,
+  "pid_create_time": 1793053883.131306,
+  "plan": {
+    "install_method": "git",
+    "updatable_in_place": true,
+    "update_mechanism": "hermes update",
+    "expected_sha": "e8387e275844c09cfd9d7a08b2e895535e64cc30",
+    "expected_version": "0.20.0",
+    "profiles": [
+      "default"
+    ],
+    "runtimes": [
+      {
+        "kind": "gateway",
+        "profile": "default",
+        "pid": 23456,
+        "supervisor": "launchd",
+        "code_sha": "c7c67d7aade8ee9e8b890572f35646ac20167006",
+        "code_version": "0.20.0",
+        "restart_via": "launchd",
+        "detail": {}
+      }
+    ]
+  },
+  "stages": [
+    {
+      "name": "plan",
+      "outcome": "success",
+      "at": "2026-10-26T22:31:26.191957+00:00"
+    },
+    {
+      "name": "snapshot",
+      "outcome": "success",
+      "at": "2026-10-26T22:31:26.465630+00:00"
+    }
+  ],
+  "exit_code": 1,
+  "stop_reason": "InstallError: venv: dependency validation failed: Checked 144 packages in 39ms\nFound 1 incompatibility\nThe package `browser-harness` requires `pillow==12.3.0`, but `13.0.0` is installed\n — retry, or run `hermes pm doctor`"
+}
