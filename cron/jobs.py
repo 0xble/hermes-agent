@@ -17,7 +17,7 @@ import re
 import uuid
 
 # Cross-process advisory locking for jobs.json: fcntl (Unix) or msvcrt (Windows). If both are
-# absent, _jobs_lock() degrades to in-process locking rather than failing.
+# absent, reads may degrade, but saves require cross-process ownership.
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-Unix
@@ -32,6 +32,10 @@ from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants
+from cron.jobs_snapshot import (
+    JobsSnapshot, _jobs_file_stamp, _record_load_stamp,
+    _unmerged_disk_jobs, _merge_unexpected_disk_jobs, merge_snapshot,
+)
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron.scheduler_detached_worker import normalize_hard_wall_timeout
 from cron.review import apply_review_update, normalize_review, validate_review_delivery
@@ -305,9 +309,8 @@ def _jobs_lock():
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
     threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
     otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
-    reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
-    degrades to in-process-only locking: a briefly torn cross-process write beats a dead
-    scheduler."""
+    reuse the held lock. Reads may degrade on timeout, but every save fails closed without
+    cross-process ownership, including nested saves and repairs."""
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
         _jobs_lock_state.depth = depth + 1
@@ -324,6 +327,7 @@ def _jobs_lock():
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
         # See #80703.
         _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.write_error = "Refusing cron write: cross-process jobs lock not owned"
         lock_fd = None
         owner = None
         from cron.lock_owner import clear_owner, describe_owner, write_owner
@@ -337,19 +341,22 @@ def _jobs_lock():
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
-                        "it. Proceeding with in-process locking only "
-                        "so the scheduler stays alive (#60703). %s",
+                        "it. Reads may proceed with in-process locking only; writes are refused. %s",
                         _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file(), describe_owner(lock_fd))
+                    _jobs_lock_state.write_error = (
+                        f"Refusing cron write: timed out waiting for {_jobs_lock_file()}; "
+                        f"{describe_owner(lock_fd)}")
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
                 elif acquired is True:
+                    _jobs_lock_state.write_error = None
                     with contextlib.suppress(OSError):
                         owner = write_owner(lock_fd, sys._getframe(2).f_code.co_name)
+                else:
+                    logger.error("jobs.json cross-process lock backend unavailable; writes are refused")
             except OSError as e:
-                # A locking failure must never take down cron writes — in-process lock still held.
-                logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
+                logger.error("jobs.json cross-process lock unavailable (%s); writes are refused", e)
             try:
                 yield
             finally:
@@ -366,6 +373,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.write_error = "Refusing cron write: cross-process jobs lock not owned"
 
 
 @contextlib.contextmanager
@@ -1511,7 +1519,7 @@ def load_jobs() -> list[dict[str, Any]]:
         except OSError as exc:  # repaired in memory; the next load retries the persist
             store_health.note_unwritable(exc, f"jobs.json repair ({repair}) not persisted", "load")
     _record_load_stamp(pre_read_stamp)
-    return jobs
+    return JobsSnapshot(jobs, pre_read_stamp)
 
 
 def _peek_jobs_unlocked() -> Optional[list[dict[str, Any]]]:
@@ -1530,71 +1538,6 @@ def _peek_jobs_unlocked() -> Optional[list[dict[str, Any]]]:
     return data if isinstance(data, list) else None
 
 
-def _jobs_file_stamp(jobs_file: Path) -> Optional[tuple[int, int, int]]:
-    """Shrink-merge fast-path stamp ``(mtime_ns, size, ino)``; ``None`` if unstatable. ``st_ino`` is
-    included because every writer uses mkstemp+rename, so a same-size write in one mtime quantum
-    can't false-match."""
-    try:
-        st = jobs_file.stat()
-        return (st.st_mtime_ns, st.st_size, st.st_ino)
-    except OSError:
-        return None
-
-
-def _record_load_stamp(stamp: Optional[tuple[int, int, int]]) -> None:
-    """Remember jobs.json's stamp for the enclosing _jobs_lock() section (no-op outside one) so the
-    save path can skip the shrink-merge when disk provably hasn't changed. Capture it BEFORE
-    reading: a mid-read sibling then mismatches (fail-safe); stamping after would certify an
-    unseen write.
-
-    Stamping after the read would let that sibling's write be certified as "seen" without being in the
-    loaded payload, wrongly suppressing the recovery. See #80703.
-    """
-    if getattr(_jobs_lock_state, "depth", 0):
-        _jobs_lock_state.load_stamp = stamp
-
-
-def _unmerged_disk_jobs(
-    jobs: list[dict[str, Any]], removed_ids: Optional[Collection[str]]
-) -> list[dict[str, Any]]:
-    """On-disk jobs missing from *jobs* and not intentionally removed. Stamp match => nothing
-    landed, return without parsing; unreadable store => raise RuntimeError (fail closed: writing
-    over an unknown baseline would silently drop every job in it)."""
-    stamp = getattr(_jobs_lock_state, "load_stamp", None)
-    if stamp is not None and _jobs_file_stamp(_current_cron_store().jobs_file) == stamp:
-        return []
-    disk_jobs = _peek_jobs_unlocked()
-    if disk_jobs is None:
-        raise RuntimeError(
-            f"Cron database corrupted; refusing to overwrite {_current_cron_store().jobs_file}")
-    seen = {str(j["id"]) for j in jobs if isinstance(j, dict) and j.get("id")}
-    seen |= {str(i) for i in (removed_ids or ()) if i}
-    recovered: list[dict[str, Any]] = []
-    for disk_job in disk_jobs:
-        if not isinstance(disk_job, dict) or not disk_job.get("id"):
-            continue
-        disk_id = str(disk_job["id"])
-        if disk_id not in seen:
-            recovered.append(disk_job)
-            seen.add(disk_id)
-    return recovered
-
-
-def _merge_unexpected_disk_jobs(
-    jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-) -> list[dict[str, Any]]:
-    """*jobs* plus on-disk jobs absent from the payload (under the degraded flock-timeout path a
-    stale writer would otherwise clobber concurrent creates). Deletes pass ``removed_ids``; never
-    mutates *jobs*."""
-    recovered = _unmerged_disk_jobs(jobs, removed_ids)
-    if not recovered:
-        return jobs
-    logger.warning(
-        "Preserved %d cron job(s) present on disk but missing from the "
-        "in-memory save payload (concurrent create under degraded lock "
-        "or stale writer) (#80624): %s",
-        len(recovered), [j.get("id") for j in recovered])
-    return jobs + recovered
 
 
 def _unlink_quiet(path: Optional[str]) -> None:
@@ -1742,8 +1685,15 @@ def _save_jobs_unlocked(
     rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes).
     ``document`` preserves an existing dict/list wrapper for exact recovery writes.
     """
+    error = getattr(_jobs_lock_state, "write_error", "Refusing cron write: jobs lock not held")
+    if error is not None:
+        logger.error("%s", error)
+        raise TimeoutError(error)
     jobs_file = _current_cron_store().jobs_file
     removed_ids = tuple(str(job_id) for job_id in (removed_ids or ()) if job_id)
+    snapshot = jobs
+    if not replace:
+        jobs = merge_snapshot(jobs, removed_ids)
     ensure_dirs()
     # Owner snapshot BEFORE replace so a root writer can hand the file back to the gateway user.
     _stat_before = None
@@ -1777,6 +1727,8 @@ def _save_jobs_unlocked(
             # Invalidate (never refresh) the stamp: a refresh would let a nested save certify disk
             # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
             _record_load_stamp(None)
+            if isinstance(snapshot, JobsSnapshot):
+                snapshot.checkpoint()
             store_health.note_writable(jobs_file.parent)
             if removed_ids:
                 try:
