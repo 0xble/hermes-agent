@@ -4,10 +4,14 @@ Row changes include SQLite triggers/FTS and rolled-back attempts. These totals
 complement the transcript writer's individual phase timings.
 """
 
+import logging
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
+
+logger = logging.getLogger(__name__)
 
 _metrics: ContextVar[dict | None] = ContextVar("compaction_publication_metrics", default=None)
 
@@ -52,16 +56,34 @@ def state_lock(lock, *, db_path, deadline: float | None = None):
     publication_deadline = started + metrics["patience_s"]
     deadline = publication_deadline if deadline is None else min(deadline, publication_deadline)
     patience_s = max(0.0, deadline - started)
+    snapshot = getattr(lock, "owner_snapshot", None)
+    acquisitions_before = snapshot()[0] if snapshot is not None else None
     acquired = lock.acquire(timeout=patience_s)
     record_publication_write(wait_s=time.monotonic() - started)
     if not acquired:
         from hermes_state_lockowners import log_write_lock_holders
+        _log_mutex_owner(snapshot, acquisitions_before, patience_s)
         log_write_lock_holders(db_path, patience_s)
         raise LocalStateLockTimeout("database is locked (local SessionDB connection mutex patience exhausted)")
     try:
         yield
     finally:
         lock.release()
+
+
+def _log_mutex_owner(snapshot, acquisitions_before, patience_s):
+    count, owner = snapshot() if snapshot is not None else (None, None)
+    acquisitions = count - acquisitions_before if count is not None else "unknown"
+    if owner is None:
+        detail = "owner=unavailable (uninstrumented mutex or acquire/release handoff)"
+    else:
+        held_s = max(0.0, time.monotonic() - owner.acquired_at)
+        sites = " <- ".join(f"{os.path.basename(code.co_filename)}:{line} ({code.co_name})"
+                            for code, line in owner.callsite)
+        detail = (f"owner_thread={owner.thread_name!r} owner_ident={owner.thread_ident} "
+                  f"held_for_s={held_s:.3f} owner_callsite={sites}")
+    logger.warning("state.db local connection mutex unavailable for %.3fs: %s "
+                   "acquisitions_during_wait=%s", patience_s, detail, acquisitions)
 
 
 @contextmanager
