@@ -50,6 +50,12 @@ def settle_recovered_unattended(db, epoch) -> int:
             "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq").fetchall()]
     settled = 0
     for row in _unattended_unknown(rows):
+        from cron.detached_authority import recover_detached, defer_detached
+        if recover_detached(db, epoch, row):
+            settled += 1
+            continue
+        if defer_detached(db, row):
+            continue
         try:
             resolve_unknown_session_input(
                 db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],
@@ -75,6 +81,12 @@ async def settle_unattended_unknown(authority, ref) -> bool:
     rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=ref.session_id)
     settled = False
     for row in _unattended_unknown(rows):
+        from cron.detached_authority import recover_detached, defer_detached
+        if await asyncio.to_thread(recover_detached, authority.db, authority.epoch, row):
+            settled = True
+            continue
+        if await asyncio.to_thread(defer_detached, authority.db, row):
+            continue
         try:
             await authority.resolve_unknown_as_owner(ref, row['admission_id'], row['generation'],
                                                      notice=AUTOMATION_INTERRUPTED_NOTICE)

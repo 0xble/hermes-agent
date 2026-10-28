@@ -127,5 +127,14 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     if job.get("last_delivery_queued"):
         # A drain that settled before this run's own bookkeeping landed found nothing to fence on.
         settle_quietly(job["id"], execution_id)
-    journal.unlink(missing_ok=True)
+    # The external executor can finish while the owner is absent. Keep its
+    # captured result until the replacement owner settles the SAME admission.
+    import json
+    pending_owner = False
+    if journal.exists():
+        record = json.loads(journal.read_text(encoding='utf-8-sig'))
+        pending_owner = 'worker_result' in record and not record.get('canonical_settled')
+    if not pending_owner:
+        journal.unlink(missing_ok=True)
+        journal.with_suffix('.cancel').unlink(missing_ok=True)
     return True
