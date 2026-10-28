@@ -19,12 +19,15 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from contextvars import ContextVar
 
 from hermes_constants import get_hermes_home, hermes_home_key
 from tools.browser_harness_dirs import daemon_env, daemon_identity, namespace_harness_dirs
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+_exec_local_engine: ContextVar[Optional[str]] = ContextVar("browser_exec_local_engine", default=None)
 
 _BACKEND_KEY = "browser-use"
 BACKEND_DISABLED = "off"
@@ -132,7 +135,11 @@ def _export_session_cdp(env: dict, get_session_info: Callable[[str], Any], cache
                         fail_msg: Callable[[Exception], str], no_cdp_msg: str) -> Optional[str]:
     """Export the CDP endpoint from ``get_session_info(cache_key)``; error string on failure / no CDP."""
     try:
-        cdp = str((get_session_info(cache_key) or {}).get("cdp_url") or "")
+        session_info = get_session_info(cache_key) or {}
+        features = session_info.get("features") or {}
+        if features.get("local"):
+            _exec_local_engine.set("lightpanda" if features.get("lightpanda") else "local")
+        cdp = str(session_info.get("cdp_url") or "")
     except Exception as e:
         return fail_msg(e)
     if not cdp:
@@ -164,9 +171,12 @@ def _code_url_verdict(code: str) -> _CodeUrlVerdict:
     return _CodeUrlVerdict(None, local_sidecar)
 
 
-def _base_subprocess_env() -> dict:
+_HARNESS_PASSTHROUGH_KEYS = ("BROWSER_USE_API_KEY",)
+
+
+def _base_subprocess_env() -> dict[str, str]:
     from tools.browser_tool import _build_browser_env
-    env = _build_browser_env()
+    env = _build_browser_env(passthrough_keys=_HARNESS_PASSTHROUGH_KEYS)
     # The harness runs on Hermes's own interpreter, but a bundled Desktop install boots that
     # interpreter with its site dir on PYTHONPATH (no venv to activate), and the harness's daemon
     # re-runs sys.executable. Point PYTHONPATH at the harness's site dir, replacing whatever the
@@ -201,8 +211,8 @@ def _floor_subprocess_path(path: str) -> str:
 def _read_browser_cfg() -> dict:
     """Return the ``browser:`` config section, or {} on any failure."""
     try:
-        from hermes_cli.config import cfg_get, read_raw_config
-        cfg = cfg_get(read_raw_config(), "browser", default={})
+        from hermes_cli.config import cfg_get, load_config_readonly
+        cfg = cfg_get(load_config_readonly(), "browser", default={})
         return cfg if isinstance(cfg, dict) else {}
     except Exception as e:
         logger.debug("Could not read browser config section: %s", e)
@@ -464,6 +474,7 @@ def _resolve_managed_chromium_cdp(env: dict, task_id: Optional[str], session_nam
         return (f"The local browser could not be started: {(res or {}).get('error') or 'agent-browser returned no CDP endpoint'} "
                 "Run `hermes tools` → Browser Automation to (re)install Chromium, or switch backends.")
     cdp = _reach_sandbox_cdp(cdp)
+    _exec_local_engine.set("local")
     _set_cdp_env(env, cdp)
     env[_PRIVATE_BROWSER_SENTINEL] = "1"  # one Chromium per cache key: nothing to share a tab with
     env[_BOT_DESKTOP_BROWSER_SENTINEL] = "1"
@@ -887,7 +898,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
 
 _HEADER_BASE = (
-    "Drive a real web browser via the Browser Use CLI: `code` runs as full Python (stdlib available) "
+    "Drive a real web browser via the Browser Use CLI. `code` runs as full Python (stdlib available) "
     "with pre-imported browser helpers; stdout comes back in the result. Start `code` with a one-line "
     "comment describing the step for the user in plain language, max 60 chars "
     "(e.g. `# Searching Amazon for paper towels`) — the UI shows it as the step label.\n\n"
@@ -990,15 +1001,26 @@ BROWSER_EXEC_SCHEMA = {
 # answers "is Browser Use mode configured"; surface policy lives with the session.
 from tools.registry import registry
 
+def _handle_browser_exec(args: dict, **kw):
+    """Registry handler; each call counts against the backend that served it (shared metrics, opt-in)."""
+    from hermes_cli.observability.shared_metrics_loop import record_browser_call
+    from tools.browser_tool_cloud import browser_backend_name
+    token = _exec_local_engine.set(None)
+    try:
+        return record_browser_call(lambda: browser_exec(
+            code=args.get("code", ""), session=args.get("session", "") or "",
+            timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
+            local=bool(args.get("local", False)),
+        ), lambda: browser_backend_name(local_engine=_exec_local_engine.get()))
+    finally:
+        _exec_local_engine.reset(token)
+
+
 registry.register(
     name="browser_exec",
     toolset="browser-use",
     schema=BROWSER_EXEC_SCHEMA,
-    handler=lambda args, **kw: browser_exec(
-        code=args.get("code", ""), session=args.get("session", "") or "",
-        timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S), task_id=kw.get("task_id"),
-        local=bool(args.get("local", False)),
-    ),
+    handler=_handle_browser_exec,
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
     emoji="🌐",

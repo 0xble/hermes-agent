@@ -44,7 +44,7 @@ def warm_agent_browser_npx_cache(timeout: float = 60.0) -> bool:
     return False
 
 
-def _build_browser_env() -> dict:
+def _build_browser_env(*, passthrough_keys: tuple[str, ...] = _BROWSER_PASSTHROUGH_KEYS) -> dict:
     """Credential-scrubbed env for an agent-browser subprocess (deferred import: test
     harnesses stub the ``tools`` package). The passthrough keys are re-added from the active
     profile's secret scope, never ``os.environ``: under multiplex that holds the LAUNCH profile's
@@ -60,7 +60,7 @@ def _build_browser_env() -> dict:
     # ``os.environ`` value that ``get_secret`` falls through to while multiplexing is inactive.
     routed = serves_routed_profile()
     scope = (current_secret_scope() or {}) if routed else None
-    for key in _BROWSER_PASSTHROUGH_KEYS:
+    for key in passthrough_keys:
         value = scope.get(key) if routed else get_secret(key)
         if value is not None:
             env[key] = value
@@ -567,7 +567,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_upload",
-        "description": "Attach local files to the page's upload control, including one inside a cross-origin iframe, without an OS file dialog. Give the trigger that opens the chooser (the upload button itself, not menu text) as a ref from the snapshot, or as a Playwright selector; for an iframe use 'iframe[src*=\"<host>\"] >> internal:control=enter-frame >> <button selector>'. With neither, the first top-level input[type=file] is used. A named trigger is refused when the top-level page has its own file input, because that input would take the file. Afterwards take a fresh snapshot, save, and read back the persisted file.",
+        "description": "Attach local files to the page's upload control without an OS file dialog. Cross-origin iframes are supported. Give the trigger that opens the chooser (the upload button itself, not menu text) as a ref from the snapshot, or as a Playwright selector; for an iframe use 'iframe[src*=\"<host>\"] >> internal:control=enter-frame >> <button selector>'. With neither, the first top-level input[type=file] is used. A named trigger is refused when the top-level page has its own file input, because that input would take the file. Afterwards take a fresh snapshot, save, and read back the persisted file.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -758,7 +758,7 @@ def _post_redirect_block(nav_session_key: str, url: str, final_url: str, auto_lo
     return json.dumps(_err(f"Blocked: redirect landed on {what}"))
 
 
-def _snapshot_fields(snap_result: Dict[str, Any], nav_session_key: str = "default") -> Dict[str, Any]:
+def _snapshot_fields(snap_result: dict[str, Any], nav_session_key: str = "default") -> dict[str, Any]:
     """``snapshot`` + ``element_count`` fields from a successful snapshot result; oversized
     snapshots truncate at line boundaries with the full tree stored for read_file paging."""
     data = snap_result.get("data", {})
@@ -1114,7 +1114,7 @@ def _parse_eval_value(raw_result: Any) -> Any:
     return raw_result
 
 
-def _eval_ok_response(parsed: Any, *, vault_tab: str = "default", vault_origin: str = "", **extra) -> Dict[str, Any]:
+def _eval_ok_response(parsed: Any, *, vault_tab: str = "default", vault_origin: str = "", **extra) -> dict[str, Any]:
     return {
         "success": True,
         "result": _snapshot._redact_browser_output(parsed,
@@ -1414,7 +1414,7 @@ from tools.browser_extension_router import extension_controller_available, route
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 
-def _camofox_handoff_schema_override() -> Dict[str, Any]:
+def _camofox_handoff_schema_override() -> dict[str, Any]:
     from tools.browser_camofox_state import get_camofox_account_aliases
     return {"parameters": {"type": "object", "properties": {"account": {
         "type": "string", "enum": list(get_camofox_account_aliases()),
@@ -1425,7 +1425,7 @@ def _camofox_handoff_schema_override() -> Dict[str, Any]:
     }}, "required": ["account"]}}
 
 
-def _camofox_account_schema_override() -> Dict[str, Any]:
+def _camofox_account_schema_override() -> dict[str, Any]:
     """Advertise account selection only when Camofox is the active backend."""
     if not _is_camofox_mode():
         return {}
@@ -1493,10 +1493,17 @@ def _routed_check_fn(name: str):
 
 def _routed_handler(name: str, fallback):
     def handler(args, **kw):
-        return record_browser_call(lambda legacy: routed_browser_handler(
-            name, args, fallback=lambda: legacy(lambda: fallback(args, kw)),
+        served_by_legacy = False
+
+        def legacy():
+            nonlocal served_by_legacy
+            served_by_legacy = True
+            return fallback(args, kw)
+
+        return record_browser_call(lambda: routed_browser_handler(
+            name, args, fallback=legacy,
             task_id=kw.get("task_id"), session_id=kw.get("session_id"),
-        ), _cloud.browser_backend_name)
+        ), lambda: _cloud.browser_backend_name() if served_by_legacy else "extension")
     return handler
 
 

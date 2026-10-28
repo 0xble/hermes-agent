@@ -5,6 +5,38 @@ the browser vault fill tool, or the 1Password backends.
 
 - Fork patch identity: `vault-origin-aliases`.
 
+## Native Browser Extraction Boundary
+
+Upstream main `69f73ec5f11f5a945cc864f29c4e2ad2307eaec3` extracts the native
+browser and Camofox into catalog plugins. Keep the maintained native owner until
+an extracted provider preserves named identity resolution, vault authorization,
+and authenticated browser-controller ownership together. Do not mix its session
+cache or lifecycle with the extracted browser-session owner, and do not install
+a second Camofox provider during configuration migration. Preserve
+`browser.backend` and `browser.extension_control` while adopting the upstream
+launcher-setting migration. The Camofox no-install and v52 migration regressions
+exercise that intentional fork contract rather than upstream's removal policy.
+Delist `plugin-catalog/camofox.yaml` while this native owner remains: its declared
+`browser_*` tools collide with the retained built-ins. This is the catalog's
+superseded-entry delisting route, not a blocklist entry or a collision-check
+exception. Restore the entry only together with an equivalent native extraction.
+Keep plugin admission and install-time collision checks unchanged.
+
+Controller and isolation fixtures must exercise `tools.browser_tool_cdp` and
+`tools.browser_tool_lifecycle`, the retained native owners, not the extracted
+`browser_session_*` modules. Keep both origin checks and guarded backend
+`fill_context` behavior in vault fixtures. The migrated `browser.headed` value
+belongs to the active profile, so a legacy process-wide headed environment
+variable must not retain a headless profile's browser. Browser Use child
+environments pass through the shared credential scrubber before adding their
+nonsecret CLI settings. Lazy toolset discovery must load native registrations
+without enabling a profile-disabled backend.
+
+Adopt upstream vault `fill_context`, guarded metadata snapshots, and protected
+OTP writes around the native origin and account checks. Attribute Browser Use
+metrics to the session that served the call, including cloud-to-local fallback,
+without changing the native browser or its consent surface.
+
 ## Required behavior
 
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.

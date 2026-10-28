@@ -73,7 +73,7 @@ def test_release_plist_executes_selected_release_with_managed_source_launcher(tm
     runtime = store_root(source)
     tool = runtime / "python-test" / "bin" / "python3"
     tool.parent.mkdir(parents=True)
-    tool.symlink_to(sys.executable)
+    tool.symlink_to(getattr(sys, "_base_executable", sys.executable))
     (runtime / "facts.json").write_text(json.dumps({"packages": {"python": {"entry": "python-test"}}}), encoding="utf-8")
     assert resolve_store_python(source) == tool
     launcher = source / ".hermes" / "bin" / "hermes"
@@ -1060,8 +1060,9 @@ def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path,
     carried = previous if carrier == "previous" else source
     environment = install_state_dir(carried) / "environments" / "generation" / "venv"
     (environment / "bin").mkdir(parents=True)
-    (environment / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (environment / "bin" / "python").symlink_to(sys.executable)
+    (environment / "pyvenv.cfg").write_text(
+        f"home = {Path(sys._base_executable).resolve().parent}\n", encoding="utf-8")
+    (environment / "bin" / "python").symlink_to(getattr(sys, "_base_executable", sys.executable))
     facts = runtime_facts_path(carried)
     facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
         "environment": str(environment), "extras": ["slack", "telegram"]}}}), encoding="utf-8")
@@ -1092,7 +1093,7 @@ def test_smoke_runs_the_interpreter_the_candidate_boots(tmp_path, monkeypatch):
     generation = install_state_dir(release) / "environments" / "generation" / "venv"
     (generation / "bin").mkdir(parents=True)
     (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (generation / "bin" / "python").symlink_to(sys.executable)
+    (generation / "bin" / "python").symlink_to(getattr(sys, "_base_executable", sys.executable))
     runtime_facts_path(release).write_text(json.dumps({"schema": 1, "packages": {"venv": {
         "environment": str(generation), "extras": ["slack"]}}}), encoding="utf-8")
     ran = []
@@ -1124,12 +1125,13 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
             "documents=['docx-pkg==1.0']\ngated=['gated-pkg==1.0; sys_platform == \"none\"']\n",
             encoding="utf-8")
         (release / ".venv" / "bin" / "python").unlink()
-        (release / ".venv" / "bin" / "python").symlink_to(sys.executable)
+        (release / ".venv" / "bin" / "python").symlink_to(getattr(sys, "_base_executable", sys.executable))
     releases.promote(home, a)
     generation = install_state_dir(a) / "environments" / "generation" / "venv"
     (generation / "bin").mkdir(parents=True)
-    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (generation / "bin" / "python").symlink_to(sys.executable)
+    (generation / "pyvenv.cfg").write_text(
+        f"home = {Path(sys._base_executable).resolve().parent}\n", encoding="utf-8")
+    (generation / "bin" / "python").symlink_to(getattr(sys, "_base_executable", sys.executable))
     runtime_facts_path(a).write_text(json.dumps({"schema": 1, "packages": {"venv": {
         "environment": str(generation), "extras": ["documents", "gated", "slack", "telegram"]}}}),
         encoding="utf-8")
@@ -1737,7 +1739,7 @@ def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_pat
     }), encoding="utf-8")
     source = Path(__file__).resolve().parents[2]
 
-    with pytest.raises(RuntimeError, match="disabled via config"):
+    with pytest.raises(RuntimeError, match="listed in both plugins.enabled and plugins.disabled"):
         releases.smoke_plugins(source, home)
 
 
@@ -1755,5 +1757,5 @@ def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_
     (plugin / "locales" / "pl.yaml").write_text("name: Polski\n", encoding="utf-8")
     source = Path(__file__).resolve().parents[2]
 
-    with pytest.raises(RuntimeError, match="disabled via config"):
+    with pytest.raises(RuntimeError, match="listed in both plugins.enabled and plugins.disabled"):
         releases.smoke_plugins(source, home)

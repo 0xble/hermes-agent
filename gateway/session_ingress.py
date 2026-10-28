@@ -95,6 +95,11 @@ async def admit_message(authority, event):
         if internal_input(event):
             log_internal_refusal(authority.runner, event.source, exc.reason, exc.field)
             return None
+        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+        if row is not None and row['status'] == 'terminal':
+            # The drain refused this head (``_refuse_head``): cancelled, not saved behind a pause.
+            return (f'⚠️ Hermes did not answer this message ({exc.reason}): the conversation it was '
+                    'queued for moved, so it was dropped. Send it again to continue.')
         return pause_notice(authority, receipt.ref, exc.reason)
     finally:
         if adopters.get(receipt.admission_id) is event:

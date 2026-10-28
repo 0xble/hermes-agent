@@ -131,6 +131,7 @@ def test_length_retry_boost_reaches_chat_wire_builder():
     agent._max_tokens_param = lambda value: {"max_tokens": value}
     agent._supports_reasoning_extra_body = lambda: False
     agent._lmstudio_reasoning_options_cached = lambda: None
+    agent._reasoning_endpoint_profile = lambda: None
 
     kwargs = _build_chat_completions_kwargs(
         agent, [{"role": "user", "content": "continue"}], [], None, {}, None,

@@ -3047,9 +3047,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # The session's own frozen route credential is gone or changed: name it, not the model.
             status_hint = f" {e.reason} ({e.field}: {e.detail or 'unavailable'})."
         from gateway.session_results import record_unexecuted_failure
+        local_error = f"{type(e).__name__}: {e}"[:500] if source.platform == Platform.LOCAL else None
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
-        ))
+        ), error=local_error)
 
     def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
         """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
@@ -4911,7 +4912,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                         pending_event = None
                         pending = None
 
-        if self._draining and (pending_event or pending) and not handover_runs_followups(self):
+        if self._draining and (pending_event or pending) and not handover_runs_followups(self) and getattr(pending_event, "_admitted_before_drain", False) is not True:
             # The adapter slot was already dequeued; spool it so startup recovery can replay it.
             from gateway.shutdown_flush import flush_pending_to_file
             # Media-only events can have no text even after transcription; persist the resolved
@@ -4958,6 +4959,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                                  session_key)
             pending_event = None
             pending = None
+        if self._draining and result and adapter and session_key and pending_event is None and not handover_runs_followups(self):
+            pending_event = self._take_wake_admitted_before_drain(session_key, adapter)
+            pending = (pending_event.text or _build_media_placeholder(pending_event)) if pending_event is not None else None
         return pending_event, pending
 
     async def _run_agent_deliver_first_response(

@@ -95,7 +95,7 @@ async def test_graceful_kill_uses_parent_first_registry_path(monkeypatch):
 def test_foreground_processes_are_killed_after_shared_deadline(monkeypatch):
     """The fast foreground-process sweep is unconditional after kill_all expires."""
     events = []
-    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    _runner, _loop_thread = _make_phase_runner(monkeypatch, events)
     import tools.environments.base as _base
 
     monkeypatch.setattr(_base, "kill_live_foreground_processes", lambda **_kw: events.append(("foreground", None)))

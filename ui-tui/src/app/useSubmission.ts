@@ -463,7 +463,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         const control = captureBusyControl()
         const editedWhileBusy = live.busy
 
-        return void Promise.resolve(picked).then(item => {
+        return void Promise.resolve(picked).then<void | boolean>(item => {
           if (!item) {
             return
           }

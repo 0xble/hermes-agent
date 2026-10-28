@@ -485,7 +485,7 @@ class GatewayProfileReconcileMixin:
             _write_runtime_status_quiet(drop_profile_platforms=name)
             for attr in ("pairing_stores", "_busy_text_modes_by_profile", "_busy_input_modes_by_profile",
                          "_busy_text_timing_by_profile", "_human_delay_by_profile", "_profile_configs",
-                         "_relay_fyi_passive_by_profile"):
+                         "_relay_fyi_passive_by_profile", "_profile_bot_platforms"):
                 store = getattr(self, attr, None)
                 if isinstance(store, dict):
                     store.pop(name, None)

@@ -640,15 +640,15 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
         "pre_tool_call",
         **cancelled,
         tool_call_id="sensitive-cancelled-tool-call",
-        tool_name="browser_navigate",
-        args={"url": prompt_canary},
+        tool_name="browser_exec",
+        args={"code": prompt_canary},
     )
     lifecycle.invoke_hook(
         "post_tool_call",
         **cancelled,
         tool_call_id="sensitive-cancelled-tool-call",
-        tool_name="browser_navigate",
-        args={"url": prompt_canary},
+        tool_name="browser_exec",
+        args={"code": prompt_canary},
         result={"error": tool_canary},
         status="cancelled",
         duration_ms=31_000,
@@ -709,7 +709,7 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
     } == {
         ("terminal", "success", "none"),
         ("read_file", "failed", "unknown"),
-        ("browser_navigate", "cancelled", "interrupted"),
+        ("browser_exec", "cancelled", "interrupted"),
     }
     assert {
         counter["dimensions"]["outcome"]
@@ -2863,7 +2863,7 @@ def test_install_snapshot_is_daily_and_carries_only_bucketed_counts(
         "main_provider": "none", "mcp_server_count_bucket": "1", "memory_provider": "plugin",
         "messaging_platform_count_bucket": "0", "plugin_count_bucket": "3_to_5",
         "profile_count_bucket": snapshot["profile_count_bucket"], "skill_count_bucket": "0",
-        "terminal_backend": "local", "local_model_provider_used": "no",
+        "terminal_backend": "local", "local_model_provider_used": "no", "compression_prepare_ahead": "off",
         **{k: snapshot[k] for k in ("behind_bucket", "gpu_class", "ram_bucket", "release_channel", "version_age_bucket")},
     }
 
@@ -2951,6 +2951,30 @@ def test_milestone_install_age_is_the_subscriber_profile_not_the_relay_thread(tm
     ages = [c["dimensions"]["install_age_bucket"] for c in subscriber.store.counter_snapshot()
             if c["metric_name"] == "hermes.install.milestone"]
     assert ages == ["gte_90d"]
+
+
+def test_subscriber_rechecks_consent_between_queued_counter_writes(tmp_path, monkeypatch):
+    """A queued Relay event cannot keep writing after its owning profile revokes collection."""
+    from hermes_cli.observability.shared_metrics import SharedMetricsStore
+    from hermes_cli.observability.shared_metrics_subscriber import SharedMetricsSubscriber
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    consent = [True]
+    subscriber = SharedMetricsSubscriber(SharedMetricsStore(), "1.0", consent_check=lambda: consent[0])
+    dimensions = {"crash_class": "none", "exit_kind": "killed", "process_kind": "gateway"}
+    counter = ("hermes.process.exit", dimensions, 1)
+    monkeypatch.setattr(subscriber, "_classify", lambda event: [counter, counter])
+    persist = subscriber._persist
+
+    def persist_then_revoke(*args):
+        persist(*args)
+        consent[0] = False
+
+    monkeypatch.setattr(subscriber, "_persist", persist_then_revoke)
+    subscriber(SimpleNamespace(metadata={}))
+    subscriber(SimpleNamespace(metadata={}))  # another event was queued before revocation
+    rows = subscriber.store.counter_snapshot()
+    assert [(r["metric_name"], r["value"]) for r in rows] == [("hermes.process.exit", 1)]
 
 
 def test_token_usage_is_summed_per_model_and_auxiliary_task(direct_runtime, tmp_path):

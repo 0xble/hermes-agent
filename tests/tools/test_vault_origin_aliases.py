@@ -8,12 +8,13 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_origin_aliases import _configured_aliases
 from agent.vault_store import VaultItemMeta
 from tools import browser_vault_tool as vault
 
 
-class _Backend:
+class _Backend(LocalLoginBackend):
     name = "onepassword"
     display_name = "1Password"
     needs_unlock = False

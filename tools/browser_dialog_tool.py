@@ -16,8 +16,8 @@ from tools.registry import registry
 BROWSER_DIALOG_SCHEMA: dict[str, Any] = {
     "name": "browser_dialog",
     "description": (
-        "Respond to a native JavaScript dialog (alert / confirm / prompt / "
-        "beforeunload) that is currently blocking the page.\n\n"
+        "Respond to a native JavaScript dialog that is currently blocking the page. "
+        "Handles alert, confirm, prompt and beforeunload dialogs.\n\n"
         "**Workflow:** call ``browser_snapshot`` first — if a dialog is open, "
         "it appears in the ``pending_dialogs`` field with ``id``, ``type``, "
         "and ``message``. Then call this tool with ``action='accept'`` or "

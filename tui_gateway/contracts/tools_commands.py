@@ -546,7 +546,7 @@ class BrowserAction(WireEnum):
 class BrowserManageParams(Params):
     action: BrowserAction = BrowserAction.status
     url: str | None = None
-    # ``use`` only: True selects Browser Use mode (browser_exec), False the built-in browser tools.
+    # ``use`` selects Browser Use for new agents without changing a running session.
     enabled: bool | None = None
     session_id: str | None = None
     profile: str | None = None
@@ -556,7 +556,6 @@ class BrowserManageResult(Result):
     connected: bool
     url: str | None = None
     messages: list[str] | None = None
-    # ``status`` / ``use``: whether new agents for this profile get browser_exec.
     browser_use: bool | None = None
 
 

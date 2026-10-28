@@ -113,6 +113,7 @@ def _finish_review_turn(
             turn,
             [],
             original_user_message=user_message,
+            final_response=turn.final_text,
             should_review_memory=review_memory,
         )
 
