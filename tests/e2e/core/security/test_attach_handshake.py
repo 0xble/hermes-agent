@@ -249,6 +249,12 @@ def _resume(home: Path, sid: str) -> tuple[subprocess.CompletedProcess, dict | N
     out = home.parent / f"handoff-{uuid.uuid4().hex}.json"
     node = shutil.which("node")
     assert node is not None, "the attachment probe requires the test runner's Node.js"
+    # Resolve in the runner's real environment: PATH may contain a version-manager
+    # shim that cannot select its runtime under the child's hermetic HOME.
+    node = subprocess.run(
+        [node, "-p", "process.execPath"], capture_output=True, text=True,
+        check=True, timeout=10).stdout.strip()
+    assert Path(node).is_absolute() and Path(node).is_file(), f"invalid Node.js executable: {node!r}"
     result = run_hermes(
         ["--tui", "--resume", sid], home, timeout=90,
         # The probe tests attachment, not a fresh PM/Node installation. The launcher's
