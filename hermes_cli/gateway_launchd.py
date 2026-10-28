@@ -187,15 +187,18 @@ def _launchd_old_gateway_exit_budget() -> float:
     return max(_launchd_reload_budget(), LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S + 5.0)
 
 
-def _launchctl_supervised_pid(label: str, *, timeout: float = 10) -> int | None:
+def _launchctl_supervised_pid(label: str, *, timeout: float = 10, strict: bool = False) -> int | None:
     """PID launchd currently runs for ``label``, or None when it runs none. ``launchctl list`` exits 0 for
     a mere registered definition (``state = not running`` on macOS 26+), so a PID — not the exit code — is
     the answer. Domain-agnostic on purpose: ``launchctl print`` domain probes fail on macOS-26 per-user
     domains, which is why the invoking profile verifies through this and not ``_launchd_print_service_pid``.
-    ``timeout`` lets a bounded caller (the guardian) pass the time left in its own deadline."""
+    ``timeout`` lets a bounded caller (the guardian) pass the time left in its own deadline.
+    ``strict`` preserves probe failures for callers that must diagnose unknown ownership."""
     try:
         result = subprocess.run(["launchctl", "list", label], check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        if strict:
+            raise RuntimeError(f'cannot probe launchd supervised PID for {label}: {exc}') from exc
         return None
     if result.returncode != 0:
         return None

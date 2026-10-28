@@ -1773,8 +1773,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     def _platform_adapter_for_unproven_relay(self, platform_name: str, source, evt: dict):
         """Platform adapter for a relay-flagged pre-ledger route, else None.
 
-        Missing relay connector plus no committed envelope is a counted refusal,
-        not a silent retry. An envelope-backed relay route keeps waiting.
+        A legacy delegation with no committed envelope reaches a permanent
+        refusal, not a silent retry. An envelope-backed relay route keeps waiting.
         """
         from copy import copy
 
@@ -1845,7 +1845,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             adapter = self.adapters.get(Platform.API_SERVER)
         if not adapter and getattr(source, "delivered_via_upstream_relay", False) is True:
             # A persisted relay flag is not a connector. A pre-ledger route must
-            # still reach admission so the unproven grant is refused and counted.
+            # still reach admission so the unproven grant is permanently refused.
             # A committed envelope waits for the relay adapter.
             adapter = self._platform_adapter_for_unproven_relay(platform_name, source, evt)
         if not adapter:

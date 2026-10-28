@@ -42,18 +42,28 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   Only events from the acknowledged PID/code identity within the post-ack window
   count. `release-admission-canary.json` retains the terminal result across the
   rollback, and the shared guardian lock prevents duplicate rollback attempts.
-- Only proven absent/ended targets in the source's runtime home and explicitly
-  suspended routes are excluded from automation outage evidence. Standalone
-  restore proves that home with a wire-invisible stamp, not a RoutingIdentity.
-  A source rebuilt from its wire dict, or one whose proven home is not this
-  runtime's state DB, stays counted. Missing routes with a live durable target,
-  native refusals, connector/auth failures and invalid producer payloads still
-  count. An unproven relay flag with no live relay adapter reaches admission
-  and is counted; a committed envelope waits for that adapter. The threshold,
-  observation window and acknowledged-process fence are unchanged.
+- Proven absent/ended targets in the source's runtime home, explicitly suspended
+  routes and pre-ledger routes with no native delegation are excluded from
+  automation outage evidence. The latter use the permanent `not_found` refusal
+  with field `automation_legacy_delegation`, before connector-identity checks so
+  a real relay registered under `Platform.RELAY` takes the same settled fence.
+  They reach the existing 8-attempt producer drop cap, never acquire
+  delegated trust and need a fresh human admission before automation can succeed.
+  Standalone restore proves its home with a wire-invisible stamp, not a
+  RoutingIdentity. A wire-dict source or one proven to another home stays counted.
+  Missing routes with a live durable target, native refusals, connector/auth
+  failures and invalid producer payloads still count. A committed envelope waits
+  for its relay adapter. Threshold, observation window and PID fence are unchanged.
+- Rollback distinguishes launchctl probe failures from an absent supervised PID
+  and a proven foreign owner. All fail closed before launchd mutation. Drain
+  escalation reserves startup time using the smaller of 15 seconds or a quarter
+  of the remaining rollback deadline, and logs a WARNING with the killed PID and
+  its last-reported in-flight agent count (unknown for a nonmatching status PID).
 - Guards: `tests/hermes_cli/test_admission_canary.py`,
   `tests/gateway/test_admission_canary.py`,
-  `tests/gateway/test_automation_upgrade_admission.py`, and existing guardian/release tests.
+  `tests/gateway/test_automation_upgrade_admission.py`,
+  `tests/gateway/test_legacy_delegation_refusal.py`,
+  `tests/hermes_cli/test_rollback_diagnostics.py`, and existing guardian/release tests.
 
 ## Billing outage persistence and provider-wide classification
 
