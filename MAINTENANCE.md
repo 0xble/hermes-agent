@@ -59,6 +59,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
+| Named remote computer use | Reuse shared profile-owned node identities and persistent SSH MCP sessions, with observed daemon policy, no fallback and native image blocks | Shared node resolution, computer-use provider dispatch, remote doctor or CuaDriver transport changes | [Named remote computer use](maintenance/remote-computer-use.md) |
 | Completed Responses images | Completed hosted image results become cached assistant media or truthful attachment failures, not empty turns | Codex Responses normalization, provider media caching, or image-only final responses | [Completed Responses images](maintenance/codex-native-images.md) |
 | Reaction tool name | Expose `react` with a thumbs-up progress icon, retaining silent rendering of saved legacy calls | Reaction tool registration, progress identity or desktop classification changes | [Reaction tool name](maintenance/react-tool-name.md) |
 | CLI streaming preview framing | Keep pending-answer previews distinct from committed transcript while preserving activity chrome | Modern-composer status rendering, streaming previews, or resize-scrollback changes | [CLI streaming preview framing](maintenance/cli-stream-preview.md) |
