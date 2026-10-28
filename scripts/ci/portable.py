@@ -393,23 +393,29 @@ def reclaim_finished_generated_dirs() -> list[str]:
     script = worktree_safety_script()
     if script is None:
         return []
-    module_path = ROOT / 'hermes_cli' / 'worktree_gc.py'
-    name = 'hermes_ci_worktree_gc'
-    cached = sys.modules.get(name)
-    if cached is not None and getattr(cached, '__file__', None) == str(module_path):
-        module = cached
-    else:
-        spec = importlib.util.spec_from_file_location(name, module_path)
-        if spec is None or spec.loader is None:
-            return []
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return module.reclaim_finished_generated(
-        str(common_repo_root(ROOT)),
-        safety_script=str(script),
-        exclude=[str(ROOT.resolve())],
-    )
+    # bin/ci is a runpy entry point, so its sys.path starts at bin/, not ROOT.
+    original_path = sys.path[:]
+    sys.path.insert(0, str(ROOT))
+    try:
+        module_path = ROOT / 'hermes_cli' / 'worktree_gc.py'
+        name = 'hermes_ci_worktree_gc'
+        cached = sys.modules.get(name)
+        if cached is not None and getattr(cached, '__file__', None) == str(module_path):
+            module = cached
+        else:
+            spec = importlib.util.spec_from_file_location(name, module_path)
+            if spec is None or spec.loader is None:
+                return []
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        return module.reclaim_finished_generated(
+            str(common_repo_root(ROOT)),
+            safety_script=str(script),
+            exclude=[str(ROOT.resolve())],
+        )
+    finally:
+        sys.path[:] = original_path
 
 
 def ensure_setup_free_space() -> None:

@@ -21,7 +21,6 @@ from typing import Dict, Optional
 
 from hermes_cli._subprocess_compat import kill_process_tree, noninteractive_git_env
 from hermes_constants import get_hermes_home
-from utils import atomic_json_write
 
 logger = logging.getLogger("cli")
 
@@ -664,6 +663,9 @@ def _load_worktree_merge_cache() -> dict[str, bool]:
 def _save_worktree_merge_cache(verdicts: dict[str, bool]) -> None:
     """Atomically persist the newest ``_WORKTREE_MERGE_CACHE_MAX`` verdicts. Never raises."""
     try:
+        # Setup needs stdlib-only ownership guards before installing YAML dependencies.
+        from utils import atomic_json_write
+
         items = list(verdicts.items())[-_WORKTREE_MERGE_CACHE_MAX:]
         atomic_json_write(_worktree_merge_cache_path(), {"version": 1, "verdicts": dict(items)}, indent=None)
     except Exception as e:

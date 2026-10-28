@@ -15,6 +15,8 @@ the entire value of these tests is exercising actual git verdicts):
 - reclaim operates ONLY on the frozen audit list (concurrent-session trap)
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 import os
 import subprocess
 from pathlib import Path
@@ -224,6 +226,52 @@ class TestAuditVerdicts:
 
 
 class TestGeneratedReclaimOwnership:
+    @pytest.mark.parametrize("kind", ["directory", "symlink"])
+    def test_concurrent_reclaimers_accept_already_removed_output(self, repo, tmp_path, monkeypatch, kind):
+        tree, _ = _add_worktree(repo, "hermes-finished")
+        generated = tree / ".ci"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "payload").write_bytes(b"keep")
+        if kind == "symlink":
+            generated.symlink_to(outside, target_is_directory=True)
+        else:
+            generated.mkdir()
+            (generated / "payload").write_bytes(b"reclaim")
+        script = tmp_path / "safety.py"
+        script.write_text(
+            'print(\'{"reasons":[],"ignored_entries":[],"dirty_entries":[], '
+            '"active_cwd":false,"locked":false,"linked_worktree":true,'
+            '"integrated_or_patch_equivalent":true,"nested_repos":[],"inbound_live_symlinks":[]}\')\n'
+        )
+        # Both callers pass ownership and existence checks before either deletes.
+        rendezvous = Barrier(2)
+        if kind == "symlink":
+            unlink = Path.unlink
+
+            def concurrent_unlink(path, *args, **kwargs):
+                if path == generated:
+                    rendezvous.wait(timeout=10)
+                return unlink(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "unlink", concurrent_unlink)
+        else:
+            rmtree = worktree_gc.shutil.rmtree
+
+            def concurrent_rmtree(path, *args, **kwargs):
+                if path == generated:
+                    rendezvous.wait(timeout=10)
+                return rmtree(path, *args, **kwargs)
+
+            monkeypatch.setattr(worktree_gc.shutil, "rmtree", concurrent_rmtree)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(worktree_gc.reclaim_finished_generated,
+                                   str(repo), safety_script=str(script)) for _ in range(2)]
+            assert [future.result(timeout=20) for future in futures] == [[str(generated)]] * 2
+        assert not generated.exists() and not generated.is_symlink()
+        assert (outside / "payload").read_bytes() == b"keep"
+        assert (tree / "README.md").read_text() == "hello\n"
+
     @pytest.mark.parametrize("name,live_lock", [
         ("t_deadbeef", False),
         ("hermes-live", True),

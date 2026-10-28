@@ -67,6 +67,10 @@ headroom reclaims generated directories from finished worktrees and refuses,
 naming the paths and the bytes still required, only when space is still short.
 Generated-output reclaim shares the attended pruner's ownership guards: kanban
 lifecycle trees and live Hermes session locks are preserved before inspection.
+The pre-install reclaim loader temporarily exposes the checkout on the import path,
+and ownership checks do not import dependencies that setup has not installed yet.
+Concurrent reclaimers accept already-removed generated paths and still recheck
+free space, while other deletion errors propagate.
 There is no host-wide install lock. Fork patch identity: `ci-shared-download-caches`. Temporary homes live outside the checkout in invocation-owned system temporary directories.
 When Linux makes the normal disk-backed Python scratch path read-only, Python
 fixtures use a unique directory under the runner's original disk-backed HOME,

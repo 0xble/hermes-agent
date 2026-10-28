@@ -1065,6 +1065,58 @@ with ci.checkout_lock():
             self.assertTrue((busy / '.venv').is_dir())
             run.assert_called()
 
+    def test_reclaim_imports_from_bin_path_without_installed_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / 'repo'
+            subprocess.run(['git', 'init', '-b', 'main', str(repo)],
+                           env=clean_git_env(), check=True, capture_output=True)
+            generated = repo / '.worktrees' / 'finished' / '.ci'
+            generated.mkdir(parents=True)
+            (generated / 'payload').write_bytes(b'reclaim')
+            script = base / 'safety.py'
+            script.write_text(
+                'print(\'{"reasons":[],"ignored_entries":[],"dirty_entries":[], '
+                '"active_cwd":false,"locked":false,"linked_worktree":true,'
+                '"integrated_or_patch_equivalent":true,"nested_repos":[],"inbound_live_symlinks":[]}\')\n',
+                encoding='utf-8',
+            )
+            probe = '''
+import runpy, sys
+from pathlib import Path
+from unittest.mock import patch
+root, repo, script = map(Path, sys.argv[1:])
+# bin/ci calls runpy without adding the checkout to the import path.
+sys.path.insert(0, str(root / 'bin'))
+assert str(root) not in sys.path
+assert 'hermes_cli' not in sys.modules
+ci = runpy.run_path(str(root / 'scripts/ci/portable.py'))
+reclaim = ci['reclaim_finished_generated_dirs']
+original_path = sys.path[:]
+with patch.dict(reclaim.__globals__, {
+    'common_repo_root': lambda _: repo,
+    'worktree_safety_script': lambda: script,
+}):
+    removed = reclaim()
+    assert removed == [str(repo / '.worktrees/finished/.ci')], removed
+    assert sys.path == original_path
+    # The cached loader and exception path must also restore the caller's path.
+    with patch('hermes_ci_worktree_gc.reclaim_finished_generated', side_effect=OSError('fixture')):
+        try:
+            reclaim()
+        except OSError:
+            pass
+        else:
+            raise AssertionError('reclaim errors must propagate')
+    assert sys.path == original_path
+'''
+            result = subprocess.run(
+                [sys.executable, '-I', '-S', '-c', probe, str(ci.ROOT), str(repo), str(script)],
+                cwd=base, env=clean_git_env(), capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(generated.exists())
+
     def test_floor_refuses_with_paths_when_nothing_is_reclaimable(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             base = Path(directory)

@@ -447,19 +447,25 @@ def _path_present(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
+def _ignore_missing_generated(_function, _path, error: BaseException) -> None:
+    """A concurrent setup may have reclaimed this output first, but other errors matter."""
+    if not isinstance(error, FileNotFoundError):
+        raise error
+
+
 def _unlink_generated(path: Path, root: Path) -> bool:
     """Remove one generated path. A symlink is unlinked, never followed."""
     if not _path_present(path):
         return False
     if path.is_symlink():
-        path.unlink()
+        path.unlink(missing_ok=True)
         return True
     if not path.is_dir():
         return False
     resolved = path.resolve()
     if resolved != root.resolve() and root.resolve() not in resolved.parents:
         return False
-    shutil.rmtree(path)
+    shutil.rmtree(path, onexc=_ignore_missing_generated)
     return True
 
 
