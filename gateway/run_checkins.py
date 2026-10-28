@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import time
+import uuid
 
 from hermes_cli.checkins import (
     CheckinConfig, CheckinManager, DISPLAY_KIND, checkin_prompt, fallback_status, outstanding_work,
@@ -34,7 +35,8 @@ def _reconcile(runner, entry):
 
 async def reconcile_turn(runner, source, session_key):
     """Retain the candidate on an observation error, so the next cheap scan retries it."""
-    entry = runner.session_store.lookup_by_session_key(session_key)
+    entry = await runner._run_in_executor_with_context(
+        runner.session_store.lookup_by_session_key, session_key)
     if entry is None or entry.suspended:
         return
     watches = getattr(runner, "_checkin_watch", None)
@@ -91,7 +93,8 @@ async def poll_checkins(runner):
                 if (getattr(runner, "_draining", False) or estop.paused_reply() is not None
                         or getattr(runner, "_user_stop_latched", lambda *_: False)(route)):
                     continue
-                entry = runner.session_store.lookup_by_session_key(route)
+                entry = await runner._run_in_executor_with_context(
+                    runner.session_store.lookup_by_session_key, route)
                 if entry is None or entry.suspended:
                     runner._checkin_watch.pop(route, None)
                     continue
@@ -117,7 +120,10 @@ async def poll_checkins(runner):
                 if pending:
                     continue
                 descriptor = [manager.root, state.due_at]
-                identity = json.dumps(["supervisor-checkin", *descriptor], separators=(",", ":"))
+                # The logical due identity is fenced by start(). A refused or pre-execution
+                # cancelled admission must not tombstone it forever in the durable FIFO.
+                identity = json.dumps(["supervisor-checkin", root, state.due_at, uuid.uuid4().hex],
+                                      separators=(",", ":"))
                 event = MessageEvent(text="[Supervisor check-in]", source=source, internal=True,
                                      message_id=identity, metadata={"gateway_session_key": route,
                                      "gateway_session_id": entry.session_id, "checkin": descriptor,

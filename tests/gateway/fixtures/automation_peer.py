@@ -91,6 +91,7 @@ async def probe(root, base, mode):
     threading.Thread(target=model.serve_forever, daemon=True).start()
     ready = asyncio.Queue()
     outgoing = []
+    outbound_at = {}
     async def connector(ws):
         hello = json.loads(await ws.recv())
         assert hello['platform'] == 'telegram', hello
@@ -103,6 +104,8 @@ async def probe(root, base, mode):
             frame = json.loads(line)
             outgoing.append(frame)
             if frame['type'] == 'outbound':
+                if 'AUTOMATION_ACK' in json.dumps(frame):
+                    outbound_at['initial'] = time.time()
                 await ws.send(json.dumps({'type': 'outbound_result', 'requestId': frame['requestId'],
                     'result': {'success': True, 'message_id': 'fixture-final'}}) + '\n')
             elif frame['type'] == 'going_idle':
@@ -157,7 +160,10 @@ async def probe(root, base, mode):
                             with sqlite3.connect(home / 'state.db') as db:
                                 row = db.execute('SELECT value FROM state_meta WHERE key=?', ('checkin:' + sid,)).fetchone()
                                 return json.loads(row[0]) if row and row[0] else None
-                        await wait_for(lambda: state() is not None)
+                        # Native execution settles before transport final delivery. Wait for
+                        # the acknowledged initial reply's timer reset before advancing it.
+                        await wait_for(lambda: 'initial' in outbound_at and state() is not None
+                                       and state()['last_visible_at'] >= outbound_at['initial'])
                         armed = state()
                         # Advance only this test timer, not the daemon's clock or production config.
                         armed['due_at'] = time.time() - 1

@@ -216,6 +216,19 @@ async def test_visible_output_before_turn_ends_is_the_first_cadence_anchor(fixtu
     assert f.manager.state.due_at == 1300
 
 
+@pytest.mark.asyncio
+async def test_unexecuted_admission_does_not_tombstone_the_due_check(fixture):
+    f = fixture
+    await run_checkins.reconcile_turn(f.runner, f.source, f.entry.session_key)
+    f.clock.now = 1400
+    await run_checkins.poll_checkins(f.runner)
+    await run_checkins.poll_checkins(f.runner)
+    first, second = f.authority.admit_automation.await_args_list
+    assert first.args[2] != second.args[2]
+    assert first.args[1].metadata["checkin"] == second.args[1].metadata["checkin"]
+    assert f.manager.state.due_at == 1300
+
+
 def test_checkin_descriptor_is_not_accepted_from_human_metadata(fixture):
     event = MessageEvent(text="human", source=fixture.source,
                          metadata={"checkin": ["owner", 1300], "display_kind": "supervisor_checkin"})
