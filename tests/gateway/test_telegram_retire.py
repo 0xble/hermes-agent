@@ -46,6 +46,42 @@ def runtime(setup_retire):
 
 
 @pytest.mark.asyncio
+async def test_failed_retirement_allows_topic_repair_and_explicit_retry(setup_retire):
+    runner, source, adapter, _ = setup_retire
+    await retire.request(runner, source)
+    state = await retire.load(runner, source)
+    state.update(phase="failed", error="Cannot transfer loop: destination already owns one")
+    await retire.save(runner, source, state)
+
+    event = MessageEvent(source=source, text="Reconcile the conflicting loop first.")
+    assert await retire.intercept(runner, event) is None
+    assert (await retire.load(runner, source))["phase"] == "failed"
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+
+    event.text = "/retire to hermes:default/successor"
+    assert await retire.intercept(runner, event) is None
+    await retire.request(runner, source, target="hermes:default/successor")
+    retried = await retire.load(runner, source)
+    assert retried["phase"] == "pending"
+    assert retried["generation"] != state["generation"]
+    assert retried["target"] == "hermes:default/successor"
+
+
+@pytest.mark.asyncio
+async def test_failure_reply_explains_repair_retry_and_cancel(setup_retire, monkeypatch):
+    runner, source, adapter, _ = setup_retire
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare",
+                        AsyncMock(side_effect=RuntimeError("destination already owns a loop")))
+    await retire.request(runner, source)
+    await retire.advance(runner, source)
+    message = adapter.send.call_args.args[1]
+    assert "destination already owns a loop" in message
+    assert "/retire cancel" in message
+    assert "/retire" in message and "retry" in message.lower()
+    adapter._bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_delivery_persist_delete_probe_unbind_order(setup_retire):
     runner, source, adapter, meta = setup_retire
     order = []

@@ -306,19 +306,65 @@ async def test_goal_and_loop_use_actual_persisted_migration(runtime, monkeypatch
     loops.save_loop("old", loop)
     items = await work.inventory(r.runner, r.source, r.state)
     for item in items:
-        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next"})
+        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
         moved = json.loads(r.db.get_meta(f"{item['kind']}:next"))
+        expected = dict(item["record"])
+        if item["kind"] == "loop":
+            expected["route"] = {"platform": "telegram", "chat_id": "101", "chat_type": "dm", "thread_id": "18"}
         assert {k: v for k, v in moved.items() if k not in {"mutation_id", "control_generation"}} == {
-            k: v for k, v in item["record"].items() if k not in {"mutation_id", "control_generation"}}
+            k: v for k, v in expected.items() if k not in {"mutation_id", "control_generation"}}
         # Reopen the durable state, with no in-memory movement acknowledgement.
         recovered = await retire.load(r.runner, r.source)
         assert not recovered["handoffs"][item["id"]]["moved"]
-        await work.transfer(r.runner, r.source, recovered, item, {"session_id": "next"})
+        await work.transfer(r.runner, r.source, recovered, item, {"session_id": "next", "thread_id": "18"})
         assert json.loads(r.db.get_meta(f"{item['kind']}:next")) == moved
     assert goals.load_goal("old").status == "cleared"
     assert goals.load_goal("next").goal == "Maintain Service"
     assert loops.load_loop("old").status == "cleared"
     assert loops.load_loop("next").prompt == "Watch Service"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("status", ["done", "cleared", "completed", "stopped"])
+async def test_terminal_destination_controls_do_not_block_preparation_or_atomic_transfer(runtime, monkeypatch, kind, status):
+    from hermes_cli import goals, loops
+    r = runtime
+    monkeypatch.setattr(goals, "_get_session_db", lambda: r.db)
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    current = {"status": "active", "goal" if kind == "goal" else "prompt": "Preserve original work"}
+    item = {"id": kind, "kind": kind, "record": current}
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18", "title": "Successor"}
+    r.db.set_meta(f"{kind}:old", json.dumps(current))
+    r.db.set_meta(f"{kind}:next", json.dumps({"status": status}))
+    r.state["owners"] = {kind: "Successor"}
+    monkeypatch.setattr(work, "inventory", AsyncMock(side_effect=[[item], []]))
+    monkeypatch.setattr(work, "destination", AsyncMock(return_value=dest))
+    receipt = AsyncMock(return_value={"receipt_id": "r1"})
+    monkeypatch.setattr(work, "receipt", receipt)
+    assert await work.prepare(r.runner, r.source, r.state)
+    receipt.assert_awaited_once()
+    assert json.loads(r.db.get_meta(f"{kind}:old"))["status"] == "cleared"
+    moved = json.loads(r.db.get_meta(f"{kind}:next"))
+    assert moved["status"] == "active"
+    assert moved["goal" if kind == "goal" else "prompt"] == "Preserve original work"
+    assert r.state["handoffs"][kind]["control_receipt"]
+
+
+@pytest.mark.asyncio
+async def test_transferred_loop_wakes_in_successor_topic(runtime, monkeypatch):
+    from hermes_cli import loops
+    r = runtime
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    route = {"platform": "telegram", "chat_id": "101", "chat_type": "dm", "thread_id": "17", "user_id": "101"}
+    loops.save_loop("old", loops.LoopState(prompt="Watch Service", route=route))
+    item = (await work.inventory(r.runner, r.source, r.state))[0]
+    await work.transfer(r.runner, r.source, r.state, item,
+                        {"session_id": "next", "session_key": "next-key", "thread_id": "18"})
+    assert loops.load_loop("next").route == {**route, "thread_id": "18"}
+    assert loops.load_loop("old").status == "cleared"
 
 
 @pytest.mark.asyncio
@@ -350,7 +396,7 @@ async def test_control_transfer_refuses_conflicts_and_rolls_back_without_proof(r
             return original(key, value, **kwargs)
         monkeypatch.setattr(r.db, "set_meta", fail)
     with pytest.raises(RuntimeError, match="Cannot transfer|proof write failed"):
-        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next"})
+        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
     assert (r.db.get_meta(f"{kind}:old"), r.db.get_meta(f"{kind}:next")) == before
     assert r.db.get_meta(retire.state_key(r.source)) is None
 
@@ -374,6 +420,42 @@ async def test_cron_moves_origin_delivery_failure_and_attach_with_exact_readback
     assert job["failure_deliver"] == "telegram:101:18"
     assert job["attach_to_session"] == "next"
     assert job["prompt"] == "Report to hermes:default/next"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending", "posted"])
+async def test_relay_wait_exhaustion_resumes_persisted_receipt_after_restart(runtime, monkeypatch, status):
+    r = runtime
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
+    item = {"id": "task:t1", "kind": "task", "record": {"id": "t1"}}
+    r.state["handoffs"][item["id"]] = {"item": item, "destination": dest}
+    await retire.save(r.runner, r.source, r.state)
+    r.runner._is_session_running = lambda _: False
+    r.adapter._bot = SimpleNamespace(delete_forum_topic=AsyncMock())
+    target = "hermes:default/next"
+    command = AsyncMock(side_effect=[{"id": "r1"}, {"id": "r1", "target": target, "status": status}])
+
+    async def prepare(runner, source, state):
+        state["handoffs"][item["id"]].update(
+            await work.send_receipt(runner, source, state, item, dest, "handoff", ("--task", "t1")))
+        return True
+
+    monkeypatch.setattr(work, "cli", command)
+    monkeypatch.setattr(work, "prepare", prepare)
+    await retire.advance(r.runner, r.source)
+    checkpoint = await retire.load(r.runner, r.source)
+    assert checkpoint["phase"] == "waiting"
+    assert not checkpoint.get("error")
+    assert checkpoint["handoffs"][item["id"]]["pending_receipt_id"] == "r1"
+    r.adapter.send.assert_not_awaited()
+    r.adapter._bot.delete_forum_topic.assert_not_awaited()
+
+    restarted = SimpleNamespace(_session_db=r.runner._session_db)
+    command.side_effect = [{"id": "r1", "target": target, "status": "delivered"}]
+    result = await work.send_receipt(restarted, r.source, checkpoint, item, dest, "handoff", ("--task", "t1"))
+    assert result["receipt_id"] == "r1"
+    assert command.await_count == 3
+    assert command.await_args.args[2] == "status"
 
 
 @pytest.mark.asyncio

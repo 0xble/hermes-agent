@@ -59,6 +59,11 @@ class WorkInProgress(RuntimeError):
     """Execution tokens must settle normally, not be transferred or discarded."""
 
 
+def open_control(raw):
+    """Use the inventory's terminal semantics for successor admission too."""
+    return raw is not None and json.loads(raw).get("status") not in {"cleared", "done", "completed", "stopped"}
+
+
 async def inventory(runner, source, state) -> list[dict]:
     from cron.jobs import list_jobs, is_terminal_job
     from tools.async_delegation import retirement_inventory
@@ -70,7 +75,7 @@ async def inventory(runner, source, state) -> list[dict]:
         raw = await runner._session_db.get_meta(f"{kind}:{sid}")
         if raw:
             record = json.loads(raw)
-            if record.get("status") not in {"cleared", "done", "completed", "stopped"}:
+            if open_control(raw):
                 items.append({"id": kind, "kind": kind, "title": record.get("goal") or record.get("prompt") or kind,
                               "record": record})
     origin_address = address(source, sid)
@@ -215,9 +220,8 @@ async def receipt(runner, source, state, item, dest):
     return await send_receipt(runner, source, state, item, dest, body, ("--task", task_id))
 
 
-async def send_receipt(runner, source, state, item, dest, body, intent):
-    """Use the same idempotency and exact-transcript receipt gate for either intent."""
-    target = address(source, dest["session_id"])
+async def _post_receipt(runner, source, state, item, target, body, intent):
+    """Post with the stable handoff key, including after an interrupted send."""
     from pathlib import Path
     from tempfile import NamedTemporaryFile
     from hermes_constants import get_hermes_home
@@ -227,17 +231,37 @@ async def send_receipt(runner, source, state, item, dest, body, intent):
         payload.write(body)
         path = Path(payload.name)
     try:
-        sent = await cli(runner, source, "relay", "--json", "send", target, *intent,
+        return await cli(runner, source, "relay", "--json", "send", target, *intent,
                          "--key", handoff_key(state, item), "--body-file", str(path))
     finally:
         await asyncio.to_thread(path.unlink, missing_ok=True)
-    receipt_id = sent.get("id")
-    if not receipt_id:
-        raise RuntimeError("Handoff did not return a relay receipt")
+
+
+async def send_receipt(runner, source, state, item, dest, body, intent):
+    """Checkpoint relay acceptance separately from exact-transcript confirmation."""
+    from gateway.telegram_retire import RetirementWaiting
+
+    target = address(source, dest["session_id"])
+    handoff = state.setdefault("handoffs", {}).setdefault(item["id"], {"item": item, "destination": dest})
+    receipt_id = handoff.get("pending_receipt_id")
+    if receipt_id:
+        if handoff.get("pending_receipt_address") != target:
+            raise RuntimeError("Pending handoff receipt destination changed")
+    else:
+        sent = await _post_receipt(runner, source, state, item, target, body, intent)
+        receipt_id = sent.get("id")
+        if not receipt_id:
+            raise RuntimeError("Handoff did not return a relay receipt")
+        handoff.update(pending_receipt_id=receipt_id, pending_receipt_address=target)
+        state["phase"] = "waiting"
+        await save(runner, source, state)
     readback = await cli(runner, source, "relay", "--json", "status", "--wait", f"{RELAY_CONFIRM_WAIT}s",
                          str(receipt_id), timeout=RELAY_CONFIRM_WAIT + 30)
-    if (readback.get("id") != receipt_id or readback.get("target") != target
-            or readback.get("status") not in {"delivered", "replied"} or readback.get("error")):
+    if readback.get("id") != receipt_id or readback.get("target") != target or readback.get("error"):
+        raise RuntimeError(f"Handoff receipt {receipt_id} is not confirmed at {target}: {readback.get('status')}")
+    if readback.get("status") in {"pending", "posted"}:
+        raise RetirementWaiting(f"Handoff receipt {receipt_id} is not confirmed at {target}: {readback.get('status')}")
+    if readback.get("status") not in {"delivered", "replied"}:
         raise RuntimeError(f"Handoff receipt {receipt_id} is not confirmed at {target}: {readback.get('status')}")
     return {"receipt_id": receipt_id, "address": target, "destination": dest}
 
@@ -273,10 +297,13 @@ async def transfer_control(runner, source, state, item, dest):
             if proof == {"source": old, "destination": new, "session_id": dest["session_id"]}:
                 return proof
             raise RuntimeError(f"Transferred {kind} changed before retirement recovery")
-        if new is not None or not old or json.loads(old) != item["record"]:
+        if open_control(new) or not old or json.loads(old) != item["record"]:
             raise RuntimeError(f"Cannot transfer {kind}: destination already owns one or the source changed")
         if kind == "loop":
             current_loop, retired_loop = LoopState.from_json(old), LoopState.from_json(old)
+            current_loop.route = {**current_loop.route, "platform": source.platform.value,
+                                  "chat_id": str(source.chat_id), "chat_type": source.chat_type,
+                                  "thread_id": str(dest["thread_id"])}
             retired_loop.status = "cleared"
             retired_loop.awaiting_response = False
             save_loop(dest["session_id"], current_loop, cursor=conn)
@@ -408,8 +435,8 @@ async def prepare(runner, source, state):
         except ValueError as exc:
             unresolved.append({**item, "blocked_owner": selector, "blocked_reason": str(exc)})
             continue
-        if item["kind"] in {"goal", "loop"} and await runner._session_db.get_meta(
-                f"{item['kind']}:{dest['session_id']}") is not None:
+        if item["kind"] in {"goal", "loop"} and open_control(await runner._session_db.get_meta(
+                f"{item['kind']}:{dest['session_id']}")):
             unresolved.append({**item, "blocked_owner": dest["title"],
                                "blocked_reason": "Destination already has a control. Choose a compatible successor, do not overwrite it."})
             continue

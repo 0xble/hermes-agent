@@ -40,6 +40,10 @@ class RetirementSuperseded(Exception):
     """A control request fenced an older executor generation."""
 
 
+class RetirementWaiting(RuntimeError):
+    """A persisted handoff is still awaiting its exact-transcript receipt."""
+
+
 async def save(runner, source, state, *, force=False, expected_generation=""):
     locks = getattr(runner, "_telegram_retire_state_locks", None)
     if locks is None:
@@ -146,7 +150,7 @@ async def intercept(runner, event):
     if event.internal and preparation and (not state or state["generation"] != preparation
                                            or state["phase"] not in {"pending", "waiting"}):
         return ""
-    if not state or state["phase"] in {"cancelled", "done"}:
+    if not state or state["phase"] in {"cancelled", "done", "failed"}:
         return None
     if event.internal:
         # Already-owned completion work may settle while retirement waits. The
@@ -316,7 +320,7 @@ async def advance(runner, source):
             await _unbind(runner, source, state)
         except asyncio.CancelledError:
             raise
-        except RetirementSuperseded:
+        except (RetirementSuperseded, RetirementWaiting):
             return
         except Exception as exc:
             if state and state["phase"] == "delete_unresolved":
@@ -330,7 +334,9 @@ async def advance(runner, source):
                 current["phase"] = "delete_unresolved" if current["phase"] in {"deleting", "delete_unresolved"} else "failed"
                 current["error"] = str(exc)
                 await save(runner, source, current)
-                recovery = " Use /retire to retry or /retire cancel to keep this topic." if current["phase"] == "delete_unresolved" else ""
+                recovery = (" Use /retire to retry or /retire cancel to keep this topic."
+                            if current["phase"] == "delete_unresolved" else
+                            " Use /retire cancel to reset preparation, resolve the problem, then /retire to retry.")
                 await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc}{recovery}",
                                    metadata={"thread_id": str(source.thread_id)})
 
