@@ -120,6 +120,7 @@ def test_failed_turn_after_agent_message_surfaces_reason(runs):
 
 def test_single_query_approval_resolves_without_waiting_for_a_human(runs):
     run = runs["q_approval"]
+    assert run.results[0].returncode == 0, run.results[0].describe()
     entries = run.fake.entries()
     sent = [e for e in entries if e.get("dir") == "out"
             and e["msg"].get("method") == "item/commandExecution/requestApproval"]
