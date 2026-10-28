@@ -70,11 +70,6 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own longer cooldown.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
-# Streaming 5xx unmask probe: one non-streaming re-issue per this window. Covers the
-# outer retry loop (up to ~3 attempts x backoff, well under 60s) so an outage doesn't
-# double traffic every attempt, while later turns re-arm automatically.
-_STREAM_5XX_PROBE_WINDOW_S = 60.0
-
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -3873,16 +3868,9 @@ class _StreamingCall(StreamingWaitMonitor):
         that decision, so a pending stop must not buy one more request.
         True = handled (caller must not overwrite result); False = propagate ``e``.
         """
-        if getattr(self.agent, "_interrupt_requested", False):
+        from agent.chat_completion_stream_probe import _STREAM_5XX_PROBE_WINDOW_S, stream_error_allows_unmask
+        if not stream_error_allows_unmask(self.agent, e, self.deltas_were_sent["yes"]):
             return False
-        if _streams_llamacpp(self.agent):
-            # Same error either way, and the router can't cancel this probe once its watchdog gives up.
-            return False
-        status = _extract_status_code(e)
-        if status is None or status < 500 or self.deltas_were_sent["yes"]:
-            return False
-        if getattr(self.agent, "api_mode", "") not in ("", "chat_completions"):
-            return False  # replay handles chat-completions shapes only
         now = time.monotonic()
         last_probe = self.agent._stream_5xx_probe_ts
         if last_probe is not None and now - last_probe < _STREAM_5XX_PROBE_WINDOW_S:
