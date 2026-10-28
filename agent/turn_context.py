@@ -1223,12 +1223,28 @@ def build_turn_context(
     ):
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
 
-    compaction = run_turn_start_compaction(
-        agent, messages=messages, system_message=system_message,
-        active_system_prompt=active_system_prompt, conversation_history=conversation_history,
-        current_turn_user_idx=current_turn_user_idx, user_message=user_message,
-        effective_task_id=effective_task_id,
-    )
+    try:
+        compaction = run_turn_start_compaction(
+            agent, messages=messages, system_message=system_message,
+            active_system_prompt=active_system_prompt, conversation_history=conversation_history,
+            current_turn_user_idx=current_turn_user_idx, user_message=user_message,
+            effective_task_id=effective_task_id,
+        )
+    except PreflightCompressionTimedOut:
+        # The rejected ask must remain recoverable, but must not grow the over-window model
+        # history on every retry (#7100). Archive only this turn's original input, atomically
+        # under the normal compression/turn lease guards. The failure envelope stays unchanged.
+        if agent._session_db is not None and agent.session_id:
+            agent._session_db.append_message(
+                session_id=agent.session_id, role="user", content=original_user_message,
+                timestamp=persist_user_timestamp, platform_message_id=persist_user_platform_id,
+                display_kind=persist_user_display_kind, display_metadata=persist_user_display_metadata,
+                message_uid=user_msg.get("message_uid"), archived=True,
+                compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+                turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+            )
+        raise
     messages = compaction.messages
     active_system_prompt = compaction.active_system_prompt
     conversation_history = compaction.conversation_history

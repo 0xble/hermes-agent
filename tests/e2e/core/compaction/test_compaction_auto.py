@@ -66,6 +66,33 @@ def test_job_prompt_survives_mid_turn_compaction(make_scenario, tmp_path, platfo
 MAX_OVERFLOW_REJECTIONS_PER_TURN = 6
 
 
+def test_preflight_rejection_archives_input_without_growing_model_history(make_scenario, monkeypatch):
+    """A failed admission still retains the user's bytes, without replaying rejected asks (#7100)."""
+    from agent.turn_context import PreflightCompressionTimedOut
+    from tests.e2e.core.compaction._helpers import db_rows
+
+    sc = make_scenario("good")
+    sc.build_agent()
+
+    def reject(*args, **kwargs):
+        raise PreflightCompressionTimedOut("Context is full. Provider call was not sent. Use /new.")
+
+    monkeypatch.setattr("agent.turn_context_compaction.run_turn_start_compaction", reject)
+    original = "U23x9xfa0dbc input that must survive a preflight rejection"
+    for _ in range(2):
+        result = sc.agent.run_conversation(original, conversation_history=[])
+        assert result["failed"] is True
+        assert result["turn_exit_reason"] == "context_compression_timeout"
+        assert result["messages"] == []
+        assert sc.db.get_messages_as_conversation(sc.session_id) == []
+    rows = db_rows(sc.db_path, sc.session_id)
+    assert [(r["role"], r["content"], r["active"], r["compacted"]) for r in rows] == [
+        ("user", original, 0, 1), ("user", original, 0, 1),
+    ]
+    assert sc._snapshots == []  # fail-closed: never sent an over-window provider request
+    assert sc.summary_calls == []
+
+
 @pytest.mark.parametrize("mode", ("empty", "good"))
 def test_provider_overflow_terminates(make_scenario, tmp_path, mode):
     """The provider itself rejects over-window requests (the local-server shape: a real window smaller

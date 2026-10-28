@@ -1460,7 +1460,7 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> dict[str, Any
         "Turn-start preflight compression timed out — ending turn with typed recovery result: %s", exc,
     )
     # Clear the tripwire slot note_turn_start registered (the early return skips the persist
-    # funnel). The user row is deliberately NOT persisted (#7100).
+    # funnel). Turn setup archived the rejected input without adding it to model replay (#7100).
     from agent.agent_runtime_helpers import note_turn_persisted
     note_turn_persisted(agent)
     # Not _COMPRESSION_TIMEOUT_FINAL_RESPONSE — that describes a different state
