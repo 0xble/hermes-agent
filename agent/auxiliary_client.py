@@ -3578,19 +3578,7 @@ def _is_server_error(exc: Exception) -> bool:
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
-_DEFAULT_TRANSIENT_RETRIES = 2
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0  # Backoff base (seconds); overridable so tests can zero it out.
-
-
-def _transient_retry_count() -> int:
-    """Same-provider retries for a transient blip: ``auxiliary.transient_retries``
-    (default 2), clamped to [0, 6]; config-read failures fall back to default."""
-    try:
-        from hermes_cli.config import cfg_get, load_config
-        val = cfg_get(load_config(), "auxiliary", "transient_retries")
-        return _DEFAULT_TRANSIENT_RETRIES if val is None else max(0, min(int(val), 6))
-    except Exception:
-        return _DEFAULT_TRANSIENT_RETRIES
 
 
 def _is_auth_error(exc: Exception) -> bool:
@@ -3766,7 +3754,7 @@ def _is_statusless_structured_provider_error(exc: Exception) -> bool:
 # compression case. Title generation joins them because its retries multiplied the user's
 # ``auxiliary.title_generation.timeout`` (~4x: three full windows plus backoff) on a slow local
 # model, and the auto-title thread outlived the deadline the user thought they had set (#89445, #66251).
-_TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision", "title_generation"})
+_TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision", "title_generation", "goal_judge"})
 
 
 def _should_skip_same_provider_retry(task: Optional[str], exc: Exception) -> bool:
@@ -6560,20 +6548,14 @@ def _resolve_task_provider_model(
 
 _DEFAULT_AUX_TIMEOUT = 30.0
 
-# Reasoning compression models can exceed the default 120 s config timeout, falling back to the
-# deterministic marker. Bounded *floor* for config-derived compression timeouts only; never
-# overrides an explicit per-call timeout.
-# Compression summarises large conversation histories; a reasoning auxiliary model (e.g. Codex / GPT-5.5)
-# can legitimately take longer than the default ``auxiliary.compression.timeout`` (120 s), causing the
-# stream to time out and the compressor to fall back to the deterministic context marker (#54915). A floor
-# is harmless for fast compression models (they finish before the deadline) and is a minimum, so a higher
-# config value is kept unchanged.
+# Reasoning compression models can exceed the 120 s default (#54915). Apply a bounded floor
+# only when the user has not pinned a task timeout or passed an explicit per-call timeout.
 _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 
 
 # Read-time resolution of auxiliary.<task> (plugin defaults, inherit_from) lives in its own module;
 # re-exported here because callers and tests reach it as agent.auxiliary_client._get_auxiliary_task_config.
-from agent.auxiliary_task_config import _get_auxiliary_task_config
+from agent.auxiliary_task_config import _get_auxiliary_task_config, _transient_retry_count, _user_set_task_timeout
 
 
 class CompressionFastLane(NamedTuple):
@@ -6673,12 +6655,15 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
 
 
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
-    """Explicit ``timeout`` wins, else config; compression gets a floor so a reasoning model
-    summarising a large context isn't cut off."""
+    """Explicit per-call and task timeouts win; only unset compression gets the floor."""
     if timeout is not None:
         return timeout
-    effective = _get_task_timeout(task)
-    return max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS) if task == "compression" else effective
+    if task == "compression":
+        explicit = _user_set_task_timeout(task)
+        if explicit is not None:
+            return explicit
+        return max(_get_task_timeout(task), _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
+    return _get_task_timeout(task)
 
 
 def _with_custom_endpoint_extra_body(
@@ -8666,8 +8651,7 @@ async def _async_call_llm_impl(
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
     try:
-        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()).
-        # (PR #16587)
+        # Share the sync path's configured transient retry count and capped backoff.
         _force_stream_async = _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
 
         async def _acreate(_kwargs: dict[str, Any]) -> Any:
@@ -8689,9 +8673,22 @@ async def _async_call_llm_impl(
             # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
             if not _should_retry_same_provider(task, transient_err, " (async)"):
                 raise
-            logger.info("Auxiliary %s (async): transient transport error; retrying "
-                        "once on the same provider before fallback: %s", task or "call", transient_err)
-            return await _primary()
+            import asyncio
+            _max_transient_retries = _transient_retry_count()
+            _last_transient = transient_err
+            for _attempt in range(1, _max_transient_retries + 1):
+                _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
+                logger.info("Auxiliary %s (async): transient transport error (attempt %d/%d); "
+                            "retrying same provider after %.1fs before fallback: %s",
+                            task or "call", _attempt, _max_transient_retries, _backoff, _last_transient)
+                await asyncio.sleep(_backoff)
+                try:
+                    return await _primary()
+                except Exception as retry_transient:
+                    if not _is_transient_transport_error(retry_transient):
+                        raise
+                    _last_transient = retry_transient
+            raise _last_transient
     except Exception as first_err:
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
