@@ -21,6 +21,21 @@ unbounded mutex admission and SQLite retry budgets, so a long local holder canno
 turn a queued transcript append into a failed write. Publication mutex timeouts
 log holder diagnostics before propagating and are terminal to both retry layers.
 
+Every successful `LoopGuardedLock` acquisition records a monotonic timestamp,
+thread identity, and 3 code/line pairs, without retaining frames or logging on
+acquire. A bounded local timeout logs that owner and held duration before the
+existing SQLite file-lock diagnostic. The acquisition counter delta reports new
+acquisitions during the wait, not distinct threads. The snapshot is best-effort
+at acquire/release handoff and does not prove a single holder covered the wait.
+Slow transaction warnings also trigger on acquisition delay alone, keeping the
+reported acquire and hold durations separate.
+
+The 2026-10-26 6:57:18 PM PT local mutex timeout exhausted approximately 20 seconds
+of publication patience without identifying its holder. The retained diagnosis
+found no owner metadata, a file-lock-only timeout diagnostic unavailable on
+Darwin, and a slow-write threshold that excluded acquisition time. Those are
+observability gaps, not proof of the historical holder or cause.
+
 Publication accounting is scoped to the publication retry call, not the whole
 commit phase. Memory extraction, rotation flushes, title and prompt updates, and
 pre-publication preparation do not inherit its bounded-lock context or inflate
@@ -76,3 +91,11 @@ local mutex without failing ordinary queued writers, refresh timestamps are
 written fresh, publication-only retries reuse
 the generated candidate, and generation fallback excludes publication failures.
 It complements fork PR #752's transcript phase timing rather than replacing it.
+Owner-attribution guidance was checked at upstream main
+`3f058ad5931828515ff439ab99b5d382e60fda32`. Related open
+[PR #139984](https://github.com/NousResearch/hermes-agent/pull/139984) changes
+lease renewal admission, while closed
+[PR #64918](https://github.com/NousResearch/hermes-agent/pull/64918) combines
+retry changes with slow-write diagnostics. Neither supplies the fork's bounded
+publication mutex attribution. Extend the existing wrapper and warning instead
+of changing admission, patience, or retries.

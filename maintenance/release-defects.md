@@ -42,8 +42,28 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   Only events from the acknowledged PID/code identity within the post-ack window
   count. `release-admission-canary.json` retains the terminal result across the
   rollback, and the shared guardian lock prevents duplicate rollback attempts.
+- Proven absent/ended targets in the source's runtime home, explicitly suspended
+  routes and pre-ledger routes with no native delegation are excluded from
+  automation outage evidence. The latter use the permanent `not_found` refusal
+  with field `automation_legacy_delegation`, before connector-identity checks so
+  a real relay registered under `Platform.RELAY` takes the same settled fence.
+  They reach the existing 8-attempt producer drop cap, never acquire
+  delegated trust and need a fresh human admission before automation can succeed.
+  Standalone restore proves its home with a wire-invisible stamp, not a
+  RoutingIdentity. A wire-dict source or one proven to another home stays counted.
+  Missing routes with a live durable target, native refusals, connector/auth
+  failures and invalid producer payloads still count. A committed envelope waits
+  for its relay adapter. Threshold, observation window and PID fence are unchanged.
+- Rollback distinguishes launchctl probe failures from an absent supervised PID
+  and a proven foreign owner. All fail closed before launchd mutation. Drain
+  escalation reserves startup time using the smaller of 15 seconds or a quarter
+  of the remaining rollback deadline, and logs a WARNING with the killed PID and
+  its last-reported in-flight agent count (unknown for a nonmatching status PID).
 - Guards: `tests/hermes_cli/test_admission_canary.py`,
-  `tests/gateway/test_admission_canary.py`, and existing guardian/release tests.
+  `tests/gateway/test_admission_canary.py`,
+  `tests/gateway/test_automation_upgrade_admission.py`,
+  `tests/gateway/test_legacy_delegation_refusal.py`,
+  `tests/hermes_cli/test_rollback_diagnostics.py`, and existing guardian/release tests.
 
 ## Billing outage persistence and provider-wide classification
 
@@ -727,10 +747,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 - Fork patch identity: `update-lifecycle`.
 - A nonzero updater exit previously skipped its finalized receipt and sent only an unverified-runtime warning. The notice now reads fresh, request-bound evidence before classifying failures. A failed or partial receipt with matching valid pre/post SHAs, positive working-tree proof (no autostash needed, edits restored, or the immutable apply explicitly left the source untouched), no release transition, restart, fleet mutation, or pending runtime transaction reports `Nothing changed. Still on <sha>. Cause: <reason>`. Immutable homes name their ready active release rather than the frozen updater checkout.
-- The first useful `stop_reason` or restart-error line is trimmed and bounded to 240 characters. Command-boundary `sys.exit(N)` text is skipped in favor of a readable `stop_class` explanation, then the exit-code fallback. Traceback headers and their following frame/source lines are never sent. An interrupted-pull marker, source-completion debt, or host restart obligation also prevents the unchanged claim, even when HEAD has already returned to the starting SHA. Missing, malformed, stale, contradictory, or mutation-bearing evidence retains the unverified-runtime warning and never claims an unchanged version.
+- Meaningful `stop_reason` or restart-error lines are joined and bounded to 240 characters after strict support-text redaction. Dependency validation retains its exception head and the offending requirement, while progress timings, incompatibility counts and the generic retry hint are omitted. Package-conflict lines retain priority over verbose preambles. Command-boundary `sys.exit(N)` text is skipped in favor of a readable `stop_class` explanation, then the exit-code fallback. Traceback headers and their following frame/source lines are never sent. An interrupted-pull marker, source-completion debt, or host restart obligation also prevents the unchanged claim, even when HEAD has already returned to the starting SHA. Missing, malformed, stale, contradictory, or mutation-bearing evidence retains the unverified-runtime warning and never claims an unchanged version.
 - A failed update can park local edits while leaving HEAD unchanged and clearing recovery markers. The updater records a clean-tree fact when it takes no autostash, and a pending disposition as soon as an autostash is taken. The shared receipt-finalization boundary records any still-pending stash with the existing `local_changes_stash` step before sealing either an inner or command-boundary receipt. Missing positive proof fails closed to the unverified-runtime wording, not an unchanged claim. Successful restores, explicit park choices and discards replace the transient pending step, leaving no stale failure for receipt consumers. Finalization suppresses stash-recorder failures under the receipt module's never-raise contract. Pending `user_action`, parked or discarded edits, and unconfirmed restores prevent the unchanged claim. Parked edits name the saved stash and restore command. `tests/gateway/test_update_failure_autostash.py` exercises real Git autostash, commit-point refusal, syntax rollback, CalledProcessError after autostash, rejected upstream targets, unsafe restores after no-op updates or failed branch switches, and torn branch-switch notices through receipt finalization and notification. Clean-checkout controls retain the useful unchanged explanation.
 - ZIP fallback invalidates earlier unchanged-tree proof before settling an interrupted source swap. ZIP/non-git installs without a source checkout keep the unverified warning because source-keyed recovery debt cannot be excluded.
 - Known conservative behavior: immutable updates whose preparation cleanup writes source files retain an `unverified`, `ok: false` `local_changes_stash` step even if the later fetch-only apply records `immutable_source_untouched`. This intentionally remains fail-closed: notices say runtime state is unverified, and `scripts/check_fork_patches.py` does not excuse a partial outcome as only fleet settle-window delay. Clearing that step requires proving the earlier cleanup preserved the starting source state, not merely that the later immutable apply left it alone.
+- The 2026-10-26 candidate-build failure remains unverified. Its receipt contains only 2 successful backup steps, equal source SHAs (`e8387e275844`), and no positive source-untouched fact or before/after active-release pointer and live-process identity. Its planned gateway code SHA (`c7c67d7aade8`) differs from those source SHAs, so source equality cannot establish the running revision. The existing immutable apply now records `immutable_source_untouched` before staging, but that cannot retroactively prove this older run or supply missing runtime observations. The redacted real-receipt fixture checks that even a ready pointer matching the source SHA does not manufacture an unchanged claim. No no-change predicate is relaxed here. A stronger future proof must bind observations of the ready active release, exact symlink target and live gateway identity across staging, exclude recovery or activation debt and earlier source mutation, and fail closed on any missing or contradictory observation.
 - Regression guard: `tests/gateway/test_update_failure_notice.py` drives the Telegram completion path for legacy and immutable layouts and failed receipts with zero or nonzero process exits. Its immutable recovery cases use distinct release and journal-bound source roots, arm the updater's real source-keyed host record without legacy breadcrumbs, and check interrupted-pull and completion markers in the source. The shared host-path resolver accepts that resolved source root while preserving the updater's default identity. Existing successful no-op and runtime-verification contracts remain unchanged.
 - Upstream status: no matching gateway failure-notice fix found. NousResearch/hermes-agent#111147 presents receipt summaries in the web UI, and #132110 improves receipt production for early failures. Neither consumes the gateway receipt on a nonzero process exit. Retire this adaptation when upstream supplies equivalent request-bound gateway behavior.
 
@@ -1023,6 +1044,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   goal-currency fence admits them to the boundary under test. Unbacked or stale
   continuations must still be dropped before admission. The user-refusal case also
   drives a 47-message transport burst and verifies the 599/600-second boundary.
+- Pre-ledger native routes may authorize their first automation against the
+  current registered transport, runtime home and direct allowlist. They do not
+  require a fresh human turn merely to receive a queued process result. Persisted
+  origins are candidates, never connector grants. Relay, role and upstream-only
+  delegation still require private native provenance. No human admission is synthesized.
+- Guards: `tests/gateway/test_automation_upgrade_admission.py` reloads a persisted
+  pre-ledger route, initializes the real authority and injects its queued watch
+  on Telegram topic and Discord routes, including lost transport, changed home,
+  direct-user revocation and unproven relay/role refusals.
 - Roll back as one source unit. No config, schema, state migration or new alert
   system is involved. Retire when a released upstream provides equivalent producer
   projection and refusal presentation guards.

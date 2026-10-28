@@ -17,18 +17,26 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
+import time
 import traceback
-from typing import Optional, Set, Tuple
+from types import CodeType
+from typing import NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
 _loop_thread: Optional[int] = None
-_reported: Set[Tuple[str, int]] = set()
+_reported: set[tuple[str, int]] = set()
 _reported_lock = threading.Lock()
 # Frames from these files are the lock plumbing, not the caller that needs fixing.
 _PLUMBING = ("hermes_loop_guard.py", "hermes_state", "session_persistence.py", "session_lifecycle.py",
              "gateway/session.py", "session_db_recovery.py", "threading.py", "contextlib.py")
+# Owner attribution skips only the acquisition wrappers themselves, so SessionDB operations
+# (hermes_state.py frames) stay visible as the holder.
+_OWNER_WRAPPERS = ("hermes_loop_guard.py", "hermes_state_publication.py", "contextlib.py", "threading.py")
+_OWNER_SITES = 3
+_OWNER_MAX_WALK = 12
 
 
 class LoopThreadBlockingError(RuntimeError):
@@ -60,21 +68,58 @@ def check(what: str) -> None:
                    message, "".join(traceback.format_list(stack[-8:])).rstrip())
 
 
+class LockOwner(NamedTuple):
+    thread_name: str
+    thread_ident: int
+    acquired_at: float
+    callsite: tuple[tuple[CodeType, int], ...]
+
+
 class LoopGuardedLock:
     """``threading.Lock`` that reports a blocking acquisition on the gateway loop thread."""
 
-    __slots__ = ("_inner", "_what")
+    __slots__ = ("_inner", "_owner_state", "_what")
 
     def __init__(self, what: str) -> None:
         self._inner = threading.Lock()
         self._what = what
+        self._owner_state: tuple[int, LockOwner | None] = (0, None)
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         if blocking and _loop_thread is not None:
             check(self._what)
-        return self._inner.acquire(blocking, timeout)
+        acquired = self._inner.acquire(blocking, timeout)
+        if acquired:
+            acquired_at = time.monotonic()
+            frame = sys._getframe(1)
+            sites = []
+            # Keep code/line pairs, never frames or their locals. Format only on timeout.
+            # Skip the acquisition wrappers (``with lock``, state_lock, contextlib) so the
+            # recorded sites name the operation that holds the lock.
+            for _ in range(_OWNER_MAX_WALK):
+                if frame is None or len(sites) == _OWNER_SITES:
+                    break
+                code = frame.f_code
+                if not code.co_filename.endswith(_OWNER_WRAPPERS):
+                    sites.append((code, frame.f_lineno))
+                frame = frame.f_back
+            del frame
+            owner = LockOwner(threading.current_thread().name, threading.get_ident(),
+                              acquired_at, tuple(sites))
+            self._owner_state = (self._owner_state[0] + 1, owner)
+        return acquired
+
+    def owner_snapshot(self) -> tuple[int, LockOwner | None]:
+        """Best-effort acquisition count and current owner, without another lock.
+
+        Metadata can be absent during acquire/release handoff. The immutable pair
+        keeps the sampled owner's identity and acquisition count together.
+        """
+        return self._owner_state
 
     def release(self) -> None:
+        # Clear before unlocking so a successor's attribution cannot be erased.
+        self._owner_state = (self._owner_state[0], None)
         self._inner.release()
 
     def locked(self) -> bool:
@@ -84,7 +129,7 @@ class LoopGuardedLock:
         return self.acquire()
 
     def __exit__(self, *_exc) -> None:
-        self._inner.release()
+        self.release()
 
 
 def _reset_for_tests() -> None:

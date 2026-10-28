@@ -466,7 +466,7 @@ def test_non_static_fast_modes_never_get_a_deadline(monkeypatch, tmp_path, tier)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("base_url, provider, route_supported", [
-    ("http://127.0.0.1:8317/v1", "custom:codex-proxy", False),  # proxy: params never sent
+    ("http://127.0.0.1:8317/v1", "custom:openai-proxy", False),  # proxy: params never sent
     ("https://api.openai.com/v1", "openai", True),              # first-party: fast applies
 ])
 async def test_fast_follows_the_route_capability_gate(monkeypatch, tmp_path, route_supported, base_url, provider):

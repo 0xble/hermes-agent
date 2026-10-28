@@ -44,6 +44,37 @@ _SIGNATURE_MAX_DEPTH = 6
 def clear_skills_cache() -> None:
     """Drop the scanned catalog so the next listing re-scans (explicit reloads must not wait out the TTL)."""
     _SKILLS_CACHE.clear()
+    _SCAN_POLL.clear()
+
+
+# Reuse a catalog signature across lookups. The walk stats every directory the catalog
+# descends, and slash lookup, the skills tool, and the 2s change watcher all call it.
+# A nested install is visible on the next lookup after this interval, or immediately
+# after clear_skills_cache. Tests keep the interval at 0 so CFG-8 stays immediate.
+_SCAN_POLL_S = 5.0
+_SCAN_POLL: dict[tuple, tuple[float, tuple]] = {}
+
+
+def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+    """Stat-based change signature over every directory the catalog walks; platform is read via
+    ``agent.skill_utils.sys`` so test patches are honored."""
+    from agent import skill_utils as _skill_utils
+    from utils import filesystem_poll_seconds
+    platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
+    key = (tuple(str(d) for d in dirs_to_scan), frozenset(disabled), platform)
+    now = time.monotonic()
+    poll = filesystem_poll_seconds(_SCAN_POLL_S)
+    if poll > 0:
+        hit = _SCAN_POLL.get(key)
+        if hit is not None and now - hit[0] < poll:
+            return hit[1]
+    sig: list = []
+    for d in dirs_to_scan:
+        _dir_tree_signature(str(d), sig)
+    signature = (tuple(sig), frozenset(disabled), platform)
+    if poll > 0:
+        _SCAN_POLL[key] = (now, signature)
+    return signature
 
 
 def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
@@ -72,17 +103,6 @@ def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
     for name in names:
         if name not in EXCLUDED_SKILL_DIRS and not (is_skill and name in SKILL_SUPPORT_DIRS):
             _dir_tree_signature(os.path.join(root, name), sig, depth - 1)
-
-
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
-    """Stat-based change signature over every directory the catalog walks; platform is read via
-    ``agent.skill_utils.sys`` so test patches are honored."""
-    from agent import skill_utils as _skill_utils
-    platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
-    sig: list = []
-    for d in dirs_to_scan:
-        _dir_tree_signature(str(d), sig)
-    return (tuple(sig), frozenset(disabled), platform)
 
 
 HERMES_HOME = get_hermes_home()  # all skills live in ~/.hermes/skills/ (seeded from bundled)
