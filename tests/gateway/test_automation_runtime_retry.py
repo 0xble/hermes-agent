@@ -20,10 +20,23 @@ async def test_refuse_runtime_once_then_recover_one_durable_delivery(tmp_path, m
     seen = []
 
     async def execute(event):
-        if event.internal and refusal == 'claimed' and clock.now == 1000.0:
-            execution_result.get()['result'] = {'pre_execution_runtime_refusal': True,
-                'failed': True, 'messages': [], 'tools': [], 'api_calls': 0}
-            return None
+        if event.internal:
+            if clock.now == 1000.0:
+                if refusal == 'claimed':
+                    result = {'pre_execution_runtime_refusal': True,
+                        'failed': True, 'messages': [], 'tools': [], 'api_calls': 0}
+                else:
+                    # Exercise the actual refusal marker at model resolution, not an
+                    # admission-side probe. Successful turns below need no real provider.
+                    from gateway.run_turn_runner import TurnRunner
+                    turn = SimpleNamespace(_runner=runner, _combined_ephemeral_prompt=lambda: '',
+                        _ctx=SimpleNamespace(source=source, session_key=metadata['gateway_session_key'],
+                                             user_config={}))
+                    result = TurnRunner._run_sync_scoped(turn)
+                assert result['pre_execution_runtime_refusal'] is True
+                assert retry.held_runtime_refusal(event, result)
+                return None
+            runtime()
         seen.append(event.text)
         execution_result.get()['result'] = {'final_response': '', 'messages': [], 'api_calls': 1}
         return None
@@ -52,17 +65,20 @@ async def test_refuse_runtime_once_then_recover_one_durable_delivery(tmp_path, m
 
         def runtime(**kwargs):
             attempts.append(clock.now)
+            if refusal == 'invalid_config':
+                from gateway.run import _load_gateway_runtime_config
+                _load_gateway_runtime_config()
             if refusal == 'runtime' and len(attempts) == 1:
                 raise ValueError('model_preset cannot be combined with inline route fields')
             return 'fixture', {}
 
         monkeypatch.setattr(runner, '_resolve_session_agent_runtime', runtime)
+        monkeypatch.setattr('gateway.session_policy.policy_for_source', lambda *_args: None)
+        monkeypatch.setattr('gateway.run._current_max_iterations', lambda: 1)
         first, _ = await authority._claim_next(ref, authority.sessions[ref.session_id])
-        if refusal == 'claimed':
-            assert first['status'] == 'started'
-            assert await authority._execute_claimed(ref, authority.sessions[ref.session_id], first) == (None, 'deferred')
-        else:
-            assert first == 'automation_wait'
+        assert first['status'] == 'started'
+        assert attempts == []  # Claiming never resolves a model or reads provider credentials.
+        assert await authority._execute_claimed(ref, authority.sessions[ref.session_id], first) == (None, 'deferred')
         pending = list_session_admissions(authority.db, session_id=ref.session_id)
         assert len(pending) == 1 and pending[0]['status'] == 'queued'
         assert retry_state(authority.db, row['admission_id']) == {'attempt': 1, 'due_at': 1010.0}
@@ -83,19 +99,75 @@ async def test_refuse_runtime_once_then_recover_one_durable_delivery(tmp_path, m
         assert list_session_admissions(db, session_id=ref.session_id)[0]['status'] == 'queued'
         clock.now = 1009.0
         assert (await authority._claim_next(ref, authority.sessions[ref.session_id]))[0] == 'automation_wait'
-        assert attempts == ([1000.0] if refusal in ('runtime', 'claimed') else [])
+        assert attempts == ([1000.0] if refusal != 'claimed' else [])
         if refusal == 'invalid_config':
             (tmp_path / 'config.yaml').write_text('{}')
         clock.now = 1010.0
         await authority._drain(ref)
         assert seen == [expected_text]
-        assert attempts == ([1000.0, 1010.0] if refusal in ('runtime', 'claimed') else [1010.0])
+        assert attempts == ([1000.0, 1010.0] if refusal != 'claimed' else [1010.0])
         assert list_session_admissions(authority.db, session_id=ref.session_id) == []
         assert retry_state(authority.db, row['admission_id']) == {}
         # The same producer result remains an ACK, not another turn, after recovery.
         assert await runner._inject_watch_notification('completed work', dict(evt)) is True
         await authority._drain(ref)
         assert seen == [expected_text]
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_only_proven_refusals_delay_the_fifo_with_bounded_backoff(tmp_path, monkeypatch):
+    from gateway import session_automation_retry as retry
+    from gateway.session_results import execution_result
+    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    ref = SessionRef(authority.profile_id, metadata['gateway_session_id'])
+    clock = SimpleNamespace(now=1000.0)
+    seen = []
+    unavailable = True
+
+    async def execute(event):
+        if event.internal and unavailable:
+            execution_result.get()['result'] = {'pre_execution_runtime_refusal': True,
+                'failed': True, 'messages': [], 'tools': [], 'api_calls': 0}
+        else:
+            seen.append(event.text)
+            execution_result.get()['result'] = {'final_response': '', 'messages': [], 'api_calls': 1}
+
+    def no_admission_probe(**_kwargs):
+        pytest.fail('admission must not resolve a model before choosing the executor')
+
+    monkeypatch.setattr(runner, '_handle_message', execute)
+    monkeypatch.setattr(runner, '_resolve_session_agent_runtime', no_admission_probe)
+    monkeypatch.setattr(retry, 'time', SimpleNamespace(time=lambda: clock.now))
+    try:
+        await authority._drain(ref)
+        seen.clear()
+        for identity in ('blocked result', 'queued follower'):
+            assert await runner._inject_watch_notification(identity, dict(type='completion',
+                event_id=identity, session_id=identity, started_at=1.0,
+                session_key=metadata['gateway_session_key'], parent_session_id=ref.session_id)) is True
+        pending = list_session_admissions(authority.db, session_id=ref.session_id)
+        identity = pending[0]['admission_id']
+        for attempt, delay in enumerate((10, 20, 40, 60, 60), 1):
+            row, _ = await authority._claim_next(ref, authority.sessions[ref.session_id])
+            assert row['admission_id'] == identity and row['status'] == 'started'
+            assert await authority._execute_claimed(ref, authority.sessions[ref.session_id], row) == (None, 'deferred')
+            assert retry_state(authority.db, identity) == {
+                'attempt': min(attempt, 4), 'due_at': clock.now + delay}
+            queued = list_session_admissions(authority.db, session_id=ref.session_id)
+            assert [item['admission_id'] for item in queued] == [item['admission_id'] for item in pending]
+            assert all(item['status'] == 'queued' for item in queued)
+            assert queued[0]['owner_epoch'] is None and queued[0]['generation'] is None
+            assert seen == []
+            clock.now += delay - 1
+            assert (await authority._claim_next(ref, authority.sessions[ref.session_id]))[0] == 'automation_wait'
+            clock.now += 1
+        unavailable = False
+        await authority._drain(ref)
+        assert len(seen) == 2 and 'blocked result' in seen[0] and 'queued follower' in seen[1]
+        assert list_session_admissions(authority.db, session_id=ref.session_id) == []
+        assert retry_state(authority.db, identity) == {}
     finally:
         authority.db.close()
 

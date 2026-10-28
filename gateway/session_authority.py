@@ -1085,8 +1085,8 @@ class SessionAuthority:
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
                 return 'classic_busy', first
             if first is not None:
-                from gateway.session_automation_retry import runtime_ready
-                if not await runtime_ready(self, ref, first):
+                from gateway.session_automation_retry import retry_ready
+                if not await retry_ready(self, first):
                     return 'automation_wait', first
             self._require_admission_open()
             from gateway.session_runtime_workers import tracked_write
