@@ -212,11 +212,19 @@ async def operation(authority, name, params, actor=None):
     if name == 'cancel':
         if row['status'] == 'queued':
             row = await authority.cancel_or_claimed(actor, ref, row['admission_id']) or {'status': 'terminal'}
-        if row['status'] == 'started':
+        if row['status'] in ('started', 'unknown'):
             # The claim commits before execute() registers its event; latching the
             # cancellation on the admission here means that window cannot lose it.
             _cancellations(authority).setdefault(row['admission_id'], threading.Event()).set()
+            from cron.detached_authority import cancel_detached
+            await asyncio.to_thread(cancel_detached, row)
         return {'ok': True}
+    from cron.detached_authority import recover_detached
+    if row['status'] in ('started', 'unknown', 'terminal') and await asyncio.to_thread(
+            recover_detached, authority.db, authority.epoch, row):
+        row = get_session_admission(authority.db, admission_id=row['admission_id'])
+        if row is None:
+            raise RuntimeStoreError('not_found')
     result, flags = None, {}
     if row['status'] == 'terminal':
         from gateway.session_results import admission_result
@@ -227,6 +235,7 @@ async def operation(authority, name, params, actor=None):
             result = [False, '', '', row.get('outcome') or 'unknown_execution']
     from cron.scheduler_liveness import owner_progress
     return {'status': row['status'], 'result': result, 'job_flags': flags,
+            'generation': row['generation'], 'profile_id': authority.profile_id,
             'progress_at': owner_progress.get(row['request_id'].rsplit(':', 1)[-1])}
 
 
@@ -287,8 +296,14 @@ async def execute(authority, ref, row, policy):
     try:
         db_path = await asyncio.to_thread(Path(authority.db.db_path).resolve)
         with _profile_runtime_scope(db_path.parent):
-            result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
-                                             extra_prompt=data['extra_prompt'], cancel_event=cancel)
+            from cron.detached_authority import detached_assignment, observe_detached
+            if await asyncio.to_thread(detached_assignment, job['id'], execution_id):
+                observed = await observe_detached(row)
+                result = tuple(observed['result'])
+                job.update(observed['job_flags'])
+            else:
+                result = await asyncio.to_thread(_run_identified, run_job, job, execution_id,
+                                                 extra_prompt=data['extra_prompt'], cancel_event=cancel)
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}

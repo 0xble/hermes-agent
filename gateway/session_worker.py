@@ -1,7 +1,7 @@
 """Execution-scoped worker operations on the ordinary authenticated authority.
 
-Only explicit local compute registrations are enabled here. A delegated child is reserved by
-the owner on its parent's receipt stream (gateway/session_worker_child.py), never registered.
+Explicit local compute and ledger-fenced canonical cron workers register here. A delegated child
+is reserved by the owner on its parent's receipt stream (gateway/session_worker_child.py), never registered.
 """
 import asyncio
 import hmac
@@ -82,6 +82,13 @@ async def worker_request(connection, ref, params, *, operation):
     if operation == 'register':
         # Only a worker-adoption ticket (what a launched worker carries): an interactive client
         # must not park a 'registered' row that nothing reaps (the FIFO would pause until restart).
+        if params['kind'] == 'cron':
+            # Its session belongs to the canonical cron principal, not the
+            # launch ticket's local user. Authorize the exact producer claim.
+            if 'worker:adopt' not in connection.actor.capabilities:
+                raise RuntimeStoreError('permission_denied')
+            from cron.detached_authority import register_detached
+            return await register_detached(connection, ref, params, claim)
         authority.authorize(connection.actor, ref, 'worker:adopt')
         if params['kind'] != 'compute':
             raise RuntimeStoreError('unsupported_producer')
