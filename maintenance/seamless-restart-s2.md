@@ -180,6 +180,19 @@ Native PM source services persist the installation launcher, which intentionally
 
 The supervised acknowledgement accepted only `python -m hermes_cli.main`, but the release plist this unit generates starts the gateway as `python -I -c <bootstrap> gateway run --external-supervisor`. Every immutable update therefore activated the intended release, then timed out waiting for an acknowledgement it could never observe, leaving `release-txn.json` pending and the receipt `partial`. The acknowledgement now also accepts that launcher, but only when its `-c` code equals the bootstrap `runtime_command` renders for the intended release root. An arbitrary `-c` program or another release's launcher is rejected, and the interpreter image, cwd and `PYTHONPATH` checks are unchanged. Guard: `test_generated_launchd_gateway_acknowledges_only_its_release` in `tests/hermes_cli/test_immutable_release_transactions.py`, driven by the real generated plist. It fails on the unchanged matcher.
 
+## Rollback Gateway Ownership
+
+A rollback snapshots the verified home gateway and its launchd-supervised ancestor
+before bootout. The planned-restart marker targets the gateway, not a launcher
+wrapper. Bootstrap waits for both pinned process incarnations to exit. After a
+15-second rollback drain grace, a still-live incarnation is killed and reaped
+within the existing overall deadline, leaving time for previous-release startup
+and health proof. Never delete a host claim to bypass a live owner.
+
+Guard: `tests/hermes_cli/test_rollback_gateway_owner.py` covers wrapper/child marker
+selection, a wedged child, foreign-service ancestry refusal and real POSIX lock
+release before replacement.
+
 ## Isolated Launcher Environment
 
 PM exports the selected project and dependency paths as `PYTHONPATH` for children, including the gateway spawned by the timestamp wrapper. A nonempty observed value is not evidence of import contamination for the exact generated isolated bootstrap: `-I` ignores inherited paths and the bootstrap clears them before importing. Acknowledgement qualifies this environment with the entrypoint, while non-isolated `-m` commands still require an empty value. The environment regression exercises observation-only recovery, durable acknowledgement and idempotence for both launch shapes, plus rejection of another release and arbitrary code. Keep all release, plist, supervisor, interpreter and cwd predicates intact.
