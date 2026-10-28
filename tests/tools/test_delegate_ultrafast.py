@@ -17,7 +17,7 @@ def inheritance(monkeypatch):
     from hermes_constants import get_hermes_home
 
     (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump({"providers": {
-        "codex-proxy": {"base_url": PROXY, "api_mode": "codex_responses",
+        "openai-proxy": {"base_url": PROXY, "api_mode": "codex_responses",
                         "capabilities": {"fast_mode": True}},
         "claude-proxy": {"base_url": PROXY, "api_mode": "anthropic_messages"},
     }}))
@@ -30,11 +30,11 @@ def _parent():
 
 
 @pytest.mark.parametrize("model,provider,url,expected", [
-    ("gpt-6.1-sol", "custom:codex-proxy", PROXY, "ultrafast"),
+    ("gpt-6.1-sol", "custom:openai-proxy", PROXY, "ultrafast"),
     ("gpt-6.1-sol", "custom", PROXY, "ultrafast"),
     ("gpt-6.1-sol", "openai", "https://api.openai.com/v1", "ultrafast"),
     ("gpt-5.4", "openai", "https://api.openai.com/v1", None),
-    ("gpt-6.1-sol", "custom:codex-proxy", "http://127.0.0.1:9999/v1", None),
+    ("gpt-6.1-sol", "custom:openai-proxy", "http://127.0.0.1:9999/v1", None),
     ("gpt-6.1-sol", "openrouter", "https://openrouter.ai/api/v1", None),
     ("claude-opus-5-5", "custom:claude-proxy", PROXY, None),
     ("claude-opus-4.8", "anthropic", "https://api.anthropic.com", None),
@@ -57,7 +57,7 @@ def test_ultrafast_uses_child_route(model, provider, url, expected, same_route):
     {"extra_body": {"service_tier": "default"}}, {"extra_body": {"speed": "fast"}},
 ])
 def test_explicit_overrides_win(explicit):
-    route = dict(child_model="gpt-6.1-sol", child_provider="custom:codex-proxy", child_base_url=PROXY)
+    route = dict(child_model="gpt-6.1-sol", child_provider="custom:openai-proxy", child_base_url=PROXY)
     assert config._resolve_child_service_tier(_parent(), explicit, **route) is None
     result = config._resolve_child_request_overrides(
         _parent(), **route, explicit_overrides=explicit, inherit_parent_route=False)
@@ -79,7 +79,7 @@ def test_account_gate_uses_child_credential(offered):
 def test_disabled_inheritance_never_pins_ultrafast(monkeypatch):
     monkeypatch.setattr(config, "_inherit_service_tier", lambda: False)
     assert config._resolve_child_request_overrides(
-        _parent(), child_model="gpt-6.1-sol", child_provider="custom:codex-proxy", child_base_url=PROXY,
+        _parent(), child_model="gpt-6.1-sol", child_provider="custom:openai-proxy", child_base_url=PROXY,
         explicit_overrides=None, inherit_parent_route=False) is None
 
 
@@ -91,7 +91,7 @@ def test_built_child_gets_gated_mode_and_wire_fields(offered):
     parent = _make_mock_parent()
     parent.service_tier = "ultrafast"
     parent.request_overrides = {}
-    runtime = dict(model="gpt-6.1-sol", provider="custom:codex-proxy", base_url=PROXY,
+    runtime = dict(model="gpt-6.1-sol", provider="custom:openai-proxy", base_url=PROXY,
                    api_key="child-token", api_mode="codex_responses")
     with patch.object(run_agent, "AIAgent") as agent, patch("tools.delegate_tool._load_config", return_value={}), \
          patch("tools.delegate_tool._resolve_child_runtime", return_value=runtime), \
