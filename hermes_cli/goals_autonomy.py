@@ -157,11 +157,13 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
         after["max_turns"] = normalize_goal_max_turns(max_turns)
     if set(after) != set(before):
         return {"ok": False, "error_code": "unknown_field", "error": "unknown contract field"}
-    removed = [item for field in (*state.contract.to_dict(), "subgoals")
+    from hermes_cli.lifecycle_authority import user_stop_condition
+    protected = ["constraints", "boundaries", "verification", "subgoals"]
+    if user_stop_condition(state):
+        protected.append("stop_when")
+    removed = [item for field in protected
                for item in contract_items(field, before[field])
                if item not in contract_items(field, after[field])]
-    if after["max_turns"] != before["max_turns"]:
-        removed.append("turn budget")
     if removed:
         authority = _CURRENT_AUTHORITY.get() or {}
         source_sid = authority.get("session_id") or manager.session_id
@@ -190,6 +192,8 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     if removed:
         revision["quote_session_id"] = source_sid
         revision["quote_message"] = checked[1]
+        if getattr(checked, "relay_receipt", ""):
+            revision["relay_receipt"] = checked.relay_receipt
     state.revisions.append(revision)
     manager._save()
     return {"ok": True, "revision": revision, "state": state, "version": len(state.revisions) + 1}

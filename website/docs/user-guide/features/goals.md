@@ -137,11 +137,11 @@ The continuation prompt asks the agent to end a completion claim with an Evidenc
 
 ### Revising a goal
 
-With the `goal-lifecycle` plugin installed, `goal_set action=revise` adds requirements while retaining every existing objective, criterion and hard limit. A quote or evidence never authorizes destructive revision. Revision history is a durable audit trail, not extra instructions appended to the current contract.
+With the `goal-lifecycle` plugin installed, an agent can revise or replace its own goal with a reason when it preserves the same intent. Operational wording and turn-budget changes do not need a quote. Hard constraints, boundaries, verification criteria and user-set stop conditions remain binding. Removing or weakening any of those items requires the user's verbatim instruction naming each item. Revision history records the reason and before/after values, not extra instructions appended to the current contract.
 
-Use `goal_set action=replace` to propose a changed objective or acceptance. Hermes authors the replacement. The core session-control path checks a verbatim instruction from your latest message, or shows 1 precise approval card when that instruction cannot authorize it. A pending request does not change the goal. Hermes should not ask you to clear the goal or compose a slash command to repair it. If you have already cleared the old goal and ask for a better one, Hermes can author and set the requested goal immediately.
+Quote authority may come from the latest typed user message or an authenticated relay receipt. Delivery alone is insufficient: the exact quote must also occur in the current typed source message, not an agent's paraphrase. The audit stores the relay receipt when present. Unverified tool output, web text and synthetic wakeups never authorize a change. Pending approval never changes the goal.
 
-Replacement preserves unrelated subgoals, omitted contract fields, lifecycle status and remaining turn budget. Explicitly supplied contract fields change only through the same authority gate, and an explicit empty field removes that field. User removal controls such as `/goal remove check <N>` and `/subgoal remove <N>` remain available. `/goal replace <text>` is also an explicit user replacement path. Existing cross-session controls retain their own authority rules, they are not a way around self-replacement approval.
+Replacement preserves unrelated subgoals, omitted contract fields, lifecycle status and remaining turn budget. Creation callers record ownership: commands create user-owned goals, while agent tools pass `actor="agent"` to the core creation API. Missing ownership stays conservative. Clearing a goal remains user-only, and completing one still requires recorded evidence for every verification criterion. User removal controls such as `/goal remove check <N>` and `/subgoal remove <N>` remain available.
 
 ## Adding criteria mid-goal: `/subgoal`
 

@@ -219,7 +219,8 @@ class GoalRevisionsMixin:
                 evidence: str = "", user_quote: str = "") -> Dict[str, Any]:
         """Validate and apply an additive revision to this manager's (staged) state."""
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
-        if goal_autonomy_enabled() and actor == "agent":
+        from hermes_cli.lifecycle_authority import agent_owned
+        if actor == "agent" and (goal_autonomy_enabled() or agent_owned(self._state)):
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
                                    subgoals=subgoals, user_quote=user_quote)
         state = self._require_goal()
@@ -232,6 +233,8 @@ class GoalRevisionsMixin:
         result = self._revise_state(state, reason=reason, actor=actor, goal=goal, contract=contract,
                                     subgoals=subgoals, evidence=evidence, evidence_error=evidence_error)
         if result.get("ok"):
+            if actor == "user" and contract and "stop_when" in contract:
+                state.stop_condition_owner = "user"
             self._save()
         return result
 
@@ -249,7 +252,8 @@ class GoalRevisionsMixin:
         )
 
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
-        if goal_autonomy_enabled() and actor == "agent":
+        from hermes_cli.lifecycle_authority import agent_owned
+        if actor == "agent" and (goal_autonomy_enabled() or agent_owned(self._state)):
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
                                    max_turns=max_turns, user_quote=user_quote, kind="replace")
         if actor != "user":
@@ -289,6 +293,8 @@ class GoalRevisionsMixin:
             # GoalContract values are complete contracts, mappings patch only named fields.
             state.contract = (contract if isinstance(contract, GoalContract)
                               else GoalContract.from_dict({**state.contract.to_dict(), **contract}))
+            if state.contract.stop_when != previous["contract"]["stop_when"]:
+                state.stop_condition_owner = "user"
         # Replacing an objective does not remove independent additive criteria. Their
         # existing explicit user removal controls remain the only removal path.
         if max_turns is not None:
@@ -312,6 +318,8 @@ class GoalRevisionsMixin:
                     "user_quote": user_quote if approved else "",
                     "user_message": str(authority.get("message") or "") if approved else "",
                     "before": previous, "after": snapshot()}
+        if authority.get("relay_receipt"):
+            revision["relay_receipt"] = authority["relay_receipt"]
         if authority.get("via") == "button":
             revision["approved_by"] = str(authority.get("user_id") or "")
             revision["user_message"] = f'Approved in Telegram: replace goal with "{goal}"'

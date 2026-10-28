@@ -34,14 +34,17 @@ completion and refusals are appended to revisions and rendered by `/goal status`
 Autonomous mode does not accept the auxiliary judge's DONE as completion.
 
 Autonomous edits patch only named contract fields. Every constraint, boundary,
-stop condition, outcome, verification item and additive criterion is retained
-unless a current verbatim user removal instruction names the exact item. A
-replacement may change the objective. It advances the continuation-instance fence
-and requires fresh proof, while preserving quality gates, consumed turns, budget
-and breach history. Its reason and before/
-after diff are recorded. A removal quote is rechecked under the commit lock so a
-newer user message cannot inherit stale authority. Starting another goal after
-completion retains the preceding goal's completion history.
+verification item and additive criterion is retained unless a current verbatim
+user removal instruction names the exact item. The same protection applies to a
+user-set stop condition. Ordinary wording, agent-owned stop conditions and turn
+budgets can change with a reason while keeping the same intent. Creation APIs
+record ownership for the model tools, which are maintained in the agents repo.
+Replacement advances the continuation-instance fence and requires fresh proof,
+while preserving quality gates, consumed turns and breach history. Its reason
+and before/after diff are recorded. A removal quote is rechecked under the commit
+lock. Quotes can arrive through a receipt-authenticated relay only when the exact
+quote matches the source user's current typed message, and the receipt is audited.
+Starting another goal after completion retains the preceding completion history.
 
 PR #781 owns preservation for the existing user-authorized replacement path.
 This patch leaves that draft's broader default-off behavior separate and extends

@@ -8,6 +8,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
+def _record_quote(sid, quote):
+    from hermes_cli import goals
+    db = goals._get_session_db()
+    if db.get_session(sid) is None:
+        db.create_session(session_id=sid, source="cli", model="test")
+    db.append_message(sid, "user", quote)
+    return [quote]
+
+
 def _manager(tmp_path, monkeypatch, sid="rev"):
     home = tmp_path / ".hermes"
     home.mkdir(exist_ok=True)
@@ -63,9 +72,9 @@ def test_authority_branches(tmp_path, monkeypatch):
     assert mgr.revise(reason="change wording", prompt="new", user_quote="short")["error_code"] == "user_quote_too_short"
     assert mgr.revise(reason="change wording", prompt="new", user_quote="User asked to change wording", user_messages=[])["error_code"] == "user_quote_not_found"
     long = "x" * 4001
-    assert mgr.revise(reason="change wording", prompt="new", user_quote="change wording now", user_messages=[long + " change wording now"])["error_code"] == "user_message_too_long"
+    assert mgr.revise(reason="change wording", prompt="new", user_quote="change wording now", user_messages=_record_quote(mgr.session_id, long + " change wording now"))["error_code"] == "user_message_too_long"
     quote = "Please change the loop wording to the new deployment check"
-    assert mgr.revise(reason="change wording", prompt="new", user_quote=quote, user_messages=[quote])["ok"] is True
+    assert mgr.revise(reason="change wording", prompt="new", user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))["ok"] is True
 
     mgr = _manager(tmp_path, monkeypatch, "authority2")
     mgr.set("watch", interval_seconds=300, times=5)
@@ -118,7 +127,7 @@ def test_replace_keeps_a_user_paused_loop_paused(tmp_path, monkeypatch):
     mgr.pause(reason="user-paused")
     quote = "Please reword the loop to check the deploy instead"
     result = mgr.replace(prompt="check the deploy", interval_seconds=300, reason="reworded",
-                         user_quote=quote, user_messages=[quote])
+                         user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))
     assert result["ok"] is True
     assert mgr.state.status == "paused"
     assert mgr.state.paused_reason == "user-paused"
@@ -146,7 +155,7 @@ def test_replace_requires_quote_and_preserves_route_in_history(tmp_path, monkeyp
     quote = "Please replace the loop with the deploy verification task"
     result = mgr.replace(
         prompt="deploy verification", interval_seconds=600, times=3, until="green",
-        reason="the task changed", user_quote=quote, user_messages=[quote],
+        reason="the task changed", user_quote=quote, user_messages=_record_quote(mgr.session_id, quote),
     )
     assert result["ok"] is True
     assert result["revision"]["kind"] == "replace"
@@ -165,7 +174,7 @@ def test_status_and_wakeup_text_include_revision_guidance(tmp_path, monkeypatch)
     state.next_due_at = time.time() - 1
     mgr._save()  # revisions compare against the durable snapshot
     quote = "Please slow the loop down while the deploy settles"
-    assert mgr.revise(reason="slow down", interval_seconds=600, user_quote="", user_messages=[quote])["ok"] is True
+    assert mgr.revise(reason="slow down", interval_seconds=600, user_quote="", user_messages=_record_quote(mgr.session_id, quote))["ok"] is True
     assert "v2" in mgr.status_line()
     mgr.state.next_due_at = time.time() - 1
     wakeup = mgr.fire_tick()
@@ -182,7 +191,7 @@ def test_cli_completion_refresh_preserves_mid_wakeup_revision(tmp_path, monkeypa
     mgr.fire_tick()
     quote = "Please change the loop to watch deploy readiness"
     external = LoopManager("cli-cache")
-    assert external.revise(reason="user changed task", prompt="watch deploy readiness", user_quote=quote, user_messages=[quote])["ok"]
+    assert external.revise(reason="user changed task", prompt="watch deploy readiness", user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))["ok"]
 
     fake = SimpleNamespace(
         session_id="cli-cache", _loop_manager=mgr, _last_turn_interrupted=False,
@@ -210,7 +219,7 @@ def test_tui_completion_uses_fresh_manager(tmp_path, monkeypatch):
     mgr.fire_tick()
     quote = "Please change the loop to watch deploy readiness"
     external = LoopManager("tui-cache")
-    assert external.revise(reason="user changed task", prompt="watch deploy readiness", user_quote=quote, user_messages=[quote])["ok"]
+    assert external.revise(reason="user changed task", prompt="watch deploy readiness", user_quote=quote, user_messages=_record_quote(mgr.session_id, quote))["ok"]
     session = {"session_key": "tui-cache"}
     st = SimpleNamespace(tts_queue=object())
     with patch("tui_gateway.prompt_turn._emit", create=True), patch("tui_gateway.prompt_turn._hook_failure"):

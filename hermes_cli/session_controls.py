@@ -212,6 +212,50 @@ def _message_grants_authority(source: str) -> bool:
     return not any(w in _NEGATION_TOKENS or w in _QUALIFIER_TOKENS for w in words)
 
 
+class UserQuote(tuple):
+    """Keep tuple compatibility while carrying authenticated relay provenance."""
+    relay_receipt: str
+    source_session_id: str
+
+    def __new__(cls, quote, message, *, relay_receipt="", source_session_id=""):
+        value = super().__new__(cls, (quote, message))
+        value.relay_receipt = relay_receipt
+        value.source_session_id = source_session_id
+        return value
+
+
+def _current_quote_source(db, session_id, rows, quote, *, cursor=None):
+    from hermes_cli.lifecycle_authority import authenticated_relay_sender
+    from hermes_cli.goals import (
+        _active_profile_name, _relay_ledger_receipts,
+        _relay_receipt_id, _relay_sender, _unwrap_steer,
+    )
+
+    for row in rows:
+        text = str(row.get("content") or "")
+        if _is_user_typed(row):
+            return text, "", session_id
+        receipt_id = _relay_receipt_id(text)
+        if not receipt_id:
+            continue
+        sender = authenticated_relay_sender(
+            db, row, session_id, _active_profile_name(), _relay_ledger_receipts([receipt_id]), cursor=cursor)
+        if not sender:
+            continue
+        # The transport authenticates delivery, not an agent's paraphrase of Brian.
+        # Bind the body to the latest CURRENT typed source, also predating delivery.
+        body = "\n".join(line for line in _unwrap_steer(text).splitlines()
+                         if _relay_sender(line) is None)
+        sources = db.messages_by_role(sender, "user", since=0.0, limit=500,
+                                      current_only=True, cursor=cursor)
+        source = next((item for item in sources if _is_user_typed(item)), None)
+        if (source and float(source.get("timestamp") or 0) <= float(row.get("timestamp") or 0)
+                and quote in _normalize(body) and quote in _normalize(source.get("content") or "")):
+            return str(source["content"]), receipt_id, sender
+        return "", "", ""
+    return "", "", ""
+
+
 def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> tuple[str, str] | str:
     """Bind a verbatim quote to current typed input before applying action-specific authority."""
     normalized = _normalize(quote)
@@ -227,10 +271,10 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
     except Exception:
         logger.debug("current user quote lookup failed", exc_info=True)
         return "user_quote_not_found"
-    latest = next((row for row in rows if _is_user_typed(row)), None)
-    if latest is None:
+    source_raw, relay_receipt, source_sid = _current_quote_source(
+        db, requester_session_id, rows, normalized, cursor=cursor)
+    if not source_raw:
         return "user_quote_not_found"
-    source_raw = str(latest.get("content") or "")
     try:
         from gateway.response_filters import is_agent_origin_text
         if is_agent_origin_text(source_raw):
@@ -252,7 +296,7 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
         return "user_message_too_long"
     if normalized not in source:
         return "user_quote_not_found"
-    return normalized, stripped
+    return UserQuote(normalized, stripped, relay_receipt=relay_receipt, source_session_id=source_sid)
 
 
 def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
@@ -277,7 +321,8 @@ def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> T
     # Judge the raw message: normalization collapses the newlines that separate sentences.
     if len([part for part in _CLAUSE_BREAK.split(stripped) if part.strip()]) != 1:
         return "user_quote_multi_sentence"
-    return normalized, source
+    return UserQuote(normalized, source, relay_receipt=getattr(checked, "relay_receipt", ""),
+                     source_session_id=getattr(checked, "source_session_id", ""))
 
 
 # A quote authorizes only the control it states. Each control has disjoint verb sets within its
@@ -494,7 +539,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 goal=str(payload.get("goal") or ""),
                 max_turns=payload.get("max_turns"),
                 contract=payload.get("contract"),
-                actor="agent" if (authority or {}).get("via") == "autonomy" else "user",
+                actor="agent" if (authority or {}).get("via") in {"autonomy", "agent"} else "user",
                 user_quote=str((authority or {}).get("quote") or ""),
             )
         continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
@@ -508,7 +553,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
-        autonomous = (authority or {}).get("via") == "autonomy"
+        autonomous = (authority or {}).get("via") in {"autonomy", "agent"}
         result = manager.resume(reset_budget=not autonomous, user_override=not autonomous)
         if result is None:
             code = f"nothing_to_{action}"
@@ -1014,6 +1059,10 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
         raise ValueError("unsupported_control")
     payload = _check_payload(kind, action, payload)
     target_sid = resolve_target(target_sid)
+    from hermes_cli.lifecycle_authority import owned_control_state
+    if owned_control_state(kind, action, target_sid, requester_sid) is not None:
+        return apply_control(kind, action, target_sid, requester_sid=requester_sid,
+                             reason=reason, payload=payload)
     if not _has_gateway_route(target_sid):
         return {"ok": False, "error_code": "target_unroutable", "error": "target_unroutable"}
     if not _has_approval_surface(target_sid):
@@ -1106,10 +1155,18 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                              expires_at=None, affected_text=affected_before, cursor=conn)
         record["resolved_at"], record["error"] = now, code or None
         record["current_max_turns"] = _current_max_turns(kind, raw)
+        record["before"] = json.loads(raw) if raw else None
+        after_raw = _meta_value(conn, _definition_key(kind, target_sid))
+        record["after"] = json.loads(after_raw) if after_raw else None
         _bind_continuation(record, result, conn)
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,
                 **({"error_code": code, "error": code} if code else {}), **result}
+
+    from hermes_cli.lifecycle_authority import apply_owned_control
+    owned_result = apply_owned_control(kind, action, target_sid, requester_sid, reason, user_quote, commit)
+    if owned_result is not None:
+        return owned_result
 
     if autonomous_goal:
         # No route/approval requirement: goal writes use the same transaction and wake receipt.
@@ -1177,7 +1234,9 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                                       cursor=conn):
             return {_REFUSED: "user_quote_mismatch"}
         quote, message = checked
-        return commit(conn, {"via": "quote", "quote": quote, "message": message},
+        return commit(conn, {"via": "quote", "quote": quote, "message": message,
+                             **({"relay_receipt": checked.relay_receipt}
+                                if getattr(checked, "relay_receipt", "") else {})},
                       "session_control_quote")
 
     try:
