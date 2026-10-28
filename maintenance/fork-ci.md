@@ -475,7 +475,33 @@ The held prefix keeps both the witness and running turn available until the
 interrupt, without changing the alive, no-final-marker, or interruption-notice
 assertions. `test_stream_partial_line_flush.py` covers real loopback SSE with
 batched display observation. Retire this fixture adaptation when upstream has
-an equally synchronized interrupt scenario.
+an equally synchronized interrupt scenario. The live-session `w030` fixture has
+the same held-response precondition, including a checked progress step before
+Ctrl+C. The real-SSE/batched-display regression covers both drivers.
+
+The shared classic CLI driver also masks spinner frames, not just digits, when
+waiting for a quiet screen. An active approval or clarify modal changes its
+spinner indefinitely even though the actionable UI is ready. Previously each
+consumed the full, silently ignored 30-second settle bound. A native macOS
+baseline reached `/quit after resume` with 294.3 seconds of successful steps
+and then hit the unchanged 300-second file cap before its one-shot/cleanup.
+Deadline failures now include the step, pane and gateway log, and stop further
+input instead of accumulating later timeouts. A missing composer acknowledgement
+never sends Enter. A slash-command completion redraw that leaves the typed
+text on its own line still counts; a suggestion row that only names the
+command does not. With that checked readiness condition, idle steps use a
+0.5-second quiet period instead of a 2-second timing cushion. All output,
+traceback, process and witness assertions remain. Non-TTY output is captured to
+temporary files so inherited
+output handles cannot hold pipe EOF open after the command exits or is killed.
+Command wait and kill/reap waits remain bounded. Linux retains exact `/proc`
+process matching, while macOS uses psutil's exact environment match to execute
+the same suites natively. `tests/ci/test_classic_tmux_driver.py` covers animated
+modals, changing content, failed synchronization and real inherited-output
+descendants. It mocks the pane and needs no tmux, so it lives outside
+`tests/e2e/core/cli_tmux`, where every suite must call `require_tmux()`.
+Retire these driver adaptations when upstream supplies equivalent bounded,
+condition-based synchronization and output capture.
 
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
