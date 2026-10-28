@@ -218,6 +218,34 @@ def test_slice_3_ten_silent_continues_stay_active_on_the_ladder(hermes_home, mon
 # --- Slice 4: a judge outage never pauses ---------------------------------------------------
 
 
+@pytest.mark.parametrize("success_verdict", ["continue", "done", "wait", "blocked"])
+@pytest.mark.parametrize("failures, notice_attempts", [
+    ([True, False], []),
+    ([True, True, True], [1]),
+    ([True, False, True], []),
+    ([True, True, False, True, True], [1, 4]),
+])
+def test_judge_outage_requires_consecutive_failed_attempts(hermes_home, failures, notice_attempts, success_verdict):
+    from hermes_cli import goals
+
+    managers = [_manager(f"judge-blip-{i}") for i in range(len(failures))]
+    notices = []
+    for i, (manager, failed) in enumerate(zip(managers, failures)):
+        with patch("agent.auxiliary_client.call_llm") as call:
+            if failed:
+                call.side_effect = RuntimeError("connection reset")
+            else:
+                call.return_value = _judge_reply({"verdict": success_verdict, "reason": "back", "wait_for_seconds": 60})
+            decision = manager.evaluate_after_turn("still working", user_initiated=True)
+        if decision["message"] == goals.JUDGE_OUTAGE_NOTICE:
+            notices.append(i)
+        stored = goals.load_goal(f"judge-blip-{i}")
+        assert stored is not None
+        if failed:
+            assert stored.status == "active"
+    assert notices == notice_attempts
+
+
 def test_slice_4_ten_goals_on_judge_http_500_end_unpaused_with_one_notice(hermes_home):
     from hermes_cli import goals
 
