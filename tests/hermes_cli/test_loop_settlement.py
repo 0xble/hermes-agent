@@ -20,7 +20,9 @@ def test_judge_cannot_settle_over_a_newer_loop(hermes_home, monkeypatch, verdict
         if change == "revise":
             assert writer.revise(reason="Less polling", interval_seconds=600)["ok"]
         elif change == "replace":
+            from tests.hermes_cli.test_loop_revise import _record_quote
             source = "Watch the new deployment instead"
+            _record_quote(manager.session_id, source)
             assert writer.replace(prompt=source, reason="User changed task", user_quote=source,
                                   user_messages=[source], interval_seconds=600)["ok"]
         elif change == "pause":
