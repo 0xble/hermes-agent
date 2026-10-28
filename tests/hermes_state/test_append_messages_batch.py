@@ -11,6 +11,7 @@ import sqlite3
 
 import pytest
 
+import hermes_state_message_insert as message_insert
 from hermes_state import SessionDB
 from hermes_state_errors import CompressionSessionClosedError
 
@@ -121,23 +122,22 @@ class TestAppendMessagesBatch:
     def test_atomicity_all_or_nothing(self, db, monkeypatch):
         """A failure mid-batch leaves ZERO rows and untouched counters."""
         real_insert = SessionDB._insert_message_rows
+        real_page = message_insert._insert_page
 
         def failing_insert(self_db, conn, session_id, messages):
-            real_conn_execute = conn.execute
+            # Small pages make the fault land after earlier rows were already written in
+            # this transaction, which is the case rollback has to undo.
+            monkeypatch.setattr(message_insert, "_INSERT_PAGE_ROWS", 1)
             calls = {"n": 0}
 
-            def exec_counting(sql, *args):
-                if sql.lstrip().startswith("INSERT INTO messages"):
-                    calls["n"] += 1
-                    if calls["n"] == 3:
-                        raise sqlite3.OperationalError("boom mid-batch")
-                return real_conn_execute(sql, *args)
+            def page_counting(page_conn, sql, sid, page):
+                calls["n"] += 1
+                if calls["n"] == 3:
+                    raise sqlite3.OperationalError("boom mid-batch")
+                return real_page(page_conn, sql, sid, page)
 
-            conn.execute = exec_counting
-            try:
-                return real_insert(self_db, conn, session_id, messages)
-            finally:
-                conn.execute = real_conn_execute
+            monkeypatch.setattr(message_insert, "_insert_page", page_counting)
+            return real_insert(self_db, conn, session_id, messages)
 
         monkeypatch.setattr(SessionDB, "_insert_message_rows", failing_insert)
         with pytest.raises(sqlite3.OperationalError):
