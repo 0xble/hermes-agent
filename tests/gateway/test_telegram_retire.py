@@ -90,6 +90,28 @@ async def test_nonconfirmed_send_never_deletes(setup_retire, result):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["retry", "cancel"])
+async def test_failed_retirement_releases_admission_and_explains_recovery(runtime, monkeypatch, control):
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    failed = await retire.load(runtime, runtime.source)
+    assert failed is not None and failed["phase"] == "failed"
+    # Failure stops automatic deletion, but cannot consume later human messages.
+    assert await retire.intercept(runtime, MessageEvent(text="keep working here", source=runtime.source)) is None
+    notice = runtime.adapter.send.await_args.args[1]
+    assert "Use /retire to retry" in notice and "/retire cancel" in notice
+    count = runtime.adapter.send.await_count
+    await retire.advance(runtime, runtime.source)
+    assert runtime.adapter.send.await_count == count
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+    await retire.request(runtime, runtime.source, cancel=control == "cancel")
+    state = await retire.load(runtime, runtime.source)
+    assert state is not None and state["generation"] != failed["generation"]
+    assert state["phase"] == ("pending" if control == "retry" else "cancelled")
+
+
+@pytest.mark.asyncio
 async def test_cancel_during_closing_invalidates_delete(setup_retire):
     runner, source, adapter, _ = setup_retire
     async def close(*args, **kwargs):

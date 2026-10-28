@@ -21,8 +21,13 @@ def address(source, session_id):
 
 # A Hermes relay is normally `posted` until the target session stores it, so
 # reconcile for a bounded time instead of failing a retirement that is about to
-# confirm. The subprocess deadline must outlast relay's own wait.
+# confirm. Each pass is bounded; housekeeping resumes receipts still in flight.
+# The subprocess deadline must outlast relay's own wait.
 RELAY_CONFIRM_WAIT = 60
+
+
+class HandoffPending(RuntimeError):
+    """The same relay receipt needs reconciliation on a later retirement pass."""
 
 
 async def cli(runner, source, *args, timeout=30):
@@ -182,8 +187,35 @@ async def assign_task(runner, source, state, task_id, target, record=None):
         raise RuntimeError(f"Task {task_id} reporting assignment was not read back")
 
 
+def same_handoff_context(saved, expected, kind):
+    """Only loop progress may differ in an already-existing keyed task."""
+    if saved == expected:
+        return True
+    if kind != "loop":
+        return False
+    # Keep the instance, definition, limits, route and authored revisions exact.
+    # Tick lifecycle/backoff writes are not a different handoff obligation.
+    progress = {"ticks_fired", "last_fired_at", "next_due_at", "run_generation",
+                "current_delay", "control_generation", "awaiting_response", "claim_phase",
+                "fired_version", "last_response_digest", "last_external_wake_tick",
+                "goal_warning", "backoff_level", "paused_reason", "last_stop_reason",
+                "mutation_id", "tick_id"}
+    try:
+        prefix, wanted = expected.split("\n", 1)
+        saved_prefix, actual = saved.split("\n", 1)
+        actual, wanted = json.loads(actual), json.loads(wanted)
+        for item in (actual, wanted):
+            item["record"] = {key: value for key, value in item["record"].items() if key not in progress}
+        return saved_prefix == prefix and actual == wanted
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
 async def receipt(runner, source, state, item, dest):
     """Preserve work as tasks, or context alone as a non-actionable merge settlement."""
+    handoff = state.get("handoffs", {}).get(item["id"], {})
+    if handoff.get("receipt_id"):
+        return await confirm_receipt(runner, source, handoff, dest)
     target = address(source, dest["session_id"])
     if item["kind"] == "context":
         body = ("📨 Topic merged\nThe retired topic's lasting subject now lives here. "
@@ -202,11 +234,28 @@ async def receipt(runner, source, state, item, dest):
             raise RuntimeError("Handoff destination binding changed")
         title = f"Retired topic: {item['kind']}"
         context = "Own the transferred work. Preserve its original limits and report to this topic.\n" + json.dumps(item, ensure_ascii=False)
-        created = await cli(runner, owner_source, "tasks", "--json", "add", title,
-                            "--context", context, "--dedupe-key", handoff_key(state, item))
-        task_id = str(created["id"])
+        key = handoff_key(state, item)
+        # Resolve an existing key before add, so only a proven dedupe hit may
+        # have older loop progress. A fresh create still requires full content.
+        matches = await cli(runner, owner_source, "tasks", "--json", "query", json.dumps(title), "--all")
+        if not isinstance(matches, list):
+            raise RuntimeError("Handoff task lookup returned an incomplete response")
+        matches = [task for task in matches if task.get("dedupe_key") == key]
+        if len(matches) > 1:
+            raise RuntimeError("Handoff task key is ambiguous")
+        prior = matches[0] if matches else None
+        created = prior if prior is not None else await cli(
+            runner, owner_source, "tasks", "--json", "add", title,
+            "--context", context, "--dedupe-key", key)
+        task_id = str(created.get("id") or "")
         saved = await cli(runner, source, "tasks", "--json", "show", task_id)
-        if saved.get("id") != task_id or saved.get("title") != title or saved.get("context") != context:
+        profile = source.profile or "default"
+        creator = f"agent_id=hermes:{profile};session_id={profile}/{dest['session_id']}"
+        expected_context = prior.get("context") if prior is not None else context
+        if (not task_id or saved.get("id") != task_id or saved.get("title") != title
+                or saved.get("dedupe_key") != key or saved.get("source") != creator
+                or saved.get("context") != expected_context
+                or not same_handoff_context(expected_context, context, item["kind"])):
             raise RuntimeError(f"Task {task_id} handoff context was not read back")
     await assign_task(runner, source, state, task_id, target,
                       item["record"] if item["kind"] == "task" else None)
@@ -234,11 +283,28 @@ async def send_receipt(runner, source, state, item, dest, body, intent):
     receipt_id = sent.get("id")
     if not receipt_id:
         raise RuntimeError("Handoff did not return a relay receipt")
+    # Persist before the bounded wait, including when polling fails or the turn
+    # is interrupted. Recovery must read this receipt, not send the handoff again.
+    handoff = state.setdefault("handoffs", {}).setdefault(item["id"], {"item": item, "moved": False})
+    handoff.update(receipt_id=receipt_id, address=target, destination=dest)
+    await save(runner, source, state)
+    return await confirm_receipt(runner, source, handoff, dest)
+
+
+async def confirm_receipt(runner, source, handoff, dest):
+    target = address(source, dest["session_id"])
+    receipt_id = handoff["receipt_id"]
+    if handoff.get("address") != target:
+        raise RuntimeError("Handoff receipt destination changed")
     readback = await cli(runner, source, "relay", "--json", "status", "--wait", f"{RELAY_CONFIRM_WAIT}s",
                          str(receipt_id), timeout=RELAY_CONFIRM_WAIT + 30)
-    if (readback.get("id") != receipt_id or readback.get("target") != target
-            or readback.get("status") not in {"delivered", "replied"} or readback.get("error")):
-        raise RuntimeError(f"Handoff receipt {receipt_id} is not confirmed at {target}: {readback.get('status')}")
+    if readback.get("id") != receipt_id or readback.get("target") != target:
+        raise RuntimeError(f"Handoff receipt {receipt_id} is not confirmed at {target}: receipt identity mismatch")
+    status = readback.get("status")
+    if status in {"pending", "posted", "sent_unconfirmed"}:
+        raise HandoffPending(f"Handoff receipt {receipt_id} is not confirmed at {target}: {status}")
+    if status not in {"delivered", "replied"} or readback.get("error"):
+        raise RuntimeError(f"Handoff receipt {receipt_id} is not confirmed at {target}: {status}")
     return {"receipt_id": receipt_id, "address": target, "destination": dest}
 
 

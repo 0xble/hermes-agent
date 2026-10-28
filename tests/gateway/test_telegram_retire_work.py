@@ -231,6 +231,75 @@ async def test_merge_hands_context_over_even_without_open_items_and_reuses_its_r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pending", ["posted", "pending", "sent_unconfirmed"])
+@pytest.mark.parametrize("outcome", ["delivered", "replied", "misrouted", "wrong_target", "wrong_id", "error"])
+async def test_pending_retirement_rechecks_same_receipt_on_resume(runtime, monkeypatch, pending, outcome):
+    r = runtime
+    r.runner._is_session_running = lambda _: False
+    r.runner.session_store.unbind_session = MagicMock(return_value=True)
+    r.adapter._bot = SimpleNamespace(delete_forum_topic=AsyncMock(return_value=True))
+    r.adapter._session_tasks = {}
+
+    @asynccontextmanager
+    async def scope(_source):
+        yield
+
+    r.runner._async_profile_scope_for_source = scope
+    monkeypatch.setattr(retire, "_probe_deleted", AsyncMock(return_value=True))
+    monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[]))
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18", "title": "Service Operations"}
+    monkeypatch.setattr(work, "destination", AsyncMock(return_value=dest))
+    reads, sends = [], []
+    reply = {"id": "r1", "target": "hermes:default/next", "status": pending}
+
+    async def command(_runner, _source, *args, **kwargs):
+        if "send" in args:
+            sends.append(args)
+            return {"id": "r1"}
+        assert args == ("relay", "--json", "status", "--wait", f"{work.RELAY_CONFIRM_WAIT}s", "r1")
+        assert kwargs["timeout"] == work.RELAY_CONFIRM_WAIT + 30
+        reads.append(args)
+        return dict(reply)
+
+    monkeypatch.setattr(work, "cli", command)
+    await retire.request(r.runner, r.source, target=dest["title"], reason="Merge service ownership.",
+                         context="Keep the existing uptime limit.")
+    await retire.advance(r.runner, r.source)
+    state = await retire.load(r.runner, r.source)
+    assert state["phase"] == "pending"
+    assert state["handoffs"]["context:next"]["receipt_id"] == "r1"
+    assert not state["handoffs"]["context:next"]["moved"]
+    r.adapter.send.assert_not_awaited()
+    r.adapter._bot.delete_forum_topic.assert_not_awaited()
+
+    # A later housekeeping tick and an explicit retry recover from stored state,
+    # never by issuing another non-idempotent send to the busy target.
+    await retire.resume_all(r.runner)
+    retry = await retire.request(r.runner, r.source)
+    assert retry["generation"] == state["generation"]
+    assert (await retire.load(r.runner, r.source))["phase"] == "pending"
+    r.adapter.send.assert_not_awaited()
+    reply["status"] = outcome
+    if outcome == "wrong_target":
+        reply.update(status="delivered", target="hermes:default/other")
+    elif outcome == "wrong_id":
+        reply.update(status="delivered", id="other")
+    elif outcome == "error":
+        reply.update(status="delivered", error="readback failed")
+    await retire.resume_all(r.runner)
+    state = await retire.load(r.runner, r.source)
+    assert len(sends) == 1 and len(reads) == 3
+    if outcome in {"delivered", "replied"}:
+        assert state["phase"] == "done"
+        assert state["handoffs"]["context:next"]["moved"]
+        r.adapter._bot.delete_forum_topic.assert_awaited_once()
+    else:
+        assert state["phase"] == "failed"
+        assert not state["handoffs"]["context:next"]["moved"]
+        r.adapter._bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_context_settlement_carries_the_summary_without_inventing_a_ledger_obligation(runtime, monkeypatch):
     from pathlib import Path
     r = runtime
@@ -484,7 +553,7 @@ async def test_task_handoff_preserves_reportback_and_reconciles_assignment(runti
     dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
     assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
     assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
-    assert len(writes) == 1 and len(keys) == 2 and keys[0] == keys[1]
+    assert len(writes) == 1 and len(keys) == 1
     # This is the tasks ledger's reporting predicate, not just a target inbox lookup.
     assert assignments[-1]["assigned_by"] == assignments[-1]["report_to"]
 
@@ -497,11 +566,15 @@ async def test_native_handoff_is_created_under_destination_not_reassigned_on_ret
     saved, assignments, sends = {}, [], []
 
     async def command(runner, source, *args, **_):
+        if "query" in args:
+            return [dict(saved)] if saved else []
         if "add" in args:
             sid = runner.session_store.peek_session_id(runner._session_key_for_source(source))
             assert work.address(source, sid) == "hermes:default/next"
             keys.append(args[args.index("--dedupe-key") + 1])
-            saved.update(id="t1", title=args[3], context=args[args.index("--context") + 1])
+            saved.update(id="t1", title=args[3], context=args[args.index("--context") + 1],
+                         dedupe_key=args[args.index("--dedupe-key") + 1],
+                         source="agent_id=hermes:default;session_id=default/next")
             return dict(saved)
         if "show" in args:
             return dict(saved)
@@ -524,8 +597,84 @@ async def test_native_handoff_is_created_under_destination_not_reassigned_on_ret
     dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
     for _ in range(2):
         assert (await work.receipt(r.runner, r.source, r.state, item, dest))["receipt_id"] == "r1"
-    assert len(keys) == 2 and keys[0] == keys[1]
-    assert len(assignments) == 1 and len(sends) == 2
+    assert len(keys) == 1
+    assert len(assignments) == 1 and len(sends) == 1
+
+
+@pytest.fixture
+def loop_handoff_retry(runtime, monkeypatch):
+    from hermes_cli.loops import LoopState
+    r = runtime
+    r.item = {"id": "loop", "kind": "loop", "title": "Watch service health",
+              "record": json.loads(LoopState(prompt="Watch service health", interval_seconds=60,
+                                              times=12, until="Service is stable.").to_json())}
+    r.dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
+    r.task, r.creates, r.sends = {}, [], []
+    r.corrupt_fresh = False
+    r.assign = AsyncMock(side_effect=[RuntimeError("assignment interrupted"), None])
+    monkeypatch.setattr(work, "assign_task", r.assign)
+
+    async def command(_runner, _source, *args, **_):
+        if "query" in args:
+            assert args == ("tasks", "--json", "query", '"Retired topic: loop"', "--all")
+            return [dict(r.task)] if r.task else []
+        if "add" in args:
+            if not r.task:
+                r.task.update(id="t1", title=args[3], context=args[args.index("--context") + 1],
+                              dedupe_key=args[args.index("--dedupe-key") + 1],
+                              source="agent_id=hermes:default;session_id=default/next")
+                r.creates.append(dict(r.task))
+            return dict(r.task)
+        if "show" in args:
+            return {**r.task, "context": "truncated on write"} if r.corrupt_fresh else dict(r.task)
+        if "send" in args:
+            r.sends.append(args)
+            return {"id": "r1"}
+        assert args[:3] == ("relay", "--json", "status")
+        return {"id": "r1", "target": "hermes:default/next", "status": "delivered"}
+
+    monkeypatch.setattr(work, "cli", command)
+    return r
+
+
+@pytest.mark.asyncio
+async def test_loop_handoff_dedupe_survives_new_tick_snapshot(loop_handoff_retry):
+    r = loop_handoff_retry
+    with pytest.raises(RuntimeError, match="assignment interrupted"):
+        await work.receipt(r.runner, r.source, r.state, r.item, r.dest)
+    original_context = r.task["context"]
+    r.item["record"].update(ticks_fired=1, last_fired_at=10, next_due_at=70, run_generation=2,
+                            tick_id="new-tick", mutation_id="new-write", current_delay=120,
+                            awaiting_response=True, claim_phase="started", fired_version=1,
+                            last_response_digest="changed", last_external_wake_tick=1, backoff_level=1,
+                            control_generation=3)
+    result = await work.receipt(r.runner, r.source, r.state, r.item, r.dest)
+    assert result["receipt_id"] == "r1"
+    assert r.task["context"] == original_context
+    assert len(r.creates) == len(r.sends) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["prompt", "cadence", "until", "limit", "task_id", "dedupe_key", "title", "target", "fresh_context"])
+async def test_loop_handoff_rejects_dedupe_identity_changes_and_truncated_fresh_context(loop_handoff_retry, change):
+    r = loop_handoff_retry
+    if change == "fresh_context":
+        r.corrupt_fresh = True
+    else:
+        with pytest.raises(RuntimeError, match="assignment interrupted"):
+            await work.receipt(r.runner, r.source, r.state, r.item, r.dest)
+        if change in {"prompt", "cadence", "until", "limit"}:
+            field = {"cadence": "interval_seconds", "limit": "times"}.get(change, change)
+            r.item["record"][field] = "different" if field in {"prompt", "until"} else 99
+        elif change == "task_id":
+            r.task["id"] = ""
+        elif change == "target":
+            r.task["source"] = "agent_id=hermes:default;session_id=default/other"
+        else:
+            r.task[change] = "different"
+    with pytest.raises(RuntimeError, match="handoff context was not read back"):
+        await work.receipt(r.runner, r.source, r.state, r.item, r.dest)
+    assert len(r.creates) == 1 and not r.sends
 
 
 @pytest.mark.asyncio

@@ -130,7 +130,17 @@ its destination and keeps
 existing automation owner keys as shared redirects. Source histories are not
 combined. The closing note states the choice, its reason, and continuing owners.
 Receipt IDs, transfer intentions and verified moves persist independently of
-discovery, so a restart cannot forget an item already moved.
+discovery, so a restart cannot forget an item already moved. Receipt IDs are
+saved before polling. `pending`, `posted` and `sent_unconfirmed` keep retirement
+pending after each bounded 60-second check. Existing housekeeping and `/retire`
+resume status reads of that exact receipt, never another handoff send. Only
+`delivered` or `replied` permits transfer and closing. A failed retirement admits
+ordinary user messages and explains `/retire` retry and `/retire cancel` recovery.
+Keyed native-task lookup reuses the existing task without another add. Its ID,
+key, title, destination creator and full stored context are read back. Only an
+existing loop handoff may differ in tick/backoff progress, never its instance,
+prompt, cadence, limits, stop condition, route or authored revisions. Fresh task
+creation still requires the complete requested context byte for byte.
 
 Deletion requires the same generation's complete successful closing SendResult,
 including a message ID and the original thread. Partial, deferred, held,

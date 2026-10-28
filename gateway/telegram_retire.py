@@ -146,7 +146,7 @@ async def intercept(runner, event):
     if event.internal and preparation and (not state or state["generation"] != preparation
                                            or state["phase"] not in {"pending", "waiting"}):
         return ""
-    if not state or state["phase"] in {"cancelled", "done"}:
+    if not state or state["phase"] in {"cancelled", "done", "failed"}:
         return None
     if event.internal:
         # Already-owned completion work may settle while retirement waits. The
@@ -227,6 +227,7 @@ async def _unbind(runner, source, state):
 
 async def advance(runner, source):
     """Resume persisted retirement only after the active turn relinquishes its lane."""
+    from gateway.telegram_retire_work import HandoffPending
     state = await load(runner, source)
     if not state or state["phase"] in {"cancelled", "done", "failed"}:
         return
@@ -318,6 +319,13 @@ async def advance(runner, source):
             raise
         except RetirementSuperseded:
             return
+        except HandoffPending:
+            # The receipt is durable. Housekeeping or /retire rechecks it without
+            # repeating the handoff or treating a busy destination as failure.
+            current = await _current(runner, source, generation)
+            if current:
+                current["phase"] = "pending"
+                await save(runner, source, current)
         except Exception as exc:
             if state and state["phase"] == "delete_unresolved":
                 # A deleted topic cannot receive another user retry. Quietly
@@ -330,7 +338,7 @@ async def advance(runner, source):
                 current["phase"] = "delete_unresolved" if current["phase"] in {"deleting", "delete_unresolved"} else "failed"
                 current["error"] = str(exc)
                 await save(runner, source, current)
-                recovery = " Use /retire to retry or /retire cancel to keep this topic." if current["phase"] == "delete_unresolved" else ""
+                recovery = " Use /retire to retry or /retire cancel to drop the request."
                 await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc}{recovery}",
                                    metadata={"thread_id": str(source.thread_id)})
 
