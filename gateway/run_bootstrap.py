@@ -55,17 +55,15 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
             "to this profile's gateway (HERMES_HOME %s). Remove the "
             "stale PID record or stop the owning profile explicitly.",
             existing_pid, _get_process_hermes_home())
-        # The stamp must be ON DISK before this process exits: every CLI exit path funnels
-        # through _exit_after_graceful_shutdown(), whose os._exit() never flushes the queued
-        # runtime-status writer. A fire-and-forget stamp can die in the queue, the supervisor
-        # retries into the same stale record, and the loop this refusal exists to break keeps
-        # going (#135392). Bounded wait: a stalled disk delays the exit by at most 5 s, it
-        # never hangs the start.
+        # This is a recovery checkpoint, not a best-effort heartbeat. A bounded
+        # write_runtime_status wait may return False with the stamp still queued,
+        # and the CLI's os._exit then kills the writer with the stale running
+        # record intact (#135392). Use the synchronous completion contract before
+        # allowing startup to return to the hard-exit path.
         try:
             write_runtime_status(
                 gateway_state="startup_failed",
                 exit_reason="gateway_replace_ownership_unproven",
-                wait_timeout=5.0,
             )
         except Exception:
             # Persistence must never abort the start; the traceback (DEBUG) keeps the
