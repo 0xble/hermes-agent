@@ -102,10 +102,6 @@ PID and creation time before shutdown, so observing a brief running-state snapsh
 is not required and PID reuse cannot redirect cleanup. Normal-return cases read
 that witness only after nested pytest exits.
 
-The classic CLI live-session file keeps the ordinary 300-second CI bound. Its
-prior 600-second override had timeout reports and a native-host completion, not
-the passing hosted timing required by [ci-slow-file-timeouts.md](ci-slow-file-timeouts.md).
-
 The idle-exit unit fixture stubs `_served_homes` rather than patching
 `gateway.run._cron_tick_profile_homes`: resolving the deeper patch imports the
 side-effectful gateway bootstrap before the patch is installed. With the checkout
