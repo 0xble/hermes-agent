@@ -1007,6 +1007,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
         from gateway.run import _AGENT_PENDING_SENTINEL
         if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
                 and not handover_accepts_received(self, source)):
             if await self._route_plaintext_approval_while_busy(event, _quick_key):
                 return None
@@ -1421,6 +1422,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
                 and not handover_accepts_received(self, source)):
             self._preserve_drain_event(self._session_key_for_source(source), event)
             return True, None, command
@@ -1874,6 +1876,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # here would send it a second time.
             return None
         if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
                 and not handover_accepts_received(self, source)):
             from gateway.session_retry_admission import refuse_deferred_retry
             refuse_deferred_retry(event)
