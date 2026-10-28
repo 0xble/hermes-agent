@@ -1,4 +1,4 @@
-"""Short-interval admission beside the unchanged FIFO general executor."""
+"""Isolated script and protected-interval lanes beside the FIFO general executor."""
 
 import concurrent.futures
 import logging
@@ -11,6 +11,9 @@ from hermes_constants import hermes_home_key
 
 logger = logging.getLogger("cron.scheduler")
 _reserved_pools: dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+_lane_pools: dict[str, dict[str, concurrent.futures.ThreadPoolExecutor]] = {
+    "reserved": _reserved_pools, "script": {},
+}
 _reserved_claims: dict[str, tuple[str, object]] = {}
 _loaded_protected: dict[str, tuple[str, ...]] = {}
 _lock = threading.Lock()
@@ -37,12 +40,13 @@ def reserved_job_id(jobs: list[dict], home) -> str | None:
             if len(loaded) > 1:
                 logger.error(
                     "Cron has %d protected interval jobs but only 1 reserved worker; "
-                    "%s use the general pool best-effort (FIFO)", len(loaded), ", ".join(loaded[1:]))
+                    "%s use the general pool best-effort (FIFO), or the script lane for no_agent jobs",
+                    len(loaded), ", ".join(loaded[1:]))
     return eligible[0] if eligible else None
 
 
 def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
-    """Preserve general FIFO while sending only the selected protected job to its reserve."""
+    """Keep agent FIFO bounded without putting script-only fires behind agent waiters."""
     from cron import jobs, scheduler
 
     home = scheduler._get_hermes_home()
@@ -66,10 +70,28 @@ def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
     for job in due_jobs:
         if job["id"] == reserved_id:
             continue
-        future = scheduler._submit_with_guard(job, pool, process_job)
+        # Only no_agent guarantees no model work. Monitor/pre-run scripts may wake an agent.
+        if job.get("no_agent"):
+            with _lock:
+                script_pool = _get_lane_pool(hermes_home_key(home), "script")
+            future = scheduler._submit_with_guard(
+                job, script_pool, process_job, dispatch_lane="script")
+        else:
+            future = scheduler._submit_with_guard(job, pool, process_job)
         if future is not None:
             futures.append(future)
     return futures
+
+
+def _get_lane_pool(key: str, lane: str) -> concurrent.futures.ThreadPoolExecutor:
+    """Called under _lock. Each workload lane is serial and belongs to one profile."""
+    pools = _lane_pools[lane]
+    pool = pools.get(key)
+    if pool is None:
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"cron-{lane}")
+        pools[key] = pool
+    return pool
 
 
 def submit_reserved(job: dict, process_job):
@@ -82,10 +104,7 @@ def submit_reserved(job: dict, process_job):
     with _lock:
         if key in _reserved_claims:
             return None
-        pool = _reserved_pools.get(key)
-        if pool is None:
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cron-reserved")
-            _reserved_pools[key] = pool
+        pool = _get_lane_pool(key, "reserved")
         _reserved_claims[key] = (job["id"], token)
     try:
         future = scheduler._submit_with_guard(
@@ -119,16 +138,17 @@ def worker_released(inflight_key: tuple, owner, *, wake: bool = True) -> None:
 def discard_reserved_pools(home_keys) -> None:
     for key in home_keys:
         with _lock:
-            pool = _reserved_pools.pop(key, None)
+            pools = [lane.pop(key) for lane in _lane_pools.values() if key in lane]
             _loaded_protected.pop(key, None)
-        if pool is not None:
+        for pool in pools:
             pool.shutdown(wait=False, cancel_futures=False)
 
 
 def shutdown_reserved_pools() -> None:
-    for pool in list(_reserved_pools.values()):
-        pool.shutdown(wait=True, cancel_futures=False)
-    _reserved_pools.clear()
+    for lane in _lane_pools.values():
+        for pool in list(lane.values()):
+            pool.shutdown(wait=True, cancel_futures=False)
+        lane.clear()
 
 
 def note_due_scan(started_at: datetime) -> None:
