@@ -115,7 +115,7 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # Remote code-execution channel vars (RPC token, kernel/rpc dirs): a
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.
-        "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
+        "${!HERMES_RPC_*} HERMES_KERNEL_DIR ${!HERMES_BROWSER_CONTROL_*} "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")

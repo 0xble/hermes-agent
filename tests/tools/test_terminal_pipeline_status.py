@@ -69,6 +69,8 @@ def _seen(result: subprocess.CompletedProcess) -> tuple[int, str, str]:
 def test_capturing_pipestatus_changes_nothing_the_model_sees(command, exit_code, stdout):
     """The capture is side data: the shell's own ``$?`` and output, no wrapper text."""
     seen_code, seen_stdout, seen_stderr = _seen(_run_result(command))
+    baseline_code, baseline_stdout, _baseline_stderr = _seen(_run_result(command, pipe_marker=""))
 
+    assert (seen_code, seen_stdout) == (baseline_code, baseline_stdout)
     assert (seen_code, seen_stdout) == (exit_code, stdout)
     assert "__hermes" not in seen_stderr

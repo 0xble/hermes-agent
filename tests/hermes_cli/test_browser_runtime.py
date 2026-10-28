@@ -69,9 +69,11 @@ def test_configured_executable_wins_without_installing(homes, monkeypatch):
     assert not (homes / "tools").exists()
 
 
-def test_agent_browser_env_is_not_an_override(homes, monkeypatch):
-    monkeypatch.setenv("AGENT_BROWSER_EXECUTABLE_PATH", str(homes / "legacy"))
-    assert browser_runtime.chromium_executable() is None
+def test_native_agent_browser_override_is_shared_by_browser_launchers(homes, monkeypatch):
+    override = str(homes / "external")
+    monkeypatch.setenv("AGENT_BROWSER_EXECUTABLE_PATH", override)
+    assert browser_runtime.chromium_executable() == override
+    assert browser_runtime.chromium_executable(allow_override=False) is None
 
 
 def test_override_is_read_from_the_active_profile(homes):

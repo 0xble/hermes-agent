@@ -164,7 +164,7 @@ def _local_sessions(monkeypatch) -> list:
     monkeypatch.setattr(browser_session_cdp, "get_cdp_override", lambda: "")
     monkeypatch.setattr(browser_session_cloud, "get_cloud_provider", lambda: None)
     monkeypatch.setattr("tools.browser_session_real_profile.real_profile_cdp", lambda: (None, None))
-    monkeypatch.setattr("tools.browser_lightpanda.using_lightpanda_engine", lambda: False)
+    monkeypatch.setattr("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", lambda: False)
     host_launches: list = []
     monkeypatch.setattr(browser_launcher, "launch_chromium",
                         lambda key, **kw: host_launches.append(key) or (None, "host Chromium must not start"))

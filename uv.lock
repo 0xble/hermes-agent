@@ -3434,6 +3434,7 @@ dev = [
 test = [
     { name = "anthropic" },
     { name = "distlib", marker = "sys_platform == 'win32'" },
+    { name = "keyring" },
     { name = "playwright" },
 ]
 
@@ -3633,6 +3634,7 @@ dev = [
 test = [
     { name = "anthropic", specifier = "==0.125.0" },
     { name = "distlib", marker = "sys_platform == 'win32'", specifier = "==0.4.4" },
+    { name = "keyring", specifier = "==25.7.0" },
     { name = "playwright", specifier = "==1.64.0" },
 ]
 

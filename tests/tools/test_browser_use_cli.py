@@ -134,7 +134,7 @@ class TestSubprocessEnvironment:
         from types import ModuleType
 
         browser_tool = ModuleType("tools.browser_tool")
-        browser_tool._build_browser_env = dict
+        browser_tool._build_browser_env = lambda **_kw: {}
         monkeypatch.setitem(sys.modules, "tools.browser_tool", browser_tool)
         env = bu_cli._base_subprocess_env()
         assert env["ANONYMIZED_TELEMETRY"] == "false"
@@ -146,7 +146,7 @@ class TestSubprocessEnvironment:
         from types import ModuleType
 
         browser_tool = ModuleType("tools.browser_tool")
-        browser_tool._build_browser_env = lambda: {
+        browser_tool._build_browser_env = lambda **_kw: {
             "PYTHONPATH": "/hermes:/hermes/venv/lib/site-packages",
             "PYTHONHOME": "/hermes/venv",
             "KEEP_ME": "yes",
@@ -171,7 +171,7 @@ class TestSubprocessEnvironment:
         from types import ModuleType
 
         browser_tool = ModuleType("tools.browser_tool")
-        browser_tool._build_browser_env = lambda: {
+        browser_tool._build_browser_env = lambda **_kw: {
             "PATH": os.pathsep.join(
                 ["/home/u/.nvm/versions/node/v24.18.0/bin"] * 7
             ),

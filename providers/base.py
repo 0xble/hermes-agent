@@ -243,7 +243,7 @@ class ProviderProfile:
     # ── Client-level quirks (set once at client construction) ─
     default_headers: dict[str, str] = field(default_factory=dict)
     # Dynamic identity belongs at header use, never in metadata discovery.
-    default_headers_factory: Callable[[], dict[str, str]] | None = None
+    default_headers_factory: Callable[[], dict[str, str]] | None = field(default=None, kw_only=True)
 
     # ── Request-level quirks ─────────────────────────────────
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send

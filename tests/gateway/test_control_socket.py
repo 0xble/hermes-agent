@@ -318,7 +318,8 @@ def test_home_refusing_sockets_listens_on_private_fallback_both_clients_reach(sh
         try:
             pointer = home / "gateway.sock.path"
             target = Path(pointer.read_text(encoding="utf-8"))
-            assert server._bind_path == target and target.name == "control.sock"
+            assert server._bind_path == target
+            assert target.name.startswith("hermes-gw-") and target.suffix == ".sock"
             assert stat.S_IMODE(pointer.lstat().st_mode) == 0o600
             assert stat.S_IMODE(target.parent.lstat().st_mode) == 0o700
             loop = asyncio.get_running_loop()
@@ -327,7 +328,7 @@ def test_home_refusing_sockets_listens_on_private_fallback_both_clients_reach(sh
             await server.stop()
 
     assert _run(scenario()) == ({"pid": 11}, {"pid": 11})
-    assert attempts[-1].endswith("/control.sock")  # the in-home attempt, if made, was refused
+    assert not Path(attempts[-1]).is_relative_to(home)  # the in-home attempt, if made, was refused
     assert not (home / "gateway.sock.path").exists()
 
 

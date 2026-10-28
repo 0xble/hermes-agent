@@ -21,7 +21,7 @@ def _git_repo(path):
     return path
 
 
-def test_profiles_sharing_a_repo_prune_it_once_per_interval(tmp_path, monkeypatch):
+def test_profiles_sharing_a_repo_prune_it_once_per_interval(tmp_path, monkeypatch, worktree_maintenance_ready):
     import cron.scheduler as sched
     from hermes_cli import worktree_ops
     from hermes_cli.worktree_registry import record_worktree_repo

@@ -22,12 +22,12 @@ _SYSTEM_CHROMIUM_COMMANDS = ("chromium", "chromium-browser")
 
 
 def _configured_executable() -> str | None:
-    """``browser.executable_path`` from the active profile's config (managed overlay applied)."""
+    """Active-profile executable pin, then the native agent-browser environment override."""
     from hermes_cli.config import cfg_get, load_config_readonly
 
     value = cfg_get(load_config_readonly(), "browser", "executable_path", default="")
     value = os.path.expanduser(value.strip()) if isinstance(value, str) else ""
-    return value or None
+    return value or os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH", "").strip() or None
 
 
 def _pm_executable() -> str | None:
@@ -61,8 +61,9 @@ def _system_executable() -> str | None:
 def chromium_executable(*, allow_override: bool = True) -> str | None:
     """The full Chromium a browser launcher should run, or ``None`` when none is available.
 
-    Order: ``browser.executable_path`` (skipped with ``allow_override=False``, for callers that need
-    pm's own build) -> pm's installed ``chromium`` -> the Docker image's baked path -> a system
+    Order: ``browser.executable_path`` -> ``AGENT_BROWSER_EXECUTABLE_PATH`` (both skipped with
+    ``allow_override=False``, for callers needing pm's own build) -> pm's installed ``chromium`` ->
+    the Docker image's baked path -> a system
     ``chromium`` / ``chromium-browser`` on PATH, only on targets pm builds no Chromium for (Termux).
     """
     if allow_override and (override := _configured_executable()):
@@ -77,8 +78,9 @@ def chromium_missing_hint() -> str:
     from hermes_platform.host.runtime import is_termux
 
     if pinned := _configured_executable():  # the pin wins over every other source, so name it
-        return (f"browser.executable_path is set to {pinned}, which is not a browser on this machine: fix the "
-                "path, or clear it to use Hermes's Chromium.")
+        return (f"The browser executable override selects {pinned}, which is not a browser on this machine: "
+                "fix browser.executable_path or AGENT_BROWSER_EXECUTABLE_PATH, or clear the override to use "
+                "Hermes's Chromium.")
     if is_termux():
         return ("No Chromium found: pm builds none for Termux. Install one with "
                 "`pkg install x11-repo && pkg install chromium`, or set browser.executable_path.")

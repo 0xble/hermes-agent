@@ -93,6 +93,9 @@ def _delivery_manager():
             def iter_hook_callbacks(self, _name): return ()
             def invoke_middleware(self, _kind, **_kwargs): return []
             def invoke_hook(self, _name, **_kwargs): return []
+            def holds_stream(self): return False
+            def held_transforms(self): return ()
+            def run_held_transforms(self, _callbacks, **_kwargs): return None, False
         return _SafeWorkerManager()
     from hermes_cli import plugins
     manager = plugins.get_plugin_manager()

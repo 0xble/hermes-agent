@@ -540,11 +540,14 @@ class BrowserAction(WireEnum):
     status = "status"
     connect = "connect"
     disconnect = "disconnect"
+    use = "use"
 
 
 class BrowserManageParams(Params):
     action: BrowserAction = BrowserAction.status
     url: str | None = None
+    # ``use`` selects Browser Use for new agents without changing a running session.
+    enabled: bool | None = None
     session_id: str | None = None
     profile: str | None = None
 
@@ -553,7 +556,9 @@ class BrowserManageResult(Result):
     connected: bool
     url: str | None = None
     messages: list[str] | None = None
+    browser_use: bool | None = None
 
 
 method("browser.manage", params=BrowserManageParams, result=BrowserManageResult,
-       doc="Inspect, attach to, or drop the CDP browser the tools use; ``messages`` narrate a connect.")
+       doc="Inspect, attach to, or drop the CDP browser the tools use, or switch Browser Use mode "
+           "(``use``, applies to new sessions); ``messages`` narrate a connect.")

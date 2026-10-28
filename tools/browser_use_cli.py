@@ -171,9 +171,12 @@ def _code_url_verdict(code: str) -> _CodeUrlVerdict:
     return _CodeUrlVerdict(None, local_sidecar)
 
 
-def _base_subprocess_env() -> dict:
+_HARNESS_PASSTHROUGH_KEYS = ("BROWSER_USE_API_KEY",)
+
+
+def _base_subprocess_env() -> dict[str, str]:
     from tools.browser_tool import _build_browser_env
-    env = _build_browser_env()
+    env = _build_browser_env(passthrough_keys=_HARNESS_PASSTHROUGH_KEYS)
     # The harness runs on Hermes's own interpreter, but a bundled Desktop install boots that
     # interpreter with its site dir on PYTHONPATH (no venv to activate), and the harness's daemon
     # re-runs sys.executable. Point PYTHONPATH at the harness's site dir, replacing whatever the
@@ -208,8 +211,8 @@ def _floor_subprocess_path(path: str) -> str:
 def _read_browser_cfg() -> dict:
     """Return the ``browser:`` config section, or {} on any failure."""
     try:
-        from hermes_cli.config import cfg_get, read_raw_config
-        cfg = cfg_get(read_raw_config(), "browser", default={})
+        from hermes_cli.config import cfg_get, load_config_readonly
+        cfg = cfg_get(load_config_readonly(), "browser", default={})
         return cfg if isinstance(cfg, dict) else {}
     except Exception as e:
         logger.debug("Could not read browser config section: %s", e)

@@ -55,7 +55,7 @@ def write_backend_code(backend, handle, meta, origin, write):
     """Mint the backend's one-time code for ``handle`` and ``write`` it, both inside ``fill_context``, as a
     password fill is. The caller has already checked ``origin`` against ``meta``. ``None`` when the backend
     has no code (or failed to give one): the caller asks the user."""
-    from agent.vault_backends import MissingCredential
+    from agent.vault_backends.base import MissingCredential
     from agent.vault_backends.plugin import PluginBackendError
 
     written = None

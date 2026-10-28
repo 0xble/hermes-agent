@@ -16,6 +16,11 @@ a second Camofox provider during configuration migration. Preserve
 `browser.backend` and `browser.extension_control` while adopting the upstream
 launcher-setting migration. The Camofox no-install and v52 migration regressions
 exercise that intentional fork contract rather than upstream's removal policy.
+Delist `plugin-catalog/camofox.yaml` while this native owner remains: its declared
+`browser_*` tools collide with the retained built-ins. This is the catalog's
+superseded-entry delisting route, not a blocklist entry or a collision-check
+exception. Restore the entry only together with an equivalent native extraction.
+Keep plugin admission and install-time collision checks unchanged.
 
 Adopt upstream vault `fill_context`, guarded metadata snapshots, and protected
 OTP writes around the native origin and account checks. Attribute Browser Use

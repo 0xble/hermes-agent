@@ -354,6 +354,9 @@ def test_draining_follow_up_is_spooled_for_startup_recovery(tmp_path, monkeypatc
     class Runner(GatewayTurnMixin):
         _draining = True
 
+        def _take_wake_admitted_before_drain(self, key, adapter):
+            return None
+
         def _promote_queued_event(self, key, adapter, event):
             return event
 
@@ -378,6 +381,9 @@ def test_draining_follow_up_spool_initialization_failure_does_not_abort_turn(mon
 
     class Runner(GatewayTurnMixin):
         _draining = True
+
+        def _take_wake_admitted_before_drain(self, key, adapter):
+            return None
 
         def _promote_queued_event(self, key, adapter, event):
             return event

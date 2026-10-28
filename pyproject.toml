@@ -578,6 +578,7 @@ dev = [
 # environment, not the core runtime. Keep the Anthropic SDK at the same
 # reviewed version as the optional runtime extra above.
 test = [
+  "keyring==25.7.0",
   "playwright==1.64.0",
   "distlib==0.4.4; sys_platform == 'win32'",
   "anthropic==0.125.0",

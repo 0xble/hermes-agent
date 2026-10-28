@@ -25,7 +25,7 @@ def _new_prune_threads(known):
             if t.name == "cron-worktree-prune" and t.ident not in known]
 
 
-def test_a_sweep_waits_instead_of_forking_git_beside_the_running_one(tmp_path, monkeypatch):
+def test_a_sweep_waits_instead_of_forking_git_beside_the_running_one(tmp_path, monkeypatch, worktree_maintenance_ready):
     entered = threading.Event()
     release = threading.Event()
     discoveries = []
@@ -58,7 +58,7 @@ def test_a_sweep_waits_instead_of_forking_git_beside_the_running_one(tmp_path, m
         _join_prune_threads()
 
 
-def test_a_waiting_sweep_runs_once_the_one_ahead_fails(tmp_path, monkeypatch):
+def test_a_waiting_sweep_runs_once_the_one_ahead_fails(tmp_path, monkeypatch, worktree_maintenance_ready):
     entered = threading.Event()
     release = threading.Event()
     second_ran = threading.Event()

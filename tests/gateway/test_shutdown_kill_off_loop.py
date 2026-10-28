@@ -45,7 +45,7 @@ def _make_phase_runner(monkeypatch, events):
         lambda: events.append(("cleanup_envs", threading.current_thread())),
     )
     monkeypatch.setattr(
-        "tools.browser_session_lifecycle.cleanup_all_browsers",
+        "tools.browser_tool_lifecycle.cleanup_all_browsers",
         lambda: events.append(("cleanup_browsers", threading.current_thread())),
     )
     return runner, loop_thread
@@ -95,7 +95,7 @@ async def test_graceful_kill_uses_parent_first_registry_path(monkeypatch):
 def test_foreground_processes_are_killed_after_shared_deadline(monkeypatch):
     """The fast foreground-process sweep is unconditional after kill_all expires."""
     events = []
-    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    _runner, _loop_thread = _make_phase_runner(monkeypatch, events)
     import tools.environments.base as _base
 
     monkeypatch.setattr(_base, "kill_live_foreground_processes", lambda **_kw: events.append(("foreground", None)))

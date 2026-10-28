@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_login_classifier import (
     build_fill_js,
     build_inspection_js,
@@ -240,7 +241,7 @@ def test_protected_birth_date_refuses_externally_launched_cdp_browser(browser, m
     meta = VaultItemMeta(id='op:field:external', kind='protected_field', label='Birth date',
                          origin=origin, created_at='', allowed_origins=(origin,), field_token='bday')
 
-    class Backend:
+    class Backend(LocalLoginBackend):
         name = 'onepassword'
         needs_unlock = False
         def get_meta(self, handle):
