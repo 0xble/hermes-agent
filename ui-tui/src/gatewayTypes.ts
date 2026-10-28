@@ -370,13 +370,12 @@ export interface SessionSteerResponse {
 
 export interface PromptSubmitResponse {
   input_id?: string
-  status?: string
   admission_id?: string
   target_session_id?: string
   target_profile_home?: string
   outcome?: string | null
   ok?: boolean
-  status?: 'dropped' | 'queued' | 'redirected' | 'steered' | 'streaming'
+  status?: 'dropped' | 'queued' | 'redirected' | 'rejected' | 'steered' | 'streaming'
   reason?: string
   message?: string
   /** Set when the submitted text was a bare voice stop phrase consumed

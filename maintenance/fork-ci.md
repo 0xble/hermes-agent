@@ -29,6 +29,22 @@ still terminate startup. Assertions must verify those outcomes, not merely
 relax an exit-code expectation. Regenerate prompt-surface fixtures through
 `scripts/ci/prompt_surface.py render` after changing tool catalog descriptions.
 
+`run_tests_parallel.py` retains the child return code (and terminating signal),
+runner status and presence/absence of a terminal pytest summary on every failed
+attempt. A timed-out or crashed child with no parsed outcomes is reported as
+"NO TEST OUTCOMES RECOVERED", never asserted to have run no tests. Keep the
+failure-count headline and every cause bucket visible.
+
+Update-finish fixtures copy the native `plugins` tree as well as core packages:
+bootstrap performs real registry discovery, so an incomplete fixture creates a
+false gateway-restart followup after a genuine build failure. Startup fixtures
+pin the import-time process home to their simulated launch home. Do not stub
+control-socket admission or weaken the real-home I/O guard to make them pass.
+
+TypeScript qualification keeps the composer's actual `void | boolean` promise
+return and one finite `PromptSubmitResponse.status` union, including `rejected`.
+Do not replace these with broad strings or suppress type errors.
+
 Shared update E2E signal injection must never enumerate or signal another file's
 processes when CI lacks usable bubblewrap. The existing fixture HOME boundary
 scopes the command agent's process table and each signal request. Fallback close

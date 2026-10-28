@@ -11,13 +11,16 @@ from gateway.status import read_runtime_status
 
 
 @pytest.fixture(autouse=True)
-def _host_attach_gate_is_not_under_test(monkeypatch):
+def _host_attach_gate_is_not_under_test(monkeypatch, tmp_path):
     """These tests exercise the STARTUP path, not the host-attach gate that now runs in front of it.
 
     Without the stub they pass only while the shared rendezvous dir happens to be empty: any record
     there makes ``start_gateway`` attach and return before reaching the code under test. The host
     role claimed along the way is released afterwards, so one test's owner is not the next one's.
     """
+    # A runner process pins its launch home at module import. These tests simulate separate
+    # launches in tmp_path, including their real control sockets and clean-shutdown markers.
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
     monkeypatch.setattr("gateway.run._host_attach_or_none", AsyncMock(return_value=None))
     yield
     from gateway import host_rendezvous as hr

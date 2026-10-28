@@ -730,6 +730,21 @@ def _run_one_file_once(
         # (venv without pytest, -k that matches nothing) can't report green.
         rc = 0
     summary = _parse_pytest_summary(output)
+    if rc != 0:
+        child_rc = proc.returncode
+        signal_name = ""
+        if child_rc is not None and child_rc < 0 and sys.platform != "win32":
+            import signal
+
+            try:
+                signal_name = f"; signal={signal.Signals(-child_rc).name}"
+            except ValueError:
+                signal_name = f"; signal={-child_rc}"
+        terminal_summary = "present" if summary else "missing"
+        output = (
+            f"(returncode={child_rc}{signal_name}; runner_status={rc}; "
+            f"terminal_summary={terminal_summary})\n{output}"
+        )
     if rc != 0 and _COLLECTION_ERROR_RE.search(output):
         summary["collect_error"] = 1
     crash = _describe_interpreter_crash(rc, output) if rc != 0 else None
@@ -1190,7 +1205,7 @@ _FAILURE_BUCKETS: dict[str, tuple[str, Callable[[str, dict[str, int]], str]]] = 
         lambda _o, s: f"({s.get('passed', 0)} passed)",
     ),
     "none_ran": (
-        "where no tests ran (timeout before collection, pytest usage error, etc.)",
+        "with NO TEST OUTCOMES RECOVERED (terminated without parsed pass/fail counts)",
         lambda _o, _s: "",
     ),
 }
@@ -1201,6 +1216,7 @@ def _print_failure_report(
 ) -> None:
     """Every failing file's output, then the failures grouped by cause."""
     print()
+    print(f"=== {_plural(len(failures), 'file')} FAILED ===")
     print("=== Failure output ===")
     for file, output, _summary in failures:
         print()

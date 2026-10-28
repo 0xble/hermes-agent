@@ -44,7 +44,7 @@ def completion(tmp_path, monkeypatch):
     # in the working checkout is modified, even by import-time self-heals.
     for path in ROOT.glob("*.py"):
         shutil.copy2(path, source / path.name)
-    for name in ("hermes_cli", "hermes_platform", "pm", "agent", "gateway", "tools", "cron"):
+    for name in ("hermes_cli", "hermes_platform", "pm", "agent", "gateway", "tools", "cron", "plugins"):
         shutil.copytree(ROOT / name, source / name,
                         ignore=shutil.ignore_patterns("__pycache__", "web_dist", "tui_dist"))
     shutil.copytree(ROOT / "scripts/build", source / "scripts/build",
@@ -509,7 +509,7 @@ def test_real_compiler_failure_is_owed_build_and_completion_continues(completion
     assert context.read_bytes() == context_before
     receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
     assert receipt["outcome"] == "success"
-    assert [row["step"] for row in receipt["followups"]] == ["build"]
+    assert [row["step"] for row in receipt["followups"]] == ["build"], receipt["followups"]
     # Only a build follow-up marks the build stage failed (an owed config/dependency step does not).
     assert {mark["name"]: mark["outcome"] for mark in receipt["stages"]}.get("build") == "failed"
     assert receipt["update_id"] == request["update_id"]
