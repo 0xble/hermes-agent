@@ -152,8 +152,16 @@ async def update_config(
             _broadcast_gateway_session_info()
         return {"ok": True}
 
+    from hermes_cli.config_errors import ConfigValidationError
+    from hermes_cli.config_write_guards import ConfigWriteConflict
+
     with http_failure("PUT /api/config failed", 500, detail="Internal server error"):
-        return await asyncio.to_thread(_run)
+        try:
+            return await asyncio.to_thread(_run)
+        except ConfigValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ConfigWriteConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _provider_card(d, description: str, url, *, is_password: bool, advanced: bool) -> dict:

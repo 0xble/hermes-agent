@@ -3820,7 +3820,13 @@ def _cmd_config_check(args):
         for var_name, info in table.items():
             print(f"    ✓ {var_name}" if get_env_value(var_name) else missing_line(var_name, info))
 
-    missing_config = get_missing_config_fields()
+    from hermes_cli.config_errors import ConfigValidationError
+
+    try:
+        missing_config = get_missing_config_fields()
+    except ConfigValidationError as exc:
+        print(color(f"  Invalid configuration: {exc}", Colors.RED))
+        missing_config = []
     if missing_config:
         print()
         print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))

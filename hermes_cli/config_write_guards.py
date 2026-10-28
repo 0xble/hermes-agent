@@ -26,6 +26,15 @@ class ConfigSnapshot(dict):
         return ConfigSnapshot(self, Path(self.source_path), self.source_revision)
 
 
+def replace_snapshot(target: dict, source: dict) -> None:
+    """Refresh an in-place caller with the values AND revision of a new read."""
+    target.clear()
+    target.update(source)
+    if isinstance(target, ConfigSnapshot) and isinstance(source, ConfigSnapshot):
+        target.source_path = source.source_path
+        target.source_revision = source.source_revision
+
+
 def revision(path: Path):
     from utils import file_signature
 

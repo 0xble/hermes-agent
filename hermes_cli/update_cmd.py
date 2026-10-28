@@ -372,8 +372,12 @@ class UpdateConfigurationError(ValueError):
 def _updates_config() -> dict:
     """The ``updates:`` config section (``{}`` when absent/malformed); may raise on config errors."""
     from hermes_cli.config import load_config, validate_config_structure
+    from hermes_cli.config_errors import ConfigValidationError
+
     try:
         config = load_config() or {}
+    except ConfigValidationError as exc:
+        raise UpdateConfigurationError(str(exc)) from exc
     except Exception as exc:
         raise UpdateConfigurationLoadError(str(exc)) from exc
     issues = [issue for issue in validate_config_structure({"updates": config.get("updates")})

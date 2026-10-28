@@ -56,7 +56,8 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
     return copy.deepcopy(raw) if raw is not None else {}
 
 
-def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> dict[str, Any]:
+def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False,
+                               validate_structure: bool = True) -> dict[str, Any]:
     """User ``config.yaml`` → ``${VAR}`` expansion → managed overlay → model-key canonicalization.
     NO ``DEFAULT_CONFIG`` merge: a key absent from the file (and from the managed layer) is absent
     here, so ``{}`` sentinels and presence-sensitive bridges keep working. An absent file is an
@@ -66,7 +67,10 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     last-good state); otherwise the last successfully parsed user file — in-process first, then
     the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
     mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
-    Cached on the user + managed file signatures and the values of every referenced env var."""
+    Cached on the user + managed file signatures and the values of every referenced env var.
+    A caller that validates its own scoped policy can set ``validate_structure=False`` without
+    ignoring parse errors or accepting a non-mapping root. Invalid documents never enter the
+    effective or last-good caches, even for these scoped readers."""
     from agent.safe_worker_policy import worker_config_snapshot
 
     # A frozen-policy worker is detached from the profile's files: the owner-supplied
@@ -112,7 +116,7 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
             try:
                 validate_candidate(raw)
             except ConfigValidationError:
-                if fail_closed:
+                if fail_closed and validate_structure:
                     raise
                 # Presence-sensitive readers retain their historical fail-open view. Runtime
                 # route boundaries still reject it, but it is never retained as last-good.

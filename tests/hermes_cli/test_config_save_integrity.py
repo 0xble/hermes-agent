@@ -178,7 +178,9 @@ def test_unreadable_config_serves_one_cached_fallback_until_it_reads(home, monke
         assert isinstance(cfg, FailedConfigRead) and cfg["display"]["skin"] == "mono"
     assert len(rebuilds) == 1
     blocked[0] = False
-    assert type(load_config()) is dict
+    recovered = load_config()
+    assert isinstance(recovered, dict) and not isinstance(recovered, FailedConfigRead)
+    assert recovered["display"]["skin"] == "mono"
 
 
 def test_save_refusal_for_bad_yaml_asks_for_an_edit_not_a_retry(home):
