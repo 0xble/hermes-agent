@@ -128,4 +128,3 @@ class EnvironmentProcessMixin:
                 # settled the session keeps its result.
                 self._finish_exited(session, -1, reason="lost", source="backend_lost")
                 return
-
