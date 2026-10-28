@@ -42,8 +42,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   Only events from the acknowledged PID/code identity within the post-ack window
   count. `release-admission-canary.json` retains the terminal result across the
   rollback, and the shared guardian lock prevents duplicate rollback attempts.
+- Only proven absent/ended targets in the source's runtime home and explicitly
+  suspended routes are excluded from automation outage evidence. Standalone
+  restore proves that home with a wire-invisible stamp, not a RoutingIdentity.
+  A source rebuilt from its wire dict, or one whose proven home is not this
+  runtime's state DB, stays counted. Missing routes with a live durable target,
+  native refusals, connector/auth failures and invalid producer payloads still
+  count. An unproven relay flag with no live relay adapter reaches admission
+  and is counted; a committed envelope waits for that adapter. The threshold,
+  observation window and acknowledged-process fence are unchanged.
 - Guards: `tests/hermes_cli/test_admission_canary.py`,
-  `tests/gateway/test_admission_canary.py`, and existing guardian/release tests.
+  `tests/gateway/test_admission_canary.py`,
+  `tests/gateway/test_automation_upgrade_admission.py`, and existing guardian/release tests.
 
 ## Billing outage persistence and provider-wide classification
 
@@ -1023,6 +1033,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   goal-currency fence admits them to the boundary under test. Unbacked or stale
   continuations must still be dropped before admission. The user-refusal case also
   drives a 47-message transport burst and verifies the 599/600-second boundary.
+- Pre-ledger native routes may authorize their first automation against the
+  current registered transport, runtime home and direct allowlist. They do not
+  require a fresh human turn merely to receive a queued process result. Persisted
+  origins are candidates, never connector grants. Relay, role and upstream-only
+  delegation still require private native provenance. No human admission is synthesized.
+- Guards: `tests/gateway/test_automation_upgrade_admission.py` reloads a persisted
+  pre-ledger route, initializes the real authority and injects its queued watch
+  on Telegram topic and Discord routes, including lost transport, changed home,
+  direct-user revocation and unproven relay/role refusals.
 - Roll back as one source unit. No config, schema, state migration or new alert
   system is involved. Retire when a released upstream provides equivalent producer
   projection and refusal presentation guards.
