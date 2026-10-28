@@ -35,7 +35,9 @@ class Model(BaseHTTPRequestHandler):
             if '[Supervisor check-in]' in str(last):
                 self.server.checkin_turns += 1
                 message['content'] = 'NO_REPLY'
-            elif 'Write the required supervisor status.' in str(last):
+            # Recovery guidance is API-only system text, not a new human row.
+            elif any('required supervisor status' in str(m.get('content', ''))
+                     for m in messages if m['role'] in ('system', 'developer')):
                 message['content'] = 'SUPERVISOR_STATUS: tests are running. Next check in 30 minutes.'
             elif 'REAL_TERMINAL_COMPLETION' in str(last):
                 message['content'] = 'COMPLETION_STATUS: background work finished.'
@@ -133,7 +135,7 @@ async def probe(root, base, mode):
             env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
                 OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url, PYTHONUNBUFFERED='1',
                 GATEWAY_RELAY_URL=f'ws://127.0.0.1:{relay.sockets[0].getsockname()[1]}/relay',
-                GATEWAY_RELAY_PLATFORMS='telegram', GATEWAY_RELAY_BOT_IDS='{"telegram":"fixture-bot"}',
+                GATEWAY_RELAY_PLATFORMS='telegram', GATEWAY_RELAY_BOT_IDS='{"telegram":{"botId":"fixture-bot"}}',
                 GATEWAY_RELAY_ID='fixture-gateway', GATEWAY_RELAY_SECRET='fixture-secret')
             with (home / 'daemon.log').open('w+') as log:
                 proc = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,  # noqa: ASYNC220 -- Popen returns immediately; the test drives the child through its handle
@@ -187,6 +189,9 @@ async def probe(root, base, mode):
                         assert status_frame['action']['chat_id'] == 'automation-chat', status_frame
                         assert str(status_frame['action']['metadata']['thread_id']) == '103', status_frame
                         assert status_frame['platform'] == 'telegram' and status_frame['botId'] == 'fixture-bot', status_frame
+                        retries = [r for r in model.requests if any('required supervisor status' in str(m.get('content', ''))
+                                   for m in r['messages'] if m['role'] in ('system', 'developer'))]
+                        assert len(retries) == 1, retries
                         model.gate.touch()
                         await wait_for(lambda: 'COMPLETION_STATUS' in json.dumps(outgoing))
                         await wait_for(lambda: state() is None)
