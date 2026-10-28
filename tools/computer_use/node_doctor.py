@@ -113,8 +113,8 @@ def node_doctor(node: Node) -> dict:
     argv = node.ssh_argv()
     argv[-1:] = [_probe_command(node)]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                              timeout=remaining(), check=False,
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              stdin=subprocess.DEVNULL, timeout=remaining(), check=False,
                               env=_sanitize_subprocess_env(served_profile_child_env()))
     except (OSError, subprocess.TimeoutExpired, TimeoutError) as exc:
         report.update(code="node_unreachable", error=str(exc))
@@ -122,7 +122,7 @@ def node_doctor(node: Node) -> dict:
     parts = _sections(proc.stdout)
     if not parts:
         denied = "permission denied" in proc.stderr.lower()
-        checks["reachable"] = _observe(True if denied else False, "SSH authentication refused" if denied else proc.stderr.strip())
+        checks["reachable"] = _observe(denied, "SSH authentication refused" if denied else proc.stderr.strip())
         report.update(code="node_ssh_denied" if denied else "node_unreachable", error=proc.stderr.strip() or "SSH probe failed")
         return report
     checks = report["checks"] = parse_observations(parts)
