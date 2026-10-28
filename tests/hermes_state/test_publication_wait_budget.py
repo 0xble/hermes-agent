@@ -59,6 +59,46 @@ def test_publication_mutex_timeout_attributes_holders(tmp_path, operation, caplo
         db.close()
 
 
+def test_publication_mutex_timeout_names_a_writer_holder_past_lock_plumbing(tmp_path, caplog):
+    """A holder inside an ordinary SessionDB write (``state_lock``'s ``with lock:``) is named by
+    its own operation, not by the loop-guard/state_lock/contextlib frames it acquired through."""
+    from hermes_state_publication import LocalStateLockTimeout, publication_metrics
+
+    db = SessionDB(tmp_path / "writer.db")
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_inside_write(conn):
+        held.set()
+        release.wait(10)
+
+    def writer():
+        db._execute_write(hold_inside_write)
+
+    thread = threading.Thread(target=writer, name="sessiondb-test-writer")
+    thread.start()
+    assert held.wait(10)
+    try:
+        with publication_metrics(0), patch("hermes_state_lockowners.log_write_lock_holders"):
+            with pytest.raises(LocalStateLockTimeout, match="local SessionDB connection mutex"):
+                db._execute_write(lambda conn: conn.execute("SELECT 1"), patience_s=0)
+        warnings = [record.getMessage() for record in caplog.records
+                    if record.levelno == logging.WARNING
+                    and "local connection mutex unavailable" in record.getMessage()]
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert "owner_thread='sessiondb-test-writer'" in warning
+        callsite = warning.split("owner_callsite=", 1)[1]
+        for wrapper in ("hermes_loop_guard.py", "hermes_state_publication.py", "contextlib.py"):
+            assert wrapper not in callsite, callsite
+        assert "hermes_state.py:" in callsite and "_execute_write" in callsite, callsite
+    finally:
+        release.set()
+        thread.join(10)
+        assert not thread.is_alive()
+        db.close()
+
+
 @pytest.mark.parametrize("operation", ["append_message", "set_session_title"])
 def test_ordinary_writer_waits_for_mutex_without_dropping_data(tmp_path, operation):
     db = SessionDB(tmp_path / "ordinary.db")

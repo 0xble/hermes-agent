@@ -32,6 +32,11 @@ _reported_lock = threading.Lock()
 # Frames from these files are the lock plumbing, not the caller that needs fixing.
 _PLUMBING = ("hermes_loop_guard.py", "hermes_state", "session_persistence.py", "session_lifecycle.py",
              "gateway/session.py", "session_db_recovery.py", "threading.py", "contextlib.py")
+# Owner attribution skips only the acquisition wrappers themselves, so SessionDB operations
+# (hermes_state.py frames) stay visible as the holder.
+_OWNER_WRAPPERS = ("hermes_loop_guard.py", "hermes_state_publication.py", "contextlib.py", "threading.py")
+_OWNER_SITES = 3
+_OWNER_MAX_WALK = 12
 
 
 class LoopThreadBlockingError(RuntimeError):
@@ -89,10 +94,14 @@ class LoopGuardedLock:
             frame = sys._getframe(1)
             sites = []
             # Keep code/line pairs, never frames or their locals. Format only on timeout.
-            for _ in range(3):
-                if frame is None:
+            # Skip the acquisition wrappers (``with lock``, state_lock, contextlib) so the
+            # recorded sites name the operation that holds the lock.
+            for _ in range(_OWNER_MAX_WALK):
+                if frame is None or len(sites) == _OWNER_SITES:
                     break
-                sites.append((frame.f_code, frame.f_lineno))
+                code = frame.f_code
+                if not code.co_filename.endswith(_OWNER_WRAPPERS):
+                    sites.append((code, frame.f_lineno))
                 frame = frame.f_back
             del frame
             owner = LockOwner(threading.current_thread().name, threading.get_ident(),
