@@ -67,6 +67,14 @@ but, on failure, reports per-profile request counts, heartbeat/success age, and
 canary job state (no prompts or keys) so the next missed fire can be attributed
 to enumeration, ticker liveness, claim, or execution instead of an opaque timeout.
 
+Prompt-surface review keeps full commit ancestry for the merge-base comparison,
+but its checkout uses Git's `blob:none` partial-clone filter. Fetching all historical
+blobs exhausted the job's 5-minute budget before review could run, even though the
+review reads only the head tree and merge-base snapshot. Checkout and base `git archive`
+hydrate the content actually read. A real local Git regression leaves an unrelated
+historical artifact missing while rendering the base-to-head prompt diff. The staleness
+test, committed snapshots, and core-approval requirement are unchanged.
+
 The nightly fetches upstream CalVer release tags before its historical upgrade E2E:
 `actions/checkout` sees only fork tags (latest `v2026.8.3`), otherwise the test's
 `git describe HEAD~1` stages an obsolete updater instead of the previous release.
