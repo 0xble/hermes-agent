@@ -958,7 +958,7 @@ class TestHeaderVariants:
 
     def test_text_only_header_teaches_text_workflow(self, monkeypatch):
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: False
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kw: False
         )
         monkeypatch.setattr(
             "tools.browser_tool_lightpanda_fallback.lightpanda_engine_status", lambda: (False, "")
@@ -1168,7 +1168,7 @@ class TestLightpandaPreamble:
 class TestLightpandaHeader:
     def test_lightpanda_header_is_text_first_even_for_vision_models(self, monkeypatch):
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kw: True
         )
         monkeypatch.setattr(
             "tools.browser_tool_lightpanda_fallback.lightpanda_engine_status", lambda: (True, "used")
@@ -1183,7 +1183,7 @@ class TestLightpandaHeader:
 
     def test_shadowed_engine_keeps_default_header(self, monkeypatch):
         monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda **kw: True
         )
         monkeypatch.setattr(
             "tools.browser_tool_lightpanda_fallback.lightpanda_engine_status", lambda: (False, "cloud")
