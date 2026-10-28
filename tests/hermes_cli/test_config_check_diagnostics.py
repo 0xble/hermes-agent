@@ -42,7 +42,10 @@ def test_config_check_and_migrate_agree_on_stale_platform_toolsets(tmp_path, mon
     clean = _write_home(tmp_path / "clean", "platform_toolsets:\n  cli: [hermes-cli]\nmcp_servers: [a]\n")
 
     for home, expected in ((stale, {"messaging", "ghost", "mcp-ghost"}), (clean, set()), (stale, {"messaging", "ghost", "mcp-ghost"})):
+        before = (home / "config.yaml").read_bytes()
         output = _check(home, monkeypatch, capsys)
+        assert (home / "config.yaml").read_bytes() == before
+        assert ("mcp_servers must be a mapping" in output) is (home == clean)
         for name in ("messaging", "ghost", "mcp-ghost", "linear", "mcp-linear", "mcp-portable", "hermes-teams"):
             assert (f"unknown toolset '{name}'" in output) is (name in expected), (home.name, name)
 
