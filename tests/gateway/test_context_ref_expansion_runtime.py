@@ -192,7 +192,7 @@ async def test_codex_proxy_at_reference_uses_transport_context_window(tmp_path, 
 
     model = "gpt-6-astra"
     route = {
-        "provider": "custom:codex-proxy", "base_url": "http://127.0.0.1:8317/v1",
+        "provider": "custom:openai-proxy", "base_url": "http://127.0.0.1:8317/v1",
         "api_key": "test-key", "api_mode": "codex_responses",
     }
     runner = _make_runner(tmp_path)

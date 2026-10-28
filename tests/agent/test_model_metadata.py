@@ -440,7 +440,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata._query_ollama_api_show", return_value=None):
             ctx = get_model_context_length(
                 "gpt-6-astra-900k", base_url="http://127.0.0.1:8317/v1",
-                provider="custom:codex-proxy", api_mode="codex_responses",
+                provider="custom:openai-proxy", api_mode="codex_responses",
             )
 
         assert ctx == 900_000
@@ -454,7 +454,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata._fetch_codex_oauth_context_lengths_with_source", return_value=({}, False)):
             ctx = get_model_context_length(
                 "gpt-6-astra-900k", base_url="http://127.0.0.1:8317/v1",
-                provider="custom:codex-proxy", api_mode="codex_responses",
+                provider="custom:openai-proxy", api_mode="codex_responses",
             )
 
         assert ctx == 900_000
@@ -467,7 +467,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata._query_ollama_api_show", return_value=None):
             ctx = get_model_context_length(
                 "gpt-6-astra", base_url="http://127.0.0.1:8317/v1",
-                provider="custom:codex-proxy", api_mode=api_mode,
+                provider="custom:openai-proxy", api_mode=api_mode,
             )
 
         assert ctx == DEFAULT_CONTEXT_LENGTHS["gpt-6-astra"]
@@ -475,21 +475,21 @@ class TestCodexOAuthContextLength:
     def test_explicit_context_length_override_beats_codex_api_mode(self):
         assert get_model_context_length(
             "gpt-6-astra", base_url="http://127.0.0.1:8317/v1",
-            provider="custom:codex-proxy", api_mode="codex_responses",
+            provider="custom:openai-proxy", api_mode="codex_responses",
             config_context_length=123456,
         ) == 123456
 
     @pytest.mark.parametrize("per_model", [False, True])
     def test_custom_provider_context_override_beats_codex_api_mode(self, per_model):
         base_url = "http://127.0.0.1:8317/v1"
-        entry: dict = {"name": "codex-proxy", "base_url": base_url}
+        entry: dict = {"name": "openai-proxy", "base_url": base_url}
         if per_model:
             entry["models"] = {"gpt-6-astra": {"context_length": 123456}}
         else:
             entry["context_length"] = 123456
 
         assert get_model_context_length(
-            "gpt-6-astra", base_url=base_url, provider="custom:codex-proxy",
+            "gpt-6-astra", base_url=base_url, provider="custom:openai-proxy",
             api_mode="codex_responses", custom_providers=[entry],
         ) == 123456
 
@@ -503,7 +503,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata._query_ollama_api_show", return_value=None):
             ctx = get_model_context_length(
                 model, base_url="http://127.0.0.1:8317/v1",
-                provider="custom:codex-proxy", api_mode="codex_responses",
+                provider="custom:openai-proxy", api_mode="codex_responses",
             )
 
         hit = _longest_key_match(_CODEX_OAUTH_CONTEXT_FALLBACK, model.lower())
@@ -515,7 +515,7 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata._resolve_endpoint_context_length", return_value=123456):
             assert get_model_context_length(
                 "uncatalogued-model", base_url="http://127.0.0.1:8317/v1",
-                provider="custom:codex-proxy", api_mode="codex_responses",
+                provider="custom:openai-proxy", api_mode="codex_responses",
             ) == 123456
 
     @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6-astra-900k"])
@@ -1334,7 +1334,7 @@ class TestGetModelContextLength:
     @pytest.mark.parametrize(
         "provider, custom_providers",
         [
-            ("custom:codex-proxy", [{"name": "codex-proxy", "base_url": "http://127.0.0.1:8317/v1", "api_mode": "codex_responses"}]),
+            ("custom:openai-proxy", [{"name": "openai-proxy", "base_url": "http://127.0.0.1:8317/v1", "api_mode": "codex_responses"}]),
             ("openai-codex", None),  # HERMES_CODEX_BASE_URL / model.base_url proxy per #115902
         ],
     )
@@ -1363,8 +1363,8 @@ class TestGetModelContextLength:
         re-probed on every resolution."""
         from agent import model_metadata as mm
 
-        custom = [{"name": "codex-proxy", "base_url": "http://127.0.0.1:8317/v1", "api_mode": "codex_responses"}]
-        route = dict(base_url="http://127.0.0.1:8317/v1", api_key="proxy-key", provider="custom:codex-proxy", custom_providers=custom)
+        custom = [{"name": "openai-proxy", "base_url": "http://127.0.0.1:8317/v1", "api_mode": "codex_responses"}]
+        route = dict(base_url="http://127.0.0.1:8317/v1", api_key="proxy-key", provider="custom:openai-proxy", custom_providers=custom)
         codex_shaped = MagicMock(status_code=200)
         codex_shaped.json.return_value = {"models": [{"slug": "GPT-6-Sol", "context_window": 1_050_000, "max_context_window": 600_000}]}
         openai_shaped = MagicMock(status_code=200)
@@ -1386,11 +1386,11 @@ class TestGetModelContextLength:
     def test_codex_proxy_route_explicit_context_length_override_still_wins(self):
         """providers.<name>.models[].context_length beats the Codex table on a codex_responses route (#102644)."""
         custom = [{
-            "name": "codex-proxy", "base_url": "http://127.0.0.1:8317/v1", "api_mode": "codex_responses",
+            "name": "openai-proxy", "base_url": "http://127.0.0.1:8317/v1", "api_mode": "codex_responses",
             "models": {"gpt-6-astra": {"context_length": 321_000}},
         }]
         ctx = get_model_context_length(
-            "gpt-6-astra", base_url="http://127.0.0.1:8317/v1", provider="custom:codex-proxy", custom_providers=custom,
+            "gpt-6-astra", base_url="http://127.0.0.1:8317/v1", provider="custom:openai-proxy", custom_providers=custom,
         )
         assert ctx == 321_000
 

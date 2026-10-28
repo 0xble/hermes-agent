@@ -195,4 +195,5 @@ async def test_legacy_origin_cannot_borrow_unproven_connector_or_delegated_grant
                                 lambda *args: pytest.fail('legacy route minted delegated provenance'))
         assert await runner._inject_watch_notification('Verifier READY', queued) is False
     assert turns == []
-    assert len(admission_canary.snapshot()['refusals']) == 1
+    assert len(admission_canary.snapshot()['refusals']) == (
+        0 if changed in {'roles', 'relay', 'upstream'} else 1)

@@ -80,7 +80,7 @@ def _warnings(caplog):
 @pytest.mark.parametrize("operation", [
     "append_messages_batch", "replace_messages", "archive_and_compact", "publish_compression_child",
 ])
-@pytest.mark.parametrize("acquire,commit", [(7.0, 4.0), (7.0, 0.0), (0.0, 0.0)])
+@pytest.mark.parametrize("acquire,commit", [(7.0, 4.0), (7.0, 0.0), (3.0, 0.0), (2.999, 0.0), (0.0, 0.0)])
 def test_transcript_commit_attribution_and_quiet_fast_writes(db, monkeypatch, caplog, operation, acquire, commit):
     clock = _Clock()
     conn = _Connection(db._conn, clock, acquire=acquire, commit=commit)
@@ -100,18 +100,18 @@ def test_transcript_commit_attribution_and_quiet_fast_writes(db, monkeypatch, ca
     assert messages[0]["_row_id"] > 0 and DB_ROW_SNAPSHOT in messages[0]
     assert db.get_messages(target)[-1]["content"] == messages[0]["content"]
     warnings = _warnings(caplog)
-    if not commit:
-        assert warnings == []  # Acquisition delay alone must not be reported as lock hold.
+    if max(acquire, commit) < 3.0:
+        assert warnings == []
         return
     assert len(warnings) == 1
     warning = warnings[0]
     assert operation in warning and "_attempt" not in warning
-    for field in (f"pid={os.getpid()}", f"session='{target}'", "input_rows=1", "acquire_s=7.000",
-                  "callback_s=0.000", "callback_cpu_s=0.000", "commit_s=4.000", "rollback_s=0.000",
+    for field in (f"pid={os.getpid()}", f"session='{target}'", "input_rows=1", f"acquire_s={acquire:.3f}",
+                  "callback_s=0.000", "callback_cpu_s=0.000", f"commit_s={commit:.3f}", "rollback_s=0.000",
                   "outcome=committed"):
         assert field in warning
-    assert "for 4.0s:" in warning
-    assert "commit=4.000s" in warning and "inserted=1" in warning and "fts=inline" in warning
+    assert f"for {commit:.1f}s:" in warning
+    assert f"commit={commit:.3f}s" in warning and "inserted=1" in warning and "fts=inline" in warning
     assert "private transcript payload" not in caplog.text
     assert "INSERT INTO" not in caplog.text
 

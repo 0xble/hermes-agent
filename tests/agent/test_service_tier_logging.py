@@ -25,7 +25,7 @@ def _lines(caplog):
 ])
 def test_tier_line(mode, requested, served, expected, caplog):
     agent = SimpleNamespace(session_id="child-session", model="configured-model",
-                            provider="custom:codex-proxy", api_mode=mode, service_tier="auto")
+                            provider="custom:openai-proxy", api_mode=mode, service_tier="auto")
     with caplog.at_level(logging.INFO):
         turn_usage.log_response_service_tier(
             agent, SimpleNamespace(service_tier=served), {"model": "gpt-6.1-sol", "service_tier": requested})
@@ -33,7 +33,7 @@ def test_tier_line(mode, requested, served, expected, caplog):
         assert not _lines(caplog)
     else:
         assert _lines(caplog) == [
-            "speed tier: session=child-session model=gpt-6.1-sol provider=custom:codex-proxy "
+            "speed tier: session=child-session model=gpt-6.1-sol provider=custom:openai-proxy "
             f"route={mode} {expected}"]
 
 
@@ -64,7 +64,7 @@ def test_response_is_logged_once_after_middleware_and_preflight(
     # Stand-in for the negotiated transport kwargs, not the agent's Ultrafast preference.
     preflight = lambda kwargs, **ignored: {**kwargs, "service_tier": requested}
     agent = SimpleNamespace(
-        api_mode=mode, service_tier="ultrafast", model="gpt-6.1-sol", provider="custom:codex-proxy",
+        api_mode=mode, service_tier="ultrafast", model="gpt-6.1-sol", provider="custom:openai-proxy",
         session_id="child-session", platform="subagent", base_url="http://127.0.0.1:8317/v1",
         _get_transport=lambda: SimpleNamespace(preflight_kwargs=preflight),
         _is_copilot_url=lambda: False, _is_codex_backend=lambda: False,
@@ -118,7 +118,7 @@ def test_requested_tier_matches_real_relay_provider_callback(mode, execution, re
 
     def consume_stream(kwargs, **ignored):
         stream = relay_llm.stream(
-            kwargs, stream_provider, session_id="session-1", name="custom:codex-proxy",
+            kwargs, stream_provider, session_id="session-1", name="custom:openai-proxy",
             model_name="gpt-6.1-sol", metadata={"api_mode": mode}, finalizer=lambda: response,
         )
         try:
@@ -136,7 +136,7 @@ def test_requested_tier_matches_real_relay_provider_callback(mode, execution, re
         return consume_stream({**kwargs, "service_tier": "priority"})
 
     agent = SimpleNamespace(
-        api_mode=mode, model="gpt-6.1-sol", provider="custom:codex-proxy",
+        api_mode=mode, model="gpt-6.1-sol", provider="custom:openai-proxy",
         session_id="session-1", platform="subagent", base_url="http://provider.invalid/v1",
         _get_transport=lambda: SimpleNamespace(preflight_kwargs=lambda kwargs, **ignored: kwargs),
         _is_copilot_url=lambda: False, _is_codex_backend=lambda: False,

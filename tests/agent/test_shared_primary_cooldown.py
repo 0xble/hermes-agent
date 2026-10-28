@@ -528,14 +528,14 @@ def test_expired_shared_record_does_not_release_a_longer_local_window_without_a_
 
 def test_clear_cooldowns_matches_exactly():
     a = ("custom:claude-proxy", "http://127.0.0.1:8317/v1", "claude-opus-5-5")
-    b = ("custom:codex-proxy", "http://127.0.0.1:8317/v1", "claude-opus-5-5")
+    b = ("custom:openai-proxy", "http://127.0.0.1:8317/v1", "claude-opus-5-5")
     c = ("custom:claude-proxy", "http://127.0.0.1:8317/v1", "claude-opus-5")
     for route in (a, b, c):
         spc.arm_cooldown(route, reason="rate_limit", reset_at=time.time() + 7200)
     assert spc.clear_cooldowns("opus") == []  # no substring matches
     assert spc.clear_cooldowns("claude-proxy") == []
-    removed = spc.clear_cooldowns("CUSTOM:codex-proxy/claude-opus-5-5")
-    assert [(r["provider"], r["model"]) for r in removed] == [("custom:codex-proxy", "claude-opus-5-5")]
+    removed = spc.clear_cooldowns("CUSTOM:openai-proxy/claude-opus-5-5")
+    assert [(r["provider"], r["model"]) for r in removed] == [("custom:openai-proxy", "claude-opus-5-5")]
     assert [r["model"] for r in spc.clear_cooldowns("claude-opus-5")] == ["claude-opus-5"]
     assert len(spc.clear_cooldowns(all_routes=True)) == 1
     with pytest.raises(ValueError):
