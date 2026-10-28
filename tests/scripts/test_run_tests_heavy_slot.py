@@ -49,6 +49,15 @@ def runner(tmp_path):
     return entry, commands, log, env
 
 
+@pytest.fixture(params=["path", "home"])
+def slot_commands(runner, request):
+    _, commands, _, env = runner
+    if request.param == "home":
+        commands = Path(env["HOME"]) / ".local" / "bin"
+        commands.mkdir(parents=True)
+    return commands
+
+
 def install_slot(commands, log, mode):
     commands.joinpath("heavy-slot").write_text(
         f"#!{sys.executable}\nimport json, os, sys\n"
@@ -65,9 +74,9 @@ def install_slot(commands, log, mode):
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("launch", ["direct", "bash", "absolute", "timeout"])
 @pytest.mark.parametrize("args", [[], ["tests/"], ["-k", "canary"], ["tests/canary.py"]])
-def test_admission_denial_starts_no_activation_or_python(runner, launch, args):
-    entry, commands, log, env = runner
-    install_slot(commands, log, "denied")
+def test_admission_denial_starts_no_activation_or_python(runner, slot_commands, launch, args):
+    entry, _, log, env = runner
+    install_slot(slot_commands, log, "denied")
     if launch == "direct":
         command = ["./scripts/run_tests.sh"]
     elif launch == "bash":
@@ -87,10 +96,10 @@ def test_admission_denial_starts_no_activation_or_python(runner, launch, args):
 
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("mode", ["held", "reuse", "disabled", "absent", "activation"])
-def test_admission_reexec_preserves_arguments_budget_and_failure(runner, mode):
-    entry, commands, log, env = runner
+def test_admission_reexec_preserves_arguments_budget_and_failure(runner, slot_commands, mode):
+    entry, _, log, env = runner
     if mode != "absent":
-        install_slot(commands, log, "held" if mode == "activation" else mode)
+        install_slot(slot_commands, log, "held" if mode == "activation" else mode)
     if mode == "reuse":
         env["HEAVY_SLOT_HELD"] = "0"
     if mode == "activation":
@@ -108,4 +117,6 @@ def test_admission_reexec_preserves_arguments_budget_and_failure(runner, mode):
     assert compilation["args"][:5] == ["-m", "compileall", "-q", "-j", "4"]
     assert final["args"][1:] == args
     assert final["workers"] == "4"
-    assert final["held"] == ("0" if mode in {"held", "reuse", "activation"} else None)
+    # Admission state must not disable terminal promotion inside the test suite.
+    assert compilation["held"] == ("0" if mode in {"held", "reuse", "activation"} else None)
+    assert final["held"] is None
