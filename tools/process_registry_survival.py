@@ -26,7 +26,7 @@ class ProcessSurvivalMixin:
     """Keep restart survival separate from ordinary pipe/PTY process supervision."""
 
     def _spawn_local_survivor(
-        self, session: ProcessSession, safe_command: str, env_vars: dict, *, restart_safe: bool = True,
+        self, session: ProcessSession, safe_command: str, env_vars: dict | None, *, restart_safe: bool = True,
     ) -> ProcessSession:
         """Launch a local command whose stdout/stderr never pass through a gateway pipe.
 
@@ -47,7 +47,8 @@ class ProcessSurvivalMixin:
         q = shlex.quote
         wrapped = (
             f"(\n{safe_command}\n) > {q(session.log_path)} 2>&1\n"
-            f"rc=$?; printf '%s\\n' \"$rc\" > {q(session.exit_path)}"
+            f"rc=$?; printf '%s\\n' \"$rc\" > {q(session.exit_path + '.tmp')}; "
+            f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}; exit \"$rc\""
         )
         if restart_safe:
             command_argv = [registry._find_shell(), "-lic", f"set +m; {wrapped}"]
@@ -419,7 +420,17 @@ class ProcessSurvivalMixin:
                     time.sleep(0.05)
                     exit_text = exit_path.read_text(encoding="utf-8-sig", errors="replace").strip() if exit_path.exists() else ""
                     if not exit_text:
-                        if not self._finish_survivor_if_allowed(session, None, "lost", "survivor_lost"):
+                        # SIGKILL can bypass the wrapper's final write. Its original
+                        # parent still owns a real wait status, so persist that rather
+                        # than discarding it as a lost detached result.
+                        code = session.process.poll() if session.process is not None else None
+                        if code is not None:
+                            from utils import atomic_write_text
+                            atomic_write_text(session.exit_path, f"{code}\n", mode=0o600, fsync_dir=True)
+                        if not self._finish_survivor_if_allowed(
+                            session, code, "exited" if code is not None else "lost",
+                            "" if code is not None else "survivor_lost",
+                        ):
                             return
                         return
             except OSError:

@@ -408,7 +408,7 @@ class GatewayChildDispatch(NamedTuple):
     """
 
     mode: Literal["in_process", "scoped", "detached", "degraded"]
-    argv: List[str]
+    argv: list[str]
 
 
 def scoped_spawn_lost_user_bus(spawn_env: dict[str, str]) -> bool:
@@ -1061,8 +1061,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Re-attach, close, or prune a recovered host-PID session.
 
-        A completion is not queued here: recovery has no waitable handle, so it
-        never collected an exit status.
+        Recovery has no waitable handle. Report an unknown status rather than
+        silently removing a gone process.
         """
         if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log:
             return session  # a log-backed adoption's reader collects the recorded exit itself
@@ -1095,30 +1095,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         session._completion_event.set()
 
     def _prune_uncollected_detached(self, session: ProcessSession) -> Optional[ProcessSession]:
-        """Drop a recovered entry whose PID is gone, without inventing an exit.
-
-        An owned systemd scope stays reachable so kill can still reap it. A
-        scope-less entry is removed: poll/list must not report a collected exit.
-        """
-        with session._lock:
-            session.exited = True
-        with self._lock:
-            self._running.pop(session.id, None)
-            if session.systemd_unit:
-                self._finished[session.id] = session
-            else:
-                self._finished.pop(session.id, None)
-        self._write_checkpoint()
-        session._completion_event.set()
-        return session if session.systemd_unit else None
-
-    def _uncollected_gone(self, session: Optional[ProcessSession]) -> bool:
-        """True when a detached entry was closed without a collected exit status
-        and the PID is no longer alive. List/poll must not report that as exited."""
-        return bool(
-            session is not None and session.exited and session.exit_code is None
-            and session.detached and session.pid_scope == "host"
-            and not self._is_host_pid_alive(session.pid))
+        """Retain a gone recovered entry and announce its uncollected exit status."""
+        self._read_survivor_log(session)
+        # A missing wait status is an outcome, not permission to discard the job.
+        # Preserve the receipt and queue one honest completion, even for old entries
+        # created before completion watches were enabled by default.
+        session.notify_on_complete = True
+        self._finish_exited(session, None, reason="lost", source="checkpoint.exit_uncollected")
+        return session
 
     @staticmethod
     def _config_value(section: str, key: str, fallback):
@@ -1252,12 +1236,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release, survive_restart=survive_restart)
-        if survive_restart or (persist_on_release and not use_pty and not _IS_WINDOWS):
+        log = None if survive_restart else worker_output_log(session.id)
+        if survive_restart or (not use_pty and not _IS_WINDOWS and log is None):
             if use_pty:
                 raise ValueError("survive_restart is only supported for non-PTY commands")
-            # persist_on_release jobs outlive the gateway that spawned them, so they take
-            # the same file-backed stdout/stderr: a pipe owned by a dead gateway raises
-            # BrokenPipeError in the re-adopted job on its next write.
+            # Every ordinary job can be checkpoint-adopted after its gateway exits.
+            # Persist stdout and the wrapper's status before losing its waitable handle.
+            # This does not opt the job into restart-safe dispatch or lifecycle survival.
             try:
                 return self._spawn_local_survivor(
                     session, safe_command, env_vars, restart_safe=survive_restart)
@@ -1265,8 +1250,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 self._remove_survivor_run_dir(session)
                 raise
         pty_scope_attempted = False
-        # A worker's pipe or PTY dies with the worker (the child's next write is SIGPIPE): write to a log.
-        log = worker_output_log(session.id)
+        # Managed workers keep their existing cross-interpreter output-log handoff.
         if use_pty and log is None:
             try:
                 return self._spawn_local_pty(session, safe_command, env_vars)
@@ -1284,6 +1268,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                     session.systemd_unit = ""
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        if not _IS_WINDOWS and log is None:
+            # A failed PTY request is now an ordinary non-interactive job too.
+            return self._spawn_local_survivor(session, safe_command, env_vars, restart_safe=False)
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
         spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
                                       unit_suffix, "Local")
@@ -1931,8 +1918,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             reoffer_unresolved_completions(self.completion_queue)
         except Exception as exc:
             logger.warning("Could not re-offer unresolved async delegation completions: %s", exc)
-        results: "list[tuple[dict, str]]" = []
-        requeue: "list[dict]" = []
+        results: list[tuple[dict, str]] = []
+        requeue: list[dict] = []
         # delegation.surface_child_process_notifications, read at most once per drain
         # and only when an sa- event shows up.
         surface_child: bool | None = None
@@ -2028,7 +2015,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         stdout pipe open, the reader blocks forever and poll() keeps returning "running" indefinitely (issue
         #17327 — 74 polls over 7 minutes on Feishu).
         """
-        if session is None or session.exited or self._file_backed(session):
+        if session is None or session.exited:
+            return
+        if self._file_backed(session):
+            # The file reader owns the final drain too. A slow live-output sink
+            # must not make a completed wrapper appear to keep running forever.
+            if session.process is not None and session.process.poll() is not None:
+                session._completion_event.wait(_READER_FINAL_DRAIN_WAIT_SECONDS)
             return
         proc = getattr(session, "process", None)
         if proc is None:
@@ -2096,7 +2089,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
         session = self.get(session_id)
-        if session is None or self._uncollected_gone(session):
+        if session is None:
             return _not_found(session_id)
         self._reconcile_local_exit(session)  # orphaned-pipe reader guard
         # Read with the preview under the lock the reader appends and exits under, so the
@@ -2529,7 +2522,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         all_sessions = [
             refreshed for refreshed in (
                 self._refresh_detached_session(s) for s in sessions.values()
-            ) if refreshed is not None and not self._uncollected_gone(refreshed)
+            ) if refreshed is not None
         ]
         if task_id or session_key:
             all_sessions = [

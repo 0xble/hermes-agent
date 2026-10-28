@@ -659,6 +659,9 @@ def _format_process_notification_payload(evt: dict) -> str | None:
             f"{attribution}Command: {_cmd}\nMatched output:\n{evt.get('output', '')}"
             + (f"\n({_sup} earlier matches were suppressed by rate limit)" if _sup else "") + "]")
     _exit = evt.get("exit_code", "?")
+    _status = ("exited, status unknown (not collected)"
+               if _exit is None
+               else _completion_status(evt))
     _out = evt.get("output", "")
     _routine_stop = _routine_process_stop(evt)
     _signal = "" if _routine_stop else (", SIGTERM" if _exit in {-15, 143, "-15", "143"} else "")
@@ -676,7 +679,7 @@ def _format_process_notification_payload(evt: dict) -> str | None:
         _out = (f"...(first {evt['output_cut']} characters cut — process(action=\"log\", "
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
     return (
-        f"{PROCESS_NOTICE_OPEN}Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
+        f"{PROCESS_NOTICE_OPEN}Background process {_sid} {_status} (exit code {_exit}{_signal}).\n"
         f"{_retry}{attribution}Command: {_cmd}\nOutput:\n{_out}]")
 
 

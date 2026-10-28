@@ -146,7 +146,7 @@ class ProcessCheckpointMixin:
                         "retaining checkpoint entry for the next startup",
                         systemd_unit, pid)
                     unresolved_scope_entries.append(entry)
-                continue
+                    continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
             recorded_exit = None
             recorded_termination = {}
@@ -199,6 +199,9 @@ class ProcessCheckpointMixin:
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })
+            if fate == "gone" and not survivor and not session.output_log:
+                self._prune_uncollected_detached(session)
+                continue
             if not pid or recorded_exit is not None:
                 self._finish_survivor(
                     session, recorded_exit,
