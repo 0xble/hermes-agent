@@ -174,7 +174,7 @@ export function useComposerSubmit({
 
     // A synchronous throw takes the rejection path too: the caller has already cleared the
     // composer, so a send that fails while it is being prepared must not take the words with it.
-    void new Promise<boolean>(resolve =>
+    void new Promise<Awaited<ReturnType<ChatBarProps['onSubmit']>>>(resolve =>
       resolve(
         onSubmit(text, {
           ...target,
