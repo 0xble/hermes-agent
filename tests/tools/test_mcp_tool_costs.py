@@ -10,6 +10,7 @@ keys only warn.
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,27 +25,43 @@ COSTED = {"trust": "full", "tool_costs": {"paid_render": 40, "batch": {"credits"
           "spend_limit": 100}
 
 
-def _run_on_loop(coro_or_factory, timeout=30):
-    coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+@pytest.fixture
+def mcp_loop():
+    # Parallel sync handlers share one transport loop in production. A loop per
+    # call lets the server's asyncio.Lock bind waiters to different threads.
     loop = asyncio.new_event_loop()
-    try:
-        async def _run():
+    started = threading.Event()
+    loop.call_soon(started.set)
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+
+    def run(coro_or_factory, timeout=30):
+        async def invoke():
             for srv in list(mcp_tool._servers.values()):
                 if getattr(srv, "_rpc_lock", None) is None:
                     srv._rpc_lock = asyncio.Lock()
+            coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
             return await coro
-        return loop.run_until_complete(_run())
+
+        return asyncio.run_coroutine_threadsafe(invoke(), loop).result(timeout)
+
+    try:
+        assert started.wait(5)
+        yield run
     finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        assert not thread.is_alive()
         loop.close()
 
 
 @pytest.fixture
-def session():
+def session(mcp_loop):
     result = SimpleNamespace(content=[SimpleNamespace(type="text", text="ok")], isError=False, structuredContent=None)
     session = MagicMock()
     session.call_tool = AsyncMock(return_value=result)
     with patch.dict(mcp_tool._servers, {"srv": SimpleNamespace(session=session, _rpc_lock=None)}), \
-         patch("tools.mcp_tool_loop._run_on_mcp_loop", side_effect=_run_on_loop), \
+         patch("tools.mcp_tool_loop._run_on_mcp_loop", side_effect=mcp_loop), \
          patch.dict(mcp_tool._server_error_counts, {}, clear=True), \
          patch.dict(mcp_tool._server_trust_levels, {}, clear=True), \
          patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True), \
@@ -207,7 +224,6 @@ def test_a_chat_keeps_its_total_across_a_rotation_and_each_cron_run_has_its_own(
 
 
 def test_parallel_over_limit_calls_are_asked_one_at_a_time(session):
-    import threading
     _register(COSTED)
     for _ in range(2):
         _call("paid_render")  # 80 of 100: the next two parallel calls both cross the limit
@@ -224,10 +240,33 @@ def test_parallel_over_limit_calls_are_asked_one_at_a_time(session):
         open_prompts[0] -= 1
         return "accept"
 
+    # Keep the first RPC inside the transport lock until the second contends.
+    # A per-call event loop cannot safely wake this lock's cross-thread waiter.
+    contended = asyncio.Event()
+
+    class ContendedLock(asyncio.Lock):
+        entries = 0
+
+        async def acquire(self):
+            self.entries += 1
+            if self.entries == 2:
+                contended.set()
+            return await super().acquire()
+
+    mcp_tool._servers["srv"]._rpc_lock = ContendedLock()
+    result = session.call_tool.return_value
+
+    async def call_tool(*args, **kwargs):
+        await contended.wait()
+        return result
+
+    session.call_tool.side_effect = call_tool
+    results = []
+
     def one():
         token = set_current_session_key("chat-a")
         try:
-            handlers._make_tool_handler("srv", "paid_render", 30.0)({})
+            results.append(json.loads(handlers._make_tool_handler("srv", "paid_render", 30.0)({})))
         finally:
             reset_current_session_key(token)
 
@@ -237,5 +276,8 @@ def test_parallel_over_limit_calls_are_asked_one_at_a_time(session):
             th.start()
         for th in threads:
             th.join(10)
+        assert all(not th.is_alive() for th in threads)
+    assert results == [{"result": "ok"}, {"result": "ok"}]
+    assert session.call_tool.await_count == 4
     assert peak[0] == 1 and len(prompts) == 2
     assert {"used about 80 credits" in p for p in prompts} == {True, False}  # the second saw the first's booking
