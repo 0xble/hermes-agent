@@ -190,7 +190,7 @@ def _handle_react(args, remove=False):
     if _relay_denial:
         return tool_error(_relay_denial)
 
-    _, adapter = _live_adapter(platform)
+    runner, adapter = _live_adapter(platform)
     if adapter is None:
         return tool_error(f"Reactions require a live {platform_name} adapter in the running "
                           "gateway (not available from cron/standalone contexts).")
@@ -199,9 +199,27 @@ def _handle_react(args, remove=False):
         return tool_error(f"Platform '{platform_name}' does not support message reactions.")
     try:
         from model_tools import _run_async
-        result = _run_async(react_fn(chat_id=chat_id, message_id=message_id, **({} if remove else {"emoji": emoji})))
+        from gateway.session_context import get_session_env
+        routing = {"thread_id": _thread_id} if _thread_id else {}
+        if not remove and platform_name == get_session_env("HERMES_SESSION_PLATFORM"):
+            routing.update({"team_id": get_session_env("HERMES_SESSION_SCOPE_ID"),
+                            "user_id": get_session_env("HERMES_SESSION_USER_ID")})
+        kwargs = {} if remove else {"emoji": emoji, **routing}
+        result = _run_async(_dispatch_on_gateway_loop(
+            runner, lambda: react_fn(chat_id=chat_id, message_id=message_id, **kwargs),
+            "send_message: failed to schedule reaction on gateway loop",
+        ))
     except Exception as e:
         return json.dumps(_error(f"Reaction failed: {e}"))
+    if result is False:
+        return tool_error(f"Platform '{platform_name}' does not support this reaction or delivery failed.")
+    delivered = result.get("success") is True if isinstance(result, dict) else result is True
+    if not remove and delivered:
+        from gateway.session_context import acknowledge_current_message_reaction
+        target = (platform_name, str(chat_id), str(message_id))
+        current = tuple(get_session_env(f"HERMES_SESSION_{key}") for key in ("PLATFORM", "CHAT_ID", "MESSAGE_ID"))
+        if target == current:
+            acknowledge_current_message_reaction()
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
 
 

@@ -26,10 +26,10 @@ from typing import Any
 import pytest
 
 from tests.e2e.core.cli_tmux._classic import PROMPT, ClassicHome, Pane, assert_no_traceback, last_user, require_tmux
-from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall
+from tests.fakes.fake_llm_provider import FakeLLMServer, StallMidStream, Text, ToolCall
 
 pytestmark = [
-    pytest.mark.platforms("linux"),  # the harness finds and reaps processes through /proc
+    pytest.mark.platforms("linux", "macos"),
 ]
 
 MARKDOWN_REPLY = ("# Heading Two\n\nSome intro text for the markdown check.\n\n- alpha item\n- beta item\n"
@@ -66,7 +66,9 @@ def _main(record: dict[str, Any]):
     if "STEP4" in user:
         return Text(STEP4_DONE) if after_tool else ToolCall("read_file", {"path": "notes.txt"})
     if "STEP8" in user:
-        return Text(LONG_REPLY, chunk_chars=6, delay_per_chunk=0.04)
+        # A moving 60-character preview can skip w040 between repaints. Keep that
+        # witness visible and the turn pending until Ctrl+C, even on a busy runner.
+        return StallMidStream(LONG_REPLY, after_chars=LONG_REPLY.index("w041"))
     if "hello" in user.lower():
         return Text(HELLO_REPLY)
     return Text("ok")

@@ -11,14 +11,15 @@ was still releasing the token.
 """
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
+from agent.notice_style import ContextNotice
 from gateway.platforms.base import (
-    SendResult, in_ingress_consumer, ingress_consumer_scope, leave_ingress_consumer)
+    MessageEvent, SendResult, in_ingress_consumer, ingress_consumer_scope, leave_ingress_consumer)
+from gateway.session import SessionSource
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -116,7 +117,7 @@ async def _on_consumer(coro):
         leave_ingress_consumer(token)
 
 
-def _inline_adapter(send_gate: asyncio.Event, sends: list):
+def _inline_adapter(send_gate: asyncio.Event, sends: list, *, payloads=None):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
 
     async def handler(_event):
@@ -125,6 +126,8 @@ def _inline_adapter(send_gate: asyncio.Event, sends: list):
     async def paced_send(**kwargs):
         await send_gate.wait()  # the chat's outbound budget slot
         sends.append(kwargs["content"])
+        if payloads is not None:
+            payloads.append(kwargs)
         return SendResult(success=True, message_id="1")
 
     adapter._message_handler = handler
@@ -133,8 +136,10 @@ def _inline_adapter(send_gate: asyncio.Event, sends: list):
 
 
 def _event():
-    return SimpleNamespace(source=SimpleNamespace(chat_id="2027045491", thread_id=None), metadata={},
-                           message_id="519", reply_to_message_id=None)
+    return MessageEvent(
+        text="/queue", source=SessionSource(platform=Platform.TELEGRAM, chat_id="2027045491"),
+        message_id="519",
+    )
 
 
 @pytest.mark.asyncio
@@ -158,20 +163,23 @@ async def test_command_reply_off_the_consumer_is_still_awaited():
 
 
 @pytest.mark.asyncio
-async def test_busy_ack_on_the_consumer_does_not_wait_for_the_budget():
+@pytest.mark.parametrize("content", ["busy", ContextNotice("busy")], ids=["unmarked", "context"])
+async def test_busy_ack_on_the_consumer_does_not_wait_for_the_budget(content):
     from gateway.run import GatewayRunner
 
-    gate, sends = asyncio.Event(), []
-    adapter = _inline_adapter(gate, sends)
+    gate, sends, payloads = asyncio.Event(), [], []
+    adapter = _inline_adapter(gate, sends, payloads=payloads)
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._reply_anchor_for_event = lambda event: None
     runner._busy_reply_to = lambda event, anchor: None
     runner._thread_metadata_for_source = lambda source, anchor: {}
-    await asyncio.wait_for(_on_consumer(runner._send_busy_reply(_event(), adapter, "busy")), timeout=1)
+    await asyncio.wait_for(_on_consumer(runner._send_busy_reply(_event(), adapter, content)), timeout=2)
     assert sends == []
     gate.set()
     await asyncio.gather(*adapter._background_tasks)
     assert sends == ["busy"]
+
+    assert payloads == [{"chat_id": "2027045491", "content": content, "reply_to": None, "metadata": {}}]
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 import errno
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -35,6 +36,32 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
 def env_var_enabled(name: str, default: str = "") -> bool:
     """Return True when an environment variable is set to a truthy value."""
     return is_truthy_value(os.getenv(name, default), default=False)
+
+
+def filesystem_poll_seconds(default: float) -> float:
+    """How long a hot path may reuse a filesystem signature without stating again.
+
+    A long-lived gateway must not walk the skills tree on every prompt build.
+    The suite keeps a zero interval, including a gateway spawned into a pytest
+    home, so a write is visible on the next read. ``HERMES_FS_POLL`` overrides
+    the interval in seconds, with nonpositive values, ``off``, or ``false``
+    disabling it. Invalid or nonfinite values retain the caller's default.
+    """
+    if default <= 0:
+        return 0.0
+    forced = os.environ.get("HERMES_FS_POLL", "").strip().lower()
+    if forced in {"0", "off", "false"}:
+        return 0.0
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return 0.0
+    home = os.environ.get("HERMES_HOME", "")
+    if "pytest-" in home or "hermes-pytest" in home:
+        return 0.0
+    try:
+        interval = float(forced)
+    except ValueError:
+        return default
+    return max(0.0, interval) if math.isfinite(interval) else default
 
 
 def file_signature(st: os.stat_result) -> tuple[int, int, int, int]:

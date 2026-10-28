@@ -13,7 +13,10 @@ Patch identity: `slack-generated-thread-titles`.
 - Use the platform adapter owning the turn, including workspace-scoped thread keys.
 - Send only the LLM stage to Slack, not the session sidebar's derived stage.
 - Reserve the bounded upgrade guard before API I/O, including API failures, so later callbacks cannot repeatedly overwrite a manual title.
-- Respect stale-run fencing and config changes before the rename. Fail silently with debug logs.
+- Fence the rename on session identity (reset, `/new`, removal), not run generation: a quick follow-up keeps the session and the titler never fires again for it. Respect config changes before the rename. Fail silently with debug logs.
+- The verb-first prompt fixes sentence case and ignores `case_style`, because Slack task titles follow Brian's sentence-case label convention.
+- Ask the model for about 28 characters, the width Slack's mobile thread header shows, without enforcing it. The 80-character ceiling stays the only hard limit.
+- Drop typographic apostrophes, which `agents.sessions.rename` rejects as `invalid_name`. Fall back to `assistant.threads.setTitle` only on `not_authorized`, which legacy Assistant roots return.
 - Do not replace the shared worker with an intake-path model request.
 
 ## Proof and Retirement

@@ -827,7 +827,9 @@ def test_failed_plugin_smoke_does_not_flip_pointer(tmp_path, monkeypatch):
     assert (home / "current").resolve() == a.resolve()
 
 
-def test_retention_keeps_live_and_rollback_pins(tmp_path):
+def test_retention_keeps_live_and_rollback_pins(tmp_path, monkeypatch):
+    import psutil
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs: iter(()))
     home = tmp_path / ".hermes"
     for i in range(7):
         p = home / "releases" / str(i)
@@ -1155,7 +1157,28 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
     assert steps == [("immutable_extras_carry", True, f"carried documents, slack from {a.resolve()}")]
 
 
-def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
+@pytest.fixture
+def retention_process_table(monkeypatch):
+    """Inspect real fixture children, not unrelated host/release executables.
+
+    psutil.exe() may stat its cmdline fallback on macOS. Enumerating the whole
+    host therefore crosses the real-home guard even for temporary releases.
+    Keep real process metadata and the production pin scanner, narrowing only
+    which processes belong to this test.
+    """
+    import psutil
+
+    def select(*pids):
+        def processes(attrs):
+            for pid in pids:
+                process = psutil.Process(pid)
+                process.info = process.as_dict(attrs=attrs, ad_value=None)
+                yield process
+        monkeypatch.setattr(psutil, "process_iter", processes)
+    return select
+
+
+def test_retention_protects_real_process_cwd_and_receipt(tmp_path, retention_process_table):
     home = tmp_path / "profile"
     release_paths = [home / "releases" / str(i) for i in range(9)]
     for i, path in enumerate(release_paths):
@@ -1171,10 +1194,11 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
                               cwd=release_paths[0], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         _await_ready(worker, str(release_paths[0].resolve()))
+        retention_process_table(worker.pid)
         assert release_paths[0].resolve() in releases._live_process_pins(home)
         removed = releases.retain(home)
-        # Unreadable host process metadata intentionally pins every release.
-        # Exact pruning belongs to the controlled-process test above.
+        # The real child and receipt must protect the old releases.
+        # Exact pruning and unreadable metadata have separate coverage above.
         protected = {"0", "1", "4", "5", "6", "7", "8"}
         assert protected <= {path.name for path in release_paths if path.exists()}
         assert protected.isdisjoint(path.name for path in removed)
@@ -1228,7 +1252,7 @@ def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypat
                "prune blocked" in s["detail"] for s in receipt["steps"])
 
 
-def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monkeypatch):
+def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monkeypatch, retention_process_table):
     from hermes_cli import update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
     from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
     home = tmp_path / "profile"
@@ -1243,6 +1267,7 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
                               cwd=releases_for_test[0], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         _await_ready(worker, str(releases_for_test[0].resolve()))
+        retention_process_table(worker.pid)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
         monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)

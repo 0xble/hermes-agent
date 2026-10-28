@@ -6,6 +6,8 @@ imported lazily from ``agent.conversation_loop`` (no cycle, same logger name).""
 
 from __future__ import annotations
 
+from agent.notice_style import ContextNotice
+
 import logging
 import os
 import time
@@ -151,8 +153,8 @@ def _resolve_budget_fallback(
         else:
             # _handle_max_iterations makes one extra toolless request for a summary.
             agent._emit_diagnostic_status(
-                f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— asking model to summarise"
+                ContextNotice(f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                "— asking model to summarise"),
             )
             if not agent.quiet_mode:
                 agent._safe_print(

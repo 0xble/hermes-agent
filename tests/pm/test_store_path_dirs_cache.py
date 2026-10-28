@@ -99,3 +99,15 @@ def test_activation_still_composes_live(tmp_path, monkeypatch):
     pm.install.store_first_path("/usr/bin")
     pm.install.store_first_path("/usr/bin")
     assert len(calls) == 3
+
+
+def test_reset_tolerates_a_pm_install_import_still_in_progress(monkeypatch):
+    """Hosted shards failed with "partially initialized module 'pm.install' has no attribute
+    '_store_path_dirs_cache'" when a prior test's thread was mid-import at the next setup."""
+    import sys
+    import types
+
+    from tests.conftest import reset_pm_path_cache
+
+    monkeypatch.setitem(sys.modules, "pm.install", types.ModuleType("pm.install"))
+    reset_pm_path_cache()

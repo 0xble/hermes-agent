@@ -241,11 +241,13 @@ async def test_refused_watch_wake_logs_the_refusal_code(tmp_path, monkeypatch, c
         evt = {'type': 'completion', 'session_id': 'proc_x', 'session_key': route, 'platform': 'discord',
                'chat_id': '42', 'chat_type': 'dm', 'exit_code': 0, 'output': 'done', 'started_at': 1.0,
                'parent_session_id': metadata['gateway_session_id']}
-        with caplog.at_level(logging.WARNING, logger='gateway.run'):
-            with pytest.raises(WakeNotAccepted):
-                await runner._inject_watch_notification('[done]', evt, raise_not_accepted=True)
-        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-                and 'not admitted' in r.getMessage()] == [
-            'Watch notification not admitted for discord chat=42: admission_conflict']
+        with caplog.at_level(logging.WARNING, logger='gateway.session_refusals'):
+            for _ in range(5):
+                with pytest.raises(WakeNotAccepted):
+                    await runner._inject_watch_notification('[done]', evt, raise_not_accepted=True)
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+            'Internal admission refused: admission_conflict (None) platform=discord chat=42 '
+            "counts={'admission_conflict:unspecified': 1} previous_window={}"]
+        assert runner._internal_refusal_window[1] == {'admission_conflict:unspecified': 5}
     finally:
         authority.db.close()

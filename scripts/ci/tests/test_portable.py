@@ -726,12 +726,11 @@ try {
         self.assertGreater(ci.E2E_UPGRADE_FILE_TIMEOUT, 300)
 
     def test_shard_gives_listed_slow_files_their_bound_and_every_other_file_the_default(self):
+        live = 'tests/e2e/core/cli_tmux/test_classic_cli_live_session.py'
         soak = 'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py'
-        self.assertTrue((ci.ROOT / soak).is_file())
+        self.assertEqual(ci.FILE_TIMEOUTS[live], 900)
         self.assertGreater(ci.FILE_TIMEOUTS[soak], 300)
-        for path in ci.FILE_TIMEOUTS:
-            self.assertTrue((ci.ROOT / path).is_file(), path)
-        owner = next(i for i, bucket in enumerate(ci.shard_files(ci.ROOT, 10), 1) if soak in bucket)
+        buckets = ci.shard_files(ci.ROOT, 10)
         calls = []
 
         def fake(env, roots, workers, file_timeout=None):
@@ -739,22 +738,25 @@ try {
             if file_timeout is None:
                 raise subprocess.CalledProcessError(1, ['run_tests.sh'])
 
-        with patch.object(ci, 'python_tests', side_effect=fake):
-            with self.assertRaises(subprocess.CalledProcessError):
-                ci.python_shard({}, 4, owner, 10)
-        # A default-bound failure does not hide the slow-file run, and nothing is lost.
-        self.assertEqual(calls[1], ([soak], ci.FILE_TIMEOUTS[soak]))
-        default_roots, default_timeout = calls[0]
-        self.assertIsNone(default_timeout)
-        self.assertNotIn(soak, default_roots)
-        self.assertEqual(sorted(default_roots + [soak]), sorted(ci.shard_files(ci.ROOT, 10)[owner - 1]))
+        for slow in ci.FILE_TIMEOUTS:
+            self.assertTrue((ci.ROOT / slow).is_file(), slow)
+            owner = next(i for i, bucket in enumerate(buckets, 1) if slow in bucket)
+            calls.clear()
+            with self.subTest(slow=slow), patch.object(ci, 'python_tests', side_effect=fake):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    ci.python_shard({}, 4, owner, 10)
+            # A default-bound failure does not hide any mapped group or lose files.
+            self.assertIn(([slow], ci.FILE_TIMEOUTS[slow]), calls)
+            self.assertEqual(sorted(f for roots, _ in calls for f in roots), sorted(buckets[owner - 1]))
+            for roots, timeout in calls:
+                self.assertEqual({ci.FILE_TIMEOUTS.get(f) for f in roots}, {timeout})
 
         calls.clear()
-        other = next(i for i in range(1, 11) if i != owner)
+        other = next(i for i, bucket in enumerate(buckets, 1) if not set(bucket) & ci.FILE_TIMEOUTS.keys())
         with patch.object(ci, 'python_tests', side_effect=fake):
             with self.assertRaises(subprocess.CalledProcessError):
                 ci.python_shard({}, 4, other, 10)
-        self.assertEqual(calls, [(ci.shard_files(ci.ROOT, 10)[other - 1], None)])
+        self.assertEqual(calls, [(buckets[other - 1], None)])
 
     def test_an_environment_error_in_one_group_still_runs_the_others(self):
         soak = 'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py'

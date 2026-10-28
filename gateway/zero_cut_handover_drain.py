@@ -162,6 +162,7 @@ async def _settle_recovery_input(adapter) -> None:
             await queue.join()
         tasks = [task for name in ("_pending_text_batch_tasks", "_pending_photo_batch_tasks", "_media_group_tasks")
                  for task in (getattr(adapter, name, {}) or {}).values()]
+        tasks.extend(getattr(adapter, "_committed_flush_tasks", {}).values())
         held = getattr(adapter, "_held_inbound_redispatch_task", None)
         if held is not None:
             tasks.append(held)

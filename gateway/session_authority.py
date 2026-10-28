@@ -459,22 +459,26 @@ class SessionAuthority:
                 waiter.set_exception(RuntimeStoreError(reason))
 
     async def admit_automation(self, adapter, event, identity, replaces=None):
+        from gateway.admission_canary import refusal_evidence
         from gateway.session_automation import admit_automation
-        return await admit_automation(self, adapter, event, identity, replaces)
+        with refusal_evidence('automation'):
+            return await admit_automation(self, adapter, event, identity, replaces)
 
     async def admit_native(self, event):
         """Await current connector policy, then commit before ACK or scheduling execution."""
+        from gateway.admission_canary import refusal_evidence
         from gateway.session_ingress_media import abandon_capture, capture_lease
-        async with self._route_turn(event) as fence:
-            with capture_lease(self) as scope:  # captured bytes are held until commit or refusal
-                try:
-                    return await self._admit_native(event, fence)
-                except BaseException:
-                    # Before the shielded write starts, no row can own these bytes. A cancelled copy
-                    # arranges its own completion cleanup in prepare_native; other failures clean here.
-                    if not scope.write_started:
-                        await abandon_capture(scope)
-                    raise
+        with refusal_evidence('native'):
+            async with self._route_turn(event) as fence:
+                with capture_lease(self) as scope:  # captured bytes are held until commit or refusal
+                    try:
+                        return await self._admit_native(event, fence)
+                    except BaseException:
+                        # Before the shielded write starts, no row can own these bytes. A cancelled copy
+                        # arranges its own completion cleanup in prepare_native; other failures clean here.
+                        if not scope.write_started:
+                            await abandon_capture(scope)
+                        raise
 
     @contextlib.asynccontextmanager
     async def _route_turn(self, event):

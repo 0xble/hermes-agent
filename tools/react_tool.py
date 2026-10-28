@@ -1,15 +1,57 @@
 #!/usr/bin/env python3
-"""Agent emoji reaction in the Hermes desktop app: the counterpart to the user's tapback
-(same store, one-per-author, ``author="agent"``). Lives in the ``desktop_ui`` toolset so it
-costs nothing elsewhere (adapters expose reactions via ``send_message(action="react")``);
-defaults to the triggering message and emits ``message.reaction`` for live painting."""
+"""React to the triggering gateway message or persist a desktop tapback."""
 
 import contextlib
 import json
+import logging
 
 from gateway.session_context import get_session_env
 from tools import desktop_ui
 from tools.registry import registry, tool_error
+
+logger = logging.getLogger(__name__)
+
+
+def _gateway_platform():
+    from gateway.config import Platform
+    try:
+        platform = Platform(get_session_env("HERMES_SESSION_PLATFORM"))
+    except ValueError:
+        return None
+    return platform if platform != Platform.LOCAL else None
+
+
+def _react_gateway(platform, emoji: str) -> str:
+    from gateway.session_context import acknowledge_current_message_reaction
+    from model_tools import _run_async
+    from tools.send_message_senders import _live_adapter
+    from tools.send_message_tool import _dispatch_on_gateway_loop
+
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID")
+    if not chat_id or not message_id:
+        return tool_error("No triggering message is bound to this gateway turn.")
+    if not emoji:
+        return tool_error("Gateway reactions require an emoji. Retraction is desktop-only.")
+    runner, adapter = _live_adapter(platform)
+    if adapter is None:
+        return tool_error(f"No live {platform.value} adapter is available for this session.")
+    routing = {key: get_session_env(f"HERMES_SESSION_{key.upper()}")
+               for key in ("scope_id", "thread_id", "user_id", "parent_chat_id")}
+    routing["team_id"] = routing["scope_id"]
+    try:
+        result = _run_async(_dispatch_on_gateway_loop(
+            runner, lambda: adapter.add_reaction(chat_id, message_id, emoji, **routing),
+            "react: failed to schedule reaction on gateway loop",
+        ))
+    except Exception as exc:
+        logger.debug("Gateway reaction delivery failed", exc_info=True)
+        return tool_error(f"Reaction failed: {exc}")
+    if result is not True:
+        return tool_error(f"Platform '{platform.value}' does not support this reaction or delivery failed.")
+    acknowledge_current_message_reaction()
+    return json.dumps({"success": True, "platform": platform.value, "chat_id": chat_id,
+                       "message_id": message_id, "emoji": emoji}, ensure_ascii=False)
 
 
 def _open_session_db():
@@ -24,6 +66,11 @@ def _open_session_db():
 def react_tool(emoji: str, message_row_id=None, messages_back=None) -> str:
     """Attach (or with an empty ``emoji`` retract) the agent's reaction."""
     emoji = (emoji or "").strip()
+    platform = _gateway_platform()
+    if platform is not None:
+        if message_row_id is not None or messages_back is not None:
+            return tool_error("Earlier-message selectors are desktop-only. Omit them to react to the triggering message.")
+        return _react_gateway(platform, emoji)
     # Routing keys identify a channel; message rows belong to the live durable session.
     session_key = get_session_env("HERMES_SESSION_ID", "") or get_session_env("HERMES_SESSION_KEY", "")
     if not session_key:
@@ -60,7 +107,7 @@ def react_tool(emoji: str, message_row_id=None, messages_back=None) -> str:
 
 
 def check_react_requirements() -> bool:
-    """Opt-in flag (Settings → Appearance); ``desktop_ui`` already restricts to GUI sessions."""
+    """Desktop opt-in, resolved during session toolset selection, never profile-cached."""
     return desktop_ui.user_enabled("message_reactions", default=False)
 
 
@@ -76,8 +123,11 @@ REACT_SCHEMA = {
         "never as a status signal. NEVER narrate or explain a reaction ('I reacted "
         "with...', 'Reacting now') — the emoji appearing on the bubble is the whole "
         "point, and commentary kills it. Defaults to the user's most recent message. "
-        "One reaction per message: a different emoji replaces yours, an empty string "
-        "retracts it."
+        "On messaging platforms, omit the desktop-only message selectors to react to "
+        "the inbound message that triggered this turn. Slack uses a reaction name "
+        "such as '+1', other platforms use their supported emoji. Replacement rules "
+        "are platform-specific. On desktop, a different emoji replaces yours and an "
+        "empty string retracts it."
     ),
     "parameters": {
         "type": "object",
@@ -111,9 +161,9 @@ REACT_SCHEMA = {
 
 
 registry.register(
-    name="react", toolset="desktop_ui", schema=REACT_SCHEMA,
+    name="react", toolset="reactions", schema=REACT_SCHEMA,
     handler=lambda args, **kw: react_tool(
         emoji=args.get("emoji", ""), message_row_id=args.get("message_row_id"),
         messages_back=args.get("messages_back")),
-    check_fn=check_react_requirements, emoji="👍",
+    emoji="👍",
 )

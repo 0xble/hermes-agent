@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import logging
+from pathlib import Path
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
@@ -19,7 +20,8 @@ logger = logging.getLogger(__name__)
 def producer_identity(runner, event):
     identity = runner._completion_delivery_identity(event)
     if identity is None:
-        raise RuntimeStoreError('invalid_params')
+        raise RuntimeStoreError('invalid_params', field='producer_identity',
+                                detail=f"event_type={event.get('type', 'completion')}")
     return json.dumps(identity, separators=(',', ':'))
 
 
@@ -264,8 +266,23 @@ def _route_owner(authority, entry):
 def _owner(runner, event, authority):
     route = event.metadata.get('gateway_session_key') or runner.session_store._generate_session_key(event.source)
     entry = runner.session_store.lookup_by_session_key(route)
-    if entry is None or entry.suspended:
-        raise RuntimeStoreError('not_found')
+    if entry is None:
+        # A route not yet restored is not proof its work is stale. Only a known
+        # absent/ended target in this source's proven runtime home is stale.
+        from gateway.session_identity import proven_runtime_home
+        home = proven_runtime_home(event.source)
+        same_home = (home is not None and
+                     (home / 'state.db').resolve() == Path(authority.db.db_path).resolve())
+        same_route = runner.session_store._generate_session_key(event.source) == route
+        expected = event.metadata.get('gateway_session_id')
+        tip = authority.db.get_compression_tip(expected) if expected else None
+        target = authority.db.get_session(tip or expected) if expected else None
+        field = ('automation_target_gone' if same_home and same_route and expected and
+                 (target is None or target.get('ended_at') is not None)
+                 else 'automation_route_unavailable')
+        raise RuntimeStoreError('not_found', field=field)
+    if entry.suspended:
+        raise RuntimeStoreError('not_found', field='automation_target_suspended')
     if runner.session_store._generate_session_key(event.source) != route:
         raise RuntimeStoreError('admission_conflict')
     expected = event.metadata.get('gateway_session_id')
@@ -301,6 +318,19 @@ def automation_display_metadata(metadata):
         raise RuntimeStoreError('invalid_params')
     return {'display_kind': kind, 'display_text': text}
 
+def automation_retry_metadata(descriptor):
+    """Preserve the existing cancellation fence, not arbitrary producer metadata."""
+    key = 'delegation_retry_notice'
+    if key not in descriptor:
+        return {}
+    stamp = descriptor[key]
+    if (not isinstance(stamp, dict) or set(stamp) != {'delegation_id', 'claim'}
+            or any(not isinstance(stamp[name], str) or not stamp[name].strip()
+                   for name in ('delegation_id', 'claim'))):
+        raise RuntimeStoreError('invalid_params', field=key)
+    return {key: dict(stamp)}
+
+
 # notification_origin / original_trigger_message_id are producer debug context (#52694) and are not
 # persisted; notification_category="diagnostic" rides the snapshot so the replayed wake still mutes,
 # and display_kind/display_text so the persisted row is the card the producer named; heartbeat_tick is
@@ -311,7 +341,8 @@ def automation_display_metadata(metadata):
 # proof at execution from the target the pre-claim check validated, and the turn's resolver reads it.
 _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
-    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick'})
+    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
+    'delegation_retry_notice'})
 
 
 def admission_display(payload):
@@ -349,11 +380,12 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
             or not isinstance(event.text, str) or not identity
-            or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER
-            or set(event.metadata) - _AUTOMATION_METADATA):
-        raise RuntimeStoreError('invalid_params')
+            or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER):
+        raise RuntimeStoreError('invalid_params', field='automation_event')
+    if set(event.metadata) - _AUTOMATION_METADATA:
+        raise RuntimeStoreError('invalid_params', field='automation_metadata')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
-                    | _tick_metadata(event.metadata))
+                    | _tick_metadata(event.metadata) | automation_retry_metadata(event.metadata))
     entry = captured[0] if captured is not None else _owner(runner, event, authority)
     if event.source.platform == Platform.LOCAL:
         return snapshot_local_automation(authority, adapter, event, identity, entry,
@@ -362,12 +394,14 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     owner = captured[2] if captured is not None else authority.logical_owner(entry.session_id)
     envelope = captured[1] if captured is not None else committed_route_envelope(authority, entry)
     if envelope is None:
-        raise RuntimeStoreError('not_found')
-    # Persisted origins deliberately omit relay trust. Borrow only an exact
-    # committed source's private proof, revalidated against the live connector.
-    # Recheck only the source/provenance: a completed input's retained media is already released.
-    restored = restore_native({'text': event.text, 'native_text_v1': {
-        key: value for key, value in envelope.items() if key != 'media'}}, runner)
+        from gateway.session_automation_legacy import revalidate_legacy_route
+        restored, envelope = revalidate_legacy_route(authority, entry, adapter)
+    else:
+        # Persisted origins deliberately omit relay trust. Borrow only an exact
+        # committed source's private proof, revalidated against the live connector.
+        # A completed input's retained media is already released.
+        restored = restore_native({'text': event.text, 'native_text_v1': {
+            key: value for key, value in envelope.items() if key != 'media'}}, runner)
     # Synthetic wakes clear ``message_id`` (#52694, #123097) while the committed human source keeps
     # it, so compare the routing/provenance identity, never the platform reply anchor.
     if (_route_identity(restored.source) != _route_identity(event.source)
@@ -421,6 +455,7 @@ def snapshot_local_automation(authority, adapter, event, identity, entry, *, ref
                   'route': entry.session_key, 'target': entry.session_id}
     descriptor.update(automation_notification_metadata(event.metadata))
     descriptor.update(automation_display_metadata(event.metadata))
+    descriptor.update(automation_retry_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
     if event.metadata.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
@@ -460,6 +495,7 @@ def restore_local_automation(authority, ref, row):
             'gateway_session_id': entry.session_id})
     event.metadata.update(automation_notification_metadata(descriptor))
     event.metadata.update(automation_display_metadata(descriptor))
+    event.metadata.update(automation_retry_metadata(descriptor))
     if descriptor.get('turn_author') is not None:
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
     if descriptor.get('heartbeat'):

@@ -261,6 +261,40 @@ class TestUserOriginatedTurnPredicate:
         assert user_originated_turn_view(hidden)["content"] == "REAL ASK"
         assert user_originated_turn_view(typed) is None
 
+    @pytest.mark.parametrize("kind", [None, "hidden", "steer", "auto_continue", "internal_notification"])
+    @pytest.mark.parametrize("layout", ["leading", "merged"])
+    def test_carried_human_input_keeps_user_authority(self, kind, layout):
+        from agent.prompt_builder import steer_user_row
+
+        ask = steer_user_row("focus on the current ask")["content"]
+        carrier = _composite_handoff(ask)
+        if layout == "merged":
+            carrier["content"] = (
+                f"{_MERGED_PRIOR_CONTEXT_HEADER}\n{ask}\n\n"
+                f"{_MERGED_SUMMARY_DELIMITER}\n{_standalone_handoff()['content']}"
+            )
+        if kind is not None:
+            carrier["display_kind"] = kind
+        expected = kind in {None, "hidden", "steer"}
+        compressor = ContextCompressor(model="test/model", config_context_length=100_000)
+        before = carrier.copy()
+        handoff, live = split_user_originated_turn(carrier)
+
+        assert is_user_originated_turn(carrier) is expected
+        assert ContextCompressor._is_real_user_turn(carrier) is expected
+        assert compressor._find_last_user_message_idx([carrier], 0) == (0 if expected else -1)
+        assert ContextCompressor._real_user_indices_desc([carrier], 0) == ([0] if expected else [])
+        assert handoff is not None
+        assert ask not in handoff["content"]
+        assert (live["content"] if live is not None else None) == (ask if expected else None)
+        assert carrier == before
+
+    def test_standalone_steer_handoff_is_not_human_input(self):
+        carrier = {**_standalone_handoff(), "display_kind": "steer"}
+        assert user_originated_turn_view(carrier) is None
+        compressor = ContextCompressor(model="test/model", config_context_length=100_000)
+        assert compressor._find_last_user_message_idx([carrier], 0) == -1
+
     def test_rewind_prefix_preserves_only_the_carrier_scaffold(self):
         messages = [
             {"role": "assistant", "content": "prefix"},

@@ -1115,6 +1115,8 @@ def _prepare_runtime_status_update(
         payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
         payload["updated_at"] = _utc_now_iso()
         payload.update(_get_code_identity_fields())
+        from gateway.admission_canary import snapshot as admission_snapshot
+        payload["native_admission"] = admission_snapshot()
         _apply_set_fields(payload, (
             ("gateway_state", gateway_state, None), ("exit_reason", exit_reason, None),
             ("restart_requested", restart_requested, bool),

@@ -73,7 +73,7 @@ def _emit_goal_receipt(agent, function_name: str, result: Any) -> None:
             # goal and contract); single-line drivers show only the headline.
             agent._emit_notice(AgentNotice(
                 text=text, level="info", kind="ttl", ttl_ms=CREDITS_RESTORED_TTL_MS,
-                key=notice_key, id=notice_key,
+                key=notice_key, id=notice_key, notice_style="context",
             ))
         else:
             agent._vprint(text, force=True)

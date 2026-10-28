@@ -161,7 +161,60 @@ def test_early_terminal_unit_is_handled_without_sync_rerun(registry_state, monke
     dispatch_module._restore_parent_cancellation(batch)
 
 
-@pytest.mark.parametrize("rejection", ["schedule_failure", "partial_schedule_failure", "capacity"])
+def test_submit_error_after_driver_start_never_replays_inline(registry_state, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    parent, child = _Parent(), _ControlledChild()
+    batch = _batch(parent, child)
+    did = batch.live_deleg_id = "deleg_submit_error_after_driver_start"
+    calls = []
+    callbacks_done = threading.Event()
+
+    def converse(**kwargs):
+        calls.append(kwargs["user_message"])
+        child.started.set()
+        if len(calls) == 1:
+            assert child.allow_finish.wait(10)
+        return {"final_response": "completed once", "completed": True, "api_calls": 1, "messages": []}
+
+    monkeypatch.setattr(child, "run_conversation", converse)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        class RaiseAfterStartExecutor:
+            def submit(self, *args, **kwargs):
+                executor.submit(*args, **kwargs)
+                assert child.started.wait(10)
+                raise RuntimeError("submit failed after its callable started")
+
+        monkeypatch.setattr(async_delegation, "_get_executor", lambda _capacity: RaiseAfterStartExecutor())
+        try:
+            result = json.loads(_dispatch_background(batch))
+            assert calls == [batch.task_list[0]["goal"]], (
+                "a submit exception after actual driver start must not replay the same child inline"
+            )
+            assert result["status"] == "dispatched"
+            with async_delegation._records_lock:
+                future = async_delegation._records[did]["_future"]
+            assert future is not None and not future.done()
+            future.add_done_callback(lambda _future: callbacks_done.set())
+            pending = async_delegation.get_durable_delegation(did)
+            assert pending is not None and pending["state"] == "running"
+            assert pending["unit_execution"] == {}
+            assert registry_state.empty(), "an active driver must not publish a scheduling-failure outcome"
+            child.allow_finish.set()
+            future.result(timeout=10)
+            assert callbacks_done.wait(10)
+            event = registry_state.get(timeout=10)
+            assert event["delegation_id"] == did and event["results"][0]["summary"] == "completed once"
+            assert registry_state.empty()
+            finished = async_delegation.get_durable_delegation(did)
+            assert finished is not None and finished["unit_execution"]["checkpoint"] == "finished_unit"
+            assert finished["child_execution"]["0"]["checkpoint"] == "finished_child"
+            assert calls == [batch.task_list[0]["goal"]]
+        finally:
+            child.allow_finish.set()
+
+
+@pytest.mark.parametrize("rejection", ["no_async", "schedule_failure", "partial_schedule_failure", "capacity"])
 @pytest.mark.parametrize("stop_timing", ["running", "during_admission"])
 @pytest.mark.parametrize("stop_kind", ["soft", "hard"])
 def test_rejected_background_child_stops_with_parent(
@@ -209,6 +262,13 @@ def test_rejected_background_child_stops_with_parent(
                 raise RuntimeError("executor shut down")
 
         monkeypatch.setattr(async_delegation, "_get_executor", lambda _n: RejectingExecutor())
+    elif rejection == "no_async":
+        def pause_no_async(*_args):
+            admission_started.set()
+            assert continue_admission.wait(5)
+            return None
+
+        monkeypatch.setattr(dispatch_module, "_resolve_async_wake_sid", pause_no_async)
     else:
         executor = async_delegation._get_executor(3)
 
@@ -283,6 +343,10 @@ def test_rejected_background_child_stops_with_parent(
             assert pending_child.stop_received.is_set(), "unsubmitted unit lost parent cancellation ownership"
             assert not pending_child.started.is_set()
         assert not outcome.done(), "dispatch returned while its child still owned resources"
+        from tools import async_delegation_completion as execution
+        assert not execution.seal_execution("", child_session_id=child.session_id), (
+            "no durable row or a failed admission cannot prove that an inline driver finished"
+        )
         assert child.close_count == 0
         child.allow_finish.set()
         result = outcome.result(timeout=5)
@@ -299,6 +363,9 @@ def test_rejected_background_child_stops_with_parent(
         assert child.close_count == 1
         assert not child.closed_while_running
         assert parent._active_children == []
+        assert not execution.seal_execution("", child_session_id=child.session_id), (
+            "inline cleanup without a durable unit-driver checkpoint must remain unknown"
+        )
     finally:
         continue_admission.set()
         if not child.finished.is_set():

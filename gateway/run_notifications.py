@@ -26,6 +26,7 @@ _UpdateTarget = Any
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
+from agent.notice_style import ContextNotice, notice_metadata
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
@@ -82,9 +83,6 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
 
 # A failed /update leaves the previous version running; the full pip/git log stays on the host
 # (`hermes update` re-runs it in the terminal) and only a short tail is quoted in chat.
-def _update_failed_notice() -> str:
-    return t("gateway.update.failed_notice")
-
 # An update's completion notice waits for its target platform adapter to (re)connect before it
 # can be delivered. Nothing bounds that wait, so a marker naming a platform that is not
 # configured at all — no adapter will ever appear — would keep itself on disk and re-log a
@@ -130,11 +128,6 @@ def _bounded_update_notice(text: str) -> str:
     return text[:_UPDATE_MAX_NOTICE_CHARS - 1].rstrip() + "…"
 
 
-def _update_output_tail(output: str, limit: int) -> str:
-    """Last ``limit`` chars of an update log, prefixed with an ellipsis when cut."""
-    return output if len(output) <= limit else "…" + output[-limit:]
-
-
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
     """Notice-dedupe key for one SERVED profile's home channel.
 
@@ -172,9 +165,9 @@ _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", 
 # Process-watcher retries of a refused completion: ~5 min at the default 5 s check interval.
 _MAX_COMPLETION_INJECTION_ATTEMPTS = 8
 _COMPLETION_INJECTION_RETRY_MAX_DELAY = 60
-# Drain retries of a refused watch event follow the same bounded-backoff policy, keyed to the
-# 2 s drain cadence instead of the watcher's check interval (#140899).
-_WATCH_INJECTION_RETRY_BASE_DELAY = 4.0
+# Refused-watch backoff starts at 10 s so hot process retries leave freed background-turn
+# slots available for goal and loop wakes. The drain cadence is 2 s (#140899).
+_WATCH_INJECTION_RETRY_BASE_DELAY = 10.0
 
 
 def _refusal_retry_at(step: int) -> float:
@@ -418,7 +411,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         proven_session_id: str = ""  # session the pre-flight proved delivery reaches (a compression tip included)
         defer: bool = False  # unadmitted retry: settle without spending a delivery attempt
 
-    async def _deliver_platform_notice(self, source, content: str) -> bool:
+    async def _deliver_platform_notice(self, source, content: str, *, notice_style: Optional[str] = None) -> bool:
         """Deliver with platform privacy rules; return only an affirmative send receipt."""
         from gateway.run import _is_slack_ignored_channel
         adapter = self._delivery_adapter_for(source)
@@ -445,6 +438,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         # stream-is-the-message adapter would seal an open foreground draft with this notice.
         from gateway.run import _interim_metadata
         metadata = _interim_metadata(self._thread_metadata_for_source(source))
+        metadata = notice_metadata(metadata, platform=source.platform, style=notice_style or getattr(content, "notice_style", None))
         if notice_delivery == "private" and getattr(source, "user_id", None):
             with _log_suppressed(
                 logging.DEBUG, "[%s] send_private_notice failed, falling back to public",
@@ -1100,7 +1094,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             heading = "⬆️ Updating"
             detail = "The native update was started. Progress follows here."
         try:
-            result = await target.send(notice(heading, pending, detail))
+            result = await target.send(ContextNotice(notice(heading, pending, detail)))
             current = self._current_update(paths, original)
             if not current:
                 return False
@@ -1218,7 +1212,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             else:
                 heading, detail = "❌ Update Failed", detail
             detail = _bounded_previous_update_detail(detail, pending)
-            result = await target.send(_bounded_update_notice(notice(heading, pending, detail)))
+            text = _bounded_update_notice(notice(heading, pending, detail))
+            result = await target.send(ContextNotice(text) if success else text)
             current = self._current_update(paths, original)
             if not current:
                 return False
@@ -1280,7 +1275,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         metadata[field] = str(data[field])
             result = await transport.send(
                 platform, str(chat_id), t("gateway.startup.restarted"),
-                metadata=_non_conversational_metadata(metadata, platform=platform),
+                metadata=notice_metadata(_non_conversational_metadata(metadata, platform=platform),
+                                         platform=platform, style="context"),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found") and returns
             # SendResult(success=False) rather than raising, so inspect the result before claiming success.
@@ -1349,7 +1345,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     metadata["user_id"] = home.user_id
                 if home.scope_id:
                     metadata["scope_id"] = home.scope_id
-            send_metadata = _non_conversational_metadata(metadata, platform=platform)
+            send_metadata = notice_metadata(_non_conversational_metadata(metadata, platform=platform),
+                                            platform=platform, style=getattr(message, "notice_style", None))
             if send_metadata is not None or transport.is_relay:
                 result = await transport.send(platform, str(home.chat_id), message, metadata=send_metadata)
             else:
@@ -1416,7 +1413,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = t("gateway.startup.online")
+        message = ContextNotice(t("gateway.startup.online"))
         targets = list(self._served_home_channel_transports())
         # A chat already notified for ANOTHER profile is not notified again.
         notified_chats = {
@@ -1582,20 +1579,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
-        """Consume queued watch events and inject them when notifications are enabled.
-
-        The queue is ALWAYS drained (so watch events don't rot or requeue-spin) but injection is
-        skipped when the OWNING profile's ``display.background_process_notifications`` is ``off``
-        — one shared queue carries every served profile's events, so the gate is evaluated per
-        event inside its profile scope, never once for the ambient (launch) profile.
-
-        See #9290.
-        """
+        """Consume watches in their owning profile, backing off refusals even during drain."""
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
         for evt in watch_events:
             next_retry_at = evt.get("_watch_next_retry_at")
-            if next_retry_at is not None and next_retry_at > time.monotonic():
+            draining = getattr(self, "_draining", False)
+            drain_offered = evt.pop("_watch_drain_offered", False)
+            if draining:
+                evt["_watch_drain_offered"] = True
+            # Offer a held event once per drain for spooling, not on every refused tick.
+            if (next_retry_at is not None and next_retry_at > time.monotonic()
+                    and (not draining or drain_offered)):
                 # Backoff between refused injections: hold the event for a later drain tick
                 # instead of re-attempting admission every 2 s (#140899).
                 completion_queue.put(evt)
@@ -1741,6 +1736,36 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return _transport.adapter
         return next((a for p, a in adapters.items() if p.value == platform_name), None)
 
+    def _platform_adapter_for_unproven_relay(self, platform_name: str, source, evt: dict):
+        """Platform adapter for a relay-flagged pre-ledger route, else None.
+
+        Missing relay connector plus no committed envelope is a counted refusal,
+        not a silent retry. An envelope-backed relay route keeps waiting.
+        """
+        from copy import copy
+
+        probe = copy(source)
+        probe.delivered_via_upstream_relay = False
+        platform_adapter = self._resolve_injection_adapter(platform_name, probe)
+        if platform_adapter is None:
+            return None
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        session_key = str(evt.get("session_key") or "").strip()
+        if authority is None or not session_key:
+            return None
+        try:
+            self.session_store._ensure_loaded()
+            entry = self.session_store._entries.get(session_key)
+        except Exception:
+            return None
+        if entry is None:
+            return None
+        from gateway.session_automation import committed_route_envelope
+        if committed_route_envelope(authority, entry) is not None:
+            return None
+        return platform_adapter
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
     ) -> Optional[bool]:
@@ -1782,6 +1807,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # A route-only served profile owns no adapter map; the shared listener wakes exactly the
             # session that profile's store owns (proven in ``_self_post_api_server``), fail-closed.
             adapter = self.adapters.get(Platform.API_SERVER)
+        if not adapter and getattr(source, "delivered_via_upstream_relay", False) is True:
+            # A persisted relay flag is not a connector. A pre-ledger route must
+            # still reach admission so the unproven grant is refused and counted.
+            # A committed envelope waits for the relay adapter.
+            adapter = self._platform_adapter_for_unproven_relay(platform_name, source, evt)
         if not adapter:
             return False
         if not adapter_supports_push(adapter):
@@ -1879,8 +1909,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return None
             if not raise_not_accepted:
                 evt["_refusal_permanent"] = exc.permanent  # the drain counts only permanent refusals
-            logger.warning("Watch notification not admitted for %s chat=%s: %s",
-                           platform_name, source.chat_id, exc)
+            from gateway.session_refusals import log_internal_refusal
+            cause = exc.__cause__
+            log_internal_refusal(self, source, exc.reason or str(exc), getattr(cause, 'field', None))
             # Durable callers refund the claim; ordinary watch callers just requeue.
             if raise_not_accepted:
                 raise
@@ -1905,6 +1936,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         ``started_at`` are delivered undeduplicated rather than risk suppressing a real completion.
         """
         evt_type = str(evt.get("type") or "")
+        if evt_type in {"delegation_retry", "delegation_auto_resume"}:
+            producer_id = str(evt.get("delegation_id") or "").strip()
+            claim = (str(evt.get("retry_notice_claim") or "").strip()
+                     if evt_type == "delegation_retry" else "boot")
+            if not producer_id or not claim:
+                return None
+            return (evt_type, producer_id, claim)
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
             if not producer_id:
@@ -2821,7 +2859,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 suppressed = authorized is None
                 if authorized is True:
                     accepted = await self._inject_watch_notification(
-                        action["text"], {**action, "retry_notice_claim": claim}) is True
+                        action["text"], {**action, "type": "delegation_retry", "retry_notice_claim": claim}) is True
             except Exception:
                 logger.debug("Delegation %s: retry notice injection failed", delegation_id, exc_info=True)
             settle = (dr.suppress_retry_notice if suppressed else
@@ -3162,7 +3200,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             notify_mode = self._load_background_notifications_mode()
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
-        silent = notify_mode == "off" and not agent_notify
+        # Explicit completion intent must not override the owning profile's notifications-off policy.
+        silent = notify_mode == "off"
         last_output_len = 0
         busy_receipt_sent = False
         text_retry_interval = min(max(interval, 1.0), 30.0)

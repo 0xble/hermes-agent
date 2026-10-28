@@ -64,6 +64,7 @@ INELIGIBLE_BATCH = "batch_delegation"
 INELIGIBLE_PARTIAL = "partial_results_recorded"
 INELIGIBLE_STATELESS = "stateless_origin"
 INELIGIBLE_CLAIMED = "already_claimed"
+INELIGIBLE_SEALED = "execution_sealed"
 
 
 def _ad():
@@ -189,9 +190,24 @@ def _batch_recovery_tasks(record: Dict[str, Any], indexes: Optional[List[int]] =
     return tasks
 
 
+def _recovery_admission_error(record: Dict[str, Any]) -> Optional[str]:
+    """Shared closure gate for new claims and replacement admission.
+
+    An explicit execution seal closes admission without changing its outcome
+    or pretending that the user stopped it.
+    """
+    if (record.get("task") or {}).get("execution_sealed_at"):
+        return INELIGIBLE_SEALED
+    if _recovery_stopped(record):
+        return INELIGIBLE_STATE
+    return None
+
+
 def _batch_resume_eligibility(record: Dict[str, Any]) -> Optional[str]:
     """Eligibility for a fan-out recovery, kept separate from legacy single-task rules."""
-    if record["state"] not in RESUMABLE_STATES or _recovery_stopped(record):
+    if reason := _recovery_admission_error(record):
+        return reason
+    if record["state"] not in RESUMABLE_STATES:
         return INELIGIBLE_STATE
     if not (record["parent_session_id"] or record["origin_session_id"]):
         return INELIGIBLE_STATELESS
@@ -214,7 +230,9 @@ def _unfinished_scalar_result(task: Dict[str, Any], results: Any) -> bool:
 
 def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     """None when the record may be resumed, else a stable refusal token."""
-    if record["state"] not in RESUMABLE_STATES or _recovery_stopped(record):
+    if reason := _recovery_admission_error(record):
+        return reason
+    if record["state"] not in RESUMABLE_STATES:
         return INELIGIBLE_STATE
     task = record["task"]
     # Production background units retain batch metadata for completion formatting
@@ -390,7 +408,7 @@ def claim_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[O
         return None, INELIGIBLE_NO_ROW
     claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
     now = time.time()
-    with ad._DB_LOCK, ad._transaction() as conn:
+    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
         record = _load(conn, delegation_id)
         if record is None:
             return None, INELIGIBLE_NO_ROW
@@ -419,7 +437,7 @@ def claim_batch_resume(delegation_id: str, consumer: str = "delegate_task") -> T
         return None, INELIGIBLE_NO_ROW
     claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
     now = time.time()
-    with ad._DB_LOCK, ad._transaction() as conn:
+    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
         record = _load(conn, delegation_id)
         if record is None:
             return None, INELIGIBLE_NO_ROW
@@ -808,9 +826,10 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
     """Classify one terminal ``armed`` row exactly once. Returns the plan, or None when not applicable."""
     ad = _ad()
     now = time.time() if now is None else now
-    with ad._DB_LOCK, ad._transaction() as conn:
+    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
         record = _load(conn, delegation_id)
-        if record is None or record["retry_state"] != RETRY_ARMED:
+        if (record is None or record["retry_state"] != RETRY_ARMED
+                or _recovery_admission_error(record) == INELIGIBLE_SEALED):
             return None
         if record["state"] in {"new", "queued", "admitted", "running", "stalling", "finalizing"}:
             return None
@@ -889,7 +908,7 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     classify_armed(now=now, limit=limit)
     actions = []
     stale = now - RETRY_CLAIM_TTL_S
-    with ad._DB_LOCK, ad._transaction() as conn:
+    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
         conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
         rows = conn.execute(
             _RETRY_SELECT + """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
@@ -909,6 +928,11 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
             (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S, limit)).fetchall()
         for row in rows:
             record = _retry_record(row)
+            # An execution seal blocks recovery work, not an already-owed
+            # terminal delivery. Reporting cannot admit a replacement driver.
+            if (_recovery_admission_error(record) == INELIGIBLE_SEALED
+                    and record["retry_state"] not in (RETRY_TERMINAL, RETRY_REPORTING)):
+                continue
             dispatch_claim = record["retry_claim"] if record["retry_state"] == RETRY_DISPATCHING else None
             stopped = _recovery_stopped(record)
             if stopped:
@@ -1055,7 +1079,7 @@ def _retry_child_claim_eligibility(conn, record: Dict[str, Any]) -> Optional[str
 
 def _resume_available_in(conn, delegation_id: str) -> bool:
     record = _load(conn, delegation_id)
-    if record is None:
+    if record is None or _recovery_admission_error(record):
         return False
     if record["retry_state"] in RETRY_PENDING_STATES + (RETRY_DISPATCHED, RETRY_REPORTED):
         return (record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED)
@@ -1105,15 +1129,15 @@ def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], 
     if not delegation_id:
         return None, INELIGIBLE_NO_ROW
     now = time.time()
-    with ad._DB_LOCK, ad._transaction() as conn:
+    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
         record = _load(conn, delegation_id)
         if record is None:
             return None, INELIGIBLE_NO_ROW
         if record["retry_state"] not in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED):
             return record, INELIGIBLE_CLAIMED if record["retry_state"] in (RETRY_DISPATCHING, RETRY_DISPATCHED) \
                 else INELIGIBLE_STATE
-        if _recovery_stopped(record):
-            return record, INELIGIBLE_STATE
+        if reason := _recovery_admission_error(record):
+            return record, reason
         if reason := _expire_retry(conn, record, now):
             return record, reason
         if reason := _retry_child_claim_eligibility(conn, record):
@@ -1128,19 +1152,19 @@ def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], 
     return record, None
 
 
+def _has_recovery_claim(record: Dict[str, Any]) -> bool:
+    return (record["retry_state"] == RETRY_DISPATCHING
+            or (record["retry_state"] == RETRY_NONE
+                and record["resume_state"] == RESUME_STATE_CLAIMED
+                and bool(record.get("resume_claim"))))
+
+
 def claimed_retry_source(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return the recovery row whose claim authorizes this recovery spawn."""
     ad = _ad()
     with ad._DB_LOCK, ad._transaction() as conn:
         prior = _replacement_source(conn, record, str(record.get("context") or ""))
-    if prior and (
-        prior["retry_state"] == RETRY_DISPATCHING
-        or (prior["retry_state"] == RETRY_NONE
-            and prior["resume_state"] == RESUME_STATE_CLAIMED
-            and prior.get("resume_claim"))
-    ):
-        return prior
-    return None
+    return prior if prior and _has_recovery_claim(prior) else None
 
 
 def recovery_source_id(context: Any) -> Optional[str]:
@@ -1235,6 +1259,8 @@ def replacement_admission_error(conn, new: Dict[str, Any], task_text: str) -> Op
     prior = _replacement_source(conn, new, task_text)
     if prior is None:
         return None
+    if _has_recovery_claim(prior) and _recovery_admission_error(prior) == INELIGIBLE_SEALED:
+        return "recovery execution is sealed; no replacement was started"
     if _recovery_stopped(prior):
         return "recovery source was stopped without restart continuation; no replacement was started"
     indexes = _replacement_children(conn, prior, new)

@@ -207,12 +207,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if getattr(source, "message_id", None):
             from gateway.session_identity import replace_source
             source = replace_source(source, message_id=None)
-        return MessageEvent(
+        event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
             reply_expected=reply_expected,
             metadata=metadata,
             inherit_channel_pin=True,
         )
+        from gateway.session_synthetic import mark_synthetic
+        mark_synthetic(event)
+        return event
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
@@ -331,7 +334,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             notice_kind or _goal_notice_kind(message), attempts, error or "unknown error",
         )
 
-    def _track_goal_notice_retry(self, task: "asyncio.Task") -> None:
+    def _track_goal_notice_retry(self, task: asyncio.Task) -> None:
         retain = getattr(self, "_retain_background_task", None)
         if callable(retain):
             retain(task)
@@ -413,6 +416,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        from agent.notice_style import notice_metadata
+        metadata = notice_metadata(metadata, platform=source.platform, style=getattr(message, "notice_style", None))
         from gateway.platforms.base import outbound_class
         try:
             with outbound_class(_goal_notice_outbound_class(message, notice_kind)):
@@ -554,7 +559,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 logger.debug("goal stop: notice failed: %s", exc)
             return True
 
-    def _post_turn_goal_identity(self, event) -> Dict[str, Any]:
+    def _post_turn_goal_identity(self, event) -> dict[str, Any]:
         """Plain-data identity of the turn whose response the post-turn goal judge evaluates."""
         if event is None:
             return {"user_turn": False, "goal_instance": None, "loop_tick": None}
@@ -603,8 +608,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if mgr is None:
                 return
             try:
+                from agent.notice_style import ContextNotice
                 await self._send_goal_status_notice(
-                    source, f"▶ Goal resumed: {mgr.state.goal}", notice_kind="resumed",
+                    source, ContextNotice(f"▶ Goal resumed: {mgr.state.goal}"), notice_kind="resumed",
                 )
             except Exception as exc:
                 logger.debug("goal recovery notice failed: %s", exc)
@@ -977,7 +983,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         no live, admitted, queued or restart-recovering turn owns it, then recovery skips it and
         schedules the next tick without pausing the loop.
         """
-        from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
+        from hermes_cli.loops import LoopManager, goal_blocks_loop_tick, self_paced_floor_seconds
         from gateway.wake import automatic_route_available
 
         if not state.awaiting_response and now < state.next_due_at:
@@ -1082,14 +1088,29 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         def _due_manager():
             from agent.estop import check_paused
             if check_paused("loop", logger):
-                return None
-            if goal_blocks_loop_tick(sid):
-                return None
+                return None, False, 0
             mgr = LoopManager(session_id=sid)
-            return mgr if mgr.is_due(now) else None
+            state = mgr.state
+            if state is None or not mgr.is_due(now):
+                return None, False, 0
+            interval = state.interval_seconds or self_paced_floor_seconds()
+            return mgr, goal_blocks_loop_tick(sid), interval
 
-        mgr = await self._run_in_executor_with_context(_due_manager)
+        mgr, goal_blocks, interval = await self._run_in_executor_with_context(_due_manager)
         if mgr is None:
+            return
+
+        def _log_deferral(reason):
+            logged_at = self.__dict__.setdefault("_loop_deferral_logged_at", {})
+            log_key = (session_key, sid, reason)
+            if now - logged_at.get(log_key, float("-inf")) >= interval:
+                logged_at[log_key] = now
+                logger.info("loop wakeup: session %s deferred by %s", sid, reason)
+
+        # A runnable goal gets the first interval, not indefinite ownership of an idle session.
+        # Live goal turns and continuations still win the turn-owner fences below, at any age.
+        if goal_blocks and now - mgr.state.next_due_at < interval:
+            _log_deferral("active goal")
             return
 
         # Loop wakeups are injected as internal events, which bypass the inbound estop gate; without
@@ -1103,6 +1124,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
         reservation = self._reserve_background_turn(session_key)
         if reservation is None:
+            _log_deferral("full background gate")
             return  # background turn limit reached: the tick stays unclaimed and due
         begin_generation = getattr(self, "_begin_session_run_generation", None)
         if callable(begin_generation):

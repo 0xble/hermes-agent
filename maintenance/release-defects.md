@@ -19,6 +19,42 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 `production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
 
+## Post-Install Admission Canary
+
+- Fork patch identity: `post-install-admission-canary`.
+- A healthy process identity does not prove native ingress works. After release
+  acknowledgement, update and guardian share a bounded refusal canary and the
+  existing guardian rollback, reload and previous-release health proof. Failure
+  persists counts, the dominant refusal clause and rollback health in a guardian
+  receipt, and fails the updater without sending chat notifications.
+- `gateway.guardian.admission_canary` defaults to `enabled: true`,
+  `window_seconds: 180` (10–300) and `refusal_threshold: 10` (5–1000).
+  10 refusals in 3 minutes catches broken ingress without treating isolated
+  invalid input or a quiet gateway as failure. `enabled: false` disables it.
+- `gateway.admission_canary.record_refusal` owns bounded, timestamped, content-free
+  runtime-status evidence. The authority's `admit_native` and `admit_automation`
+  boundaries count each refused attempt once with its source, reason and clause,
+  including internal wakes and suppressed user notices. Receipt-only producer
+  scope also covers pre-admission authorization, codec preparation and retry
+  conflicts. Nested scopes count once per task without suppressing later tasks.
+  Codec, gate and ledger refusals share this hook, not the deduplicated
+  presentation/logging paths.
+  Only events from the acknowledged PID/code identity within the post-ack window
+  count. `release-admission-canary.json` retains the terminal result across the
+  rollback, and the shared guardian lock prevents duplicate rollback attempts.
+- Only proven absent/ended targets in the source's runtime home and explicitly
+  suspended routes are excluded from automation outage evidence. Standalone
+  restore proves that home with a wire-invisible stamp, not a RoutingIdentity.
+  A source rebuilt from its wire dict, or one whose proven home is not this
+  runtime's state DB, stays counted. Missing routes with a live durable target,
+  native refusals, connector/auth failures and invalid producer payloads still
+  count. An unproven relay flag with no live relay adapter reaches admission
+  and is counted; a committed envelope waits for that adapter. The threshold,
+  observation window and acknowledged-process fence are unchanged.
+- Guards: `tests/hermes_cli/test_admission_canary.py`,
+  `tests/gateway/test_admission_canary.py`,
+  `tests/gateway/test_automation_upgrade_admission.py`, and existing guardian/release tests.
+
 ## Billing outage persistence and provider-wide classification
 
 - Fork patch identity: `billing-outage-recovery`.
@@ -964,6 +1000,52 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   No remaining successor source imports `timings_report`.
 - Retire once the next release sync no longer carries these merge points.
 
+## Native Admission Synthetic Metadata
+
+- Fork patch identity: `native-admission-synthetic-metadata`.
+- Upstream native admission (`78646003aeab0`) rejects ordinary inbound metadata. The
+  v0.22.5 fork integration retained gateway-authored goal prompts with routing and
+  continuation metadata, but did not project that producer state into the durable
+  codec. Goals intentionally have `internal=False` so their turns still evaluate
+  goals. Changing that flag would hide the defect by breaking goal lifecycle.
+- Only gateway producer entry points mint private synthetic provenance. The native
+  envelope carries its metadata and internal semantics separately, and restores
+  them before execution. Source, authorization, content and route validation still
+  run. Ordinary user metadata and the WhatsApp-only projection are unchanged.
+- Admission refusals for producer/internal inputs are silent in chat. Internal
+  refusals share one operator warning per 600-second window, with clause counts
+  logged at debug level and summarized in the next window's warning. Human refusal
+  notices are limited per authority/platform/chat/reason to one every 600 seconds,
+  including all threads of that chat. Suppressed attempts log their count.
+- Delegation retry claims and boot-recovery notices have distinct stable producer
+  identities, separate from final delegation results. Retry notices persist only
+  the validated `delegation_retry_notice` cancellation stamp through native and
+  local snapshots and replay. Unknown metadata remains closed. Refusals identify
+  producer-identity, event-shape and unknown-metadata clauses.
+- Guards: `tests/gateway/test_watch_automation_admission.py` drives real watch,
+  process, heartbeat and delegation producers through automation admission,
+  including retry settlement, persisted cancellation fencing, boot-notice dedupe,
+  native/local retry round trips, malformed stamps and unknown-key refusal.
+- Guards: `tests/gateway/test_synthetic_native_admission.py`, including the real
+  lifted-barrier and watch-pattern producer paths, durable restore, source/route
+  revalidation, foreign human metadata, internal silence, and per-chat notice windows.
+  Refusal and callback-rewrite cases use a stored active goal instance so the
+  goal-currency fence admits them to the boundary under test. Unbacked or stale
+  continuations must still be dropped before admission. The user-refusal case also
+  drives a 47-message transport burst and verifies the 599/600-second boundary.
+- Pre-ledger native routes may authorize their first automation against the
+  current registered transport, runtime home and direct allowlist. They do not
+  require a fresh human turn merely to receive a queued process result. Persisted
+  origins are candidates, never connector grants. Relay, role and upstream-only
+  delegation still require private native provenance. No human admission is synthesized.
+- Guards: `tests/gateway/test_automation_upgrade_admission.py` reloads a persisted
+  pre-ledger route, initializes the real authority and injects its queued watch
+  on Telegram topic and Discord routes, including lost transport, changed home,
+  direct-user revocation and unproven relay/role refusals.
+- Roll back as one source unit. No config, schema, state migration or new alert
+  system is involved. Retire when a released upstream provides equivalent producer
+  projection and refusal presentation guards.
+
 ## v0.21.6 merge integration
 
 - Fork patch identity: `v0216-merge-integration`.
@@ -1153,3 +1235,29 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   forces the interleave through real SQLite settlement and `refresh_receipt` and
   expects `settled` with reply `pong`. The paused-resume contract and its timeout
   are unchanged.
+
+## API admission drain check off the owner loop
+
+- Fork patch identity: `api-drain-owner-no-import`.
+- `gateway/platforms/api_server.py` imported `gateway.run` synchronously on the owner loop
+  to read the global runner's drain flags, stalling the loop (~0.85 s cold) ahead of the
+  off-loop SQLite admission. Read the adapter-attached runner first; keep the standalone
+  global fallback.
+- Guards: `tests/gateway/test_api_drain_owner.py` (both drain flags, no-import boundary) and
+  `tests/gateway/test_api_admission_off_loop.py`.
+
+## Delegation model-rejected banner on finished work
+
+- Fork patch identity: `delegation-model-rejected-banner`.
+- `tools/process_registry_notifications.py::_delegation_model_not_found` matched the
+  configured model name plus any model-not-found phrase (`does not exist`, `unknown model`,
+  ...) anywhere in a result's summary, including a task that finished normally. A completed
+  worker whose answer named its own model and said a file "does not exist" therefore raised
+  "SUBAGENT MODEL REJECTED … Every task in this batch failed … before doing any work".
+  Only results that did not finish normally (`exit_reason != "completed"`, set by
+  `tools/delegate_tool_child_run.py`) count, and the banner states the real share
+  (`N of M tasks`) unless every task was rejected.
+- Guards: `tests/tools/test_process_registry_model_not_found.py`, including
+  `test_model_not_found_notice_absent_for_a_normally_finished_task` and
+  `test_model_not_found_notice_counts_only_rejected_tasks`; `tests/tools/test_async_delegation.py`
+  model-rejection notices (a real rejection that exhausts iterations still raises it).

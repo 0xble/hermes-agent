@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Dict
 
-from gateway.response_filters import reply_expected_metadata, silence_allowed
+from gateway.response_filters import reaction_answered, reply_expected_metadata, silence_allowed
 
 if TYPE_CHECKING:
     from gateway.turn_context import TurnContext
@@ -31,6 +31,7 @@ def silence_recovery_due(runner, response: Any, turn_ctx: "TurnContext", *,
     return bool(
         not (silence_retry or scheduled_heartbeat) and isinstance(response, dict)
         and not response.get("interrupted") and response.get("completed") is not False
+        and not reaction_answered(response)
         and runner._is_intentional_silence(response, response.get("final_response", ""))
         and not silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected)
         and turn_ctx._run_still_current()
