@@ -169,12 +169,24 @@ async def probe(root, base, mode):
                         armed['due_at'] = time.time() - 1
                         with sqlite3.connect(home / 'state.db') as db:
                             db.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(armed), 'checkin:' + sid))
-                        await wait_for(lambda: 'SUPERVISOR_STATUS' in json.dumps(outgoing))
+                        try:
+                            await wait_for(lambda: 'SUPERVISOR_STATUS' in json.dumps(outgoing))
+                        except AssertionError as exc:
+                            raise AssertionError(json.dumps({
+                                'outgoing': outgoing,
+                                'model_inputs': [next((m.get('content', '') for m in reversed(r['messages'])
+                                                       if m['role'] == 'user'), '')[:500]
+                                                 for r in model.requests],
+                                'admissions': [{k: r[k] for k in ('request_id', 'status', 'outcome')} for r in rows()],
+                            })) from exc
                         assert model.checkin_turns == 1, model.requests
                         automatic = [r for r in rows() if 'supervisor-checkin' in r['request_id']]
                         assert len(automatic) == 1 and automatic[0]['status'] == 'terminal', automatic
                         assert state()['fired'] and state()['due_at'] > time.time() + 1700
-                        assert '103' in json.dumps(outgoing), outgoing
+                        status_frame = next(f for f in outgoing if 'SUPERVISOR_STATUS' in json.dumps(f))
+                        assert status_frame['action']['chat_id'] == 'automation-chat', status_frame
+                        assert str(status_frame['action']['metadata']['thread_id']) == '103', status_frame
+                        assert status_frame['platform'] == 'telegram' and status_frame['botId'] == 'fixture-bot', status_frame
                         model.gate.touch()
                         await wait_for(lambda: 'COMPLETION_STATUS' in json.dumps(outgoing))
                         await wait_for(lambda: state() is None)
