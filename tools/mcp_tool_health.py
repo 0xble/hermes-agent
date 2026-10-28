@@ -8,7 +8,6 @@ import logging
 import time
 from typing import Iterable, Optional
 from tools.mcp_tool_errors import _is_method_not_found_error, _unwrap_exception_group
-from tools.mcp_tool_schema import mcp_prefixed_tool_name
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_registration as _registration
 
@@ -131,11 +130,17 @@ class MCPServerHealthMixin:
 
     def _publish_discovered_tools(self, new_mcp_tools) -> None:
         """Reconcile an already-fetched manifest without removing retained handlers first."""
+        if getattr(self, '_editor_frozen_manifest', None) is not None:
+            return  # Reconnects must preserve the canonical editor session's selected schemas too.
         old_tool_names = set(self._registered_tool_names)
-        self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
+        old_tools = self._tools
         self._tools = new_mcp_tools
-        registered_names = _registration._register_server_tools(self.name, self, self._config)
-        # Normalization can make a previously registered name ambiguous.
+        try:
+            registered_names = _registration._register_server_tools(self.name, self, self._config)
+        except Exception:
+            self._tools = old_tools
+            raise
+        # Only prune after registration succeeds, including names made ambiguous by normalization.
         self._deregister_owned(old_tool_names - set(registered_names))
         self._registered_tool_names = registered_names
 
