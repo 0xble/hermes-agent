@@ -134,13 +134,22 @@ discovery, so a restart cannot forget an item already moved. Receipt IDs are
 saved before polling. `pending`, `posted` and `sent_unconfirmed` keep retirement
 pending after each bounded 60-second check. Existing housekeeping and `/retire`
 resume status reads of that exact receipt, never another handoff send. Only
-`delivered` or `replied` permits transfer and closing. A failed retirement admits
-ordinary user messages and explains `/retire` retry and `/retire cancel` recovery.
+`delivered` or `replied` permits an unaccepted handoff's transfer and closing.
+Destination acceptance is independent delivery proof when the exact keyed task,
+creator, title, kind and destination assignment are verified and its original
+brief survives as a context prefix or in task history. Acceptance reads the
+ledger's `assignments.accepted_at`, post-`todo` status, append-only notes or
+exact-destination-authored updates. Recovery never edits or recreates accepted
+tasks and never sends another handoff for them. Accepted goal/loop handoffs clear
+only the source control atomically with recovery proof. The destination owns its
+successor, which retirement neither overwrites nor arms, and later successor
+progress does not invalidate that proof. A failed retirement admits ordinary
+user messages and explains `/retire` retry and `/retire cancel` recovery.
 Keyed native-task lookup reuses the existing task without another add. Its ID,
-key, title, destination creator and full stored context are read back. Only an
-existing loop handoff may differ in tick/backoff progress, never its instance,
-prompt, cadence, limits, stop condition, route or authored revisions. Fresh task
-creation still requires the complete requested context byte for byte.
+key, title and destination creator are read back. Only loop tick/backoff progress
+may differ in the original brief, never its instance, prompt, cadence, limits,
+stop condition, route or authored revisions. Fresh unaccepted task creation
+still requires the complete requested context byte for byte.
 
 Deletion requires the same generation's complete successful closing SendResult,
 including a message ID and the original thread. Partial, deferred, held,

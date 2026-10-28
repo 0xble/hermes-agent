@@ -580,6 +580,8 @@ async def test_native_handoff_is_created_under_destination_not_reassigned_on_ret
             return dict(saved)
         if "assignments" in args:
             return list(assignments)
+        if "log" in args:
+            return {"events": []}
         if "assign" in args:
             by = args[args.index("--agent-id") + 1] + "/" + args[args.index("--session-id") + 1]
             assert by == args[args.index("--report-to") + 1] == "hermes:default/next"
@@ -627,6 +629,10 @@ def loop_handoff_retry(runtime, monkeypatch):
             return dict(r.task)
         if "show" in args:
             return {**r.task, "context": "truncated on write"} if r.corrupt_fresh else dict(r.task)
+        if "assignments" in args:
+            return []
+        if "log" in args:
+            return {"events": []}
         if "send" in args:
             r.sends.append(args)
             return {"id": "r1"}
@@ -675,6 +681,135 @@ async def test_loop_handoff_rejects_dedupe_identity_changes_and_truncated_fresh_
     with pytest.raises(RuntimeError, match="handoff context was not read back"):
         await work.receipt(r.runner, r.source, r.state, r.item, r.dest)
     assert len(r.creates) == 1 and not r.sends
+
+
+@pytest.fixture
+def accepted_handoff(runtime, monkeypatch):
+    from hermes_cli import loops
+    r = runtime
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    loops.save_loop("old", loops.LoopState(prompt="Mine ideas", interval_seconds=60, times=12))
+    r.item = {"id": "loop", "kind": "loop", "title": "Mine ideas",
+              "record": json.loads(r.db.get_meta("loop:old"))}
+    r.dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18"}
+    r.original = ("Own the transferred work. Preserve its original limits and report to this topic.\n"
+                  + json.dumps(r.item, ensure_ascii=False))
+    r.task = {"id": "accepted-task", "title": "Retired topic: loop", "context": r.original,
+              "status": "todo", "dedupe_key": work.handoff_key(r.state, r.item),
+              "source": "agent_id=hermes:default;session_id=default/next"}
+    r.assignment = {"id": "a1", "assigned_to": "hermes:default/next",
+                    "assigned_by": "hermes:default/next", "report_to": "hermes:default/next",
+                    "accepted_at": "2026-10-28T12:00:00Z"}
+    r.events, r.commands = [], []
+    r.state["handoffs"]["loop"] = {"item": r.item, "destination": r.dest, "moved": False}
+
+    async def command(_runner, _source, *args, **_):
+        r.commands.append(args)
+        if args[:3] == ("tasks", "--json", "query"):
+            return [dict(r.task)]
+        if args == ("tasks", "--json", "show", "accepted-task"):
+            return dict(r.task)
+        if args == ("tasks", "--json", "assignments", "accepted-task"):
+            return [dict(r.assignment)]
+        if args == ("tasks", "--json", "log", "accepted-task"):
+            return {"events": list(r.events)}
+        raise AssertionError(f"Unexpected write or relay: {args}")
+
+    monkeypatch.setattr(work, "cli", command)
+    return r
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acceptance", ["assignment", "assignment_appended", "status", "append", "log"])
+async def test_retry_accepts_destination_amendments_without_task_writes(accepted_handoff, acceptance):
+    r = accepted_handoff
+    if acceptance not in {"assignment", "assignment_appended"}:
+        r.assignment.pop("accepted_at")
+    if acceptance == "status":
+        r.task["status"] = "in_progress"
+    if acceptance == "log":
+        r.task["context"] = "Destination's current execution notes"
+        r.events = [{"task_id": r.task["id"], "actor": "hermes:default/next", "event_type": "updated",
+                     "event_data": {"context": r.original + "\nAccepted. Preserve original limits."}}]
+    elif acceptance in {"append", "assignment_appended"}:
+        r.task["context"] += "\nAccepted in Mining Ideas.\n6h successor-loop owns the follow-through."
+    amended = dict(r.task)
+    result = await work.receipt(r.runner, r.source, r.state, r.item, r.dest)
+    assert result["accepted_task_id"] == r.task["id"]
+    assert result["address"] == "hermes:default/next"
+    assert r.task == amended
+    assert all(args[2] in {"query", "show", "assignments", "log"} for args in r.commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_receipt", [False, True])
+async def test_accepted_loop_handoff_keeps_successor_and_retires_source(accepted_handoff, monkeypatch, stored_receipt):
+    from hermes_cli import loops
+    r = accepted_handoff
+    r.task["context"] += "\nAccepted. Using a 6h successor-loop."
+    loops.save_loop("next", loops.LoopState(prompt="Mine successor ideas", interval_seconds=21600, times=8))
+    successor = r.db.get_meta("loop:next")
+    if stored_receipt:
+        r.state["handoffs"]["loop"].update(receipt_id="delivered-proof", address="hermes:default/next")
+        monkeypatch.setattr(work, "confirm_receipt", AsyncMock(return_value={"receipt_id": "delivered-proof"}))
+    assert await work.prepare(r.runner, r.source, r.state)
+    retired = loops.load_loop("old")
+    assert retired is not None and retired.status == "cleared"
+    assert r.db.get_meta("loop:next") == successor
+    assert r.state["handoffs"]["loop"]["moved"]
+    # Recovery after movement must not compare the successor's live progress or
+    # arm another loop, even if retirement's in-memory moved acknowledgement was lost.
+    recovered = await retire.load(r.runner, r.source)
+    assert recovered is not None
+    recovered["handoffs"]["loop"]["moved"] = False
+    loops.save_loop("next", loops.LoopState(prompt="Mine successor ideas", interval_seconds=21600, times=8,
+                                            ticks_fired=1))
+    progressed = r.db.get_meta("loop:next")
+    assert await work.prepare(r.runner, r.source, recovered)
+    assert r.db.get_meta("loop:next") == progressed
+    assert all(args[2] in {"query", "show", "assignments", "log"} for args in r.commands)
+
+
+@pytest.mark.asyncio
+async def test_accepted_loop_task_does_not_arm_a_missing_successor(accepted_handoff):
+    r = accepted_handoff
+    assert r.db.get_meta("loop:next") is None
+    assert await work.prepare(r.runner, r.source, r.state)
+    assert r.db.get_meta("loop:next") is None
+    assert json.loads(r.db.get_meta("loop:old"))["status"] == "cleared"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["task_id", "title", "creator", "assignee", "kind", "original"])
+async def test_accepted_handoff_still_checks_identity_and_original(accepted_handoff, change):
+    r = accepted_handoff
+    if change == "task_id":
+        r.task["id"] = ""
+    elif change == "title":
+        r.task["title"] = "Different title"
+    elif change == "creator":
+        r.task["source"] = "agent_id=hermes:default;session_id=default/other"
+    elif change == "assignee":
+        r.assignment["assigned_to"] = "hermes:default/other"
+    else:
+        changed = {**r.item, "kind": "goal"} if change == "kind" else {
+            **r.item, "record": {**r.item["record"], "prompt": "Different work"}}
+        r.task["context"] = r.original.split("\n", 1)[0] + "\n" + json.dumps(changed) + "\nAccepted."
+    with pytest.raises(RuntimeError, match="handoff context|handoff assignment"):
+        await work.receipt(r.runner, r.source, r.state, r.item, r.dest)
+    assert all(args[2] in {"query", "show", "assignments", "log"} for args in r.commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_retry_rejects_changed_context_without_preserved_original(accepted_handoff, accepted):
+    r = accepted_handoff
+    if not accepted:
+        r.assignment.pop("accepted_at")
+    r.task["context"] = "A different obligation, not the original prefix"
+    with pytest.raises(RuntimeError, match="handoff context was not read back"):
+        await work.receipt(r.runner, r.source, r.state, r.item, r.dest)
 
 
 @pytest.mark.asyncio

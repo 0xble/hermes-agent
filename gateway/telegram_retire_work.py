@@ -211,10 +211,55 @@ def same_handoff_context(saved, expected, kind):
         return False
 
 
+def original_handoff_context(context):
+    """Separate the original structured brief from destination-appended notes."""
+    try:
+        prefix, payload = context.split("\n", 1)
+        _, end = json.JSONDecoder().raw_decode(payload)
+        return prefix + "\n" + payload[:end]
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+async def accepted_handoff_task(runner, source, saved, context, kind, target):
+    """Read ownership and preserved content without ever editing destination work."""
+    task_id = saved["id"]
+    rows = await cli(runner, source, "tasks", "--json", "assignments", task_id)
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Task {task_id} has no readable assignment history")
+    assignment = rows[-1] if rows else {}
+    if assignment and any(assignment.get(key) != target for key in ("assigned_to", "assigned_by", "report_to")):
+        raise RuntimeError(f"Task {task_id} handoff assignment changed")
+    original = original_handoff_context(saved.get("context"))
+    current_preserved = same_handoff_context(original, context, kind)
+    preserved = current_preserved
+    appended = preserved and original != saved.get("context")
+    accepted = bool(assignment.get("accepted_at")) or saved.get("status") in {
+        "in_progress", "waiting", "blocked", "needs_review", "done", "cancelled"}
+    if not preserved or (assignment and not (accepted or appended)):
+        history = await cli(runner, source, "tasks", "--json", "log", task_id)
+        events = history.get("events") if isinstance(history, dict) else None
+        if not isinstance(events, list):
+            raise RuntimeError(f"Task {task_id} has no readable history")
+        for event in events:
+            if event.get("task_id") != task_id:
+                continue
+            data = event.get("event_data") or {}
+            preserved |= same_handoff_context(original_handoff_context(data.get("context")), context, kind)
+            accepted |= event.get("actor") == target and event.get("event_type") == "updated"
+    if not preserved or (not current_preserved and not accepted):
+        raise RuntimeError(f"Task {task_id} handoff context was not read back")
+    # Acceptance must belong to this exact destination assignment. A matching
+    # creator alone is not proof that the destination owns the delivered task.
+    if (accepted or appended) and not assignment:
+        raise RuntimeError(f"Task {task_id} has no destination assignment")
+    return bool(accepted or appended)
+
+
 async def receipt(runner, source, state, item, dest):
     """Preserve work as tasks, or context alone as a non-actionable merge settlement."""
     handoff = state.get("handoffs", {}).get(item["id"], {})
-    if handoff.get("receipt_id"):
+    if handoff.get("receipt_id") and item["kind"] not in {"goal", "loop"}:
         return await confirm_receipt(runner, source, handoff, dest)
     target = address(source, dest["session_id"])
     if item["kind"] == "context":
@@ -244,19 +289,27 @@ async def receipt(runner, source, state, item, dest):
         if len(matches) > 1:
             raise RuntimeError("Handoff task key is ambiguous")
         prior = matches[0] if matches else None
+        if prior is None and (handoff.get("receipt_id") or handoff.get("accepted_task_id")):
+            raise RuntimeError("Delivered handoff task was not found by its key")
         created = prior if prior is not None else await cli(
             runner, owner_source, "tasks", "--json", "add", title,
             "--context", context, "--dedupe-key", key)
         task_id = str(created.get("id") or "")
+        if not task_id or (handoff.get("accepted_task_id") and handoff["accepted_task_id"] != task_id):
+            raise RuntimeError(f"Task {task_id} handoff context was not read back")
         saved = await cli(runner, source, "tasks", "--json", "show", task_id)
         profile = source.profile or "default"
         creator = f"agent_id=hermes:{profile};session_id={profile}/{dest['session_id']}"
-        expected_context = prior.get("context") if prior is not None else context
         if (not task_id or saved.get("id") != task_id or saved.get("title") != title
-                or saved.get("dedupe_key") != key or saved.get("source") != creator
-                or saved.get("context") != expected_context
-                or not same_handoff_context(expected_context, context, item["kind"])):
+                or saved.get("dedupe_key") != key or saved.get("source") != creator):
             raise RuntimeError(f"Task {task_id} handoff context was not read back")
+        if prior is None and saved.get("context") != context and original_handoff_context(saved.get("context")) != context:
+            raise RuntimeError(f"Task {task_id} handoff context was not read back")
+        if prior is not None or saved.get("context") != context or saved.get("status", "todo") != "todo":
+            if await accepted_handoff_task(runner, source, saved, context, item["kind"], target):
+                return {"accepted_task_id": task_id, "address": target, "destination": dest}
+    if handoff.get("receipt_id"):
+        return await confirm_receipt(runner, source, handoff, dest)
     await assign_task(runner, source, state, task_id, target,
                       item["record"] if item["kind"] == "task" else None)
     # The full resumption context is already in the canonical ledger.
@@ -309,11 +362,11 @@ async def confirm_receipt(runner, source, handoff, dest):
 
 
 async def transfer_control(runner, source, state, item, dest):
-    """Move both control rows and their replay proof in one store transaction.
+    """Settle source control and replay proof in one store transaction.
 
-    Continuation migration is best-effort and rewrites writer-owned tokens. A
-    retirement needs an atomic, snapshot-checked move, not token-stripped equality
-    with an unrelated destination goal that happens to have the same text.
+    Continuation migration is best-effort and rewrites writer-owned tokens. An
+    unaccepted retirement handoff needs an atomic, snapshot-checked move. An
+    accepted destination task instead owns its successor control independently.
     """
     from gateway.telegram_retire import RetirementSuperseded, state_key
     from hermes_cli.goals import GoalState, save_goal
@@ -335,25 +388,39 @@ async def transfer_control(runner, source, state, item, dest):
         handoff = stored["handoffs"].setdefault(item["id"], {"item": item, "destination": dest, "moved": False})
         old, new = read(conn, old_key), read(conn, new_key)
         proof = handoff.get("control_receipt")
+        accepted_task_id = handoff.get("accepted_task_id")
         if proof:
-            if proof == {"source": old, "destination": new, "session_id": dest["session_id"]}:
+            expected = {"source": old, "session_id": dest["session_id"]}
+            if accepted_task_id:
+                expected["accepted_task_id"] = accepted_task_id
+            else:
+                expected["destination"] = new
+            if proof == expected:
                 return proof
             raise RuntimeError(f"Transferred {kind} changed before retirement recovery")
-        if new is not None or not old or json.loads(old) != item["record"]:
+        if (not old or json.loads(old) != item["record"]
+                or (not accepted_task_id and new is not None)):
             raise RuntimeError(f"Cannot transfer {kind}: destination already owns one or the source changed")
         if kind == "loop":
             current_loop, retired_loop = LoopState.from_json(old), LoopState.from_json(old)
             retired_loop.status = "cleared"
             retired_loop.awaiting_response = False
-            save_loop(dest["session_id"], current_loop, cursor=conn)
+            if not accepted_task_id:
+                save_loop(dest["session_id"], current_loop, cursor=conn)
             save_loop(state["session_id"], retired_loop, cursor=conn)
         else:
             current_goal, retired_goal = GoalState.from_json(old), GoalState.from_json(old)
             retired_goal.status = "cleared"
-            save_goal(dest["session_id"], current_goal, cursor=conn)
+            if not accepted_task_id:
+                save_goal(dest["session_id"], current_goal, cursor=conn)
             save_goal(state["session_id"], retired_goal, cursor=conn)
-        proof = {"source": read(conn, old_key),
-                 "destination": read(conn, new_key), "session_id": dest["session_id"]}
+        # An accepted task owns its successor control. Clear only the source,
+        # and never pin recovery to the destination's independently ticking loop.
+        proof = {"source": read(conn, old_key), "session_id": dest["session_id"]}
+        if accepted_task_id:
+            proof["accepted_task_id"] = accepted_task_id
+        else:
+            proof["destination"] = read(conn, new_key)
         handoff["control_receipt"] = proof
         db.set_meta(state_key(source), json.dumps(stored), cursor=conn)
         return proof
@@ -426,7 +493,7 @@ async def prepare(runner, source, state):
     # Reconcile receipts independently of source inventory. A crash after moving
     # an item must not forget a still-unconfirmed handoff just because it moved.
     for item_id, handoff in state["handoffs"].items():
-        if handoff.get("receipt_id") and handoff.get("moved"):
+        if (handoff.get("receipt_id") or handoff.get("accepted_task_id")) and handoff.get("moved"):
             continue
         item, dest = handoff["item"], handoff["destination"]
         sent = await receipt(runner, source, state, item, dest)
