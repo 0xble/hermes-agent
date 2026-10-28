@@ -388,7 +388,14 @@ def _rewrite_browser_exec(td: dict[str, Any], available: set) -> Optional[dict[s
     """browser_exec runs arbitrary host Python: a session without the terminal surface
     must not regain host execution via the browser toolset. Session-level gate rather
     than a check_fn because check_fns are TTL-cached process-wide across sessions."""
-    return td if "terminal" in available else None
+    if "terminal" not in available:
+        return None
+    from tools.vision_tools import _should_use_native_vision_fast_path
+    if "vision_analyze" in available and not _should_use_native_vision_fast_path():
+        fn = td["function"]
+        return _fn_def({**fn, "description": fn.get("description", "")
+                        + " For images, pass its capture_screenshot() path to vision_analyze."})
+    return td
 
 
 def _rewrite_delegate_task(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:

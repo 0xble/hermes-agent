@@ -39,4 +39,7 @@ def test_chromium_binary_and_env_survive_store_relocation(tmp_path, target, rela
     store.rename(moved)
     env = Facts(moved / "facts.json").env_for("chromium", moved)
     assert package.binary(moved / entry.name, target) == moved / entry.name / relative
-    assert env == {"PLAYWRIGHT_BROWSERS_PATH": str(moved)}
+    assert env == {
+        "PLAYWRIGHT_BROWSERS_PATH": str(moved),
+        "AGENT_BROWSER_EXECUTABLE_PATH": str(moved / entry.name / relative),
+    }

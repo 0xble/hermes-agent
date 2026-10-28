@@ -78,19 +78,19 @@ def _fake_cli(tmp_path, body):
 class TestModeDetection:
     def test_default_on_when_cli_available(self, monkeypatch):
         """Backend unset: Browser Use mode is the default when the CLI runs."""
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["/usr/bin/browser-use"])
         assert bu_cli.is_browser_use_cli_mode() is True
 
     def test_default_off_when_cli_unavailable(self, monkeypatch):
         """Backend unset + no runnable CLI: keep the built-in browser tools."""
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         assert bu_cli.is_browser_use_cli_mode() is False
 
     def test_explicit_off_wins_over_default(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"backend": bu_cli.BACKEND_DISABLED}},
         )
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["/usr/bin/browser-use"])
@@ -99,7 +99,7 @@ class TestModeDetection:
     def test_yaml_bool_off_means_disabled(self, monkeypatch):
         """YAML 1.1 parses unquoted `off` as False — must mean disabled."""
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"backend": False}},
         )
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["/usr/bin/browser-use"])
@@ -107,14 +107,14 @@ class TestModeDetection:
 
     def test_config_opt_in(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"backend": "browser-use"}},
         )
         assert bu_cli.is_browser_use_cli_mode() is True
 
     def test_other_backend_value_is_not_cli_mode(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"backend": "something-else"}},
         )
         assert bu_cli.is_browser_use_cli_mode() is False
@@ -123,7 +123,7 @@ class TestModeDetection:
         def boom():
             raise RuntimeError("config unreadable")
 
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", boom)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", boom)
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         assert bu_cli.is_browser_use_cli_mode() is False
 
@@ -242,7 +242,7 @@ class TestVaultSupervisorAttach:
     def test_exec_attaches_supervisor_to_the_browser_it_drives(self, tmp_path, monkeypatch, _fake_supervisor_registry):
         """browser_vault_fill injects secrets only over the supervisor's CDP WebSocket. Without this attach the
         default (Browser Use) backend had no supervisor at all and every fill failed with supervisor_required."""
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"browser": {"backend": "browser-use"}})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"browser": {"backend": "browser-use"}})
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho ok\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
@@ -308,13 +308,13 @@ class TestLegacyCloudMigration:
     _LEGACY = {"browser": {"cloud_provider": "browser-use"}}
 
     def test_direct_api_config_migrates(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: self._LEGACY)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: self._LEGACY)
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
         assert bu_cli.is_browser_use_cli_mode() is True
 
     def test_gateway_config_stays_on_legacy_path(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"cloud_provider": "browser-use", "use_gateway": True}},
         )
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
@@ -322,7 +322,7 @@ class TestLegacyCloudMigration:
         assert bu_cli.is_browser_use_cli_mode() is False
 
     def test_no_api_key_stays_on_legacy_path(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: self._LEGACY)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: self._LEGACY)
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         assert bu_cli.is_browser_use_cli_mode() is False
 
@@ -330,7 +330,7 @@ class TestLegacyCloudMigration:
         """A Camofox user (env-var selected, cloud_provider unset) with a
         stray BROWSER_USE_API_KEY keeps Camofox — no silent mode flip."""
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config", lambda: {"browser": {}}
+            "hermes_cli.config.load_config_readonly", lambda: {"browser": {}}
         )
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
         import tools.browser_camofox as camofox
@@ -342,7 +342,7 @@ class TestLegacyCloudMigration:
         """Even with browser.backend: browser-use, an active Camofox setup
         falls back to the built-in tools (no CDP surface to drive)."""
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"backend": "browser-use"}},
         )
         import tools.browser_camofox as camofox
@@ -353,7 +353,7 @@ class TestLegacyCloudMigration:
 
     def test_explicit_other_backend_wins(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"cloud_provider": "browser-use", "backend": "something-else"}},
         )
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
@@ -361,7 +361,7 @@ class TestLegacyCloudMigration:
 
     def test_other_cloud_provider_does_not_migrate(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"cloud_provider": "browserbase"}},
         )
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
@@ -373,7 +373,7 @@ class TestLegacyCloudMigration:
         """No cloud_provider configured + BROWSER_USE_API_KEY set: credential
         auto-detection prefers Browser Use (even when Browserbase creds are
         also present), which now means Browser Use mode."""
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
         monkeypatch.setenv("BROWSERBASE_API_KEY", "bb-key")
         monkeypatch.setenv("BROWSERBASE_PROJECT_ID", "bb-project")
@@ -381,7 +381,7 @@ class TestLegacyCloudMigration:
 
 
     def test_migrated_config_gets_bu_autospawn(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: self._LEGACY)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: self._LEGACY)
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "autospawn:$BU_AUTOSPAWN"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
@@ -390,7 +390,7 @@ class TestLegacyCloudMigration:
 
     def test_explicit_backend_does_not_set_bu_autospawn(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"backend": "browser-use"}},
         )
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "autospawn:[$BU_AUTOSPAWN]"\n')
@@ -1034,7 +1034,7 @@ class TestBrowserExec:
 class TestDefaultDowngradeNotice:
     def _isolate(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
 
     def test_notice_when_default_and_cli_missing(self, tmp_path, monkeypatch):
         self._isolate(tmp_path, monkeypatch)
@@ -1055,7 +1055,7 @@ class TestDefaultDowngradeNotice:
     def test_no_notice_on_explicit_backend(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"browser": {"backend": bu_cli.BACKEND_DISABLED}},
         )
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
@@ -1244,7 +1244,7 @@ class TestTimeoutProcessGroupKill:
         """A grandchild that outlives the direct child and holds the inherited stdout
         pipe must not keep browser_exec blocked past the timeout (it wedged permanently
         before the group kill)."""
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
         pid_file = tmp_path / "grandchild.pid"
         cli = _fake_cli(tmp_path, (
             "cat > /dev/null\n"

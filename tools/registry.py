@@ -269,6 +269,11 @@ _check_fn_ever_good: set[tuple[Callable, Optional[str]]] = set()  # probes that 
 _check_fn_core_drop_warned: set[tuple[Callable, Optional[str]]] = set()  # once-per-process WARNING gate
 _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
+_BROWSER_IDENTITY_KEYS = (
+    "HERMES_SESSION_ID",
+    "HERMES_BROWSER_CONTROL_PRINCIPAL",
+    "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
+)
 _NO_CACHE_CHECK_FNS: set[Callable] = set()
 
 
@@ -298,6 +303,14 @@ def check_fn_cache_scope() -> Optional[str]:
     """Return the active profile key when availability is profile-scoped. Single-profile
     processes keep the process-wide cache; a multiplex gateway installs a Hermes-home override
     per profile turn, so the canonical profile key is the boundary."""
+    try:
+        from gateway.session_context import get_session_env
+        if all(str(get_session_env(key, "") or "").strip() for key in _BROWSER_IDENTITY_KEYS):
+            from gateway.browser_control_broker import browser_control_enabled
+            if browser_control_enabled():
+                return CHECK_FN_CACHE_BYPASS
+    except Exception:
+        pass
     try:
         from agent.secret_scope import serves_routed_profile
         from hermes_constants import get_hermes_home_override

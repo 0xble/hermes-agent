@@ -22,6 +22,16 @@ superseded-entry delisting route, not a blocklist entry or a collision-check
 exception. Restore the entry only together with an equivalent native extraction.
 Keep plugin admission and install-time collision checks unchanged.
 
+Controller and isolation fixtures must exercise `tools.browser_tool_cdp` and
+`tools.browser_tool_lifecycle`, the retained native owners, not the extracted
+`browser_session_*` modules. Keep both origin checks and guarded backend
+`fill_context` behavior in vault fixtures. The migrated `browser.headed` value
+belongs to the active profile, so a legacy process-wide headed environment
+variable must not retain a headless profile's browser. Browser Use child
+environments pass through the shared credential scrubber before adding their
+nonsecret CLI settings. Lazy toolset discovery must load native registrations
+without enabling a profile-disabled backend.
+
 Adopt upstream vault `fill_context`, guarded metadata snapshots, and protected
 OTP writes around the native origin and account checks. Attribute Browser Use
 metrics to the session that served the call, including cloud-to-local fallback,

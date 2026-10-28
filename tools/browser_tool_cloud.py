@@ -222,11 +222,10 @@ def _get_browser_engine() -> str:
 
 
 def _is_headed_mode() -> bool:
-    """True when the browser should launch headed: ``browser.headed``, else ``AGENT_BROWSER_HEADED``; cached."""
+    """Resolve the active profile's migrated ``browser.headed`` setting; cached."""
     _bt = _origin()
     def compute() -> bool:
-        headed = _bt._browser_cfg("headed", False, lambda v: False if v is None else str(v).strip().lower() in ("true", "1", "yes"), "browser.headed from config")
-        return headed or os.environ.get("AGENT_BROWSER_HEADED", "").strip().lower() in ("true", "1", "yes")
+        return _bt._browser_cfg("headed", False, lambda v: False if v is None else str(v).strip().lower() in ("true", "1", "yes"), "browser.headed from config")
     return _memo(_bt, "_headed_mode_resolved", "_cached_headed_mode", compute)
 
 

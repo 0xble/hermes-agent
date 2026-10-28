@@ -66,7 +66,7 @@ def test_routed_home_with_multiplex_flag_off_gets_no_launch_residue(homes, monke
     helper child sees B's env, the browser child env carries no provider key for either profile, and the
     browser_exec harness resolves B's (absent) credential as no credential."""
     from tools.browser_session import build_browser_env
-    from tools.browser_use_cli import _harness_credentials
+    from tools.browser_use_cli import _base_subprocess_env
 
     _a, b = homes
     token = set_hermes_home_override(str(b))
@@ -76,13 +76,13 @@ def test_routed_home_with_multiplex_flag_off_gets_no_launch_residue(homes, monke
         assert "A_MARKER" not in env and "HERMES_MODEL" not in env and "OPENAI_API_KEY" not in env
         browser_env = build_browser_env()
         assert "FIRECRAWL_API_KEY" not in browser_env and browser_env["HERMES_HOME"] == str(b)
-        assert _harness_credentials() == {}
+        assert "BROWSER_USE_API_KEY" not in _base_subprocess_env()
     finally:
         reset_hermes_home_override(token)
     # Control: the launch profile's browser env is credential-free too, its harness keeps its own key, and
     # its other children keep their settings.
     assert "FIRECRAWL_API_KEY" not in build_browser_env()
-    assert _harness_credentials() == {"BROWSER_USE_API_KEY": "a-bu"}
+    assert _base_subprocess_env()["BROWSER_USE_API_KEY"] == "a-bu"
     assert served_profile_child_env(inherit_credentials=True)["HERMES_MODEL"] == "a-model"
 
 

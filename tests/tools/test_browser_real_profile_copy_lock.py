@@ -51,7 +51,7 @@ _SESSION = textwrap.dedent("""\
     while not os.path.exists(gate):
         time.sleep(0.01)
     with patch.object(browser_session_cloud, "use_real_profile", return_value=True), \\
-         patch.object(browser_lightpanda, "using_lightpanda_engine", return_value=False), \\
+         patch("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", return_value=False), \\
          patch.object(browser_session, "ensure_screen_for_headed_chromium", lambda: None), \\
          patch.object(bc, "detect_default_chromium", return_value="chrome"), \\
          patch.object(bc, "chromium_executable", return_value=chrome), \\

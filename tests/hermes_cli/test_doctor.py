@@ -411,7 +411,7 @@ class TestDoctorMemoryProviderSection:
         monkeypatch.setattr(
             shutil,
             "which",
-            lambda cmd: None if cmd == "gh" else real_which(cmd),
+            lambda cmd, **kwargs: None if cmd == "gh" else real_which(cmd, **kwargs),
         )
 
         import io, contextlib
@@ -1517,7 +1517,7 @@ def test_run_doctor_reports_shadowed_lightpanda_engine(monkeypatch, tmp_path):
 
     monkeypatch.setattr("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", lambda: True, raising=False)
     monkeypatch.setattr(
-        "tools.browser_lightpanda.lightpanda_engine_status",
+        "tools.browser_tool_lightpanda_fallback.lightpanda_engine_status",
         lambda: (False, "cloud provider Browserbase is selected"), raising=False,
     )
     out = helper._run_doctor_and_capture(monkeypatch, tmp_path)
@@ -1531,7 +1531,7 @@ def test_run_doctor_warns_when_lightpanda_binary_missing(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()
 
     monkeypatch.setattr("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", lambda: True, raising=False)
-    monkeypatch.setattr("tools.browser_lightpanda.lightpanda_engine_status",
+    monkeypatch.setattr("tools.browser_tool_lightpanda_fallback.lightpanda_engine_status",
                         lambda: (True, "Hermes spawns `lightpanda serve`"), raising=False)
     monkeypatch.setattr("tools.browser_lightpanda.find_lightpanda_binary", lambda: None)
     out = helper._run_doctor_and_capture(monkeypatch, tmp_path)

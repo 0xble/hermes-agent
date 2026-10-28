@@ -1133,8 +1133,8 @@ BROWSER_VAULT_LIST_SCHEMA = {
 BROWSER_VAULT_SCHEMA = {
     "name": "browser_vault",
     "description": (
-        "Use saved logins, passwords, credentials, cards and addresses on the CURRENT browser page without secrets "
-        "entering the conversation. "
+        "Use saved credentials on the current browser page without revealing secrets. "
+        "Supports logins, passwords, cards and addresses. "
         "Actions: list (call first: saved logins/cards/addresses as handles; logins carry the identifier you type "
         "yourself with the browser's input tool; locked password managers appear under `locked`); fill (handle: "
         "the password for a login, card fields after the user confirms, address fields; refused unless the page "

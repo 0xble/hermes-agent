@@ -344,7 +344,7 @@ def test_headed_chromium_spawn_asks_the_screen_to_start_but_the_env_builder_neve
     monkeypatch.setattr(browser_session_cloud, "get_cloud_provider", lambda: None)
     monkeypatch.setattr("tools.bot_desktop.runtime.tool_placement", lambda: placement.GATEWAY)  # host browser
     monkeypatch.setattr("tools.browser_session_real_profile.real_profile_cdp", lambda: (None, None))
-    monkeypatch.setattr(browser_session_cloud, "get_browser_engine", lambda: engine)
+    monkeypatch.setattr("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", lambda: engine == "lightpanda")
     monkeypatch.setattr(browser_launcher, "launch_chromium", lambda key, **kw: (
         SimpleNamespace(cdp_url="ws://127.0.0.1:41234/devtools/browser/abc", pid=4242), None))
     monkeypatch.setattr(browser_lightpanda, "launch_lightpanda", lambda name, **kw: (

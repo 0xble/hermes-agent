@@ -67,6 +67,8 @@ def emitted_event_names() -> set[str]:
     for src in (REPO / "tools").glob("delegate_tool*.py"):
         names.update(_SUBAGENT_RELAY.findall(_read(src)))
     names.discard("subagent.text")  # mirrored into the watch window as message.delta, never emitted
+    from gateway.browser_control_broker import FRAME_CANCEL, FRAME_COMMAND
+    names.update((FRAME_COMMAND, FRAME_CANCEL))
     from tools.registry import _tool_module_candidates
 
     for src in _tool_module_candidates(REPO / "tools"):

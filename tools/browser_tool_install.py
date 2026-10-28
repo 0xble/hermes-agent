@@ -4,7 +4,8 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 
 import functools
 import os
-import shutil
+
+from hermes_platform.resolver import LookupContext, locate_command
 
 from hermes_constants import node_tool_runnable, is_termux as _is_termux_environment
 from tools.browser_tool_origin import origin_module as _origin
@@ -76,7 +77,8 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     for search_path in (None, _merge_browser_path("")):
         if search_path == "":
             continue
-        candidate = shutil.which("agent-browser", path=search_path)
+        command = locate_command("agent-browser", LookupContext(path=search_path)).command
+        candidate = command[0] if command else None
         if candidate and usable(candidate):
             return candidate
     hint = f"agent-browser CLI not found. Install it with: {_browser_install_hint()}"
@@ -102,7 +104,7 @@ def _chromium_installed() -> bool:
     from hermes_cli.browser_runtime import chromium_executable
 
     ab_path = chromium_executable()
-    return bool(ab_path and (os.path.isfile(ab_path) or shutil.which(ab_path)))
+    return bool(ab_path and (os.path.isfile(ab_path) or locate_command(ab_path).found))
 
 
 def _maybe_autoinstall_chromium() -> bool:
