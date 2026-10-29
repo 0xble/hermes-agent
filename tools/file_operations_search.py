@@ -470,7 +470,7 @@ class SearchMixin:
         command = (
             f"{shell_prefix}{{ diagnostic=$( {{ {' '.join(words)} | head -n {fetch_limit}; }} "
             "2>&1 1>&3 | { head -c 4096; cat >/dev/null; }); status=$?; "
-            f"printf '\n{marker}%s' \"$diagnostic\"; exit \"$status\"; }} 3>&1"
+            f"printf '\n{marker}%s' \"$diagnostic\"; (exit \"$status\"); }} 3>&1"
         )
         result = self._exec(command, timeout=timeout)
         stdout, separator, diagnostic = result.stdout.rpartition(f"\n{marker}")
@@ -997,15 +997,31 @@ class SearchMixin:
         """File-name search via ``rg --files`` (respects .gitignore, skips hidden dirs,
         parallel walk). Discovery order stays bounded and fast; exact modification-time
         ordering is explicit because it scans globally."""
+        roots = [path] if isinstance(path, str) else path
+        while pattern.startswith('./'):
+            pattern = pattern[2:]
+        anchored = pattern.startswith('/')
+        if anchored:
+            cwd = getattr(self.env, "cwd", None) or self.cwd
+            absolute_roots = [posixpath.normpath(posixpath.join(cwd, root)) for root in roots]
+            for root in sorted(absolute_roots, key=len, reverse=True):
+                prefix = root.rstrip('/') + '/'
+                if pattern.startswith(prefix):
+                    pattern = pattern[len(prefix):]
+                    break
+            pattern = pattern.lstrip('/')
+
         # Preserve the recursive basename-search intent of find -name. Slashes
         # inside brace alternatives are syntax, not a basename separator. rg
         # matches slash-bearing globs against emitted paths (including absolute
-        # root operands), so allow their complete suffix at any depth.
-        if '/' in pattern:
-            glob_pattern = pattern if pattern.startswith(('**/', '/')) else f"**/{pattern}"
+        # root operands), so allow their complete suffix at any depth. rg's
+        # leading slash anchors even a bare basename to the selected root.
+        if anchored:
+            glob_pattern = f"/{pattern}"
+        elif '/' in pattern:
+            glob_pattern = pattern if pattern.startswith('**/') else f"**/{pattern}"
         else:
             glob_pattern = f"*{pattern}" if not pattern.startswith('*') else pattern
-        roots = [path] if isinstance(path, str) else path
         fetch_limit = limit + offset + 1
         effective_exclusions = self._effective_macos_search_exclusions(roots)
         scoped_common = None
@@ -1065,11 +1081,15 @@ class SearchMixin:
         # when rg already timed out — partial file results must not be presented
         # as a coherent page. Only the single-root path supplements (a multi-root
         # walk is already the merged view across roots).
-        # find -name cannot interpret path globs or brace alternation. Do not
-        # supplement a valid rg result with a different (or corrupted) pattern.
+        # A path made only of recursive ** components is still a basename
+        # search. Other path globs and brace alternation exceed find -name.
+        directory_parts = pattern.split('/')
         if (limit_reason != "search_timeout" and isinstance(path, str)
-                and not any(char in pattern for char in '/{}') and self._has_command("find")):
-            dirs, directory_limit_reason = self._search_directories_with_find(glob_pattern, path, fetch_limit)
+                and not anchored and not any(char in pattern for char in '{}')
+                and all(part == '**' for part in directory_parts[:-1]) and self._has_command("find")):
+            basename = directory_parts[-1]
+            directory_glob = basename if basename.startswith('*') else f"*{basename}"
+            dirs, directory_limit_reason = self._search_directories_with_find(directory_glob, path, fetch_limit)
             if dirs:
                 existing = set(all_files)
                 merged_entries = self._sort_paths_by_mtime(
