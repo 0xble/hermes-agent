@@ -27,6 +27,24 @@ class _Program:
             self.owner = owner
             accept = self.add('accept', None, None)
             self.roots.append(self.sequence(parsed, accept, bool(pattern.flags & re.DOTALL)))
+        # Search only actual note openers, not every bracket in pasted code/JSON.
+        # Derive them from the same program so registry edits cannot miss the guard.
+        prefixes = set()
+        pending = [(root, '', frozenset()) for root in self.roots]
+        while pending:
+            state, prefix, visited = pending.pop()
+            operation, argument, successor = self.nodes[state]
+            if state in visited:
+                prefixes.add(prefix)
+                continue
+            visited = visited | {state}
+            if operation == 'literal':
+                pending.append((successor, prefix + argument, visited))
+            elif operation == 'split':
+                pending.extend((branch, prefix, visited) for branch in (argument, successor))
+            else:
+                prefixes.add(prefix)
+        self.openers = re.compile('|'.join(map(re.escape, sorted(prefixes))))
 
     def add(self, operation, argument, successor):
         self.nodes.append((operation, argument, successor))
@@ -198,9 +216,46 @@ def _program(patterns):
     return _Program(patterns)
 
 
+def _regex_strip(text, patterns, openers):
+    """Try each original regex once per opener, never search a failed suffix twice.
+
+    Complete disjoint notes need no per-character state. A failed opener or a
+    possible deletion seam uses the bounded engine on the original input. After
+    the first deletion, regex matching sees the stripped EOF, just as before.
+    """
+    cursor, limit = 0, len(text)
+    parts, descriptions = [], []
+    while opener := openers.search(text, cursor, limit):
+        match = next((match for pattern in patterns
+                      if (match := pattern.match(text, opener.start(), limit))), None)
+        if match is None:
+            return None
+        parts.append(text[cursor:match.start()])
+        if 'description' in match.re.groupindex and (description := match['description'].strip()):
+            descriptions.append(description)
+        cursor = match.end()
+        if len(parts) == 1:
+            limit = len(text.rstrip())
+    if not parts:
+        return text, []
+    parts.append(text[cursor:limit])
+    result = ''.join(parts).strip()
+    if openers.search(result):
+        return None
+    return result, descriptions
+
+
 def strip_recall_context(
     text: str, patterns: tuple[re.Pattern[str], ...],
 ) -> tuple[str, list[str]]:
+    program = _program(patterns)
+    fast = _regex_strip(text, patterns, program.openers)
+    if fast is not None:
+        return fast
+    return _strip_bounded(text, patterns, program)
+
+
+def _strip_bounded(text, patterns, program):
     """Erase notes in original leftmost order with O(pattern states × input) work.
 
     There are 2 suffix tables at most, before and after the first whole-turn
@@ -208,7 +263,6 @@ def strip_recall_context(
     per character. Even malformed openers and notes created by deletion seams
     therefore cannot trigger suffix rescanning or repeated whole-turn copies.
     """
-    program = _program(patterns)
     suffix = _Suffix(program, text, len(text))
     cursor, limit = 0, len(text)
     chars, snapshots = [], [[]]

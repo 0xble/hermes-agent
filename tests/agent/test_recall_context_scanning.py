@@ -2,8 +2,7 @@
 import json
 import random
 import re
-import statistics
-import timeit
+import sys
 from itertools import product
 
 import pytest
@@ -72,13 +71,46 @@ def test_adversarial_work_scales_with_input_size(shape):
             return '[Triggering message id: `x' * count
         return '[User sent a file: ' * count
 
-    # Use a large size ratio and repeated medians, not an absolute speed requirement.
-    small, large = crafted(20), crafted(160)
+    # Count actual Python execution steps, independent of host scheduling/load.
+    from agent import recall_context
+
     def measure(text):
-        return statistics.median(timeit.repeat(lambda: _strip_recall_context(text), number=2, repeat=5))
-    small_time, large_time = measure(small), measure(large)
-    size_ratio = len(large) / len(small)
-    assert large_time / small_time < size_ratio * 2.5, (small_time, large_time, size_ratio)
+        steps = 0
+
+        def trace(frame, event, arg):
+            nonlocal steps
+            if event == 'line' and frame.f_code.co_filename == recall_context.__file__:
+                steps += 1
+            return trace
+
+        previous = sys.gettrace()
+        sys.settrace(trace)
+        try:
+            _strip_recall_context(text)
+        finally:
+            sys.settrace(previous)
+        return steps
+
+    small, large = crafted(20), crafted(160)
+    small_steps, large_steps = measure(small), measure(large)
+    assert large_steps <= small_steps * (len(large) / len(small)) * 1.25
+
+
+@pytest.mark.parametrize('with_note', [False, True])
+def test_bracket_dense_json_does_not_allocate_bounded_states(monkeypatch, with_note):
+    from agent import recall_context
+
+    def unexpected_bounded_engine(*args):
+        pytest.fail('Benign bracket-dense text must not allocate suffix tables or snapshots')
+
+    monkeypatch.setattr(recall_context, '_Suffix', unexpected_bounded_engine)
+    payload = json.dumps({'values': [[1, 2], {'array': [3, 4]}]}) + '\n'
+    text = payload * (1_000_000 // len(payload))
+    original = text
+    if with_note:
+        text = FILE + '\n\n' + text
+    expected = original.strip() if with_note else original
+    assert _strip_recall_context(text) == (expected, [])
 
 
 @pytest.mark.parametrize('pattern', [r'no bracket', r'\[(a?)*', r'\[(?<=x)y', r'(?i)\[case'])

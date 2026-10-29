@@ -11,7 +11,6 @@ _WEBHOOK_PORT (8090), _WEBHOOK_PATH (/whatsapp/webhook), _API_VERSION (v20.0).""
 from __future__ import annotations
 
 import asyncio
-from agent.attachment_context import format_document_content
 import contextlib
 import hashlib
 import hmac
@@ -40,6 +39,7 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
+from agent.attachment_context import format_document_content
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import config_connected_extra
 from agent.i18n import t
