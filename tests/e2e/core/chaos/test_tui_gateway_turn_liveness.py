@@ -337,9 +337,12 @@ def _reap(gw: TuiGatewayProcess, tag: str) -> None:
 def run_scenario(scn: Scenario, root: Path) -> dict[str, Any]:
     drop_pending, sampled = threading.Event(), threading.Event()
 
-    def before_drop() -> None:
+    def before_drop(keep_alive: Callable[[], None]) -> None:
         drop_pending.set()
-        assert sampled.wait(TURN_DEADLINE_S), "drop observation never finished"
+        deadline = time.monotonic() + TURN_DEADLINE_S
+        while not sampled.wait(HEARTBEAT_INTERVAL_S):
+            assert time.monotonic() < deadline, "drop observation never finished"
+            keep_alive()
 
     def respond(record: dict[str, Any]):
         response = responder(record)
@@ -388,15 +391,17 @@ def _run_scenario(scn: Scenario, srv: FakeLLMServer, root: Path,
             submitted = gw.call("prompt.submit", {"session_id": sid, "text": f"please work {marker}"})
             assert submitted.get("status") == "streaming", submitted
             if scn.fault == "drop":
-                # A legal slow RPC can consume most of a fast failed turn. Hold the
-                # first provider request until the sampler has actually observed it,
-                # rather than infer five observations from two seconds of wall time.
+                # Observe five probes during the first stream. Empty SSE chunks keep
+                # each read/stale gap short even when one legal RPC takes nearly 3s.
+                # A retry before release means we tested a stale kill, not the drop.
                 assert drop_pending.wait(TURN_DEADLINE_S), "provider never prepared its drop"
                 observed = len(hb.latencies)
                 assert _wait_until(lambda: len(hb.latencies) >= observed + MIN_HEARTBEATS,
                                    TURN_DEADLINE_S), "dispatcher never answered the drop-window probes"
                 assert gw.wait_event(lambda e: _is(e, "message.complete", sid),
                                      timeout=0, start=start) is None, "turn ended before the injected drop"
+                assert len(_main_requests_for(srv, marker)) == 1, (
+                    "first drop request was abandoned or stale-killed before release")
                 sampled.set()
             if scn.wait_for == "provider":
                 assert _wait_until(lambda: _main_requests_for(srv, marker), TURN_DEADLINE_S), (
@@ -429,6 +434,13 @@ def _run_scenario(scn: Scenario, srv: FakeLLMServer, root: Path,
         if scn.action == "interrupt":
             assert stats["status"] == "interrupted", done
         _wait_settled(gw, sid, done, scn.id)
+
+        if scn.fault == "drop":
+            first = next(r for r in srv.requests if r["kind"] == "main"
+                         and marker in _deciding_user_text(r["body"].get("messages") or []))
+            assert first.get("drop_served") is True, (
+                "first marked request never served its truncated drop", first)
+            stats["first_drop_served"] = True
 
         calls = len(_main_requests_for(srv, marker))
         stats["provider_calls"] = calls
