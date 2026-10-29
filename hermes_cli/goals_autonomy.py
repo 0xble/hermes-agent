@@ -269,6 +269,9 @@ class GoalAutonomyMixin:
 
     def _complete(self, *, reason, evidence):
         state = self._require_goal()
+        if state.pending_peers:
+            return {"ok": False, "error_code": "pending_peers",
+                    "error": "pending peer work requires parent verification before goal completion"}
         criteria = completion_criteria(state)
         gap = ""
         if not reason or not str(reason).strip():

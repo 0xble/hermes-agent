@@ -42,7 +42,7 @@ runtime and request-override resolution in `tools/delegate_tool_config.py`.
   same-transport entry at that URL opts in.
 - The Anthropic adapter honors the same opt-in for its native third-party
   guard, so the request carries `speed` and the fast-mode beta.
-- Brian's profile opts in `codex-proxy` only (2026-09-26). Claude Fast bills
+- Brian's profile opts in `openai-proxy` only (2026-09-26). Claude Fast bills
   usage credits from the first token, so `claude-proxy` stays closed.
 
 ### Reasoning level

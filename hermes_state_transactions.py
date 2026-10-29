@@ -61,7 +61,7 @@ def settle_write_transaction(
     """Run the callback and settle an already acquired transaction, preserving its exception.
 
     Acquisition covers this attempt's process writer guard, generation check and BEGIN.
-    It is separate from the acquired-lock warning threshold. No payload or SQL is logged.
+    Either acquisition or transaction hold time can trigger the warning. No payload or SQL is logged.
     """
     started = clock.monotonic()
     changes_before = conn.total_changes
@@ -102,7 +102,7 @@ def settle_write_transaction(
         current_write_metrics.reset(metrics_token)
         held_s = clock.monotonic() - started
         record_publication_write(hold_s=held_s, rows_written=conn.total_changes - changes_before)
-        if held_s >= warn_s:
+        if held_s >= warn_s or acquire_s >= warn_s:
             name = getattr(fn, "__qualname__", type(fn).__qualname__)[:160]
             logger.warning(
                 "state.db write transaction held the write lock for %.1fs: callback=%s pid=%d "

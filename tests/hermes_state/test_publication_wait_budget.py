@@ -1,6 +1,10 @@
 """Only compaction publication bounds the in-process mutex admission wait."""
 
+import logging
+import re
 import threading
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -9,7 +13,7 @@ from hermes_state import SessionDB
 
 
 @pytest.mark.parametrize("operation", ["write", "degraded_read"])
-def test_publication_mutex_timeout_attributes_holders(tmp_path, operation):
+def test_publication_mutex_timeout_attributes_holders(tmp_path, operation, caplog):
     from hermes_state_publication import LocalStateLockTimeout, publication_metrics
 
     db = SessionDB(tmp_path / "wait.db")
@@ -21,21 +25,77 @@ def test_publication_mutex_timeout_attributes_holders(tmp_path, operation):
             held.set()
             release.wait(10)
 
-    thread = threading.Thread(target=reader)
+    thread = threading.Thread(target=reader, name="sessiondb-test-holder")
     thread.start()
     assert held.wait(10)
+    observed_at = time.monotonic()
     try:
         db._wal_active = False
-        with publication_metrics(0), patch("hermes_state_lockowners.log_write_lock_holders") as holders:
+        clock = SimpleNamespace(monotonic=lambda: observed_at + 5.0)
+        with publication_metrics(0), patch("hermes_state_lockowners.log_write_lock_holders") as holders, \
+                patch("hermes_state_publication.time", clock):
             with pytest.raises(LocalStateLockTimeout, match="local SessionDB connection mutex"):
                 if operation == "write":
                     db._execute_write(lambda conn: conn.execute("SELECT 1"), patience_s=0)
                 else:
                     db._read_one("SELECT 1")
         holders.assert_called_once_with(db.db_path, 0)
+        warnings = [record.getMessage() for record in caplog.records
+                    if record.levelno == logging.WARNING
+                    and "local connection mutex unavailable" in record.getMessage()]
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert "owner_thread='sessiondb-test-holder'" in warning
+        assert f"owner_ident={thread.ident}" in warning
+        assert re.search(r"test_publication_wait_budget\.py:\d+ \(reader\)", warning)
+        duration = re.search(r"held_for_s=([0-9.]+)", warning)
+        assert duration is not None
+        assert float(duration[1]) >= 5.0
+        assert "acquisitions_during_wait=0" in warning
     finally:
         release.set()
         thread.join(10)
+        assert not thread.is_alive()
+        db.close()
+
+
+def test_publication_mutex_timeout_names_a_writer_holder_past_lock_plumbing(tmp_path, caplog):
+    """A holder inside an ordinary SessionDB write (``state_lock``'s ``with lock:``) is named by
+    its own operation, not by the loop-guard/state_lock/contextlib frames it acquired through."""
+    from hermes_state_publication import LocalStateLockTimeout, publication_metrics
+
+    db = SessionDB(tmp_path / "writer.db")
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_inside_write(conn):
+        held.set()
+        release.wait(10)
+
+    def writer():
+        db._execute_write(hold_inside_write)
+
+    thread = threading.Thread(target=writer, name="sessiondb-test-writer")
+    thread.start()
+    assert held.wait(10)
+    try:
+        with publication_metrics(0), patch("hermes_state_lockowners.log_write_lock_holders"):
+            with pytest.raises(LocalStateLockTimeout, match="local SessionDB connection mutex"):
+                db._execute_write(lambda conn: conn.execute("SELECT 1"), patience_s=0)
+        warnings = [record.getMessage() for record in caplog.records
+                    if record.levelno == logging.WARNING
+                    and "local connection mutex unavailable" in record.getMessage()]
+        assert len(warnings) == 1
+        warning = warnings[0]
+        assert "owner_thread='sessiondb-test-writer'" in warning
+        callsite = warning.split("owner_callsite=", 1)[1]
+        for wrapper in ("hermes_loop_guard.py", "hermes_state_publication.py", "contextlib.py"):
+            assert wrapper not in callsite, callsite
+        assert "hermes_state.py:" in callsite and "_execute_write" in callsite, callsite
+    finally:
+        release.set()
+        thread.join(10)
+        assert not thread.is_alive()
         db.close()
 
 

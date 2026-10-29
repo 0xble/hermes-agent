@@ -2162,6 +2162,7 @@ TERMINAL_CONFIG_ENV_MAP = {
             "daytona_image", "vercel_runtime", "vercel_image", "ssh_host", "ssh_user", "ssh_port", "ssh_key",
             "container_cpu", "container_memory", "container_disk", "container_persistent",
             "docker_volumes", "docker_env", "docker_mount_cwd_to_workspace", "docker_network",
+            "docker_auto_mount_host_state",
             "docker_extra_args", "docker_shm_size", "docker_run_as_host_user", "docker_snap_compat",
             "docker_persist_across_processes", "docker_shared_container_key",
             "docker_orphan_reaper", "sandbox_dir", "persistent_shell")}}
@@ -3064,7 +3065,7 @@ def _default_value_for_key(dotted_key: str):
 _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "providers", "credential_pool_strategies", "mcp_servers", "hooks", "quick_commands",
     "personalities", "command_allowlist", "model_catalog", "channel_prompts", "server_actions",
-    "secrets", "goals", "loops"})
+    "secrets", "goals", "loops", "checkins"})
 
 # Top-level keys whose sub-keys are partially schema-defined (e.g. a PlatformConfig dataclass) but
 # where users may add fields DEFAULT_CONFIG doesn't enumerate: validate the FIRST segment only.

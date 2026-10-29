@@ -362,7 +362,7 @@ class TestCooldownsCommand:
         chain = [{"provider": "openrouter", "model": "gpt-5.4"}]
         _write_config(isolated_home, {"fallback_providers": chain})
         _arm("custom:claude-proxy", "claude-opus-5-5")
-        _arm("custom:codex-proxy", "gpt-6.1-sol")
+        _arm("custom:openai-proxy", "gpt-6.1-sol")
         from hermes_cli.fallback_cmd import cmd_fallback
         cmd_fallback(_parse(["fallback", "cooldowns", "clear", "--all"]))
         assert _cooling_models() == []

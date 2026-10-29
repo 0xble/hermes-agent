@@ -50,6 +50,7 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = _SHELL_ENV_NAME_RE
 _ENVIRONMENT_LABEL_KEY = "hermes-environment"
+_HOST_STATE_LABEL_KEY = "hermes-auto-mount-host-state"
 # Stamped at create time on per-workspace persistent containers (task key ``<base>:ws:<digest>``)
 # with the digest as its value. The orphan reaper reads it to spare a container the idle reaper
 # stopped on purpose; ``hermes-task-id`` cannot serve, it is truncated to 63 chars.
@@ -678,7 +679,8 @@ class DockerEnvironment(BaseEnvironment):
         shm_size: str = _DEFAULT_SHM_SIZE,
         shared_container_key: str = "",
         snap_compat: bool = False,
-        image_pinned: bool = False):
+        image_pinned: bool = False,
+        auto_mount_host_state: bool = True):
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
@@ -713,7 +715,8 @@ class DockerEnvironment(BaseEnvironment):
                 mount, cwd)
             cwd = mount
             self.cwd = mount
-        volume_args.extend(_readonly_skill_mount_args())
+        if auto_mount_host_state:
+            volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
         volume_args.extend(egress_volume_args)
@@ -758,7 +761,8 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
-            _EGRESS_LABEL_KEY: egress_label}
+            _EGRESS_LABEL_KEY: egress_label,
+            _HOST_STATE_LABEL_KEY: str(auto_mount_host_state).lower()}
         if workspace := _WORKSPACE_TASK_RE.search(task_id or ""):
             self._labels[_WORKSPACE_LABEL_KEY] = workspace.group(1)
         # Explicit sharing opts into the first creator's settings. Otherwise,
@@ -1247,7 +1251,10 @@ class DockerEnvironment(BaseEnvironment):
         self, task_label: str, profile_label: str, egress_label: str) -> Optional[tuple[str, str]]:
         """``(container_id, state)`` of an existing container labeled for this task/profile/
         egress posture and immutable environment, or ``None`` on miss or any failure.
-        Explicit shared keys opt out of the environment filter. The egress posture is a label
+        Explicit shared keys opt out of the environment filter, never the host-state policy:
+        disabled policy requires an explicit false label, while enabled policy accepts legacy
+        containers without the label to preserve their writable layers.
+        The egress posture is a label
         FILTER for every posture, "off" included: a container built with egress on must not be
         reused after ``hermes egress disable`` (baked-in proxy env and CA mounts), and every
         container this class creates carries the label. The ``{{.Label "key"}}`` template
@@ -1257,6 +1264,8 @@ class DockerEnvironment(BaseEnvironment):
             "--filter", f"label=hermes-task-id={task_label}",
             "--filter", f"label=hermes-profile={profile_label}",
             "--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"]
+        if self._labels[_HOST_STATE_LABEL_KEY] == "false":
+            filters.extend(["--filter", f"label={_HOST_STATE_LABEL_KEY}=false"])
         if environment_label := self._labels.get(_ENVIRONMENT_LABEL_KEY):
             filters.extend(["--filter", f"label={_ENVIRONMENT_LABEL_KEY}={environment_label}"])
         result = _docker_query(
@@ -1273,6 +1282,14 @@ class DockerEnvironment(BaseEnvironment):
             if len(parts) != 2:
                 continue
             cid, state = parts[0], parts[1].strip().lower()
+            if self._labels[_HOST_STATE_LABEL_KEY] == "true":
+                policy = _docker_query(
+                    [self._docker_exe, "inspect", "--format",
+                     f'{{{{index .Config.Labels "{_HOST_STATE_LABEL_KEY}"}}}}', cid], timeout=10,
+                    fail="docker inspect host-state policy failed: %s",
+                    nonzero="docker inspect host-state policy returned %d: %s")
+                if policy is None or policy.stdout.strip() == "false":
+                    continue
             if first is None:
                 first = (cid, state)
             if state == "running" and running is None:

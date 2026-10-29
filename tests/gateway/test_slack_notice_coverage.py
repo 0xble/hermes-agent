@@ -10,6 +10,7 @@ import cli
 import gateway.run as gateway_run
 from hermes_cli.config_effective import load_user_config_effective
 
+from agent.status_output import StatusOutputMixin
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, EphemeralReply, SendResult, as_command_reply
 from gateway.platforms.event import MessageEvent
@@ -95,6 +96,131 @@ def _adapter(platform):
     adapter = _TextAdapter(PlatformConfig(enabled=True, token="test"), platform)
     adapter.sent = []
     return adapter
+
+
+class _BoundaryAgent(StatusOutputMixin):
+    def __init__(self, callback):
+        self.model, self.provider, self.api_mode = "default", "nous", "chat_completions"
+        self.status_callback = callback
+        self.log_prefix = ""
+        self._vprint = MagicMock()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [Platform.SLACK, Platform.TELEGRAM])
+@pytest.mark.parametrize("suppressed", [False, True])
+async def test_cached_attended_unavailable_is_one_context_diagnostic(home, monkeypatch, platform, suppressed):
+    from gateway.attended_model import AttendedResolution
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+    from gateway.warning_notifications import DiagnosticText
+    from hermes_cli.auth import AuthError
+
+    runner, adapter = _runner(home), _adapter(platform)
+    source = _event("", platform).source
+    config = {"model": {"default": "default", "attended": {"model": "opus", "provider": "anthropic"}},
+              "display": {"suppress_warning_notifications": suppressed}}
+    decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *_a: "default")
+    monkeypatch.setattr(gateway_run, "_get_channel_override", lambda *_a, **_kw: None)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {
+        "provider": "nous", "api_mode": "chat_completions", "api_key": "test", "base_url": "https://test.invalid"})
+    provider_resolution = MagicMock(side_effect=AuthError("attended credentials unavailable"))
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs_for_provider", provider_resolution)
+    monkeypatch.setattr(runner, "_attended_resolution_for_session", lambda **_kw: decision)
+    monkeypatch.setattr(runner, "_rehydrate_session_model_override", lambda _key: None)
+    monkeypatch.setattr(runner, "_expire_attended_temporary_picks", lambda *_a: None)
+    monkeypatch.setattr(runner, "_session_model_override", lambda _key: None)
+    runner.adapters = {platform: adapter}
+    arrived = asyncio.Event()
+    original_send = adapter.send
+
+    async def observe(*args, **kwargs):
+        result = await original_send(*args, **kwargs)
+        arrived.set()
+        return result
+
+    adapter.send = observe
+    ctx = TurnContext(source=source, session_key="cached-session", user_config=config,
+        _run_still_current=lambda: True, _status_adapter=adapter, _status_chat_id="C1",
+        _status_thread_metadata={"thread_id": "123.0"}, _loop_for_step=asyncio.get_running_loop())
+    turn = TurnRunner(runner, ctx)
+    statuses = []
+
+    def callback(kind, message):
+        statuses.append((kind, message))
+        turn._status_callback_sync(kind, message)
+
+    agent = _BoundaryAgent(callback)
+    # Another session's pending notice must survive this request boundary untouched.
+    runner._commit_session_agent_runtime("other-session", ("other", {}, "other notice", False))
+    try:
+        await asyncio.to_thread(turn._apply_attended_before_api_call, agent)
+        await asyncio.to_thread(turn._apply_attended_before_api_call, agent)
+        assert (agent.model, agent.provider, agent.api_mode) == ("default", "nous", "chat_completions")
+        provider_resolution.assert_called_once_with("anthropic", target_model="opus")
+        assert len(statuses) == 1
+        kind, notice = statuses[0]
+        assert kind == "lifecycle" and isinstance(notice, DiagnosticText)
+        expected = "⚠️ Attended model unavailable; staying on default."
+        assert notice == expected
+        assert runner._consume_pre_agent_fallback_notice("cached-session") is None
+        assert runner._consume_pre_agent_fallback_notice("other-session") == "other notice"
+        if suppressed:
+            assert not arrived.is_set()
+            assert (adapter._web_client.chat_postMessage.call_count if platform == Platform.SLACK else len(adapter.sent)) == 0
+        else:
+            await asyncio.wait_for(arrived.wait(), 5)
+            _assert_sent(adapter, platform == Platform.SLACK, expected)
+            if platform == Platform.SLACK:
+                payload = adapter._web_client.chat_postMessage.call_args.kwargs
+                assert payload["text"] == expected
+                assert payload["blocks"][0]["elements"][0]["text"] == expected
+                assert adapter._web_client.chat_postMessage.call_count == 1
+                adapter._web_client.chat_update.assert_not_awaited()
+            else:
+                assert len(adapter.sent) == 1
+                assert adapter.sent[0] == (expected, {"metadata": {"thread_id": "123.0"}})
+    finally:
+        await _close(runner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["Credentials unavailable. Configure a provider.",
+    "Login required. Run /login.", "Model access denied. Choose another model."])
+async def test_cached_action_needed_diagnostics_remain_full(home, message):
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    runner, adapter = _runner(home), _adapter(Platform.SLACK)
+    runner.adapters = {Platform.SLACK: adapter}
+    source = _event("").source
+    arrived = asyncio.Event()
+    original_send = adapter.send
+
+    async def observe(*args, **kwargs):
+        result = await original_send(*args, **kwargs)
+        arrived.set()
+        return result
+
+    adapter.send = observe
+    ctx = TurnContext(source=source, session_key="cached-session", user_config={},
+        _run_still_current=lambda: True, _status_adapter=adapter, _status_chat_id="C1",
+        _status_thread_metadata={"thread_id": "123.0"}, _loop_for_step=asyncio.get_running_loop())
+    turn = TurnRunner(runner, ctx)
+    agent = _BoundaryAgent(turn._status_callback_sync)
+    runner._commit_session_agent_runtime("cached-session", ("default", {}, message, False))
+    try:
+        notice = runner._consume_pre_agent_fallback_notice("cached-session")
+        assert notice == message
+        assert getattr(notice, "notice_style", None) is None
+        await asyncio.to_thread(agent._emit_diagnostic_status, notice)
+        await asyncio.wait_for(arrived.wait(), 5)
+        _assert_sent(adapter, False, message)
+        assert runner._consume_pre_agent_fallback_notice("cached-session") is None
+    finally:
+        await _close(runner)
 
 
 def _event(text, platform=Platform.SLACK):

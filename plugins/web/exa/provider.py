@@ -7,12 +7,15 @@ sync-only; the dispatcher threads extract when the caller is async.
 from __future__ import annotations
 
 import logging
+from copy import copy
 from typing import Any, Dict, List
 
 from plugins.web._common import (
     BaseWebSearchProvider, cached_sdk_client, document, keyless_extract, keyless_search, keyless_variant_schema,
     provider_env, run_extract, run_search, search_ok, use_keyless, web_hit,
 )
+
+from plugins.web.exa.policy import select_search_policy
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +41,33 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
     EXTRACT = True
     KEYLESS = True
 
+    # Explicit endpoint isolates pre-policy cache entries, which lack type metadata.
+    SEARCH_ENDPOINT = "https://api.exa.ai/search"
+    SEARCH_TYPE = "auto"
+    SEARCH_TYPE_REASON = "default"
+    _stakes = None
+
+    def prepare_search(self, query: str, *, stakes: str | None = None) -> ExaWebSearchProvider:
+        request = copy(self)
+        request._stakes = stakes
+        request.SEARCH_TYPE, request.SEARCH_TYPE_REASON = select_search_policy(query, stakes)
+        return request
+
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         def _body() -> dict[str, Any]:
             if use_keyless("exa", provider_env("EXA_API_KEY")):
                 return keyless_search("Exa", "exa", query, limit, logger)
             logger.info("Exa search: '%s' (limit=%d)", query, limit)
-            response = _get_exa_client().search(query, num_results=limit, contents={"highlights": True})
-            return search_ok([
+            search_type, reason = select_search_policy(query, self._stakes)
+            response = _get_exa_client().search(
+                query, type=search_type, num_results=limit, contents={"highlights": True},
+            )
+            result = search_ok([
                 web_hit(r.url or "", r.title or "", " ".join(r.highlights or []), i + 1)
                 for i, r in enumerate(response.results or [])
             ])
+            result["data"].update(search_type=search_type, search_type_reason=reason)
+            return result
 
         return run_search("Exa", logger, _body, sdk=True)
 

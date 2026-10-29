@@ -2,6 +2,7 @@
 import json
 import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -78,6 +79,51 @@ async def test_failed_update_delivers_unchanged_version_and_one_line_cause(
         assert "Cause: The downloaded update contains a syntax error." in text
         assert "sys.exit" not in text
     assert not (tmp_path / ".update_pending.json").exists()
+
+
+def test_real_candidate_failure_names_dependency_conflict_without_inventing_unchanged_proof(tmp_path):
+    from gateway.update_notifications import notice
+
+    receipt = json.loads((Path(__file__).parent / "fixtures/immutable_candidate_dependency_failure.json").read_text())
+    sha = receipt["pre_update"]["sha"]
+    _release(tmp_path, sha=sha)
+    path = tmp_path / "logs/update_receipts/latest.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(receipt))
+    (tmp_path / ".update_process_exit_code").write_text("1")
+    request = {
+        "notification_version": 2,
+        "timestamp": receipt["started_at"],
+        "reason": "Activate the requested reaction tool rename to react and thumbs-up progress icon from merged PR #848",
+    }
+    outcome = final_outcome(tmp_path, request)
+    assert outcome is not None
+    success, detail = outcome
+    cause = ("InstallError: venv: dependency validation failed: "
+             "The package `browser-harness` requires `pillow==12.3.0`, but `13.0.0` is installed")
+    assert success is False
+    assert _failure_cause(receipt, 1) == cause
+    assert notice("❌ Update Failed", request, detail) == (
+        f"❌ Update Failed\n\n{request['reason']} Cause: {cause} "
+        "Runtime state is unverified; see the update output."
+    )
+
+
+@pytest.mark.parametrize("reason, expected", [
+    ("Checked 3 packages in 2ms\nFound 1 incompatibility\nalpha has requirement beta==1, but beta 2 is installed",
+     "alpha has requirement beta==1, but beta 2 is installed"),
+    ("InstallError: Checked 3 packages in 2ms\nFound 1 incompatibility\nalpha requires beta==1\n — retry, or run `hermes pm doctor`",
+     "InstallError: alpha requires beta==1"),
+    ("Checked 3 packages in 2ms\nFound 1 incompatibility", "The updater exited with code 1."),
+    ("build failed\nTraceback (most recent call last):\n  File \"probe.py\", line 1\nsecret source", "build failed"),
+    ("build failed\nsys.exit(1)\nsecret source", "build failed"),
+    ("build failed\nAuthorization: Bearer test-secret-value-123456789", "build failed Authorization: [REDACTED]"),
+    ("x" * 1000, "x" * 240),
+    ("warning " * 100 + "\nThe package `alpha` requires `beta==1`, but `2` is installed",
+     ("warning " * 100)[:80] + " The package `alpha` requires `beta==1`, but `2` is installed"),
+])
+def test_multiline_failure_cause_keeps_diagnostics_bounded_and_scrubbed(reason, expected):
+    assert _failure_cause({"stop_reason": reason}, 1) == expected
 
 
 @pytest.mark.parametrize("local_work", ["clean", "edits", "lockfile-churn"])

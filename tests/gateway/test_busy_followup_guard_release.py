@@ -119,7 +119,10 @@ def _multiplexed_queue_text(runner, monkeypatch, held):
     load_scope = gateway_run._load_profile_secret_scope
 
     def _held_load(profile_home):
-        held.block()
+        # Only hold the busy handler's read. Final delivery also legitimately
+        # loads the owning scope, and must be allowed to finish M1 meanwhile.
+        if not held.entered.is_set():
+            held.block()
         return load_scope(profile_home)
 
     monkeypatch.setattr(gateway_run, "_load_profile_secret_scope", _held_load)

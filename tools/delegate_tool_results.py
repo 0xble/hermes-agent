@@ -204,7 +204,7 @@ def _trim_summary_with_footer(summary: str, cap: int, task_index: int) -> tuple[
     if spill_path:
         # Agent-visible path: the parent's read_file runs inside the active backend (#81984, #77015).
         from tools.credential_files import to_agent_visible_cache_path
-        spill_path = to_agent_visible_cache_path(spill_path)
+        spill_path = to_agent_visible_cache_path(spill_path, fallback_to_host=False)
     model_text = _head_tail_with_footer(str(summary), cap, spill_path)
     return parent_copy(model_text, _head_tail_with_footer(forced, cap, spill_path)), spill_path
 
