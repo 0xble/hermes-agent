@@ -116,6 +116,17 @@ strategy and cron-exclusion behavior.
   generated templates. Model input and retention keep the complete file and channel content.
   Proof: `tests/agent/test_document_channel_recall_query.py` and the platform document suites.
   Retire when upstream carries the human caption separately through all attachment producers.
+- Recall-note peeling preserves the original leftmost regex choice and image-description fallback,
+  including notes that become complete across a deletion seam. `agent.recall_context` compiles only
+  the existing recall regex subset into ordered states. Memoized lookahead evaluates each
+  `(state, input offset)` at most once for each of the 2 possible EOF positions, and retained-prefix
+  snapshots avoid restarting at the beginning after deletion. This bounds work and space linearly
+  in input length for the fixed registry. The compiler uses CPython's internal regex parser, so
+  qualifying Python-version upgrades must run the corpus against the original eraser. Unsupported
+  regex constructs fail explicitly rather than silently changing the format contract.
+  Proof: `tests/agent/test_recall_context_scanning.py` compares producer, malformed, nested/seam,
+  escaped-quote, EOF, and whitespace cases and checks adversarial timing ratios by input size.
+  Retire when upstream has equivalent bounded peeling with the same semantics.
 - A generated-only turn also excludes its assistant reply from automatic transcript retention.
   Filtering only the user half creates an orphan assistant result that can turn test, relay or
   recall feedback into apparent personal evidence. Reuse the shared human-part classifier, not
