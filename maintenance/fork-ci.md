@@ -474,8 +474,11 @@ condition-based synchronization and output capture.
 The TUI gateway drop scenario holds its first provider request until five
 heartbeat RPCs have actually completed while that request is in flight. A
 legal slow first RPC otherwise consumes most of a short failed turn, so elapsed
-time cannot establish the sampler's count. Only then does the provider emit the
-same truncated SSE response. The turn's original deadline includes observation,
+time cannot establish the sampler's count. The provider emits the partial SSE
+immediately and sends empty content chunks during observation, keeping each
+read/stale gap short without changing either timeout. Only then does it close
+without a finish chunk. The first marked request must have served that drop to
+an open peer, with no retry before release. The turn's original deadline includes observation,
 and all heartbeat latency, terminal, retry-bound, history, reaping and subsequent
 prompt assertions remain. Each parallel scenario owns its provider and barrier.
 Retire this synchronization when upstream supplies equivalent observation-driven
@@ -483,9 +486,10 @@ fault injection.
 
 The PM wheelhouse fixture uses the four unmodified universal wheels vendored in
 `tests/pm/fixtures/runtime-wheelhouse`, not live PyPI or a host cache. It checks
-their hashes against the current `pm/uv.lock` before copying them into the
-isolated wheelhouse. Keep the fixtures and lock together when updating PM. The
-offline sealing, relocation and missing-locked-wheel rejection checks are
+the selected wheels' hashes against the current `pm/uv.lock` before copying them
+into the isolated wheelhouse, and requires the fixture archives to match that
+selection exactly. Missing fixtures name their lock entry. Keep the fixtures
+and lock together when updating PM. The offline sealing, relocation and missing-locked-wheel rejection checks are
 unchanged. Retire the vendored source if upstream provides an equally hermetic
 real-wheel fixture.
 

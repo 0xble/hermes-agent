@@ -25,6 +25,7 @@ def locked_wheelhouse(tmp_path_factory):
     lock = tomllib.loads((project / "uv.lock").read_text(encoding="utf-8-sig"))
     tags = set(sys_tags())
     versions = {}
+    selected = set()
     for package in lock["package"]:
         if "registry" not in package.get("source", {}):
             continue
@@ -33,10 +34,17 @@ def locked_wheelhouse(tmp_path_factory):
         assert choices, f"no host wheel for {package['name']}"
         wheel = choices[0]
         filename = wheel["url"].rsplit("/", 1)[1]
-        data = (source / filename).read_bytes()
+        selected.add(filename)
+        fixture = source / filename
+        assert fixture.is_file(), (
+            f"missing fixture {fixture} for {project / 'uv.lock'} entry "
+            f"{package['name']}=={package['version']}: {wheel['url']}")
+        data = fixture.read_bytes()
         assert "sha256:" + hashlib.sha256(data).hexdigest() == wheel["hash"]
         (wheelhouse / filename).write_bytes(data)
         versions[package["name"]] = package["version"]
+    assert {path.name for path in source.glob("*.whl")} == selected, (
+        f"{source} must contain exactly the wheels selected from {project / 'uv.lock'}", selected)
     return wheelhouse, versions
 
 
