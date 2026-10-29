@@ -17,6 +17,12 @@ from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# Pre-hand-off updaters leave root utils cached while purging packages.
+# Backup's state/agent imports reach prompt_builder before config's bridge.
+from hermes_cli.stale_modules import drop_stale_root_modules
+
+drop_stale_root_modules()
+
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, _get_platform_default_hermes_home, get_default_hermes_root, get_hermes_home,
     display_hermes_home,
