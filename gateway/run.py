@@ -429,7 +429,7 @@ def _ensure_windows_gateway_venv_imports() -> None:
         return
 
     project_root = Path(__file__).resolve().parent.parent
-    from pm.environments import committed_venv
+    from pm.environments import committed_venv, venv_python_version
 
     # A PM install's store Python was already activated onto the committed generation by
     # hermes_bootstrap; overlaying the leftover pre-PM venv loads a foreign ABI (#122183).
@@ -453,6 +453,10 @@ def _ensure_windows_gateway_venv_imports() -> None:
 
         site_packages = resolved_venv / "Lib" / "site-packages"
         if not site_packages.exists():
+            continue
+        # A legacy venv must match this interpreter before any .pth or native module is loaded.
+        if (found := venv_python_version(resolved_venv)) != sys.version_info[:2]:
+            logger.debug("Skipping venv overlay %s: Python %s, gateway %s", resolved_venv, found or "unknown", sys.version_info[:2])
             continue
 
         project_entry = str(project_root)
