@@ -164,8 +164,18 @@ def _show_skill_settings() -> None:
 
 
 def show_config():
-    """Display current configuration."""
-    config = _cfg.load_config()
+    """Display current configuration, or an operator repair diagnostic, never stale values."""
+    from hermes_cli.config_errors import ConfigValidationError
+    from hermes_cli.config_home import config_load_issue
+
+    try:
+        config = _cfg.load_config()
+    except ConfigValidationError as exc:
+        issue = config_load_issue(exc)
+        print(color(issue.message, Colors.RED))
+        print(f"  Config: {_cfg.get_config_path()}")
+        print(f"  {issue.hint}")
+        return
 
     print()
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))

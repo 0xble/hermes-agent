@@ -48,6 +48,19 @@ acceptance of the design. Reassess this divergence before adopting upstream work
   The shared auth advisory-lock primitive serializes writers by resolved path, including CLI
   read-modify-write cycles. Raw and expanded snapshots carry an out-of-band revision and reject
   stale rollbacks. A final revision check catches external edits during serialization.
+  Every shared raw-cache producer retains revision metadata. Wizard subflows checkpoint pending
+  settings before independent writes and refresh values and revisions together afterward.
+  Generic atomic I/O applies admission only to owned home/profile configs or explicit config
+  transactions, never to an unrelated application/template file by basename alone.
+- Credential mirror admission precedes environment and pool changes. A rejected mirror
+  candidate leaves those stores unchanged, rather than splitting a rotation/removal.
+- Strict runtime reads never serve stale semantic values. Local config display and structure
+  diagnostics retain repair details without admitting invalid runtime data. Guardian canary
+  reads validate their own policy independently of unrelated runtime fields, retaining managed
+  overlays. Consent readers accept revision-bearing mappings but reject failed-read sentinels.
+- Guard: cache-revision, credential-admission, wizard-subflow, write-ownership, scoped-canary,
+  update-consent and operational-recovery regressions under `tests/hermes_cli/` cross the actual
+  file-backed consumer paths, preserving stale-write rejection and full write validation.
 - Good backups and in-memory last-good state accept only semantic successes. Recovery scans
   past invalid good snapshots and expands the first valid authored candidate. Snapshot copying
   uses the exact admitted bytes, not a later reread of the source path.
