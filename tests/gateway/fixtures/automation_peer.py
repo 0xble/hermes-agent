@@ -96,6 +96,7 @@ async def probe(root, base, mode):
     ready = asyncio.Queue()
     outgoing = []
     outbound_at = {}
+    status_ack = asyncio.Event()
     async def connector(ws):
         hello = json.loads(await ws.recv())
         assert hello['platform'] == 'telegram', hello
@@ -110,6 +111,9 @@ async def probe(root, base, mode):
             if frame['type'] == 'outbound':
                 if 'AUTOMATION_ACK' in json.dumps(frame):
                     outbound_at['initial'] = time.time()
+                if 'SUPERVISOR_STATUS' in json.dumps(frame):
+                    outbound_at['supervisor'] = time.time()
+                    await status_ack.wait()
                 await ws.send(json.dumps({'type': 'outbound_result', 'requestId': frame['requestId'],
                     'result': {'success': True, 'message_id': 'fixture-final'}}) + '\n')
             elif frame['type'] == 'going_idle':
@@ -190,8 +194,8 @@ async def probe(root, base, mode):
                                 return json.loads(row[0]) if row and row[0] else None
                         # Native execution settles before transport final delivery. Wait for
                         # the acknowledged initial reply's timer reset before advancing it.
-                        await wait_for(lambda: state() is not None and (mode == 'peer-checkin' or
-                                       'initial' in outbound_at and state()['last_visible_at'] >= outbound_at['initial']))
+                        await wait_for(lambda: state() is not None and 'initial' in outbound_at
+                                       and state()['last_visible_at'] >= outbound_at['initial'])
                         armed = state()
                         # Advance only this test timer, not the daemon's clock or production config.
                         armed['due_at'] = time.time() - 1
@@ -210,7 +214,16 @@ async def probe(root, base, mode):
                         assert model.checkin_turns == 1, model.requests
                         automatic = [r for r in rows() if 'supervisor-checkin' in r['request_id']]
                         assert len(automatic) == 1 and automatic[0]['status'] == 'terminal', automatic
-                        assert state()['fired'] and state()['due_at'] > time.time() + 1700
+                        # An outbound frame is not a visible ACK. Hold the real relay response
+                        # until the daemon proves execution did not erase its overdue debt.
+                        before_ack = state()
+                        assert before_ack is not None and armed is not None
+                        assert before_ack['fired'] and before_ack['due_at'] == armed['due_at'], before_ack
+                        assert before_ack['last_visible_at'] == armed['last_visible_at'], before_ack
+                        assert before_ack['next_attempt_at'] > time.time() + 1700, before_ack
+                        status_ack.set()
+                        await wait_for(lambda: state()['last_visible_at'] >= outbound_at['supervisor'])
+                        assert state()['due_at'] > time.time() + 1700
                         status_frame = next(f for f in outgoing if 'SUPERVISOR_STATUS' in json.dumps(f))
                         assert status_frame['action']['chat_id'] == 'automation-chat', status_frame
                         assert str(status_frame['action']['metadata']['thread_id']) == '103', status_frame
@@ -271,6 +284,7 @@ async def probe(root, base, mode):
                     print(json.dumps({'daemon_pid': proc.pid, 'ledger': rows(), 'model_inputs': texts,
                                       'observer_closed_before_completion': True}))
                 except BaseException:
+                    status_ack.set()
                     print((home / 'daemon.log').read_text()[-10000:], file=sys.stderr)
                     raise
     finally:
