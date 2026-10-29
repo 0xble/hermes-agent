@@ -286,9 +286,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return "\n\n---\n".join(p for p in (self._accumulated, progress) if p)
 
     def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False) -> dict | None:
-        """Per-send metadata.  ``final`` → notify=True (Mattermost treats notify-worthy sends
-        as final when a broken thread root may fall back flat); ``expect_edits`` keeps
-        editable previews on Telegram's legacy send path."""
+        """Per-send metadata. ``final`` carries the native draft's identity and notify=True
+        (Mattermost treats notify-worthy sends as final when a broken thread root may fall
+        back flat). ``expect_edits`` keeps editable previews on Telegram's legacy send path."""
         meta = dict(self.metadata) if self.metadata else {}
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
@@ -296,6 +296,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            if self._draft_id is not None:
+                meta["_draft_id"] = self._draft_id
         return meta or None
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).

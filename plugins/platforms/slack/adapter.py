@@ -2644,13 +2644,10 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
     async def _try_finalize_stream(
         self, chat_id: str, content: str, metadata: Optional[dict[str, Any]] = None
     ) -> Optional[SendResult]:
-        """Seal the active native stream if ``content`` is its final text: SendResult when the
-        stream IS the final message; None when unrelated (interim commentary), leaving it open.
+        """Seal only the owning draft's final, never an unowned or interim send.
 
-        Invariant (duplicate-final class): a successfully streamed answer is NEVER posted a
-        second time. A fresh post happens only when the streamed message is demonstrably
-        uncommittable — the seal failed AND an in-place ``chat.update`` of it failed — or when
-        the content is unrelated to the stream."""
+        A streamed answer is never posted twice unless both sealing and in-place update
+        fail, or the final content cannot reuse the stream."""
         md = metadata or {}
         # Streaming contract: interim sends (commentary, segment-tail flushes) and editable
         # previews are never the turn final, whatever their text looks like.
@@ -2658,7 +2655,9 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
             return None
         key = self._stream_key(chat_id, md)
         stream = self._active_streams.get(key) if key else None
-        if stream is None:
+        if stream is None or md.get("_draft_id") is None or md["_draft_id"] != stream.get("draft_id"):
+            # Thread routing and matching prose are not ownership. Only the consumer
+            # that opened this draft may commit it, never a background or stale send.
             return None
         text = self._strip_stream_cursor(content)
         sent = stream.get("sent", "")
