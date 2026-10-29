@@ -322,7 +322,15 @@ async def execute_admission(authority, ref, row):
                 # a finite (``chat -q`` / ``-z``) prompt, whose exit code is the only verdict a
                 # script reads, unless the prompt was a command and the reply is its answer.
                 result = {'final_response': response or '', 'messages': []}
-                if is_api or (row['payload'].get('finite') is True and not event.get_command()):
+                if getattr(event, '_outbox_duplicate', False):
+                    # The claimed turn was discarded as a transport redelivery of its own ingress, so
+                    # it never ran. Recorded as completed, a whole class of input vanishes silently
+                    # (2026-10-29: ~92% of Telegram turns for 5 hours); a failed receipt is visible.
+                    logger.error("Claimed admission %s produced no turn: outbox treated it as a redelivery",
+                                 row['admission_id'])
+                    result = {'final_response': '', 'messages': [], 'failed': True, 'completed': False,
+                              'error': 'The admitted turn was dropped as a duplicate delivery.'}
+                elif is_api or (row['payload'].get('finite') is True and not event.get_command()):
                     result = {'final_response': '', 'messages': [], 'failed': True, 'completed': False,
                               'error': response or 'The admitted turn failed.'}
             # The drain commits this under the stream lock so no viewer reads `terminal`
