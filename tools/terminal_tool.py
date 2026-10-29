@@ -901,6 +901,7 @@ def _get_env_config() -> dict[str, Any]:
         "container_persistent": _tenv_bool("TERMINAL_CONTAINER_PERSISTENT", "true"),
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
+        "docker_auto_mount_host_state": _tenv_bool("TERMINAL_DOCKER_AUTO_MOUNT_HOST_STATE", "true"),
         "docker_run_as_host_user": _tenv_bool("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false"),
         "docker_snap_compat": _tenv_bool("TERMINAL_DOCKER_SNAP_COMPAT", "false"),
         "docker_network": _tenv_bool("TERMINAL_DOCKER_NETWORK", "true"),
