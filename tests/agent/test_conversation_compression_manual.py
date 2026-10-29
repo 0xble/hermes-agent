@@ -335,8 +335,8 @@ def _summary_budgets(agent, history, raw):
     budgets = []
     real = ContextCompressor._compute_summary_budget
 
-    def _spy(self, turns):
-        budgets.append(real(self, turns))
+    def _spy(self, content):
+        budgets.append(real(self, content))
         return budgets[-1]
 
     with patch.object(ContextCompressor, "_compute_summary_budget", _spy):

@@ -3403,18 +3403,18 @@ class ContextCompressor(
             f"{int(self._proactive_prune_rearm_tokens):,}",
         )
 
-    def _compute_summary_budget(self, turns_to_summarize: list[dict[str, Any]]) -> int:
-        """Scale the summary token budget with content size and context window."""
-        # Price what the summarizer sees, not raw logs discarded by serialization.
-        content = self._bound_summary_input(self._serialize_for_summary(turns_to_summarize))
+    def _compute_summary_budget(self, content_to_summarize: str) -> int:
+        """Price the already serialized, sampled or bounded text used by the prompt."""
         previous = self._bound_summary_input(self._previous_summary or "")
-        messages = [{"role": "user", "content": previous + content}]
+        messages = [{"role": "user", "content": previous + content_to_summarize}]
         content_tokens = estimate_messages_tokens_rough(messages)
         forget_message_token_memo(messages)
         default_cap = min(int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING)
         cap_scale = min(1.0, self.max_summary_tokens / max(1, default_cap))
         budget = int(content_tokens * _SUMMARY_RATIO * cap_scale)
-        return min(self.max_summary_tokens, _SUMMARY_TOKENS_CEILING, max(_MIN_SUMMARY_TOKENS, budget))
+        # Only a lowered manual cap overrides the floor, not small-context defaults.
+        cap = self.max_summary_tokens if cap_scale < 1.0 else max(_MIN_SUMMARY_TOKENS, self.max_summary_tokens)
+        return min(cap, _SUMMARY_TOKENS_CEILING, max(_MIN_SUMMARY_TOKENS, budget))
 
     # Summarizer-input limits: the budget is the summary model's window, not the main model's.
     _CONTENT_MAX = 6000       # total chars per message body
@@ -3921,10 +3921,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             focus_topic = _redact_compaction_text(focus_topic)
         if self._previous_summary:
             self._previous_summary = _redact_compaction_text(self._previous_summary)
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
-        telemetry = getattr(self, "_active_compression_telemetry", None)
-        if isinstance(telemetry, dict):
-            telemetry["summary_budget_tokens"] = summary_budget
         # Ghost-skill defense: LLMs paraphrase [SKILL_PRUNED] markers away; collect the names
         # deterministically BEFORE the call (from the turn LIST, not the bounded text), re-inject after.
         _pruned_skill_names = list(dict.fromkeys(
@@ -3937,6 +3933,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._record_summary_input_coverage(coverage)
         else:
             content_to_summarize = self._bound_summary_input(self._serialize_for_summary(turns_to_summarize))
+        summary_budget = self._compute_summary_budget(content_to_summarize)
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry["summary_budget_tokens"] = summary_budget
         has_user_turn = getattr(self, "_summary_has_user_turn", None)
         if has_user_turn is None:
             has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
@@ -3951,10 +3951,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # Restore any [SKILL_PRUNED] marker the summarizer paraphrased away.
             # See #32106.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
+            self._record_summary_output(summary, summary_budget)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
-            self._record_summary_output(summary, summary_budget)
             # A detached stale attempt must not publish its late summary onto shared compressor state:
             # the fallback already advanced _previous_summary and owns the cooldown/error fields. The
             # candidate itself is discarded downstream by the working-attempt check; bail here so the
