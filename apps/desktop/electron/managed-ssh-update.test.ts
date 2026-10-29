@@ -368,16 +368,22 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
     const launcher: string = path.join(home, 'hermes launcher')
 
     // Subscribe before launching: the detached child can publish before exec returns.
+    // On macOS under a loaded full suite the watch event alone has missed the publication,
+    // so any event and a steady poll both re-check; the test timeout stays the only bound.
     const statusPath: string = path.join(home, `.update_exit_code.${CORRELATION}`)
     const publication = watch(home)
+    let poll: ReturnType<typeof setInterval> | undefined
 
     const published = new Promise<void>((resolve, reject) => {
-      publication.on('error', reject)
-      publication.on('change', (_event, filename) => {
-        if (String(filename) === path.basename(statusPath) && existsSync(statusPath)) {
+      const check = (): void => {
+        if (existsSync(statusPath)) {
           resolve()
         }
-      })
+      }
+
+      publication.on('error', reject)
+      publication.on('change', check)
+      poll = setInterval(check, 25)
     })
 
     try {
@@ -419,6 +425,7 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
         false
       )
     } finally {
+      clearInterval(poll)
       publication.close()
       await rm(home, { force: true, recursive: true })
     }
