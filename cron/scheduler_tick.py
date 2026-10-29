@@ -7,6 +7,7 @@ import time
 
 from cron import store_health
 from cron.constants import is_recurring
+from cron.jobs import JobsLockContended
 from cron.scheduler_diagnostics import note_dispatch_stage
 
 logger = logging.getLogger("cron.scheduler")
@@ -40,6 +41,11 @@ def process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     try:
         claimed = _sched.claim_job_for_fire(job["id"], return_job=True)
         note_dispatch_stage(job, "fire_claim_exit")
+    except JobsLockContended as exc:
+        logger.warning("Cron fire claim deferred until the next tick: %s", exc)
+        _sched.settle_unstarted_execution(
+            job["execution_id"], job["id"], f"Cron jobs lock contended; not started: {exc}")
+        return False
     except OSError as exc:
         store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
         _sched.settle_unstarted_execution(
@@ -90,12 +96,15 @@ def _acquire_tick_lock_or_degrade(_sched):
 
 
 def _advance_or_drop_recurring(_sched, due_jobs: list) -> list:
-    """Persist the recurring jobs' advance before any runs; when the store refuses it, drop them
-    (no durable advance -> a crash mid-run would re-fire them, so skipping is the at-most-once
-    side). One-shots still go through their own fire claim."""
+    """Persist recurring advances before any runs. Lock contention defers the entire tick.
+    Disk write failures filter recurring jobs out of this tick (no durable advance -> a crash
+    mid-run would re-fire them). One-shots still go through their own fire claim."""
     try:
         _sched.advance_next_runs([job["id"] for job in due_jobs])
         return due_jobs
+    except JobsLockContended as exc:
+        logger.warning("Cron advance deferred until the next tick, retaining all due slots: %s", exc)
+        raise  # Defer the tick as a whole, do not filter or consume recurring jobs.
     except OSError as exc:
         skipped = [j for j in due_jobs if is_recurring(j)]
         store_health.note_unwritable(exc, f"skipped {len(skipped)} recurring job(s)", "advance", skipped)
@@ -195,7 +204,11 @@ def _tick_admitted(
         # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
         # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
         # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
-        due_jobs = _advance_or_drop_recurring(_sched, due_jobs)
+        try:
+            due_jobs = _advance_or_drop_recurring(_sched, due_jobs)
+        except JobsLockContended:
+            _sched._sweep_mcp_orphans()
+            return 0
         if not due_jobs:
             _sched._sweep_mcp_orphans()
             return 0

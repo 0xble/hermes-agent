@@ -27,7 +27,7 @@ def _completed_rows(job_id, instant):
     The due scan holds jobs.json's cross-process lock. Taking the execution writer
     mutex here lets unrelated ledger work hold that global lock for an entire scan.
     WAL readers need neither that mutex nor a fresh schema/PRAGMA pass per job.
-    Busy/unknown reads keep the existing fail-open policy in completed_occurrence.
+    Brief SQLite busy periods get 50 ms to clear before the unknown-proof fail-open policy.
     """
     from cron.executions import _db_path, _transaction
 
@@ -40,7 +40,7 @@ def _completed_rows(job_id, instant):
     )
     try:
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
-                                     timeout=0)) as conn:
+                                     timeout=0.05)) as conn:
             conn.row_factory = sqlite3.Row
             return conn.execute(query, (str(job_id), instant)).fetchall()
     except sqlite3.OperationalError as exc:

@@ -91,7 +91,44 @@ def test_missing_completion_ledger_is_not_created(ledger):
     assert not ledger.exists()
 
 
-def test_busy_completion_read_remains_unknown_without_waiting(ledger, caplog):
+def test_completion_read_waits_briefly_for_transient_sqlite_busy(ledger, monkeypatch):
+    slot = "2026-01-01T00:00:00+00:00"
+    with sqlite3.connect(ledger) as conn:
+        conn.execute("CREATE TABLE executions (id, job_id, scheduled_instant, status, finished_at, claimed_at)")
+        conn.execute("INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?)",
+                     ("proof", "job", slot, "completed", slot, slot))
+    held, reading = threading.Event(), threading.Event()
+    connect = sqlite3.connect
+
+    def hold_until_read():
+        with connect(ledger) as writer:
+            writer.execute("BEGIN EXCLUSIVE")
+            held.set()
+            assert reading.wait(5)
+            # Simulate a short schema/commit lock, not an execution writer mutex wait.
+            threading.Event().wait(0.005)
+            writer.rollback()
+
+    class CompletionReader(sqlite3.Connection):
+        def execute(self, query, *args, **kwargs):
+            if query.startswith("SELECT id, finished_at"):
+                assert super().execute("PRAGMA busy_timeout").fetchone()[0] == 50
+                reading.set()
+            return super().execute(query, *args, **kwargs)
+
+    holder = threading.Thread(target=hold_until_read)
+    holder.start()
+    try:
+        assert held.wait(5)
+        monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: connect(*a, **kw, factory=CompletionReader))
+        assert completed_occurrence({"id": "job"}, slot)
+    finally:
+        reading.set()
+        holder.join(timeout=5)
+    assert not holder.is_alive()
+
+
+def test_busy_completion_read_remains_unknown_after_bounded_wait(ledger, caplog):
     # DELETE-mode readers may be excluded by a writer. Unknown proof is still fail-open.
     with sqlite3.connect(ledger) as conn:
         conn.execute("CREATE TABLE executions (id, job_id, scheduled_instant, status, finished_at, claimed_at)")
@@ -125,7 +162,7 @@ def test_lock_timeout_names_real_owner_and_does_not_overwrite_it(tmp_path, monke
             owner = json.loads(before.decode("utf-8-sig"))
             assert owner["pid"] == child.pid
             monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0)
-            with caplog.at_level("ERROR", logger="cron.jobs"):
+            with caplog.at_level("WARNING", logger="cron.jobs"):
                 with jobs._jobs_lock():
                     pass
             assert path.read_bytes() == before

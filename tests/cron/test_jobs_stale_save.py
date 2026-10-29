@@ -44,7 +44,7 @@ with jobs._jobs_lock():
                         jobs.save_jobs(stale)
                 else:
                     jobs.save_jobs(stale)
-            except TimeoutError:
+            except jobs.JobsLockContended:
                 refused = True
             # Assert the value first: the unfixed implementation actually reverts it.
             assert jobs.get_job(job["id"])["deliver"] == "telegram:edited"
@@ -81,7 +81,7 @@ def interleave(*args, **kwargs):
 jobs._record_run_outcome = interleave
 try:
     jobs.mark_job_run(sys.argv[1], True)
-except TimeoutError:
+except jobs.JobsLockContended:
     print("refused", flush=True)
 else:
     print("saved", flush=True)
@@ -174,7 +174,7 @@ def test_all_save_entrypoints_refuse_unowned_lock(monkeypatch, result):
         lambda: jobs.save_jobs_document({"jobs": []}),
         lambda: jobs.update_job(job["id"], {"prompt": "changed"}),
     ):
-        with pytest.raises(TimeoutError, match="Refusing cron write"):
+        with pytest.raises(jobs.JobsLockContended, match="Refusing cron write"):
             save()
         assert path.read_bytes() == before
     # Read-only degradation remains available.

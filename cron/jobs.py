@@ -304,6 +304,10 @@ def _release_flock(lock_fd) -> None:
         lock_fd.close()
 
 
+class JobsLockContended(RuntimeError):
+    """A refused store write without lock ownership, safe to retry after contention."""
+
+
 @contextlib.contextmanager
 def _jobs_lock():
     """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
@@ -338,7 +342,7 @@ def _jobs_lock():
                 lock_fd.seek(0)
                 acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
                 if acquired is False:
-                    logger.error(
+                    logger.warning(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
                         "it. Reads may proceed with in-process locking only; writes are refused. %s",
@@ -1511,11 +1515,13 @@ def load_jobs() -> list[dict[str, Any]]:
                 return load_jobs()
         for note in notes:
             logger.warning("%s", note)
-        # Keep the shrink-merge (a degraded-lock sibling's create may have landed since the read)
+        # Keep the shrink-merge (a sibling's create may have landed since an unlocked read)
         # unless disk is STILL a shape the merge would refuse: a sibling may have rewritten it.
         try:
             save_jobs(jobs, replace=unmergeable and _peek_jobs_unlocked() is None)
             logger.warning("Auto-repaired jobs.json (%s)", repair)
+        except JobsLockContended as exc:
+            logger.warning("Cron repair deferred until the jobs lock is available: %s", exc)
         except OSError as exc:  # repaired in memory; the next load retries the persist
             store_health.note_unwritable(exc, f"jobs.json repair ({repair}) not persisted", "load")
     _record_load_stamp(pre_read_stamp)
@@ -1687,8 +1693,8 @@ def _save_jobs_unlocked(
     """
     error = getattr(_jobs_lock_state, "write_error", "Refusing cron write: jobs lock not held")
     if error is not None:
-        logger.error("%s", error)
-        raise TimeoutError(error)
+        logger.warning("%s", error)
+        raise JobsLockContended(error)
     jobs_file = _current_cron_store().jobs_file
     removed_ids = tuple(str(job_id) for job_id in (removed_ids or ()) if job_id)
     snapshot = jobs
@@ -1769,8 +1775,8 @@ def save_jobs_document(document: Any) -> None:
     if not isinstance(jobs, list):
         raise ValueError("Cron jobs document must contain a jobs list")
     with _jobs_lock():
-        # Keep the shrink-merge guard: under the degraded (in-process only) lock a sibling's
-        # create may have landed after the caller read the document.
+        # Keep the shrink-merge guard: a sibling's create may have landed after the
+        # caller read the document, before this cross-process lock was acquired.
         _save_jobs_unlocked(jobs, document=document)
 
 
@@ -3581,6 +3587,9 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
     if scan.needs_save:
         try:
             save_jobs(raw_jobs, removed_ids=scan.removed or None)
+        except JobsLockContended as exc:
+            logger.warning("Cron due scan deferred until the next tick: %s", exc)
+            return []  # No dispatch may consume an uncommitted repair/claim/pending slot.
         except OSError as exc:  # repairs live in memory; the next tick retries the persist
             store_health.note_unwritable(exc, "due-scan repairs not persisted", "scan")
             return due

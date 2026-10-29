@@ -63,8 +63,8 @@ def _unmerged_disk_jobs(
 def _merge_unexpected_disk_jobs(
     jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
 ) -> list[dict[str, Any]]:
-    """*jobs* plus on-disk jobs absent from the payload (under the degraded flock-timeout path a
-    stale writer would otherwise clobber concurrent creates). Deletes pass ``removed_ids``; never
+    """*jobs* plus on-disk jobs absent from a stale writer's payload, preserving concurrent
+    creates committed before this writer acquired the lock. Deletes pass ``removed_ids``; never
     mutates *jobs*."""
     from cron import jobs as store
     recovered = store._unmerged_disk_jobs(jobs, removed_ids)
@@ -72,8 +72,7 @@ def _merge_unexpected_disk_jobs(
         return jobs
     store.logger.warning(
         "Preserved %d cron job(s) present on disk but missing from the "
-        "in-memory save payload (concurrent create under degraded lock "
-        "or stale writer) (#80624): %s",
+        "in-memory save payload (concurrent create since a stale writer read) (#80624): %s",
         len(recovered), [j.get("id") for j in recovered])
     return jobs + recovered
 
