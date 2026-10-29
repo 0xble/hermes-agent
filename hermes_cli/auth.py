@@ -1390,6 +1390,24 @@ def deactivate_provider() -> None:
 # ── Provider Resolution — picks which provider to use ───────────────────────────────────────────────
 
 
+def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
+    """Return a helpful hint string when provider resolution fails."""
+    if str(provider_name or "").strip().lower() in {"opencode-free", "free", "opencode_free"}:
+        return ("OpenCode discontinued anonymous free-tier access outside its own client "
+                "(relay 403s FreeTierError), so the keyless 'opencode-free' provider was removed. "
+                "Switch to 'opencode-zen' (pay-as-you-go, OPENCODE_ZEN_API_KEY) or 'opencode-go' "
+                "($10/mo subscription, OPENCODE_GO_API_KEY) via 'hermes model'.")
+    try:
+        from hermes_cli.config import validate_config_structure
+        issues = validate_config_structure()
+        if not issues:
+            return ""
+        # This hint can reach chat through AuthError. Keep authored diagnostics local.
+        return "Config issues detected. Run 'hermes doctor' for local diagnostics."
+    except Exception:
+        return ""
+
+
 def _refuse_env_adoption_if_config_corrupt() -> None:
     """Refuse env-key/pool auto-adoption of openrouter while config.yaml is corrupt.
 

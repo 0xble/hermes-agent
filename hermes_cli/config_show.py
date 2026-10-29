@@ -172,7 +172,7 @@ def show_config():
         config = _cfg.load_config()
     except ConfigValidationError as exc:
         issue = config_load_issue(exc)
-        print(color(issue.message, Colors.RED))
+        print(color(issue.local_detail or issue.message, Colors.RED))
         print(f"  Config: {_cfg.get_config_path()}")
         print(f"  {issue.hint}")
         return

@@ -40,3 +40,27 @@ def test_wizard_refresh_preserves_revision_and_pending_edits(tmp_path, monkeypat
     with pytest.raises(ConfigWriteConflict):
         config.save_config(stale)
     assert path.read_bytes() == latest
+
+
+def test_gateway_cancel_keeps_entry_checkpoint_and_says_so(tmp_path, monkeypatch, capsys):
+    from hermes_cli import gateway, setup, setup_platforms
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "config.yaml"
+    path.write_text("timezone: UTC\n", encoding="utf-8")
+    wizard = config.load_config()
+    wizard["display"]["skin"] = "mono"
+    platforms = [{"key": "synthetic", "label": "Synthetic", "emoji": ""}]
+    monkeypatch.setattr(gateway, "_all_platforms", lambda: platforms)
+    monkeypatch.setattr(gateway, "_platform_status", lambda _: "not configured")
+
+    def cancel(*args):
+        raise setup._SetupCancelled()
+
+    monkeypatch.setattr(setup, "prompt_checklist", cancel)
+    monkeypatch.setattr(setup, "_run_setup_wizard_impl", lambda _: setup_platforms.setup_gateway(wizard))
+    setup.run_setup_wizard(None)
+    assert config.read_user_config_raw()["display"]["skin"] == "mono"
+    output = capsys.readouterr().out
+    assert "earlier checkpoints are kept" in output
+    assert "Remaining sections were not changed" not in output

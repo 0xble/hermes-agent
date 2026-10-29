@@ -41,8 +41,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   existing classification, failed-turn bookkeeping and sanitized messages.
 - Owner: `hermes_cli/config_errors.py`, `gateway/run_turn_runner.py`,
   `gateway/run_turn.py` and `gateway/run_turn_persistence.py`.
+- Config load failures use generic `ConfigIssue.message` text and keep operator detail in
+  `local_detail` for config show, doctor and stderr. Unknown-provider replies in model switching
+  and auth do not copy structural issue messages or hints either, since those can quote authored
+  values. The generic repair hint is enough for transport callers.
 - Guard: `tests/gateway/test_config_error_notice.py` covers chained pre-turn
   errors, both in-turn handlers, repeated turns and a changed config mtime.
+  `tests/gateway/test_model_config_diagnostics.py` crosses the real model-switch reply boundary
+  with private preset and authored-value markers, and checks both unknown-provider hint builders.
 - Retire when upstream provides the same typed classification and log dedupe.
 
 ## Config Changes During Failed Cron Runs

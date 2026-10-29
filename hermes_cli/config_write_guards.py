@@ -58,13 +58,18 @@ _holders = threading.local()
 
 def _is_config_document(path: Path) -> bool:
     """Only owned homes or an explicit config transaction opt generic I/O into admission."""
+    # Explicit transactions may use another basename, including resolved symlink targets.
+    holders = getattr(_holders, "paths", {})
+    if holders:
+        holder = holders.get(str(path.resolve()))
+        if holder is not None and getattr(holder, "depth", 0):
+            return True
+    if path.name != "config.yaml":
+        return False
     from hermes_cli.config import get_config_path
     from hermes_constants import get_default_hermes_root
 
     resolved = path.resolve()
-    holder = getattr(_holders, "paths", {}).get(str(resolved))
-    if holder is not None and getattr(holder, "depth", 0):
-        return True
     if resolved == get_config_path().resolve():
         return True
     root = get_default_hermes_root().resolve()

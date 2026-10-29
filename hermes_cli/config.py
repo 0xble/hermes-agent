@@ -979,6 +979,19 @@ _VALID_CUSTOM_PROVIDER_FIELDS = {
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
 
 
+@dataclass
+class ConfigIssue:
+    """A config problem. ``local_detail`` is for operator diagnostics, never transport replies."""
+    severity: str  # "error", "warning"
+    message: str
+    hint: str
+    local_detail: str = ""
+
+
+def _issue(issues: list[ConfigIssue], severity: str, message: str, hint: str) -> None:
+    issues.append(ConfigIssue(severity, message, hint))
+
+
 def _require_fields(
     issues: list[ConfigIssue], entry: dict[str, Any], label: str,
     fields: tuple[tuple[str, str], ...], suffix: str = "") -> None:
@@ -1170,11 +1183,10 @@ def print_config_warnings(config: Optional[dict[str, Any]] = None) -> None:
         issues = []
     if not issues:
         return
-
     lines = ["\033[33m⚠ Config issues detected in config.yaml:\033[0m"]
     for ci in issues:
         marker = "\033[31m✗\033[0m" if ci.severity == "error" else "\033[33m⚠\033[0m"
-        lines.append(f"  {marker} {ci.message}")
+        lines.append(f"  {marker} {ci.local_detail or ci.message}")
     lines.append("  \033[2mRun 'hermes doctor' for fix suggestions.\033[0m")
     sys.stderr.write("\n".join(lines) + "\n\n")
 
