@@ -2864,15 +2864,11 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         return value
 
     def _slack_api_human_users(self) -> frozenset:
-        """User IDs whose Web-API posts count as human (``extra.api_human_users`` /
-        ``SLACK_API_HUMAN_USERS``): ``xoxp-`` posts carry ``app_id`` and no ``client_msg_id`` so
-        look like bots. Users only — an app-id allowlist would admit the app's own posts.
-
-        A message posted with a *user* token (``xoxp-``) is authored by a real person, but Slack still
-        stamps it with the posting ``app_id`` and it carries no ``client_msg_id`` — exactly the #35777
-        app/bot signature in ``_event_declares_bot_sender``. Operators running their own front-end
-        (dashboard, mobile shell) allowlist those *users* via ``platforms.slack.extra.api_human_users``
-        (``SLACK_API_HUMAN_USERS`` fallback) instead of ``allow_bots: all``.
+        """User IDs whose Web-API (``xoxp-``) posts count as human (``extra.api_human_users`` /
+        ``SLACK_API_HUMAN_USERS``) although Slack stamps them like app posts (see
+        ``_event_declares_bot_sender``). Operators running their own front-end (dashboard, mobile
+        shell) list those *users* instead of ``allow_bots: all``. Users only — an app-id allowlist
+        would admit the app's own posts.
         """
         cached = getattr(self, "_api_human_users_cache", None)
         if cached is None:
@@ -2886,27 +2882,23 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
 
     def _event_declares_bot_sender(self, event: dict) -> bool:
         """Return True when the Slack event itself identifies a bot sender."""
-        # A ``subtype: bot_message`` post is bot-authored no matter what; but a user-token
-        # (``xoxp-``) post can arrive stamped with the posting app's ``bot_id``/``bot_profile``
-        # *and* the real author's ``user`` — so consult the ``api_human_users`` allowlist before
-        # the bot short-circuit. This cannot readmit an app's own ``xoxb`` posts: those carry the
-        # *bot's* user id, which operators never allowlist (the list holds human ids only).
-        if (event.get("subtype") != "bot_message" and event.get("user")
-                and event.get("user") in self._slack_api_human_users()):
+        # ``subtype: bot_message`` is always a bot. A user-token (``xoxp-``) post can be stamped with
+        # the posting app's ``bot_id``/``bot_profile``/``app_id`` yet carry the real author's ``user``,
+        # so an allowlisted user is human before any bot marker is read. Our own bot user never is,
+        # even if listed, so its posts keep the echo-loop guard.
+        user = event.get("user")
+        if event.get("subtype") == "bot_message":
+            return True
+        if user and user in self._slack_api_human_users() and user not in {
+                self._bot_user_id, *self._team_bot_user_ids.values()}:
             return False
-        if event.get("bot_id") or event.get("bot_profile") or event.get("subtype") == "bot_message":
+        if event.get("bot_id") or event.get("bot_profile"):
             return True
         profile = event.get("user_profile")
         if isinstance(profile, dict) and bool(profile.get("is_bot")):
             return True
-        # App-originated events may lack bot_id/subtype but carry app_id and no client_msg_id
-        # (humans have one) → bot-authored unless the user is in _slack_api_human_users
-        # (classic bot posts have no ``user`` so never match).
-        # Real human-authored messages normally carry client_msg_id, so treat the combination as
-        # app/bot-authored (#35777).
-        if event.get("app_id") and not event.get("client_msg_id"):
-            return event.get("user") not in self._slack_api_human_users()
-        return False
+        # Real human messages carry client_msg_id: app_id without it is app/bot-authored (#35777).
+        return bool(event.get("app_id") and not event.get("client_msg_id"))
 
     def _resolve_thread_ts(
         self, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None
