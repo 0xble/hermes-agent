@@ -2,6 +2,7 @@
 """Slack platform adapter: slack-bolt Socket Mode (messages, slash commands, threads)."""
 
 import asyncio
+from agent.attachment_context import format_document_content
 import contextvars
 import functools
 import inspect
@@ -4827,7 +4828,7 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
                 text_content = raw_bytes.decode("utf-8")
                 display_name = original_filename or f"document{ext or '.txt'}"
                 display_name = re.sub(r"[^\w.\- ]", "_", display_name)
-                injection = f"[Content of {display_name}]:\n{text_content}"
+                injection = format_document_content(display_name, text_content)
             except UnicodeDecodeError:
                 pass  # Binary content, skip injection
         return cached_path, doc_mime, injection

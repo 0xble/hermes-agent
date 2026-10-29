@@ -11,6 +11,7 @@ _WEBHOOK_PORT (8090), _WEBHOOK_PATH (/whatsapp/webhook), _API_VERSION (v20.0).""
 from __future__ import annotations
 
 import asyncio
+from agent.attachment_context import format_document_content
 import contextlib
 import hashlib
 import hmac
@@ -989,7 +990,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if file_size > _MAX_TEXT_INJECT_BYTES:
                     logger.info("[whatsapp_cloud] skipping text injection for %s (%d bytes > %d)", doc, file_size, _MAX_TEXT_INJECT_BYTES)
                     continue
-                injection = f"[Content of {doc.name}]:\n{doc.read_text(encoding='utf-8-sig', errors='replace')}"
+                injection = format_document_content(
+                    doc.name, doc.read_text(encoding="utf-8-sig", errors="replace"),
+                )
                 body = f"{injection}\n\n{body}" if body else injection
                 inlined[i] = True
             except OSError:

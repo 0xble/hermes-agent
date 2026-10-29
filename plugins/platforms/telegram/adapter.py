@@ -2,6 +2,7 @@
 """Telegram platform adapter (python-telegram-bot): inbound messages/media/commands, outbound replies."""
 
 import asyncio
+from agent.attachment_context import format_document_content
 import contextlib
 from contextvars import ContextVar
 import dataclasses
@@ -8547,7 +8548,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 try:
                     text_content = raw_bytes.decode("utf-8")
                     display_name = re.sub(r'[^\w.\- ]', '_', original_filename or f"document{ext or '.txt'}")
-                    injection = f"[Content of {display_name}]:\n{text_content}"
+                    injection = format_document_content(display_name, text_content)
                     event.text = f"{injection}\n\n{event.text}" if event.text else injection
                     event.media_text_inlined = [True]
                 except UnicodeDecodeError:

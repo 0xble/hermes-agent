@@ -106,6 +106,16 @@ strategy and cron-exclusion behavior.
   formatter boundary decides, keeping any human text merged after it. Add a new generated prompt there, beside its producer constant,
   rather than in a provider. `memory.recall_synthetic_turns` (default off) restores recall on
   generated turns. Proof: `tests/agent/test_synthetic_prompt.py`.
+- Automatic recall also excludes producer-owned inline document bodies and recent-channel
+  backfill. All text-document producers use `agent.attachment_context.format_document_content`,
+  whose character count frames the existing filename/content injection without altering file text.
+  Extract it before trimming whitespace or interpreting generated-prompt boundaries, so paragraphs,
+  Unicode, and copied markers in a document cannot become the human caption. Unframed legacy
+  document text has no provable end and is preserved rather than guessed. Recent-channel history
+  ends at its last `[New message]` boundary, accepting the same quoted-boundary limitation as
+  generated templates. Model input and retention keep the complete file and channel content.
+  Proof: `tests/agent/test_document_channel_recall_query.py` and the platform document suites.
+  Retire when upstream carries the human caption separately through all attachment producers.
 - A generated-only turn also excludes its assistant reply from automatic transcript retention.
   Filtering only the user half creates an orphan assistant result that can turn test, relay or
   recall feedback into apparent personal evidence. Reuse the shared human-part classifier, not
