@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from hermes_cli.fs_utils import rmtree_with_handler
+
 logger = logging.getLogger(__name__)
 
 # Branches never considered for deletion, in any mode.
@@ -429,14 +431,16 @@ def _report_allows_generated_reclaim(report: dict) -> bool:
         return False
     if report.get("linked_worktree") is not True or report.get("integrated_or_patch_equivalent") is not True:
         return False
-    if report.get("dirty_entries") or report.get("inbound_live_symlinks"):
+    dirty = report.get("dirty_entries")
+    inbound = report.get("inbound_live_symlinks")
+    if not isinstance(dirty, list) or not isinstance(inbound, list) or dirty or inbound:
         return False
     nested = report.get("nested_repos")
     ignored = report.get("ignored_entries")
     reasons = report.get("reasons")
     if not isinstance(nested, list) or not isinstance(ignored, list) or not isinstance(reasons, list):
         return False
-    if any(isinstance(item, dict) and item.get("unresolved") for item in nested):
+    if any(not isinstance(item, dict) or item.get("unresolved") for item in nested):
         return False
     if any(not isinstance(entry, str) or not _disposable_ignored(entry) for entry in ignored):
         return False
@@ -447,8 +451,10 @@ def _path_present(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
-def _ignore_missing_generated(_function, _path, error: BaseException) -> None:
+def _ignore_missing_generated(_function, _path, error) -> None:
     """A concurrent setup may have reclaimed this output first, but other errors matter."""
+    if isinstance(error, tuple):  # ``onerror`` passes exc_info, ``onexc`` the exception.
+        error = error[1]
     if not isinstance(error, FileNotFoundError):
         raise error
 
@@ -465,7 +471,7 @@ def _unlink_generated(path: Path, root: Path) -> bool:
     resolved = path.resolve()
     if resolved != root.resolve() and root.resolve() not in resolved.parents:
         return False
-    shutil.rmtree(path, onexc=_ignore_missing_generated)
+    rmtree_with_handler(path, _ignore_missing_generated)
     return True
 
 

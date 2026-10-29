@@ -17,6 +17,7 @@ the entire value of these tests is exercising actual git verdicts):
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -226,6 +227,70 @@ class TestAuditVerdicts:
 
 
 class TestGeneratedReclaimOwnership:
+    @pytest.mark.parametrize("field,value,missing", [
+        ("dirty_entries", None, True),
+        ("inbound_live_symlinks", None, True),
+        ("nested_repos", None, True),
+        ("ignored_entries", None, True),
+        ("reasons", None, True),
+        ("dirty_entries", None, False),
+        ("dirty_entries", {}, False),
+        ("inbound_live_symlinks", "", False),
+        ("inbound_live_symlinks", False, False),
+        ("nested_repos", {}, False),
+        ("nested_repos", [None], False),
+        ("nested_repos", ["unexpected"], False),
+        ("ignored_entries", {}, False),
+        ("reasons", "", False),
+    ])
+    def test_incomplete_safety_report_preserves_generated_output(self, repo, tmp_path, field, value, missing):
+        tree, _ = _add_worktree(repo, "hermes-finished")
+        generated = tree / ".ci"
+        generated.mkdir()
+        payload = generated / "payload"
+        payload.write_bytes(b"keep")
+        report = {
+            "active_cwd": False, "locked": False, "linked_worktree": True,
+            "integrated_or_patch_equivalent": True, "dirty_entries": [],
+            "inbound_live_symlinks": [], "nested_repos": [], "ignored_entries": [], "reasons": [],
+        }
+        if missing:
+            del report[field]
+        else:
+            report[field] = value
+        script = tmp_path / "safety.py"
+        script.write_text(f"print({json.dumps(report)!r})\n")
+        assert worktree_gc.reclaim_finished_generated(str(repo), safety_script=str(script)) == []
+        assert payload.read_bytes() == b"keep"
+        assert (tree / "README.md").read_text() == "hello\n"
+
+    def test_python311_reclaim_tolerates_output_vanishing_before_rmtree(self, repo, tmp_path, monkeypatch):
+        tree, _ = _add_worktree(repo, "hermes-finished")
+        generated = tree / ".ci"
+        generated.mkdir()
+        (generated / "payload").write_bytes(b"reclaim")
+        script = tmp_path / "safety.py"
+        script.write_text(
+            'print(\'{"reasons":[],"ignored_entries":[],"dirty_entries":[], '
+            '"active_cwd":false,"locked":false,"linked_worktree":true,'
+            '"integrated_or_patch_equivalent":true,"nested_repos":[],"inbound_live_symlinks":[]}\')\n'
+        )
+        rmtree = worktree_gc.shutil.rmtree
+        callbacks = []
+
+        def python311_rmtree(path, *args, **kwargs):
+            if "onexc" in kwargs:
+                raise TypeError("rmtree() got an unexpected keyword argument 'onexc'")
+            callbacks.append(kwargs["onerror"])
+            rmtree(path)  # Another reclaimer wins after our existence check.
+            return rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(worktree_gc.shutil, "rmtree", python311_rmtree)
+        assert worktree_gc.reclaim_finished_generated(str(repo), safety_script=str(script)) == [str(generated)]
+        assert len(callbacks) == 1
+        assert not generated.exists()
+        assert (tree / "README.md").read_text() == "hello\n"
+
     @pytest.mark.parametrize("kind", ["directory", "symlink"])
     def test_concurrent_reclaimers_accept_already_removed_output(self, repo, tmp_path, monkeypatch, kind):
         tree, _ = _add_worktree(repo, "hermes-finished")

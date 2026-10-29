@@ -6,6 +6,14 @@ import stat
 from pathlib import Path
 
 
+def rmtree_with_handler(path: Path, handler) -> None:
+    """Use the same error handler on Python 3.11 and 3.12+ callback APIs."""
+    try:
+        shutil.rmtree(path, onexc=handler)
+    except TypeError:  # ``onexc`` is 3.12+; 3.11 has ``onerror``.
+        shutil.rmtree(path, onerror=handler)
+
+
 def rmtree_force(path: Path) -> None:
     """``shutil.rmtree`` that clears read-only bits before deleting.
 
