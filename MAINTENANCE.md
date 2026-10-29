@@ -476,6 +476,18 @@ Fork-Patch: web-search-cost-controls.
 - **Retirement:** Remove when released upstream provides equivalent cross-process paid-search deduplication, route-aware cache identity, and visible warning behavior.
 - **Rollback:** Revert the commit carrying `Fork-Patch: web-search-cost-controls`.
 
+## Active patch record: Exa direct extraction
+
+Fork-Patch: exa-direct-extract.
+
+- **Patch identity:** `exa-direct-extract`.
+- **Behavior:** For paid Exa extraction of known HTML URLs, try bounded direct HTTP and readable-text cleanup before paid contents. Reject thin, access-gated, challenge or unsupported responses, preserve visible fallback/rescue attribution and batch order, and do not cache direct results or newly fetched fallback contents. Existing keyless, non-Exa, non-Markdown, PDF and disabled-direct routes remain unchanged. Search behavior and schemas are untouched.
+- **Source surfaces:** `tools/web_extract_direct.py`, `tools/web_extract_html.py`, `tools/web_tools_extract.py`, `tools/web_tools_truncate.py`, and focused extraction tests. Builds on [direct web extraction](maintenance/web-extract-direct.md).
+- **Provenance:** Split from reviewed `4e42e464c6c228e975c2a87352fc5ab1a51e6bee`, without its Lite/Auto search policy. Paid-route eligibility lives in the extraction dispatcher to leave `plugins/web/exa/` unchanged.
+- **Focused regression:** `tests/tools/test_web_extract_direct_policy.py`, `tests/tools/test_web_extract_direct.py`, and web extraction/cache/provider regressions.
+- **Retirement:** Remove when a released upstream provides equivalent bounded direct HTML extraction with conservative content acceptance and truthful fallback attribution.
+- **Rollback:** Revert the commit carrying `Fork-Patch: exa-direct-extract`, preserving the pre-existing plain-file and local-docs route.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
