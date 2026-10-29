@@ -15,6 +15,10 @@ def store(tmp_path, monkeypatch):
 
     db = SessionDB(tmp_path / "state.db")
     monkeypatch.setattr(loops, "_get_session_db", lambda: db)
+    monkeypatch.setattr("hermes_cli.goals._get_session_db", lambda: db)
+    for sid in ("controls", "failure"):
+        db.create_session(session_id=sid, source="cli", model="test")
+        db.append_message(sid, "user", QUOTE)
     yield db
     db.close()
 

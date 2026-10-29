@@ -593,7 +593,7 @@ Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the d
 
 ## Session controls
 
-Fork patch identity: `session-controls`. One session can pause, resume, clear or replace another session's goal, and pause, resume or stop another session's loop, authorized by a fresh verbatim user quote or a Telegram Approve/Deny press. See [the maintenance unit](maintenance/session-controls.md).
+Fork patch identity: `session-controls`. One session can pause, resume, clear or replace another session's goal, and pause, resume or stop another session's loop. Reasoned same-intent edits and controls of agent-owned definitions use their recorded creation provenance. Protected changes require a fresh verbatim user quote (typed or authenticated through the relay ledger) or the existing explicit approval path. See [the maintenance unit](maintenance/session-controls.md).
 
 Authorized replacement preserves independent subgoals and merges only explicitly supplied contract fields at `GoalManager.replace`. Session controls retain sparse field presence through authorization and approval-card rendering. The goal-lifecycle plugin must not supply the current profile's default budget on replacement, so finite remaining budgets stay finite. Explicit empty contract fields and existing user removal commands remain available. User pauses, wait state, completed-goal protection, compare-and-swap persistence, and the existing judge-contract-pause reset semantics are unchanged. No model-only semantic-equivalence authority is introduced.
 

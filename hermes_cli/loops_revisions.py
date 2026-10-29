@@ -24,11 +24,7 @@ class LoopRevisionsMixin:
     def _revision_quote(self, state: LoopState, user_quote: str,
                         user_messages: Optional[List[str]], *, required: bool) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
         """Validate a verbatim user quote using the goal lifecycle's shared source rules."""
-        from hermes_cli.goals import (
-            _REVISION_QUOTE_MIN_CHARS,
-            _REVISION_SOURCE_MAX_CHARS,
-            user_messages_since,
-        )
+        from hermes_cli.goals import _REVISION_QUOTE_MIN_CHARS
 
         quote = " ".join((user_quote or "").split())
         if required and not quote:
@@ -44,24 +40,16 @@ class LoopRevisionsMixin:
             return None, "user_quote_too_short", {
                 "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"
             }
-        pool = user_messages if user_messages is not None else user_messages_since(
-            self.session_id, state.created_at
-        )
-        sources = [" ".join(message.split()) for message in pool if quote in " ".join(message.split())]
-        if not sources:
-            return None, "user_quote_not_found", {
-                "error": "user_quote does not match any user message sent since the loop was set"
-            }
-        source = next((message for message in sources if len(message) <= _REVISION_SOURCE_MAX_CHARS), "")
-        if not source:
-            return None, "user_message_too_long", {
-                "error": (
-                    f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too long to "
-                    "judge whether it authorizes this change; ask the user to state the change in a short "
-                    "message and quote that"
-                )
-            }
-        return quote, None, {"user_message": source}
+        # Compatibility user_messages input is never authority. Authenticate the
+        # current transcript, including a receipt-bound relay of Brian's words.
+        from hermes_cli.session_controls import _read_current_user_quote
+        checked = _read_current_user_quote(self.session_id, quote, cursor=self._cursor)
+        if isinstance(checked, str):
+            return None, checked, {"error": "user_quote has no current authenticated source"}
+        return checked[0], None, {
+            "user_message": checked[1],
+            **({"relay_receipt": checked.relay_receipt} if checked.relay_receipt else {}),
+        }
 
     def revise(
         self,
@@ -156,28 +144,20 @@ class LoopRevisionsMixin:
                 error_code="no_change", error="the revision changes nothing",
             )
 
-        current_effective_delay = (
-            state.interval_seconds if state.mode == "interval"
-            else (state.current_delay or float(self_paced_floor_seconds()))
-        )
+        from hermes_cli.lifecycle_authority import agent_owned, user_stop_condition
         new_effective_delay = (
             after["interval_seconds"] if after["mode"] == "interval"
             else float(self_paced_floor_seconds())
         )
-        # Switching to self-paced starts at the floor, so it is faster whenever the floor is below the
-        # current delay; it gets the same authority check as any other cadence change.
-        faster = new_effective_delay < current_effective_delay
-        raising_times = (
-            "times" in changed
-            and state.times > 0
-            and (after["times"] == 0 or after["times"] > state.times)
-        )
-        needs_authority = (
-            ("prompt" in changed)
-            or ("until" in changed)
-            or faster
-            or raising_times
-        )
+        # Cadence, wording and run-count edits are operational judgment. A user
+        # stop condition is a commitment, not an operational tuning parameter.
+        needs_authority = "until" in changed and user_stop_condition(state)
+        if not agent_owned(state):
+            current_delay = state.interval_seconds if state.mode == "interval" else state.current_delay
+            faster = new_effective_delay < (current_delay or float(self_paced_floor_seconds()))
+            raising_times = ("times" in changed and state.times > 0 and
+                             (after["times"] == 0 or after["times"] > state.times))
+            needs_authority = needs_authority or "prompt" in changed or faster or raising_times
         quote, quote_error, quote_detail = self._revision_quote(
             state, user_quote, user_messages, required=needs_authority
         )
@@ -197,6 +177,10 @@ class LoopRevisionsMixin:
             "before": {key: before[key] for key in changed},
             "after": {key: after[key] for key in changed},
         }
+        if quote_detail and quote_detail.get("relay_receipt"):
+            revision["relay_receipt"] = quote_detail["relay_receipt"]
+        if "until" in changed and quote:
+            state.stop_condition_owner = "user"
         if clamped_from is not None:
             revision["clamped"] = {
                 "interval_seconds": clamped_from,
@@ -232,7 +216,7 @@ class LoopRevisionsMixin:
         until: str = "",
         route: Optional[Dict[str, str]] = None,
         reason: str,
-        user_quote: str,
+        user_quote: str = "",
         user_messages: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Replace the loop definition while preserving its revision history and route.
@@ -251,7 +235,7 @@ class LoopRevisionsMixin:
         until: str = "",
         route: Optional[Dict[str, str]] = None,
         reason: str,
-        user_quote: str,
+        user_quote: str = "",
         user_messages: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Replace the loop definition while preserving its revision history and route."""
@@ -275,8 +259,11 @@ class LoopRevisionsMixin:
                 ok=False, revision=None, version=state.version,
                 error_code="no_change", error="replacement prompt is empty",
             )
+        from hermes_cli.lifecycle_authority import agent_owned, user_stop_condition
+        needs_authority = (not agent_owned(state) or
+                           (state.until != (until or "").strip() and user_stop_condition(state)))
         quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=True
+            state, user_quote, user_messages, required=needs_authority
         )
         if quote_error:
             return self._revision_result(
@@ -316,8 +303,12 @@ class LoopRevisionsMixin:
             "before": old_snapshot,
             "after": new_snapshot,
         }
+        if quote_detail and quote_detail.get("relay_receipt"):
+            revision["relay_receipt"] = quote_detail["relay_receipt"]
+        if state.until != new_until and quote:
+            state.stop_condition_owner = "user"
         old_route = dict(state.route)
-        # Resume is a user-only control: a replaced paused loop stays paused (with its reason) until /loop resume.
+        # Replacement never implicitly resumes a paused loop.
         was_paused = state.status == "paused"
         state.prompt = prompt
         state.status = "paused" if was_paused else "active"

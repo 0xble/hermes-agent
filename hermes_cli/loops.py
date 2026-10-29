@@ -365,6 +365,8 @@ class LoopState:
     revisions: List[Dict[str, Any]] = field(default_factory=list)
     mutation_id: str = ""  # durable-write token, including same-value lifecycle changes
     tick_id: str = ""  # survives revisions, changes on every new claim
+    created_by: str = ""  # agent tool or user command, empty on legacy rows
+    stop_condition_owner: str = ""
 
     @property
     def version(self) -> int:
@@ -380,6 +382,8 @@ class LoopState:
         revisions = data.get("revisions", [])
         kwargs: dict[str, Any] = {
             "prompt": data.get("prompt", ""),
+            "created_by": str(data.get("created_by") or ""),
+            "stop_condition_owner": str(data.get("stop_condition_owner") or ""),
             "status": data.get("status", "active"),
             "mode": data.get("mode", "interval"),
             "paused_reason": data.get("paused_reason"),
@@ -822,6 +826,7 @@ class LoopManager(LoopRevisionsMixin):
         times: int = 0,
         until: str = "",
         route: Optional[dict[str, str]] = None,
+        actor: str = "user",
     ) -> LoopState:
         """Start a new loop (replaces any existing one for the session)."""
         prompt = (prompt or "").strip()
@@ -833,6 +838,8 @@ class LoopManager(LoopRevisionsMixin):
         # clock is coarse or frozen; otherwise a stale scheduler or completion could match it.
         stored = load_loop(self.session_id) if self._cursor is None else load_loop(
             self.session_id, cursor=self._cursor)
+        if actor == "agent" and stored is not None and stored.status in {"active", "paused"}:
+            raise ValueError("Use revise or replace to preserve the existing loop authority")
         prior = max(
             float(getattr(self._state, "created_at", 0.0) or 0.0),
             float(getattr(stored, "created_at", 0.0) or 0.0),
@@ -842,6 +849,8 @@ class LoopManager(LoopRevisionsMixin):
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
         state = LoopState(
             prompt=prompt,
+            created_by="agent" if actor == "agent" else "user",
+            stop_condition_owner="agent" if actor == "agent" else "user",
             mode="self_paced" if self_paced else "interval",
             interval_seconds=interval,
             current_delay=float(self_paced_floor_seconds()) if self_paced else interval,
