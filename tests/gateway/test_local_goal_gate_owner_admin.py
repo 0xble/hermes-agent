@@ -7,9 +7,11 @@ proven that (``authorize_local_source`` plus the ``session:control`` capability)
 admin-only.
 """
 import asyncio
+import hermes_bootstrap  # noqa: F401 -- initialize dependencies before the real-home I/O guard
 import json
 import signal
 import threading
+from types import SimpleNamespace
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -77,6 +79,7 @@ async def test_messaging_goal_gate_add_stays_admin_only():
 
     class _Mgr:
         session_id = 's1'
+        state = None
         added = []
 
         def add_gate(self, command):
@@ -86,7 +89,7 @@ async def test_messaging_goal_gate_add_stays_admin_only():
     mgr = _Mgr()
 
     async def _mgr_for(_event):
-        return mgr, None
+        return mgr, SimpleNamespace(session_id='s1')
 
     async def _inline(fn, *args):
         return fn(*args)

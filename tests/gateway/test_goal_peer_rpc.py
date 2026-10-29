@@ -20,6 +20,8 @@ async def test_native_goal_peer_rpc_uses_authorized_parent_snapshot_and_arms(own
     monkeypatch.setattr(run_checkins, "reconcile_turn", reconcile)
     reply = await owner.call("goal", "set", "Return the verified artifact")
     instance = json.loads(reply["state"])["created_at"]
+    assert len(reconciled) == 1
+    reconciled.clear()
     reply = await owner.call("goal", "wait_on_peer", "hermes:default/peer", "existing-work",
                              "artifact readback", expected_instance=instance)
     assert reply["value"]["ok"], reply
@@ -36,6 +38,31 @@ async def test_native_goal_peer_rpc_uses_authorized_parent_snapshot_and_arms(own
     assert reply["value"]["ok"], reply
     assert not json.loads(reply["state"])["pending_peers"]
     assert len(reconciled) == 2
+
+
+@pytest.mark.asyncio
+async def test_native_goal_commands_reconcile_changed_snapshots_not_argument_prefixes(owner, monkeypatch):
+    from gateway import run_checkins
+
+    reconciled = []
+
+    async def reconcile(runner, source, route):
+        reconciled.append((source, route))
+    monkeypatch.setattr(run_checkins, "reconcile_turn", reconcile)
+    reply = await owner.call("goal", "set", "Return the verified artifact")
+    instance = json.loads(reply["state"])["created_at"]
+    reply = await owner.call("goal", "command", f'PEER\twait {instance} hermes:other/peer existing-work "artifact readback"')
+    assert not reply["value"]["error"], reply
+    assert len(reconciled) == 2
+    before = owner.db.get_meta("goal:" + owner.target)
+    rejected = await owner.call("goal", "command", 'peer wait invalid hermes:other/peer existing-work "artifact readback"')
+    assert rejected["value"]["error"]
+    assert owner.db.get_meta("goal:" + owner.target) == before
+    assert len(reconciled) == 2
+    await owner.call("goal", "pause", "user-paused")
+    assert len(reconciled) == 3
+    await owner.call("goal", "resume")
+    assert len(reconciled) == 4
 
 
 @pytest.mark.asyncio

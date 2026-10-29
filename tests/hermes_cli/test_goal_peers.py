@@ -259,3 +259,20 @@ def test_explicit_user_clear_retains_existing_semantics(parent):
     mgr.clear()
     assert not outstanding_work(db, "parent")
     assert json.loads(db.get_meta("goal:parent"))["status"] == "cleared"
+
+
+@pytest.mark.parametrize("arg", [
+    'wait invalid hermes:default/peer existing-work "artifact readback"',
+    'resolve invalid hermes:default/peer existing-work "artifact readback"',
+    'wait nan hermes:default/peer existing-work "artifact readback"',
+    'wait inf hermes:default/peer existing-work "artifact readback"',
+    'wait 123 hermes:default/peer existing-work "unclosed',
+])
+def test_malformed_peer_input_returns_usage_without_mutation(parent, arg):
+    from hermes_cli.goal_peer_command import USAGE
+
+    mgr, db = parent
+    before = db.get_meta("goal:parent")
+    result = command(mgr, "peer " + arg)
+    assert result.error and result.output == USAGE
+    assert db.get_meta("goal:parent") == before

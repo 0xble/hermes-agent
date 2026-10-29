@@ -146,3 +146,21 @@ def test_inventory_failure_is_not_completion(db, monkeypatch):
     with pytest.raises(OSError):
         outstanding_work(db, "owner")
     assert manager.state.due_at == 1300
+
+
+def test_unknown_process_outcome_retains_wait_until_authoritative_completion(db, monkeypatch):
+    from hermes_cli.goals import GoalState
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr("tools.async_delegation.supervisor_inventory", lambda _: [])
+    monkeypatch.setattr(process_registry, "_running", {})
+    db.set_meta("goal:owner", GoalState(goal="verify the build", created_at=10,
+                                        waiting_on_session="pruned-process").to_json())
+    monkeypatch.setattr("hermes_cli.goals._process_outcome", lambda _: None)
+    work = outstanding_work(db, "owner")
+    assert [row["id"] for row in work] == ["pruned-process"]
+    manager = CheckinManager(db, "owner", CheckinConfig())
+    manager.reconcile(work, now=100)
+    assert manager.reconcile(outstanding_work(db, "owner"), now=5000).due_at == 1300
+    monkeypatch.setattr("hermes_cli.goals._process_outcome", lambda _: {"running": False})
+    assert manager.reconcile(outstanding_work(db, "owner"), now=5001) is None

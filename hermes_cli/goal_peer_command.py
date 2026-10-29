@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import shlex
 import sys
 
@@ -11,14 +12,23 @@ USAGE = ('Usage: /goal peer wait|resolve <goal-created-at> <hermes:profile/sessi
 
 
 def peer_request(arg):
-    tokens = shlex.split(arg)
+    try:
+        tokens = shlex.split(arg)
+    except ValueError:
+        raise ValueError(USAGE) from None
     if not tokens or tokens == ["list"]:
         return "state", [], {}
     if len(tokens) != 5 or tokens[0] not in {"wait", "resolve"}:
         raise ValueError(USAGE)
     verb, instance, peer, ref, text = tokens
+    try:
+        instance = float(instance)
+    except ValueError:
+        raise ValueError(USAGE) from None
+    if not math.isfinite(instance):
+        raise ValueError(USAGE)
     return ("wait_on_peer" if verb == "wait" else "resolve_peer",
-            [peer, ref, text], {"expected_instance": float(instance)})
+            [peer, ref, text], {"expected_instance": instance})
 
 
 def peer_list(state):
@@ -32,7 +42,10 @@ def peer_list(state):
 def dispatch_peer_command(mgr, arg):
     from hermes_cli.goal_command import GoalCommandResult
 
-    call, args, kwargs = peer_request(arg)
+    try:
+        call, args, kwargs = peer_request(arg)
+    except ValueError as exc:
+        return GoalCommandResult(str(exc), error=True)
     if call == "state":
         return GoalCommandResult(peer_list(mgr.state))
     result = getattr(mgr, call)(*args, **kwargs)

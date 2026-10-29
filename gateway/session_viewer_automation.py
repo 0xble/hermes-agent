@@ -161,14 +161,16 @@ async def automation(connection, ref, params):
         with _profile_runtime_scope(home), _session_workspace(runner, live.source):
             from gateway.session_context import scoped_current_session_id
             with scoped_current_session_id(target):
-                return invoke(runner, kind, target, call, args, kwargs)
+                before = authority.db.get_meta(f"goal:{target}") if kind == "goal" else None
+                result = invoke(runner, kind, target, call, args, kwargs)
+                changed = kind == "goal" and authority.db.get_meta(f"goal:{target}") != before
+                return result, changed
     rows = lambda: tuple(authority.db.get_meta(f"{k}:{target}") for k in ("goal", "loop", "heartbeat"))
     # Publish read-side writes if any, but pure barrier checks leave the wait for wake admission.
     before = rows() if call in _READS else None
     # The judge and gates block for seconds: off the loop, with the caller's context (profile scope).
-    result = await asyncio.to_thread(run)
-    if kind == "goal" and (call in {"wait_on_peer", "resolve_peer"}
-                           or call == "command" and args and str(args[0]).startswith("peer ")):
+    result, goal_changed = await asyncio.to_thread(run)
+    if goal_changed:
         from gateway.run_checkins import reconcile_turn
         await reconcile_turn(runner, live.source, live.route)
     if before is None or rows() != before:
