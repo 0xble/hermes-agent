@@ -652,39 +652,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows.
         A caller that re-archives some rows afterwards passes ``prune_checkpoints=False`` and prunes once they
         are archived again (:meth:`_prune_shadowed_checkpoints`)."""
-        now_ts = time.time()
-        inserted = tool_calls_total = 0
-        batch_tool_index: dict[str, str] = {}
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            tool_calls = _parse_tool_calls(msg.get("tool_calls"))
-            message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
-            # The durable per-message id: kept when the dict carries one (a copy of an already-stored
-            # message), minted and stamped on the dict otherwise. Stamped BEFORE the bind so the row and
-            # the live dict never disagree. Tool calls get their per-occurrence ids the same way.
-            stamp_message_uid(msg)
-            self._stamp_tool_call_uids(msg, tool_calls, batch_tool_index)
-            cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
-                session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
-            # Keep the caller's live row aligned with the durable identity. Rows created without an explicit
-            # timestamp (notably mid-turn steers) may be carried through several compaction generations; if
-            # the generated timestamp exists only in SQLite, every copy receives a new identity and renders
-            # as another logical message.
-            msg["timestamp"] = message_timestamp
-            if cur.lastrowid is not None:
-                msg["_row_id"] = cur.lastrowid
-            inserted += 1
-            tool_calls_total += _tool_calls_count(tool_calls)
-            now_ts = max(now_ts, message_timestamp) + 1e-6
-        if prune_checkpoints:
-            self._prune_shadowed_checkpoints(conn, session_id, messages)
-        # Every inserter (flush, compaction clone, replace, rotation handoff, import) gets the new rows' own
-        # stored-row digest, so a later re-flush of these dicts takes the versioned rewrite path instead of the
-        # legacy one. One batched SELECT; hash the STORED rows (column affinity rewrites bind values).
-        from agent.transcript_repair import stamp_inserted_row_snapshots
-        stamp_inserted_row_snapshots(conn, session_id, messages)
-        add_write_rows("inserted", inserted)
-        return inserted, tool_calls_total
+        from hermes_state_message_insert import insert_message_rows
+        return insert_message_rows(self, conn, session_id, messages, prune_checkpoints=prune_checkpoints)
 
     def _prune_shadowed_checkpoints(self, conn, session_id: str, live_messages: list[dict[str, Any]]) -> None:
         """Keep only the newest checkpoint among *live_messages* (inserted rows carrying ``_row_id``)."""
