@@ -156,7 +156,7 @@ def main():
                   "platform": platform.platform(), "switchinterval": sys.getswitchinterval(),
                   "rows": 201, "rounds": args.rounds,
                   "cases": [_case(directory, args.baseline, args.rounds, loaded) for loaded in (False, True)]}
-    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"summary": [{"loaded": case["loaded"], "summary": case["summary"]} for case in result["cases"]]}, indent=2))
 
 
