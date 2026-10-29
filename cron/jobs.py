@@ -2824,6 +2824,28 @@ def _write_retired_oneshot_diagnostic(
         "missed-oneshot")
 
 
+def _write_missed_oneshot_diagnostic(job: dict[str, Any], next_run: str) -> None:
+    """Local trace only. The owner alert is delivered after the jobs save, outside the lock."""
+    text = (
+        "# Cron job removed before firing (run time outside grace window)\n\n"
+        f"- job id: {job.get('id')}\n"
+        f"- name: {job.get('name')}\n"
+        f"- scheduled run time: {next_run}\n"
+        f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
+        f"- removed at: {_hermes_now().isoformat()}\n\n"
+        "This one-shot's run time is more than the grace window in the "
+        "past (scheduler down past the window, host asleep, or jobs.json "
+        "edited), which is outside the 'will never fire' contract "
+        "enforced at create/update/resume time. The job was removed "
+        "without running; recreate it (or use the Run button) to "
+        "schedule it again.\n"
+    )
+    try:
+        save_job_output(job.get("id", ""), text)
+    except Exception as exc:
+        logger.debug("Failed to write missed-oneshot diagnostic for job %r: %s", job.get("id"), exc)
+
+
 def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot dispatch BEFORE execution: ``repeat.completed`` is bumped
     and persisted under the jobs lock so a tick dying mid-execution cannot lose the dispatch
@@ -3144,7 +3166,7 @@ def _sweep_completed_oneshots(
 
 # --- Due scan ---
 
-def get_due_jobs() -> list[dict[str, Any]]:
+def get_due_jobs(*, adapters=None, loop=None) -> list[dict[str, Any]]:
     """Return all jobs due now. A recurring job more than one period stale (gateway down, or a run
     overran the interval) has its backlog collapsed — next_run_at fast-forwards so nothing
     burst-fires — but still fires ONCE now (via mark_job_run, consuming one ``repeat.times`` run),
@@ -3153,8 +3175,13 @@ def get_due_jobs() -> list[dict[str, Any]]:
     This prevents the perpetual-defer loop (#33315) where a job whose runtime exceeds ``interval + grace``
     would be skipped forever.
     """
+    from cron.jobs_oneshot import deliver_misses
+
+    missed = []
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        due = _get_due_jobs_locked(missed=missed)
+    deliver_misses(missed, adapters=adapters, loop=loop)
+    return due
 
 
 @dataclass
@@ -3168,6 +3195,7 @@ class _DueScan:
     # Miss/catch-up metrics, emitted once the save that persists the scan's repairs lands: an
     # unwritable store re-finds the same miss every tick, so counting before the save over-counts.
     on_saved: list[Callable[[], None]] = field(default_factory=list)
+    missed: list[tuple[dict, str]] = field(default_factory=list)
 
     def find(self, job_id: Any) -> Optional[dict[str, Any]]:
         return next((rj for rj in self.raw_jobs if rj["id"] == job_id), None)
@@ -3439,29 +3467,6 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     return False
 
 
-def _retire_expired_oneshot(d: _DueJob) -> bool:
-    """One-shot grace gate; True when the job must not fire this tick.
-
-    A one-shot beyond the grace window must never fire (create/update/resume reject such schedules
-    and recovery never revives them; only the due scan used to dispatch them hours late). With no
-    claim stamped, retire it with a diagnostic (never silently delete). A claim may mean a run is
-    still in flight elsewhere — skip but keep the record so its mark_job_run can land."""
-    if _elapsed_seconds(d.scan.now, d.next_run_dt) <= ONESHOT_GRACE_SECONDS:
-        return False
-    # Due during an outage of its store: it was skipped, not missed; fire it once on recovery.
-    if store_health.outage_covers(_current_cron_store().cron_dir, d.next_run_dt.timestamp(), ONESHOT_GRACE_SECONDS):
-        return False
-    claim = d.job.get("run_claim")
-    # An outage-covered claim that never reached its fire claim never started: it stays covered.
-    if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
-        return False
-    if not (claim or d.job.get("fire_claim")):
-        _write_retired_oneshot_diagnostic(d.job, d.next_run)
-        d.scan.retire(d.job["id"])
-        d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
-    return True
-
-
 def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool:
     """One-shot dispatch-limit guard; True when the job must not fire this tick.
 
@@ -3590,14 +3595,15 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     if not manual_run and recurring and _fast_forward_missed_recurring(d, grace):
         return False
     if kind == "once":
-        if _retire_expired_oneshot(d) or _oneshot_dispatch_limit_reached(job, scan):
+        from cron.jobs_oneshot import retire_expired_oneshot
+        if retire_expired_oneshot(d) or _oneshot_dispatch_limit_reached(job, scan):
             return False
         # Durably claim the one-shot for the DURATION of its run: a second scheduler process on the
         # same HERMES_HOME must not re-dispatch it while in flight, and advancing next_run_at by a
         # fixed window is not enough for a run that outlives a tick. The other process sees the
         # fresh claim and skips; mark_job_run() clears it. The TTL only covers a tick that DIES.
         claim = {"at": now.isoformat(), "by": _machine_id()}
-        if _elapsed_seconds(now, d.next_run_dt) > ONESHOT_GRACE_SECONDS:  # only an outage lets it through
+        if _elapsed_seconds(now, d.next_run_dt) > ONESHOT_GRACE_SECONDS:  # scheduler/store interruption catch-up
             claim["outage"] = True
         job["run_claim"] = claim
         scan.persist(job["id"], run_claim=claim)
@@ -3625,7 +3631,7 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     return True
 
 
-def _get_due_jobs_locked() -> list[dict[str, Any]]:
+def _get_due_jobs_locked(*, missed=None) -> list[dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
     raw_jobs = load_jobs()
     scan = _DueScan(raw_jobs, _hermes_now())
@@ -3669,6 +3675,8 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
     store_health.end_recovery_window(_current_cron_store().cron_dir)
     for emit in scan.on_saved:
         emit()
+    if missed is not None:
+        missed.extend(scan.missed)
     return due
 
 
