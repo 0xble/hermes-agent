@@ -288,8 +288,12 @@ def _restart_running_gateway(any_messaging: bool, supports_systemd: bool) -> Non
 
 def setup_gateway(config: dict):
     """Configure messaging platform integrations."""
-    from hermes_cli.setup import _info, print_header, print_info, print_success, prompt_checklist
+    from hermes_cli.setup import _info, print_header, print_info, print_success, prompt_checklist, save_config
     from hermes_cli.gateway import _all_platforms, _platform_status, _configure_platform
+    from hermes_cli.setup_quick import _reload_config_into
+    # Platform subflows persist through independent readers. Commit the wizard's pending
+    # settings first, then reload their writes before the owner continues editing.
+    save_config(config)
     print_header("Messaging Platforms")
     _info("Connect to messaging platforms to chat with Hermes from anywhere.",
           "Toggle with Space, confirm with Enter.", None)
@@ -304,6 +308,7 @@ def setup_gateway(config: dict):
         print_info("No platforms selected. Run 'hermes setup gateway' later to configure.")
     for idx in selected or ():
         _configure_platform(platforms[idx])
+    _reload_config_into(config)
 
     # Any platform (built-in or plugin) configured in this pass — via ``_platform_status`` so
     # plugin platforms like IRC are counted without another hard-coded env-var list.
