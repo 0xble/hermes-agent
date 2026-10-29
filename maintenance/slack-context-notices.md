@@ -10,7 +10,10 @@ formatting-stripped accessibility fallback. Larger content uses the existing
 renderer. Unmarked replies and action-needed failures remain normal size.
 Other platforms retain their existing content and metadata. Presentation must
 not change notice visibility, privacy, persistence, or suppression policy.
-Context notices never finalize a foreground stream.
+Context notices never finalize a foreground stream. Native Slack finalization
+also requires the consumer's existing draft identity in `metadata["_draft_id"]`
+to match the open stream. Equal text, thread routing and `notify=True` do not
+authorize a background or stale turn to commit a foreground stream.
 
 Classification belongs to producers through `ContextNotice` or the existing
 notice's `notice_style` field, carried by `notice_metadata`. Never infer it from
@@ -72,6 +75,13 @@ callback, and actual Slack payloads. The producer marks only the recoverable
 working-default notice. Tests preserve diagnostic suppression, session isolation,
 repeat-boundary deduplication, unchanged Telegram text, and full-size unmarked
 credentials, login, and model-access prompts.
+
+`tests/gateway/test_background_attribution_delivery.py` forces concurrent
+completions and rejected sends through the actual background producer, requiring
+one attributed payload per result. `tests/gateway/test_slack_native_streaming.py`
+rejects equal-text finalization without the owning draft identity, including a
+stale turn. Its real stream-consumer fixture posts an equal background body
+without touching the foreground stream, then commits the owning final in place.
 
 `tests/gateway/test_telegram_ingress_nonblocking.py` drives busy acknowledgements
 through the native ingress-consumer boundary with a real `MessageEvent` and
