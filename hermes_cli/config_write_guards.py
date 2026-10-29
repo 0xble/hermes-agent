@@ -56,14 +56,34 @@ def assert_current(path: Path, expected) -> None:
 _holders = threading.local()
 
 
+def _is_config_document(path: Path) -> bool:
+    """Only owned homes or an explicit config transaction opt generic I/O into admission."""
+    from hermes_cli.config import get_config_path
+    from hermes_constants import get_default_hermes_root
+
+    resolved = path.resolve()
+    holder = getattr(_holders, "paths", {}).get(str(resolved))
+    if holder is not None and getattr(holder, "depth", 0):
+        return True
+    if resolved == get_config_path().resolve():
+        return True
+    if path.name != "config.yaml":
+        return False
+    root = get_default_hermes_root().resolve()
+    home = path.parent.resolve()
+    return home == root or home.parent == root / "profiles"
+
+
 @contextmanager
-def config_write_lock(path: Path, data: Any = None):
+def config_write_lock(path: Path, data: Any = None, *, managed: bool = False):
     """One lock per resolved config path. Preserve the existing RLock → flock order.
 
+    Explicit config entry points set managed=True. Generic YAML writers only opt in
+    for owned documents or when nested inside an explicit transaction.
     Snapshots reject stale whole-document rollbacks even when a writer waited for the lock.
     Plain new mappings intentionally replace current state, but still serialize with all writers.
     """
-    if path.name != "config.yaml":
+    if not managed and not _is_config_document(Path(path)):
         yield None
         return
     from hermes_cli import config
@@ -124,8 +144,8 @@ def validate_candidate(raw: dict[str, Any]) -> dict[str, Any]:
 @contextmanager
 def atomic_write_guard(path: Path):
     """Final serialized-byte admission and CAS immediately before atomic replacement."""
-    if path.name != "config.yaml":
-        yield lambda _: None
+    if not _is_config_document(Path(path)):
+        yield lambda _tmp: None
         return
     with config_write_lock(path) as expected:
 
