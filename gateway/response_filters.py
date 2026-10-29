@@ -230,16 +230,15 @@ _BRACKETED_SILENCE_MARKERS = tuple(
     sorted(m for m in LIVE_GATEWAY_SILENT_MARKERS if m.startswith("["))
 )
 
-# The persisted user-row kind of a self-injected MessageEvent(internal=True) turn; only these
-# machinery kinds may vanish on a bare silence marker.
+# Persisted kinds of self-injected MessageEvent(internal=True) turns. Machinery provenance
+# does not itself authorize silence: the supervisor kind requires a written status.
 INTERNAL_NOTIFICATION_DISPLAY_KIND = "internal_notification"
-# Async-result cards the in-process TUI persisted: a producer's internal event naming one (with a
-# display_text) persists as that row kind instead of internal_notification.
-PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete", "async_delegation_complete"})
+MANDATORY_STATUS_DISPLAY_KIND = "supervisor_checkin"
+# A producer's internal event naming a card (with display_text) retains this row kind.
+PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete", "async_delegation_complete",
+                                         MANDATORY_STATUS_DISPLAY_KIND})
 MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
-# What a gateway producer's card may name (a liveness tick names internal_notification for its CLI
-# receipt). Closed, and kept apart from the silence set above so a kind added there never becomes
-# nameable; never a client-chosen presentation such as ``hidden``.
+# A closed producer allowlist, never a client-chosen presentation such as ``hidden``.
 PRODUCER_CARD_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
 
 # Longer than any marker could plausibly be, even with stray punctuation.
@@ -568,7 +567,8 @@ def is_machinery_display_kind(display_kind: Any) -> bool:
 
 def silence_allowed(display_kind: Any, reply_expected: Optional[bool] = None) -> bool:
     """Whether a successful bare silence marker may remain silent for this turn."""
-    return is_machinery_display_kind(display_kind) or reply_expected is False
+    return (display_kind != MANDATORY_STATUS_DISPLAY_KIND
+            and (is_machinery_display_kind(display_kind) or reply_expected is False))
 
 
 def reply_expected_metadata(reply_expected: Optional[bool]) -> dict:

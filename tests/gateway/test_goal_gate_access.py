@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import hermes_bootstrap  # noqa: F401 -- initialize dependencies before the real-home I/O guard
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource

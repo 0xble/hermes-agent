@@ -203,13 +203,14 @@ def _templates():
 
 
 def _template_id(template: str) -> str:
+    import hermes_cli.checkins as checkins
     import hermes_cli.goals as goals
     import hermes_cli.heartbeat as heartbeat
     import hermes_cli.loops as loops
 
     from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
 
-    for module in (goals, heartbeat, loops):
+    for module in (checkins, goals, heartbeat, loops):
         for name, value in vars(module).items():
             if name.endswith("_TEMPLATE") and value == template:
                 return name

@@ -1482,6 +1482,12 @@ DEFAULT_CONFIG = {
         # Fork patch: committed agent goal_set receipts surface as notices; /goal replies don't.
         "auto_notices": True,
     },
+    # Supervisor check-ins, automatic reassurance while gateway-owned work remains.
+    "checkins": {
+        "enabled": True,
+        "first_after_seconds": 1200,  # Both durations have a 300-second floor.
+        "interval_seconds": 1800,
+    },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
     # while replies stop changing.

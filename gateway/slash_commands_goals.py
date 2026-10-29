@@ -52,15 +52,26 @@ class GatewayGoalCommandsMixin:
             return None
 
         def dispatch():
-            return dispatch_goal_command(
-                mgr, event.get_command_args() or "", authorize_gate=authorize_gate,
-                render=lambda key, default, **values: t(key, **values),
-                last_user_message=last_user_message_from_db(getattr(mgr, "session_id", None)),
-            )
+            from gateway.session_context import scoped_current_session_id
+
+            # Slash controls bypass the turn that normally binds this identity. The event's
+            # physical row supplies caller authority, never an arbitrary manager's target.
+            with scoped_current_session_id(_session_entry.session_id):
+                before = mgr.state.to_json() if mgr.state is not None else None
+                result = dispatch_goal_command(
+                    mgr, event.get_command_args() or "", authorize_gate=authorize_gate,
+                    render=lambda key, default, **values: t(key, **values),
+                    last_user_message=last_user_message_from_db(getattr(mgr, "session_id", None)),
+                )
+                after = mgr.state.to_json() if mgr.state is not None else None
+                return result, before != after
 
         # Drafting resolves profile-scoped credentials. Keep ContextVars across the
         # executor hop; manager I/O must also stay off the messaging event loop.
-        result = await self._run_in_executor_with_context(dispatch)
+        result, changed = await self._run_in_executor_with_context(dispatch)
+        if changed and not result.error:
+            from gateway.run_checkins import reconcile_turn
+            await reconcile_turn(self, event.source, _session_entry.session_key)
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:

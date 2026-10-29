@@ -35,8 +35,11 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
 
     replace_mode = bool(kwargs.pop("_replace", False))
     complete_mode = bool(kwargs.pop("_complete", False))
+    peer_mode = kwargs.pop("_peer", None)
 
     def apply(target):
+        if peer_mode:
+            return target._peer_change(operation=peer_mode, **kwargs)
         method = target._complete if complete_mode else target._replace if replace_mode else target._revise
         return method(**kwargs)
     if (replace_mode and kwargs.get("actor") == "user" and manager.session_id

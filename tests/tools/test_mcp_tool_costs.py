@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tools import mcp_tool, mcp_tool_costs
+from tools import mcp_tool, mcp_tool_costs, mcp_tool_loop
 from tools import mcp_tool_handlers as handlers
 from tools import mcp_tool_registration as registration
 from tools.approval_context import reset_current_session_key, set_current_session_key
@@ -24,35 +24,35 @@ COSTED = {"trust": "full", "tool_costs": {"paid_render": 40, "batch": {"credits"
           "spend_limit": 100}
 
 
-def _run_on_loop(coro_or_factory, timeout=30):
-    coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
-    loop = asyncio.new_event_loop()
-    try:
-        async def _run():
-            for srv in list(mcp_tool._servers.values()):
-                if getattr(srv, "_rpc_lock", None) is None:
-                    srv._rpc_lock = asyncio.Lock()
-            return await coro
-        return loop.run_until_complete(_run())
-    finally:
-        loop.close()
-
-
 @pytest.fixture
 def session():
     result = SimpleNamespace(content=[SimpleNamespace(type="text", text="ok")], isError=False, structuredContent=None)
     session = MagicMock()
     session.call_tool = AsyncMock(return_value=result)
-    with patch.dict(mcp_tool._servers, {"srv": SimpleNamespace(session=session, _rpc_lock=None)}), \
-         patch("tools.mcp_tool_loop._run_on_mcp_loop", side_effect=_run_on_loop), \
-         patch.dict(mcp_tool._server_error_counts, {}, clear=True), \
-         patch.dict(mcp_tool._server_trust_levels, {}, clear=True), \
-         patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True), \
-         patch.dict(mcp_tool._server_cost_policies, {}, clear=True), \
-         patch.dict(mcp_tool_costs._spent, {}, clear=True), \
-         patch.dict(mcp_tool_costs._ask_locks, {}, clear=True), \
-         patch.object(mcp_tool_costs, "_unscoped_moved_to", None):
-        yield session
+    # Parallel callers share an RPC lock, so they must also share its owning loop.
+    # Per-call loops can strand a waiter when another thread releases that lock.
+    mcp_tool_loop._ensure_mcp_loop()
+    loop, thread = mcp_tool._mcp_loop, mcp_tool._mcp_thread
+    assert loop is not None and thread is not None
+
+    async def make_server():
+        return SimpleNamespace(session=session, _rpc_lock=asyncio.Lock())
+
+    try:
+        server = asyncio.run_coroutine_threadsafe(make_server(), loop).result(timeout=5)
+        with patch.dict(mcp_tool._servers, {"srv": server}), \
+             patch.dict(mcp_tool._server_error_counts, {}, clear=True), \
+             patch.dict(mcp_tool._server_trust_levels, {}, clear=True), \
+             patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True), \
+             patch.dict(mcp_tool._server_cost_policies, {}, clear=True), \
+             patch.dict(mcp_tool_costs._spent, {}, clear=True), \
+             patch.dict(mcp_tool_costs._ask_locks, {}, clear=True), \
+             patch.object(mcp_tool_costs, "_unscoped_moved_to", None):
+            yield session
+    finally:
+        assert mcp_tool_loop._stop_mcp_loop()
+        assert not thread.is_alive()
+        assert loop.is_closed()
 
 
 def _register(config, name="srv", tools=("paid_render", "batch", "free_status")):
@@ -237,5 +237,74 @@ def test_parallel_over_limit_calls_are_asked_one_at_a_time(session):
             th.start()
         for th in threads:
             th.join(10)
+    assert not any(th.is_alive() for th in threads)
+    assert session.call_tool.await_count == 4
     assert peak[0] == 1 and len(prompts) == 2
     assert {"used about 80 credits" in p for p in prompts} == {True, False}  # the second saw the first's booking
+
+
+def test_contended_rpc_fixture_shuts_down_and_exits(tmp_path):
+    """A cross-loop RPC lock can leave a caller alive after every spend assertion passes."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import textwrap
+
+    probe = textwrap.dedent("""
+        import asyncio
+        from contextlib import contextmanager
+        import json
+        import runpy
+        import sys
+        import threading
+
+        source = runpy.run_path(sys.argv[1])
+        mcp = source["mcp_tool"]
+        from tools import mcp_tool_loop
+
+        with contextmanager(source["session"].__wrapped__)():
+            class ContendedLock(asyncio.Lock):
+                def __init__(self):
+                    super().__init__()
+                    self.second_attempt = asyncio.Event()
+                    self.attempts = 0
+
+                async def acquire(self):
+                    self.attempts += 1
+                    if self.attempts == 1:
+                        await super().acquire()
+                        # Keep the first RPC's lock until the other caller tries it.
+                        await self.second_attempt.wait()
+                        return True
+                    self.second_attempt.set()
+                    return await super().acquire()
+
+            async def install_lock():
+                mcp._servers["srv"]._rpc_lock = ContendedLock()
+            mcp_tool_loop._run_on_mcp_loop(install_lock)
+            results = []
+
+            def call():
+                raw = source["handlers"]._make_tool_handler("srv", "free_status", 5)({})
+                results.append(json.loads(raw))
+
+            callers = [threading.Thread(target=call) for _ in range(2)]
+            for caller in callers:
+                caller.start()
+            for caller in callers:
+                caller.join(2)
+            assert not any(caller.is_alive() for caller in callers), "RPC caller leaked"
+            assert results == [{"result": "ok"}, {"result": "ok"}], results
+        assert mcp._mcp_loop is None
+        assert mcp._mcp_thread is None
+        print("callers joined; fixture shutdown complete", flush=True)
+    """)
+    env = dict(os.environ, HERMES_HOME=str(tmp_path / "home"),
+               HERMES_TEST_ISOLATION=str(tmp_path / "isolation"))
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(Path(__file__).resolve())],
+        env=env, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "callers joined; fixture shutdown complete" in result.stdout

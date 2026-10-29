@@ -1299,6 +1299,21 @@ def _event_delivery(fn, evt: dict[str, Any], claim_id: str) -> None:
         fn(str(evt.get("delegation_id") or ""), claim_id)
 
 
+def supervisor_inventory(session_ids: list[str]) -> list[dict[str, Any]]:
+    """Live delegations owned by this compression lineage, including after gateway restart.
+
+    A chat key is reusable after /new, so it is never an ownership substitute here.
+    Registry timestamps are observations, not proof the child is making progress.
+    """
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(f"""SELECT delegation_id, state, task_json, dispatched_at, updated_at
+            FROM async_delegations WHERE parent_session_id IN ({','.join('?' for _ in session_ids)})
+            AND state IN ('queued','admitted','running','stalling','finalizing')""", session_ids).fetchall()
+    return [{"kind": "delegation", "id": row[0], "status": row[1],
+             "name": str(_json_object(row[2]).get("goal") or "Background delegation")[:240],
+             "started_at": row[3], "last_activity_at": row[4]} for row in rows]
+
+
 def retirement_inventory(session_key: str, session_id: str) -> list[dict[str, Any]]:
     """Live work and undelivered results owned by one exact gateway conversation."""
     with _DB_LOCK, _transaction() as conn:

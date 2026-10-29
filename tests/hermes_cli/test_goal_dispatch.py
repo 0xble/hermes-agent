@@ -5,6 +5,7 @@ import queue
 from types import SimpleNamespace
 
 import pytest
+import hermes_bootstrap  # noqa: F401 -- initialize dependencies before the real-home I/O guard
 
 from hermes_cli import goals
 
@@ -31,7 +32,7 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
 
         runner = object.__new__(Runner)
         async def manager(event):
-            return mgr, None
+            return mgr, SimpleNamespace(session_id=mgr.session_id, session_key=mgr.session_id)
         async def execute(fn, *args):
             return fn(*args)
         runner._get_goal_manager_for_event = manager
@@ -39,6 +40,7 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
         runner._adapter_and_key_for = lambda event: (None, None)
         runner._enqueue_goal_turn = lambda event, text, **kwargs: prompts.append(text)
         runner._resume_caller_is_admin = lambda source: True
+        runner.session_store = SimpleNamespace(lookup_by_session_key=lambda _: None)
         def execute(arg):
             event = SimpleNamespace(get_command_args=lambda: arg, source=None)
             if arg == 'show':
