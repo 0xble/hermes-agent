@@ -450,9 +450,53 @@ def release_admission_media(db, admission_id):
     # so they are history context like an API image: they go once no live row and no transcript row
     # names them, never while a follow-up turn can still be told to read them. Session deletion
     # collects them through ``retire_media``; ``sweep_settled_media`` bounds the rest at main's 24 h.
-    released = release_unheld_media(db, admission_media_references(row['payload']))
-    released += release_unheld_media(db, hosted_document_references(row['request_id'], row['payload']))
+    released = release_unheld_media(db, admission_media_references(row['payload']), admitted=True)
+    released += release_unheld_media(db, hosted_document_references(row['request_id'], row['payload']),
+                                     admitted=True)
     return released + sweep_settled_media(db)
+
+
+# A release reads transcripts and takes the writer (``release_unheld_media``). Awaited at settlement,
+# it held the chat's FIFO and the settled reply for its whole duration after every photo or voice
+# turn (a full transcript scan then: 13 minutes on an 86 GB store). Owner callers queue it here.
+_SLOW_RELEASE_S = 30.0
+
+
+def release_admission_media_later(authority, admission_id):
+    """Queue ``release_admission_media`` for a terminal admission and return at once (call on the
+    owner loop). One tracked worker per owner runs the queue in order, so a burst of media turns never
+    starts concurrent transcript scans. Deferring only keeps bytes longer, never drops held ones; a
+    draining or retiring owner leaves the rest on disk, where ``sweep_settled_media`` bounds them."""
+    pending = authority.__dict__.setdefault('_media_releases', [])
+    pending.append(admission_id)
+    task = getattr(authority, '_media_release_task', None)
+    if task is None or task.done():
+        from gateway.session_runtime_workers import track_mutation
+        authority._media_release_task = track_mutation(authority, _run_media_releases(authority))
+    return authority._media_release_task
+
+
+async def media_releases_idle(authority):
+    """Wait until every queued terminal media release has run."""
+    while (task := getattr(authority, '_media_release_task', None)) is not None and not task.done():
+        await task
+
+
+async def _run_media_releases(authority):
+    import asyncio
+    import time
+    pending = authority._media_releases
+    while pending and not (getattr(authority.runner, '_draining', False) or getattr(authority, 'retiring', False)):
+        admission_id = pending.pop(0)
+        started = time.monotonic()
+        try:
+            await asyncio.to_thread(release_admission_media, authority.db, admission_id)
+        except Exception:
+            logger.exception('Terminal media cleanup failed for admission %s', admission_id)
+        elapsed = time.monotonic() - started
+        if elapsed >= _SLOW_RELEASE_S:
+            logger.warning('Terminal media cleanup of admission %s took %.0fs (off the FIFO path)',
+                           admission_id, elapsed)
 
 
 _SWEEP_INTERVAL_S = 3600
@@ -513,10 +557,39 @@ def collect_unheld_api_images(db):
         return 0
 
 
-def _history_mentions(conn, references, after_id=0):
-    """Candidate paths any transcript row (id > after_id) mentions raw or JSON-escaped, in ONE
-    messages pass. Rows are prefiltered in SQL on the literal text before each candidate's digest
-    directory, so only rows that could name a candidate reach Python's exact substring test."""
+def _mention_scope(conn, references):
+    """The sessions whose transcripts can name these bytes: every session an admission naming one
+    of their digests targeted (any status), with its whole ``parent_session_id`` family. A note
+    reaches a transcript through the admitting turn's prompt, and rows are copied only along that
+    family (compression continuations, branches, delegates). Bounded by those conversations,
+    never the whole store; ``sweep_settled_media`` bounds anything else at 24 hours anyway."""
+    digests = {reference['sha256'] for reference in references}
+    owners = set()
+    for target, request_id, encoded, text in conn.execute("""SELECT target_session_id, request_id,
+            json_extract(payload_json, '$.attachments_v1.media', '$.native_text_v1.media', '$.api_turn_v1.media'),
+            CASE WHEN request_id LIKE 'hosted:%' THEN json_extract(payload_json, '$.text') END
+            FROM session_admissions"""):
+        named = [reference for group in json.loads(encoded) for reference in group or ()]
+        named += hosted_document_references(request_id, {'text': text})
+        if any(isinstance(reference, dict) and reference.get('sha256') in digests for reference in named):
+            owners.add(target)
+    if not owners:
+        return []
+    return [row[0] for row in conn.execute("""WITH RECURSIVE
+            up(id) AS (SELECT value FROM json_each(?) UNION
+                       SELECT s.parent_session_id FROM sessions s JOIN up ON s.id = up.id
+                       WHERE s.parent_session_id IS NOT NULL),
+            family(id) AS (SELECT id FROM up UNION
+                           SELECT s.id FROM sessions s JOIN family ON s.parent_session_id = family.id)
+            SELECT id FROM family""", (json.dumps(sorted(owners)),))]
+
+
+def _history_mentions(conn, references, after_id=0, *, sessions=None):
+    """Candidate paths a transcript row (id > after_id) mentions raw or JSON-escaped, in ONE messages
+    pass. With ``sessions`` (``_mention_scope``) only those sessions' rows are read, through the
+    session index: a store-wide pass took 13 minutes on an 86 GB store. Rows are prefiltered in SQL
+    on the literal text before each candidate's digest directory, so only rows that could name a
+    candidate reach Python's exact substring test."""
     # Matched by the content-addressed tail ``<sha256>/<name>`` with either separator, so every
     # spelling a note can carry (the host path, a sandbox backend's ``to_agent_visible_cache_path``)
     # counts as a mention.
@@ -528,10 +601,21 @@ def _history_mentions(conn, references, after_id=0):
     prefixes = sorted({reference['sha256'] for reference in references})
     # The digests are ONE bound JSON array, never one ``instr`` term each: the statement's size
     # must not grow with the candidate count (SQLite's expression-depth limit fails at ~1000 terms).
-    query = ('WITH digests(value) AS MATERIALIZED (SELECT value FROM json_each(?)) SELECT content FROM messages '
-             'WHERE EXISTS (SELECT 1 FROM digests WHERE instr(content, digests.value))' + (' AND id>?' if after_id else ''))
+    query = 'WITH digests(value) AS MATERIALIZED (SELECT value FROM json_each(?)) SELECT content FROM messages '
+    params = [json.dumps(prefixes)]
+    if sessions is not None:
+        if not sessions:
+            return set()
+        query += 'INDEXED BY idx_messages_session_id WHERE session_id IN (SELECT value FROM json_each(?)) AND '
+        params.append(json.dumps(sessions))
+    else:
+        query += 'WHERE '
+    query += 'EXISTS (SELECT 1 FROM digests WHERE instr(content, digests.value))'
+    if after_id:
+        query += ' AND id>?'
+        params.append(after_id)
     mentioned = set()
-    for (content,) in conn.execute(query, (json.dumps(prefixes), *((after_id,) if after_id else ()))):
+    for (content,) in conn.execute(query, params):
         text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
         mentioned.update(raw for needle, raw in needles.items() if needle in text)
     return mentioned
@@ -542,13 +626,16 @@ def _collectable(references, root):
             and Path(reference['path']).parent.name == reference['sha256'] and Path(reference['path']).exists()]
 
 
-def release_unheld_media(db, references, *, retain_history=True):
+def release_unheld_media(db, references, *, retain_history=True, admitted=False):
     """Delete unowned references, preserving accepted admission and retained transcript owners.
 
     The history owner check is one read-snapshot pass over messages, outside the write lock; under
     the lock only rows inserted after that snapshot (an indexed id range) are re-checked. A new
     transcript mention of a retained image comes from an admission holding it (re-checked under the
-    lock) or from a copied row (branch/compress insert, caught by the range)."""
+    lock) or from a copied row (branch/compress insert, caught by the range). ``admitted``: the
+    references belong to admissions still on record, so the snapshot pass reads only their
+    conversations (``_mention_scope``), never every transcript row; retired and orphaned bytes have
+    no admission left to scope by, so their collection keeps the store-wide pass."""
     root = _media_root()
     references = _collectable(references or (), root)
     if not references:
@@ -559,7 +646,8 @@ def release_unheld_media(db, references, *, retain_history=True):
             conn.execute('BEGIN')  # one snapshot: the id watermark and the scan agree
             try:
                 last_id = conn.execute('SELECT coalesce(max(id), 0) FROM messages').fetchone()[0]
-                seen = _history_mentions(conn, references)
+                scope = {'sessions': _mention_scope(conn, references)} if admitted else {}
+                seen = _history_mentions(conn, references, **scope)
             finally:
                 if conn.in_transaction:
                     conn.execute('ROLLBACK')

@@ -78,6 +78,9 @@ async def test_retained_bytes_are_released_after_cancel_and_settlement(tmp_path,
         settled = next(r for r in list_session_admissions(db, session_id='s', pending_only=False)
                        if r['admission_id'] == second.admission_id)
         assert settled['status'] == 'terminal' and settled['outcome'] == 'completed'
+        # Released by the owner's queued cleanup, off the FIFO path, once the drain settled it.
+        from gateway.session_ingress_media import media_releases_idle
+        await media_releases_idle(authority)
         assert not Path(retained).exists()
         assert not Path(retained).parent.exists()
         assert list(_media_root().iterdir()) == []

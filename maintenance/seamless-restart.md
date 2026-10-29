@@ -113,6 +113,36 @@ than hanging its own asyncio timeout. Retain semantic regression coverage in
 Do not weaken the liveness watchdog, bypass SQLite/FTS locks, or change typed-turn
 progress, cleanup, live status or ten-second bubble-edit behavior.
 
+## Terminal media cleanup stays off the FIFO path
+
+Patch identity: `seamless-restart; FIFO never waits on terminal media cleanup`.
+`release_admission_media` checked transcript ownership by reading every `messages`
+row (`_history_mentions`): 786 seconds for one digest on a clone of the 86 GB live
+store. Run inline at settlement it held a chat's FIFO, and the settled reply, after
+every photo or voice turn on every platform (2026-10-29, Telegram topic 139328).
+
+- Settlement, `/discard` resolution, cancellation (each queued row of a `/stop` or
+  `/new`) and queued-edit replacement queue the release through
+  `release_admission_media_later`: one tracked worker per owner, in order, warning
+  when a release takes over 30 seconds. Deferral only retains bytes longer; a
+  stopping owner leaves the rest for `sweep_settled_media`.
+- An admission's release reads only its `_mention_scope`: the sessions any admission
+  naming the digest targeted, with their `parent_session_id` family, through
+  `idx_messages_session_id`. Retired and orphaned bytes have no admission to scope
+  by, so `collect_retired_media` and `collect_unheld_api_images` keep the store-wide
+  pass (off the FIFO path; a follow-up should bound them too).
+
+Proof: `tests/gateway/test_fifo_media_settlement_no_stall.py` and
+`test_native_media_history_retention.py::test_the_history_owner_check_reads_only_the_admitting_conversations`.
+
+Patch identity: `seamless-restart; /new after a restart cancels the route's queued rows`.
+A `/stop` or `/new` that arrives before startup recovery mounts the route's durable
+FIFO mounts it first (`_hm_mounted_owner`), so its queued rows are cancelled instead
+of stranded behind the fresh session. A superseded session stays read-only, except
+for its own receipts and cancelling its own queued rows (`authorize(superseded_ok=True)`):
+those rows can never run, and cancelling them is what lets the session be deleted.
+Proof: `tests/gateway/test_superseded_queued_rows.py`.
+
 ## Bounded terminal shutdown
 
 Patch identity: `seamless-restart; bounded restart shutdown` (the same lineage as
