@@ -17,7 +17,7 @@ class GatewayProcessEventSourcesMixin:
         """Bound failed recovery work without discarding a process or its completion."""
         if not evt.get("session_id"):
             return self._resolve_process_event_source(evt)
-        store = self.session_store
+        store = getattr(self, "session_store", None)
         # A new route, store replacement or route write immediately bypasses the cooldown.
         key = (id(store), getattr(store, "_routing_generation", 0), *(str(evt.get(field) or "") for field in (
             "session_id", "session_key", "profile", "platform", "chat_type", "chat_id", "thread_id",
