@@ -82,21 +82,18 @@ def _prune_env_pool_entries(env_var: str) -> list[str]:
 def _scrub_config_yaml_mirrors(old_value: str, new_value: str | None) -> list[str]:
     """Reconcile config.yaml api_key mirrors holding ``old_value``; return dotted paths touched.
 
-    Value-matched on purpose: only an entry holding the SAME credential that just changed in
+    Value-matched on purpose: only an entry holding the SAME credential being changed in
     ``.env`` is touched. ``new_value=None`` removes the field. Operates on the RAW user config
     so defaults are never baked into the user's file.
     """
     if not old_value:
         return []
-    from hermes_cli.config import atomic_config_replace, get_config_path, read_user_config_raw
+    from hermes_cli.config import atomic_config_replace, get_config_path, require_readable_config_before_write
 
     config_path = get_config_path()
     if not config_path.exists():
         return []
-    try:
-        user_config = read_user_config_raw(config_path)
-    except Exception:
-        return []
+    user_config = require_readable_config_before_write(config_path)
     if not user_config:
         return []
 
@@ -183,11 +180,12 @@ def save_provider_env_credential(env_var: str, value: str) -> dict[str, Any]:
     # scrub below would still move the new value into config.yaml.
     require_env_writable(env_var, "set")
     old_value = load_env().get(env_var)
-    save_env_value(env_var, value)
-
+    # Admit and persist the overriding mirrors before mutating the environment or pool.
+    # A rejected config write must leave the credential the caller still uses intact.
     config_updates: list[str] = []
     if value and old_value and old_value != value:
         config_updates = _scrub_config_yaml_mirrors(old_value, value)
+    save_env_value(env_var, value)
 
     # A prior removal may have suppressed this env source; a fresh save is an explicit re-add.
     providers = _providers_for_env_var(env_var)
@@ -208,9 +206,9 @@ def remove_provider_env_credential(env_var: str) -> dict[str, Any]:
     # Before the pool prune and mirror scrub: a refused remove must not strip the other stores.
     require_env_writable(env_var, "remove")
     old_value = load_env().get(env_var)
+    config_scrubbed = _scrub_config_yaml_mirrors(old_value, None) if old_value else []
     removed_from_env = remove_env_value(env_var)
     refs = purge_env_credential_references(env_var)
-    config_scrubbed = _scrub_config_yaml_mirrors(old_value, None) if old_value else []
 
     return {
         "ok": True,
