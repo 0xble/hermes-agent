@@ -108,7 +108,8 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                         validate_candidate(loaded)
                     return _effective({})
                 raw = loaded if isinstance(loaded, dict) else {}
-                _config._RAW_CONFIG_CACHE[path_key] = (*user_sig, copy.deepcopy(raw))
+                from hermes_cli.config_write_guards import snapshot
+                _config._RAW_CONFIG_CACHE[path_key] = (*user_sig, snapshot(copy.deepcopy(raw), config_path, user_sig))
 
         if not recovered:
             from hermes_cli.config_write_guards import validate_candidate
