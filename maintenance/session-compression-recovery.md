@@ -5,6 +5,14 @@
 Load this unit when changing hard-window recovery, preflight input admission,
 archive-backed request projection or the gateway exhaustion boundary.
 
+## Summary Latency Budget
+
+The shipped summarizer and agent-requested compaction changes are independent of the recovery design below. The summary target is 12% of bounded serialized input plus the previous summary, floored at 2000 tokens and capped by the configured ceiling (never above 10000). A lower manual-level ceiling also scales the target down. Focus and the detailed session log share this total, not extra allowances. Preserve exact identifiers, constraint quotes, decisions with reasons and open tasks. Collapse repeated diagnostics and completed-step narration.
+
+Keep this prompt-side: a wire `max_tokens` cap can cut off the checkpoint mid-fact, or consume its allowance on reasoning alone. Existing attempt telemetry records provider-reported `aux_input_tokens` and `aux_output_tokens` (null when unavailable), elapsed `aux_call_duration_ms`, `summary_budget_tokens`, and rough final `summary_output_tokens`/`summary_budget_overrun_tokens`. Log overruns without truncating or issuing another call. Provider usage accumulates across calls in an attempt. Budget and final-summary size describe the latest generation.
+
+`compact_context` refuses focus longer than 1500 characters and asks the caller to shorten narration while preserving identifiers. Never silently slice it. `tests/agent/test_summary_latency_budget.py` compares required facts under old and new targets with a synthetic extractive fake and checks focus admission, usage and overruns. This verifies integration, not real-model compliance or production latency.
+
 ## Proposed behavior
 
 Compression failure is not `/new`: never clear the conversation scope, replace
