@@ -2021,8 +2021,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.
         await self._send_session_db_warning_notifications()
-        from gateway.cron_store_notices import install_cron_store_notices
-        install_cron_store_notices(self, asyncio.get_running_loop())
+        from gateway.runtime_health import install_health_notices
+        await install_health_notices(self)
         # Resume recovered process watchers. Detach the batch atomically (fresh list, not clear(): a
         # concurrent append during the yield must not be lost); yield every 100 to keep the loop live.
         with _log_suppressed(logging.ERROR, "Recovered watcher setup error: %s"):

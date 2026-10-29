@@ -466,19 +466,20 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
     if previous is None or previous == candidate or repo_root() != candidate.resolve():
         return []
     from pm.environments import project_python
-    # Missing means the candidate's boot environment lacks an applicable requirement, so a
-    # recorded extra that is platform-gated off, or already installed, never re-syncs.
+    # A satisfied candidate needs no sync, and platform-gated extras are excluded.
     leaves = _leaf_requirements(candidate)
+    applicable = sorted(_committed_extras(previous, candidate) & leaves.keys())
     installed = set(_active_distributions(project_python(candidate)))
-    missing = sorted(extra for extra in _committed_extras(previous, candidate)
-                     if extra in leaves and not leaves[extra] <= installed)
+    missing = [extra for extra in applicable if not leaves[extra] <= installed]
     if missing:
         import pm
         from hermes_cli.update_receipt import record_step
-        # An update never fails because of a plugin: evict one that keeps the candidate's
-        # environment from building, as every other update-path sync does.
-        pm.sync_venv(missing, explicit=True, project_root=candidate, evict_incompatible_plugins=True)
-        record_step("immutable_extras_carry", True, f"carried {', '.join(missing)} from {previous}")
+        # Sync replaces the selected environment. Carry the complete applicable set:
+        # an extra present only in the payload .venv may not be inferred by PM's
+        # first-generation selection, even though it was not missing before sync.
+        # Evict incompatible plugins as every other update-path sync does.
+        pm.sync_venv(applicable, explicit=True, project_root=candidate, evict_incompatible_plugins=True)
+        record_step("immutable_extras_carry", True, f"carried {', '.join(applicable)} from {previous}")
     return missing
 
 
@@ -1020,10 +1021,14 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         _set_pointer(paths.previous, record["previous_intended"])
         return {"current": None, "previous": record["previous_intended"]}
 
+    from hermes_cli.immutable_release_preflight import activation_preflight
+    origin = record.get("current_original") or record.get("source")
+
     if operation == "first-migration-rollback":
         source = Path(record["source"])
         if not source.is_dir() or release_sha(source) != record["source_sha"]:
             raise RuntimeError("source checkout changed since migration; refusing unsafe rollback")
+        activation_preflight(source, origin, paths.home)
         _set_pointer(paths.current, None)
         _set_pointer(paths.previous, None)
         if record.get("journal_intended") is not None:
@@ -1036,6 +1041,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         candidate = Path(record["candidate"])
         if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
             raise RuntimeError(f"transaction candidate no longer ready: {candidate}")
+        activation_preflight(candidate, origin, paths.home)
         if record.get("journal_intended") is not None:
             _atomic_json(paths.home / "release-layout.json", record["journal_intended"])
         _set_pointer(paths.previous, record["previous_intended"])

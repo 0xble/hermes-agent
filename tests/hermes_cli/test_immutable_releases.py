@@ -1152,9 +1152,9 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
     # Post-swap: B's own code commits the missing extra before activate_release runs.
     monkeypatch.setattr("pm.paths.repo_root", lambda: b.resolve())
     assert releases.stage_release(tmp_path / "source", home, sha="B") == (b, "existing")
-    assert synced == [(["documents", "slack"],
+    assert synced == [(["documents", "slack", "telegram"],
                        {"explicit": True, "project_root": b, "evict_incompatible_plugins": True})]
-    assert steps == [("immutable_extras_carry", True, f"carried documents, slack from {a.resolve()}")]
+    assert steps == [("immutable_extras_carry", True, f"carried documents, slack, telegram from {a.resolve()}")]
 
 
 @pytest.fixture

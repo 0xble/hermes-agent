@@ -196,16 +196,37 @@ extension point, passive availability, and bounded dependencies. Upstream
 related missing-client symptom. [#144642](https://github.com/NousResearch/hermes-agent/issues/144642)
 is related Windows import behavior. Neither establishes this exact PM path bug.
 
-The immutable-release boundary already carries declared extras from the previous
-release's committed PM generation, not just its base `.venv`. The `hindsight`
-extra is declared in this source, so the recorded recovery selection survives
-`prepare_venv`. A ready candidate built by older code uses `carry_active_extras`
-from the candidate's own code before activation. The existing tests in
-`tests/hermes_cli/test_immutable_releases.py` cover build-time carry, old-builder
-ready-candidate carry, and selecting the committed-generation smoke interpreter.
-No separate extras framework or release activation path is added here. Subsequent
-PM rebuilds are protected by the configured-provider union fix, independently of
-the retained extra. Release integration and promotion remain with Maintenance.
+The immutable-release boundary carries declared extras from the previous
+release's committed PM generation, not just its base `.venv`. If any applicable
+extra is missing, candidate-owned `carry_active_extras` syncs the full applicable
+active selection, including extras already present in the candidate's `.venv`.
+PM's first committed generation replaces that payload and its anchor inference
+may not cover every declared extra, so syncing only the missing subset can drop
+clients the payload already had. `tests/hermes_cli/test_release_extras_carry.py`
+exercises this transition with real offline wheels, PM sync, and import probes.
+Build-time carry and candidate-owned carry remain the repair paths. They are not
+activation gates: an older updater, direct promotion, rollback, or recovered
+transaction can reach the pointer flip without importing candidate-owned PM.
+Every transaction now verifies the selected candidate PM interpreter before
+changing `current`, including source-layout rollback. A recorded active extra
+that the candidate no longer declares, a missing or unimportable direct
+requirement, or a configured provider's failed passive readiness check refuses
+activation. The gate retries existing candidate-owned carry, then reads back the
+environment rather than trusting either PM's return value or the payload venv.
+Configured-provider checks use the candidate's `is_available` and
+`unavailable_reason`, not client construction or network requests. Empty reasons
+(such as absent credentials) do not become dependency errors.
+
+At gateway startup and each 60-second housekeeping tick, configured providers use
+those same readiness APIs. Client degradation emits an ERROR with client package
+names and PM repair guidance, and an operator home-channel notice. Per-profile,
+per-release markers suppress repeat errors and delivered notices across ticks and
+restarts. Unsent notices remain eligible for retry. No provider readiness, PM
+selection, or status-command implementation is duplicated or changed by this gate.
+The existing `hermes memory status` red readiness contract remains #845's owner.
+Proof: `tests/hermes_cli/test_release_extras_preflight.py`,
+`tests/gateway/test_memory_health.py`, and the existing immutable-release and
+memory-status suites. Release integration and promotion remain with Maintenance.
 
 Additional isolated proof lives in
 `tests/pm/test_bundled_memory_selection.py` (real offline union build with a named
