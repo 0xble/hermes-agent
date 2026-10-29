@@ -917,6 +917,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   all-home reservation and the per-home conflict probes. The original deadline
   still applies, and each retry must acquire the actual ownership locks.
   Guard: `tests/gateway/test_browse_reservation_release_race.py` and browse schema drift.
+- Ink submission replies retain one bounded status type, derived from the generated
+  legacy prompt, canonical admission, and correction contracts. Queue-edit dispatch
+  preserves both the synchronous queue mutation result and asynchronous send result
+  in its Promise callback. Guards: Ink typecheck and submission/queue suites.
 - Integrating fork main through #818 keeps atomic fanout prepare/stamp/admission alongside
   overflow resume notices and their physical-drain barrier. Routing replacement performs its
   diff and retirement-fence check in SQLite and returns only rejected route keys, without
