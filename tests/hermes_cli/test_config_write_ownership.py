@@ -29,3 +29,18 @@ def test_owned_or_explicit_config_transactions_still_validate_final_bytes(tmp_pa
         else:
             atomic_write_text(path, "timezone: NOT/A_ZONE\n")
     assert not path.exists()
+
+
+def test_symlinked_named_profile_retains_owned_document_admission(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    target = tmp_path / "operator-owned-profile"
+    target.mkdir()
+    (profiles / "other").symlink_to(target, target_is_directory=True)
+    path = profiles / "other" / "config.yaml"
+    path.write_text("timezone: UTC\n", encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(ConfigValidationError):
+        atomic_write_text(path, "timezone: NOT/A_ZONE\n")
+    assert path.read_bytes() == before
