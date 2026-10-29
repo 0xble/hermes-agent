@@ -64,7 +64,7 @@ def _git_proc_running() -> bool:
 def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, repo_root: Path,
                  min_age_seconds: Optional[int], default_age: int, skip_msg: str,
                  log_removed: Callable[[Path, int], None], packs: bool = False) -> list[str]:
-    """Shared age-floor sweep; packs use holder-scoped Linux liveness, locks stay global."""
+    """Shared age-floor sweep with conservative repository/holder-scoped liveness."""
     if not directory.is_dir():
         return []
     if packs:
@@ -73,7 +73,9 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, r
         packs = _linux_process_scope  # non-Linux keeps the original global veto
         # One bounded re-check budget per sweep, shared by every candidate.
         retry_until = time.monotonic() + INSPECTION_RETRY_SECONDS
-    if not packs and _git_proc_running():
+    from hermes_cli._git_process_scope import git_process_running_for
+
+    if not packs and git_process_running_for(repo_root, _git_proc_running):
         logger.debug(skip_msg)
         return []
     cutoff = time.time() - (min_age_seconds if min_age_seconds is not None else default_age)
@@ -84,10 +86,10 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, r
                 if packs:
                     if tmp_pack_in_use(repo_root, entry, lambda: _git_proc_running(), retry_until=retry_until):
                         continue
-                    current = entry.stat()
-                    if (current.st_dev, current.st_ino, current.st_mtime_ns) != (
-                            st.st_dev, st.st_ino, st.st_mtime_ns):
-                        continue
+                current = entry.stat()
+                if (current.st_dev, current.st_ino, current.st_mtime_ns) != (
+                        st.st_dev, st.st_ino, st.st_mtime_ns):
+                    continue
                 if os.name == "nt":
                     # git renames its transfer temps into place read-only; Windows refuses to
                     # unlink a read-only file (EACCES/13), so without clearing the write bit
@@ -109,8 +111,8 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, r
 def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> list[str]:
     """Remove abandoned ``.git`` lock files under ``repo_root``; returns the removed paths.
 
-    Removes only when older than the age floor AND no git process is running. Never raises: a lock we cannot
-    stat/unlink is skipped (it may have been re-created between the age check and the unlink; skipping is safe).
+    Removes only past the age floor with no target/shared/unknown Linux Git owner
+    (or any Git process on other hosts). Never raises: a lock we cannot stat/unlink is skipped (it may have been re-created between the age check and the unlink; skipping is safe).
     """
     git_dir = Path(repo_root) / ".git"
     return _sweep_stale(

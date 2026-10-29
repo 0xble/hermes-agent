@@ -50,9 +50,28 @@ checks a committed revision instead. Plugin admission fetches exact pins and
 executes dependency validation, so run catalog changes in a disposable,
 credentialless environment. The required runner already provides that isolation.
 
-Mutable state lives in the current worktree: `.venv`, `node_modules`,
-`website/node_modules`, and ignored `.ci/` caches and Cargo targets. Temporary
-homes live outside the checkout in invocation-owned system temporary directories.
+Mutable installs stay in the current worktree: `.venv`, `node_modules`,
+`website/node_modules`, and the Cargo target under ignored `.ci/`. uv, npm,
+and mise download caches are the exception on same-volume APFS hosts. They are
+content-addressed, so they live in one dedicated host directory outside the
+checkout and outside the disposable HOME. That directory is not `~/.cache/uv`.
+If it is on another volume or APFS cloning is unavailable, CI logs the reason
+and retains the previous checkout-local `.ci/cache` paths instead of failing.
+`UV_LINK_MODE` is `clone` when the selected volume supports APFS copy-on-write
+and `copy` otherwise, so caches cannot fall back to hardlinks or symlinks.
+Clone probes use invocation-unique temporary files in the shared cache, so
+concurrent setups cannot invalidate each other's capability checks. Cache paths
+inside the checkout are rejected before creating directories.
+Before setup, a free-space floor sized for one 3-slot wave plus
+headroom reclaims generated directories from finished worktrees and refuses,
+naming the paths and the bytes still required, only when space is still short.
+Generated-output reclaim shares the attended pruner's ownership guards: kanban
+lifecycle trees and live Hermes session locks are preserved before inspection.
+The pre-install reclaim loader temporarily exposes the checkout on the import path,
+and ownership checks do not import dependencies that setup has not installed yet.
+Concurrent reclaimers accept already-removed generated paths and still recheck
+free space, while other deletion errors propagate.
+There is no host-wide install lock. Fork patch identity: `ci-shared-download-caches`. Temporary homes live outside the checkout in invocation-owned system temporary directories.
 When Linux makes the normal disk-backed Python scratch path read-only, Python
 fixtures use a unique directory under the runner's original disk-backed HOME,
 outside the isolated child HOME. Temporary parents with Git or Node dependency
