@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pm import install_hint
 import asyncio
+from agent.attachment_context import format_document_content
 import collections
 import concurrent.futures
 import contextvars
@@ -3090,7 +3091,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 return ""
             content = Path(cached_path).read_text(encoding="utf-8-sig")
             display_name = self._display_name_from_cached_path(cached_path)
-            return f"[Content of {display_name}]:\n{content}"
+            return format_document_content(display_name, content)
         except (OSError, UnicodeDecodeError):
             logger.warning("[Feishu] Failed to inject text document content from %s", cached_path, exc_info=True)
             return ""

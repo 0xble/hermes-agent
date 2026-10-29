@@ -2,6 +2,7 @@
 client; messages are polled over a local HTTP API and responses are posted back through it."""
 
 import asyncio
+from agent.attachment_context import format_document_content
 import logging
 import mimetypes
 import os
@@ -995,7 +996,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     continue
                 content = p.read_text(encoding="utf-8-sig", errors="replace")
                 parts = p.name.split("_", 2)  # strip the doc_<hex>_ prefix for display
-                injection = f"[Content of {parts[2] if len(parts) >= 3 else p.name}]:\n{content}"
+                injection = format_document_content(parts[2] if len(parts) >= 3 else p.name, content)
                 body = f"{injection}\n\n{body}" if body else injection
                 inlined[i] = True
                 print(f"[{self.name}] Injected text content from: {doc_path}", flush=True)

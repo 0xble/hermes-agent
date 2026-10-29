@@ -11,6 +11,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+from agent.attachment_context import format_document_content
 import datetime as dt
 import hashlib
 import inspect
@@ -6050,7 +6051,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                             text_content = raw_bytes.decode("utf-8")
                             display_name = att.filename or f"document{ext or '.txt'}"
                             display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                            injection = f"[Content of {display_name}]:\n{text_content}"
+                            injection = format_document_content(display_name, text_content)
                             if pending_text_injection:
                                 pending_text_injection = f"{pending_text_injection}\n\n{injection}"
                             else:
