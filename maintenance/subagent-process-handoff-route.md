@@ -32,9 +32,11 @@ checkpointed route of a background process.
   supply an unambiguous chat type for the watcher's exact platform, chat and profile.
   A sibling session never supplies a missing thread. Unknown or ambiguous chats remain
   unroutable rather than being guessed. No checkpoint migration is required.
-- An unresolvable process source warns once per process per gateway lifetime. Later
-  watcher ticks and the terminal event log at DEBUG. Async-delegation diagnostic
-  sources retain their existing DEBUG-only behavior.
+- An unresolvable process source warns once per process per gateway lifetime. Failed
+  recovery work has a 30-second cooldown, invalidated by route changes, store replacement
+  or routing-generation advancement. The retry cache is capped at 512 entries. No
+  checkpoint, output or completion is discarded. Async-delegation diagnostic sources
+  retain their existing DEBUG-only behavior.
 
 ## Entry Points
 
@@ -71,7 +73,8 @@ its 12 cases fail: the completion keeps the child's session id.
 `test_process_event_source_recovery.py` loads a real legacy process checkpoint and a
 reloaded routing store, then drives its completion to gateway admission. It also
 covers exact-chat fallback, explicit-thread preservation, fail-closed unknown chats,
-and warning deduplication across watcher ticks and a fresh completion event.
+and warning deduplication across watcher ticks and a fresh completion event. Failed
+route scans are bounded while route-write and cooldown-expiry recovery remain intact.
 
 ## Retirement And Rollback
 
