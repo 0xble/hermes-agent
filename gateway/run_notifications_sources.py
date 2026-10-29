@@ -3,6 +3,7 @@
 import dataclasses
 import logging
 import threading
+import time
 from typing import Optional
 
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
@@ -13,6 +14,31 @@ logger = logging.getLogger("gateway.run")
 
 class GatewayProcessEventSourcesMixin:
     def _build_process_event_source(self, evt: dict):
+        """Bound failed recovery work without discarding a process or its completion."""
+        if not evt.get("session_id"):
+            return self._resolve_process_event_source(evt)
+        store = self.session_store
+        # A new route, store replacement or route write immediately bypasses the cooldown.
+        key = (id(store), getattr(store, "_routing_generation", 0), *(str(evt.get(field) or "") for field in (
+            "session_id", "session_key", "profile", "platform", "chat_type", "chat_id", "thread_id",
+            "scope_id", "user_id", "user_name",
+        )))
+        lock = self.__dict__.setdefault("_process_source_retry_lock", threading.Lock())
+        with lock:
+            pending = self.__dict__.setdefault("_process_source_retries", {})
+            if pending.get(key, 0) > time.monotonic():
+                return None
+        source = self._resolve_process_event_source(evt)
+        with lock:
+            if source is None:
+                pending[key] = time.monotonic() + 30.0
+                while len(pending) > 512:
+                    pending.pop(next(iter(pending)))
+            else:
+                pending.pop(key, None)
+        return source
+
+    def _resolve_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
 
         Prefer the persisted session-store origin; the active foreground event causes cross-topic bleed.

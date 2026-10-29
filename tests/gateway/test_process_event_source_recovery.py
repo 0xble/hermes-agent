@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -118,4 +118,35 @@ def test_unresolvable_source_warns_once_per_process_across_ticks_and_completion(
             "type": "completion", "profile": "default",
         }) is None
     records = [r for r in caplog.records if "Synthetic event source unresolvable" in r.message]
-    assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG, logging.DEBUG, logging.WARNING, logging.DEBUG]
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+
+
+def test_unresolved_process_route_retries_are_bounded_without_losing_recovery(runner, monkeypatch):
+    import gateway.run_notifications_sources as sources
+
+    now = [100.0]
+    monkeypatch.setattr(sources.time, "monotonic", lambda: now[0])
+    event = {"session_id": "proc_missing", "session_key": "missing", "platform": "telegram", "chat_id": "123"}
+    with patch.object(runner.session_store, "list_sessions", wraps=runner.session_store.list_sessions) as scans:
+        for _ in range(60):
+            assert runner._build_process_event_source(dict(event)) is None
+        assert scans.call_count == 1
+        # Recovery still happens without a gateway restart, and the checkpoint is untouched.
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="42")
+        runner.session_store.get_or_create_session(source)
+        recovered = runner._build_process_event_source(dict(event))
+        assert recovered is not None and recovered.thread_id is None
+        assert event["session_key"] == "missing"
+        # An unchanged unresolved route is retried when the bounded delay expires.
+        unknown = {**event, "session_id": "proc_other", "chat_id": "999"}
+        assert runner._build_process_event_source(unknown) is None
+        attempts = scans.call_count
+        now[0] += 31
+        assert runner._build_process_event_source(dict(unknown)) is None
+        assert scans.call_count == attempts + 1
+    with patch.object(runner, "_resolve_process_event_source", return_value=None):
+        for index in range(520):
+            runner._build_process_event_source({**event, "session_id": f"proc_{index}"})
+    assert len(runner._process_source_retries) == 512
+    assert event["session_id"] == "proc_missing"
