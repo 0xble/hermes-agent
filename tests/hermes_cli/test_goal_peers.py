@@ -74,7 +74,7 @@ def test_resolve_only_exact_ref_with_recorded_parent_proof(parent):
     assert not db.list_meta_prefix("loop:")
 
 
-def test_peer_resolution_retries_native_cas_without_losing_concurrent_peer(parent, monkeypatch):
+def test_peer_resolution_refuses_native_cas_conflict_without_losing_concurrent_peer(parent, monkeypatch):
     from hermes_cli import goals_evaluation
     mgr, db = parent
     register(mgr)
@@ -90,6 +90,11 @@ def test_peer_resolution_retries_native_cas_without_losing_concurrent_peer(paren
         return commit(session_id, expected, state, database, **kwargs)
 
     monkeypatch.setattr(goals_evaluation, "commit_goal_snapshot", race)
+    result = mgr.resolve_peer(PEER, "existing-work", PROOF, expected_instance=mgr.state.created_at)
+    assert result.get("error_code") == "state_changed", result
+    current = goals.load_goal("parent")
+    assert current is not None
+    assert {row["ref"] for row in current.pending_peers} == {"existing-work", "concurrent-work"}
     assert mgr.resolve_peer(PEER, "existing-work", PROOF, expected_instance=mgr.state.created_at)["ok"]
     assert [row["ref"] for row in goals.load_goal("parent").pending_peers] == ["concurrent-work"]
     assert raced
