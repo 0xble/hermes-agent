@@ -68,6 +68,13 @@ def _health_scopes(runner) -> list[tuple[str | None, Path]]:
     return [(None, get_hermes_home())]
 
 
+def _failure_key(home: Path) -> str:
+    try:
+        return str(_marker(home))
+    except Exception:
+        return f"{__file__}:{home}"
+
+
 async def check_memory_health(runner) -> None:
     from gateway.run import _async_profile_runtime_scope
 
@@ -174,12 +181,9 @@ async def install_health_notices(runner) -> None:
     try:
         from gateway.cron_store_notices import install_cron_store_notices
         install_cron_store_notices(runner, asyncio.get_running_loop())
-    except Exception:
-        logger.error("Cron store health notice setup failed", exc_info=True)
-    try:
         schedule_memory_health(runner, asyncio.get_running_loop())
     except Exception:
-        logger.error("Memory health notice setup failed", exc_info=True)
+        logger.error("Cron store health notice setup failed", exc_info=True)
 
 
 def health_notice_chores(runner, loop) -> list:
