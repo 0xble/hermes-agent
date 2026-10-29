@@ -67,11 +67,17 @@ def _is_config_document(path: Path) -> bool:
         return True
     if resolved == get_config_path().resolve():
         return True
-    if path.name != "config.yaml":
-        return False
     root = get_default_hermes_root().resolve()
-    home = path.parent.resolve()
-    return home == root or home.parent == root / "profiles"
+    profiles = (root / "profiles").resolve()
+    for candidate in (path, resolved):
+        if candidate.name != "config.yaml":
+            continue
+        home = candidate.parent
+        # An operator-owned profile directory may itself be a symlink. Keep its
+        # logical membership as well as the resolved target's identity.
+        if home.resolve() == root or home.parent.resolve() == profiles:
+            return True
+    return False
 
 
 @contextmanager
