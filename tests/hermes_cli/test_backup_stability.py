@@ -56,7 +56,7 @@ def test_atomic_output_keeps_previous_file_after_failure(tmp_path) -> None:
 def test_quick_snapshot_is_published_with_manifest(tmp_path, monkeypatch) -> None:
     home = tmp_path / ".hermes"
     home.mkdir()
-    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (home / "config.yaml").write_bytes(b"model: {}\n")
     published: list[tuple[Path, Path]] = []
 
     from hermes_cli import backup
@@ -85,7 +85,7 @@ def test_quick_snapshot_is_published_with_manifest(tmp_path, monkeypatch) -> Non
     assert manifest["files"] == {"config.yaml": 10}
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+@pytest.mark.platforms("posix")  # POSIX permission bits
 def test_quick_snapshot_tree_is_owner_only_under_permissive_umask(tmp_path) -> None:
     """Recovery snapshots must never inherit world-readable default modes.
 
@@ -139,3 +139,92 @@ def test_failed_automatic_backup_preserves_previous_archive(tmp_path, monkeypatc
     assert _write_full_zip_backup(archive, home) is None
     assert archive.read_bytes() == b"previous-valid-backup"
     assert list(tmp_path.glob(".*.partial")) == []
+
+
+#: Cap below the database so it is skipped for SIZE — a standing property of the file,
+#: not a transient failure. This is what a real install looks like: a 32 GB state.db
+#: against a 1 GiB cap, on every run, forever.
+_TINY_CAP = 1024
+
+
+def _home_with_oversized_db(tmp_path):
+    """A home whose state.db is past the snapshot size cap, as a real install's is."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (home / "state.db").write_bytes(b"x" * 4096)
+    return home
+
+
+def test_a_permanently_oversized_db_does_not_disable_pruning_forever(tmp_path) -> None:
+    """Skipping a file for SIZE must not latch the prune off.
+
+    The guard exists so an incomplete snapshot never deletes the last good one. Size is
+    not a transient failure though: the condition never clears, so a state.db past the cap
+    made the branch permanent and snapshots grew without bound. Observed on a live install
+    as 26 directories and 32 GB, every one of them also missing that database — so the
+    guard was preserving snapshots that did not contain the thing it was protecting.
+    """
+    home = _home_with_oversized_db(tmp_path)
+    root = home / "state-snapshots"
+
+    ids = [create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP) for _ in range(3)]
+    assert all(ids), "each snapshot must still publish"
+
+    remaining = sorted(d.name for d in root.iterdir() if d.is_dir())
+    assert len(remaining) == 1, f"keep=1 must actually prune, got {remaining}"
+    assert remaining == [ids[-1]]
+
+
+def test_a_snapshot_still_holding_the_oversized_db_is_never_pruned(tmp_path) -> None:
+    """Pruning may not drop the only copy of a database later runs had to skip."""
+    home = _home_with_oversized_db(tmp_path)
+    root = home / "state-snapshots"
+    # Capture a real, manifest-listed SQLite database before it exceeds the cap.
+    (home / "state.db").unlink()
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute("CREATE TABLE evidence (value TEXT)")
+        conn.execute("INSERT INTO evidence VALUES ('recovery')")
+    first = create_quick_snapshot(hermes_home=home, keep=1)
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute("INSERT INTO evidence VALUES (?)", ("x" * 4096,))
+
+    for _ in range(3):
+        create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP)
+
+    assert (root / first / "state.db").exists(), "the only copy must survive the prune"
+
+
+def test_an_oversized_non_database_is_protected_too(tmp_path) -> None:
+    """Protection is about what this run omitted, not about file type.
+
+    Gating it on ``.db`` meant an oversized auth.json got none, so the prune could drop
+    the only copy of it while happily protecting a database beside it.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (home / "auth.json").write_bytes(b"the only copy")
+    root = home / "state-snapshots"
+
+    first = create_quick_snapshot(hermes_home=home, keep=1)
+    (home / "auth.json").write_bytes(b"y" * 4096)
+
+    for _ in range(3):
+        create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP)
+
+    assert (root / first / "auth.json").exists(), "the only copy must survive the prune"
+
+
+def test_abandoned_staging_is_reclaimed(tmp_path) -> None:
+    """Only the creating process removes staging, and the prune deliberately skips
+    ``.partial``, so a killed run leaked one permanently. Observed as 22 GB abandoned."""
+    home = _home_with_oversized_db(tmp_path)
+    root = home / "state-snapshots"
+    root.mkdir(parents=True, exist_ok=True)
+    orphan = root / ".20260101-000000.99999.partial"
+    orphan.mkdir()
+    (orphan / "state.db").write_bytes(b"half copied")
+
+    assert create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP) is not None
+    assert not orphan.exists(), "abandoned staging must be reclaimed"

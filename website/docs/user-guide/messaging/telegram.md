@@ -83,6 +83,84 @@ Notes:
   profile-text indicator.
 - Off by default, since it mutates the bot's global profile.
 
+### Cold-boot pending queue (Optional)
+
+By default the adapter drops server-side pending updates on a cold boot
+(`drop_pending_updates=True` on the first `start_polling`). That fits
+always-on servers: a restart means "clean up," and the queue is treated as
+stale. It does not fit hosts that turn off (a desktop shut down overnight):
+messages sent while the gateway is offline sit in Telegram's Bot API queue,
+and the next boot discards them before Hermes ever sees them — silently, no
+log, no retry.
+
+Set `drop_pending_on_cold_boot: false` to receive that backlog in order on
+startup instead:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      drop_pending_on_cold_boot: false
+```
+
+Notes:
+
+- Default is `true`: existing behavior is unchanged unless you opt in.
+- Watcher reconnects (brief network outages with the process still alive)
+  always preserve the queue regardless of this setting.
+- Conflict recovery still drops pending updates to terminate the competing
+  `getUpdates` session — that path is unrelated to this knob.
+- After a crash, a preserved queue can redeliver an update the crashed
+  instance partially processed. Telegram's offset usually prevents this,
+  but time-sensitive commands sent during a long outage will run on boot.
+
+### Concurrent update handling
+
+Updates from different chats are processed concurrently, so one slow turn
+(a long provider retry, a large download) no longer stalls every other chat.
+Updates from the same chat still run one after another, in arrival order.
+The cross-chat pool defaults to 32; an invalid value logs a warning and uses
+the default:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      max_concurrent_updates: 32   # 1 restores fully sequential processing
+```
+
+### Repeated inbound updates
+
+Hermes suppresses repeated Telegram `update_id` values before message batching,
+command/media handling, observed group-history writes and plugin observers.
+The receiving adapter and numeric bot ID scope this check; it does not deduplicate
+by text or `message_id`. A genuine edit with a new update ID can still be processed.
+
+This is bounded, **in-memory** protection, not an exactly-once guarantee:
+
+- The adapter remembers the most recent 4096 completed admissions, with no time
+  expiry. Active updates stay claimed until dispatch and its scheduled PTB handler
+  tasks finish, including nonblocking native plugins and registered error callbacks.
+- Reconnecting the same adapter retains that history. Eviction, adapter replacement
+  or a process restart can allow an old update through again. Nothing is written
+  to a replay ledger on disk.
+- Failed or cancelled preparation releases its claim if nothing has been handed
+  off. Once an update enters a batch/hold queue, gateway dispatch, an observer or
+  a native plugin, a later error does not reopen it. Native plugins own their own
+  partial effects, so entering their update or registered error callback is
+  conservatively treated as handoff. PTB's own exception logging is not a handoff.
+  Uncached static-sticker vision analysis is also a handoff: cancelling the await
+  cannot undo an auxiliary model request already submitted. Caught preparation
+  errors before any handoff remain retryable; an intentional refusal is terminal.
+- Releasing a claim only permits a later delivery; it does not request one from
+  Telegram. Polling acknowledgement is independent of agent completion. This check
+  does not retry failed replies or prevent a downstream component from independently
+  duplicating work.
+
+For a suspected late replay, compare both occurrences' bot/profile, chat/topic,
+`update_id`, update kind, `message_id` and actual receive time. An edit can reuse
+`message_id`, and the message's sent timestamp is not its receive time.
+
 ### Command menu priority and cap (Optional)
 
 Hermes registers its command menu automatically when the Telegram gateway starts. The menu is built from the central slash-command registry plus eligible plugin/skill commands, then capped so Telegram accepts the payload reliably. The default cap is 60 commands — enough to keep all built-in commands plus common skill commands visible.
@@ -685,13 +763,13 @@ Each topic gets its own conversation session, history, and context — completel
 ### Configuration
 
 :::caution Prerequisites
-Before adding topics to your config, the user must **enable Topics mode** in the DM chat with the bot:
+Before adding topics to your config, the bot owner must **enable Threaded Mode** for the bot in **@BotFather**:
 
-1. Open your private chat with the Hermes bot in Telegram
-2. Tap the bot's name at the top to open chat info
-3. Enable **Topics** (the toggle to turn the chat into a forum)
+1. Open the BotFather **Mini App** (search `botfather` in Telegram, then tap **Open** on the search result — the classic `/mybots` text menu does not expose this setting)
+2. Go to **My bots → your bot → Bot Settings → Threads Settings**
+3. Turn on **Threaded Mode**
 
-Without this, Hermes will log `The chat is not a forum` on startup and skip topic creation. This is a Telegram client-side setting — the bot cannot enable it programmatically.
+There is no "Topics" toggle in the DM chat itself — a bot DM is not a group, so the group-forum toggle described in some older guides does not apply here. Without Threaded Mode, Hermes will log `The chat is not a forum` on startup and skip topic creation. See [Prerequisites](#prerequisites) below for the same steps with more detail.
 :::
 
 Add topics under `platforms.telegram.extra.dm_topics` in `~/.hermes/config.yaml`:
@@ -1001,7 +1079,7 @@ gateway:
 
 ## Rendering: Rich Messages, Tables and Link Previews
 
-**Rich Messages (Bot API 10.1).** Final replies that contain constructs the legacy MarkdownV2 path degrades — tables, task lists, collapsible `<details>`, and block math — are sent with Telegram's native [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) using the agent's **raw markdown**, so they render natively with no client-side flattening. In DMs, the default `rich_drafts: false` keeps the streaming preview plain — it uses Telegram's ephemeral draft transport with legacy rendering (tables and other rich-only constructs stay as raw markdown in the preview) — then persists the completed response with `sendRichMessage`. Setting `rich_drafts: true` makes the live preview use `sendRichMessageDraft` too. Edit-based streams can finalize an existing preview in place through `editMessageText`'s `rich_message` parameter. Ordinary replies (plain prose, bold/italic, simple lists) stay on the MarkdownV2 path for consistent font weight and spacing across clients.
+**Rich Messages (Bot API 10.1).** In `auto` mode, final replies that contain constructs the legacy MarkdownV2 path degrades — tables, task lists, collapsible `<details>`, and block math — are sent with Telegram's native [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) using the agent's **raw markdown**, so they render natively with no client-side flattening. In DMs, the default `rich_drafts: false` keeps the streaming preview plain — it uses Telegram's ephemeral draft transport with legacy rendering (tables and other rich-only constructs stay as raw markdown in the preview) — then persists the completed response with `sendRichMessage`. Setting `rich_drafts: true` makes the live preview use `sendRichMessageDraft` too. Edit-based streams can finalize an existing preview in place through `editMessageText`'s `rich_message` parameter. In `auto` mode, ordinary replies (plain prose, bold/italic, simple lists) stay on the MarkdownV2 path for consistent font weight and spacing across clients.
 
 The rich path is skipped automatically when content exceeds the 32,768-character rich text limit, and any rejection from Telegram (unsupported endpoint on an older `python-telegram-bot`, parser error, oversized blocks/columns) **transparently falls back** to the MarkdownV2 path — your message is never lost. Transient/network errors are *not* silently re-sent (no duplicate final message).
 
@@ -1009,6 +1087,21 @@ The rich path is skipped automatically when content exceeds the 32,768-character
 
 - **Small tables** are flattened into **row-group bullets** — each row becomes a readable bulleted list under the column headings. Good for 2–4 columns and short cells.
 - **Larger or wider tables** fall back to a **fenced code block** with aligned columns so nothing collapses.
+
+`rich_messages` accepts a single routing mode:
+
+| Value | Final response behavior |
+|---|---|
+| `always` | Prefer native rich rendering for every eligible nonblank response, including headings, emphasis, and ordinary prose. |
+| `auto` or `true` | Use rich rendering for tables, task lists, details, and block math. |
+| `never` or `false` | Use MarkdownV2, retaining basic bold, italic, links, and code formatting. |
+
+The unset default remains `never`. Quoted boolean tokens (`true`/`false`,
+`yes`/`no`, `on`/`off`, `1`/`0`) remain accepted. Unknown values produce a
+configuration error instead of silently disabling rich rendering. `always`
+retains the same capability, client-risk, size, and fallback guards as `auto`.
+Streaming previews remain independently controlled by `rich_drafts`; final
+edits and fresh final messages follow `rich_messages`.
 
 Rich messages are **opt-in**. The default stays on the legacy MarkdownV2 path because current Telegram clients can make Bot API rich messages difficult to copy as plain text, which is especially painful for command snippets and mobile handoffs. To enable native rendering for tables/task lists/details/math:
 
@@ -1019,9 +1112,14 @@ gateway:
       extra:
         rich_messages: true
         rich_drafts: false
+        allow_cjk_rich_messages: false
 ```
 
-This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message.
+
+CJK text (Chinese, Japanese, Korean, and rare Han extensions) stays on the legacy MarkdownV2 path by default because affected Telegram Desktop/macOS clients have rendered Bot API rich messages with overlapping CJK glyph artifacts. If you use an unaffected client and prefer native rich tables/task lists/details/math for CJK payloads, set `allow_cjk_rich_messages: true` alongside `rich_messages: true` to opt in to that client-side risk.
+
+If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
 
 **Link previews.** Telegram auto-generates link previews for URLs in bot messages. If you'd rather suppress those (long `/tools` output, agent reply that mentions ten links, etc.):
 
@@ -1323,7 +1421,9 @@ When the agent calls the `clarify` tool — to ask which approach you prefer, ge
 
 Tap a button to answer, or tap **Other** to type a free-form response (the next message you send becomes the answer). Open-ended `clarify` calls (no preset choices) skip the buttons and just capture your next message.
 
-Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `600` seconds). If you don't respond within the timeout, the agent unblocks with a sentinel message and adapts rather than hanging.
+Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `3600` seconds). If you don't respond within the timeout, the agent unblocks with `"outcome": "timed_out"` and adapts rather than hanging. Reply `skip` to skip a question.
+
+If Telegram cannot render the button card (the Bot API rejects it, or the send fails after its 15-second acknowledgement window), Hermes re-asks the same question as a plain numbered-list message and your typed reply (a number or the option text) is taken as the answer. When even that cannot be delivered, the agent is released at once with `[clarify prompt could not be delivered]` instead of waiting out the timeout and mistaking the silence for you not answering.
 
 ## Push notification volume
 
@@ -1367,4 +1467,4 @@ Always set `TELEGRAM_ALLOWED_USERS` to restrict who can interact with your bot. 
 
 Never share your bot token publicly. If compromised, revoke it immediately via BotFather's `/revoke` command.
 
-For more details, see the [Security documentation](/user-guide/security). You can also use [DM pairing](/user-guide/messaging#dm-pairing-alternative-to-allowlists) for a more dynamic approach to user authorization.
+For more details, see the [Security documentation](../security.md). You can also use [DM pairing](./index.md#dm-pairing-alternative-to-allowlists) for a more dynamic approach to user authorization.

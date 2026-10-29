@@ -166,7 +166,82 @@ async def test_telegram_long_flood_result_keeps_retry_after():
     assert result.retry_after == 30.0
 
 
+@pytest.mark.asyncio
+async def test_copy_block_chunk_is_plain_text_without_markdown(monkeypatch):
+    adapter = object.__new__(TelegramAdapter)
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+    monkeypatch.setattr(adapter, "_text_send_refusal", lambda: None)
 
+    await adapter._send_chunk_markdown_or_plain(
+        "*literal* _text_ `code`", {"chat_id": "123"}, plain=True)
+
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["text"] == "*literal* _text_ `code`"
+    assert kwargs["parse_mode"] is None
+
+
+@pytest.mark.asyncio
+async def test_copy_block_over_telegram_limit_is_one_document(monkeypatch):
+    adapter = object.__new__(TelegramAdapter)
+    adapter._bot = MagicMock()
+    adapter._send_path_degraded = False
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter._text_send_refusal = lambda: None
+    adapter._send_flood_cooldown_remaining = lambda _chat_id: None
+    adapter._chat_outbound_slot_remaining = lambda _chat_id: 0
+    adapter._hold_chat_outbound_slot = lambda _chat_id: None
+    adapter._telegram_error_types = lambda: (OSError, None, None)
+    adapter._should_attempt_rich = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rich path used"))
+    captured = {}
+
+    async def send_media(_send, _chat_id, _reply_to, _metadata, _media_key, *, reset_media, **kwargs):
+        captured["content"] = kwargs["document"].read()
+        captured["name"] = kwargs["filename"]
+        return SimpleNamespace(message_id="doc-1")
+
+    adapter._send_media = send_media
+    body = "🙂" * 4096
+    result = await adapter._send_text_locked("123", body, None, {"copy_block": True})
+
+    assert result.success is True
+    assert captured == {"content": body.encode("utf-8"), "name": "copy.txt"}
+
+
+@pytest.mark.asyncio
+async def test_failed_copy_document_upload_is_not_reported_delivered():
+    adapter = object.__new__(TelegramAdapter)
+    adapter._bot = MagicMock()
+    adapter._send_path_degraded = False
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter._text_send_refusal = lambda: None
+    adapter._send_flood_cooldown_remaining = lambda _chat_id: None
+    adapter._chat_outbound_slot_remaining = lambda _chat_id: 0
+    adapter._hold_chat_outbound_slot = lambda _chat_id: None
+    adapter._telegram_error_types = lambda: (OSError, None, None)
+    from gateway.config import Platform
+    adapter.platform = Platform.TELEGRAM
+    fallback_text = []
+
+    async def send_media(*_args, **_kwargs):
+        raise OSError("upload broke")
+
+    async def send(**kwargs):  # the generic warning fallback must never stand in for the body
+        fallback_text.append(kwargs)
+        return SendResult(success=True, message_id="warn")
+
+    async def emit_media_warning(chat_id, text, **_kwargs):
+        fallback_text.append(text)
+        return SendResult(success=True, message_id="warn")
+
+    adapter._send_media = send_media
+    adapter.send = send
+    adapter.emit_media_warning = emit_media_warning
+    adapter.gateway_runner = None
+    result = await adapter._send_text_locked("123", "x" * 5000, None, {"copy_block": True})
+
+    assert result.success is False
+    assert fallback_text == []
 
 @pytest.mark.asyncio
 async def test_empty_fallback_resend_preserves_reply_anchor():

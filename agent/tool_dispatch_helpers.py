@@ -16,23 +16,23 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.compression_marker import _COMPRESSION_MARKER_ARTIFACT_RE
 from agent.message_metadata import stamp_message_timestamp
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
+    tool_may_have_side_effect,
 )
+from tools.ansi_strip import strip_unicode_tags
 from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
 
 # Interactive / user-facing tools never run concurrently: any of these in a batch is a barrier.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections"})
+_NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections", "manage_catalog", "setup_beat", "set_theme"})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "connectors__execute",  # pure remote batches have per-dispatch idempotency keys
-    "ha_get_state",
-    "ha_list_entities",
-    "ha_list_services",
     "image_generate",
     "read_file",
     "search_files",
@@ -66,6 +66,38 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 )
 # Output redirects that overwrite files (> but not >>)
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
+
+def _context_pruned_argument_paths(tool_name: str, args: Any) -> list[str]:
+    """Paths whose values contain model-visible context-compression artifacts.
+
+    A minted marker is identified by its prefix plus the first rendered numeric
+    count. This catches a marker cut short before its fixed sentence while still
+    letting Hermes edit source/docs that mention the bare prefix or template.
+    Unknown/plugin/MCP tools stay effect-capable by default; known read-only
+    tools may inspect or quote compressed history.
+    """
+    if not tool_may_have_side_effect(tool_name):
+        return []
+
+    found: list[str] = []
+
+    def _walk(value: Any, path: str) -> None:
+        if isinstance(value, str):
+            if _COMPRESSION_MARKER_ARTIFACT_RE.search(value):
+                found.append(path)
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key)
+                child_path = f"{path}.{key_text}" if key_text.isidentifier() else f"{path}[{key_text!r}]"
+                _walk(child, child_path)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                _walk(child, f"{path}[{index}]")
+
+    _walk(args, "$")
+    return found
 
 
 def _is_destructive_command(cmd: str) -> bool:
@@ -103,6 +135,7 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
     try:
         from tools.tool_search import (
             CONNECTOR_BATCH_SENTINEL,
+            LOCAL_BATCH_SENTINEL,
             TOOL_CALL_NAME,
             is_connector_name,
             resolve_underlying_call,
@@ -111,6 +144,11 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
             return tool_name, function_args
         underlying, underlying_args, err = resolve_underlying_call(function_args)
         if err is not None or not underlying:
+            return tool_name, function_args
+        if underlying == LOCAL_BATCH_SENTINEL:
+            # Direct callers are handled losslessly by model_tools; the planner must
+            # keep this wrapper as a sequential barrier because it cannot split the
+            # entries into independently admitted tool calls here.
             return tool_name, function_args
         if underlying == CONNECTOR_BATCH_SENTINEL:
             # Only a PURE connector batch is parallel-safe (network-bound,
@@ -131,7 +169,7 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
         return tool_name, function_args
 
 
-def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, List[Path], bool] | None:
+def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, list[Path], bool] | None:
     """Classify one call for the planner: ``None`` = sequential barrier, else
     ``(effective_name, scoped_paths, is_writer)`` (empty paths = unscoped parallel-safe)."""
     tool_name = tool_call.function.name
@@ -161,7 +199,7 @@ def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, Lis
     return None
 
 
-def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
+def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> list[tuple]:
     """Split a tool-call batch into ordered ``("parallel"|"sequential", calls)`` segments.
 
     Call order is preserved exactly (a later call never crosses an earlier barrier), so
@@ -172,7 +210,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
     the call starts a NEW run after the conflicting one lands. Runs shorter than two calls
     demote to sequential (it owns the richer inline dispatch); adjacent sequential merge.
     """
-    segments: List[tuple] = []
+    segments: list[tuple] = []
     current: list = []
     reserved_paths: list[tuple[Path, bool]] = []  # (canonical_path, is_writer) for the current run
 
@@ -231,7 +269,7 @@ def _extract_parallel_scope_paths(
     tool_name: str,
     function_args: dict,
     execution_cwd: Optional[Path] = None,
-) -> List[Path]:
+) -> list[Path]:
     """Every canonical path this call reserves for overlap checks. *execution_cwd* is the cwd
     the tool will actually use (may differ from the process cwd on WSL / sandboxed backends);
     V4A ``patch`` scope comes from patch-body headers. Empty = unknown scope = barrier."""
@@ -292,7 +330,7 @@ def _multimodal_text_summary(value: Any) -> str:
         return str(value)
 
 
-def _append_subdir_hint_to_multimodal(value: Dict[str, Any], hint: str) -> None:
+def _append_subdir_hint_to_multimodal(value: dict[str, Any], hint: str) -> None:
     """Append a subdir hint to the envelope's first text part (and ``text_summary``) in place."""
     if not _is_multimodal_tool_result(value):
         return
@@ -314,7 +352,7 @@ _V4A_FILE_HEADER = re.compile(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$'
 _V4A_MOVE_HEADER = re.compile(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', re.MULTILINE)
 
 
-def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List[str]:
+def _extract_file_mutation_targets(tool_name: str, args: dict[str, Any]) -> list[str]:
     """File paths a ``write_file`` / ``patch`` call targets: ``args["path"]`` in replace mode,
     every ``*** Update/Add/Delete/Move File:`` header in V4A patch mode."""
     if tool_name not in _FILE_MUTATING_TOOLS:
@@ -336,9 +374,9 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
 
 def _extract_landed_file_mutation_paths(
     tool_name: str,
-    args: Dict[str, Any],
+    args: dict[str, Any],
     result: Any,
-) -> List[str]:
+) -> list[str]:
     """Concrete file paths a successful mutation reports (``files_modified`` /
     ``resolved_path`` in the JSON result), falling back to the declared targets."""
     targets = _extract_file_mutation_targets(tool_name, args)
@@ -374,7 +412,7 @@ def _extract_error_preview(result: Any, max_len: int = 180) -> str:
     return text
 
 
-def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
+def _trajectory_normalize_msg(msg: dict[str, Any]) -> dict[str, Any]:
     """Shallow copy for trajectory saving: multimodal results become their text summary,
     image parts become ``[screenshot]``."""
     if not isinstance(msg, dict):
@@ -407,12 +445,18 @@ def make_tool_result_message(
     """Build a tool-result message: OpenAI ``name`` (wire format) plus internal ``tool_name``
     (session DB). High-risk tool content (web_extract, web_search, browser_*, mcp_*) is
     wrapped in untrusted-data delimiters — the defense against indirect prompt injection.
+    Invisible Unicode TAG characters are stripped from that same set plus skill_view
+    before wrapping. Clean text is returned unchanged.
     """
     # Replay-recovery callers bypass the executor's canonical-id helper, so normalize here too.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
+    # Strip before the elision notice and untrusted wrap so the model never sees the
+    # smuggled characters, including inside the wrapped block. Risk metadata still scans
+    # the pre-strip content.
+    shown = _maybe_strip_unicode_tags(name, content)
     # Elision notice is appended to the RAW content first, THEN wrapped, so it sits inside
     # the untrusted block next to the data it describes — once, at construction (cache-safe).
-    wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, content))
+    wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, shown))
     message = stamp_message_timestamp({
         "role": "tool",
         "name": name,
@@ -443,6 +487,37 @@ _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 
 def _is_untrusted_tool(name: Optional[str]) -> bool:
     return bool(name) and (name in _UNTRUSTED_TOOL_NAMES or name.startswith(_UNTRUSTED_TOOL_PREFIXES))
+
+
+def _should_strip_unicode_tags(name: Optional[str]) -> bool:
+    """Model-facing results that can carry fetched or loaded third-party text.
+
+    Untrusted tools cover web, browser, and MCP output. skill_view is stripped
+    here too, but is not added to the untrusted-wrapping set. read_file is
+    excluded: its display must match disk bytes so patch and write_file can
+    target what the model saw.
+    """
+    return _is_untrusted_tool(name) or name == "skill_view"
+
+
+def _maybe_strip_unicode_tags(name: Optional[str], content: Any) -> Any:
+    """Strip invisible TAG characters from covered tool text.
+
+    Strings and text parts of a multimodal list are passed through
+    ``strip_unicode_tags``. Valid emoji tag sequences survive. When no tag
+    characters are present the original string object is returned, so clean
+    output stays byte-identical. Other tools and non-text parts are untouched.
+    """
+    if not _should_strip_unicode_tags(name):
+        return content
+    if isinstance(content, str):
+        return strip_unicode_tags(content)
+    if isinstance(content, list):
+        return [
+            {**item, "text": strip_unicode_tags(item["text"])} if _is_text_item(item) else item
+            for item in content
+        ]
+    return content
 
 
 def _is_text_item(item: Any) -> bool:
@@ -478,13 +553,22 @@ def _detect_upstream_elision(content: Any) -> bool:
 
 
 def _maybe_append_elision_notice(name: str, content: Any) -> Any:
-    """Append the incompleteness notice to untrusted string results with elision markers."""
-    if _is_untrusted_tool(name) and _detect_upstream_elision(content):
+    """Append the incompleteness notice to untrusted results with elision markers. A multimodal part list (an MCP
+    result that also carries images) is judged by its first text part, which is where the notice goes."""
+    if not _is_untrusted_tool(name):
+        return content
+    if isinstance(content, list):
+        idx = next((i for i, item in enumerate(content) if _is_text_item(item)), None)
+        if idx is not None and _detect_upstream_elision(content[idx]["text"]):
+            return [*content[:idx], {**content[idx], "text": content[idx]["text"] + _UPSTREAM_ELISION_NOTICE},
+                    *content[idx + 1:]]
+        return content
+    if _detect_upstream_elision(content):
         return content + _UPSTREAM_ELISION_NOTICE
     return content
 
 
-def _tool_output_risk_metadata(name: str, content: Any) -> Optional[Dict[str, Any]]:
+def _tool_output_risk_metadata(name: str, content: Any) -> Optional[dict[str, Any]]:
     """Internal-only advisory classification of attacker-controlled output: deterministic
     finding ids, never blocks or redacts, omits the scanned text."""
     if not _is_untrusted_tool(name):
@@ -498,7 +582,7 @@ def _tool_output_risk_metadata(name: str, content: Any) -> Optional[Dict[str, An
     if not text_parts:
         return None
 
-    findings: List[str] = []
+    findings: list[str] = []
     for text in text_parts:
         for finding in scan_for_threats(text, scope="context"):
             if finding not in findings:
@@ -542,12 +626,29 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
 
 
 __all__ = [
-    "_NEVER_PARALLEL_TOOLS", "_PARALLEL_SAFE_TOOLS", "_PATH_SCOPED_TOOLS", "_PATH_SCOPED_READERS",
-    "_PATH_SCOPED_WRITERS", "_DESTRUCTIVE_PATTERNS", "_REDIRECT_OVERWRITE", "_is_destructive_command",
-    "_plan_tool_batch_segments", "_should_parallelize_tool_batch", "_canonical_path",
-    "_extract_parallel_scope_path", "_extract_parallel_scope_paths", "_paths_overlap",
-    "_is_multimodal_tool_result", "_multimodal_text_summary", "_append_subdir_hint_to_multimodal",
-    "_extract_file_mutation_targets", "_extract_landed_file_mutation_paths", "_extract_error_preview",
-    "_trajectory_normalize_msg", "_detect_upstream_elision", "_maybe_append_elision_notice",
+    "_DESTRUCTIVE_PATTERNS",
+    "_NEVER_PARALLEL_TOOLS",
+    "_PARALLEL_SAFE_TOOLS",
+    "_PATH_SCOPED_READERS",
+    "_PATH_SCOPED_TOOLS",
+    "_PATH_SCOPED_WRITERS",
+    "_REDIRECT_OVERWRITE",
+    "_append_subdir_hint_to_multimodal",
+    "_canonical_path",
+    "_context_pruned_argument_paths",
+    "_detect_upstream_elision",
+    "_extract_error_preview",
+    "_extract_file_mutation_targets",
+    "_extract_landed_file_mutation_paths",
+    "_extract_parallel_scope_path",
+    "_extract_parallel_scope_paths",
+    "_is_destructive_command",
+    "_is_multimodal_tool_result",
+    "_maybe_append_elision_notice",
+    "_multimodal_text_summary",
+    "_paths_overlap",
+    "_plan_tool_batch_segments",
+    "_should_parallelize_tool_batch",
+    "_trajectory_normalize_msg",
     "make_tool_result_message",
 ]

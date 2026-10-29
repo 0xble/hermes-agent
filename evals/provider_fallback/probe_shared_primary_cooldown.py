@@ -12,9 +12,10 @@ path, ``AIAgent.run_conversation``. Roles exercise all three request wrappers: s
 (``first``, ``session``, ``restart``, ``recovery``), non-streaming (``subagent``) and
 ``direct_api_call`` (``cron``, platform=cron).
 
-A pass prints two lines:
+A pass prints three lines:
     PROBE_OK: one primary outage call, one outage notice, restart-safe fallback, one recovery notice
     PROBE_OK: no-reset shared backoff 60s -> 120s -> 240s; cooling sessions never wait on the primary
+    PROBE_OK: overload (529) arms the shared cooldown: one primary call, one outage notice, restart-safe, one recovery notice
 
 Phase 1 also proves that fallback replies never clear the outage: the shared record must
 still exist with its 2h reset after every outage-phase turn, and no recovery notice may
@@ -46,8 +47,12 @@ HERMES_HOME.mkdir()
 RECORD_PATH = HERMES_HOME / "state" / "model_cooldowns.json"
 PRIMARY_MODEL = "primary-model"
 
-state = {"primary_available": False, "send_reset": True, "requests": []}
+state = {"primary_available": False, "send_reset": True, "failure_status": 429, "requests": []}
 lock = threading.Lock()
+FAILURE_BODIES = {
+    429: {"error": {"message": "rate_limit_error: retry later", "type": "rate_limit_error"}},
+    529: {"error": {"message": "Overloaded", "type": "overloaded_error"}},
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -65,11 +70,12 @@ class Handler(BaseHTTPRequestHandler):
         model = body.get("model")
         stream = bool(body.get("stream"))
         ok = model != PRIMARY_MODEL or state["primary_available"]
+        status = 200 if ok else state["failure_status"]
         with lock:
-            state["requests"].append({"model": model, "status": 200 if ok else 429, "stream": stream})
+            state["requests"].append({"model": model, "status": status, "stream": stream})
         if not ok:
-            payload = json.dumps({"error": {"message": "rate_limit_error: retry later", "type": "rate_limit_error"}}).encode()
-            self.send_response(429)
+            payload = json.dumps(FAILURE_BODIES[status]).encode()
+            self.send_response(status)
             if state["send_reset"]:
                 self.send_header("Retry-After", "7200")
             self.send_header("Content-Type", "application/json")
@@ -233,6 +239,39 @@ try:
     assert len(phase2_outage) == 1, phase2_outage
     assert notices_matching(phase2, "restored") == []
     print("PROBE_OK: no-reset shared backoff 60s -> 120s -> 240s; cooling sessions never wait on the primary")
+
+    # Phase 3 (overload): a 529 with no reset arms the same shared record. The arming turn
+    # (non-streaming, so exactly one request) is the only primary call; fresh streaming, cron and
+    # restarted processes adopt the fallback; one "is overloaded until" notice; one recovery.
+    RECORD_PATH.unlink(missing_ok=True)
+    state["failure_status"] = 529
+    state["send_reset"] = False
+    phase3 = []
+    armed = run_child("subagent")
+    assert armed["primary_calls"] == 1 and armed["final_response"] == "OK from fallback-model", armed
+    entry = read_record()
+    assert entry["reason"] == "overloaded", entry
+    assert round(entry["reset_at"] - entry["recorded_at"]) == 60, entry
+    phase3.append(armed)
+    for role in ("session", "cron", "restart"):
+        cooled = run_child(role)
+        assert cooled["primary_calls"] == 0, cooled
+        assert cooled["final_response"] == "OK from fallback-model", cooled
+        assert RECORD_PATH.exists(), f"{role}: fallback reply cleared the overload record"
+        phase3.append(cooled)
+    expire_record()
+    state["primary_available"] = True
+    overload_recovery = run_child("recovery")
+    overload_notices = notices_matching(phase3, "is overloaded until")
+    print(json.dumps({"overload_primary_calls": [r["primary_calls"] for r in phase3],
+                      "overload_notice_count": len(overload_notices)}))
+    assert len(overload_notices) == 1, overload_notices
+    assert notices_matching(phase3, "Model fallback:") == []
+    assert notices_matching(phase3, "restored") == []
+    assert overload_recovery["final_response"] == "OK from primary-model", overload_recovery
+    assert len(notices_matching([overload_recovery], "restored")) == 1, overload_recovery
+    assert not RECORD_PATH.exists(), "primary success must clear the overload record"
+    print("PROBE_OK: overload (529) arms the shared cooldown: one primary call, one outage notice, restart-safe, one recovery notice")
 finally:
     server.shutdown()
     server.server_close()

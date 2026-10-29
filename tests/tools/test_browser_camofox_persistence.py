@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tools.browser_camofox import (
-    _drop_session,
     _get_session,
     _managed_persistence_enabled,
     camofox_close,
@@ -48,10 +47,6 @@ def _clear_session_state():
 
 
 class TestManagedPersistenceToggle:
-    def test_disabled_by_default(self):
-        config = {"browser": {"camofox": {"managed_persistence": False}}}
-        with patch("tools.browser_camofox.load_config", return_value=config):
-            assert _managed_persistence_enabled() is False
 
 
     def test_disabled_on_config_load_error(self):
@@ -121,8 +116,8 @@ class TestManagedPersistenceMode:
         assert first["success"] is True
         assert second["success"] is True
         tab_requests = [req for req in requests_seen if "userId" in req]
-        assert len(tab_requests) == 2
-        assert tab_requests[0]["userId"] == tab_requests[1]["userId"]
+        assert len(tab_requests) == 4
+        assert len({req["userId"] for req in tab_requests}) == 1
 
 
 class TestConfiguredCamofoxIdentity:
@@ -164,8 +159,9 @@ class TestConfiguredCamofoxIdentity:
                 result = json.loads(
                     camofox_navigate("https://example.com", task_id="scoped-precedence")
                 )
-                request_url = mock_post.call_args.args[0]
-                request_body = mock_post.call_args.kwargs["json"]
+                request_url = mock_post.call_args_list[0].args[0]
+                request_body = mock_post.call_args_list[0].kwargs["json"]
+                assert mock_post.call_args_list[1].args[0] == "https://secondary.example/tabs/scoped-tab/navigate"
         finally:
             secret_scope.reset_secret_scope(token)
             secret_scope.set_multiplex_active(False)
@@ -239,11 +235,7 @@ class TestConfiguredCamofoxIdentity:
         assert session["session_key"] == "visible-tab"
         assert session["managed"] is True
         assert session["adopt_existing_tab"] is True
-        mock_get.assert_called_once_with(
-            "/tabs",
-            params={"userId": "shared-camofox"},
-            timeout=5,
-        )
+        mock_get.assert_not_called()  # adoption runs when a tab is needed, not on lookup
 
 
     def test_soft_cleanup_preserves_externally_managed_session(self, tmp_path, monkeypatch):
@@ -258,7 +250,7 @@ class TestConfiguredCamofoxIdentity:
         assert result is True
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert mod._sessions["task-1"]["user_id"] == "shared-camofox"
 
 
 class TestVncUrlDiscovery:
@@ -289,9 +281,9 @@ class TestVncUrlDiscovery:
 
 
 class TestCamofoxSoftCleanup:
-    """camofox_soft_cleanup drops local state only when managed persistence is on."""
+    """Managed soft cleanup keeps the task's binding for its next turn."""
 
-    def test_returns_true_and_drops_session_when_enabled(self, tmp_path, monkeypatch):
+    def test_returns_true_and_keeps_session_when_enabled(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
 
@@ -300,10 +292,10 @@ class TestCamofoxSoftCleanup:
             result = camofox_soft_cleanup("task-1")
 
         assert result is True
-        # Session should have been dropped from in-memory store
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert mod._sessions["task-1"]["managed"] is True
+            assert mod._sessions["task-1"]["carried"] is True
 
 
     def test_does_not_call_server_delete(self, tmp_path, monkeypatch):

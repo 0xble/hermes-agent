@@ -5,12 +5,15 @@ can enter a wedged state where ``bot.send_message()`` returns a valid Message
 but nothing reaches the recipient.  ``_send_path_degraded`` short-circuits
 ``send()`` so cron's live-adapter branch falls through to standalone HTTP.
 """
+import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from plugins.platforms.telegram import adapter as tg_adapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 def _make_adapter() -> TelegramAdapter:
@@ -61,19 +64,61 @@ async def test_send_long_flood_fails_closed_without_inline_sleep(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_send_short_flood_still_retries_inline(monkeypatch):
-    """Waits of a few seconds keep the existing inline retry."""
+    """A short RetryAfter is retried only after its deadline has elapsed."""
     adapter = _make_adapter()
     adapter._rich_send_disabled = True
     ok = MagicMock(message_id=7)
-    adapter._bot.send_message = AsyncMock(side_effect=[_FloodError(2.0), ok])
-    sleep = AsyncMock()
+    adapter._bot.send_message = AsyncMock(side_effect=[_FloodError(0.02), ok])
+    real_sleep = asyncio.sleep
+    sleep = AsyncMock(side_effect=real_sleep)
     monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
 
     result = await adapter.send("123", "hello")
 
     assert result.success is True
     assert result.message_id == "7"
-    sleep.assert_awaited_once_with(2.0)
+    sleep.assert_awaited_once_with(0.02)
+
+
+@pytest.mark.asyncio
+async def test_send_times_out_instead_of_hanging(monkeypatch):
+    """A shielded/hung send_message must fail on the wall-clock deadline, not pin getUpdates."""
+    adapter = _make_adapter()
+    adapter._rich_send_disabled = True
+
+    async def _hang(**_kwargs):
+        await asyncio.sleep(1000)
+
+    adapter._bot.send_message = _hang
+    monkeypatch.setattr(tg_adapter, "_TEXT_SEND_DEADLINE", 0.05)
+
+    t0 = time.monotonic()
+    result = await adapter.send("123", "hello")
+    elapsed = time.monotonic() - t0
+
+    assert result.success is False
+    assert "timed out" in (result.error or "").lower()
+    assert elapsed < 5.0
+
+
+@pytest.mark.asyncio
+async def test_media_send_times_out_instead_of_hanging(monkeypatch):
+    """A hung send_photo under ``_send_media`` fails on the media deadline; the error is surfaced,
+    not swallowed, and the per-chat send lock is released so later text is not pinned behind it."""
+    adapter = _make_adapter()
+
+    async def _hang(**_kwargs):
+        await asyncio.sleep(1000)
+
+    monkeypatch.setattr(tg_adapter, "_MEDIA_SEND_DEADLINE", 0.05)
+
+    t0 = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError, match="timed out"):
+        await adapter._send_media(_hang, "123", None, None, "photo", photo=b"png")
+    assert time.monotonic() - t0 < 5.0
+
+    result = await adapter.send("123", "after the photo")
+    assert result.success is True
 
 
 def test_mark_connected_publishes_connected_when_healthy():

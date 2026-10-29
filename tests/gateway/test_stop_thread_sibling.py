@@ -43,7 +43,9 @@ def _per_user_key(uid, thread_id="thr1", chat_id="chan1"):
 
 
 def test_sibling_returns_empty_for_non_thread_source():
-    # Non-thread group/channel must NOT trigger the cross-user fallback.
+    # The sibling TIER is thread-scoped: a non-thread group/channel source has no thread slot to
+    # match. The room-wide fallback for that shape is the chat tier's job — see
+    # tests/gateway/test_stop_chat_scope.py::test_stop_reaches_peer_run_in_per_sender_group.
     runner = object.__new__(GatewayRunner)
     nonthread = SessionSource(
         platform=Platform.DISCORD, chat_type="group", chat_id="chan1", user_id="userA"
@@ -54,12 +56,15 @@ def test_sibling_returns_empty_for_non_thread_source():
         )
     )
     runner._running_agents = {grp_b: _FakeAgent()}
-    assert runner._sibling_thread_run_keys(nonthread, "agent:main:discord:group:chan1:userA") == []
+    own_key = "agent:main:discord:group:chan1:userA"
+    assert runner._sibling_thread_run_keys(
+        nonthread, runner._same_chat_runs(nonthread, own_key)
+    ) == []
 
 
 def test_sibling_matches_named_profile_runs():
-    # Under multiplexing the sibling prefix must follow the source's profile namespace,
-    # so /stop finds another participant's run under the SAME named profile...
+    # A named-profile stop must match another participant's run under the SAME profile, taken from
+    # the caller's own key (the session store's answer)...
     runner = object.__new__(GatewayRunner)
     source = _thread_source("userA")
     source.profile = "work"
@@ -67,9 +72,8 @@ def test_sibling_matches_named_profile_runs():
         _thread_source("userB"), thread_sessions_per_user=True, profile="work"
     )
     runner._running_agents = {key_b: _FakeAgent()}
-    assert runner._sibling_thread_run_keys(
-        source, "agent:work:discord:forum:chan1:thr1:userA"
-    ) == [key_b]
+    own_key = "agent:work:discord:forum:chan1:thr1:userA"
+    assert runner._sibling_thread_run_keys(source, runner._same_chat_runs(source, own_key)) == [key_b]
 
 
 def test_sibling_does_not_cross_profiles():
@@ -79,12 +83,8 @@ def test_sibling_does_not_cross_profiles():
     source.profile = "work"
     main_key = build_session_key(_thread_source("userB"), thread_sessions_per_user=True)
     runner._running_agents = {main_key: _FakeAgent()}
-    assert (
-        runner._sibling_thread_run_keys(
-            source, "agent:work:discord:forum:chan1:thr1:userA"
-        )
-        == []
-    )
+    own_key = "agent:work:discord:forum:chan1:thr1:userA"
+    assert runner._sibling_thread_run_keys(source, runner._same_chat_runs(source, own_key)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -93,8 +93,9 @@ def test_sibling_does_not_cross_profiles():
 
 
 class _StoreEntry:
-    def __init__(self, session_key):
+    def __init__(self, session_key, origin=None):
         self.session_key = session_key
+        self.origin = origin
 
 
 class _FakeStore:
@@ -103,6 +104,15 @@ class _FakeStore:
 
     def get_or_create_session(self, source):
         return _StoreEntry(self._key)
+
+
+class _OriginStore(_FakeStore):
+    def __init__(self, session_key, entries):
+        super().__init__(session_key)
+        self._entries = entries
+
+    def lookup_by_session_key(self, session_key):
+        return self._entries.get(session_key)
 
 
 @pytest.mark.asyncio
@@ -128,6 +138,33 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
 
     assert interrupted == []
     assert "no active" in str(getattr(result, "text", result)).lower()
+
+
+@pytest.mark.asyncio
+async def test_stop_pauses_sibling_goal_through_its_own_source():
+    caller = _thread_source("userA")
+    sibling = _thread_source("userB")
+    key_a = _per_user_key("userA")
+    key_b = _per_user_key("userB")
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {key_b: _FakeAgent()}
+    runner.session_store = _OriginStore(
+        key_a, {key_b: _StoreEntry(key_b, origin=sibling)}
+    )
+    runner._is_user_authorized_for_source = lambda source, **kw: True
+    runner.adapters = {}
+    interrupted = []
+
+    async def _fake_interrupt(session_key, source, *, interrupt_reason, invalidation_reason):
+        interrupted.append((session_key, source.user_id))
+
+    runner._interrupt_and_clear_session = _fake_interrupt
+    result = await runner._handle_stop_command(
+        MessageEvent(text="/stop", message_type=MessageType.TEXT, source=caller)
+    )
+
+    assert interrupted == [(key_b, "userB")]
+    assert "Stopped" in str(getattr(result, "text", result))
 
 
 # ---------------------------------------------------------------------------

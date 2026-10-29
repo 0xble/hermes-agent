@@ -39,7 +39,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 MAX = DiscordAdapter.MAX_MESSAGE_LENGTH
@@ -67,13 +67,29 @@ class TestCapSplitChunks:
         capped = adapter._cap_split_chunks(chunks)
         assert len(capped) == CAP
         assert capped[0] == chunks[0]
-        assert "Response truncated" in capped[-1]
-        assert "delivery limit" in capped[-1]
+        assert capped[-1] not in chunks  # last slot is the truncation notice
         # The notice itself must stay under Discord's per-message cap.
         assert len(capped[-1]) <= MAX
 
 
 class TestSendCap:
+    @pytest.mark.asyncio
+    async def test_send_at_cap_preserves_complete_response(self, monkeypatch, tmp_path):
+        """Telegram-only overhead must not turn an eight-message answer into a truncated ninth."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        content = "x" * 15_850
+        channel = SimpleNamespace(id=555, send=AsyncMock(return_value=SimpleNamespace(id=9000)))
+        adapter._client = SimpleNamespace(get_channel=lambda _cid: channel, fetch_channel=AsyncMock())
+
+        result = await adapter.send("555", content)
+
+        assert result.success is True
+        posts = [call.kwargs["content"] for call in channel.send.call_args_list]
+        assert len(posts) == CAP
+        assert all(len(post) <= MAX for post in posts)
+        assert "".join(post.removesuffix(f" ({i}/{CAP})") for i, post in enumerate(posts, 1)) == content
+
     @pytest.mark.asyncio
     async def test_send_caps_split_flood(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

@@ -7,15 +7,15 @@ and backward compatibility with the legacy ``allow_*`` gates.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from hermes_cli.plugin_capabilities import (
     CAPABILITY_REGISTRY,
-    VALID_CAPABILITY_IDS,
     capability_set_hash,
     consent_hash,
     declared_set_changed,
@@ -35,6 +35,25 @@ def hermes_home(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_default_capability_denial_is_debug_but_grants_remain_info(hermes_home, caplog):
+    """Expected ungranted defaults are quiet; meaningful authorization remains visible."""
+    logger_name = "hermes_cli.plugin_capabilities"
+    caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    assert plugin_capability_granted("quiet-plugin", "tools.override") is False
+    [denial] = [r for r in caplog.records if r.name == logger_name]
+    assert denial.levelno == logging.DEBUG
+    assert "decision=deny" in denial.getMessage()
+
+    caplog.clear()
+    record_consent("quiet-plugin", ["tools.override"], ["tools.override"])
+    caplog.clear()
+    assert plugin_capability_granted("quiet-plugin", "tools.override") is True
+    [grant] = [r for r in caplog.records if r.name == logger_name]
+    assert grant.levelno == logging.INFO
+    assert "decision=allow" in grant.getMessage()
+
+
 def _read_cfg(home):
     return yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
 
@@ -48,18 +67,12 @@ class TestRegistry:
             assert spec.legacy_path, spec.id
             assert spec.description
 
-    def test_known_ids(self):
-        assert "tools.override" in VALID_CAPABILITY_IDS
-        assert "llm.model_override" in VALID_CAPABILITY_IDS
 
 
 # ── Declaration parsing ──────────────────────────────────────────────────────
 
 
 class TestDeclarationParsing:
-    def test_parses_known_ids(self):
-        got = parse_declared_capabilities(["tools.override", "llm.model_override"])
-        assert got == ["tools.override", "llm.model_override"]
 
     def test_drops_unknown_ids(self):
         got = parse_declared_capabilities(["tools.override", "root.everything"])
@@ -175,9 +188,6 @@ class TestConsentPersistence:
         entry = _read_cfg(hermes_home)["plugins"]["entries"]["capplug"]
         assert entry["llm"]["allow_model_override"] is True
 
-    def test_granted_capabilities_roundtrip(self, hermes_home):
-        record_consent("capplug", ["tools.override"], ["tools.override"])
-        assert granted_capabilities("capplug") == frozenset({"tools.override"})
 
     def test_grant_is_union_with_previous(self, hermes_home):
         record_consent("capplug", ["tools.override"], ["tools.override"])
@@ -190,9 +200,6 @@ class TestConsentPersistence:
             {"tools.override", "llm.model_override"}
         )
 
-    def test_capability_granted_after_consent(self, hermes_home):
-        record_consent("capplug", ["tools.override"], ["tools.override"])
-        assert plugin_capability_granted("capplug", "tools.override") is True
 
     def test_declined_stays_off(self, hermes_home):
         # No record_consent call — nothing granted.

@@ -1,6 +1,6 @@
 """Goal visibility must not stop TUI evaluation or continuation."""
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -29,3 +29,31 @@ def test_tui_goal_notice_policy_preserves_continuation(monkeypatch, enabled):
     manager.evaluate_after_turn.assert_called_once()
     assert prompt == "Continue work"
     assert emitted == ([("status.update", "view", {"kind": "goal", "text": "Goal judged"})] if enabled else [])
+
+@pytest.mark.parametrize("notices", [False, True])
+def test_tui_human_revival_keeps_snapshot_and_progress(monkeypatch, notices):
+    from hermes_cli import goals
+    from hermes_constants import get_hermes_home
+    from tui_gateway import server
+    get_hermes_home().joinpath("config.yaml").write_text(
+        f"goals:\n  notices: {str(notices).lower()}\n")
+    manager = goals.GoalManager("quiet-tui-revival")
+    manager.set("finish the bounded work")
+    with patch("hermes_cli.goals.judge_goal", return_value=(
+        "blocked", "the irreversible constraint needs a human decision", False, None, False)):
+        manager.evaluate_after_turn("Waiting for a decision")
+    assert manager.state.status == "paused"
+    spent = manager.state.turns_used
+    with patch("tui_gateway.server._emit") as emit, patch(
+            "tui_gateway.server._publish_session_control_snapshot") as snapshot:
+        session = {"session_key": manager.session_id}
+        server._revive_blocked_goal_for_user_turn("room", session, True)
+        server._revive_blocked_goal_for_user_turn("room", session, True)
+    snapshot.assert_called_once_with("room", session, only_if_present=True)
+    manager = goals.GoalManager(manager.session_id)
+    assert emit.call_count == int(notices)
+    assert manager.is_active()
+    assert manager.state.turns_used == spent
+    assert goals.GoalManager(manager.session_id).is_active()
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "work remains", False, None, False)):
+        assert manager.evaluate_after_turn("Decision received")["should_continue"]

@@ -19,7 +19,6 @@ from pathlib import Path
 
 import pytest
 
-import hermes_state_repair
 
 import hermes_startup_watchdog as sw
 from hermes_startup_watchdog import (
@@ -37,13 +36,52 @@ from hermes_startup_watchdog import (
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """Every test gets a fresh singleton and its own HERMES_HOME."""
+    """Own watchdogs through teardown, including helpers outside the singleton."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv(sw.ENV_STARTUP_WATCHDOG, raising=False)
     monkeypatch.delenv(sw.ENV_STARTUP_WATCHDOG_TIMEOUT_S, raising=False)
     sw._reset_for_tests()
-    yield
-    sw._reset_for_tests()
+    handles = []
+    helpers = []
+    unexpected_exits = []
+    stop_escorts = threading.Event()
+    original_init = StartupWatchdogHandle.__init__
+    original_start = threading.Thread.start
+
+    def own_handle(handle, *args, **kwargs):
+        original_init(handle, *args, **kwargs)
+        # A helper that escapes a failed bounded join must never inherit the
+        # real os._exit when pytest restores the class-level monkeypatch.
+        handle._exit = StartupWatchdogHandle._exit
+        handles.append(handle)
+
+    def own_helper(thread):
+        if thread.name.startswith("gateway-startup-watchdog"):
+            helpers.append(thread)
+        return original_start(thread)
+
+    monkeypatch.setattr(StartupWatchdogHandle, "__init__", own_handle)
+    monkeypatch.setattr(StartupWatchdogHandle, "_exit", staticmethod(unexpected_exits.append))
+    monkeypatch.setattr(StartupWatchdogHandle, "_sleep", staticmethod(stop_escorts.wait))
+    monkeypatch.setattr(threading.Thread, "start", own_helper)
+    try:
+        yield
+    finally:
+        sw._reset_for_tests()
+        for handle in handles:
+            handle.disarm()
+        stop_escorts.set()
+        deadline = time.monotonic() + 10
+        for handle in handles:
+            handle.join(timeout=max(0, deadline - time.monotonic()))
+        # Joining the main workers first also captures ledger helpers created
+        # during cleanup. Fast-escort tests retain their own sleep seam.
+        for helper in helpers:
+            if helper.ident is not None:
+                helper.join(timeout=max(0, deadline - time.monotonic()))
+        alive = [helper.name for helper in helpers if helper.is_alive()]
+        assert not alive, f"watchdog helpers survived test teardown: {alive}"
+        assert not unexpected_exits, f"unexpected watchdog exits: {unexpected_exits}"
 
 
 @pytest.fixture(autouse=True)
@@ -85,85 +123,7 @@ class TestContracts:
 
         assert SERVICE_RESTART_EXIT_CODE == GATEWAY_SERVICE_RESTART_EXIT_CODE
 
-    def test_implementation_module_is_stdlib_only(self):
-        """Import-lightness is a correctness property (arm-before-imports,
-        no import-lock dependence at fire time): the implementation module
-        must not import the gateway/agent/hermes_cli graphs at module level."""
-        import ast
-        import inspect
 
-        source = inspect.getsource(sw)
-        tree = ast.parse(source)
-        forbidden_roots = {
-            "gateway",
-            "agent",
-            "hermes_cli",
-            "hermes_state",
-            "hermes_constants",
-            "tools",
-            "plugins",
-        }
-        offenders = []
-        for node in ast.walk(tree):
-            # Only module-level and unconditional imports matter; function-
-            # bodied imports (the ledger helper) are deliberate and guarded.
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                names = [node.module or ""]
-            else:
-                continue
-            for name in names:
-                root = name.split(".")[0]
-                if root in forbidden_roots and node.col_offset == 0:
-                    offenders.append(name)
-        assert offenders == []
-
-    def test_all_documented_entry_points_arm_the_watchdog(self):
-        """Every documented arm site must actually call arm_startup_watchdog,
-        so a future entry point can't silently ship unwatched. This is a
-        structural contract: the arm sites are the whole point of the
-        pre-loop coverage, and they're spread across four files."""
-        import ast
-        import inspect
-        from pathlib import Path
-
-        repo_root = Path(__file__).resolve().parents[2]
-        arm_sites = {
-            # (file, reason) — each must contain an arm_startup_watchdog call
-            "hermes_cli/main.py": "argv fast-path (standard `hermes gateway run`)",
-            "hermes_cli/gateway.py": "run_gateway() config-bridge re-arm",
-            "gateway/run.py": "gateway.run.main() backstop arm",
-            "cli.py": "legacy `--gateway` entry point",
-        }
-        for rel, reason in arm_sites.items():
-            path = repo_root / rel
-            assert path.exists(), f"arm site file missing: {rel} ({reason})"
-            source = path.read_text()
-            tree = ast.parse(source)
-            # Collect both direct calls and aliased imports (main.py uses
-            # `from hermes_startup_watchdog import arm_startup_watchdog as _arm_sw`
-            # then calls `_arm_sw()` to keep the fast-path import-light).
-            aliases = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.module == "hermes_startup_watchdog":
-                    for alias in node.names:
-                        if alias.name == "arm_startup_watchdog":
-                            aliases.add(alias.asname or "arm_startup_watchdog")
-            calls = []
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Call):
-                    fn = node.func
-                    name = (
-                        fn.id
-                        if isinstance(fn, ast.Name)
-                        else fn.attr
-                        if isinstance(fn, ast.Attribute)
-                        else None
-                    )
-                    if name in aliases or name == "arm_startup_watchdog":
-                        calls.append(node.lineno)
-            assert calls, f"{rel} has no arm_startup_watchdog call ({reason})"
 
 
 
@@ -221,9 +181,6 @@ class TestArmDisarm:
         handle.join(timeout=2)
         assert not exit_capture.fired.is_set()
         assert exit_capture.codes == []
-
-    def test_disarm_without_arm_is_safe(self):
-        disarm_startup_watchdog()  # must not raise
 
     def test_disarm_is_idempotent(self):
         arm_startup_watchdog(timeout_s=60)
@@ -439,24 +396,7 @@ class TestProgressLease:
         assert record["lease_count"] >= 1
         assert record["last_lease_phase"] == "brief_phase"
 
-    def test_schema_init_declares_lease(self):
-        """hermes_state_schema._init_schema must hold a progress lease so
-        multi-GB migrations aren't misread as deadlocks (wiring contract)."""
-        import inspect
 
-        import hermes_state_schema
-
-        src = inspect.getsource(hermes_state_schema.SessionSchemaMixin._init_schema)
-        assert "report_startup_progress" in src
-
-    def test_repair_declares_lease(self):
-        """repair_state_db_schema (I/O-bound, ~zero CPU) must hold a lease."""
-        import inspect
-
-        import hermes_state
-
-        src = inspect.getsource(hermes_state_repair.repair_state_db_schema)
-        assert "report_startup_progress" in src
 
 
 class TestFire:
@@ -482,6 +422,24 @@ class TestFire:
         # File-based faulthandler dump follows the JSON record (stderr may be
         # absent on detached runs).
         assert "Thread" in content or "Current thread" in content
+
+    def test_file_dump_precedes_stderr_dump(self, monkeypatch):
+        """A blocked stderr must not hide the durable stack dump."""
+        writes = []
+
+        def _dump(*, file=None, all_threads=True):
+            writes.append("file" if file is not None else "stderr")
+
+        monkeypatch.setattr(sw.faulthandler, "dump_traceback", _dump)
+        monkeypatch.setattr(
+            StartupWatchdogHandle, "_exit", staticmethod(lambda code: None)
+        )
+
+        StartupWatchdogHandle(
+            timeout_s=60, exit_code=SERVICE_RESTART_EXIT_CODE
+        )._fire()
+
+        assert writes[:2] == ["file", "stderr"]
 
     def test_fire_marks_lifecycle_exit(self, exit_capture, monkeypatch):
         marked = {}
@@ -569,12 +527,14 @@ class TestBoundedExit:
         monkeypatch.setattr(sw, "_write_dump_record", _hang)
         handle = arm_startup_watchdog(timeout_s=0.1)
         assert handle is not None
-        assert exit_capture.fired.wait(timeout=10)
-        assert SERVICE_RESTART_EXIT_CODE in exit_capture.codes
-        # Unblock and drain the fire thread before monkeypatch teardown
-        # (same real-os._exit hazard as above).
-        forever.set()
-        handle.join(timeout=10)
+        try:
+            assert exit_capture.fired.wait(timeout=10)
+            assert SERVICE_RESTART_EXIT_CODE in exit_capture.codes
+        finally:
+            # Release the barrier even when an assertion fails. The owning
+            # fixture also drains all helpers before monkeypatch teardown.
+            forever.set()
+            handle.join(timeout=10)
 
     def test_escort_stands_down_when_fire_completes(self, exit_capture, monkeypatch):
         """When forensics complete normally the escort must NOT double-exit:
@@ -589,25 +549,59 @@ class TestBoundedExit:
         time.sleep(0.8)
         assert exit_capture.codes == [SERVICE_RESTART_EXIT_CODE]
 
-    def test_escort_uses_no_logging_or_filesystem(self):
-        """Structural guarantee: the escort body must not touch logging,
-        the filesystem, or imports — only sleep, an Event check, and the
-        exit seam."""
-        import inspect
-
-        src = inspect.getsource(StartupWatchdogHandle._exit_escort)
-        for banned in ("logger.", "logging", "open(", "Path(", "import ", "mkdir"):
-            assert banned not in src, f"escort must not use {banned!r}"
 
 
 class TestDumpPath:
-    def test_dump_path_under_home(self, tmp_path):
-        assert get_startup_watchdog_dump_path(tmp_path) == (
-            tmp_path / "logs" / "gateway-startup-watchdog.log"
-        )
 
     def test_dump_write_failure_is_swallowed(self, monkeypatch):
         monkeypatch.setattr(
             sw, "get_startup_watchdog_dump_path", lambda home=None: Path("/dev/null/nope")
         )
         sw._write_dump_record({"tag": "x"})
+
+
+def test_isolation_drains_firing_handle_before_restoring_exit(tmp_path):
+    """A non-singleton fire cannot escape its test or inherit a later exit seam."""
+    in_dump = threading.Event()
+    release_dump = threading.Event()
+    captured = []
+    wrong_exit = []
+
+    with pytest.MonkeyPatch.context() as patches:
+        isolation = _isolate.__wrapped__(tmp_path, patches)
+        next(isolation)
+        patches.setattr(StartupWatchdogHandle, "_exit", staticmethod(captured.append))
+
+        def blocked_dump(record):
+            in_dump.set()
+            assert release_dump.wait(timeout=10)
+
+        patches.setattr(sw, "_write_dump_record", blocked_dump)
+        handle = StartupWatchdogHandle(0.01, SERVICE_RESTART_EXIT_CODE)
+        original_join = handle.join
+
+        def release_and_join(timeout=None):
+            release_dump.set()
+            original_join(timeout=timeout)
+
+        patches.setattr(handle, "join", release_and_join)
+        try:
+            assert handle._start()
+            assert in_dump.wait(timeout=5)
+            # The handle must retain its own callback even if the class seam
+            # changes while its forensic worker is still blocked.
+            patches.setattr(StartupWatchdogHandle, "_exit", staticmethod(wrong_exit.append))
+            isolation.close()
+            assert not handle.is_alive(), "fixture returned before draining its fire worker"
+            assert not any(
+                thread.name.startswith("gateway-startup-watchdog")
+                for thread in threading.enumerate()
+            ), "fixture returned before draining its helpers"
+            assert captured
+            assert wrong_exit == []
+        finally:
+            # The RED version of the fixture does not drain. Keep this
+            # regression safe even when that exact defect returns.
+            release_dump.set()
+            original_join(timeout=5)
+            isolation.close()

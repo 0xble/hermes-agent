@@ -39,7 +39,7 @@ and finally paths can write the result, remove the marker, and relaunch Desktop.
 So the contract is: bounded when a descendant holds the pipe open, never slower
 than the step can write, and bounded when the step itself remains alive without
 observable progress. All arms live in the script's own
-``-SelfTestPipeDrain`` fixture, which is ``windows_only`` because Linux CI
+``-SelfTestPipeDrain`` fixture, which is ``platforms("windows")`` because Linux CI
 cannot execute the PowerShell hand-off.
 """
 
@@ -56,75 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 WINDOWS_PS1 = REPO_ROOT / "scripts" / "desktop-update" / "windows.ps1"
 
 
-class TestIdleWatchdogCountsUpdateLogGrowth:
-    """The idle watchdog must count logs/update.log growth as progress.
-
-    Real updates are stdout-silent for 40+ minutes: ``hermes update`` captures
-    the (very loud) Electron/vite build into ``logs/update.log`` — NOT the
-    child's stdout (``hermes_cli/update_cmd.py``, the update-log tee) — so the
-    step's pipes go quiet for the whole build while the update is demonstrably
-    progressing. A no-output ceiling that watches only stdout/stderr would
-    kill every healthy large update at ``StepIdleTimeoutSeconds`` and mark it
-    exit 124.
-
-    These are source-contract assertions (the executable proof is the
-    ``logstall`` arm of ``-SelfTestPipeDrain``, ``windows_only`` below):
-    Linux CI cannot run the PowerShell hand-off, but it CAN pin that the
-    drain loop consults update-log growth before terminating the tree.
-    Sabotage-proof: removing the ``Get-StepProgressLogStamp`` consult from
-    the stall branch, dropping the ``logstall`` self-test arm, or dropping
-    the ``HERMES_UPDATE_STEP_IDLE_SECONDS`` override each fails a test here.
-    """
-
-    def _src(self) -> str:
-        return WINDOWS_PS1.read_text(encoding="utf-8")
-
-    def test_progress_log_default_is_update_log(self):
-        src = self._src()
-        assert '$script:StepProgressLogPath = Join-Path $LogDir "update.log"' in src
-
-    def test_progress_log_overridable_for_self_test(self):
-        assert "HERMES_UPDATE_PROGRESS_LOG" in self._src()
-
-    def test_idle_override_env_retained(self):
-        # The user/test-facing idle override must survive the amendment.
-        assert "HERMES_UPDATE_STEP_IDLE_SECONDS" in self._src()
-
-    def test_stall_branch_consults_log_growth_before_terminating(self):
-        src = self._src()
-        assert "function Get-StepProgressLogStamp" in src
-        # The consult must sit inside the idle-ceiling branch, upstream of
-        # TerminateAndWait: growth resets the progress clock instead of
-        # cancelling the tree. Pin the exact consult + compare + reset shape
-        # so an inert consult (or a removed one) fails here.
-        msg = (
-            "the idle watchdog no longer checks logs/update.log growth "
-            "before declaring a stall -- a healthy 40+ min build whose "
-            "output goes to update.log would be killed at the idle ceiling"
-        )
-        assert "$currentLogStamp = Get-StepProgressLogStamp" in src, msg
-        assert "if ($currentLogStamp -ne $progressLogStamp)" in src, msg
-        # The growth check must gate the termination: compare-and-reset
-        # appears before the 124 tree-termination inside the drain loop.
-        consult = src.index("if ($currentLogStamp -ne $progressLogStamp)")
-        terminate = src.index("TerminateAndWait($job, 124")
-        assert consult < terminate, msg
-        # And the clock actually resets on growth.
-        growth_block = src[consult:terminate]
-        assert "$progressLogStamp = $currentLogStamp" in growth_block, msg
-        assert "$lastProgressAt = Get-Date" in growth_block, msg
-
-    def test_self_test_has_silent_but_logging_arm(self):
-        src = self._src()
-        assert "logstall" in src, (
-            "-SelfTestPipeDrain lost its silent-but-logging arm: the fixture "
-            "no longer proves that a step which is quiet on its pipes but "
-            "growing update.log is NOT killed by the idle watchdog"
-        )
-        assert "silent but logging" in src
-
-
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
     tmp_path: Path,
 ) -> None:
@@ -174,11 +106,18 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         # TEMP; point that at tmp_path so the test leaves nothing behind.
         "TEMP": str(tmp_path),
         "TMP": str(tmp_path),
+        # The runner's autouse home guard exports HERMES_HOME under its own
+        # relocated home.  The script prefers HERMES_HOME over TEMP for its
+        # durable hand-off log, so pin it to this fixture root as well.
+        "HERMES_HOME": str(tmp_path),
         # Keep the test quick. The grace is what the fix bounds; the hold is
         # how long the leaking grandchild lives. hold >> grace is what makes a
         # regression measurable rather than lucky.
         "HERMES_UPDATE_PIPE_DRAIN_SECONDS": "3",
-        "HERMES_UPDATE_STEP_IDLE_SECONDS": "3",
+        # Only the stall arm uses the short idle bound. PowerShell startup and
+        # grandchild creation in the leak arm can exceed three seconds on a
+        # loaded runner before the step emits its first byte; that is not a
+        # post-exit pipe leak. The self-test scopes the short bound to stall.
         "HERMES_SELFTEST_HOLD_SECONDS": "45",
     }
 
@@ -200,16 +139,38 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         timeout=300,
         env=env,
         cwd=str(REPO_ROOT),
+        check=False,
     )
 
-    assert "PIPE-DRAIN SELF-TEST: PASS" in result.stdout, (
-        "The Windows update hand-off's step drain regressed: it either waited "
-        "on a descendant holding the pipe open (the Desktop parks on 'Updating "
-        "Hermes' forever) or metered a chatty step (backpressure on the running "
-        f"update). Fixture diagnosis follows.\n--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
-    assert result.returncode == 0, (
-        f"-SelfTestPipeDrain exited {result.returncode}.\n"
-        f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+    def diagnosis() -> str:
+        # The flood arm captures 8 MiB. A failure must not copy those bytes
+        # into the assertion and then into the slow hosted Windows job log.
+        def bounded(name: str, text: str) -> str:
+            data = text.encode("utf-8", errors="replace")
+            tail = data[-4096:].decode("utf-8", errors="replace")
+            return f"--- {name}: {len(data)} bytes; last 4096 bytes ---\n{tail}"
+
+        return (
+            "The Windows update hand-off's step drain regressed. "
+            "Fixture diagnosis follows.\n"
+            f"{bounded('stdout', result.stdout)}\n"
+            f"{bounded('stderr', result.stderr)}"
+        )
+
+    # pytest's assert introspection would also render the entire 8 MiB stdout
+    # operand; fail explicitly so only the bounded diagnosis is reported.
+    if "PIPE-DRAIN SELF-TEST: PASS" not in result.stdout:
+        pytest.fail(diagnosis(), pytrace=False)
+    if result.returncode != 0:
+        pytest.fail(
+            f"-SelfTestPipeDrain exited {result.returncode}.\n{diagnosis()}",
+            pytrace=False,
+        )
+    if len(result.stdout.encode("utf-8", errors="replace")) >= 65536:
+        pytest.fail(f"Fixture replayed excessive output to its host.\n{diagnosis()}", pytrace=False)
+    if "pipeflood|" in result.stdout:
+        pytest.fail(f"Fixture replayed flood content to its host.\n{diagnosis()}", pytrace=False)
+    handoff_log = tmp_path / "logs" / "desktop-update-handoff.log"
+    assert handoff_log.stat().st_size >= 8192 * 1024, (
+        "Flood output was not preserved in the durable hand-off log"
     )

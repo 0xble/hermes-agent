@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 
 class TestAtomicRoundtripYamlSave:
@@ -25,6 +25,30 @@ class TestAtomicRoundtripYamlSave:
 
         assert config_path.exists()
         assert yaml.safe_load(config_path.read_text())["model"]["default"] == "test-model"
+
+    @pytest.mark.parametrize("full_state", [False, True], ids=["key-update", "full-state"])
+    def test_deletion_preserves_next_sibling_comment(self, config_path, full_state):
+        from utils import atomic_roundtrip_yaml_save, atomic_roundtrip_yaml_update
+
+        config_path.write_text(
+            "model:\n"
+            "  model_preset: fast  # Obsolete reference.\n"
+            "  # Keep my slot policy.\n"
+            "  model_slots:\n"
+            "    fast: 'off'\n",
+            encoding="utf-8",
+        )
+        if full_state:
+            atomic_roundtrip_yaml_save(config_path, {"model": {"model_slots": {"fast": "off"}}})
+        else:
+            atomic_roundtrip_yaml_update(config_path, "model.model_preset", None)
+
+        text = config_path.read_text(encoding="utf-8")
+        assert "model_preset" not in text
+        assert "Obsolete reference." not in text
+        assert "  # Keep my slot policy.\n  model_slots:" in text
+        assert "fast: 'off'" in text
+        assert yaml.safe_load(text) == {"model": {"model_slots": {"fast": "off"}}}
 
     def test_preserves_top_level_key_order(self, config_path):
         """Existing top-level keys keep their author-intended ordering."""
@@ -119,6 +143,20 @@ class TestAtomicRoundtripYamlSave:
         assert "(=^･ω･^=)" in text
         assert "\\u4f60" not in text
         assert "\\u30CE" not in text
+
+    def test_preserves_long_double_quoted_scalar_with_backslash(self, config_path):
+        """A no-op save must not turn fold indentation after a backslash into data."""
+        value = "A" * 74 + r"D:\CentBrowserPortable " + "B" * 40
+        config_path.write_text(
+            'policy: "' + value.replace("\\", "\\\\") + '"\n',
+            encoding="utf-8",
+        )
+
+        from utils import atomic_roundtrip_yaml_save
+
+        atomic_roundtrip_yaml_save(config_path, {"policy": value})
+
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["policy"] == value
 
     def test_appends_new_keys(self, config_path):
         config_path.write_text(
@@ -248,7 +286,7 @@ class TestAtomicRoundtripYamlSave:
         from utils import atomic_roundtrip_yaml_save
 
         with patch("builtins.open", side_effect=self._deny_config_reads(config_path)):
-            with pytest.raises(RuntimeError, match="Refusing to overwrite"):
+            with pytest.raises(RuntimeError, match="this change was not saved"):
                 atomic_roundtrip_yaml_save(config_path, {"model": {"default": "replacement"}})
 
         assert config_path.read_text(encoding="utf-8") == original

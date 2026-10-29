@@ -40,7 +40,7 @@ def safe_schedule_threadsafe(
         return None
 
 
-def consume_detached_task_result(task: "asyncio.Future[Any]") -> None:
+def consume_detached_task_result(task: asyncio.Future[Any]) -> None:
     """``add_done_callback`` for cancelled-and-detached tasks: observe the exception so the
     loop does not log "exception was never retrieved"; cancellation and terminal errors
     are swallowed because the task's owner already gave up on it."""
@@ -48,3 +48,22 @@ def consume_detached_task_result(task: "asyncio.Future[Any]") -> None:
         task.exception()
     except (asyncio.CancelledError, Exception):
         pass
+
+
+async def cancel_task_with_grace(task: "asyncio.Future", grace: float = 0.5) -> bool:
+    """Cancel ``task`` and wait only a short grace before detaching it.
+
+    Some transports swallow ``CancelledError`` while stuck in I/O. Waiting for such a task
+    without a bound wedges restart recovery forever; a task that misses the grace is detached
+    and its result is consumed when it eventually finishes.
+    """
+    task.cancel()
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=grace)
+    except asyncio.CancelledError:
+        task.add_done_callback(consume_detached_task_result)
+        raise
+    if task not in done:
+        task.add_done_callback(consume_detached_task_result)
+        return False
+    return True

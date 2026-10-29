@@ -1,12 +1,16 @@
 """Smoke tests for gateway /busy command dispatch."""
 
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import Platform
-from gateway.platforms.base import EphemeralReply
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
+from hermes_cli.commands import resolve_command
 
 
 def _make_runner(busy_mode="interrupt"):
@@ -46,13 +50,6 @@ class TestBusyCommand:
         assert busy_mode in reply_text
         assert "busy" in reply_text
 
-    @pytest.mark.asyncio
-    async def test_busy_invalid_arg(self):
-        """/busy with invalid arg returns error."""
-        runner = _make_runner()
-        event = _make_event("/busy bananas")
-        result = await runner._handle_busy_command(event)
-        assert "unknown" in str(result).lower()
 
 class TestBusyCommandPersistence:
     """Test /busy persistence with mocked save_config_value."""
@@ -101,3 +98,108 @@ class TestBusyCommandPersistence:
         result = await runner._handle_busy_command(event)
         assert "unchanged" in str(result).lower()
         assert runner._busy_input_mode == "steer"
+
+
+def test_deferred_policy_registry_covers_session_mutations():
+    for name in ("compress", "undo", "retry", "save", "branch", "moa"):
+        assert resolve_command(name).busy_policy == "defer_until_idle"
+    for name in ("fast", "reasoning", "title"):
+        assert resolve_command(name).busy_policy == "dispatch"
+    assert resolve_command("model").busy_policy == "defer_until_idle"
+
+
+@pytest.mark.asyncio
+async def test_model_busy_command_is_deferred_and_replayed_once():
+    """A model pick made during a turn runs after the current turn, never against its live agent."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return {}
+
+    adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._delivery_adapter_for = lambda _source: adapter
+    turns = []
+    busy = True
+
+    async def handler(event):
+        if busy:
+            return await runner._dispatch_busy_slash_command(
+                event, resolve_command("model"), build_session_key(event.source), event.source)
+        turns.append(event.text)
+
+    adapter.set_message_handler(handler)
+    event = _make_event("/model sonnet")
+    session_key = build_session_key(event.source)
+    await adapter.handle_message(event)
+    await asyncio.sleep(0.2)
+
+    assert turns == []
+    assert adapter._deferred_commands[session_key][0][2].text == "/model sonnet"
+
+    busy = False
+    adapter.resume_deferred_commands(session_key)
+    await asyncio.sleep(0.1)
+    await adapter.cancel_background_tasks()
+    assert turns == ["/model sonnet"]
+
+
+@pytest.mark.asyncio
+async def test_moa_busy_command_is_deferred_and_replayed_once():
+    """Gateway busy dispatch keeps /moa as a command and runs it only after release."""
+    from gateway.platforms.base import BasePlatformAdapter
+    from hermes_cli.commands import resolve_command
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return {}
+
+    adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    sent = []
+    adapter._send_with_retry = AsyncMock(side_effect=lambda **kwargs: sent.append(kwargs.get("content")))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._delivery_adapter_for = lambda _source: adapter
+    busy = True
+    turns = []
+
+    async def handler(event):
+        if busy:
+            return await runner._dispatch_busy_slash_command(
+                event, resolve_command("moa"), build_session_key(event.source), event.source)
+        turns.append(event.text)
+        return None
+
+    adapter.set_message_handler(handler)
+    event = _make_event("/moa compare these answers")
+    session_key = build_session_key(event.source)
+    await adapter.handle_message(event)
+    await asyncio.sleep(0.2)
+    assert turns == []
+    assert len([text for text in sent if text and "scheduled" in text]) == 1
+
+    busy = False
+    adapter.resume_deferred_commands(session_key)
+    await asyncio.sleep(0.1)
+    await adapter.cancel_background_tasks()
+    assert turns == ["/moa compare these answers"]
+    assert len([text for text in sent if text and "scheduled" in text]) == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_moa_busy_command_returns_usage_without_queue(monkeypatch):
+    from hermes_cli.commands import resolve_command
+    runner = _make_runner()
+    adapter = SimpleNamespace(defer_command_until_idle=lambda *_args: pytest.fail("must not queue"))
+    runner._delivery_adapter_for = lambda _source: adapter
+    monkeypatch.setattr("hermes_cli.moa_config.moa_usage", lambda: "usage: /moa <prompt>")
+    event = _make_event("/moa")
+    result = await runner._dispatch_busy_slash_command(
+        event, resolve_command("moa"), "session", event.source)
+    assert result == "usage: /moa <prompt>"

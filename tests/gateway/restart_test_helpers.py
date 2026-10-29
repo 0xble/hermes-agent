@@ -77,8 +77,10 @@ def make_restart_runner(
     runner._restart_via_service = False
     runner._detached_restart_helper_started = False
     runner._restart_command_source = None
+    runner._restart_reason = None
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     runner._restart_after_turn_timeout = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
+    runner._restart_delegation_timeout = 900.0
     runner._cron_drain_timeout = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
     runner._signal_interrupt_grace_timeout = (
         DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
@@ -117,9 +119,6 @@ def make_restart_runner(
         runner, GatewayRunner
     )
     runner._status_action_gerund = GatewayRunner._status_action_gerund.__get__(
-        runner, GatewayRunner
-    )
-    runner._queue_during_drain_enabled = GatewayRunner._queue_during_drain_enabled.__get__(
         runner, GatewayRunner
     )
     runner._running_agent_count = GatewayRunner._running_agent_count.__get__(

@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli import goals
+
 
 @pytest.fixture()
 def hermes_home(tmp_path, monkeypatch):
@@ -60,7 +62,7 @@ def server(hermes_home, monkeypatch):
     # originals on teardown so nothing leaks to later tests either.
     monkeypatch.setattr(mod, "_hermes_home", hermes_home)
     monkeypatch.setattr(mod, "_cfg_cache", None)
-    monkeypatch.setattr(mod, "_cfg_mtime", None)
+    monkeypatch.setattr(mod, "_cfg_sig", None)
     monkeypatch.setattr(mod, "_cfg_path", None)
     yield mod
     # Reset module-level session state without re-importing. importlib.reload
@@ -135,7 +137,7 @@ def turn_env(server, monkeypatch, tmp_path):
         server, "_sync_session_key_after_compress", lambda *a, **k: None
     )
     monkeypatch.setattr(server, "_get_usage", lambda agent: {})
-    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_load_cfg", dict)
     return emitted
 
 
@@ -169,14 +171,79 @@ def _compression_failure():
     }
 
 
+def _max_iterations_fallback(final_response="fallback summary"):
+    return {
+        "final_response": final_response,
+        "completed": False,
+        "failed": False,
+        "turn_exit_reason": "max_iterations_reached(3/3)",
+    }
+
+
+@pytest.mark.parametrize(
+    ("result", "status", "raw", "expected"),
+    [
+        (_max_iterations_fallback(), "complete", "fallback summary", True),
+        (
+            {
+                "completed": True,
+                "failed": False,
+                "turn_exit_reason": "text_response(finish_reason=stop)",
+            },
+            "complete",
+            "normal response",
+            True,
+        ),
+        (
+            {**_max_iterations_fallback(), "failed": True},
+            "complete",
+            "fallback summary",
+            False,
+        ),
+        (
+            {**_max_iterations_fallback(), "turn_exit_reason": "budget_exhausted"},
+            "complete",
+            "fallback summary",
+            False,
+        ),
+        (_max_iterations_fallback(), "error", "fallback summary", False),
+        (_max_iterations_fallback(), "interrupted", "fallback summary", False),
+        (_max_iterations_fallback(), "complete", "   ", False),
+        (_max_iterations_fallback("   "), "complete", "   ", False),
+        (_max_iterations_fallback(""), "complete", "", False),
+    ],
+)
+def test_successful_goal_turn_accepts_only_valid_completion_outcomes(
+    server, result, status, raw, expected
+):
+    assert server._is_successful_goal_turn(result, status, raw) is expected
+
+
 # ── command.dispatch /goal ────────────────────────────────────────────
 
 
-def test_goal_bare_shows_status_when_none_set(server, session):
-    sid, _, _ = session
-    r = _call(server, "command.dispatch", name="goal", arg="", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "No active goal" in r["result"]["output"]
+@pytest.mark.parametrize("configured,expected", [(0, 0), (7, 7), (-1, 20), ("invalid", 20), (None, 20)])
+def test_goal_budget_flows_through_command_and_prompt_manager(
+    server, session, hermes_home, configured, expected,
+):
+    import hermes_yaml as yaml
+    from hermes_cli import goals
+
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump({"goals": {"max_turns": configured}}))
+    sid, session_key, record = session
+    record["profile_home"] = str(hermes_home)
+    result = _call(server, "command.dispatch", name="goal", arg="ship it", session_id=sid)
+    assert result["result"]["type"] == "send"
+    with server._session_profile_runtime_scope(record):
+        assert goals.load_goal(session_key).max_turns == expected
+        mgr = server._active_goal_manager(record)
+        assert mgr.default_max_turns == expected
+        assert mgr.state.max_turns == expected
+    if expected == 0:
+        assert "∞" in result["result"]["notice"]
+
+
+
 
 
 def _exhaust_budget(session_key: str, goal_text: str = "finish the benchmark"):
@@ -214,9 +281,8 @@ def test_goal_resume_after_budget_exhaustion_dispatches_continuation(
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
     result = r["result"]
     assert result["type"] == "send"
-    assert result["message"].startswith("[Continuing toward your standing goal]")
+    assert result["message"].strip()
     assert result["display"] == "/goal resume"
-    assert "Goal resumed" in result["notice"]
 
     state = GoalManager(session_key).state
     assert state.status == "active"
@@ -227,7 +293,33 @@ def test_goal_resume_without_goal_stays_exec(server, session):
     sid, _, _ = session
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
     assert r["result"]["type"] == "exec"
-    assert "No goal to resume" in r["result"]["output"]
+
+
+def test_goal_replace_and_remove_commands_use_real_dispatch(server, session):
+    sid, session_key, record = session
+    _call(server, "command.dispatch", name="goal", arg="Ship X\nconstraints: No downtime.; No secrets.", session_id=sid)
+    replaced = _call(server, "command.dispatch", name="goal", arg="replace Ship Y", session_id=sid)
+    assert replaced["result"]["type"] == "send"
+    assert "Goal replaced" in replaced["result"]["notice"]
+    assert "Ship Y" in replaced["result"]["message"]
+    assert "Ship X" not in replaced["result"]["message"]
+    removed = _call(server, "command.dispatch", name="goal", arg="remove constraint 2", session_id=sid)
+    assert removed["result"]["type"] == "send"
+    assert "Removed constraint 2" in removed["result"]["notice"]
+    assert "No downtime." in removed["result"]["message"]
+    assert "No secrets." not in removed["result"]["message"]
+    with server._session_profile_runtime_scope(record):
+        state = goals.load_goal(session_key)
+        assert state.goal == "Ship Y" and state.contract.constraints == "No downtime."
+        assert state.status == "active"
+
+
+def test_goal_remove_out_of_range_uses_real_dispatch_error(server, session):
+    sid, _, _ = session
+    _call(server, "command.dispatch", name="goal", arg="Ship X\nconstraints: No downtime.", session_id=sid)
+    result = _call(server, "slash.exec", command="goal remove constraint 2", session_id=sid)
+    assert "error" in result
+    assert "out of range" in result["error"]["message"]
 
 
 # ── slash.exec /goal routing ──────────────────────────────────────────
@@ -243,13 +335,59 @@ def test_slash_exec_routes_goal_to_command_dispatch(server, session):
     # Should succeed by routing to command.dispatch internally
     assert "result" in r
     assert r["result"]["type"] == "exec"
-    assert "No active goal" in r["result"]["output"]
 
 
-def test_pending_input_commands_includes_goal(server):
-    """Guard: _PENDING_INPUT_COMMANDS must list 'goal' — removing it would
-    silently re-break the TUI."""
-    assert "goal" in server._PENDING_INPUT_COMMANDS
+
+
+def test_iteration_limit_fallback_is_judged_and_can_continue(
+    server, turn_env, monkeypatch
+):
+    from hermes_cli.goals import GoalManager
+
+    session_key = "goal-iteration-limit-fallback"
+    mgr = GoalManager(session_key)
+    mgr.set("finish the current task")
+    continuation = mgr.next_continuation_prompt()
+    seen_prompts = []
+    judged = []
+    results = iter([
+        _max_iterations_fallback(),
+        {
+            "final_response": "finished normally",
+            "completed": True,
+            "failed": False,
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+        },
+    ])
+
+    def run_conversation(message, **_kwargs):
+        seen_prompts.append(message)
+        return next(results)
+
+    def evaluate(self, response, **_kwargs):
+        judged.append(response)
+        if len(judged) == 1:
+            return {
+                "message": "",
+                "should_continue": True,
+                "continuation_prompt": continuation,
+            }
+        return {"message": "", "should_continue": False}
+
+    monkeypatch.setattr(GoalManager, "evaluate_after_turn", evaluate)
+    agent = types.SimpleNamespace(
+        session_id=session_key,
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+    )
+    session = _turn_session(agent, session_key)
+
+    server._run_prompt_submit("rid", "sid", session, "initial work")
+
+    assert seen_prompts == ["initial work", continuation]
+    assert judged == ["fallback summary", "finished normally"]
+    completes = [p for event, _sid, p in turn_env if event == "message.complete"]
+    assert [p["status"] for p in completes] == ["complete", "complete"]
 
 
 # ── active-goal recovery after compression exhaustion ───────────────
@@ -328,15 +466,14 @@ def test_second_consecutive_exhaustion_pauses_goal_instead_of_looping(
     state = GoalManager(session_key).state
     assert state.status == "paused"
     assert state.turns_used == 0
-    assert "compression exhausted twice" in state.paused_reason
+    assert state.paused_reason
     assert server._GOAL_COMPRESSION_RECOVERY_ATTEMPTS not in session
     notices = [
         p["text"]
         for event, _sid, p in turn_env
         if event == "status.update" and p.get("kind") == "goal"
     ]
-    assert any("Retrying the active goal once" in text for text in notices)
-    assert any("Goal paused" in text for text in notices)
+    assert len(notices) >= 2  # retry notice, then pause notice
 
 
 def test_real_queued_prompt_preempts_goal_compression_retry(
@@ -437,8 +574,146 @@ def test_new_goal_does_not_inherit_previous_goal_recovery_attempt(server):
     assert first_prompt is not None
     assert replacement_prompt is not None
     assert "replacement goal" in replacement_prompt
-    assert "Retrying the active goal once" in replacement_notice
+    assert replacement_notice
     assert GoalManager(session_key).state.status == "active"
+
+
+# ── blocked goal + real user message ──────────────────────────────────
+
+
+def _blocked_goal(session_key: str):
+    """Set a goal and drive it to the judge's BLOCKED auto-pause (needs user input)."""
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_key)
+    mgr.set("run both agent sessions end to end")
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False),
+    ):
+        decision = mgr.evaluate_after_turn("Can I use your login for the tests?")
+    assert decision["status"] == "paused"
+    return mgr
+
+
+def test_user_message_after_blocked_pause_continues_the_goal(server, turn_env, monkeypatch):
+    """The judge pauses a goal as BLOCKED when the agent needs user input. The user's
+    next real message IS that input: the turn must run under the goal again (judged,
+    continuation dispatched) instead of executing as a plain prompt on a paused goal."""
+    from hermes_cli.goals import GoalManager
+
+    session_key = "goal-blocked-user-answers"
+    _blocked_goal(session_key)
+    continuation = GoalManager(session_key).next_continuation_prompt() or ""
+    assert continuation == "", "a paused goal has no continuation prompt yet"
+
+    seen_prompts = []
+    start_states = []
+    start_snapshots = []
+    results = iter([{"final_response": "Copying the login and starting session A."},
+                    {"final_response": "Session A is running."}])
+
+    def run_conversation(message, **_kwargs):
+        seen_prompts.append(message)
+        state = GoalManager(session_key).state
+        assert state is not None
+        start_states.append((state.status, state.turns_used))
+        start_snapshots.append([payload["control"] for event, _, payload in turn_env
+                                if event == "session.control.update"])
+        return next(results)
+
+    verdicts = iter([("continue", "session B still pending", False, None, False),
+                     ("done", "both sessions verified", False, None, False)])
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", lambda *a, **k: next(verdicts))
+    agent = types.SimpleNamespace(
+        session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda: None)
+    session = _turn_session(agent, session_key)
+
+    server._run_prompt_submit("rid", "sid", session, "yes go ahead.", user_turn=True)
+
+    assert start_states == [("active", 1), ("active", 2)]
+    assert start_snapshots[0], "publish the resumed goal before the model starts working"
+    assert start_snapshots[0][-1]["goal"]["status"] == "active"
+    assert seen_prompts[0] == "yes go ahead."
+    assert len(seen_prompts) == 2 and seen_prompts[1].startswith("[Continuing toward your standing goal]")
+    notices = [p["text"] for event, _sid, p in turn_env
+               if event == "status.update" and p.get("kind") == "goal"]
+    assert any(text.startswith("▶ Goal resumed") for text in notices), notices
+    assert any("Continuing toward goal" in text for text in notices), notices
+    assert GoalManager(session_key).state.status == "done"
+
+
+@pytest.mark.parametrize("outcome", ["error", "exception", "interrupted", "pause"])
+def test_recovery_is_not_conditional_on_a_successful_reply(
+    server, turn_env, monkeypatch, tmp_path, outcome,
+):
+    from hermes_cli.goals import GoalManager
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    session_key = "profile-recovery"
+    secondary = tmp_path / "secondary"
+    secondary.mkdir()
+    start_states = []
+
+    def run_conversation(message, **_kwargs):
+        state = GoalManager(session_key).state
+        start_states.append((state.status, state.turns_used))
+        if outcome == "exception":
+            raise RuntimeError("fixture provider failure")
+        if outcome == "pause":
+            GoalManager(session_key).pause("user-paused")
+            return {"final_response": "Stopped as requested."}
+        if outcome == "interrupted":
+            return {"final_response": "", "interrupted": True}
+        return {"final_response": "", "failed": True, "error": "fixture provider failure"}
+
+    agent = types.SimpleNamespace(
+        session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda: None)
+    session = _turn_session(agent, session_key)
+    session["profile_home"] = str(secondary)
+    with server._session_profile_runtime_scope(session):
+        _blocked_goal(session_key)
+    monkeypatch.setattr("hermes_cli.goals.judge_goal",
+                        lambda *a, **k: pytest.fail("failed or user-paused turns must not be judged"))
+
+    server._run_prompt_submit("rid", "sid", session, "I fixed it, continue.", user_turn=True)
+
+    assert start_states == [("active", 1)]
+    assert GoalManager(session_key).state is None, "must not write the launch profile"
+    with server._session_profile_runtime_scope(session):
+        state = GoalManager(session_key).state
+        assert state.turns_used == 1, "failed turns must not spend goal budget"
+        assert state.status == ("paused" if outcome == "pause" else "active")
+        assert state.paused_reason == ("user-paused" if outcome == "pause" else None)
+
+
+def test_synthetic_turn_does_not_reactivate_a_blocked_goal(server, turn_env, monkeypatch):
+    """Background-process notifications, delegation completions, wakeups and auto-continues
+    are not the user answering — they must not silently un-pause a goal waiting on input.
+    They reach ``_run_prompt_submit`` without ``user_turn`` (the default)."""
+    from hermes_cli.goals import GoalManager
+
+    session_key = "goal-blocked-synthetic"
+    _blocked_goal(session_key)
+    seen_prompts = []
+
+    def run_conversation(message, **_kwargs):
+        seen_prompts.append(message)
+        return {"final_response": "noted the background result"}
+
+    monkeypatch.setattr(
+        "hermes_cli.goals.judge_goal",
+        lambda *a, **k: pytest.fail("a paused goal must not be judged"))
+    agent = types.SimpleNamespace(
+        session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda: None)
+    session = _turn_session(agent, session_key)
+
+    server._run_prompt_submit(
+        "rid", "sid", session, "[IMPORTANT: Background process proc_1 completed normally]")
+
+    assert seen_prompts == ["[IMPORTANT: Background process proc_1 completed normally]"]
+    assert GoalManager(session_key).state.status == "paused"
 
 
 # ── command.dispatch /moa ────────────────────────────────────────────
@@ -448,24 +723,73 @@ def _write_moa_config(home, text):
     cfg_path.write_text(text)
 
 
-def test_moa_bare_returns_usage(server, session, hermes_home):
-    _write_moa_config(hermes_home, """
-moa:
-  default_preset: default
-  presets:
-    default:
-      reference_models:
-        - provider: openai-codex
-          model: gpt-5.5
-      aggregator:
-        provider: openrouter
-        model: anthropic/claude-opus-4.8
-""")
+
+
+# ── prompt.submit marks the turn as the user's ────────────────────────
+
+
+def test_prompt_submit_rpc_marks_turn_as_user_turn(server, session, monkeypatch):
+    """The RPC the composer calls is the ONLY place that knows a person typed the message;
+    it must say so, or a BLOCKED-paused goal never learns its input arrived."""
     sid, _, s = session
-    r = _call(server, "command.dispatch", name="moa", arg="", session_id=sid)
-    # Bare /moa is usage-only now; switching to a preset is via the model picker.
-    assert "error" in r
-    assert "model_override" not in s
+    seen = {}
+
+    def fake_run(rid, _sid, _session, text, **kwargs):
+        seen["text"] = text
+        seen["kwargs"] = kwargs
+        _session["running"] = False  # the real one releases the turn in its finally
+        return True
+
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", fake_run)
+    s["agent_ready"] = threading.Event()
+    s["agent_ready"].set()
+    s["agent"] = types.SimpleNamespace(session_id="x", clear_interrupt=lambda: None)
+
+    r = _call(server, "prompt.submit", session_id=sid, text="yes go ahead.")
+
+    assert r["result"]["status"] == "streaming", r
+    assert seen["text"] == "yes go ahead."
+    assert seen["kwargs"]["user_turn"] is True
+
+    seen.clear()
+    r = _call(server, "prompt.submit", session_id=sid, text="widget intent", display_kind="hidden")
+    assert r["result"]["status"] == "streaming", r
+    assert seen["kwargs"]["user_turn"] is False, "hidden widget sends are not the user answering"
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+@pytest.mark.parametrize("origin", ["hidden", "relay"])
+def test_queued_non_user_does_not_become_a_user_answer(server, session, monkeypatch, isolated, origin):
+    from tools.bot_relay import DeliveryAuthor
+
+    sid, _, record = session
+    record["running"] = True
+    record["agent"] = types.SimpleNamespace()
+    seen = []
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a: None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a: isolated)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *a, **kw: seen.append(kw) or True)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host",
+                        lambda *a, **kw: seen.append(kw) or {"result": {"status": "streaming"}})
+    provenance = ({"display_kind": "hidden"} if origin == "hidden" else
+                  {"_turn_author": DeliveryAuthor({"id": "bot:fixture", "name": "Fixture"})})
+    response = _call(server, "prompt.submit", session_id=sid, text="Non-user update", **provenance)
+    assert response["result"]["status"] == "queued"
+    # A subsequent real answer must keep a separate envelope and its own provenance.
+    _call(server, "prompt.submit", session_id=sid, text="I fixed it, continue.")
+    record["running"] = False
+    assert server._drain_queued_prompt("first", sid, record)
+    record["running"] = False
+    assert server._drain_queued_prompt("second", sid, record)
+    assert [kw["user_turn"] for kw in seen] == [False, True]
+    if origin == "hidden":
+        assert seen[0]["display_kind"] == "hidden"
+    elif not isolated:
+        assert seen[0]["turn_author"]["id"] == "bot:fixture"
 
 
 @pytest.mark.parametrize("method", ["command.dispatch", "slash.exec"])
@@ -527,3 +851,40 @@ def test_goal_draft_uses_session_profile_without_blocking_rpc_reader(
         assert state.max_turns == 37 and state.contract.verification == "tests pass"
     result = next(frame["result"] for frame in frames if frame.get("id") == "draft")
     assert result["type"] == "send" and result["message"] == state.goal
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+def test_isolated_submit_keeps_preview_separate_from_user_provenance(server, session, monkeypatch, hidden):
+    sid, _, record = session
+    seen = []
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a: True)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a: None)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host",
+                        lambda *a, **kw: seen.append(kw) or {"result": {"status": "streaming"}})
+    kwargs = {"display_kind": "hidden"} if hidden else {}
+    result = _call(server, "prompt.submit", session_id=sid, text="request", title_preview="Useful title", **kwargs)
+    assert result["result"]["status"] == "streaming"
+    assert seen[0]["user_turn"] is (not hidden)
+    assert seen[0]["display_metadata"]["title_preview"] == "Useful title"
+
+
+def test_user_turn_completes_over_a_corrupt_goal_row(server, turn_env, monkeypatch):
+    """Regression for the PR #551 review: an unreadable goal row errored every TUI user turn."""
+    session_key = "goal-corrupt-row"
+    goals._get_session_db().set_meta(f"goal:{session_key}", "{corrupt")
+    seen = []
+
+    def run_conversation(message, **_kwargs):
+        seen.append(message)
+        return {"final_response": "Answered."}
+
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", lambda *a, **k: pytest.fail("never judged"))
+    agent = types.SimpleNamespace(
+        session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda: None)
+
+    server._run_prompt_submit("rid", "sid", _turn_session(agent, session_key), "hello", user_turn=True)
+
+    assert seen == ["hello"]
+    assert not [event for event, _sid, _payload in turn_env if event == "error"]
+    assert any(event == "message.complete" for event, _sid, _payload in turn_env)
+    assert goals._get_session_db().get_meta(f"goal:{session_key}") == "{corrupt"

@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import stat
+import sys
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -34,7 +35,9 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # while every real command position (text start, whitespace, `;`/`&`/`|`, `$(`, backtick,
     # U+FFFD) still matches.
     # See #77173.
-    r"(?:(?<![/\w.\-])hermes\s+gateway\s+(?:restart|stop|uninstall)\b)"
+    # Windows spells the CLI with a launcher suffix (`hermes.exe`, npm-style `hermes.cmd`/`.ps1`);
+    # same command, so the suffix is optional here.
+    r"(?:(?<![/\w.\-])hermes(?:\.(?:exe|cmd|bat|com|ps1))?\s+gateway\s+(?:restart|stop|uninstall)\b)"
     # Branch B: launchctl ops anchored on a hermes-gateway label so unrelated hermes services stay
     # unblocked. `submit`/`bootstrap` register a NEW keepalive job wrapping an arbitrary helper (a
     # laundered restart); neutral-label submissions are caught by
@@ -56,9 +59,164 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill/kill of the gateway process, both token orders. Leading \b keeps "skill" from
     # matching as "kill".
-    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    # `taskkill` / `Stop-Process` are the Windows spellings of the same operation; `\bp?kill\b`
+    # cannot reach inside `taskkill`, so they are named outright. Service-control forms (`net stop`,
+    # `sc stop`) presuppose a service install this guard has no evidence of and stay uncovered.
+    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n]*\bhermes\b[^\n]*\bgateway)"
+    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n]*\bgateway\b[^\n]*\bhermes)"
 )
+
+# Branch E: process killers whose TARGET is the interpreter image hosting the gateway. A supervised
+# gateway is literally `python.exe` / `python3.12` (`python -m hermes_cli.main gateway run`), so
+# `taskkill /F /IM python.exe`, `pkill -9 python3` or `killall python` carry no hermes/gateway token
+# yet terminate it (#113667). Token-aware rather than a line regex: option VALUES are never read as
+# targets (`pkill -u <user> chrome`), `-f` cmdline patterns are judged as patterns, and other image
+# names (`taskkill /F /IM agent-browser.exe`) stay available. Numeric-PID kills are out of scope:
+# the explicit PID / `proc_*` id IS the ownership-scoped route the rejection points to.
+_INTERPRETER_IMAGE_RE = re.compile(r"^pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
+_HOST_INTERPRETER_NAME = Path(sys.executable).name.lower() if sys.executable else ""
+_KILLER_VALUE_OPTIONS = {
+    # procps pkill/pgrep options that consume the next token, so the value is never the pattern.
+    "pkill": frozenset({
+        "-g", "--pgroup", "-G", "--group", "-P", "--parent", "-s", "--session", "-t", "--terminal",
+        "-u", "--euid", "-U", "--uid", "-F", "--pidfile", "--ns", "--nslist", "-d", "--delimiter",
+        "--signal", "-O", "--older", "-r", "--runstates", "--cgroup", "-A", "--ignore-ancestors",
+    }),
+    "killall": frozenset({"-s", "--signal", "-u", "--user", "-o", "--older-than", "-y", "--younger-than",
+                          "-n", "--ns", "-Z", "--context"}),
+}
+_KILLER_VALUE_OPTIONS["pgrep"] = _KILLER_VALUE_OPTIONS["pkill"]
+_KILLER_VALUE_OPTIONS["pidof"] = frozenset({"-o", "--omit-pid", "-S", "--separator"})
+# Regex metacharacters a pkill/pgrep ERE may carry around the interpreter name (`^python3?$`, `python.*`).
+_ERE_TAIL = re.compile(r"[.*+?\\\[\](){}|].*$")
+_ERE_WILDCARD_ONLY = re.compile(r"^[.*+?$\s]*$")
+_NAME_KILLERS = frozenset({"pkill", "killall", "taskkill", "stop-process"})
+_NAME_ENUMERATORS = frozenset({"pgrep", "pidof", "get-process"})
+_KILL_VERB_RE = re.compile(r"(?i)\b(?:kill|taskkill|stop-process)\b")
+# A `-f` pattern that does not start with the interpreter reaches the gateway cmdline
+# (`python -m hermes_cli.main gateway run` / `hermes gateway run`) only through its own tokens;
+# an unrelated script that merely contains "hermes" (`hermes-polis/run.sh`, `my_hermes_bot.py`)
+# cannot match it. Same hermes+gateway pairing as Branch D, plus the module path.
+_GATEWAY_CMDLINE_TOKEN_RE = re.compile(r"(?i)hermes_cli|\bhermes\b[^\n]*\bgateway\b|\bgateway\b[^\n]*\bhermes\b")
+# Rejection text for Branch E, shared by every tool surface that runs the guard so the agent is
+# pointed at the ownership-scoped route (proc_* id / explicit PID) rather than the shell.
+HOST_INTERPRETER_KILL_REJECTION = (
+    "Blocked: this command kills every process whose image/name matches the Python "
+    "interpreter, which is the process hosting this gateway (and this command). "
+    "Stop only the process you own instead: process(action=\"kill\", session_id=\"proc_…\") "
+    "for a background job Hermes started, or kill/taskkill by its explicit PID."
+)
+
+
+def _is_interpreter_image(value: str, *, substring: bool = False) -> bool:
+    """True when *value* (a process/image name, `*`-wildcard allowed) denotes the Python interpreter
+    that hosts the gateway. *substring*: pkill/pgrep match an ERE anywhere in the name, so `py`
+    reaches `python3` too."""
+    name = value.strip().strip("\"'").lower().removesuffix(".exe")
+    if not name:
+        return False
+    if name.endswith("*"):
+        prefix = name.rstrip("*")
+        return "python".startswith(prefix) or _HOST_INTERPRETER_NAME.startswith(prefix)
+    if _INTERPRETER_IMAGE_RE.match(name) or name == _HOST_INTERPRETER_NAME.removesuffix(".exe"):
+        return True
+    return substring and len(name) >= 2 and "python".startswith(name)
+
+
+def _pattern_reaches_host_interpreter(pattern: str, *, full_cmdline: bool, exact: bool) -> bool:
+    """pkill/pgrep/killall operand semantics: an ERE against the process NAME (or, with `-f`, the full
+    command line). `python -m hermes_cli.main …` is the gateway's own cmdline, so a `-f` pattern
+    that names the interpreter and then only wildcards or a `hermes` token reaches it, while
+    `python mt_add.py` (a specific script) does not."""
+    core = pattern.strip().strip("\"'").lstrip("^")
+    core = core.removesuffix("$")
+    head, _, rest = core.partition(" ") if full_cmdline else (core, "", "")
+    # A literal interpreter name first (`python3.12`: the dot is a version separator, not an ERE
+    # wildcard); only then read the head as an ERE with a metacharacter tail (`python3?`, `python.*`).
+    match = None if _is_interpreter_image(head, substring=not exact) else _ERE_TAIL.search(head)
+    if match:
+        rest = head[match.start():] + " " + rest
+        head = head[: match.start()]
+    if not _is_interpreter_image(head, substring=not exact):
+        return full_cmdline and bool(_GATEWAY_CMDLINE_TOKEN_RE.search(core))
+    return not rest.strip() or bool(_ERE_WILDCARD_ONLY.match(rest)) or "hermes" in rest.lower()
+
+
+def _killer_targets_host_interpreter(name: str, args: list[str]) -> bool:
+    """Whether killer/enumerator *name* with argv *args* would select the host interpreter."""
+    if name in ("pkill", "pgrep", "killall", "pidof"):
+        # pkill/pgrep: ERE anywhere in the name unless -x; killall: exact name unless -r; pidof: exact.
+        exact = name == "pidof" or (name == "killall") != any(t in ("-r", "--regexp", "-x", "--exact") for t in args)
+        full_cmdline = name in ("pkill", "pgrep") and any(t in ("-f", "--full") for t in args)
+        operands: list[str] = []
+        position = 0
+        while position < len(args):
+            token = args[position]
+            if token == "--":
+                operands += args[position + 1:]
+                break
+            if token in _KILLER_VALUE_OPTIONS[name]:
+                position += 2
+                continue
+            if not token.startswith("-"):
+                operands.append(token)
+            position += 1
+        return any(_pattern_reaches_host_interpreter(op, full_cmdline=full_cmdline, exact=exact) for op in operands)
+    if name == "taskkill":
+        for position, token in enumerate(args[:-1]):
+            option = token.lower().lstrip("/-")
+            value = args[position + 1]
+            if option == "im" and _is_interpreter_image(value):
+                return True
+            if option == "fi":
+                filter_match = re.match(r"(?i)\s*['\"]?imagename\s+eq\s+(\S+)", value)
+                if filter_match and _is_interpreter_image(filter_match.group(1)):
+                    return True
+        return False
+    # Stop-Process / Get-Process: `-Name`/`-ProcessName` (also `-Name:value`), comma lists, positional
+    # names for Get-Process.
+    values: list[str] = []
+    for position, token in enumerate(args):
+        option, _, inline_value = token.partition(":")
+        if option.lower() in ("-name", "-processname", "-n"):
+            values.append(inline_value if inline_value else (args[position + 1] if position + 1 < len(args) else ""))
+        elif name == "get-process" and not token.startswith("-") and (position == 0 or not args[position - 1].startswith("-")):
+            values.append(token)
+    return any(_is_interpreter_image(part) for value in values for part in value.split(","))
+
+
+def _segment_names_host_interpreter(tokens: list[str], killers: frozenset[str]) -> bool:
+    """Whether a tokenized segment runs one of *killers* against the host interpreter. The
+    executable is read at the wrapper-peeled position first, then at the first killer token anywhere
+    in the segment (`xargs kill`, Python argv lists)."""
+    index = _executed_command_index(tokens)
+    candidates = [index] if index is not None else []
+    candidates += [i for i, token in enumerate(tokens) if _executable_name(token).lower().removesuffix(".exe") in killers]
+    for position in candidates:
+        name = _executable_name(tokens[position]).lower().removesuffix(".exe")
+        if name in killers and _killer_targets_host_interpreter(name, tokens[position + 1:]):
+            return True
+    return False
+
+
+def contains_host_interpreter_kill(text: str) -> bool:
+    """Branch E entrypoint: a process killer aimed at the interpreter image hosting the gateway, or a
+    name-derived PID feed into one (`pgrep python | xargs kill`, `kill $(pidof python3)`,
+    `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
+    argv lists resolve the same way the shell resolves them."""
+    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
+    for segment in _iter_command_segments(normalized):
+        joined = " ".join(segment)
+        stripped = _ARGV_LIST_PUNCTUATION.sub(" ", joined)
+        # Python argv lists (`subprocess.run(["taskkill", "/IM", "python.exe"])`) re-split only when
+        # list punctuation was present, so a quoted `-f 'python my_script.py'` stays one operand.
+        for tokens in ([segment, stripped.split()] if stripped != joined else [segment]):
+            if _segment_names_host_interpreter(tokens, _NAME_KILLERS):
+                return True
+            if kill_verb_present and _segment_names_host_interpreter(tokens, _NAME_ENUMERATORS):
+                return True
+    return False
 
 # Every branch uses `[^\n]*` between verb and label so matches cannot span unrelated lines. A POSIX
 # backslash-newline continuation is therefore collapsed to a space before matching (as the shell
@@ -87,12 +245,16 @@ _ARGV_LIST_PUNCTUATION = re.compile(r"[\[\],]+")
 _PROFILE_FLAG_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
     r"hermes\s+"
-    # Any global flags before the profile selector (each may carry a value).
-    r"(?:-{1,2}\S+(?:\s+\S+)?\s+)*"
+    # Each flag has one parse: '-' plus its remainder, never two ways to split
+    # '--'. A following flag cannot also be an optional value (#129281).
+    # Possessive token/space runs avoid repartitioning whitespace on failure;
+    # whole flag groups can still backtrack to expose the profile selector.
+    # Do not cap the number of flags: that would silently allow long self-stops.
+    r"(?:-\S++(?:\s++(?!-\S)\S++)?\s++)*"
     # The selector: exactly the shapes the CLI's `_apply_profile_override` accepts.
     r"(?:--profile=([^\s]+)|(?:-p|--profile)\s+([^\s]+))"
     # Any global flags between the selector and the subcommand.
-    r"(?:\s+-{1,2}\S+(?:\s+\S+)?)*"
+    r"(?:\s++-\S++(?:\s++(?!-\S)\S++)?)*"
     r"\s+gateway\s+(?:restart|stop)"
 )
 
@@ -158,14 +320,19 @@ _TRANSPARENT_COMMAND_PREFIXES = frozenset({
 _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
     "sudo": {"-u", "-g", "-U", "-C", "-p", "-r", "-t", "-T", "--user", "--group", "--prompt"},
     "doas": {"-u", "-C"},
-    "env": {"-u", "--unset", "-S", "--split-string", "-C", "--chdir"},
+    # GNU env: -u/-C/-S; BSD env additionally has -P and -a, while GNU env has --argv0.
+    "env": {"-u", "--unset", "-S", "--split-string", "-C", "--chdir", "-P", "--path",
+            "-a", "--argv0"},
     "nice": {"-n", "--adjustment"},
     "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
     "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
     "pkexec": {"--user"},
-    "su": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"},
-    "runuser": {"-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+    "exec": {"-a"},
+    # util-linux su/runuser: the whitelist, group, shell, and supplemental-group options all take
+    # values.  -l/-m/-p/-f (and their long forms) are flags and are listed below.
+    "su": {"-w", "--whitelist-environment", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+    "runuser": {"-u", "--user", "-w", "--whitelist-environment", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
     "setpriv": {"--reuid", "--regid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set",
                 "--selinux-label", "--apparmor-profile"},
     "systemd-run": {"-u", "--unit", "-p", "--property", "-E", "--setenv", "--slice",
@@ -174,13 +341,39 @@ _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
     "unshare": {"--map-user", "--map-group", "--setgroups", "-R", "--root", "-w", "--wd"},
 }
 
+# Flags must be recognized too: an unrecognized option cannot prove where a wrapper's command (or a
+# string-command option's payload) starts. Unknown options deliberately stay ambiguous; every later
+# token is then scanned as a possible command start (over-flag rather than silently drop).
+_TRANSPARENT_PREFIX_FLAG_OPTIONS = {
+    "sudo": {"-A", "-b", "-E", "-e", "-H", "-i", "-K", "-k", "-l", "-n", "-P", "-S", "-s", "-V", "-v",
+             "--askpass", "--background", "--preserve-env", "--edit", "--set-home", "--login",
+             "--remove-timestamp", "--reset-timestamp", "--list", "--non-interactive",
+             "--preserve-groups", "--stdin", "--shell", "--validate"},
+    "doas": {"-n", "-s", "-L"},
+    # GNU env: -i/-0/-v and signal options; BSD env: -i/-v.  -l is NOT an env flag and stays unknown.
+    "env": {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug",
+            "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"},
+    "timeout": {"-v", "--verbose", "--preserve-status", "--foreground"},
+    "setsid": {"-c", "--ctty", "-f", "--fork", "-w", "--wait"},
+    "ionice": {"-t", "--ignore"},
+    "exec": {"-c", "-l"},
+    "command": {"-p", "-v", "-V"},
+    "pkexec": {"--disable-internal-agent", "--keep-cwd"},
+    "su": {"-f", "--fast", "-l", "--login", "-m", "-p", "--preserve-environment", "-P", "--pty"},
+    "runuser": {"-f", "--fast", "-l", "--login", "-m", "-p", "--preserve-environment", "-P", "--pty"},
+}
+
 # Wrapper options carrying a COMMAND STRING (shell source, re-scanned like `sh -c`); treating it as
 # an opaque value would hide whatever it runs (`env -S 'bash ~/restart.sh'`).
 _STRING_COMMAND_OPTIONS = {
     "env": ("-S", "--split-string"),
-    "su": ("-c", "--command"),
-    "runuser": ("-c", "--command"),
+    "su": ("-c", "--command", "--session-command"),
+    "runuser": ("-c", "--command", "--session-command"),
 }
+
+# Wrappers whose trailing arguments reach a shell (util-linux ``run_shell`` passes everything after
+# the user operand, including after ``--``); their command-string scan is never bounded.
+_SHELL_TAIL_WRAPPERS = frozenset({"su", "runuser"})
 
 # Wrappers whose first non-option operand is a VALUE, not the command (`timeout 60 bash x.sh`).
 _TRANSPARENT_PREFIX_OPERANDS = {"timeout": 1}
@@ -207,18 +400,10 @@ _BINARY_MAGICS = (
 # --- profile identity -------------------------------------------------------------------------
 
 def _current_profile_name() -> Optional[str]:
-    """Profile running the guard: ``HERMES_PROFILE_NAME``/``HERMES_PROFILE`` env first, then
-    ``hermes_cli.profiles.get_active_profile_name`` (from ``HERMES_HOME``); ``None`` if neither."""
-    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
-        value = os.environ.get(env_name)
-        if value and value.strip():
-            return value.strip()
-    try:
-        from hermes_cli.profiles import get_active_profile_name
+    """Profile running the guard (``hermes_cli.profiles.current_profile_name``); ``None`` if none."""
+    from hermes_cli.profiles import current_profile_name
 
-        return get_active_profile_name() or None
-    except Exception:
-        return None
+    return current_profile_name()
 
 
 def _named_profile_is_current(named: str) -> bool:
@@ -299,7 +484,8 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # defined in an earlier `;`-separated segment (`label=${item%%:*}; launchctl bootout
     # "gui/$uid/$label"`), so neither the same-span regex nor same-segment tokenization sees verb and label
     # together. Check "verb anywhere AND label anywhere" instead.
-    return _contains_launchctl_gateway_lifecycle(normalized)
+    # Branch E (#113667): killers aimed at the interpreter image itself carry no hermes/gateway token.
+    return _contains_launchctl_gateway_lifecycle(normalized) or contains_host_interpreter_kill(normalized)
 
 
 # Whole-walk work limits. The per-file cap and depth bound above limit one read, not the walk: a
@@ -311,16 +497,26 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 # get a far tighter cap.
 # See #78398.
 _MAX_LIFECYCLE_SCAN_BYTES = _MAX_REFERENCED_SCRIPT_BYTES  # 1 MiB across the walk
-_MAX_LIFECYCLE_SCAN_LINES = 16384
+# Large generated Python CLIs can stay below the byte cap while legitimately exceeding 16K
+# short lines. Keep a separate bounded line-work ceiling without rejecting those executables.
+_MAX_LIFECYCLE_SCAN_LINES = 32768
 _MAX_LIFECYCLE_SCAN_LINE_BYTES = 64 * 1024
 _MAX_LIFECYCLE_SCAN_PATHS = 1024
 _MAX_LIFECYCLE_SCAN_REMOTE_READS = 64
 
 
 class _LifecycleScanBudget:
-    """Shared work budget for one complete referenced-script walk."""
+    """Shared work budget for one complete referenced-script walk. ``refusal`` records why the walk
+    failed closed for a reason other than a lifecycle command (budget, size, device, live SQLite,
+    cloud placeholder) so the caller can tell the model the real reason (#113944)."""
 
-    __slots__ = ("bytes_remaining", "lines_remaining", "paths_remaining", "remote_reads_remaining")
+    __slots__ = (
+        "bytes_remaining",
+        "lines_remaining",
+        "paths_remaining",
+        "refusal",
+        "remote_reads_remaining",
+    )
 
     def __init__(self) -> None:
         # Read the module constants at construction so tests/operators can lower them at runtime.
@@ -328,6 +524,7 @@ class _LifecycleScanBudget:
         self.lines_remaining = _MAX_LIFECYCLE_SCAN_LINES
         self.paths_remaining = _MAX_LIFECYCLE_SCAN_PATHS
         self.remote_reads_remaining = _MAX_LIFECYCLE_SCAN_REMOTE_READS
+        self.refusal: Optional[str] = None
 
     def charge_text(self, text: str) -> bool:
         """Charge *text* before tokenization; False when it does not fit."""
@@ -386,12 +583,42 @@ def lifecycle_scan_root_within_budget(text: str) -> bool:
         return False
 
 
-def _budget_exhausted(what: str, depth: int) -> bool:
+def _budget_exhausted(budget: _LifecycleScanBudget, what: str, depth: int) -> bool:
     logger.warning(
         "lifecycle guard scan budget exhausted (%s at depth %d); "
         "failing closed — see _MAX_LIFECYCLE_SCAN_* in cron/lifecycle_guard.py",
         what, depth,
     )
+    budget.refusal = f"the scan budget was exhausted ({what} at depth {depth})"
+    return True
+
+
+def _unreadable_reason(path: Path) -> str:
+    """Name why an *executed* script failed closed without being scanned (live SQLite, device,
+    oversized). Message-only: the fail-closed verdict itself came from the bounded reader."""
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    if has_live_connection(path):
+        return f"`{path}` is a SQLite database open in this gateway process"
+    try:
+        metadata = os.stat(path)
+    except OSError:
+        return f"`{path}` could not be read"
+    if not stat.S_ISREG(metadata.st_mode):
+        return f"`{path}` is not a regular file"
+    return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
+
+
+def _refuse_named(budget: _LifecycleScanBudget, reason: str) -> bool:
+    """Fail closed on an unscannable wrapper shape without inventing a filesystem path."""
+    logger.warning("lifecycle guard cannot determine wrapped command: %s; failing closed", reason)
+    budget.refusal = reason
+    return True
+
+
+def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
+    logger.warning("lifecycle guard cannot scan referenced script %s: %s; failing closed", path, reason)
+    budget.refusal = reason
     return True
 
 
@@ -470,34 +697,166 @@ def _executable_name(token: str) -> str:
     return Path(token).name or token
 
 
-def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
-    """Index of the command a wrapper chain actually executes. Unchanged if not a wrapper; may be
-    ``len(segment)`` when a wrapper has no operand — callers must bounds-check."""
+def _installed_heavy_slot_path(token: str) -> bool:
+    """Whether *token* is an explicit path resolving to this profile's installed helper."""
+    try:
+        path = Path(token)
+        if not path.is_absolute() or _on_cloud_path(path):
+            return False
+        installed = Path.home() / ".local" / "bin" / "heavy-slot"
+        return path.resolve(strict=True) == installed.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
+    """Peel only an explicit absolute path to the installed helper and its exact grammar.
+
+    Bare names never earn this exception: modelling shell PATH mutations is unnecessary for the
+    LPG caller, which uses the installed absolute path. Other scripts keep the strict walk.
+    """
+    if not _installed_heavy_slot_path(segment[index]):
+        return None
+    position = index + 1
+    while position < len(segment):
+        option = segment[position]
+        if option == "--":
+            return position + 1 if position + 1 < len(segment) else None
+        name, equals, value = option.partition("=")
+        if name not in {"--label", "--gate-fd"}:
+            return None
+        if not equals:
+            position += 1
+            if position >= len(segment) or segment[position].startswith("-"):
+                return None
+            value = segment[position]
+        if name == "--gate-fd" and re.fullmatch(r"[0-9]+", value) is None:
+            return None
+        position += 1
+    return None
+
+
+def _heavy_slot_fallback_command_index(
+    segment: list[str], index: int,
+) -> tuple[Optional[int], Optional[str]]:
+    """Find the command tail when heavy-slot's transparent grammar cannot be peeled.
+
+    The helper remains a strict source reference on this path. Consume only exact known options
+    up to the command boundary: argparse accepts abbreviations, so skipping to a later delimiter
+    could hide a command already started by an abbreviated option. Refuse ambiguity by name.
+    """
+    if _executable_name(segment[index]) != "heavy-slot" and not _installed_heavy_slot_path(segment[index]):
+        return None, None
+    arguments = segment[index + 1:]
+    if not arguments or arguments in (["--help"], ["-h"]):
+        return None, None
+    position = index + 1
+    while position < len(segment):
+        option = segment[position]
+        if option == "--":
+            if position + 1 >= len(segment):
+                return None, "heavy-slot wrapper has `--` but no wrapped command"
+            return position + 1, None
+        name, equals, value = option.partition("=")
+        if name in {"--label", "--gate-fd"}:
+            if not equals:
+                position += 1
+                if position >= len(segment) or segment[position].startswith("-"):
+                    return None, f"heavy-slot wrapper has an incomplete option `{name}`"
+                value = segment[position]
+            if name == "--gate-fd" and re.fullmatch(r"[0-9]+", value) is None:
+                return None, f"heavy-slot wrapper has an invalid option `{option}`"
+            position += 1
+            continue
+        if option in {"-h", "--help"}:
+            return None, None
+        if option.startswith("-"):
+            return None, f"heavy-slot wrapper has an unknown option `{option}`"
+        # The delimiter may belong to the wrapped command itself. Once a command operand
+        # starts, scan from here rather than skipping ahead to a later `--` in its argv.
+        return position, None
+
+    return None, "heavy-slot wrapper has options but no wrapped command"
+
+
+def _prefix_positions(
+    segment: list[str], index: int, *, allow_heavy_slot: bool = True,
+) -> tuple[list[int], bool, list[bool]]:
+    """Return peeled positions, budget completion, and proven wrapper boundaries.
+
+    ``boundaries[i]`` is true only when the transition from ``positions[i]`` to the next position
+    was proven by ``--`` or entirely recognized options. An unknown option leaves that boundary
+    ambiguous: callers scanning a string-command option must then scan to the segment end.
+    """
+    positions = [index]
+    boundaries: list[bool] = []
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(segment):
-            return index
+            return positions, False, boundaries
+        heavy_target = _heavy_slot_command_index(segment, index) if allow_heavy_slot else None
+        if heavy_target is not None:
+            index = heavy_target
+            positions.append(index)
+            boundaries.append(True)
+            continue
+        fallback_target, _ = _heavy_slot_fallback_command_index(segment, index)
+        if fallback_target is not None:
+            index = fallback_target
+            positions.append(index)
+            boundaries.append(True)
+            continue
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
-            return index
-        value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
+            return positions, True, boundaries
         index += 1
+        positional_operand_seen = False
+        user_option_seen = False
+        boundary_proven = True
         while index < len(segment):
             token = segment[index]
             if token == "--":
-                # POSIX end-of-options: the command starts at the next token.
                 index += 1
                 break
-            if token in value_options:
-                index += 2
+            matched_option, _, option_end = _getopt_value_option(segment, index, name)
+            if matched_option is not None:
+                if not token.startswith("--"):
+                    # Every cluster character before the value option must be a known flag;
+                    # otherwise that character's own arity is unknown.
+                    cluster = token[1:token.index(matched_option[1]) if matched_option[1] in token[1:] else 1]
+                    if cluster and not _getopt_token_recognized(f"-{cluster}", name):
+                        boundary_proven = False
+                if name == "runuser" and matched_option in {"-u", "--user"}:
+                    # runuser's -u/--user forms select the account in option syntax; unlike
+                    # ``su root``, the next non-option token is already the command.
+                    user_option_seen = True
+                index = option_end
                 continue
+            if token.startswith("-") and token != "-" and not _getopt_token_recognized(token, name):
+                # An unknown option may consume the next token, so neither this wrapper's command
+                # boundary nor a su/runuser user operand is proven past this point.
+                boundary_proven = False
             if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
+                index += 1
+                continue
+            if name in {"su", "runuser"} and not positional_operand_seen and not user_option_seen:
+                # These tools accept the login/user operand before later options, e.g.
+                # ``su root -c '...'``; it is not the wrapped command boundary.
+                positional_operand_seen = True
                 index += 1
                 continue
             break
         for _ in range(_TRANSPARENT_PREFIX_OPERANDS.get(name, 0)):
             if index < len(segment) and not segment[index].startswith("-"):
                 index += 1
-    return index
+        positions.append(index)
+        boundaries.append(boundary_proven)
+    return positions, False, boundaries
+
+
+def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
+    """Index of the wrapper chain's final command; callers must bounds-check."""
+    positions, _, _ = _prefix_positions(segment, index)
+    return positions[-1]
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
@@ -524,7 +883,15 @@ def contains_launchctl_submit_command(command: str) -> bool:
     """
     for segment in _iter_command_segments(command):
         index = _executed_command_index(segment)
-        if index is not None and _executable_name(segment[index]) == "launchctl":
+        candidates = [index] if index is not None else []
+        start = _command_token_index(segment)
+        if start is not None:
+            # After an unrecognized wrapper option any later token may be the command.
+            positions, _, boundaries = _prefix_positions(segment, start)
+            candidates += _ambiguous_positions(segment, positions, boundaries)
+        for index in candidates:
+            if _executable_name(segment[index]) != "launchctl":
+                continue
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
@@ -590,6 +957,34 @@ def _direct_lifecycle_scan(command: str) -> bool:
 
 # --- path handling ----------------------------------------------------------------------------
 
+_NON_EXECUTABLE_DEVICE_PATHS = frozenset({"/dev/null", "/dev/zero"})
+_FAIL_CLOSED_DEVICE_PATHS = frozenset({"/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/fd"})
+
+
+def _is_non_executable_device_path(candidate: str) -> bool:
+    """Only empty/NUL-producing devices are harmless as shell script operands.
+
+    Standard streams and /dev/fd aliases can carry executable text, so they stay fail-closed.
+    """
+    return candidate in _NON_EXECUTABLE_DEVICE_PATHS
+
+
+def _is_fail_closed_device_path(candidate: str) -> bool:
+    """True for stream and descriptor pseudo-paths that must never be treated as scripts.
+
+    Some hosts expose ``/dev/stdin`` or ``/dev/fd/<n>`` as regular-file descriptors (or make
+    stdout/stderr unreadable), so relying only on ``fstat`` can accidentally allow them. The
+    lexical guard keeps every device except the two empty devices fail-closed, while traversal
+    paths such as ``/dev/fd/../root/restart.sh`` remain ordinary script candidates. Matching is
+    lexical after normalization (no symlink resolution), so ``//dev/stdin`` or ``/dev/./stdin``
+    cannot slip past.
+    """
+    candidate = os.path.normpath(candidate)
+    if candidate.startswith("//"):
+        candidate = "/" + candidate.lstrip("/")
+    return candidate in _FAIL_CLOSED_DEVICE_PATHS or re.fullmatch(r"/dev/fd/[0-9]+", candidate) is not None
+
+
 def _resolve_lenient(path: Path) -> Path:
     """``path.resolve(strict=False)``, falling back to *path* on OSError (unreadable/long) or
     ValueError (embedded NUL from decoded binary tokenized as a path) — never crash the guard."""
@@ -638,6 +1033,8 @@ def _expand_candidate_path(candidate: str) -> Optional[Path]:
 
 def _resolved_or_nothing(candidate: str, cwd: Optional[str]) -> Iterator[Path]:
     """Yield *candidate* anchored on *cwd* (or the process cwd) when it is a real path."""
+    if _is_non_executable_device_path(candidate):
+        return
     path = _expand_candidate_path(candidate)
     if path is None:
         return
@@ -681,15 +1078,160 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 # --- referenced-script discovery --------------------------------------------------------------
 
-def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator[str]:
-    """Yield values given to *option*, in both ``--opt v`` and ``--opt=v`` form."""
-    prefix = option + "="
-    for position in range(start + 1, len(segment)):
+def _getopt_token_recognized(token: str, executable_name: str) -> bool:
+    """True when a non-value option token consists only of known flags for *executable_name*.
+
+    Value-taking options are matched by ``_getopt_value_option`` before this is consulted, so a
+    token reaching here must be flags alone to keep the wrapper's command boundary proven.
+    """
+    flags = _TRANSPARENT_PREFIX_FLAG_OPTIONS.get(executable_name, frozenset())
+    if token.startswith("--"):
+        return token.partition("=")[0] in flags
+    return bool(token[1:]) and all(f"-{character}" in flags for character in token[1:])
+
+
+def _ambiguous_positions(segment: list[str], positions: list[int], boundaries: list[bool]) -> list[int]:
+    """Every later token that could be a command once an unknown wrapper option hid the boundary.
+
+    An unrecognized option may consume any number of following tokens, so the real command can sit
+    anywhere to its right. Over-scanning those tokens may over-flag; under-scanning drops payloads.
+    """
+    for position_index, proven in enumerate(boundaries):
+        if not proven:
+            return list(range(positions[position_index] + 1, len(segment)))
+    return []
+
+
+def _getopt_value_option(
+    segment: list[str], position: int, executable_name: str,
+) -> tuple[Optional[str], Optional[str], int]:
+    """Parse the first value-taking option in one getopt token.
+
+    Short-option clusters are walked left to right. Flag-only characters continue; the first
+    value-taking option consumes the rest of the token, or the next token when no attached value
+    remains. Returning the consumed option and end position gives both wrapper peeling and command
+    string discovery one getopt-correct parser.
+    """
+    token = segment[position]
+    value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(executable_name, frozenset())
+    string_options = _STRING_COMMAND_OPTIONS.get(executable_name, ())
+    all_options = value_options | set(string_options)
+
+    if token.startswith("--"):
+        name, separator, attached = token.partition("=")
+        if name not in all_options:
+            return None, None, position + 1
+        if separator:
+            return name, attached, position + 1
+        value = segment[position + 1] if position + 1 < len(segment) else None
+        return name, value, min(position + 2, len(segment))
+
+    if not token.startswith("-") or token == "-":
+        return None, None, position + 1
+    short_options = token[1:]
+    for offset, character in enumerate(short_options):
+        name = f"-{character}"
+        if name not in all_options:
+            continue
+        attached = short_options[offset + 1:]
+        if attached:
+            return name, attached, position + 1
+        value = segment[position + 1] if position + 1 < len(segment) else None
+        return name, value, min(position + 2, len(segment))
+    return None, None, position + 1
+
+
+def _iter_option_values(
+    segment: list[str], start: int, option: str, *, stop: Optional[int] = None,
+) -> Iterator[str]:
+    """Yield values given to *option* before the wrapped command operand begins."""
+    limit = len(segment) if stop is None else min(stop, len(segment))
+    position = start + 1
+    while position < limit:
+        matched_option, value, option_end = _getopt_value_option(
+            segment, position, _executable_name(segment[start]),
+        )
+        if matched_option is not None:
+            if matched_option == option and value is not None:
+                yield value
+            position = option_end
+            continue
+        position += 1
+
+
+def _sudo_shell_mode(segment: list[str], start: int, end: int) -> bool:
+    """True when sudo's options before *end* may include ``-s``/``-i`` (shell mode).
+
+    Deliberately generous: any ``s``/``i`` in a short-option token counts, so an attached value
+    such as ``-usi`` over-flags rather than hiding a shell-mode payload.
+    """
+    for token in segment[start + 1:end]:
+        if token in {"--shell", "--login"}:
+            return True
+        if token.startswith("-") and not token.startswith("--") and ("s" in token or "i" in token):
+            return True
+    return False
+
+
+def _doas_shell_mode(segment: list[str], start: int, end: int) -> bool:
+    """True when doas has selected shell mode (``-s``) before its command tail."""
+    return any(token == "-s" or (token.startswith("-") and not token.startswith("--") and "s" in token)
+               for token in segment[start + 1:end])
+
+
+def _runuser_command_mode(segment: list[str], start: int) -> bool:
+    """True only when runuser provably runs ``-u USER COMMAND`` (execvp, no shell).
+
+    Any unknown option leaves the mode unproven, so the caller keeps the fail-closed shell reading.
+    """
+    position = start + 1
+    while position < len(segment):
         token = segment[position]
-        if token == option and position + 1 < len(segment):
-            yield segment[position + 1]
-        elif token.startswith(prefix):
-            yield token[len(prefix):]
+        if token == "--":
+            return False
+        matched_option, _, option_end = _getopt_value_option(segment, position, "runuser")
+        if matched_option in {"-u", "--user"}:
+            return True
+        if matched_option is None and token.startswith("-") and token != "-" and \
+                not _getopt_token_recognized(token, "runuser"):
+            return False
+        position = option_end if matched_option is not None else position + 1
+    return False
+
+
+def _iter_shell_tail_payloads(segment: list[str], start: int) -> Iterator[str]:
+    """Yield every possible shell payload of an su/runuser invocation at *start*.
+
+    util-linux su/runuser parse with a permuting ``getopt_long`` (``-c`` may follow the user
+    operand), and ``run_shell`` hands every argument left after the user, including everything
+    after ``--``, to the target shell. No token after the wrapper is a safe stop, so the option scan
+    is unbounded and, unless ``runuser -u`` provably execs a command directly, every later token
+    (and every attached ``-c``/``--command=`` value) is scanned as shell source.
+    """
+    name = _executable_name(segment[start])
+    seen: set[str] = set()
+
+    def once(value: str) -> Iterator[str]:
+        if value and value not in seen:
+            seen.add(value)
+            yield value
+
+    for option in _STRING_COMMAND_OPTIONS.get(name, ()):
+        for value in _iter_option_values(segment, start, option):
+            yield from once(value)
+    if name == "runuser" and _runuser_command_mode(segment, start):
+        return
+    for token in segment[start + 1:]:
+        yield from once(token)
+        if token.startswith("--"):
+            _, separator, attached = token.partition("=")
+            if separator:
+                yield from once(attached)
+        elif token.startswith("-"):
+            # Clustered/attached short forms: ``-c{cmd}``, ``-fc{cmd}``, ``-lc{cmd}``.
+            for offset, character in enumerate(token[1:], start=2):
+                if character == "c":
+                    yield from once(token[offset:])
 
 
 def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
@@ -727,22 +1269,82 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
 
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
+    if executable == "heavy-slot":
+        # A bare name does NOT earn the exception. Resolve it only to keep the fallback strict,
+        # including a different script on PATH; use the existing passive resolver, never execute it.
+        from hermes_platform.resolver import locate_command
+
+        resolution = locate_command(executable)
+        if resolution.command:
+            yield from _resolved_or_nothing(resolution.command[0], cwd)
+        return
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
         yield from _resolved_or_nothing(executable, cwd)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
-    original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
-    a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
+def _iter_heavy_slot_fallback_refusals(command: str) -> Iterator[str]:
+    """Yield named refusals for heavy-slot invocations with an ambiguous command boundary."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
-        peeled = _peel_transparent_prefixes(segment, index)
-        if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+        positions, complete, _ = _prefix_positions(segment, index, allow_heavy_slot=False)
+        if not complete and positions[-1] < len(segment):
+            # Identify helpers even beyond the scan limit, without changing ordinary wrapper
+            # behavior. Each chunk advances strictly through the segment's finite token list.
+            chain = positions
+            while True:
+                if any(
+                    position < len(segment)
+                    and (_executable_name(segment[position]) == "heavy-slot"
+                         or _installed_heavy_slot_path(segment[position]))
+                    for position in chain
+                ):
+                    yield "the heavy-slot command wrapper chain exceeds the prefix scan budget"
+                    break
+                if complete or chain[-1] >= len(segment):
+                    break
+                chain, complete, _ = _prefix_positions(segment, chain[-1], allow_heavy_slot=False)
+        for position in positions:
+            if position >= len(segment):
+                continue
+            if (_executable_name(segment[position]) != "heavy-slot"
+                    and not _installed_heavy_slot_path(segment[position])):
+                continue
+            _, reason = _heavy_slot_fallback_command_index(segment, position)
+            if reason:
+                yield reason
+
+
+def _iter_referenced_shell_scripts(
+    command: str, *, cwd: Optional[str] = None, allow_heavy_slot: bool = True,
+) -> Iterator[Path]:
+    """Scan every wrapper reference, except the identity-trusted, exact-grammar heavy-slot helper.
+
+    Remote callbacks cannot attest the installed local helper's identity, so keep them strict.
+    """
+    for segment in _iter_command_segments(command):
+        index = _command_token_index(segment)
+        if index is None:
+            continue
+        positions, complete, boundaries = _prefix_positions(
+            segment, index, allow_heavy_slot=allow_heavy_slot,
+        )
+        if allow_heavy_slot and not complete:
+            # An exhausted chain gets exactly the pre-heavy-slot walk: the helper is a normal
+            # executable, so its source stays in the strict scan set and earns no peel benefit.
+            positions, _, boundaries = _prefix_positions(segment, index, allow_heavy_slot=False)
+        # Positions after an unrecognized wrapper option are all possible command starts.
+        positions = positions + [
+            position for position in _ambiguous_positions(segment, positions, boundaries)
+            if position not in positions
+        ]
+        for position in positions:
+            if position >= len(segment):
+                continue
+            if allow_heavy_slot and complete and _heavy_slot_command_index(segment, position) is not None:
+                continue
+            yield from _references_at(segment, position, cwd)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -752,11 +1354,49 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
         index = _command_token_index(segment)
         if index is None:
             continue
-        # Read at the ORIGINAL token: peeling past `su`/`env` would discard the command option.
-        for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[index]), ()):
-            yield from _iter_option_values(segment, index, option)
+        positions, _, boundaries = _prefix_positions(segment, index)
+        for position_index, position in enumerate(positions):
+            if position >= len(segment):
+                continue
+            name = _executable_name(segment[position])
+            if name in _SHELL_TAIL_WRAPPERS:
+                yield from _iter_shell_tail_payloads(segment, position)
+                continue
+            next_position = positions[position_index + 1] if position_index + 1 < len(positions) else None
+            if name == "sudo" and next_position is not None and _sudo_shell_mode(segment, position, next_position):
+                # ``sudo -s|-i CMD...`` joins its operands into ``$SHELL -c``; scan each one as source.
+                yield from segment[next_position:]
+            if name == "doas" and next_position is not None and _doas_shell_mode(segment, position, next_position):
+                # ``doas -s CMD...`` likewise feeds its command tail to a shell.
+                yield from segment[next_position:]
+            # Bound the option scan only where the program itself stops parsing options: a proven
+            # boundary (every option before it recognized, or ended by ``--``) whose next token is
+            # a real command name. An option-shaped "command" (``env -i -- -S ...``) is not proven.
+            proven = (
+                position_index < len(boundaries) and boundaries[position_index]
+                and next_position is not None and next_position < len(segment)
+                and not segment[next_position].startswith("-")
+            )
+            stop = next_position if proven else None
+            for option in _STRING_COMMAND_OPTIONS.get(name, ()):
+                yield from _iter_option_values(segment, position, option, stop=stop)
+        ambiguous = _ambiguous_positions(segment, positions, boundaries)
+        for position in ambiguous:
+            # Any later token may be the real command: treat each wrapper/shell there unbounded.
+            name = _executable_name(segment[position])
+            if name in _SHELL_TAIL_WRAPPERS:
+                yield from _iter_shell_tail_payloads(segment, position)
+                continue
+            for option in _STRING_COMMAND_OPTIONS.get(name, ()):
+                yield from _iter_option_values(segment, position, option)
+            if name in _SHELL_EXECUTABLES:
+                arguments = segment[position + 1:]
+                for arg_index, argument in enumerate(arguments[:-1]):
+                    if argument in _SHELL_COMMAND_FLAGS:
+                        yield arguments[arg_index + 1]
+                        break
         index = _executed_command_index(segment)
-        if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
+        if index is None or index in ambiguous or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue
         arguments = segment[index + 1 :]
         for arg_index, argument in enumerate(arguments[:-1]):
@@ -812,6 +1452,8 @@ def _read_referenced_script_unlocked(
     See #88052.
     """
     byte_limit = _capped_read_limit(max_bytes)
+    if _is_fail_closed_device_path(str(path)):
+        return None, True
     if _on_cloud_path(path):
         return None, True
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
@@ -888,81 +1530,128 @@ def _sanitize_remote_script_text(
     return text, False
 
 
-def _read_script_for_scanning(script_path: str) -> str:
-    """Read a cron script with the bounded scanner. Non-regular/oversized inputs fail closed via a
-    lifecycle-shaped sentinel; missing/unreadable paths stay empty so scheduler validation reports
-    them."""
+def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
+    """``(text, refusal)``: read a cron script with the bounded scanner. Non-regular/oversized/live
+    SQLite inputs fail closed with a NAMED *refusal* (never a lifecycle-shaped verdict); missing or
+    unreadable paths stay empty so scheduler validation reports them."""
     resolved = _resolve_script_path(script_path)
     if resolved is None:
-        return ""
+        return "", None
     script_text, unsafe = _read_referenced_script(resolved)
     if unsafe:
-        return "hermes gateway restart"
-    return script_text or ""
+        return "", _unreadable_reason(resolved)
+    return script_text or "", None
 
 
 # --- recursive walk ---------------------------------------------------------------------------
 
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
-    read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
 ) -> bool:
+    """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
+    (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
+    depth, size, device, live SQLite, cloud) is "nothing to scan" there, never a block (#113944)."""
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
-        return _budget_exhausted("text", depth)
+        return _budget_exhausted(budget, "text", depth) if executed else False
     if _direct_lifecycle_scan(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
-        return True
+        return executed
 
-    def recurse(text: str, cwd: Optional[str]) -> bool:
+    def recurse(text: str, cwd: Optional[str], executed: bool) -> bool:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
-            read_remote_script=read_remote_script,
+            read_remote_script=read_remote_script, executed=executed,
         )
 
-    for payload in _iter_shell_command_payloads(command):
-        if recurse(payload, cwd):
+    # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
+    # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
+    # oversized data file mentioned there otherwise fails closed as a "script".
+    from tools.shell_heredoc import strip_inert_heredoc_bodies
+
+    walk_command = strip_inert_heredoc_bodies(command)
+
+    wrapper_refusal = next(_iter_heavy_slot_fallback_refusals(walk_command), None) if executed else None
+
+    for payload in _iter_shell_command_payloads(walk_command):
+        if recurse(payload, cwd, executed):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    # Paths named only inside a masked body are still READ: an interpreter body that hands
+    # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
+    # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
+    # trip them. Executed candidates come first so a mention never starves a real script's budget.
+    allow_heavy_slot = read_remote_script is None
+    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(
+        walk_command, cwd=cwd, allow_heavy_slot=allow_heavy_slot,
+    )]
+    if walk_command != command:
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts(
+            command, cwd=cwd, allow_heavy_slot=allow_heavy_slot,
+        )]
+
+    for script_path, candidate_executed in candidates:
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
-            return True
+            if candidate_executed:
+                return _refuse_unreadable(
+                    budget, script_path,
+                    f"`{script_path}` lives on a cloud-synced path (iCloud Drive / "
+                    "~/Library/CloudStorage) that the guard refuses to open",
+                )
+            continue
         resolved = _resolve_lenient(script_path)
         if resolved in visited:
             continue
         if not budget.charge_path():
-            return _budget_exhausted("paths", depth)
+            if candidate_executed:
+                return _budget_exhausted(budget, "paths", depth)
+            break  # remaining candidates are all mentions
         visited.add(resolved)
         # Never read more than the walk can still afford to tokenize; a file larger than the
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
-            return True
+            if candidate_executed:
+                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+            continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
             # local read — sanitize identically (binary skip + size fail-closed).
             if not budget.charge_remote_read():
-                return _budget_exhausted("remote reads", depth)
+                if candidate_executed:
+                    return _budget_exhausted(budget, "remote reads", depth)
+                break
             script_text, unsafe = _sanitize_remote_script_text(
                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
             if unsafe:
-                return True
+                if candidate_executed:
+                    return _refuse_unreadable(
+                        budget, script_path,
+                        f"`{script_path}` read from the backend exceeds the scan cap "
+                        f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget",
+                    )
+                continue
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's directory, not the cwd.
-        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd):
+        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed):
             return True
+    if wrapper_refusal is not None:
+        return _refuse_named(budget, wrapper_refusal)
     return False
 
 
-def contains_gateway_lifecycle_command_or_referenced_script(
+def scan_gateway_lifecycle(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
-) -> bool:
-    """Detect lifecycle/submit commands, including bounded nested scripts.
+) -> tuple[bool, Optional[str]]:
+    """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
+    size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
+    real lifecycle command or the command is allowed.
 
     Total by construction: never raises. Direct scans are pure string ops; the referenced-script
     walk (filesystem, remote backends, shlex on decoded bytes) is best-effort defense-in-depth — an
@@ -973,11 +1662,13 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     every terminal command until the gateway restarts (#77780, #78256), which is strictly worse than either
     verdict.
     """
+    budget = _LifecycleScanBudget()
     try:
-        return _contains_unsafe_gateway_action(
-            command, cwd=cwd, depth=0, visited=set(), budget=_LifecycleScanBudget(),
+        unsafe = _contains_unsafe_gateway_action(
+            command, cwd=cwd, depth=0, visited=set(), budget=budget,
             read_remote_script=read_remote_script,
         )
+        return unsafe, budget.refusal if unsafe else None
     except Exception:
         logger.warning(
             "lifecycle guard referenced-script walk failed; "
@@ -985,10 +1676,20 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             exc_info=True,
         )
         try:
-            return _direct_lifecycle_scan(command)
+            return _direct_lifecycle_scan(command), None
         except Exception:
             # If even the data-argument masker fails, fall to raw regex + submit scan: stay total.
-            return contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(command)
+            return (contains_gateway_lifecycle_command(command)
+                    or contains_launchctl_submit_command(command)), None
+
+
+def contains_gateway_lifecycle_command_or_referenced_script(
+    command: str, *, cwd: Optional[str] = None,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+) -> bool:
+    """Detect lifecycle/submit commands, including bounded nested scripts (see
+    ``scan_gateway_lifecycle`` for the contract)."""
+    return scan_gateway_lifecycle(command, cwd=cwd, read_remote_script=read_remote_script)[0]
 
 
 def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None) -> None:
@@ -998,6 +1699,7 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
     propagate."""
     combined = prompt or ""
     python_script = False
+    refusal: Optional[str] = None
     if script:
         resolved_script = _resolve_script_path(script)
         # Attribute the refusal correctly: not a lifecycle command, but a cloud path never opened.
@@ -1016,24 +1718,34 @@ def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None)
                 "(e.g. ~/.hermes/scripts/) and recreate the job."
             )
         python_script = resolved_script is not None and resolved_script.suffix == ".py"
-        script_text = _read_script_for_scanning(script)
+        script_text, refusal = _read_script_for_scanning(script)
         if script_text:
             combined = f"{combined}\n{script_text}"
 
-    if python_script:
+    if refusal:
+        unsafe = True
+    elif python_script:
         # Python runs via the interpreter, never a POSIX shell, and the shell reference walk is a
         # false-positive generator on Python sources (pathlib "/" resolves to the filesystem root).
-        # The regex still scans the full text; non-regular/oversized files fail closed (sentinel).
+        # The regex still scans the full text; non-regular/oversized files fail closed above (named refusal).
         # The data-exemption masker tokenizes with shlex, so it is charged against the walk budget.
         # The direct command regex below still scans the full text, so a literal `hermes gateway restart`
         # embedded in a .py script is still blocked. See #77131, #78398.
-        if not _LifecycleScanBudget().charge_text(combined):
-            unsafe = _budget_exhausted("text", 0)
+        budget = _LifecycleScanBudget()
+        if not budget.charge_text(combined):
+            unsafe = _budget_exhausted(budget, "text", 0)
+            refusal = budget.refusal
         else:
             unsafe = _lifecycle_command_scan_with_data_exemption(combined)
     else:
-        unsafe = contains_gateway_lifecycle_command_or_referenced_script(
+        unsafe, refusal = scan_gateway_lifecycle(
             combined, cwd=_resolve_script_directory(script) if script else None
+        )
+    if unsafe and refusal:
+        raise GatewayLifecycleBlocked(
+            f"Blocked: the lifecycle guard could not scan this cron job or referenced script: {refusal}. "
+            "Nothing in the job is known to contain a gateway lifecycle command, but a script "
+            "the job executes must be scannable (a regular text file under 1 MiB) before it can run."
         )
     if unsafe:
         raise GatewayLifecycleBlocked(

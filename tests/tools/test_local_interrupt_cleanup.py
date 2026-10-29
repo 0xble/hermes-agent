@@ -11,6 +11,7 @@ to the python process, sleep 300 survived with PPID=1 for the full 300 s
 because _wait_for_process never got to call _kill_process before python
 died.  See commit message for full context.
 """
+import contextlib
 import os
 import signal
 import subprocess
@@ -41,19 +42,24 @@ def _pgid_still_alive(pgid: int) -> bool:
 
 def _process_group_snapshot(pgid: int) -> str:
     """Return a process-table snapshot for diagnostics."""
-    return subprocess.run(
-        ["ps", "-o", "pid,ppid,pgid,stat,cmd", "-g", str(pgid)],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
+    import psutil
+
+    members = []
+    for proc in psutil.process_iter(["pid", "ppid", "status", "cmdline"]):
+        try:
+            if os.getpgid(proc.pid) == pgid:
+                members.append(f"{proc.pid} {proc.info['ppid']} {pgid} "
+                               f"{proc.info['status']} {proc.info['cmdline']}")
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            continue
+    return "\n".join(members)
 
 
 def _wait_for_pgid_exit(pgid: int, timeout: float = 60.0) -> bool:
-    """Wait for a process group to disappear under loaded xdist hosts.
+    """Wait for a process group to disappear under loaded CI hosts.
 
     The cleanup chain is: SIGTERM → 3s TimeoutStopSec → SIGKILL → reap.
-    Under heavy xdist load (40 parallel workers, 6-shard CI), the full
+    Under heavy parallel-test load (40 workers, 6-shard CI), the full
     sequence can exceed 10s. Default timeout is generous to avoid CI
     flakes; in practice the wait returns in <1s on quiet hosts.
     """
@@ -65,6 +71,7 @@ def _wait_for_pgid_exit(pgid: int, timeout: float = 60.0) -> bool:
     return not _pgid_still_alive(pgid)
 
 
+@pytest.mark.platforms("linux")
 def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
     """If the shell wrapper exits before cleanup, still kill its process group.
 
@@ -97,15 +104,13 @@ def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
     assert killpg_calls == [(67890, signal.SIGTERM), (67890, 0)]
 
 
+@pytest.mark.platforms("linux")
 def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
     """When KeyboardInterrupt arrives mid-poll, the subprocess group must be
     killed before the exception is re-raised."""
     env = LocalEnvironment(cwd="/tmp")
     try:
         result_holder = {}
-        proc_holder = {}
-        started = threading.Event()
-        raise_at = [None]  # set by the main thread to tell worker when
 
         # Drive execute() on a separate thread so we can SIGNAL-interrupt it
         # via a thread-targeted exception without killing our test process.
@@ -115,7 +120,7 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             # that goes through _wait_for_process.
             try:
                 result_holder["result"] = env.execute("sleep 30", timeout=60)
-            except BaseException as e:  # noqa: BLE001 — we want to observe it
+            except BaseException as e:
                 result_holder["exception"] = type(e).__name__
 
         t = threading.Thread(target=worker, daemon=True)
@@ -141,6 +146,7 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
                 # Fall back to ps
                 ps = subprocess.run(
                     ["ps", "-eo", "pid,ppid,pgid,cmd"], capture_output=True, text=True,
+                    check=False,
                 )
                 for line in ps.stdout.splitlines():
                     if "sleep 30" in line and "grep" not in line:
@@ -173,13 +179,13 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
 
         # Give the worker a moment to: hit the exception at the next poll,
         # run the except-block cleanup (_kill_process), and exit.  Under
-        # xdist load the SIGTERM → 3s wait → SIGKILL chain can take longer
+        # heavy load the SIGTERM → 3s wait → SIGKILL chain can take longer
         # than 5s before the worker's join() returns; bumped to 15s.
         t.join(timeout=30.0)
         assert not t.is_alive(), "worker didn't exit within 30 s of the interrupt"
 
         # The critical assertion: the subprocess GROUP must be dead.  Not
-        # just the bash wrapper — the 'sleep 30' child too. Under xdist load,
+        # just the bash wrapper — the 'sleep 30' child too. Under heavy load,
         # process-group disappearance can lag briefly after the worker exits,
         # especially if the process is already dying or waiting to be reaped.
         assert _wait_for_pgid_exit(pgid), (
@@ -200,3 +206,220 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             env.cleanup()
         except Exception:
             pass
+
+
+def _descendant_running(marker: str):
+    import psutil
+    for p in psutil.Process(os.getpid()).children(recursive=True):
+        try:
+            if marker in " ".join(p.cmdline()):
+                return p
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return None
+
+
+def test_exit_cleanup_kills_foreground_command_still_running(monkeypatch):
+    """The host-exit funnel (CLI, one-shot, messaging gateway, serve atexit) must take an
+    in-flight foreground command's process group with it: it runs in its own session, so
+    the host exiting mid-command would otherwise orphan it to init."""
+    from tools import terminal_tool_lifecycle
+
+    monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", list)
+    env = LocalEnvironment(cwd="/tmp")
+    result: dict = {}
+    t = threading.Thread(target=lambda: result.update(env.execute("sleep 3517", timeout=600)), daemon=True)
+    try:
+        t.start()
+        deadline = time.monotonic() + 20.0
+        while (proc := _descendant_running("sleep 3517")) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert proc is not None, "test setup: foreground sleep never started"
+        pgid = os.getpgid(proc.pid)
+
+        terminal_tool_lifecycle.cleanup_all_environments()
+
+        assert _wait_for_pgid_exit(pgid, timeout=15.0), (
+            f"foreground command survived exit cleanup:\n{_process_group_snapshot(pgid)}")
+        t.join(timeout=15.0)
+        assert not t.is_alive() and result.get("returncode") not in (None, 0), result
+    finally:
+        with contextlib.suppress(Exception):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        env.cleanup()
+
+
+def test_graceful_cleanup_allows_a_later_foreground_command(monkeypatch):
+    """Cleanup can run in-process without permanently refusing later terminal work."""
+    from tools import terminal_tool_lifecycle
+
+    monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", lambda: [])
+    env = LocalEnvironment(cwd="/tmp")
+    try:
+        terminal_tool_lifecycle.cleanup_all_environments()
+        result = env.execute("printf 'after cleanup'", timeout=10)
+        assert result["returncode"] == 0
+        assert "after cleanup" in result["output"]
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.parametrize("same_thread", [False, True])
+def test_graceful_cleanup_does_not_wait_forever_for_a_spawn(monkeypatch, same_thread):
+    """A stalled spawn, including a signal-like same-thread cleanup, cannot hang teardown."""
+    from tools.environments import base
+
+    env = LocalEnvironment(cwd="/tmp")
+    entered = threading.Event()
+    release = threading.Event()
+    real_run_bash = env._run_bash
+    durations = []
+    results = []
+
+    def cleanup():
+        start = time.monotonic()
+        base.kill_live_foreground_processes()
+        durations.append(time.monotonic() - start)
+
+    def gated(command, **kwargs):
+        if "printf stalled" in command:
+            entered.set()
+            if same_thread:
+                cleanup()
+            else:
+                assert release.wait(10), "test setup: stalled spawn was not released"
+        return real_run_bash(command, **kwargs)
+
+    monkeypatch.setattr(env, "_run_bash", gated)
+    worker = threading.Thread(target=lambda: results.append(env.execute("printf stalled", timeout=20)), daemon=True)
+    try:
+        worker.start()
+        assert entered.wait(10), "test setup: spawn never reached the gate"
+        if not same_thread:
+            cleanup()
+        else:
+            worker.join(2.0)
+        assert len(durations) == 1 and durations[0] < 2.0, durations
+    finally:
+        release.set()
+        worker.join(10)
+        env.cleanup()
+    assert not worker.is_alive() and results[0]["returncode"] == 0, results
+
+
+@pytest.mark.live_system_guard_bypass  # teardown races the worker's final kill of its own child
+def test_graceful_exit_kills_foreground_spawn_before_publication(monkeypatch):
+    """Exit cleanup must not miss a child born before it snapshots the live commands."""
+    from tools import terminal_tool_lifecycle
+
+    monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", lambda: [])
+    env = LocalEnvironment(cwd="/tmp")
+    spawned = threading.Event()
+    release = threading.Event()
+    result = {}
+    real_run_bash = env._run_bash
+    proc_holder = []
+
+    def gated(command, **kwargs):
+        proc = real_run_bash(command, **kwargs)
+        if "sleep 3518" in command:
+            proc_holder.append(proc)
+            spawned.set()
+            assert release.wait(20), "test setup: spawn gate was not released"
+        return proc
+
+    monkeypatch.setattr(env, "_run_bash", gated)
+    worker = threading.Thread(target=lambda: result.update(env.execute("sleep 3518", timeout=600)), daemon=True)
+    cleanup = threading.Thread(target=terminal_tool_lifecycle.cleanup_all_environments, daemon=True)
+    try:
+        worker.start()
+        assert spawned.wait(20), "test setup: foreground command never spawned"
+        pgid = os.getpgid(proc_holder[0].pid)
+        cleanup.start()
+        # Allow cleanup to enter the live-process snapshot before registration.
+        time.sleep(0.2)
+        release.set()
+        cleanup.join(timeout=15)
+        assert not cleanup.is_alive(), "exit cleanup did not complete"
+        assert _wait_for_pgid_exit(pgid, timeout=15), (
+            f"foreground command survived exit cleanup:\n{_process_group_snapshot(pgid)}")
+        worker.join(timeout=15)
+        assert not worker.is_alive() and result.get("returncode") not in (None, 0), result
+    finally:
+        release.set()
+        if proc_holder:
+            with contextlib.suppress(Exception):
+                os.killpg(os.getpgid(proc_holder[0].pid), signal.SIGKILL)
+        env.cleanup()
+
+
+# Child for the hard-exit race tests: it really os._exit()s right after the kill, like the watchdogs.
+_HARD_EXIT_RACE_CHILD = r"""
+import os, sys, threading
+from tools.environments import base
+from tools.environments.local import LocalEnvironment
+scenario, cmd = sys.argv[1], sys.argv[2]
+env = LocalEnvironment(cwd=os.getcwd())
+if scenario == "spawn_before_publish":
+    spawned, release = threading.Event(), threading.Event()
+    real_run_bash = LocalEnvironment._run_bash
+    def gated(self, command, **kw):
+        proc = real_run_bash(self, command, **kw)
+        if cmd in command:
+            spawned.set()
+            release.wait(10)  # barrier: the child exists, it is not published yet
+        return proc
+    LocalEnvironment._run_bash = gated
+    threading.Thread(target=env.execute, args=(cmd,), kwargs={"timeout": 600}, daemon=True).start()
+    assert spawned.wait(20)
+    threading.Timer(0.2, release.set).start()  # registration lands while the killer is in flight
+    base.kill_live_foreground_processes(now=True)
+else:  # launch_after_fence
+    base.kill_live_foreground_processes(now=True)
+    t = threading.Thread(target=env.execute, args=(cmd,), kwargs={"timeout": 600}, daemon=True)
+    t.start()
+    t.join(3)
+os._exit(0)
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+@pytest.mark.live_system_guard_bypass  # a red run must reap survivors reparented to init
+@pytest.mark.parametrize("scenario", ["spawn_before_publish", "launch_after_fence"])
+def test_hard_exit_leaves_no_foreground_survivor_around_the_spawn(scenario, tmp_path):
+    """A hard exit must own every foreground child: one spawned but not yet registered when the kill
+    runs, and one launched after the kill took its snapshot (the exit fence refuses it)."""
+    import sys
+
+    import psutil
+
+    cmd = f"sleep {35000 + os.getpid() % 1000}.{len(scenario)}"
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    r = subprocess.run([sys.executable, "-c", _HARD_EXIT_RACE_CHILD, scenario, cmd], cwd=str(tmp_path),
+                       env={**os.environ, "PYTHONPATH": repo}, capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode == 0, r.stderr[-2000:]
+    time.sleep(0.3)
+    survivors = [p for p in psutil.process_iter(["cmdline"]) if cmd in " ".join(p.info["cmdline"] or [])]
+    for p in survivors:
+        with contextlib.suppress(psutil.Error):
+            p.kill()
+    assert not survivors, f"{scenario}: {[' '.join(p.info['cmdline']) for p in survivors]} outlived the hard exit"
+
+
+def test_hard_exit_kill_never_blocks_on_a_slow_remote_cancel(monkeypatch):
+    """Modal/Daytona/Vercel cancel through a blocking SDK call; the hard-exit kill runs just before
+    os._exit, so it must give those one short deadline instead of waiting them out."""
+    from tools.environments import base
+    from tools.environments.base_output import _ThreadedProcessHandle
+
+    class _SdkEnv:  # the kill every SDK backend inherits: proc.kill() -> cancel_fn
+        _kill_process = base.BaseEnvironment._kill_process
+        _force_kill_process = base.BaseEnvironment._force_kill_process
+
+    cancelled = threading.Event()
+    handle = _ThreadedProcessHandle(lambda: ("", 0), cancel_fn=lambda: (cancelled.set(), time.sleep(8)))
+    monkeypatch.setitem(base._live_foreground, id(handle), (_SdkEnv(), handle))
+    t0 = time.monotonic()
+    base.kill_live_foreground_processes(now=True)
+    elapsed = time.monotonic() - t0
+    assert cancelled.is_set() and elapsed < 1.0, f"blocked {elapsed:.2f}s"

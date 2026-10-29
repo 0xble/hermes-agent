@@ -17,8 +17,41 @@ DEFAULT_KEEP_LAST = 2
 #: Hard ceiling so a fat-fingered ``/compress here 9999`` clamps instead of no-op'ing.
 MAX_KEEP_LAST = 100
 
+#: ``/compress --level N`` range: 1 is the configured compression, each higher level keeps less verbatim.
+MAX_COMPRESS_LEVEL = 3
 
-def parse_partial_compress_args(raw_args: str) -> Tuple[bool, int, Optional[str]]:
+
+def extract_compress_level(raw_args: str) -> Tuple[str, int]:
+    """Strip ``--level N`` / ``--level=N`` (anywhere in the string) and return ``(remaining_args, level)``.
+
+    A missing or unparseable value means level 1; out-of-range values clamp to ``[1, MAX_COMPRESS_LEVEL]``.
+    """
+    tokens = (raw_args or "").split()
+    kept: List[str] = []
+    level = 1
+    i = 0
+    while i < len(tokens):
+        low = tokens[i].lower()
+        if low == "--level":
+            level = _coerce_level(tokens[i + 1] if i + 1 < len(tokens) else "")
+            i += 2
+            continue
+        if low.startswith("--level="):
+            level = _coerce_level(low.split("=", 1)[1])
+        else:
+            kept.append(tokens[i])
+        i += 1
+    return " ".join(kept), level
+
+
+def _coerce_level(value: str) -> int:
+    try:
+        return max(1, min(int(value), MAX_COMPRESS_LEVEL))
+    except (TypeError, ValueError):
+        return 1
+
+
+def parse_partial_compress_args(raw_args: str) -> tuple[bool, int, Optional[str]]:
     """Parse the argument string after ``/compress`` into ``(partial, keep_last, focus_topic)``.
 
     ``here [N]`` / ``up to here [N]`` / ``--keep N`` / ``-k N`` / ``--keep=N`` select the
@@ -47,7 +80,7 @@ def parse_partial_compress_args(raw_args: str) -> Tuple[bool, int, Optional[str]
     return False, DEFAULT_KEEP_LAST, text or None
 
 
-def extract_compress_flags(raw_args: str) -> Tuple[str, bool, bool]:
+def extract_compress_flags(raw_args: str) -> tuple[str, bool, bool]:
     """Strip ``--preview``/``--dry-run``/``--aggressive`` (anywhere in the string) and return
     ``(remaining_args, preview, aggressive_requested)``.
 
@@ -57,7 +90,7 @@ def extract_compress_flags(raw_args: str) -> Tuple[str, bool, bool]:
     """
     preview = False
     aggressive = False
-    kept: List[str] = []
+    kept: list[str] = []
     for tok in (raw_args or "").split():
         low = tok.lower()
         if low in ("--preview", "--dry-run", "--dryrun"):
@@ -70,12 +103,13 @@ def extract_compress_flags(raw_args: str) -> Tuple[str, bool, bool]:
 
 
 def summarize_compress_preview(
-    history: List[Dict[str, Any]],
+    history: list[dict[str, Any]],
     partial: bool,
     keep_last: int,
     focus_topic: Optional[str],
     approx_tokens: int,
-) -> Dict[str, Any]:
+    level: int = 1,
+) -> dict[str, Any]:
     """Build the ``/compress --preview`` report — pure, no side effects.
 
     Shared by the CLI and the gateway slash handler so both report the numbers the real run would
@@ -103,6 +137,8 @@ def summarize_compress_preview(
         lines.append("Boundary: 'here' split would keep everything — falling back to full compression.")
     if focus_topic:
         lines.append(f'Focus topic: "{focus_topic}"')
+    if level > 1 and not effective_partial:
+        lines.append(f"Level {level}: keeps less verbatim and writes a shorter summary than plain /compress.")
     lines.append("Run the command again without --preview to apply.")
 
     return {
@@ -124,9 +160,9 @@ def _coerce_keep(value: str) -> int:
 
 
 def split_history_for_partial_compress(
-    history: List[Dict[str, Any]],
+    history: list[dict[str, Any]],
     keep_last: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split ``history`` into ``(head, tail)``: head is summarized, tail is the last ``keep_last``
     exchanges kept verbatim.
 
@@ -155,9 +191,9 @@ def split_history_for_partial_compress(
 
 
 def rejoin_compressed_head_and_tail(
-    compressed_head: List[Dict[str, Any]],
-    tail: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    compressed_head: list[dict[str, Any]],
+    tail: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Concatenate a compressed head with the verbatim tail, defending the seam's role alternation.
 
     The head compressor's output shape isn't contractually guaranteed (a plugin engine could end on

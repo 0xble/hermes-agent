@@ -39,6 +39,9 @@ class _FakeAdapter:
 
 
 def _make_runner():
+    # Match the completed startup barrier that this bare runner bypasses.
+    from hermes_cli.plugins import get_plugin_manager
+    get_plugin_manager().discover_and_load()
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
@@ -86,7 +89,6 @@ async def test_sentinel_placed_before_agent_setup():
     concurrent message sees the session as occupied."""
     runner = _make_runner()
     event = _make_event()
-    session_key = build_session_key(event.source)
 
     # Patch _handle_message_with_agent to capture state at entry
     sentinel_was_set = False
@@ -230,6 +232,57 @@ async def test_active_session_bypass_commands_dispatch_without_interrupt(
     assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages
 
 
+@pytest.mark.asyncio
+async def test_active_session_quick_alias_dispatches_to_steer_handler():
+    """Alias expansion must happen before the runner's active-session guard."""
+    runner = _make_runner()
+    runner.config.quick_commands = {
+        "s": {"type": "alias", "target": "/steer"},
+    }
+    event = _make_event(text="/s also check auth.log")
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    fake_agent.steer.return_value = True
+    runner._running_agents[session_key] = fake_agent
+
+    result = await runner._handle_message(event)
+
+    assert result is not None and "Steer queued" in result
+    fake_agent.steer.assert_called_once()
+    assert fake_agent.steer.call_args.args[0].endswith("also check auth.log")
+    fake_agent.interrupt.assert_not_called()
+    assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_active_session_quick_alias_uses_routed_profile_snapshot():
+    runner = _make_runner()
+    runner.config.quick_commands = {
+        "s": {"type": "alias", "target": "/status"},
+    }
+    runner._quick_commands_by_profile = {
+        "secondary": {
+            "s": {"type": "alias", "target": "/steer"},
+        },
+    }
+    event = _make_event(text="/s keep the secondary profile")
+    event.source.profile = "secondary"
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    fake_agent.steer.return_value = True
+    runner._running_agents[session_key] = fake_agent
+
+    result = await runner._handle_message(event)
+
+    assert result is not None and "Steer queued" in result
+    fake_agent.steer.assert_called_once()
+    assert fake_agent.steer.call_args.args[0].endswith("keep the secondary profile")
+
+
 # ------------------------------------------------------------------
 # Test 6: /stop during sentinel force-cleans and unlocks session
 # ------------------------------------------------------------------
@@ -242,19 +295,18 @@ async def test_stop_during_sentinel_force_cleans_session():
     session_key = build_session_key(event1.source)
 
     barrier = asyncio.Event()
+    agent_setup_entered = asyncio.Event()
 
     async def slow_inner(self_inner, ev, src, qk, generation):
+        agent_setup_entered.set()
         await barrier.wait()
         return "ok"
 
     with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
         task1 = asyncio.create_task(runner._handle_message(event1))
-        for _ in range(50):
-            await asyncio.sleep(0)
-            if runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
-                break
+        await asyncio.wait_for(agent_setup_entered.wait(), timeout=10)
 
-        # Sentinel should be set
+        # Sentinel should be set before the blocked agent setup.
         assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
         # Send /stop — should force-clean the sentinel
@@ -288,3 +340,160 @@ async def test_stop_during_sentinel_force_cleans_session():
 # Test 7: Shutdown skips sentinel entries
 # ------------------------------------------------------------------
     # Should not have raised on the sentinel
+
+
+def test_deferred_commands_keep_fifo_order_separate_from_prompt_queue():
+    """Deferred slash commands retain command identity and order ahead of queued text."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return None
+
+    adapter = object.__new__(_Adapter)
+    adapter._deferred_commands = {}
+    adapter._session_generations = {}
+    first = _make_event("/undo 1")
+    second = _make_event("/compress")
+    assert adapter.defer_command_until_idle("session", first) == 1
+    assert adapter.defer_command_until_idle("session", second) == 2
+    assert adapter._pop_deferred_command("session") is first
+    assert adapter._pop_deferred_command("session") is second
+    assert adapter._pop_deferred_command("session") is None
+
+
+def test_deferred_commands_are_bounded_and_generation_fenced():
+    """Overflow is rejected and an old session incarnation cannot drain its commands."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return None
+
+    adapter = object.__new__(_Adapter)
+    adapter._deferred_commands = {}
+    adapter._session_generations = {}
+    events = [_make_event(f"/undo {i}") for i in range(adapter._MAX_DEFERRED_COMMANDS_PER_SESSION)]
+    assert all(adapter.defer_command_until_idle("session", event) for event in events)
+    assert adapter.defer_command_until_idle("session", _make_event("/undo overflow")) is None
+    adapter._invalidate_deferred_commands("session")
+    assert adapter._pop_deferred_command("session") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_text", ["/new", "/reset", "/stop"])
+async def test_reset_like_commands_invalidate_deferred_queue(command_text):
+    """Every active-session replacement/stop route fences deferred commands."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return None
+        async def interrupt_session_activity(self, *args, **kwargs): pass
+        def get_pending_message(self, key): return self._pending_messages.pop(key, None)
+
+    adapter = object.__new__(_Adapter)
+    adapter._deferred_commands = {}
+    adapter._session_generations = {}
+    adapter._pending_messages = {}
+    adapter._active_sessions = {}
+    adapter.defer_command_until_idle("session", _make_event("/undo"))
+
+    runner = _make_runner()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    runner._peek_session_state = lambda _key: None
+    runner._interrupt_running_turn = lambda *_args, **_kwargs: 1
+    runner._is_session_run_current = lambda *_args: True
+    runner._thread_metadata_for_source = lambda _source: {}
+    runner._drop_turn_slot = lambda *_args, **_kwargs: None
+    runner._overflow_queue = lambda _key: []
+    runner._delivery_adapter_for = lambda _source: adapter
+
+    await runner._interrupt_and_clear_session(
+        "session", _make_event(command_text).source,
+        interrupt_reason="test", invalidation_reason=command_text,
+    )
+    assert adapter._deferred_commands == {}
+
+
+@pytest.mark.asyncio
+async def test_shutdown_invalidates_all_deferred_commands():
+    """Adapter replacement/shutdown clears deferred work and advances its generations."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _Adapter(BasePlatformAdapter):
+        name = "test"
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return None
+
+    adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    adapter.defer_command_until_idle("session", _make_event("/undo"))
+    before = adapter._session_generations["session"]
+
+    await adapter.cancel_background_tasks()
+
+    assert adapter._deferred_commands == {}
+    assert adapter._session_generations["session"] > before
+
+
+@pytest.mark.asyncio
+async def test_deferred_command_replayed_while_runner_busy_waits_for_turn_release():
+    """A deferred command replayed while the runner's turn is still running is acknowledged once
+    and runs once, after that turn releases.
+
+    The adapter drains deferred commands when its own task ends, but the runner may still own a
+    turn the adapter never saw (an internal wake admitted after /stop). Re-deferring the replay as a
+    new command re-acked and re-drained it in a tight loop, one chat message per iteration.
+    """
+    from gateway.platforms.base import BasePlatformAdapter
+    from hermes_cli.commands import resolve_command
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return {}
+
+    adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    sent = []
+
+    async def _send(**kwargs):
+        sent.append(kwargs.get("content"))
+
+    adapter._send_with_retry = AsyncMock(side_effect=_send)
+    runner = _make_runner()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    runner._delivery_adapter_for = lambda _source: adapter
+    event = _make_event("/undo 2")
+    session_key = build_session_key(event.source)
+    runner_busy = True
+    ran = []
+
+    async def handler(ev):
+        if runner_busy:
+            return await runner._dispatch_busy_slash_command(
+                ev, resolve_command("undo"), session_key, ev.source)
+        ran.append(ev.text)
+        return None
+
+    adapter.set_message_handler(handler)
+    await adapter.handle_message(event)
+    await asyncio.sleep(0.3)
+    acks = [text for text in sent if text and "scheduled" in text]
+    assert len(acks) == 1
+    assert ran == []
+
+    runner_busy = False
+    adapter.resume_deferred_commands(session_key)
+    await asyncio.sleep(0.1)
+    await adapter.cancel_background_tasks()
+    assert ran == ["/undo 2"]
+    assert len([text for text in sent if text and "scheduled" in text]) == 1

@@ -11,7 +11,6 @@ per-call script ship, tool calls as request files polled via env.execute()
 scrubbing, interpreter/cwd), tools/code_execution_rpc.py (RPC servers).
 """
 
-import base64
 import json
 import logging
 import os
@@ -30,7 +29,9 @@ from tools.registry import registry, tool_error
 
 from hermes_time import get_timezone_name
 from tools.code_execution_env import _resolve_child_cwd, _resolve_child_python
-from tools.code_execution_rpc import _rpc_poll_loop
+from tools.code_execution_rpc import (
+    _execute_checked, _private_dirs_cmd, _remote_write, _rpc_poll_loop, tool_errors_since,
+)
 from tools.tool_output_truncate import head_tail_split, truncation_notice
 
 logger = logging.getLogger(__name__)
@@ -52,14 +53,14 @@ MAX_STDERR_BYTES = 10_000    # 10 KB
 MAX_SPILLED_STDOUT_BYTES = 5_000_000
 
 
-def _truncate_stdout_text(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
+def _truncate_stdout_text(stdout_text: str) -> tuple[str, dict[str, Any]]:
     """Cap stdout by bytes (40% head / 60% tail) with explicit truncation metadata: byte counts
     ride alongside the textual marker because a client layer can miss or re-truncate it. The
     omitted middle is spilled to cache/exec and the result carries the path (recover-don't-rerun)."""
     stdout_bytes = stdout_text.encode("utf-8", errors="replace")
     total = len(stdout_bytes)
     captured = min(total, MAX_STDOUT_BYTES)
-    metadata: Dict[str, Any] = {"stdout_truncated": total > captured, "stdout_bytes_captured": captured,
+    metadata: dict[str, Any] = {"stdout_truncated": total > captured, "stdout_bytes_captured": captured,
                                 "stdout_bytes_total": total, "stdout_bytes_omitted": total - captured}
     if total <= MAX_STDOUT_BYTES:
         return stdout_bytes.decode("utf-8", errors="replace"), metadata
@@ -96,7 +97,7 @@ def _spill_full_stdout(stdout_text: str) -> Optional[str]:
         path = cache_dir / f"stdout-{digest}.txt"
         write_text_exclusive(path, stdout_text, private=False, overwrite=True)
         return str(path)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("Failed to spill execute_code stdout: %s", exc)
         return None
 
@@ -126,16 +127,16 @@ _TOOL_STUBS = {
         '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
         '{"urls": urls, "char_limit": char_limit}'),
     "read_file": ("path: str, offset: int = 1, limit: int = 2000",
-        '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""',
+        '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines"; tool errors raise HermesToolError."""',
         '{"path": path, "offset": offset, "limit": limit}'),
     "write_file": ("path: str, content: str, cross_profile: bool = False",
-        '"""Write content to a file (always overwrites). Returns dict with status."""',
+        '"""Write content to a file (always overwrites). Returns dict with status; tool errors raise HermesToolError."""',
         '{"path": path, "content": content, "cross_profile": cross_profile}'),
     "search_files": ('pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0, order: str = "discovery"',
-        '"""Search file contents (target="content") or find files by name (target="files"). Returns dict with "matches"."""',
+        '"""Search file contents (target="content") or find files by name (target="files"). Returns dict with "matches"; tool errors raise HermesToolError."""',
         '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context, "order": order}'),
     "patch": ('path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False, mode: str = "replace", patch: str = None, cross_profile: bool = False',
-        '"""Targeted find-and-replace (mode="replace") or V4A multi-file patches (mode="patch"). Returns dict with status."""',
+        '"""Targeted find-and-replace (mode="replace") or V4A multi-file patches (mode="patch"). Returns dict with status; tool errors raise HermesToolError."""',
         '{"path": path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all, "mode": mode, "patch": patch, "cross_profile": cross_profile}'),
     "terminal": ("command: str, timeout: int = None, workdir: str = None",
         '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
@@ -171,6 +172,11 @@ _FAILURE_HINT_RULES = (
     (r"TypeError: string indices must be integers|AttributeError: 'str' object has no attribute 'get'",
      lambda m, _: "Tool functions in the sandbox return DICTS (already parsed) — "
                   "do not json.loads() them or index them like strings. Example: read_file(path)['content']."),
+    (r"JSONDecodeError: (?:Extra data|Invalid control character|Expecting value)",
+     lambda _, __: "The text is not one JSON value. Do not json.loads() the entire tool output; "
+                   "use the structured dict returned by the Hermes tool or isolate one JSON value "
+                   "before parsing. For terminal/web_extract text with control characters or a BOM, "
+                   "use json_parse()."),
 )
 
 
@@ -190,7 +196,7 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
     return None
 
 
-def generate_hermes_tools_module(enabled_tools: List[str],
+def generate_hermes_tools_module(enabled_tools: list[str],
                                  transport: str = "uds") -> str:
     """Source of the hermes_tools.py stub module for SANDBOX_ALLOWED_TOOLS ∩ *enabled_tools*.
     ``transport``: ``"uds"`` (local socket client) or ``"file"`` (file RPC, remote backends)."""
@@ -204,6 +210,32 @@ def generate_hermes_tools_module(enabled_tools: List[str],
 # ---- Shared helpers section (embedded in both transport headers) ----------
 
 _COMMON_HELPERS = '''\
+
+_FILE_TOOL_NAMES = frozenset({"read_file", "write_file", "patch", "search_files"})
+
+
+class HermesToolError(RuntimeError):
+    """Raised when a sandbox file tool returns an error result."""
+
+    def __init__(self, tool_name, message):
+        self.tool_name = tool_name
+        self.message = str(message)
+        super().__init__(f"{tool_name} failed: {self.message}")
+
+
+def _parse_tool_result(tool_name, result):
+    """Parse a transport result and fail loudly on a tool error envelope."""
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    if tool_name == "read_file" and isinstance(result, dict) and result.get("content_returned") is False:
+        raise HermesToolError(tool_name, "content was not returned; retry read_file to obtain the file contents")
+    if tool_name in _FILE_TOOL_NAMES and isinstance(result, dict) and result.get("error"):
+        raise HermesToolError(tool_name, result["error"])
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Convenience helpers (avoid common scripting pitfalls)
@@ -236,6 +268,8 @@ def retry(fn, max_attempts=3, delay=2):
     for attempt in range(max_attempts):
         try:
             return fn()
+        except HermesToolError:
+            raise
         except Exception as e:
             last_err = e
             if attempt < max_attempts - 1:
@@ -284,7 +318,7 @@ def _connect():
     return _sock
 
 def _call(tool_name, args):
-    """Send a tool call to the parent process and return the parsed result."""
+    """Send a tool call to the parent process; file-tool errors raise HermesToolError."""
     request = json.dumps({
         "tool": tool_name,
         "args": args,
@@ -319,13 +353,7 @@ def _call(tool_name, args):
                 if _attempt + 1 >= _attempts:
                     raise
     raw = buf.decode().strip()
-    result = json.loads(raw)
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return result
-    return result
+    return _parse_tool_result(tool_name, json.loads(raw))
 
 '''
 
@@ -344,7 +372,7 @@ _seq_lock = threading.Lock()
 ''' + _COMMON_HELPERS + '''\
 
 def _call(tool_name, args):
-    """Send a tool call request via file-based RPC and wait for response."""
+    """Send a tool call request via file-based RPC; file-tool errors raise HermesToolError."""
     global _seq
     with _seq_lock:
         _seq += 1
@@ -358,7 +386,10 @@ def _call(tool_name, args):
     # (or any non-UTF-8 locale) the default open() mode would mangle
     # non-ASCII chars in tool args when encoding them as JSON.
     tmp = req_file + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # The request carries the RPC token and tool args: owner-only even under a
+    # permissive process umask.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump({
             "tool": tool_name,
             "args": args,
@@ -385,13 +416,7 @@ def _call(tool_name, args):
     except OSError:
         pass
 
-    result = json.loads(raw)
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return result
-    return result
+    return _parse_tool_result(tool_name, json.loads(raw))
 
 '''
 
@@ -401,7 +426,8 @@ def _call(tool_name, args):
 def _get_or_create_env(task_id: str):
     """``(env, env_type)`` — the environment the terminal/file tools share for *task_id*, created on
     first use (same double-checked per-task lock pattern as file_tools._get_file_ops)."""
-    from tools.terminal_tool_backends import _container_config_from_config, _create_environment, _ssh_config_from_config
+    from tools.terminal_tool_backends import (_container_config_from_config, _create_environment,
+                                              _local_config_from_config, _ssh_config_from_config)
     from tools.terminal_tool import (
         _active_environments, _env_lock, _get_env_config, _last_activity,
         _start_cleanup_thread, _creation_locks, _creation_locks_lock, _task_env_overrides,
@@ -438,7 +464,7 @@ def _get_or_create_env(task_id: str):
             cwd=overrides.get("cwd") or config["cwd"], timeout=config["timeout"],
             ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
             container_config=container_config,
-            local_config={"persistent": config.get("local_persistent", False)} if env_type == "local" else None,
+            local_config=_local_config_from_config(config) if env_type == "local" else None,
             task_id=effective_task_id, host_cwd=_resolve_task_host_cwd(config, task_id),
         )
         with _env_lock:
@@ -450,11 +476,38 @@ def _get_or_create_env(task_id: str):
         return env, env_type
 
 
-def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
-    """Write *content* to *remote_path* via ``echo … | base64 -d`` — some backends (Modal) don't
-    reliably deliver stdin_data to chained commands; base64 is shell-safe inside single quotes."""
-    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    env.execute(f"echo '{encoded}' | base64 -d > {shlex.quote(remote_path)}", cwd="/", timeout=30)
+def _ship_file_to_remote(env, remote_path: str, content: str, *, atomic: bool = False) -> None:
+    """Write *content* owner-only to *remote_path*; the payload rides
+    ``stdin_data``, never an ``echo`` argv (see _remote_write). Raises on write
+    failure: the caller ships secrets and code into dirs it believes are locked
+    down, so a silent failure would run the next step against a missing or
+    half-written file."""
+    _remote_write(env, remote_path, content, atomic=atomic, check=True)
+
+
+def _ship_env_file_and_launch(env, remote_dir: str, env_name: str, launch: str, *,
+                              rpc_dir: str, rpc_token: str, **extra_env: str) -> str:
+    """Ship the sandbox env (RPC dir + token, PYTHONDONTWRITEBYTECODE, the routed
+    profile's TZ, plus *extra_env*) as KEY=value lines to ``remote_dir/env_name``
+    and return the complete command that sources it inside a subshell and runs
+    *launch* there.
+
+    The subshell is load-bearing: every env.execute() runs inside the backend's
+    session wrapper, which re-dumps ``export -p`` into the shared session
+    snapshot after each command. A plain ``set -a; . file`` in the outer shell
+    would export HERMES_RPC_TOKEN/PYTHONPATH/TZ into that snapshot and re-export
+    them into every later command on the backend (the #71296 snapshot-leak
+    class). The token also stays off the remote shell's argv, which co-tenant
+    users can read via ps for the command's lifetime."""
+    env_map = {"HERMES_RPC_DIR": rpc_dir, "HERMES_RPC_TOKEN": rpc_token,
+               "PYTHONDONTWRITEBYTECODE": "1", **extra_env}
+    tz = get_timezone_name()  # routed profile's timezone, not the bridged default's
+    if tz:
+        env_map["TZ"] = tz
+    lines = "".join(f"{k}={shlex.quote(v)}\n" for k, v in env_map.items())
+    _ship_file_to_remote(env, f"{remote_dir}/{env_name}", lines)
+    return (f"cd {shlex.quote(remote_dir)} && "
+            f"( set -a && . ./{env_name} && set +a && {launch} )")
 
 
 def _env_temp_dir(env: Any) -> str:
@@ -469,7 +522,7 @@ def _env_temp_dir(env: Any) -> str:
     for candidate in (temp_dir, tempfile.gettempdir()):
         if isinstance(candidate, str) and candidate.startswith("/"):
             return candidate.rstrip("/") or "/"
-    return "/tmp"
+    return tempfile.gettempdir()
 
 
 def _format_interrupted_output(stdout_text: str) -> str:
@@ -480,7 +533,7 @@ def _format_interrupted_output(stdout_text: str) -> str:
     return f"{stdout_text}\n{marker}" if stdout_text else marker
 
 
-def _clean_output(stdout_text: str) -> Tuple[str, Dict[str, Any]]:
+def _clean_output(stdout_text: str) -> tuple[str, dict[str, Any]]:
     """Shared output pipeline: byte-cap (with spill), ANSI strip, secret redaction. code_file=True:
     output often echoes source/config — skip ENV/JSON/f-string false positives, still mask credentials."""
     from tools.ansi_strip import strip_ansi
@@ -495,9 +548,12 @@ def _with_timeout_notice(stdout_text: str, timeout_msg: str) -> str:
     return stdout_text + f"\n\n⏰ {timeout_msg}" if stdout_text else f"⏰ {timeout_msg}"
 
 
-def _error_result(error: str, *, tool_calls_made: int = 0, duration: float = 0) -> str:
-    return json.dumps({"status": "error", "error": error, "tool_calls_made": tool_calls_made,
-                       "duration_seconds": duration}, ensure_ascii=False)
+def _error_result(error: str, *, tool_calls_made: int = 0, duration: float = 0,
+                  user_summary: Optional[str] = None) -> str:
+    body = {"status": "error", "error": error, "tool_calls_made": tool_calls_made, "duration_seconds": duration}
+    if user_summary:
+        body["user_summary"] = user_summary  # one human sentence; surfaces show it before the model text
+    return json.dumps(body, ensure_ascii=False)
 
 
 def _remote_failure(exc: BaseException, exec_start: float, tool_calls_made: int) -> str:
@@ -510,12 +566,12 @@ def _remote_failure(exc: BaseException, exec_start: float, tool_calls_made: int)
 _REMOTE_EXIT_STATUS = {124: "timeout", 130: "interrupted"}
 
 
-def _remote_result(status: str, raw_stdout: str, exec_start: float, fields: Dict[str, Any],
-                   kernel: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _remote_result(status: str, raw_stdout: str, exec_start: float, fields: dict[str, Any],
+                   kernel: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Common remote reply shape: status, cleaned output, *fields*, duration, optional kernel
     info, then truncation metadata (key order is part of the result contract)."""
     stdout_text, stdout_metadata = _clean_output(raw_stdout)
-    result: Dict[str, Any] = {"status": status, "output": stdout_text, **fields,
+    result: dict[str, Any] = {"status": status, "output": stdout_text, **fields,
                               "duration_seconds": round(time.monotonic() - exec_start, 2)}
     if kernel is not None:
         result["kernel"] = kernel
@@ -523,12 +579,12 @@ def _remote_result(status: str, raw_stdout: str, exec_start: float, fields: Dict
     return result
 
 
-def _apply_timeout(result: Dict[str, Any], timeout_msg: str) -> None:
+def _apply_timeout(result: dict[str, Any], timeout_msg: str) -> None:
     result["error"] = timeout_msg
     result["output"] = _with_timeout_notice(result["output"], timeout_msg)
 
 
-def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
+def _finish_remote_kernel_result(kernel_result: dict[str, Any], *,
                                  timeout: int, exec_start: float) -> str:
     """Post-process a remote-kernel cell result into the tool's JSON reply. Timeout messaging
     mirrors the local kernel contract (kernel killed, state lost, next call fresh)."""
@@ -542,6 +598,8 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
     result = _remote_result(kernel_result.get("status", "error"), stdout_text, exec_start,
                             {"tool_calls_made": kernel_result.get("tool_calls_made", 0)},
                             kernel=kernel_result.get("kernel", {"remote": True}))
+    if kernel_result.get("tool_errors"):
+        result["tool_errors"] = kernel_result["tool_errors"]
     if result["status"] == "timeout":
         _apply_timeout(result, f"Cell timed out after {timeout}s; the remote session kernel was "
                                "killed and its state was lost. The next call starts fresh.")
@@ -550,7 +608,7 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
     return json.dumps(result, ensure_ascii=False)
 
 
-def _sandbox_tools_for(enabled_tools: Optional[List[str]]) -> frozenset:
+def _sandbox_tools_for(enabled_tools: Optional[list[str]]) -> frozenset:
     """Enabled ∩ SANDBOX_ALLOWED_TOOLS, or every sandbox tool when the intersection is empty."""
     return frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())) or SANDBOX_ALLOWED_TOOLS
 
@@ -562,10 +620,13 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
     serve file-RPC from a polling thread, run, clean up."""
     sandbox_dir = f"{_env_temp_dir(env)}/hermes_exec_{uuid.uuid4().hex[:12]}"
     quoted_sandbox_dir = shlex.quote(sandbox_dir)
-    quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
-    tool_call_counter, stop_event, rpc_thread = [0], threading.Event(), None
+    tool_call_counter, tool_call_log, stop_event, rpc_thread = [0], [], threading.Event(), None
     try:
-        env.execute(f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10)
+        # Private dirs: the sandbox lives under a shared temp dir and carries the
+        # RPC token (in req files) and tool results. Fail closed on setup
+        # failure rather than ship secrets into a dir that stayed permissive.
+        _execute_checked(env, _private_dirs_cmd(sandbox_dir, f"{sandbox_dir}/rpc"),
+                         "remote sandbox setup", timeout=10)
         rpc_token = secrets.token_urlsafe(32)
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py",
                              generate_hermes_tools_module(list(sandbox_tools), transport="file"))
@@ -575,17 +636,17 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         # See #30882.
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
-            args=(env, f"{sandbox_dir}/rpc", effective_task_id, [], tool_call_counter,
+            args=(env, f"{sandbox_dir}/rpc", effective_task_id, tool_call_log, tool_call_counter,
                   max_tool_calls, sandbox_tools, stop_event, rpc_token))
         rpc_thread.start()
-        env_prefix = (f"HERMES_RPC_DIR={quoted_rpc_dir} HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
-                      "PYTHONDONTWRITEBYTECODE=1")
-        tz = get_timezone_name()  # routed profile's timezone, not the bridged default's
-        if tz:
-            env_prefix += f" TZ={shlex.quote(tz)}"
+        # The token travels in a sourced env file, never in argv. No umask on
+        # the launch command: the 700 dirs + explicit 0600 writes cover Hermes'
+        # files, and user code keeps the remote's default file modes.
+        launch_cmd = _ship_env_file_and_launch(
+            env, sandbox_dir, "sandbox.env", "exec python3 script.py",
+            rpc_dir=f"{sandbox_dir}/rpc", rpc_token=rpc_token)
         logger.info("Executing code on %s backend (task %s)...", env_type, effective_task_id[:8])
-        script_result = env.execute(f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
-                                    timeout=timeout)
+        script_result = env.execute(launch_cmd, timeout=timeout)
         stdout_text = script_result.get("output", "") or ""
         exit_code = script_result.get("returncode", -1)
         # Backend exit codes: 124 = timeout wrapper, 130 = SIGINT.
@@ -602,6 +663,9 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
             logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
     result = _remote_result(status, stdout_text, exec_start,
                             {"exit_code": exit_code, "tool_calls_made": tool_call_counter[0]})
+    tool_errors = tool_errors_since(tool_call_log)
+    if tool_errors:
+        result["tool_errors"] = tool_errors
     if status == "timeout":
         _apply_timeout(result, f"Script timed out after {timeout}s and was killed.")
         logger.warning("execute_code (remote) timed out after %ss (limit %ss) with %d tool calls",
@@ -614,7 +678,7 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
     return json.dumps(result, ensure_ascii=False)
 
 
-def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[List[str]],
+def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[list[str]],
                     reset: bool = False) -> str:
     """Run code on the remote terminal backend: the owner's persistent remote session kernel
     (tools/code_kernel_remote.py) first, else the per-call script ship — the fail-open route when
@@ -661,7 +725,7 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[L
 def execute_code(
     code: str,
     task_id: Optional[str] = None,
-    enabled_tools: Optional[List[str]] = None,
+    enabled_tools: Optional[list[str]] = None,
     reset: bool = False,
 ) -> str:
     """Run Python in the session's persistent kernel (local) or on the remote terminal backend,
@@ -691,10 +755,29 @@ def execute_code(
     # execute_code is a straight bypass — the terminal() path refuses `launchctl bootout ai.hermes.gateway`,
     # but the identical command inside `os.system(...)` / `subprocess.run([...])` here sailed through and
     # SIGTERM'd the gateway mid-task.
+    # The identity probe ends in a kernel process query that has wedged on macOS
+    # (#111922); share the cell's own deadline and fail CLOSED when it renders no verdict.
+    from agent.deadline import run_bounded_sync
     from tools.process_registry import _is_supervised_gateway_process
-    if _is_supervised_gateway_process():
-        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+    from tools.terminal_tool import _PRE_EXEC_GUARD_MIN_TIMEOUT_S
+    _probe_timeout = max(_load_config().get("timeout", DEFAULT_TIMEOUT), _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+    _probe = run_bounded_sync(
+        _is_supervised_gateway_process, _probe_timeout, label="execute_code.lifecycle-guard",
+    )
+    if _probe.timed_out:
+        return tool_error(
+            f"execute_code lifecycle guard did not finish within {_probe_timeout}s "
+            "(process-identity probe wedged); the code was not run. Retry the call."
+        )
+    if _probe.value:
+        from cron.lifecycle_guard import (
+            HOST_INTERPRETER_KILL_REJECTION,
+            contains_gateway_lifecycle_command,
+            contains_host_interpreter_kill,
+        )
         if contains_gateway_lifecycle_command(code):
+            if contains_host_interpreter_kill(code):
+                return tool_error(HOST_INTERPRETER_KILL_REJECTION)
             return tool_error(
                 "Blocked: cannot restart or stop the gateway from inside the "
                 "gateway process. The gateway would kill this script before "
@@ -711,28 +794,30 @@ def execute_code(
     from tools.approval import check_execute_code_guard
     _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
     if not _guard.get("approved", False):
-        return _error_result(_guard.get("message") or "execute_code blocked by approval guard.")
+        return _error_result(_guard.get("message") or "execute_code blocked by approval guard.",
+                             user_summary=_guard.get("user_summary"))
     # Clear a stale interrupt bit that landed during the blocking approval-wait so it can't
     # kill the just-approved run on the first poll. A genuine post-clear interrupt re-sets it.
     if _guard.get("user_approved"):
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
+    from hermes_cli.observability.shared_metrics_loop import record_execution_backend
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools, reset=bool(reset))
+        return record_execution_backend("code", "remote", _execute_remote(code, task_id, enabled_tools, reset=bool(reset)))
     from tools.interrupt import is_interrupted as _is_interrupted
     # Session kernels are always on locally (one interpreter per conversation); the guards above
     # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
     from tools.code_kernel import execute_in_session_kernel
     _cfg = _load_config()
     _mode = _get_execution_mode()
-    return execute_in_session_kernel(
+    return record_execution_backend("code", "local", execute_in_session_kernel(
         code, task_id=task_id or "", mode=_mode, child_python=_resolve_child_python(_mode),
         child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),
         sandbox_tools=frozenset(_sandbox_tools_for(enabled_tools)),
         timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
         reset=bool(reset), is_interrupted=_is_interrupted,
-    )
+    ))
 
 
 def _kill_process_group(proc, escalate: bool = False):
@@ -800,19 +885,19 @@ _TOOL_DOC_LINES = [
      "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
      "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
     ("read_file", "  read_file(path: str, offset: int = 1, limit: int = 2000) -> dict\n"
-     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
-    ("write_file", "  write_file(path: str, content: str) -> dict\n    Always overwrites the entire file."),
+     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}; errors raise HermesToolError."),
+    ("write_file", "  write_file(path: str, content: str) -> dict\n    Always overwrites the entire file; an existing file must be read_file'd first or the write is refused. Errors raise HermesToolError."),
     ("search_files", "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50, order=\"discovery\") -> dict\n"
-     "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}"),
+     "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}; errors raise HermesToolError."),
     ("patch", "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
-     "    Replaces old_string with new_string in the file."),
+     "    Replaces old_string with new_string in the file; errors raise HermesToolError."),
     ("terminal", "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
      "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
 ]
 
 
-def build_execute_code_schema(enabled_sandbox_tools: set = None,
-                              mode: str = None) -> dict:
+def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
+                              mode: str | None = None) -> dict:
     """execute_code schema listing only *enabled_sandbox_tools* — a disabled tool (e.g. web off)
     must not appear or the model keeps trying it. ``mode`` (None → config) picks the cwd sentence."""
     if enabled_sandbox_tools is None:
@@ -825,8 +910,9 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
     import_str = ", ".join(import_examples) + ", ..." if import_examples else "..."
     if mode == "strict":
         cwd_note = (
-            "Scripts run in their own temp dir, not the session's CWD — use absolute paths "
-            "(os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files."
+            "Scripts run in their own temp dir, not the session's CWD — pass "
+            "absolute paths for any file that lives outside the session's "
+            "working directory, or use terminal()/read_file() to reach it."
         )
     else:
         cwd_note = (
@@ -847,13 +933,23 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "(N pages/files, retry on failure). Use normal tool calls for "
         "single calls, results you must reason over in full, or anything needing user interaction.\n\n"
         "Calls run in a persistent session kernel: variables, imports, and "
-        "loaded data survive across execute_code calls, so build on earlier "
-        "work instead of re-loading it. A timed-out or interrupted call loses that state.\n\n"
+        "loaded data survive across execute_code calls while the session kernel "
+        "remains cached. Local session kernels may be evicted when the local "
+        "process reaches its max_session_kernels limit; local eviction sets "
+        "kernel.state_reset=true and explains that variables must be recreated. "
+        "Remote-backed kernels share that cap but their cap eviction is not "
+        "reported; a remote kernel that died or disconnected sets "
+        "kernel.state_lost=true. Check kernel.reused=false before relying on "
+        "earlier variables. A timed-out or interrupted call loses that state.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
         "Limits: 5-minute timeout, max 50 tool calls per call. Stdout over "
         "50KB shows head/tail inline; the FULL text is auto-saved to a file whose path rides in the result.\n\n"
         f"{cwd_note}\n\n"
+        "Tool calls return parsed dicts on success. The file tools `read_file`, "
+        "`write_file`, `patch`, and `search_files` raise `HermesToolError` "
+        "when their result contains an error; other tools keep returning their "
+        "error dicts so scripts can inspect fields such as `exit_code` or `success`. "
         "Helpers require imports: `from hermes_tools import json_parse, shell_quote, retry`. "
         "json_parse(text) — tolerant "
         "json.loads for terminal() output; shell_quote(s) — shlex.quote for "
@@ -902,32 +998,3 @@ registry.register(
     handler=_execute_code_handler, check_fn=check_sandbox_requirements, emoji="🐍",
     max_result_size_chars=100_000,
 )
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import platform  # noqa: F401,E402
-import socket  # noqa: F401,E402
-import sys  # noqa: F401,E402
-
-DEFAULT_KERNEL_MODE = "session"
-
-KERNEL_MODES = ("per-call", "session")  # legacy compat constant
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'thread_scoped_silence': ('agent.thread_scoped_output', 'thread_scoped_silence'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----

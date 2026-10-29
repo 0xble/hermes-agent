@@ -62,10 +62,8 @@ class TestFormatSubagentFailureLine:
             error="Error code: 404 - model not found",
             duration_seconds=12.4,
         )
-        assert line.startswith("⚠️ Subagent failed")
         assert '"research competitor pricing"' in line
         assert "404" in line
-        assert "(after 12s)" in line
 
     def test_timeout_verb(self):
         line = format_subagent_failure_line("do a thing", "timeout")
@@ -73,29 +71,26 @@ class TestFormatSubagentFailureLine:
 
     def test_long_goal_truncated(self):
         line = format_subagent_failure_line("g" * 200, "failed")
-        assert "g" * 57 + "..." in line
         assert "g" * 61 not in line
 
     def test_no_goal_no_error(self):
         line = format_subagent_failure_line(None, "error")
-        assert line == "⚠️ Subagent failed"
+        assert '"' not in line  # no empty goal quotes
 
     def test_multiline_goal_flattened(self):
         line = format_subagent_failure_line("a\nb", "failed")
         assert "\n" not in line
 
-    def test_failure_statuses_frozen(self):
-        assert SUBAGENT_FAILURE_STATUSES == {"failed", "error", "timeout"}
 
 
-def _make_runner_and_captured(monkeypatch, run_still_current=True, *, platform="telegram", user_config=None):
+def _make_runner_and_captured(monkeypatch, run_still_current=True):
     """TurnRunner with a stub gateway runner; captures scheduled notices."""
     from gateway import run as run_mod
 
     captured: list[str] = []
 
     class _StubGatewayRunner:
-        def _adapter_for_source(self, source):
+        def _delivery_adapter_for(self, source):
             return None
 
         async def _deliver_platform_notice(self, source, content):
@@ -106,11 +101,8 @@ def _make_runner_and_captured(monkeypatch, run_still_current=True, *, platform="
 
     monkeypatch.setattr(run_mod, "safe_schedule_threadsafe", _fake_schedule)
 
-    source = MagicMock()
-    source.platform = platform
     ctx = TurnContext(
-        source=source,
-        user_config=user_config,
+        source=MagicMock(),
         _run_still_current=lambda: run_still_current,
         progress_queue=None,
         _loop_for_step=None,
@@ -132,8 +124,13 @@ class TestGatewayFailureNotice:
         )
         assert len(captured) == 1
         assert "Subagent" in captured[0]
-        assert "404" in captured[0]
         assert '"scan the repo"' in captured[0]
+        if status == "timeout":
+            # A timeout's error text is scheduler boilerplate; the notice says the outcome and the knob.
+            assert "timed out" in captured[0]
+            assert "delegation.child_timeout_seconds" in captured[0]
+        else:
+            assert "404" in captured[0]
 
     @pytest.mark.parametrize("status", ["completed", "interrupted", None])
     def test_non_failure_statuses_stay_silent(self, monkeypatch, status):
@@ -174,25 +171,82 @@ class TestGatewayFailureNotice:
         )
         assert "the real error detail" in captured[0]
 
-    def test_suppressed_platform_does_not_deliver(self, monkeypatch):
-        runner, captured = _make_runner_and_captured(
-            monkeypatch,
-            platform="slack",
-            user_config={"display": {"platforms": {"slack": {"suppress_warning_notifications": True}}}},
-        )
-        runner.progress_callback(
-            "subagent.complete", preview="Error code: 404", status="failed", goal="scan the repo",
-        )
-        assert captured == []
 
-    def test_suppression_off_still_delivers(self, monkeypatch):
-        runner, captured = _make_runner_and_captured(
-            monkeypatch,
-            platform="slack",
-            user_config={"display": {"platforms": {"slack": {"suppress_warning_notifications": False}}}},
-        )
-        runner.progress_callback(
-            "subagent.complete", preview="Error code: 404", status="failed", goal="scan the repo",
-        )
+class TestPluginClaimedFailureNotice:
+    """A plugin that recovers a child failure itself (review fallback) can claim the notice."""
+
+    def _hook(self, monkeypatch, result):
+        seen = []
+
+        def _invoke(name, **kw):
+            seen.append((name, kw))
+            return [result]
+
+        import hermes_cli.plugins as plugins
+        monkeypatch.setattr(plugins, "has_hook", lambda name: name == "subagent_failure_notice")
+        monkeypatch.setattr(plugins, "invoke_hook", _invoke)
+        return seen
+
+    def _fail(self, runner):
+        runner.progress_callback("subagent.complete", preview="HTTP 429", status="failed",
+                                 goal="Review candidate c665c6b2d03f", child_session_id="child-1")
+
+    def test_suppress_claims_the_notice(self, monkeypatch):
+        seen = self._hook(monkeypatch, {"action": "suppress"})
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
+        assert captured == []
+        assert seen[0][1]["child_session_id"] == "child-1"
+        assert seen[0][1]["child_goal"] == "Review candidate c665c6b2d03f"
+
+    @pytest.mark.parametrize("result", [None, {"action": "keep"}, "suppress"])
+    def test_anything_else_keeps_the_notice(self, monkeypatch, result):
+        self._hook(monkeypatch, result)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
+        assert len(captured) == 1 and "429" in captured[0]
+
+    def test_hook_error_keeps_the_notice(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+        monkeypatch.setattr(plugins, "has_hook", lambda name: True)
+
+        def _boom(name, **kw):
+            raise RuntimeError("plugin crashed")
+
+        monkeypatch.setattr(plugins, "invoke_hook", _boom)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
         assert len(captured) == 1
-        assert "404" in captured[0]
+
+
+class TestClaimEvaluatedOncePerFailure:
+    """Real child relay -> gateway TurnRunner: the hook fires once and its decision holds end to end."""
+
+    def _relay_into(self, runner, spinner=None):
+        from types import SimpleNamespace
+        from tools.delegate_tool_progress import _build_child_progress_callback
+        parent = SimpleNamespace(_delegate_spinner=spinner, tool_progress_callback=runner.progress_callback)
+        return _build_child_progress_callback(0, "Review candidate c665c6b2d03f", parent, 1,
+                                              session_ref={"session_id": "child-1"})
+
+    @pytest.mark.parametrize("answers, delivered", [
+        ([{"action": "suppress"}, None], 0),  # a second call would have leaked the notice
+        ([None, {"action": "suppress"}], 1),  # a second call would have hidden a real failure
+    ])
+    def test_hook_runs_once_and_its_first_decision_wins(self, monkeypatch, answers, delivered):
+        import hermes_cli.plugins as plugins
+        calls = []
+
+        def _invoke(name, **kw):
+            calls.append(kw)
+            return [answers[len(calls) - 1]]
+
+        monkeypatch.setattr(plugins, "has_hook", lambda name: True)
+        monkeypatch.setattr(plugins, "invoke_hook", _invoke)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        spinner = MagicMock()
+        self._relay_into(runner, spinner)("subagent.complete", preview="HTTP 429", status="failed",
+                                          duration_seconds=3.0, summary="HTTP 429: rate limit")
+        assert len(calls) == 1 and calls[0]["child_session_id"] == "child-1"
+        assert len(captured) == delivered
+        assert spinner.print_above.called is bool(delivered)

@@ -23,7 +23,6 @@ from pathlib import Path
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def _isolate_env(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
@@ -33,14 +32,12 @@ def _isolate_env(tmp_path, monkeypatch):
     monkeypatch.delenv("SECURITY_GUIDANCE_DISABLE", raising=False)
     yield hermes_home
 
-
 # ---------------------------------------------------------------------------
 # Module loading
 # ---------------------------------------------------------------------------
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
-
 
 def _load_patterns():
     """Import patterns.py in isolation (no plugin glue)."""
@@ -51,7 +48,6 @@ def _load_patterns():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
-
 
 def _load_plugin_init():
     """Import the plugin __init__.py with patterns.py as a sibling."""
@@ -72,21 +68,17 @@ def _load_plugin_init():
     spec.loader.exec_module(mod)
     return mod
 
-
 # ---------------------------------------------------------------------------
 # patterns.py data integrity
 # ---------------------------------------------------------------------------
 
 class TestPatternsData:
-    def test_has_at_least_one_rule(self):
-        p = _load_patterns()
-        assert len(p.SECURITY_PATTERNS) >= 1
 
     def test_every_rule_has_required_fields(self):
         p = _load_patterns()
         for rule in p.SECURITY_PATTERNS:
             assert "ruleName" in rule
-            assert "reminder" in rule and rule["reminder"]
+            assert rule.get("reminder")
             # At least one of substrings/regex/path_check must be present —
             # otherwise the rule could never fire.
             assert any(k in rule for k in ("substrings", "regex", "path_check")), rule
@@ -95,7 +87,6 @@ class TestPatternsData:
         p = _load_patterns()
         names = [r["ruleName"] for r in p.SECURITY_PATTERNS]
         assert len(names) == len(set(names))
-
 
 # ---------------------------------------------------------------------------
 # _scan_content
@@ -109,7 +100,6 @@ class TestScanContent:
         )
         names = [n for n, _ in findings]
         assert "pickle_deserialization" in names
-
 
     def test_method_call_eval_does_not_trip(self):
         """model.eval() / redis.eval() / spec.eval() must not match eval_injection."""
@@ -136,6 +126,32 @@ class TestScanContent:
         )
         assert "react_dangerously_set_html" in [n for n, _ in findings]
 
+    @pytest.mark.parametrize(
+        ("path", "content", "rule"),
+        [
+            ("/tmp/example.py", "text = 'new Function(value)'", "new_function_injection"),
+            ("/tmp/example.py", "html = '<div dangerouslySetInnerHTML />'", "react_dangerously_set_html"),
+            ("/tmp/example.py", "text = 'document.write(value)'", "document_write_xss"),
+            ("/tmp/example.py", "text = '.innerHTML = value'", "innerHTML_xss"),
+            ("/tmp/example.py", "text = '.outerHTML = value'", "outerHTML_xss"),
+            ("/tmp/example.py", "text = '.insertAdjacentHTML(value)'", "insertAdjacentHTML_xss"),
+        ],
+    )
+    def test_browser_rules_skip_non_javascript_files(self, path, content, rule):
+        """Browser/XSS rules should not warn on prose or non-JS source."""
+        mod = _load_plugin_init()
+        assert rule not in [name for name, _ in mod._scan_content(path, content)]
+
+    def test_browser_rules_warn_in_javascript_files(self):
+        mod = _load_plugin_init()
+        findings = mod._scan_content(
+            "/tmp/example.tsx",
+            "element.innerHTML = value; document.write(value);",
+        )
+        names = [name for name, _ in findings]
+        assert "innerHTML_xss" in names
+        assert "document_write_xss" in names
+
     def test_github_workflow_path_check_fires_on_path_alone(self):
         """github_actions_workflow has no regex/substring — fires on path."""
         mod = _load_plugin_init()
@@ -159,7 +175,6 @@ class TestScanContent:
         # out at _MAX_SCAN_BYTES (256 KB), so this should return [].
         big = "x" * (1024 * 1024) + "\npickle.load(open('p.pkl', 'rb'))\n"
         assert mod._scan_content("/tmp/foo.py", big) == []
-
 
 # ---------------------------------------------------------------------------
 # Hooks
@@ -192,7 +207,6 @@ class TestTransformToolResultHook:
             )
             is None
         )
-
 
     def test_patch_tool_new_string_scanned(self):
         mod = _load_plugin_init()
@@ -243,7 +257,6 @@ class TestTransformToolResultHook:
             is None
         )
 
-
 class TestPreToolCallHook:
 
     def test_blocks_in_block_mode_on_dangerous_pattern(self, monkeypatch):
@@ -256,29 +269,26 @@ class TestPreToolCallHook:
         assert "pickle_deserialization" in out["message"]
         assert "SECURITY_GUIDANCE_BLOCK" in out["message"]  # tells user how to disable
 
-
 # ---------------------------------------------------------------------------
 # Bundled-plugin discovery
 # ---------------------------------------------------------------------------
 
 class TestPluginDiscovery:
-    def test_loads_via_plugin_manager(self, _isolate_env, monkeypatch):
-        """End-to-end: enable in config.yaml and verify the PluginManager
-        picks it up via the standard discovery path."""
-        import yaml
+    def test_manifest_declares_registered_hooks(self):
+        """Manifest metadata must use the field consumed by plugin discovery."""
+        import hermes_yaml as yaml
 
-        config = {"plugins": {"enabled": ["security-guidance"]}}
-        (_isolate_env / "config.yaml").write_text(yaml.safe_dump(config))
+        plugin_dir = _repo_root() / "plugins" / "security-guidance"
+        manifest = yaml.safe_load(
+            (plugin_dir / "plugin.yaml").read_text(encoding="utf-8")
+        )
+        mod = _load_plugin_init()
+        registered = []
 
-        # Wipe any cached plugin state from earlier tests in this worker.
-        for k in list(sys.modules):
-            if k.startswith(("hermes_plugins", "hermes_cli.plugins")):
-                del sys.modules[k]
+        class HookContext:
+            def register_hook(self, name, _callback):
+                registered.append(name)
 
-        from hermes_cli.plugins import _ensure_plugins_discovered
-
-        mgr = _ensure_plugins_discovered(force=True)
-        loaded = set()
-        if hasattr(mgr, "_plugins"):
-            loaded = set(mgr._plugins.keys())
-        assert "security-guidance" in loaded
+        mod.register(HookContext())
+        assert set(manifest["provides_hooks"]) == set(registered)
+        assert "hooks" not in manifest

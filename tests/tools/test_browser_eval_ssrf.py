@@ -156,7 +156,7 @@ class TestCamofoxEvalGuard:
 
         import tools.browser_camofox as camofox
 
-        monkeypatch.setattr(camofox, "_ensure_tab", lambda task_id: {"tab_id": "tab-1", "user_id": "user-1"})
+        monkeypatch.setattr(camofox, "_get_session", lambda task_id: {"tab_id": "tab-1", "user_id": "user-1"})
 
         def fake_post(path, body=None, **_kwargs):
             if body and body.get("expression") == "window.location.href":
@@ -192,7 +192,7 @@ class TestCamofoxEvalGuard:
             seen["task_id"] = task_id
             return {"tab_id": "tab-1", "user_id": "user-1"}
 
-        monkeypatch.setattr(camofox, "_ensure_tab", record_tab)
+        monkeypatch.setattr(camofox, "_get_session", record_tab)
         monkeypatch.setattr(
             camofox, "_post", lambda path, body=None, **_kw: {"result": "https://example.com"}
         )

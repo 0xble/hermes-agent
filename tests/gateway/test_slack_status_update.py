@@ -42,12 +42,12 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
+import plugins.platforms.slack.adapter as _slack_mod
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from gateway.config import PlatformConfig  # noqa: E402
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from gateway.config import PlatformConfig
+from plugins.platforms.slack.adapter import SlackAdapter
 
 
 @pytest.fixture()
@@ -70,15 +70,6 @@ def adapter():
 METADATA = {"thread_id": "1784585355.415219"}
 
 
-@pytest.mark.asyncio
-async def test_first_call_sends_fresh(adapter):
-    result = await adapter.send_or_update_status(
-        "C_CHAN", "context_pressure", "compressing 1/3", metadata=METADATA
-    )
-    assert result.success
-    client = adapter._get_client.return_value
-    assert client.chat_postMessage.call_count == 1
-    assert client.chat_update.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -94,3 +85,15 @@ async def test_distinct_keys_do_not_crosstalk(adapter):
     assert client.chat_update.call_count == 0
 
 
+@pytest.mark.asyncio
+async def test_status_after_cleanup_delete_posts_fresh_without_updating(adapter):
+    """End-of-turn progress cleanup deletes status bubbles; the next status must not chat.update the gone ts."""
+    client = adapter._get_client.return_value
+    client.chat_delete = AsyncMock(return_value={"ok": True})
+
+    first = await adapter.send_or_update_status("C_CHAN", "lifecycle", "recalled", metadata=METADATA)
+    assert await adapter.delete_message("C_CHAN", first.message_id) is True
+    await adapter.send_or_update_status("C_CHAN", "lifecycle", "recalled again", metadata=METADATA)
+
+    assert client.chat_update.call_count == 0
+    assert client.chat_postMessage.call_count == 2

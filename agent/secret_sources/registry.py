@@ -24,17 +24,42 @@ from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION, ErrorKind, FetchResult, SecretSource, is_valid_env_name,
     reset_source_environment, set_source_environment,
 )
-from hermes_constants import hermes_home_key
+from hermes_constants import hermes_home_key, normalize_scope
 
 logger = logging.getLogger(__name__)
 
 # Ordered registry: name → source. Dict insertion order doubles as the default
 # apply order. Origin is recorded so consumers never infer ownership from names.
-_SOURCES: Dict[str, SecretSource] = {}
-_SOURCE_ORIGINS: Dict[str, str] = {}
-_SCOPED_SOURCES: Dict[str, Dict[str, SecretSource]] = {}
+_SOURCES: dict[str, SecretSource] = {}
+_SOURCE_ORIGINS: dict[str, str] = {}
+_SCOPED_SOURCES: dict[str, dict[str, SecretSource]] = {}
 _BUILTINS_LOADED = False
 _REGISTRY_LOCK = threading.RLock()
+
+# Failure kinds a later attempt can plausibly resolve. The taxonomy in ``base`` already
+# singles these two out ("stale-cache fallback on NETWORK/TIMEOUT, never AUTH_FAILED");
+# the rest (NOT_CONFIGURED, BINARY_MISSING, AUTH_FAILED, REF_INVALID, ...) describe a
+# genuine configuration fault that restarting will not repair.
+_TRANSIENT_ERROR_KINDS = frozenset({ErrorKind.NETWORK, ErrorKind.TIMEOUT, ErrorKind.RATE_LIMITED})
+
+# Homes whose most recent apply_all() lost secrets to a retryable condition. Keyed by
+# home, NOT a bare flag: a multiplexing gateway hydrates each secondary profile through
+# apply_all() during startup, so a single global would be overwritten by whichever
+# profile happened to hydrate last and answer for a home it knows nothing about.
+_TRANSIENT_FAILURE_HOMES: Dict[str, bool] = {}
+
+
+def last_apply_had_transient_failure(home_path: Optional[Path] = None) -> bool:
+    """True when the most recent :func:`apply_all` FOR THIS HOME had an enabled source
+    fail for a reason a retry could fix (backend slow or unreachable), so its secrets are
+    missing from the environment through no fault of the user's configuration.
+
+    Callers that would otherwise treat an absent credential as a permanent configuration
+    fault must consult this first: a blown fetch budget drops the whole source, and a
+    per-entry timeout drops one value, both indistinguishable downstream from a
+    credential the user never set.
+    """
+    return _TRANSIENT_FAILURE_HOMES.get(hermes_home_key(home_path), False)
 
 # (module, class, label) for the bundled sources, in registration order.
 _BUILTIN_SOURCES = (
@@ -52,6 +77,9 @@ class AppliedVar:
     source: str          # SecretSource.name
     shape: str           # "mapped" | "bulk"
     overrode_env: bool   # replaced a pre-existing .env/shell value
+    # The source may beat .env/shell for this var (``override_existing`` and not ``preserve_existing``), so a
+    # dotenv reload may re-assert it; a gap-fill or preserved name must keep following .env edits (#74265).
+    authoritative: bool = False
 
 
 @dataclass
@@ -61,20 +89,20 @@ class SourceReport:
     name: str
     label: str
     result: FetchResult
-    applied: List[str] = field(default_factory=list)
-    skipped_existing: List[str] = field(default_factory=list)   # .env/shell won
-    skipped_claimed: List[str] = field(default_factory=list)    # earlier source won
-    skipped_protected: List[str] = field(default_factory=list)  # bootstrap-auth guard
-    skipped_invalid: List[str] = field(default_factory=list)    # bad env-var name
+    applied: list[str] = field(default_factory=list)
+    skipped_existing: list[str] = field(default_factory=list)   # .env/shell won
+    skipped_claimed: list[str] = field(default_factory=list)    # earlier source won
+    skipped_protected: list[str] = field(default_factory=list)  # bootstrap-auth guard
+    skipped_invalid: list[str] = field(default_factory=list)    # bad env-var name
 
 
 @dataclass
 class ApplyReport:
     """Merged outcome of one orchestrated apply pass."""
 
-    sources: List[SourceReport] = field(default_factory=list)
-    provenance: Dict[str, AppliedVar] = field(default_factory=dict)
-    conflicts: List[str] = field(default_factory=list)  # human-readable warnings
+    sources: list[SourceReport] = field(default_factory=list)
+    provenance: dict[str, AppliedVar] = field(default_factory=dict)
+    conflicts: list[str] = field(default_factory=list)  # human-readable warnings
 
     @property
     def applied_any(self) -> bool:
@@ -108,6 +136,7 @@ def register_source(source: SecretSource, *, replace: bool = False, builtin: boo
     if problem:
         logger.warning(problem)
         return False
+    scope = normalize_scope(scope)
     name = source.name
     with _REGISTRY_LOCK:
         effective = dict(_SOURCES)
@@ -129,10 +158,10 @@ def register_source(source: SecretSource, *, replace: bool = False, builtin: boo
     return True
 
 
-def _merged(scope: Optional[str]) -> Dict[str, SecretSource]:
+def _merged(scope: Optional[str]) -> dict[str, SecretSource]:
     """Global sources overlaid with the scope's (default: current home) registrations."""
     merged = dict(_SOURCES)
-    merged.update(_SCOPED_SOURCES.get(scope or hermes_home_key(), {}))
+    merged.update(_SCOPED_SOURCES.get(hermes_home_key(scope), {}))
     return merged
 
 
@@ -145,6 +174,7 @@ def get_source(name: str, *, scope: Optional[str] = None) -> Optional[SecretSour
 def snapshot_registration(name: str, *, scope: Optional[str] = None) -> Optional[SecretSource]:
     """Return the registration owned by exactly one registry layer."""
     _ensure_builtin_sources()
+    scope = normalize_scope(scope)
     with _REGISTRY_LOCK:
         return (_SOURCES if scope is None else _SCOPED_SOURCES.get(scope, {})).get(name)
 
@@ -153,6 +183,7 @@ def restore_registration(name: str, current: SecretSource, previous: Optional[Se
                          scope: Optional[str] = None) -> bool:
     """Restore a host-owned source registration if it is still current."""
     _ensure_builtin_sources()
+    scope = normalize_scope(scope)
     with _REGISTRY_LOCK:
         target = _SOURCES if scope is None else _SCOPED_SOURCES.setdefault(scope, {})
         if target.get(name) is not current:
@@ -166,13 +197,13 @@ def restore_registration(name: str, current: SecretSource, previous: Optional[Se
     return True
 
 
-def list_sources(*, scope: Optional[str] = None) -> List[SecretSource]:
+def list_sources(*, scope: Optional[str] = None) -> list[SecretSource]:
     _ensure_builtin_sources()
     with _REGISTRY_LOCK:
         return list(_merged(scope).values())
 
 
-def list_plugin_sources() -> List[SecretSource]:
+def list_plugin_sources() -> list[SecretSource]:
     """Sources registered outside the bundled set: global ``"plugin"`` origins
     plus every scoped registration (bundled sources register with scope=None).
 
@@ -199,12 +230,13 @@ def _ensure_builtin_sources() -> None:
             try:
                 module = __import__(module_name, fromlist=[class_name])
                 register_source(getattr(module, class_name)(), builtin=True)
-            except Exception:  # noqa: BLE001 — never block startup
+            except Exception:
                 logger.warning("Failed to register bundled %s secret source", label, exc_info=True)
 
 
 def _reset_registry_for_tests() -> None:
     global _BUILTINS_LOADED
+    _TRANSIENT_FAILURE_HOMES.clear()
     with _REGISTRY_LOCK:
         _SOURCES.clear()
         _SOURCE_ORIGINS.clear()
@@ -242,7 +274,7 @@ def _fetch_with_timeout(source: SecretSource, cfg: dict, home_path: Path,
                                       "without this source (raise secrets."
                                       f"{source.name}.timeout_seconds if the backend is just slow)",
                                       ErrorKind.TIMEOUT)
-        except Exception as exc:  # noqa: BLE001 — contract violation, contain it
+        except Exception as exc:
             return FetchResult().fail(f"fetch raised {type(exc).__name__}: {exc}", ErrorKind.INTERNAL)
     finally:
         executor.shutdown(wait=False)
@@ -258,7 +290,7 @@ def _section(secrets_cfg: dict, name: str) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
-def _ordered_enabled_sources(secrets_cfg: dict, *, scope: Optional[str] = None) -> List[SecretSource]:
+def _ordered_enabled_sources(secrets_cfg: dict, *, scope: Optional[str] = None) -> list[SecretSource]:
     """Enabled sources: ``secrets.sources`` order first, then registration order
     (mapped-vs-bulk precedence is applied on top by :func:`apply_all`)."""
     sources = {source.name: source for source in list_sources(scope=scope)}
@@ -271,14 +303,22 @@ def _ordered_enabled_sources(secrets_cfg: dict, *, scope: Optional[str] = None) 
                        ", ".join(unknown), ", ".join(sources) or "none")
     order = dict.fromkeys([n for n in names if n in sources] + list(sources))  # insertion-ordered set
 
-    enabled: List[SecretSource] = []
+    enabled: list[SecretSource] = []
     for name in order:
         try:
             if sources[name].is_enabled(_section(secrets_cfg, name)):
                 enabled.append(sources[name])
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("Secret source '%s' is_enabled() raised; skipping", name, exc_info=True)
     return enabled
+
+
+def enabled_source_names(secrets_cfg: dict, home_path: Path) -> frozenset:
+    """Names of the sources :func:`apply_all` would fetch for *home_path* right now (registered
+    and enabled). A source missing here was removed or disabled, so a value it injected earlier
+    is no longer backed by anything and must be revoked, not kept as process residue."""
+    secrets_cfg = secrets_cfg if isinstance(secrets_cfg, dict) else {}
+    return frozenset(s.name for s in _ordered_enabled_sources(secrets_cfg, scope=hermes_home_key(home_path)))
 
 
 def _active_profile_name(home_path: Optional[Path]) -> str:
@@ -312,9 +352,9 @@ class _Applier:
     """Apply phase state for one orchestrated pass: sequential, first-wins, attributed."""
 
     def __init__(self, env: MutableMapping[str, str], report: ApplyReport,
-                 protected: Dict[str, str], preserve: frozenset) -> None:
+                 protected: dict[str, str], preserve: frozenset) -> None:
         self.env, self.report, self.protected, self.preserve = env, report, protected, preserve
-        self.claimed: Dict[str, str] = {}  # var → source name that won it
+        self.claimed: dict[str, str] = {}  # var → source name that won it
 
     def apply_source(self, source: SecretSource, cfg: dict, result: FetchResult,
                      profile: str, supplied_directly: set) -> None:
@@ -324,7 +364,7 @@ class _Applier:
             return
         try:
             override = source.override_existing(cfg)
-        except Exception:  # noqa: BLE001
+        except Exception:
             override = False
 
         for var, value in result.secrets.items():
@@ -359,7 +399,8 @@ class _Applier:
         self.env[var] = value
         self.claimed[var] = source.name
         sr.applied.append(var)
-        self.report.provenance[var] = AppliedVar(var, source.name, source.shape, overrode_env=existed)
+        self.report.provenance[var] = AppliedVar(var, source.name, source.shape, overrode_env=existed,
+                                                 authoritative=override and var not in self.preserve)
         return True
 
 
@@ -388,6 +429,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     secrets_cfg = secrets_cfg if isinstance(secrets_cfg, dict) else {}
     enabled = _ordered_enabled_sources(secrets_cfg, scope=hermes_home_key(home_path))
     if not enabled:
+        _TRANSIENT_FAILURE_HOMES[hermes_home_key(home_path)] = False
         return report
 
     preserve_raw = secrets_cfg.get("preserve_existing")
@@ -398,8 +440,8 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     # Mapped outranks bulk regardless of list order.
     ordered = [s for s in enabled if s.shape == "mapped"] + [s for s in enabled if s.shape == "bulk"]
 
-    fetches: List[tuple[SecretSource, dict, FetchResult]] = []
-    protected: Dict[str, str] = {}  # var → source that protects it
+    fetches: list[tuple[SecretSource, dict, FetchResult]] = []
+    protected: dict[str, str] = {}  # var → source that protects it
     for source in ordered:
         cfg = _section(secrets_cfg, source.name)
         result = _fetch_with_timeout(source, cfg, home_path, env)
@@ -407,8 +449,22 @@ def apply_all(secrets_cfg: dict, home_path: Path,
         try:
             for var in source.protected_env_vars(cfg):
                 protected.setdefault(var, source.name)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
+
+    # A whole-source failure AND a per-entry failure both cost us secrets; only the first
+    # sets error_kind, so consult degraded_kinds too or a single slow reference is missed.
+    # ANY transient failure counts: one unrelated non-transient failure in the same run
+    # must not hide a bot token that a retry would have fetched.
+    _TRANSIENT_FAILURE_HOMES[hermes_home_key(home_path)] = any(
+        (r.error_kind in _TRANSIENT_ERROR_KINDS) if not r.ok
+        # .intersection(... or ()) rather than `&`: degraded_kinds is part of the public
+        # secret-source API, so a third-party source may hand back a list or None, and `&`
+        # would raise TypeError there. apply_all does not catch it and the env_loader
+        # callers swallow it by returning {}, which would silently drop every secret.
+        else bool(_TRANSIENT_ERROR_KINDS.intersection(r.degraded_kinds or ()))
+        for _, _, r in fetches
+    )
 
     # An alias never shadows a var some source supplies by its real name.
     supplied_directly = {v for _, _, r in fetches if r.ok for v in r.secrets if isinstance(v, str)}

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -21,6 +22,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from gateway.gateway_slot import SLOT_ACTIVE, effective_gateway_slot, slot_filename
 
 logger = logging.getLogger(__name__)
 
@@ -39,38 +42,38 @@ def _home_hash(home: Path) -> str:
     return hashlib.sha256(os.path.normcase(str(Path(home).expanduser().resolve(strict=False))).encode("utf-8")).hexdigest()[:16]
 
 
-def windows_pipe_name(home: Path) -> str:
-    """Per-HERMES_HOME named pipe path (Windows transport)."""
-    return rf"\\.\pipe\hermes-gateway-{_home_hash(home)}"
+def windows_pipe_name(home: Path, slot: str = SLOT_ACTIVE) -> str:
+    """Per-HERMES_HOME named pipe path (Windows transport); slot ``a`` keeps the historical name."""
+    return rf"\\.\pipe\hermes-gateway-{_home_hash(home)}" + ("" if slot == SLOT_ACTIVE else f"-{slot}")
 
 
 def _fits_sun_path(path: Path) -> bool:
     return len(str(path).encode("utf-8")) <= _MAX_UNIX_PATH
 
 
-def _fallback_socket_path(home: Path) -> Path:
+def _fallback_socket_path(home: Path, slot: str = SLOT_ACTIVE) -> Path:
     """Short temp-dir path for homes whose direct socket path exceeds sun_path: ``tempfile.gettempdir()``
     then ``/tmp`` (POSIX); if nothing fits the tempdir candidate is returned anyway — bind fails
     non-fatally and consumers use the scan layer."""
-    name = f"hermes-gw-{_home_hash(home)}.sock"
-    candidates = [Path(tempfile.gettempdir()) / name] + ([] if _IS_WINDOWS else [Path("/tmp") / name])
+    name = slot_filename(f"hermes-gw-{_home_hash(home)}.sock", slot)
+    candidates = [Path(tempfile.gettempdir()) / name] + ([] if _IS_WINDOWS else [Path("/tmp") / name])  # no-tmp: ok — AF_UNIX 104-byte path limit needs the short /tmp candidate
     return next((c for c in candidates if _fits_sun_path(c)), candidates[0])
 
 
-def resolve_server_socket_path(home: Path) -> tuple[Path, Optional[Path]]:
+def resolve_server_socket_path(home: Path, slot: str = SLOT_ACTIVE) -> tuple[Path, Optional[Path]]:
     """Return ``(bind_path, pointer_file)``; pointer_file is set only for the temp-dir fallback."""
-    direct = Path(home) / _SOCKET_FILENAME
-    return (direct, None) if _fits_sun_path(direct) else (_fallback_socket_path(home), Path(home) / _POINTER_FILENAME)
+    direct = Path(home) / slot_filename(_SOCKET_FILENAME, slot)
+    return (direct, None) if _fits_sun_path(direct) else (_fallback_socket_path(home, slot), Path(home) / slot_filename(_POINTER_FILENAME, slot))
 
 
-def resolve_client_socket_path(home: Path) -> Optional[Path]:
-    """Where a client should connect for ``home``, or None when nothing exists."""
-    direct = Path(home) / _SOCKET_FILENAME
+def resolve_client_socket_path(home: Path, slot: str = SLOT_ACTIVE) -> Optional[Path]:
+    """Where a client should connect for ``home`` (slot ``a`` unless asked), or None when nothing exists."""
+    direct = Path(home) / slot_filename(_SOCKET_FILENAME, slot)
     if direct.exists():
         return direct
     with contextlib.suppress(OSError):
-        pointer = Path(home) / _POINTER_FILENAME
-        target = pointer.read_text(encoding="utf-8").strip() if pointer.is_file() else ""
+        pointer = Path(home) / slot_filename(_POINTER_FILENAME, slot)
+        target = pointer.read_text(encoding="utf-8-sig").strip() if pointer.is_file() else ""
         if target and Path(target).exists():
             return Path(target)
     return None
@@ -86,8 +89,8 @@ def _detect_supervisor() -> str:
     env = os.environ
     if env.get("INVOCATION_ID"):
         return "systemd"
-    if sys.platform == "darwin" and (env.get("XPC_SERVICE_NAME", "").startswith("ai.hermes")
-                                     or env.get("LAUNCHD_SOCKET")):
+    from gateway.restart import launchd_job_label
+    if sys.platform == "darwin" and (launchd_job_label(env) or env.get("LAUNCHD_SOCKET")):
         return "launchd"
     if env.get("HERMES_DESKTOP_MANAGED"):
         return "desktop"
@@ -103,6 +106,8 @@ def build_identify_payload() -> dict[str, Any]:
         **{k: record.get(k) for k in ("kind", "pid", "start_time", "hermes_home")},
         "profile": _profile_label_for_home(record.get("hermes_home") or ""),
         "supervisor": _detect_supervisor(), **_get_code_identity_fields()}
+    from gateway import zero_cut_standby as zcs
+    payload.update({"slot": zcs.readiness()["slot"], "standby": zcs.readiness()["standby"]})
     with contextlib.suppress(Exception):
         # served_profiles (multiplex mode) is stamped into runtime status by the runner.
         served = (read_runtime_status() or {}).get("served_profiles")
@@ -114,7 +119,8 @@ def build_identify_payload() -> dict[str, Any]:
 def build_status_payload() -> dict[str, Any]:
     """Default ``status`` answer — current runtime status, answered live."""
     from gateway.status import read_runtime_status
-    return {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
+    from gateway import zero_cut_standby as zcs
+    return {**(read_runtime_status() or {}), **zcs.readiness(), "protocol": CONTROL_PROTOCOL_VERSION,
             "answered_at": time.time(), "answering_pid": os.getpid()}
 
 
@@ -124,7 +130,9 @@ class GatewayControlServer:
     because its control socket couldn't bind; consumers fall back to the scan layer."""
 
     def __init__(self, home: Optional[Path] = None, *,
-                 verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None) -> None:
+                 verb_handlers: Optional[dict[str, Callable[..., dict[str, Any]]]] = None,
+                 slot: Optional[str] = None) -> None:
+        self._slot = effective_gateway_slot() if slot is None else slot  # 'b' only for the opt-in standby
         if home is None:
             from gateway.status import _get_process_hermes_home
             home = _get_process_hermes_home()
@@ -133,7 +141,7 @@ class GatewayControlServer:
         self._pipe_server: Any = None  # Windows proactor pipe server
         self._bind_path: Optional[Path] = None
         self._pointer_file: Optional[Path] = None
-        self._handlers: dict[str, Callable[[], dict[str, Any]]] = {
+        self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
 
     async def start(self) -> bool:
@@ -145,7 +153,7 @@ class GatewayControlServer:
             return False
 
     async def _start_posix(self) -> bool:
-        bind_path, pointer_file = resolve_server_socket_path(self._home)
+        bind_path, pointer_file = resolve_server_socket_path(self._home, self._slot)
         # We only get here after winning the PID-file O_EXCL race, so any existing
         # file is stale or a collision — never a live sibling.
         with contextlib.suppress(OSError):
@@ -173,7 +181,7 @@ class GatewayControlServer:
             logger.debug("Event loop %s has no start_serving_pipe — control socket "
                          "disabled (selector loop on Windows).", type(loop).__name__)
             return False
-        pipe_name = windows_pipe_name(self._home)
+        pipe_name = windows_pipe_name(self._home, self._slot)
         servers = await start_serving_pipe(lambda: _PipeControlProtocol(self), pipe_name)
         self._pipe_server = servers[0] if servers else None
         logger.info("Gateway control pipe listening at %s", pipe_name)
@@ -210,7 +218,17 @@ class GatewayControlServer:
                 response: dict[str, Any] = {"ok": False, "error": f"unknown verb: {verb!r}",
                                             "protocol": CONTROL_PROTOCOL_VERSION, "supported_verbs": sorted(self._handlers)}
             else:
-                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": handler()}
+                # Dispatch by the declared protocol, without retrying callback exceptions.
+                parameters = inspect.signature(handler).parameters
+                if "payload" in parameters:
+                    result = handler(request.get("payload"))
+                elif "params" in parameters:
+                    params = request.get("params")
+                    result = handler(params if isinstance(params, dict) else {})
+                else:
+                    result = handler()
+                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
+                        "result": result}
         except Exception as exc:
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "protocol": CONTROL_PROTOCOL_VERSION}
         if request_id is not None:
@@ -234,7 +252,7 @@ class GatewayControlServer:
                 None, self.handle_request_line, raw.rstrip(b"\n"))
             writer.write(response)
             await writer.drain()
-        except (asyncio.TimeoutError, ConnectionError, OSError):
+        except (TimeoutError, ConnectionError, OSError):
             pass
         except Exception:
             logger.debug("Control socket connection handler error", exc_info=True)
@@ -264,14 +282,27 @@ class _PipeControlProtocol(asyncio.Protocol):
                 self._transport.close()
 
 
-def query_gateway_control(home: Path, verb: str, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
+def query_gateway_control(
+    home: Path, verb: str, *, params: Optional[dict[str, Any]] = None,
+                          timeout: float = _DEFAULT_CLIENT_TIMEOUT, payload: Optional[dict[str, Any]] = None,
+    slot: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; returns its ``result`` payload. Any failure (no/stale
     socket, timeout, malformed answer, ``ok: false``) returns None so callers fall back to the scan layer.
-    Never raises."""
-    request = json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}).encode("utf-8") + b"\n"
+    ``params`` carries verb arguments (e.g. ``{"old": ..., "new": ...}``); ``slot`` pins a handover slot,
+    else the slot serving ``home`` (``a``, or a promoted ``b`` once ``a`` is gone). Never raises."""
+    if slot is None:
+        from gateway.gateway_slot import serving_slot
+        slot = serving_slot(home)
+    request_data: dict[str, Any] = {"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}
+    if payload is not None:
+        request_data["payload"] = payload
+    if params:
+        request_data["params"] = params
+    request = json.dumps(request_data).encode("utf-8") + b"\n"
     query = _query_windows_pipe if _IS_WINDOWS else _query_unix_socket
     try:
-        raw = query(Path(home), request, timeout)
+        raw = query(Path(home), request, timeout, slot)
         response = json.loads(raw.decode("utf-8")) if raw else None
     except Exception:
         return None
@@ -292,8 +323,8 @@ def _read_response_line(read: Callable[[], bytes], deadline: float) -> Optional[
     return b"".join(chunks).partition(b"\n")[0] or None
 
 
-def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[bytes]:
-    path = resolve_client_socket_path(home)
+def _query_unix_socket(home: Path, request: bytes, timeout: float, slot: str = SLOT_ACTIVE) -> Optional[bytes]:
+    path = resolve_client_socket_path(home, slot)
     if path is None:
         return None
     # OSError covers ConnectionRefusedError / FileNotFoundError on connect and socket.timeout on read.
@@ -305,8 +336,18 @@ def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[b
     return None
 
 
-def _query_windows_pipe(home: Path, request: bytes, timeout: float) -> Optional[bytes]:  # pragma: no cover - wine2e lane
-    pipe_name = windows_pipe_name(home)
+def _query_windows_pipe(home: Path, request: bytes, timeout: float, slot: str = SLOT_ACTIVE) -> Optional[bytes]:
+    """A synchronous pipe handle has no ``settimeout``: ``handle.read`` blocks until the peer answers,
+    so the ``deadline`` in ``_read_response_line`` is only checked between chunks. Run the exchange on
+    an abandoned-at-deadline worker so a peer that never answers costs ``timeout``, never forever —
+    the bound ``_query_unix_socket`` already gets from ``sock.settimeout`` (#132547)."""
+    from agent.deadline import run_bounded_sync
+    outcome = run_bounded_sync(lambda: _windows_pipe_exchange(home, request, timeout, slot), timeout, label="control-pipe")
+    return None if outcome.timed_out else outcome.value
+
+
+def _windows_pipe_exchange(home: Path, request: bytes, timeout: float, slot: str = SLOT_ACTIVE) -> Optional[bytes]:  # pragma: no cover - wine2e lane
+    pipe_name = windows_pipe_name(home, slot)
     deadline = time.monotonic() + timeout
     handle = None
     while handle is None:
@@ -327,9 +368,10 @@ def _query_windows_pipe(home: Path, request: bytes, timeout: float) -> Optional[
             handle.close()
 
 
-def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
-    """Convenience wrapper: ``identify`` the gateway serving ``home``."""
-    return query_gateway_control(home, "identify", timeout=timeout)
+def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+                     slot: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Convenience wrapper: ``identify`` the gateway serving ``home`` (its serving slot unless asked)."""
+    return query_gateway_control(home, "identify", timeout=timeout, slot=slot)
 
 
 def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
@@ -348,3 +390,42 @@ def rescan_gateway_profiles(home: Path, *, timeout: float = 8.0) -> Optional[dic
     when no gateway answers / the gateway predates the verb — callers then rely on the periodic rescan
     (or the restart reminder)."""
     return query_gateway_control(home, "rescan-profiles", timeout=timeout)
+
+
+def request_unserve_profile(home: Path, name: str) -> Optional[dict[str, Any]]:
+    return query_gateway_control(home, "unserve-profile", params={"name": name}, timeout=8.0)
+
+
+def request_serve_profile_hot(home: Path, name: str) -> Optional[dict[str, Any]]:
+    return query_gateway_control(home, "serve-profile", params={"name": name}, timeout=8.0)
+
+
+def migrate_gateway_profile_identity(home: Path, old_name: str, new_name: str, *,
+                                     timeout: float = 8.0) -> Optional[dict[str, Any]]:
+    """Ask the multiplexer serving ``home`` to rekey a renamed profile's in-memory + on-disk routing
+    from ``agent:<old>:`` to ``agent:<new>:`` now. Returns its ``{"rekeyed": N, ...}`` answer, or None
+    when no gateway answers / the gateway predates the verb — the CLI's durable DB rewrite still lands,
+    and a restart reconciles the in-memory copy."""
+    return query_gateway_control(home, "migrate-profile-identity",
+                                 params={"old": old_name, "new": new_name}, timeout=timeout)
+
+
+def purge_gateway_profile_identity(home: Path, name: str, *,
+                                   timeout: float = 8.0) -> Optional[dict[str, Any]]:
+    """Ask the multiplexer serving ``home`` to drop a deleted profile's routing identity now — the
+    in-memory index AND the durable rows, neither of which a CLI-side delete can settle: this process
+    writes its in-memory copy back, so it re-creates what the CLI removed. Returns its
+    ``{"ok": True, "dropped": N, ...}`` answer, or None when no gateway answers / the gateway predates
+    the verb."""
+    return query_gateway_control(home, "purge-profile-identity", params={"name": name}, timeout=timeout)
+
+
+def reload_gateway_plugins(home: Path, *, profile_home: Optional[Path] = None,
+                           timeout: float = 30.0) -> Optional[dict[str, Any]]:
+    """Ask the gateway serving ``home`` to force plugin re-discovery for ``profile_home`` (default: ``home``)
+    and re-wire its live adapters' plugin handlers now (#87770). Returns ``{"reloaded", "plugins",
+    "adapters_rewired", ...}`` or None when no gateway answers / it predates the verb — callers then
+    fall back to the restart hint. Tools and prompt sections of the reloaded plugin still apply next
+    session; only handlers go live."""
+    params = {"home": str(profile_home or home)}
+    return query_gateway_control(home, "reload-plugins", params=params, timeout=timeout)

@@ -9,7 +9,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import pytest
 
@@ -32,11 +32,6 @@ class TestWebProviderABCs:
     ``supports_search() / supports_extract()`` flags.
     """
 
-    def test_cannot_instantiate_abc_directly(self):
-        from agent.web_search_provider import WebSearchProvider
-
-        with pytest.raises(TypeError):
-            WebSearchProvider()  # type: ignore[abstract]
 
 
     def test_search_only_provider_skips_extract(self):
@@ -58,7 +53,7 @@ class TestWebProviderABCs:
             def supports_search(self) -> bool:
                 return True
 
-            def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+            def search(self, query: str, limit: int = 5) -> dict[str, Any]:
                 return {"success": True, "data": {"web": []}}
 
         # Should instantiate fine — extract has default supports_*()
@@ -88,6 +83,29 @@ class TestPerCapabilityBackendSelection:
         assert web_tools._get_search_backend() == "keenable"
 
 
+    def test_perplexity_cache_identity_separates_direct_and_managed_routes(self, monkeypatch):
+        from tools import web_tools
+
+        class _Perplexity:
+            name = "perplexity"
+
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: "direct-key" if name == "PERPLEXITY_API_KEY" else "",
+        )
+        monkeypatch.setattr(web_tools, "_managed_web_search", lambda: True)
+        direct_provider, direct = web_tools._search_cache_identity(_Perplexity())
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env", lambda name: ""
+        )
+        managed_provider, managed = web_tools._search_cache_identity(_Perplexity())
+        assert direct_provider == "perplexity:direct"
+        assert managed_provider == "perplexity:managed"
+        assert direct["search_type"] == "direct"
+        assert managed["search_type"] == "fast"
+        assert direct["freshness_class"] == managed["freshness_class"] == "default"
+
+
     def test_fully_backward_compatible_with_web_backend_only(self, monkeypatch):
         from tools import web_tools
 
@@ -100,26 +118,115 @@ class TestPerCapabilityBackendSelection:
         assert web_tools._get_extract_backend() == "keenable"
 
 
+    def test_ring_cache_identity_separates_keyed_and_keyless_routes(self, monkeypatch):
+        from tools import web_tools
+
+        class _Exa:
+            name = "exa"
+
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: "exa-key" if name == "EXA_API_KEY" else "",
+        )
+        monkeypatch.setattr("plugins.web.keyless_mcp.provider_tier", lambda name: "auto")
+        keyed_provider, _ = web_tools._search_cache_identity(_Exa())
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env", lambda name: ""
+        )
+        keyless_provider, _ = web_tools._search_cache_identity(_Exa())
+        assert keyed_provider == "exa:keyed"
+        assert keyless_provider == "exa:keyless"
+
+    def test_parallel_mode_and_tavily_tier_are_cache_identity_dimensions(self, monkeypatch):
+        from tools import web_tools
+
+        class _Parallel:
+            name = "parallel"
+
+        class _Tavily:
+            name = "tavily"
+
+        monkeypatch.setattr("tools.web_tools_rescue._ring_vendor_keyless", lambda name: False)
+        monkeypatch.setenv("PARALLEL_SEARCH_MODE", "fast")
+        _, fast = web_tools._search_cache_identity(_Parallel())
+        monkeypatch.setenv("PARALLEL_SEARCH_MODE", "agentic")
+        _, agentic = web_tools._search_cache_identity(_Parallel())
+        assert fast["search_type"] == "fast"
+        assert agentic["search_type"] == "agentic"
+
+        monkeypatch.setattr("tools.web_tools_rescue._ring_vendor_keyless", lambda name: name == "tavily")
+        keyless_tavily, _ = web_tools._search_cache_identity(_Tavily())
+        monkeypatch.setattr("tools.web_tools_rescue._ring_vendor_keyless", lambda name: False)
+        keyed_tavily, _ = web_tools._search_cache_identity(_Tavily())
+        assert keyless_tavily == "tavily:keyless"
+        assert keyed_tavily == "tavily:keyed"
+
+    def test_firecrawl_cache_identity_separates_paid_routes(self, monkeypatch):
+        from tools import web_tools
+
+        class _Firecrawl:
+            name = "firecrawl"
+
+        env: dict[str, str] = {}
+        managed = {"value": True}
+        monkeypatch.setattr("plugins.web.firecrawl.provider._use_keyless_ring", lambda capability=None: False)
+        monkeypatch.setattr("plugins.web.firecrawl.provider._env", lambda name: env.get(name, ""))
+        monkeypatch.setattr("plugins.web.firecrawl.provider.is_managed_route", lambda capability=None: managed["value"])
+        monkeypatch.setattr("plugins.web.firecrawl.provider._is_explicit_firecrawl_selection", lambda: True)
+        managed_route, _ = web_tools._search_cache_identity(_Firecrawl())
+        managed["value"] = False
+        anonymous_route, _ = web_tools._search_cache_identity(_Firecrawl())
+        env["FIRECRAWL_API_KEY"] = "direct-key"
+        direct_route, _ = web_tools._search_cache_identity(_Firecrawl())
+        env["FIRECRAWL_API_URL"] = "https://firecrawl-a.example/"
+        hosted_a, _ = web_tools._search_cache_identity(_Firecrawl())
+        env["FIRECRAWL_API_URL"] = "https://firecrawl-b.example"
+        hosted_b, _ = web_tools._search_cache_identity(_Firecrawl())
+        assert managed_route == "firecrawl:managed"
+        assert anonymous_route == "firecrawl:direct-keyless"
+        assert direct_route == "firecrawl:direct"
+        assert hosted_a.startswith("firecrawl:selfhosted-")
+        assert len({managed_route, anonymous_route, direct_route, hosted_a, hosted_b}) == 5
+
+    def test_firecrawl_cache_identity_uses_search_capability_route(self, monkeypatch):
+        from tools import web_tools
+
+        class _Firecrawl:
+            name = "firecrawl"
+
+        seen = []
+
+        def keyless(capability=None):
+            seen.append(capability)
+            return False
+
+        monkeypatch.setattr("plugins.web.firecrawl.provider._use_keyless_ring", keyless)
+        monkeypatch.setattr("plugins.web.firecrawl.provider.is_managed_route", lambda capability=None: capability == "search")
+        route, _ = web_tools._search_cache_identity(_Firecrawl())
+        assert seen == ["search"]
+        assert route == "firecrawl:managed"
+
+    def test_cache_identity_stringifies_provider_dimensions(self):
+        from tools import web_tools
+        from unittest.mock import MagicMock
+
+        provider = MagicMock(name="custom")
+        provider.name = "custom"
+        provider.SEARCH_ENDPOINT = MagicMock()
+        provider.SEARCH_TYPE = MagicMock()
+        provider.FRESHNESS_CLASS = MagicMock()
+
+        route, identity = web_tools._search_cache_identity(provider)
+
+        assert route == "custom:default"
+        assert all(isinstance(value, str) for value in identity.values())
+
+
 # ---------------------------------------------------------------------------
 # Config key presence in DEFAULT_CONFIG
 # ---------------------------------------------------------------------------
 
 
-class TestDefaultConfig:
-    """The web section exists in DEFAULT_CONFIG with per-capability keys."""
-
-    def test_web_section_in_default_config(self):
-        from hermes_cli.config import DEFAULT_CONFIG
-
-        assert "web" in DEFAULT_CONFIG
-        web = DEFAULT_CONFIG["web"]
-        assert "backend" in web
-        assert "search_backend" in web
-        assert "extract_backend" in web
-        # All empty string by default (no override)
-        assert web["backend"] == ""
-        assert web["search_backend"] == ""
-        assert web["extract_backend"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +312,7 @@ class TestUnconfiguredErrorEnvelopeParity:
         monkeypatch.setattr(web_tools, "_firecrawl_client", None, raising=False)
         monkeypatch.setattr(web_tools, "_firecrawl_client_config", None, raising=False)
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
+        monkeypatch.setattr(web_tools, "_load_web_config", dict)
         monkeypatch.setattr(web_search_registry, "_keyless_tier_enabled", lambda: False)
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
 

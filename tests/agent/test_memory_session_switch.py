@@ -8,6 +8,7 @@ for scoped writes) keep writing into the old session's record.
 """
 
 
+
 import pytest
 
 from agent.memory_manager import MemoryManager
@@ -64,30 +65,6 @@ class _RecordingProvider(MemoryProvider):
 
 
 # ---------------------------------------------------------------------------
-# MemoryProvider ABC — default on_session_switch is a no-op
-# ---------------------------------------------------------------------------
-
-
-class _MinimalProvider(MemoryProvider):
-    """Provider that does NOT override on_session_switch — ABC default must no-op."""
-
-    @property
-    def name(self) -> str:
-        return "minimal"
-
-    def is_available(self) -> bool:
-        return True
-
-    def initialize(self, session_id, **kwargs):  # pragma: no cover - unused
-        pass
-
-    def get_tool_schemas(self):
-        return []
-
-
-
-
-# ---------------------------------------------------------------------------
 # MemoryManager.on_session_switch — fan-out
 # ---------------------------------------------------------------------------
 
@@ -111,8 +88,6 @@ def test_manager_fans_out_to_all_providers():
         assert call["extra"] == {"reason": "resume"}
 
 
-
-
 def test_manager_isolates_provider_failures():
     """A provider that raises must not block other providers."""
 
@@ -134,8 +109,6 @@ def test_manager_isolates_provider_failures():
     assert good.switch_calls[0]["new"] == "new-sid"
 
 
-
-
 # ---------------------------------------------------------------------------
 # MemoryManager.sync_all / queue_prefetch_all — session_id propagation
 # ---------------------------------------------------------------------------
@@ -154,12 +127,12 @@ def _make_hindsight_provider():
     """Build a bare HindsightMemoryProvider that skips network setup.
 
     We instantiate without importing optional deps at class-level by
-    bypassing __init__ and seeding the attributes on_session_switch
-    reads/writes. This keeps the test hermetic.
+    using its offline constructor and seeding the session state.
+    Network setup belongs to initialize(), which is not called.
     """
     import threading
     hindsight_mod = pytest.importorskip("plugins.memory.hindsight")
-    provider = object.__new__(hindsight_mod.HindsightMemoryProvider)
+    provider = hindsight_mod.HindsightMemoryProvider()
     provider._session_id = "old-sid"
     provider._parent_session_id = ""
     provider._document_id = "old-sid-20260101_000000_000000"
@@ -241,9 +214,3 @@ def test_hindsight_on_session_switch_clears_turn_buffers():
     assert provider._session_turns == []
     assert provider._turn_counter == 0
     assert provider._turn_index == 0
-
-
-
-
-
-

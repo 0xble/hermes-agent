@@ -94,8 +94,8 @@ for match in matches.get("matches", []):
         new_string="new_api_call(",
         replace_all=True
     )
-    if "error" not in str(result):
-        fixed += 1
+    # File-tool errors raise HermesToolError; successful patch calls return normally.
+    fixed += 1
 
 print(f"Fixed {fixed} files out of {len(matches.get('matches', []))} matches")
 ```
@@ -155,6 +155,17 @@ Security-critical invariants are identical across both modes:
 
 Switching mode changes where scripts run and which interpreter runs them, not what credentials they can see or which tools they can call.
 
+## Persistent session kernel
+
+Calls reuse a Python child for the same session, execution mode, interpreter,
+working directory, and tool set. Imports, variables, and loaded data can persist
+between cells. The child environment is fixed when the kernel starts.
+
+Pass `reset: true` to discard that kernel state. A timeout or interrupted kernel
+can also lose it. Do not assume that a later terminal environment change is
+already visible inside an existing kernel. The old `code_execution.kernel_mode`
+setting is no longer a separate switch.
+
 ## Resource Limits
 
 | Resource | Limit | Notes |
@@ -176,13 +187,13 @@ code_execution:
 
 ## State Between Calls (the session kernel)
 
-On the local terminal backend, `execute_code` does not start a fresh interpreter for every call. Each session owns a persistent Python kernel, so variables, imports, and loaded data from one call are available in the next. The agent can load a dataset once and query it across several turns instead of re-reading it every time. Subagents get their own kernel; kernels are never shared across sessions.
+On the local terminal backend, `execute_code` does not start a fresh interpreter for every call. Each session owns a persistent Python kernel, so variables, imports, and loaded data from one call are available in the next. The agent can load a dataset once and query it across several turns instead of re-reading it every time. Subagents get their own kernel; kernels are never shared across sessions. A subagent's kernel lives exactly as long as the subagent: it is exempt from the live-kernel cap while the subagent runs (a wide fan-out no longer evicts a sibling's kernel mid-task) and is disposed when the subagent finishes.
 
 What ends a kernel:
 
 - **Timeout or interrupt.** A cell that hits the timeout (or is interrupted) kills the kernel process and its state is lost on purpose; the result says so and the next call starts a fresh kernel.
 - **`reset=true`.** The agent can pass `reset: true` to discard the kernel's state and start clean. This is also the way to pick up environment changes: a kernel's environment is frozen when it spawns, so a newly allowlisted passthrough variable is invisible until the kernel is reset.
-- **Idle timeout and eviction.** Kernels die with the session, after `code_execution.kernel_idle_timeout` idle seconds (default 1800), or when more than `code_execution.max_session_kernels` (default 4) are alive and the oldest is evicted.
+- **Idle timeout and eviction.** Kernels die with the session, after `code_execution.kernel_idle_timeout` idle seconds (default 1800), or when more than `code_execution.max_session_kernels` (default 4) top-level sessions' kernels are alive and the oldest is evicted (running subagents' kernels do not count against the cap).
 
 The security envelope is the same as a one-shot script: environment scrubbing, the tool whitelist, and the per-call tool budget all apply to every cell, and tool-call authority (approvals, session, allow-list) is rebound on each cell.
 
@@ -215,6 +226,8 @@ When a script fails, the agent receives structured error information:
 - **Non-zero exit code**: stderr is included in the output so the agent sees the full traceback
 - **Timeout**: Script is killed and the agent sees `"Script timed out after 300s and was killed."`
 - **Interruption**: If the user sends a new message during execution, the script is terminated and the agent sees `[execution interrupted — user sent a new message]`
+- **File-tool errors**: `read_file`, `write_file`, `patch`, and `search_files` raise `HermesToolError` when the tool returns an error envelope, so a failed read cannot be mistaken for empty successful data. Catch that exception if the script can recover.
+- **Other tool errors**: tools such as `terminal`, `web_search`, and `web_extract` still return their error dictionaries, so scripts can inspect fields such as `exit_code` or `success`.
 - **Tool call limit**: When the 50-call limit is hit, subsequent tool calls return an error message
 
 The response always includes `status` (success/error/timeout/interrupted), `output`, `tool_calls_made`, and `duration_seconds`.
@@ -240,7 +253,7 @@ terminal:
     - ANOTHER_TOKEN
 ```
 
-See the [Security guide](/user-guide/security#environment-variable-passthrough) for full details.
+See the [Security guide](../security.md#environment-variable-passthrough) for full details.
 
 ### `HERMES_*` variables in the child
 
@@ -310,7 +323,7 @@ Hermes always writes the script and the auto-generated `hermes_tools.py` RPC stu
 | Running a build or test suite | ❌ | ✅ |
 | Looping over search results | ✅ | ❌ |
 | Interactive/background processes | ❌ | ✅ |
-| Needs API keys in environment | ⚠️ Only via [passthrough](/user-guide/security#environment-variable-passthrough) | ✅ (most pass through) |
+| Needs API keys in environment | ⚠️ Only via [passthrough](../security.md#environment-variable-passthrough) | ✅ (most pass through) |
 
 **Rule of thumb:** Use `execute_code` when you need to call Hermes tools programmatically with logic between calls. Use `terminal` for running shell commands, builds, and processes.
 

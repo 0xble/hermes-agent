@@ -16,11 +16,11 @@ Second bug bundled into the same fix: even on a *genuine* provider failure,
 regardless of whether fallback_providers was ever configured. Most installs
 have fallback_providers: [], so the message always implied an
 attempted-and-failed fallback that never existed. _fallback_chain_phrase() now checks the effective chain
-via get_fallback_chain() and reports "No fallback chain configured." when
+via get_cron_fallback_chain() and reports "No backup provider is configured" when
 it's empty.
 """
 
-import cron.scheduler as scheduler
+from cron import scheduler
 from cron.scheduler import _summarize_cron_failure_for_delivery
 
 
@@ -31,21 +31,21 @@ def test_inactivity_timeout_is_not_reported_as_provider_timeout():
         "(limit 600s) — last activity: terminal command running (30s elapsed)"
     )
     msg = _summarize_cron_failure_for_delivery(job, error)
-    assert "provider timeout" not in msg
-    assert "fallback chain" not in msg.lower()
+    assert "did not respond in time" not in msg
+    assert "backup provider" not in msg.lower()
     assert "stalled" in msg.lower()
     assert "Daily Repo Sweep" in msg
 
 
 def test_genuine_provider_timeout_with_no_fallback_configured(monkeypatch):
     monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
-    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+    monkeypatch.setattr(scheduler, "get_cron_fallback_chain", lambda cfg: [])
     job = {"name": "CI Autofix Poller", "id": "f7fe78574bda"}
     error = "Request timed out."
     msg = _summarize_cron_failure_for_delivery(job, error)
-    assert "provider timeout" in msg
-    assert "No fallback chain configured" in msg
-    assert "exhausted or unavailable" not in msg
+    assert "did not respond in time" in msg
+    assert "No backup provider is configured" in msg
+    assert "succeeded either" not in msg
 
 
 def test_genuine_provider_timeout_with_fallback_configured(monkeypatch):
@@ -54,15 +54,15 @@ def test_genuine_provider_timeout_with_fallback_configured(monkeypatch):
     })
     monkeypatch.setattr(
         scheduler,
-        "get_fallback_chain",
+        "get_cron_fallback_chain",
         lambda cfg: [{"provider": "openrouter", "model": "anthropic/claude-sonnet-5"}],
     )
     job = {"name": "CI Autofix Poller", "id": "f7fe78574bda"}
     error = "Request timed out."
     msg = _summarize_cron_failure_for_delivery(job, error)
-    assert "provider timeout" in msg
-    assert "Fallback chain was exhausted or unavailable." in msg
-    assert "No fallback chain configured" not in msg
+    assert "did not respond in time" in msg
+    assert "No backup provider succeeded either." in msg
+    assert "No backup provider is configured" not in msg
 
 
 def test_fallback_chain_phrase_fails_open_on_config_error(monkeypatch):
@@ -70,16 +70,16 @@ def test_fallback_chain_phrase_fails_open_on_config_error(monkeypatch):
         raise RuntimeError("config unreadable")
 
     monkeypatch.setattr(scheduler, "load_config", _raise)
-    assert scheduler._fallback_chain_phrase() == "Fallback chain was exhausted or unavailable."
+    assert scheduler._fallback_chain_phrase() == "No backup provider succeeded either."
 
 
 def test_readtimeout_error_still_classified_as_provider_timeout(monkeypatch):
     monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
-    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+    monkeypatch.setattr(scheduler, "get_cron_fallback_chain", lambda cfg: [])
     job = {"name": "some-job", "id": "abc123"}
     error = "httpx.ReadTimeout: The read operation timed out"
     msg = _summarize_cron_failure_for_delivery(job, error)
-    assert "provider timeout" in msg
+    assert "did not respond in time" in msg
 
 
 def test_rate_limit_classification_still_takes_priority_over_inactivity_text(monkeypatch):
@@ -88,9 +88,11 @@ def test_rate_limit_classification_still_takes_priority_over_inactivity_text(mon
     # adjacent wording; rate-limit check runs first and should be unaffected
     # by the new inactivity branch inserted after it.
     monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
-    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+    monkeypatch.setattr(scheduler, "get_cron_fallback_chain", lambda cfg: [])
     job = {"name": "some-job", "id": "abc123"}
     error = "HTTP 429: weekly usage limit exceeded"
     msg = _summarize_cron_failure_for_delivery(job, error)
-    assert "weekly usage limit" in msg
-    assert "No fallback chain configured" in msg
+    # A usage-limit wall is a billing verdict: it names the limit and the provider-pin fix,
+    # never the transient "backup provider" retry clause.
+    assert "usage or credit limit" in msg
+    assert "hermes cron edit abc123 --provider" in msg

@@ -34,6 +34,23 @@ fills the password through Hermes. The tool result it sees is
 `{filled_fields: 1, origin: "https://github.com"}`; the password is also
 registered with the redactor so a later page read cannot echo it back.
 
+### Protected date fields
+
+Configured date-of-birth fields are filled only on their exact saved origin **in a
+private per-task local Chromium browser**. The fill refuses Camofox (including
+managed identities and named accounts), attached `/browser connect` or CDP
+browsers, real-profile, Bot Desktop shared browsers, Lightpanda, cloud browsers,
+and sessions without verified task ownership. The named brianle/lpg/meridian
+Camofox account browsers cannot fill birth dates; navigate with a fresh local
+per-task browser instead. After a protected-date fill, every browser-derived
+result in that browser session,
+including snapshots, evaluations, console/CDP output and iframe output,
+redacts the full date and its exact year/month/day components. This is intentionally
+session-scoped: unrelated standalone numbers equal to a component (for example `4`,
+`12`, or `1990`) are also masked, on every tab, until the browser session closes.
+Navigating or focusing another tab does not lift it, because the filled tab may still
+be open. Screenshots remain refused for the same lifetime.
+
 ## Two-factor codes
 
 Sites that ask for a code after the password are handled the same way:
@@ -60,6 +77,9 @@ per session, 30 minutes idle). Hermes hands the master password to the manager's
 CLI through its non-interactive channel (`op signin` on stdin, `bw unlock
 --passwordenv` in the child's environment) and keeps only the session token in
 memory. The agent never sees the master password, the token, or any login.
+A manager item that lists several websites (say `amazon.co.uk`,
+`www.amazon.co.uk` and `eu.account.amazon.com`) fills on each of those exact
+origins; nothing is inferred beyond the URLs saved on the item.
 
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
@@ -86,6 +106,70 @@ Items live encrypted under `~/.hermes/vault/` (Fernet key + vault file, both
 visible metadata; passwords and card values never leave the vault except into
 the page.
 
+### Protected fields from 1Password
+
+An operator can expose one sensitive 1Password field to browser autofill without
+exposing its value to the model. Each entry binds an `op://` reference to one
+supported semantic and an exact HTTPS origin:
+
+```yaml
+vault:
+  onepassword:
+    protected_fields:
+      - label: Traveler date of birth
+        reference: op://Personal/Traveler/birthdate
+        semantic: bday
+        value_type: date
+        origins: [https://www.example-airline.com]
+```
+
+`browser_vault_list` returns only an opaque handle, label, semantic and origin.
+`browser_vault_fill` resolves the field server-side and fills only a matching
+birth-date control on that exact origin, rechecked inside the page immediately
+before the write. Protected references require a CLI session or service-account
+token; Connect-only profiles do not advertise them because Connect cannot resolve
+arbitrary `op://` references. Current protected-field support is limited to birth
+dates; unsupported semantics or malformed entries are ignored.
+
+The fill path also protects model-visible browser output. Labels (such as `April`),
+full date strings and four-digit years remain redacted as exact registered values.
+Every browser result in the session, whether a structured snapshot or an
+arbitrary-code channel (`browser_eval`, `browser_exec`, CDP `Runtime.evaluate`,
+including OOPIF evaluation), passes one boundary that masks standalone components.
+That includes unrelated values such as `{"bookings": 4}`. This registry is in memory
+and does not infer provenance from page structure or JavaScript source text.
+Screenshots and CDP pixel captures are unavailable in that session; do not
+handoff a protected page into a shared browser. The registry clears only after
+a confirmed browser close. If close fails, reads stay masked and pixels blocked;
+raw CDP (both target and frame routing) is refused while any protected browser remains open.
+
+### Login origin aliases
+
+A 1Password Login can be bound to more than one exact sign-in origin without
+rewriting the item. When a fill returns `origin_mismatch`, the agent may add the
+exact page origin under the item handle or raw 1Password item ID with
+`hermes config set`:
+
+```shell
+hermes config set vault.origin_aliases.<item-id> '["https://signin.example.com"]'
+```
+
+`set` replaces the entire value for that item, so include existing aliases when
+adding another origin. The config is reread for each vault list/fill call; no
+restart is required. Aliases are HTTPS-only, exact-origin matches. Entries with
+a path, an `http` scheme, or a wildcard are ignored. Hermes does not infer
+parent or subdomain origins and applies an alias only to the named login. After
+adding an alias, retry the fill. The first alias-only fill asks the user to
+confirm the full origin and item label unless `vault.confirm_alias_fills` is
+false. A
+cross-registrable-domain alias is logged as an advisory warning when prompts
+are disabled, and otherwise warns in the confirmation detail when the advisory
+fallback recognizes those suffixes. The warning is not an authorization check
+and has partial suffix coverage; the full origin is always shown. Saved-origin
+fills do not need that extra prompt. Never edit or rewrite an existing shared
+1Password item to add a website URL, because template rewrites can remove
+passkeys.
+
 ## Headless sessions
 
 Cron jobs, webhooks, the API server and `hermes chat -q` have nobody to answer a
@@ -104,6 +188,28 @@ vault:
     enabled: false
 ```
 
+### Several 1Password accounts
+
+A service-account token reads every vault it was granted, but only in its own
+account. To add logins from another account (a business account next to a
+personal one), list it under `accounts` with its own service-account token:
+
+```yaml
+vault:
+  onepassword:
+    accounts:
+      - alias: business                       # handles become op@business:<item-id>
+        account: business.1password.com
+        service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN_BUSINESS
+        browser_account: work                 # optional: fill only in this Camofox account
+```
+
+Each additional account authenticates only with its own token, never with
+1Password Connect or an unlocked desktop session, so a handle can never resolve
+under another account's credential. An entry without a unique alias, an account,
+and a token variable of its own is ignored. `browser_account` limits fills and
+one-time codes to tasks whose browser uses that named account.
+
 ## What this does and does not guarantee
 
 **Does:** the password never enters the model's context through Hermes: not in
@@ -117,3 +223,9 @@ site, that site (and any script it runs) has it, exactly as when you type it
 yourself. On a cloud browser backend the vendor's browser sees the page like any
 other. The origin binding is the guard against filling on the wrong site, not
 against a compromised right one.
+
+Nor does it isolate the browser from this machine. Masking and screenshot refusal
+apply to Hermes' browser tools. A local process that connects straight to the
+browser's debugging endpoint, including a shell command run through the terminal
+tool, bypasses them and can read the page like any other client. This applies
+equally to filled passwords and protected dates.

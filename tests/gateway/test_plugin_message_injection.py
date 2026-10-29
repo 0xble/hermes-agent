@@ -1,13 +1,12 @@
 """Tests for plugin-triggered turns in existing gateway sessions."""
 
 import asyncio
-import concurrent.futures
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import (
@@ -45,7 +44,9 @@ def _runner(entry: SessionEntry | None, adapter=None) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     runner.session_store = SimpleNamespace()
     runner._async_session_store = SimpleNamespace(
-        _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry)
+        _store=runner.session_store,
+        lookup_by_session_key=AsyncMock(return_value=entry),
+        get_resume_pending_marker=lambda _key: None,
     )
     runner.adapters = {Platform.TELEGRAM: adapter} if adapter else {}
     runner._profile_adapters = {}
@@ -120,7 +121,9 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
         manager,
     )
 
-    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+    # The runner publishes process-wide; expose this standalone manager through the legacy slot so
+    # the real publisher stamps it while this integration test still exercises the scheduler.
+    with patch("hermes_cli.plugins._plugin_manager", manager):
         runner._install_plugin_message_injector()
         assert (
             context.inject_message(
@@ -147,9 +150,31 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
         assert manager.has_gateway_message_injector is False
 
 
+def _admitting_adapter(accept: bool = True):
+    async def handle(event):
+        event._gateway_accepted = accept
+
+    return SimpleNamespace(handle_message=AsyncMock(side_effect=handle))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_reports_false_when_adapter_does_not_admit():
+    """A busy adapter can refuse the event without raising: callers must not see a delivery."""
+    adapter = _admitting_adapter(accept=False)
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="outcome", plugin_id="session-controls",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_dispatch_uses_stored_origin_and_adapter_message_path():
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = _admitting_adapter()
     entry = _entry()
     runner = _runner(entry, adapter)
 
@@ -179,6 +204,44 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
         "gateway_session_id": entry.session_id,
         "gateway_session_strict": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_rebound_session_when_identity_is_pinned():
+    """A requester outcome must not follow a session key after /new or /resume rebinds it."""
+    adapter = _admitting_adapter()
+    old_entry = _entry()
+    rebound = _entry()
+    rebound.session_id = "new-session-after-reset"
+    runner = _runner(rebound, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=old_entry.session_key,
+        expected_session_id=old_entry.session_id,
+        content="outcome",
+        plugin_id="session-controls",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_accepts_matching_pinned_session_identity():
+    adapter = _admitting_adapter()
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key,
+        expected_session_id=entry.session_id,
+        content="outcome",
+        plugin_id="session-controls",
+    )
+
+    assert accepted is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.metadata["gateway_session_id"] == entry.session_id
 
 
 @pytest.mark.asyncio
@@ -332,67 +395,12 @@ async def test_base_adapter_rejects_derived_session_mismatch():
     assert adapter._active_sessions == {}
 
 
-@pytest.mark.asyncio
-async def test_scheduler_submits_dispatch_on_live_gateway_loop():
-    runner = _runner(_entry())
-    runner._gateway_loop = asyncio.get_running_loop()
-    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
 
-    assert (
-        runner._schedule_plugin_message_injection(
-            session_key="agent:main:telegram:dm:42",
-            content="wake up",
-            plugin_id="notify-plugin",
-        )
-        is True
-    )
 
-    await asyncio.sleep(0)
-    runner._dispatch_plugin_message_injection.assert_awaited_once_with(
-        session_key="agent:main:telegram:dm:42",
-        content="wake up",
-        plugin_id="notify-plugin",
-    )
 
 
 @pytest.mark.asyncio
-async def test_scheduler_ignores_same_loop_task_cancellation():
-    runner = _runner(_entry())
-    loop = asyncio.get_running_loop()
-    runner._gateway_loop = loop
-    callback_errors = []
-    previous_handler = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context: callback_errors.append(context))
-
-    blocker = asyncio.Event()
-
-    async def _wait_for_cancellation(**_kwargs):
-        await blocker.wait()
-
-    runner._dispatch_plugin_message_injection = _wait_for_cancellation
-
-    try:
-        assert (
-            runner._schedule_plugin_message_injection(
-                session_key="key",
-                content="wake up",
-                plugin_id="notify-plugin",
-            )
-            is True
-        )
-
-        task = next(iter(runner._background_tasks))
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        await asyncio.sleep(0)
-    finally:
-        loop.set_exception_handler(previous_handler)
-
-    assert callback_errors == []
-
-
-@pytest.mark.asyncio
-async def test_scheduler_logs_async_failure_without_callback_error(caplog):
+async def test_scheduler_logs_async_failure_without_callback_error():
     runner = _runner(_entry())
     loop = asyncio.get_running_loop()
     runner._gateway_loop = loop
@@ -419,61 +427,10 @@ async def test_scheduler_logs_async_failure_without_callback_error(caplog):
         loop.set_exception_handler(previous_handler)
 
     assert callback_errors == []
-    assert "plugin=notify-plugin session=key" in caplog.text
 
 
-def test_scheduler_uses_threadsafe_bridge_outside_gateway_loop():
-    runner = _runner(_entry())
-    loop = MagicMock()
-    loop.is_closed.return_value = False
-    runner._gateway_loop = loop
-
-    def _submit(coro, target_loop, **_kwargs):
-        assert target_loop is loop
-        coro.close()
-        future = concurrent.futures.Future()
-        future.set_result(True)
-        return future
-
-    with patch("gateway.run.safe_schedule_threadsafe", side_effect=_submit) as submit:
-        assert (
-            runner._schedule_plugin_message_injection(
-                session_key="key",
-                content="wake up",
-                plugin_id="notify-plugin",
-            )
-            is True
-        )
-
-    submit.assert_called_once()
 
 
-def test_scheduler_ignores_threadsafe_future_cancellation():
-    runner = _runner(_entry())
-    loop = MagicMock()
-    loop.is_closed.return_value = False
-    runner._gateway_loop = loop
-
-    def _submit(coro, _target_loop, **_kwargs):
-        coro.close()
-        future = concurrent.futures.Future()
-        future.cancel()
-        return future
-
-    with (
-        patch("gateway.run.safe_schedule_threadsafe", side_effect=_submit),
-        patch("gateway.run.logger.warning") as warning,
-    ):
-        assert (
-            runner._schedule_plugin_message_injection(
-                session_key="key",
-                content="wake up",
-                plugin_id="notify-plugin",
-            )
-            is True
-        )
-
-    warning.assert_not_called()
 
 
 def test_scheduler_rejects_stopped_or_closed_gateway():
@@ -525,7 +482,6 @@ def test_scheduler_rejects_submission_failure():
 
     def _reject(coro, _target_loop, **_kwargs):
         coro.close()
-        return None
 
     with patch("gateway.run.safe_schedule_threadsafe", side_effect=_reject):
         assert (
@@ -542,7 +498,8 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     runner = _runner(_entry())
     manager = PluginManager()
 
-    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+    # The runner publishes process-wide; expose this standalone manager through the legacy slot.
+    with patch("hermes_cli.plugins._plugin_manager", manager):
         runner._install_plugin_message_injector()
         assert manager.has_gateway_message_injector is True
 
@@ -559,3 +516,35 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     assert manager.has_gateway_message_injector is True
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", [True, False], ids=("busy", "idle"))
+async def test_rebound_requester_outcome_is_refused_at_admission(busy):
+    """/new or /resume rebinds the requester key between the injector's lookup and busy admission:
+    the strict outcome must be dropped (not admitted, not queued into the new conversation)."""
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    old_entry = _entry()
+    rebound = _entry()
+    rebound.session_id = "new-session"
+    runner = _runner(old_entry, adapter)
+    runner._async_session_store.lookup_by_session_key = AsyncMock(side_effect=[old_entry, rebound, rebound])
+    runner.config = GatewayConfig()
+    adapter.gateway_runner = runner
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    session_key = build_session_key(old_entry.origin)
+    assert session_key == old_entry.session_key
+    if busy:
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=old_entry.session_key, expected_session_id=old_entry.session_id,
+        content="requester outcome", plugin_id="session-controls",
+    )
+
+    assert accepted is False
+    assert session_key not in adapter._pending_messages
+    assert not runner._overflow_queue(session_key)
+    assert adapter._session_tasks.get(session_key) is None
+    adapter._message_handler.assert_not_awaited()

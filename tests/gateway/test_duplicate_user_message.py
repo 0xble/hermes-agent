@@ -21,11 +21,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_transcript import TranscriptReadError
+from hermes_state import AsyncSessionDB
 
 
 def _bootstrap(monkeypatch, tmp_path):
@@ -44,7 +46,10 @@ def _bootstrap(monkeypatch, tmp_path):
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._handle_active_session_busy_message = AsyncMock(return_value=False)
-    runner._session_db = MagicMock()
+    # Ingress reads topic-retirement metadata through the production async facade.
+    session_db = MagicMock()
+    session_db.get_meta.return_value = None
+    runner._session_db = AsyncSessionDB(session_db)
     runner._recover_telegram_topic_thread_id = lambda _source: None
     runner._cache_session_source = lambda _key, _source: None
     runner._is_session_run_current = lambda _key, _gen: True
@@ -154,7 +159,7 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
-    assert runner._FAILED_TURN_NOTICE in response
+    assert FAILED_TURN_NOTICE in response
 
     transcript_rows = [
         call.args[1]
@@ -162,7 +167,7 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
         if len(call.args) >= 2 and call.args[1].get("role") in {"user", "assistant"}
     ]
     assert [row["role"] for row in transcript_rows] == ["user", "assistant"]
-    assert transcript_rows[-1]["content"] == runner._FAILED_TURN_NOTICE
+    assert transcript_rows[-1]["content"] == FAILED_TURN_NOTICE
 
     # The next unrelated input remains its own turn instead of alternation repair
     # merging the failed mutating request into it.
@@ -207,7 +212,7 @@ async def test_boundary_keyed_on_durable_tail_when_user_row_is_deduped(
         if len(call.args) >= 2 and call.args[1].get("role") in {"user", "assistant"}
     ]
     assert [row["role"] for row in rows] == expected_roles
-    assert all(row["content"] == runner._FAILED_TURN_NOTICE for row in rows)
+    assert all(row["content"] == FAILED_TURN_NOTICE for row in rows)
 
 
 @pytest.mark.asyncio
@@ -249,8 +254,8 @@ async def test_failed_turn_with_tool_activity_does_not_recommend_blind_retry(
         if len(call.args) >= 2 and call.args[1].get("role") == "assistant"
     ]
     assert len(assistant_rows) == 1
-    assert assistant_rows[0]["content"] == runner._PARTIAL_FAILED_TURN_NOTICE
-    assert runner._PARTIAL_FAILED_TURN_NOTICE in response
+    assert assistant_rows[0]["content"] == PARTIAL_FAILED_TURN_NOTICE
+    assert PARTIAL_FAILED_TURN_NOTICE in response
     assert "not processed" not in response
     assert "Send it again" not in response
 

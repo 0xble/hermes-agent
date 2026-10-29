@@ -29,10 +29,67 @@ def _receipt(home: Path, **fields):
     (directory / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+def test_maintenance_installer_targets_current_release(tmp_path):
+    mod = _load("install_candidate_extensions")
+    home = tmp_path / "profile"
+    home.mkdir()
+    scripts = home / "scripts"
+    scripts.mkdir()
+    installed = mod.install_maintenance(home)
+    assert installed == ["sync_fork_candidate.py", "check_fork_patches.py", "sync_fork_candidate_job.sh"]
+    assert all((scripts / name).is_file() for name in installed)
+    assert all((scripts / name).stat().st_mode & stat.S_IXUSR for name in installed)
+    shell = (scripts / "sync_fork_candidate_job.sh").read_text(encoding="utf-8")
+    assert '$profile_home/scripts/sync_fork_candidate.py' in shell
+    assert 'runtime_python="$profile_home/current/.venv/bin/python"' in shell
+    assert '$profile_home/hermes-agent/venv/bin/python' not in shell
+    checker = (scripts / "check_fork_patches.py").read_text(encoding="utf-8-sig")
+    assert "home / 'current'" in checker
+    assert "--repo" in checker
+    assert "home / 'hermes-agent'" not in checker
+
+    release = home / "releases" / ("a" * 40)
+    runtime_scripts = release / "scripts"
+    runtime_scripts.mkdir(parents=True)
+    (release / ".hermes_build_sha").write_text("a" * 40, encoding="utf-8")
+    python = release / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
+    (runtime_scripts / "sync_fork_candidate.py").write_text("print('forwarded')\n", encoding="utf-8")
+    (home / "current").symlink_to(release, target_is_directory=True)
+    legacy_scripts = home / "hermes-agent" / "scripts"
+    legacy_scripts.mkdir(parents=True)
+    (legacy_scripts / "sync_fork_candidate.py").write_text("print('stale')\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    completed = subprocess.run([sys.executable, str(scripts / "sync_fork_candidate.py")],
+                               env=env, capture_output=True, text=True, check=True)
+    assert completed.stdout.strip() == "forwarded"
+
+
+def test_maintenance_installer_refuses_linked_checkout_without_writing(tmp_path):
+    mod = _load("install_candidate_extensions")
+    home = tmp_path / "profile"
+    home.mkdir()
+    source = tmp_path / "checkout" / "src"
+    source.mkdir(parents=True)
+    (source / "hermes").mkdir()
+    tracked = source / "hermes" / "sync-fork-gate.py"
+    tracked.write_text("untouched", encoding="utf-8")
+    (home / "scripts").symlink_to(source, target_is_directory=True)
+    with pytest.raises(ValueError, match="migrate versioned entrypoints and cron paths first"):
+        mod.install_maintenance(home)
+    assert sorted(path.relative_to(source).as_posix() for path in source.rglob("*")) == [
+        "hermes", "hermes/sync-fork-gate.py"
+    ]
+    assert tracked.read_text(encoding="utf-8") == "untouched"
+
+
 def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     head = "b" * 40
     monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})  # nothing running
     _receipt(tmp_path)
     assert mod.check_receipt(tmp_path) == []
     _receipt(tmp_path, outcome="partial", steps=[{"name": "reinstall", "ok": False}])
@@ -47,28 +104,218 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     assert any("not a native" in p for p in mod.check_receipt(tmp_path))
 
 
-def _fake_gh(tmp_path: Path, exit_code: int, stdout: str = "") -> Path:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    gh = bin_dir / "gh"
-    gh.write_text(f"#!/bin/sh\nprintf '%s\\n' {stdout!r}\nexit {exit_code}\n")
-    gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
-    return bin_dir
+def test_check_receipt_ignores_pm_latest_for_the_newest_update(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})  # nothing running
+    _receipt(tmp_path)
+    directory = tmp_path / "logs" / "update_receipts"
+    native = directory / "update_20261005_045152_65780_a276f85a563a4f74983a41e34995844a.json"
+    native.write_text((directory / "latest.json").read_text(encoding="utf-8"), encoding="utf-8")
+    (directory / "latest.json").write_text(json.dumps({"kind": "sync", "outcome": "ok", "steps": []}), encoding="utf-8")
+
+    assert mod.check_receipt(tmp_path) == []
 
 
-def test_create_pr_reports_failure_and_retire_is_idempotent(tmp_path, monkeypatch):
-    mod = _load("curate_skill_observations")
-    monkeypatch.setenv("PATH", f"{_fake_gh(tmp_path, 1)}:{os.environ['PATH']}")
-    assert mod._create_pr(tmp_path, "skills/curate-x", "main", ["hermes"], "body") == ""
-    monkeypatch.setenv("PATH", f"{_fake_gh(tmp_path, 0, 'https://github.com/0xble/dotfiles/pull/1')}:{os.environ['PATH']}")
-    assert mod._create_pr(tmp_path, "skills/curate-x", "main", ["hermes"], "body").endswith("/pull/1")
-    monkeypatch.setenv("PATH", f"{_fake_gh(tmp_path, 0, 'created something but no url')}:{os.environ['PATH']}")
-    assert mod._create_pr(tmp_path, "skills/curate-x", "main", ["hermes"], "body") == ""
-    observations = tmp_path / "obs"
-    observations.mkdir()
-    (observations / "hermes.md").write_text("- note\n")
-    mod._retire_observations(observations, observations / "processed" / "2026-09-19", {"hermes": ["note"], "gone": []})
-    assert (observations / "processed/2026-09-19/hermes.md").is_file() and not (observations / "hermes.md").exists()
+def test_check_receipt_treats_lone_pm_latest_as_no_update(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    monkeypatch.setattr(mod, "_git", lambda *args: "b" * 40)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    (directory / "latest.json").write_text(json.dumps({"kind": "sync", "outcome": "ok", "steps": []}), encoding="utf-8")
+    assert mod.check_receipt(tmp_path) == []
+    # A non-PM legacy pointer is still schema-checked, not silently skipped.
+    (directory / "latest.json").write_text(json.dumps({"sha": "b" * 40}), encoding="utf-8")
+    assert any("not a native" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_newest_update_receipt_orders_by_mtime_not_local_name(tmp_path):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    # When DST ends the local-time stamp repeats, so a later run can sort earlier by name.
+    later_by_name = directory / "update_20261101_015900_1_a.json"
+    newer_on_disk = directory / "update_20261101_011000_2_b.json"
+    later_by_name.write_text("{}", encoding="utf-8")
+    newer_on_disk.write_text("{}", encoding="utf-8")
+    os.utime(later_by_name, (1_000, 1_000))
+    os.utime(newer_on_disk, (2_000, 2_000))
+    assert mod._newest_update_receipt(tmp_path) == newer_on_disk
+
+
+def test_newest_update_receipt_skips_a_receipt_pruned_after_glob(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    kept = directory / "update_20261005_045152_1_a.json"
+    kept.write_text("{}", encoding="utf-8")
+    pruned = directory / "update_20261005_045153_2_b.json"
+    real_glob = Path.glob
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: [*real_glob(self, pattern), pruned])
+    assert mod._newest_update_receipt(tmp_path) == kept
+
+
+def test_newest_update_receipt_ignores_non_regular_entries(tmp_path):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    kept = directory / "update_20261005_045152_1_a.json"
+    kept.write_text("{}", encoding="utf-8")
+    os.utime(kept, (1_000, 1_000))
+    (directory / "update_20261005_045153_2_dir.json").mkdir()
+    os.mkfifo(directory / "update_20261005_045154_3_fifo.json")
+    assert mod._newest_update_receipt(tmp_path) == kept
+
+
+@pytest.mark.parametrize("kind", ["directory", "file"])
+def test_non_symlink_current_fails_closed(tmp_path, monkeypatch, kind):
+    mod = _load("check_fork_patches")
+    monkeypatch.setattr(mod, "_git", lambda *args: "a" * 40)
+    current = tmp_path / "current"
+    if kind == "directory":
+        current.mkdir()
+    else:
+        current.write_text("not a pointer\n", encoding="utf-8")
+    revision, target, failure = mod._verification_revision(tmp_path)
+    assert (revision, target) == ("", "release")
+    assert failure and "not a release symlink" in failure
+
+
+def test_absent_current_keeps_legacy_checkout(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    monkeypatch.setattr(mod, "_git", lambda *args: "a" * 40)
+    assert mod._verification_revision(tmp_path) == ("a" * 40, "checkout", None)
+
+
+def test_check_receipt_uses_immutable_release_not_source_head(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    source_head, active = "a" * 40, "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: source_head)
+    release = tmp_path / "releases" / active
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(active + "\n", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    row = {"profile": "default", "pid": 9, "code_sha": active, "state": "current"}
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": row})
+    _receipt(tmp_path, fleet=[row])
+    assert mod.check_receipt(tmp_path) == []
+
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": dict(row, code_sha=source_head)})
+    assert any("running profile" in p and "release" in p for p in mod.check_receipt(tmp_path))
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": row})
+    _receipt(tmp_path, post_update={"sha": source_head}, fleet=[row])
+    assert any("post_update" in p and "release" in p for p in mod.check_receipt(tmp_path))
+    _receipt(tmp_path, fleet=[dict(row, code_sha=source_head)])
+    assert mod.check_receipt(tmp_path) == []  # receipt fleet snapshot may lag the live gateway
+    (tmp_path / "current").unlink()
+    (tmp_path / "current").symlink_to(tmp_path / "releases" / ("c" * 40))
+    assert any("current release" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_check_receipt_trusts_the_live_fleet_over_a_stale_snapshot(tmp_path, monkeypatch, capsys):
+    """A gateway that drained past the updater's settle window is recorded stale and the outcome
+    partial, but launchd relaunched it on the new code: the live fleet, not the snapshot, decides."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    stale_row = {"profile": "default", "pid": 7, "code_sha": "a" * 40, "state": "stale"}
+    _receipt(tmp_path, outcome="partial", fleet=[stale_row])
+
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": {"pid": 9, "code_sha": head, "state": "current"}})
+    assert mod.check_receipt(tmp_path) == []
+    out = capsys.readouterr().out
+    assert "live gateway pid 9 verified current" in out and "outcome is 'partial'" in out
+
+    # Live gateway on a different SHA, or none for that profile, or probe unavailable: still stale.
+    for live in ({"default": {"pid": 9, "code_sha": "c" * 40, "state": "current"}}, {"other": {"pid": 9, "code_sha": head}}, {}, None):
+        monkeypatch.setattr(mod, "_live_fleet", lambda live=live: live)
+        problems = mod.check_receipt(tmp_path)
+        assert any("state stale" in p for p in problems), live
+        assert any("outcome is 'partial'" in p for p in problems), live
+
+    # A failed step is a real failure regardless of the live fleet.
+    _receipt(tmp_path, outcome="partial", steps=[{"name": "reinstall", "ok": False}], fleet=[stale_row])
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": {"pid": 9, "code_sha": head, "state": "current"}})
+    problems = mod.check_receipt(tmp_path)
+    assert len(problems) == 1 and "reinstall" in problems[0]
+
+
+def test_check_receipt_only_excuses_partial_when_a_row_was_verified_live(tmp_path, monkeypatch, capsys):
+    """The outcome downgrade is limited to the settle-window case: a ``partial`` whose only evidence
+    is a stale/down row the live fleet disproves. Nothing else non-success passes, even with no step
+    records and a healthy live fleet."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    healthy = {"default": {"pid": 9, "code_sha": head, "state": "current"}}
+    monkeypatch.setattr(mod, "_live_fleet", lambda: healthy)
+
+    for outcome in ("failed", "refused", "running", "partial", ""):
+        _receipt(tmp_path, outcome=outcome)  # no steps, no fleet rows: nothing was verified live
+        problems = mod.check_receipt(tmp_path)
+        assert len(problems) == 1 and f"outcome is {outcome or 'missing'!r}" in problems[0], outcome
+    assert "verified current" not in capsys.readouterr().out
+
+    # A down row (updater killed it, nothing replaced it) is treated like stale: live fleet decides.
+    down_row = {"profile": "default", "pid": 7, "code_sha": None, "state": "down"}
+    _receipt(tmp_path, outcome="partial", fleet=[down_row])
+    assert mod.check_receipt(tmp_path) == []
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    problems = mod.check_receipt(tmp_path)
+    assert any("state down" in p for p in problems) and any("outcome is 'partial'" in p for p in problems)
+
+    # Probe unavailable is said so, not silently treated as verified.
+    monkeypatch.setattr(mod, "_live_fleet", lambda: None)
+    problems = mod.check_receipt(tmp_path)
+    assert any("live fleet probe unavailable" in p for p in problems)
+
+    # Two stale rows, only one verified live: the unverified profile still fails, and so does the outcome.
+    monkeypatch.setattr(mod, "_live_fleet", lambda: healthy)
+    _receipt(tmp_path, outcome="partial", fleet=[
+        {"profile": "default", "pid": 7, "code_sha": "a" * 40, "state": "stale"},
+        {"profile": "lpg", "pid": 8, "code_sha": "a" * 40, "state": "stale"},
+    ])
+    problems = mod.check_receipt(tmp_path)
+    assert any("'lpg'" in p and "state stale" in p for p in problems)
+    assert any("outcome is 'partial'" in p for p in problems)
+    assert not any("'default'" in p for p in problems)
+
+
+def test_check_receipt_success_ignores_opted_out_steps(tmp_path, monkeypatch):
+    """The updater records an opted-out backup as ``ok: false`` and still finalizes success."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: (_ for _ in ()).throw(AssertionError("probe must not run without stale rows")))
+    _receipt(tmp_path, outcome="success", steps=[{"name": "pre_update_backup", "ok": False, "detail": "disabled or failed"}],
+             fleet=[{"profile": "default", "pid": 9, "code_sha": head, "state": "current"}])
+    assert mod.check_receipt(tmp_path) == []
+
+
+def test_check_receipt_partial_with_other_causes_is_not_excused(tmp_path, monkeypatch):
+    """A live-verified stale row cannot mask the receipt's other partial causes, which are not steps."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": {"pid": 9, "code_sha": head, "state": "current"}})
+    stale_row = {"profile": "default", "pid": 7, "code_sha": "a" * 40, "state": "stale"}
+    cases = {
+        "failed restart units: ai.hermes.gateway-lpg": {"gateway_restart": {"failed_units": ["ai.hermes.gateway-lpg"]}},
+        "restart phase incomplete (boom)": {"gateway_restart": {"incomplete": True, "phase_error": "boom"}},
+        "unaccounted runtimes: lpg": {"runtime_outcomes": [{"kind": "gateway", "profile": "lpg", "outcome": "unaccounted"}]},
+    }
+    for expected, extra in cases.items():
+        _receipt(tmp_path, outcome="partial", fleet=[stale_row], **extra)
+        problems = mod.check_receipt(tmp_path)
+        assert len(problems) == 1 and "outcome is 'partial'" in problems[0] and expected in problems[0], expected
+    # The clean bookkeeping the settle-window case actually produces still passes.
+    _receipt(tmp_path, outcome="partial", fleet=[stale_row],
+             gateway_restart={"failed_units": [], "incomplete": False, "phase_error": ""},
+             runtime_outcomes=[{"kind": "gateway", "profile": "default", "outcome": "restarted"}])
+    assert mod.check_receipt(tmp_path) == []
 
 
 def test_rollback_reinstall_failure_reaches_recovery(tmp_path):
@@ -81,3 +328,95 @@ def test_rollback_reinstall_failure_reaches_recovery(tmp_path):
     assert run.returncode == 1 and "RECOVERED" in run.stdout and "UNREACHABLE" not in run.stdout
     real = (SCRIPTS / "rollback_fork_runtime.sh").read_text()
     assert "if reinstall 2>&1 | tail -3; then" in real and "PIPESTATUS" not in real
+
+
+def test_fork_patch_check_verifies_the_checkout_it_runs_from(tmp_path):
+    """A candidate worktree shares the primary checkout's venv, whose editable hermes_cli resolves
+    to the primary checkout; the check must still verify the worktree it was launched from."""
+    import importlib.util
+
+    checkout = tmp_path / "candidate"
+    (checkout / "hermes_cli").mkdir(parents=True)
+    (checkout / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (checkout / "scripts").mkdir()
+    script = checkout / "scripts" / "check_fork_patches.py"
+    script.write_text((SCRIPTS / "check_fork_patches.py").read_text(encoding="utf-8"), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("candidate_fork_patch_check", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.REPO == checkout.resolve()
+
+    # Copied out of a checkout (the cron --script root), it still falls back to the installed package.
+    loose = tmp_path / "home" / "scripts"
+    loose.mkdir(parents=True)
+    copied = loose / "check_fork_patches.py"
+    copied.write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("loose_fork_patch_check", copied)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    import hermes_cli
+    assert module.REPO == Path(hermes_cli.__file__).resolve().parents[1]
+
+
+def test_check_receipt_ignores_gateways_on_a_separate_checkout(tmp_path, monkeypatch):
+    """A fleet row in the updater's ``external`` state serves a checkout this update did not touch."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    _receipt(tmp_path, fleet=[
+        {"profile": "default", "pid": 9, "code_sha": head, "state": "current"},
+        {"profile": "lpg", "pid": 11, "code_sha": "e" * 40, "state": "external", "code_root": "/srv/other"},
+    ])
+    assert mod.check_receipt(tmp_path) == []
+    # An ordinary row on other code still fails; only the external state is exempt.
+    _receipt(tmp_path, fleet=[{"profile": "lpg", "pid": 11, "code_sha": "e" * 40, "state": "current"}])
+    assert any("'lpg'" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
+    """Background review is an owner choice; enabling it must not fail the fork-patch check."""
+    mod = _load("check_fork_patches")
+    assert "auxiliary.background_review.enabled" not in mod.EXPECTED_CONFIG
+    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m",
+              "auxiliary.background_review.enabled": "true"}
+
+    def fake_run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+    values["memory.write_approval"] = "true"
+    assert mod.check_config(tmp_path) == ["config memory.write_approval = 'true', expected 'false'"]
+
+
+def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    release = tmp_path / "releases" / ("b" * 40)
+    python = release / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("placeholder", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    calls = []
+    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m"}
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+    assert all(call[0][0] == str(python) for call in calls)
+    assert all(call[1]["cwd"] == str(release) for call in calls)
+    assert all(call[1]["env"]["PYTHONPATH"] == str(release) for call in calls)
+
+
+def test_runtime_checks_fail_closed_when_release_interpreter_is_missing(tmp_path):
+    mod = _load("check_fork_patches")
+    release = tmp_path / "releases" / ("c" * 40)
+    release.mkdir(parents=True)
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+
+    context = mod._runtime_context(tmp_path)
+    assert isinstance(context, str) and "release interpreter" in context
+    assert mod.check_config(tmp_path) == [context]

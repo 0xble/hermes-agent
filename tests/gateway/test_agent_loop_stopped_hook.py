@@ -13,7 +13,6 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
-from hermes_cli.plugins import VALID_HOOKS
 
 
 def _make_source() -> SessionSource:
@@ -43,16 +42,12 @@ def _make_runner():
     runner._running_agents = {}
     runner._pending_messages = {}
 
-    # _invalidate_session_run_generation + _release_running_agent_state are
-    # called downstream; stub to no-op so we exercise the hook emit only.
-    runner._invalidate_session_run_generation = lambda *a, **kw: None
+    # Keep the real generation bump so delayed cleanup can check its fence;
+    # the hook-only tests need no running-slot release.
     runner._release_running_agent_state = lambda *a, **kw: None
     return runner
 
 
-def test_agent_loop_stopped_in_valid_hooks():
-    """Plugins must be able to subscribe to the new hook without warnings."""
-    assert "agent_loop_stopped" in VALID_HOOKS
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,9 @@
 import os
 import subprocess
 from unittest.mock import MagicMock, patch
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
 from rich.text import Text
 import pytest
 
@@ -78,17 +81,11 @@ class TestGatewayQuickCommands:
     """Test quick command dispatch in GatewayRunner._handle_message."""
 
     def _make_event(self, command, args=""):
-        event = MagicMock()
-        event.get_command.return_value = command
-        event.get_command_args.return_value = args
-        event.text = f"/{command} {args}".strip()
-        event.source = MagicMock()
-        event.source.user_id = "test_user"
-        event.source.user_name = "Test User"
-        event.source.platform.value = "telegram"
-        event.source.chat_type = "dm"
-        event.source.chat_id = "123"
-        return event
+        source = SessionSource(
+            platform=Platform.TELEGRAM, user_id="test_user", user_name="Test User",
+            chat_type="dm", chat_id="123",
+        )
+        return MessageEvent(text=f"/{command} {args}".strip(), source=source)
 
     @pytest.mark.asyncio
     async def test_exec_command_returns_output(self):

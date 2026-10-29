@@ -8,8 +8,9 @@ here so ``--preview`` / ``--aggressive`` and the lock-skip wording cannot drift 
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 #: Every surface renders the same refusal; hard truncation has no persistence path outside the guarded
 #: ``_compress_context`` rotation, so ``--aggressive`` is refused rather than mis-parsed as a focus topic.
@@ -27,19 +28,55 @@ class CompressRequest:
     partial: bool = False
     keep_last: int = 2
     focus_topic: Optional[str] = None
+    level: int = 1  # ``--level N``: 1 = configured retention, higher levels keep less verbatim
+
+
+#: Per-level ``(tail token budget as a fraction of the configured one, summary token ceiling)``. Level 1 is
+#: absent: it runs the configured compressor untouched. Level 3's zero budget leaves only the anchors
+#: ``_find_tail_cut_by_tokens`` always keeps: the latest user request and the latest reply.
+_LEVEL_OVERRIDES = {2: (0.25, 5_000), 3: (0.0, 2_000)}
+#: Recent messages whose tool results a tightened run still leaves unpruned.
+_LEVEL_PROTECT_LAST_N = 2
+
+
+@contextlib.contextmanager
+def compression_level(compressor: Any, level: int) -> Iterator[None]:
+    """Tighten ``compressor``'s verbatim tail and summary ceiling for one manual run, then restore them.
+
+    Only the built-in ``ContextCompressor`` has these knobs; a plugin context engine keeps its own policy
+    and ``--level`` is a no-op there."""
+    from agent.context_compressor import ContextCompressor
+
+    override = _LEVEL_OVERRIDES.get(level)
+    if override is None or not isinstance(compressor, ContextCompressor):
+        yield
+        return
+    tail_scale, summary_cap = override
+    protect_last_n, min_tail_users = compressor.protect_last_n, compressor.min_tail_user_messages
+    try:
+        compressor.tail_token_budget = max(1, int(compressor.tail_token_budget * tail_scale))
+        compressor.max_summary_tokens = min(compressor.max_summary_tokens, summary_cap)
+        compressor.protect_last_n = min(protect_last_n, _LEVEL_PROTECT_LAST_N)
+        compressor.min_tail_user_messages = 1
+        yield
+    finally:
+        # The two budgets are derived from the model window and may be re-derived mid-run (aux-context
+        # ceiling, model update), so they are cleared back to lazy rather than restored from a stale copy.
+        compressor._tail_token_budget = compressor._max_summary_tokens = None
+        compressor.protect_last_n, compressor.min_tail_user_messages = protect_last_n, min_tail_users
 
 
 @dataclass
 class CompressResult:
     status: str  # "preview" | "compressed" | "lock_skipped" | "nothing_to_do"
-    before_messages: List[Dict[str, Any]]
-    after_messages: List[Dict[str, Any]]
+    before_messages: list[dict[str, Any]]
+    after_messages: list[dict[str, Any]]
     before_tokens: int
     after_tokens: int
     request: CompressRequest
-    lines: List[str] = field(default_factory=list)  # preview report lines (status == "preview")
+    lines: list[str] = field(default_factory=list)  # preview report lines (status == "preview")
     lock_holder: Any = None
-    summary: Optional[Dict[str, Any]] = None  # ``summarize_manual_compression`` payload when compressed
+    summary: Optional[dict[str, Any]] = None  # ``summarize_manual_compression`` payload when compressed
 
     @property
     def removed(self) -> int:
@@ -48,14 +85,16 @@ class CompressResult:
 
 def parse_compress_args(raw_args: str) -> CompressRequest:
     """One parser for every surface: flags anywhere, then the boundary-aware / focus positional forms."""
-    from hermes_cli.partial_compress import extract_compress_flags, parse_partial_compress_args
+    from hermes_cli.partial_compress import (
+        extract_compress_flags, extract_compress_level, parse_partial_compress_args)
     rest, preview, aggressive = extract_compress_flags((raw_args or "").strip())
+    rest, level = extract_compress_level(rest)
     partial, keep_last, focus_topic = parse_partial_compress_args(rest)
     return CompressRequest(preview=preview, aggressive=aggressive, partial=partial, keep_last=keep_last,
-                           focus_topic=focus_topic or None)
+                           focus_topic=focus_topic or None, level=level)
 
 
-def estimate_request_tokens(agent: Any, messages: Sequence[Dict[str, Any]]) -> int:
+def estimate_request_tokens(agent: Any, messages: Sequence[dict[str, Any]]) -> int:
     """Transcript + system prompt + tool schemas: a transcript-only figure understates real request pressure
     and can even appear to grow after a dense handoff summary replaces many short turns (#6217)."""
     from agent.model_metadata import estimate_request_tokens_rough
@@ -67,12 +106,15 @@ def estimate_request_tokens(agent: Any, messages: Sequence[Dict[str, Any]]) -> i
 
 
 def compress_now(
-    agent: Any, history: Sequence[Dict[str, Any]], request: CompressRequest, *,
+    agent: Any, history: Sequence[dict[str, Any]], request: CompressRequest, *,
     system_message: Any = None, task_id: str = "default", skip_without_window: bool = False,
+    snapshot_is_current: Optional[Callable[[], bool]] = None,
 ) -> CompressResult:
     """Run one manual compression of ``history`` on ``agent`` and return the outcome; the caller installs
     ``after_messages`` (and re-anchors session ids) — history is never mutated here.
 
+    ``snapshot_is_current`` validates the host's snapshot after durable lease admission, before the
+    summarizer runs; the normal timeout/fallback pipeline remains in charge of the attempt.
     ``preview=True`` performs no compression and leaves ``agent`` untouched. A held compression lock
     yields ``lock_skipped`` with the agent's signal cleared and the deferred context-engine notification
     discarded; otherwise the caller must call ``finalize_context_engine_compression_notification(agent,
@@ -83,10 +125,8 @@ def compress_now(
     ``_compress_context`` still does useful work there — codex_app_server native compaction, and the
     phase-1 tool-result prune / blank-echo drop that ``ContextCompressor.compress`` commits even when no
     summary window exists."""
-    from agent.conversation_compression import finalize_context_engine_compression_notification
-    from agent.manual_compression_feedback import summarize_manual_compression
     from hermes_cli.partial_compress import (
-        rejoin_compressed_head_and_tail, split_history_for_partial_compress, summarize_compress_preview)
+        MAX_COMPRESS_LEVEL, split_history_for_partial_compress, summarize_compress_preview)
 
     before = list(history)
     before_tokens = estimate_request_tokens(agent, before)
@@ -96,17 +136,64 @@ def compress_now(
         if not tail:  # degenerate split: nothing to keep verbatim → full compression
             head = before
     if request.preview:
-        report = summarize_compress_preview(before, request.partial, request.keep_last, request.focus_topic, before_tokens)
+        report = summarize_compress_preview(before, request.partial, request.keep_last, request.focus_topic, before_tokens,
+                                            level=request.level)
         return CompressResult("preview", before, before, before_tokens, before_tokens, request, lines=report["lines"])
+
+    compressor = getattr(agent, "context_compressor", None)
+    # ``here N`` already chose what stays verbatim, so the head is summarized at the tightest level: only the
+    # head's own latest exchange rides along, which the compressor keeps so a real user turn follows the summary.
+    level = MAX_COMPRESS_LEVEL if tail else request.level
+    if level > 1 and getattr(agent, "_compression_feasibility_checked", True) is False:
+        # The first attempt's lazy aux-feasibility probe may recalibrate the retention budgets, which would
+        # silently discard the per-run override, so the probe runs before the override is applied.
+        from agent.conversation_compression import check_compression_model_feasibility
+        check_compression_model_feasibility(agent)
+        agent._compression_feasibility_checked = True
+    with compression_level(compressor, level):
+        return _compress_head(agent, before, head, tail, before_tokens, request, system_message=system_message,
+                              task_id=task_id, skip_without_window=skip_without_window,
+                              snapshot_is_current=snapshot_is_current)
+
+
+def _compress_head(
+    agent: Any, before: List[Dict[str, Any]], head: List[Dict[str, Any]], tail: List[Dict[str, Any]],
+    before_tokens: int, request: CompressRequest, *, system_message: Any, task_id: str, skip_without_window: bool,
+    snapshot_is_current: Optional[Callable[[], bool]] = None,
+) -> CompressResult:
+    from agent.context_compressor import _DB_PERSISTED_MARKER, _fresh_compaction_message_copy
+    from agent.conversation_compression import finalize_context_engine_compression_notification
+    from agent.manual_compression_feedback import summarize_manual_compression
+    from hermes_cli.partial_compress import rejoin_compressed_head_and_tail
 
     compressor = getattr(agent, "context_compressor", None)
     has_content = getattr(compressor, "has_content_to_compress", None)
     if skip_without_window and callable(has_content) and has_content(head) is False:
         return CompressResult("nothing_to_do", before, before, before_tokens, before_tokens, request)
+    # An in-place commit archives every durable row under the lease watermark, the kept tail's included, so
+    # it must store the tail again itself. It gets copies because the insert writes row ids onto them. A copy
+    # keeps its source's row id only while the source is unchanged since it was loaded (marker present): a
+    # resume merge rewrote the row and dropped the marker, and its id no longer bounds what the row holds.
+    tail_rows = []
+    for m in tail:
+        row = _fresh_compaction_message_copy(m)
+        if not m.get(_DB_PERSISTED_MARKER):
+            # A rewritten row's id does not bound the archive, but it and any row a merge
+            # folded into it were still in the compressor's input. Keep them named so the
+            # commit archives those originals instead of cloning them beside the tail.
+            dropped = row.pop("_row_id", None)
+            if isinstance(dropped, int) and not isinstance(dropped, bool) and dropped > 0:
+                absorbed = [*(row.get("_absorbed_row_ids") or ())]
+                if dropped not in absorbed:
+                    absorbed.append(dropped)
+                row["_absorbed_row_ids"] = absorbed
+        tail_rows.append(row)
     try:
         compressed, _ = agent._compress_context(
             head, system_message, approx_tokens=before_tokens, focus_topic=request.focus_topic, force=True,
-            defer_context_engine_notification=True, **({"task_id": task_id} if task_id != "default" else {}))
+            defer_context_engine_notification=True, **({"task_id": task_id} if task_id != "default" else {}),
+            **({"snapshot_is_current": snapshot_is_current} if snapshot_is_current is not None else {}),
+            **({"verbatim_tail": tail_rows} if tail_rows else {}))
     except Exception:
         finalize_context_engine_compression_notification(agent, committed=False)
         raise
@@ -117,14 +204,16 @@ def compress_now(
         finalize_context_engine_compression_notification(agent, committed=False)
         return CompressResult("lock_skipped", before, before, before_tokens, before_tokens, request,
                               lock_holder=lock_signal if isinstance(lock_signal, str) else None)
-    if tail:
+    # Stamped copies mean the commit (in place or rotated) stored the tail and already returned head + tail.
+    # A no-op or a rolled-back commit leaves them unstamped, and the tail is then only in the caller's dicts.
+    if tail and not all(row.get(_DB_PERSISTED_MARKER) is True for row in tail_rows):
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
     after_tokens = estimate_request_tokens(agent, compressed)
     summary = summarize_manual_compression(before, compressed, before_tokens, after_tokens, compression_state=compressor)
     return CompressResult("compressed", before, list(compressed), before_tokens, after_tokens, request, summary=summary)
 
 
-def render_compress_result(result: CompressResult, *, prefix: str = "") -> List[str]:
+def render_compress_result(result: CompressResult, *, prefix: str = "") -> list[str]:
     """Surface-neutral text lines for a result (each surface may add its own icon/prefix)."""
     if result.status == "preview":
         return [f"{prefix}{line}" for line in result.lines]

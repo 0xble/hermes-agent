@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { PanelRowMenu } from './panel'
@@ -11,8 +11,13 @@ beforeAll(() => {
 })
 
 describe('PanelRowMenu', () => {
-  afterEach(() => {
+  afterEach(async () => {
     cleanup()
+    // Radix restores focus on the next timer turn after unmount. Finish that
+    // callback before Vitest tears down this file's jsdom event constructors.
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
   })
 
   it('opens its actions menu from the kebab without a tooltip', async () => {
@@ -28,5 +33,9 @@ describe('PanelRowMenu', () => {
     fireEvent.click(await screen.findByRole('menuitem', { name: 'Rename' }))
 
     expect(onSelect).toHaveBeenCalledOnce()
+    await waitFor(() => {
+      expect(screen.queryByRole('menu')).toBeNull()
+      expect(document.activeElement).toBe(trigger)
+    })
   })
 })

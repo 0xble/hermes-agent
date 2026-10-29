@@ -52,14 +52,18 @@ def build_gateway_parser(
             "already supervises this profile. Without --force, the command "
             "refuses because a second dispatcher escapes the service and can "
             "corrupt shared gateway state.")
-    _flag(gateway_run, "--no-supervise",
-        help="Inside the s6-overlay Docker image, normally `gateway run` is "
+    gateway_run.add_argument(
+        "--no-supervise",
+        action="store_true",
+        help=(
+            "Inside the s6-overlay Docker image, normally `gateway run` is "
             "automatically redirected to the supervised s6 service (so the "
             "gateway gets auto-restart on crash, plus a supervised dashboard "
             "if HERMES_DASHBOARD is set). Pass --no-supervise to opt out and "
             "get the historical pre-s6 foreground behavior: the gateway is "
             "the container's main process and the container exits with the "
-            "gateway's exit code. No effect outside an s6 container.")
+            "gateway's exit code. No effect outside an s6 container."),
+    )
     _flag(gateway_run, "--external-supervisor",
         help="Declare that an external process manager owns this foreground "
             "gateway. In-chat restarts and updates exit back to that manager "
@@ -87,6 +91,16 @@ def build_gateway_parser(
     _flag(gateway_restart, "--force", help=_FORCE_SERVED_PROFILE_HELP)
     _add_compat_platform_flag(gateway_restart)
 
+    gateway_subparsers.add_parser(
+        "handover", help="Switch gateway service to the zero-cut standby slot")
+
+    guardian = gateway_subparsers.add_parser(
+        "guardian", help="Manage the opt-in macOS guardian (install, uninstall, status)",
+        description="Manage the independent launchd guardian. Set gateway.guardian.enabled: true "
+                    "for install; status reports enabled, installed and stopped intent. "
+                    "Inspect logs/guardian for bounded repair receipts and alerts.")
+    guardian.add_argument("guardian_command", choices=("install", "uninstall", "status"))
+
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     _flag(gateway_status, "--deep", help="Deep status check")
     _flag(gateway_status, "-l", "--full",
@@ -94,6 +108,7 @@ def build_gateway_parser(
     _add_system_flag(gateway_status)
     _add_compat_platform_flag(gateway_status)
 
+    # gateway install
     gateway_install = gateway_subparsers.add_parser(
         "install", help="Install gateway as a systemd/launchd background service")
     _flag(gateway_install, "--force",
@@ -110,12 +125,21 @@ def build_gateway_parser(
         help="Enable the service to start automatically on login/boot")
     gateway_install.add_argument("--no-start-on-login", dest="start_on_login", action="store_false",
         help="Do not enable the service to start on login/boot")
+    _flag(gateway_install, "--if-missing", dest="if_missing",
+        help="Do nothing when a gateway service is already installed")
+    _flag(gateway_install, "--force-unit-path", dest="force_unit_path",
+        help="Repoint a service definition that pins another HERMES_HOME at this one")
     _flag(gateway_install, "--elevated-handoff", dest="elevated_handoff", help=argparse.SUPPRESS)
 
     gateway_uninstall = gateway_subparsers.add_parser("uninstall", help="Uninstall gateway service")
     _add_system_flag(gateway_uninstall)
 
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
+
+    gateway_update = gateway_subparsers.add_parser(
+        "update", help="Request a native update from a delegated agent session")
+    gateway_update.add_argument("--reason", required=True,
+        help="Short single-paragraph reason for the parent-session update handoff")
 
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
@@ -130,15 +154,15 @@ def build_gateway_parser(
     _flag(gateway_migrate_legacy, "-y", "--yes", dest="yes", help="Skip the confirmation prompt")
 
     gateway_migrate = gateway_subparsers.add_parser(
-        "migrate", help="Move per-profile gateways onto one multiplexed default gateway (or back)",
-        description="Stop and uninstall each secondary profile's standalone gateway, turn on "
-            "gateway.multiplex_profiles on the default profile and restart its gateway so it serves "
-            "every profile. Runs a preflight first (duplicate bot tokens, port-binding platforms "
-            "without a /p/<profile>/ ingress) and changes nothing when blocked. "
-            "--standalone rolls the recorded migration back.")
-    mode = gateway_migrate.add_mutually_exclusive_group()
-    _flag(mode, "--multiplex", dest="multiplex", help="Migrate to one multiplexed gateway (default)")
-    _flag(mode, "--standalone", dest="standalone", help="Roll back to per-profile gateways from the recorded manifest")
+        "migrate", help="Converge every per-profile gateway onto the ONE host gateway",
+        description="Converge this host onto the one-gateway-per-host model: stop and uninstall "
+            "each secondary profile's gateway and its supervisor unit (systemd, launchd, Windows "
+            "Scheduled Task), then restart the default profile's gateway so it serves every "
+            "profile. Runs a preflight first (duplicate bot tokens, port-binding platforms "
+            "without a /p/<profile>/ ingress) and changes nothing when blocked. Safe to re-run: a "
+            "half-migrated host converges on the next run. Per-profile gateways are not a "
+            "supported topology any more, so there is no rollback command.")
+    _flag(gateway_migrate, "--multiplex", dest="multiplex", help="Converge onto the one host gateway (default)")
     _flag(gateway_migrate, "--dry-run", dest="dry_run", help="Print the plan and blockers without changing anything")
     _flag(gateway_migrate, "-y", "--yes", dest="yes", help="Apply without confirmation")
 

@@ -1,9 +1,0 @@
-name: review-candidate
-version: "0.1.0"
-description: "Parent-only candidate-bound review receipt for Hermes Agent Next."
-author: "0xble"
-provides_tools:
-  - review_candidate
-provides_hooks:
-  - subagent_start
-  - subagent_stop

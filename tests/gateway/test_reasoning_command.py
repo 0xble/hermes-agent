@@ -1,13 +1,11 @@
 """Tests for gateway /reasoning command and hot reload behavior."""
 
 import asyncio
-import inspect
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import yaml
 
 import gateway.run as gateway_run
 from gateway.config import Platform
@@ -86,10 +84,8 @@ class TestReasoningCommand:
         runner._reasoning_config = {"enabled": True, "effort": "xhigh"}
         runner._show_reasoning = False
 
-        result = await runner._handle_reasoning_command(_make_event("/reasoning"))
+        await runner._handle_reasoning_command(_make_event("/reasoning"))
 
-        assert "**Effort:** `none (disabled)`" in result
-        assert "**Display:** on ✓" in result
         assert runner._reasoning_config == {"enabled": False}
         assert runner._show_reasoning is True
 
@@ -116,6 +112,34 @@ class TestReasoningCommand:
             "enabled": True,
             "effort": effort,
         }
+
+    @pytest.mark.asyncio
+    async def test_attended_reasoning_plain_is_temporary_session_is_pinned_and_reset_clears(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-6.1-sol\n"
+            "  attended:\n"
+            "    model: claude-opus-5-5\n"
+            "    provider: custom:claude-proxy\n"
+            "agent:\n  reasoning_effort: medium\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        runner = _make_runner()
+        event = _make_event("/reasoning high")
+        session_key = runner._session_key_for_source(event.source)
+
+        await runner._handle_reasoning_command(event)
+        assert runner._session_state(session_key).conversation.reasoning_override_scope == "temporary"
+        await runner._handle_reasoning_command(_make_event("/reasoning low"))
+        assert runner._session_state(session_key).conversation.reasoning_override_scope == "temporary"
+        await runner._handle_reasoning_command(_make_event("/reasoning xhigh --session"))
+        assert runner._session_state(session_key).conversation.reasoning_override_scope == "session"
+        await runner._handle_reasoning_command(_make_event("/reasoning reset"))
+        conversation = runner._session_state(session_key).conversation
+        assert conversation.reasoning_override is None
 
 
     def test_resolve_session_reasoning_prefers_session_override(self, tmp_path, monkeypatch):

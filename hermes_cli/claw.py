@@ -1,5 +1,6 @@
 """hermes claw — OpenClaw migration commands."""
 
+import contextlib
 import importlib.util
 import itertools
 import logging
@@ -13,7 +14,7 @@ from typing import Callable, Optional
 from hermes_cli.config import get_hermes_home, get_config_path, load_config, save_config
 from hermes_constants import get_optional_skills_dir
 from hermes_cli.setup import (Colors, color, print_header, print_info, print_success, print_error,
-                              prompt_yes_no)
+                              print_warning, prompt_yes_no)
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,7 @@ def _detect_openclaw_processes() -> list[str]:
 def _posix_probe(cmd: list[str], timeout: int):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
-                              errors='replace', timeout=timeout)
+                              errors='replace', timeout=timeout, check=False)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
 
@@ -166,9 +167,27 @@ def _warn_if_openclaw_running(auto_yes: bool) -> None:
 
 
 def _warn_if_gateway_running(auto_yes: bool) -> None:
-    """Warn if a Hermes gateway has connected platforms (token conflicts, e.g. Telegram 409)."""
-    from gateway.status import get_running_pid, read_runtime_status
-    platforms = ((read_runtime_status() or {}).get("platforms") or {}) if get_running_pid() else {}
+    """Warn if the HOST gateway has connected platforms for this profile (token conflicts, e.g.
+    Telegram 409).
+
+    Multiplex-only: one host process serves N profiles, so a SERVED profile owns no ``gateway.pid``.
+    Gating on ``get_running_pid()`` made this destructive-action warning silently vanish for exactly
+    those profiles — the liveness ladder answers for the served case too.
+    """
+    from gateway.status import (
+        profile_platforms_from_multiplexer, read_runtime_status, resolve_gateway_liveness)
+    liveness = resolve_gateway_liveness(use_cache=False)
+    platforms: dict = {}
+    if liveness.running:
+        profile = None
+        with contextlib.suppress(Exception):
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+        if liveness.source == "multiplexer" and profile and profile != "default":
+            # Served profile: its platforms live under `<profile>:<platform>` in the host record.
+            platforms = profile_platforms_from_multiplexer(liveness.runtime, profile)
+        else:
+            platforms = (liveness.runtime or read_runtime_status() or {}).get("platforms") or {}
     connected = [name for name, info in platforms.items()
                  if isinstance(info, dict) and info.get("state") == "connected"]
     if connected and _warn_running(
@@ -176,7 +195,7 @@ def _warn_if_gateway_running(auto_yes: bool) -> None:
         ("Migrating bot tokens while the gateway is active will cause "
          "conflicts (Telegram, Discord, and Slack only allow one active "
          "session per token).",
-         "Recommendation: stop the gateway first with 'hermes gateway stop'."),
+         "Recommendation: stop the host gateway first with 'hermes gateway stop'."),
         "Continue anyway?", declined="Migration cancelled. Stop the gateway and try again.",
     ) is False:
         sys.exit(0)
@@ -348,18 +367,37 @@ def _preview_migration(run_migrator: Callable[[bool], dict], opts: SimpleNamespa
 def _apply_migration(run_migrator: Callable[[bool], dict], opts: SimpleNamespace) -> None:
     """Take a pre-migration backup (unless --no-backup), execute, and print the report. The backup
     shares the pre-update backup's implementation (exclusions, SQLite safe-copy, zip) so it is
-    restorable with `hermes import`: one restore point before any mutation, pruned to the last 5."""
+    restorable with `hermes import`: one restore point before any mutation. Complete archives are
+    pruned to the last 5; an incomplete one is marked and kept separately, so it can never rotate a
+    complete archive out and can never accumulate."""
     backup_archive: Optional[Path] = None
     if not opts.no_backup:
         try:
             from hermes_cli.backup import create_pre_migration_backup
             from hermes_cli.sizefmt import format_bytes as _format_size
-            backup_archive = create_pre_migration_backup(hermes_home=opts.hermes_home)
+            _outcome: dict = {}
+            backup_archive = create_pre_migration_backup(
+                hermes_home=opts.hermes_home, outcome=_outcome)
             if backup_archive:
                 print()
-                print_success(f"Pre-migration backup: {backup_archive} "
-                              f"({_format_size(backup_archive.stat().st_size)})")
+                _size = _format_size(backup_archive.stat().st_size)
+                if _outcome.get("incomplete"):
+                    # print_success on a partial archive is how this gets found out at
+                    # restore time instead of now. Same yellow idiom as the skipped-keys
+                    # warning above, which is the local convention for "kept, but not whole".
+                    print(color(
+                        f"  ⚠ Pre-migration backup is INCOMPLETE: {backup_archive} ({_size}); "
+                        f"{_outcome.get('errors', 0)} unreadable, "
+                        f"{_outcome.get('vanished', 0)} vanished of "
+                        f"{_outcome.get('selected', 0)} selected.", Colors.YELLOW))
+                else:
+                    print_success(f"Pre-migration backup: {backup_archive} ({_size})")
                 print_info(f"Restore with: hermes import {backup_archive.name}")
+            else:
+                print()
+                print_warning("Pre-migration backup was not created (nothing to back up, the write "
+                              "failed, or it was incomplete); if incomplete, a partial "
+                              "pre-migration-*.incomplete.zip may exist in the backups dir.")
         except Exception as e:
             return _error_block(
                 f"Could not create pre-migration backup: {e}",

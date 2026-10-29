@@ -20,6 +20,7 @@ the E2E-over-mocks discipline for file-touching code.
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -138,7 +139,8 @@ def test_expr_edit_on_a_legacy_offset_row_still_does_not_fire(temp_home, monkeyp
 
 def test_future_local_wall_clock_is_left_scheduled(temp_home, monkeypatch):
     """A legacy row whose normalized instant has not arrived yet is simply
-    not due — no catch-up, no re-anchor, no telemetry."""
+    not due. Its old wall-clock slot has passed, so keep it for catch-up rather
+    than re-anchoring past an occurrence that has never fired."""
     from cron.jobs import get_due_jobs, get_job, get_timezone_migration_catchup_stats
 
     before_due = datetime.fromisoformat("2026-09-02T05:00:00+02:00")
@@ -173,6 +175,32 @@ def test_future_stored_wall_clock_still_takes_the_offset_repair_path(
     assert (
         get_timezone_migration_catchup_stats()["timezone_migration_catchups"] == 0
     )
+
+
+def test_profile_move_reanchors_future_unpinned_cron_before_old_instant(temp_home, monkeypatch):
+    """A West-coast profile must not retain an East-coast instant until the old clock fires."""
+    from cron.jobs import get_due_jobs, get_job
+
+    scan_time = datetime(2026, 9, 2, 5, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: scan_time)
+    jid = _write_cron_job("0 9 * * *", "2026-09-02T09:00:00-04:00")
+
+    assert get_due_jobs() == []
+    assert get_job(jid)["next_run_at"] == "2026-09-02T09:00:00-07:00"
+    assert get_due_jobs() == []  # persisted repair is stable on the next scan
+
+
+def test_future_dst_offset_does_not_look_like_profile_move(temp_home, monkeypatch):
+    """A future winter occurrence already carries the governing zone's expected offset."""
+    from cron.jobs import get_due_jobs, get_job
+
+    scan_time = datetime(2026, 10, 31, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: scan_time)
+    future = "2026-11-01T09:00:00-08:00"
+    jid = _write_cron_job("0 9 * * *", future)
+
+    assert get_due_jobs() == []
+    assert get_job(jid)["next_run_at"] == future
 
 
 def test_classifier_separates_migration_from_edit(temp_home):

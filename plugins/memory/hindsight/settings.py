@@ -13,13 +13,17 @@ logger = logging.getLogger(__name__.rpartition(".")[0])
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
-# Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
+# Keep in sync with plugin.yaml and the PM dependency declaration.
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` on retained memories is OPT-IN (AGENTS.md forbids
 # on-by-default attribution tags): ``retain_source`` / HINDSIGHT_RETAIN_SOURCE.
 _DEFAULT_RETAIN_SOURCE = ""
+# Named retain strategy applied to every item this plugin stores. Empty means the bank
+# decides (its ``retain_default_strategy``, else unmissioned ``concise`` extraction).
+# The bank must already define the name under ``retain_strategies``.
+_DEFAULT_RETAIN_STRATEGY = ""
 # Hindsight brand mark (eye ringed by graph nodes) for the recall/retain indicators.
 _HINDSIGHT_GLYPH = "👁️"
 # Hindsight 0.5.0 added ``update_mode='append'``; older APIs would silently
@@ -121,7 +125,7 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
         return fallback
     try:
         rendered = template.format(**{k: _sanitize_bank_segment(v) for k, v in placeholders.items()})
-    except (KeyError, IndexError) as exc:
+    except (KeyError, IndexError, ValueError) as exc:  # ValueError: unmatched braces, bad spec
         logger.warning("Invalid bank_id_template %r: %s — using fallback %r",
                        template, exc, fallback)
         return fallback

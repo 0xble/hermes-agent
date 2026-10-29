@@ -130,7 +130,7 @@ class TestSurfaces:
     def test_tool_create_and_update_carry_the_zone(self, store, monkeypatch):
         from tools.cronjob_tools import cronjob
         import json as _json
-        monkeypatch.setattr("tools.cronjob_tools._origin_from_env", lambda: None, raising=False)
+        monkeypatch.setattr("tools.cronjob_tools._origin_from_env", lambda *_args: None, raising=False)
         out = _json.loads(cronjob(action="create", prompt="zoned", schedule="0 8 * * *", job_timezone="America/Los_Angeles"))
         assert out.get("success", True), out
         jid = out.get("job_id") or out.get("job", {}).get("id") or out.get("id")
@@ -143,3 +143,98 @@ class TestSurfaces:
         from types import SimpleNamespace
         assert ("job_timezone", "job_timezone") in _JOB_ARG_FIELDS
         assert _job_api_kwargs(SimpleNamespace(job_timezone="Asia/Manila"))["job_timezone"] == "Asia/Manila"
+
+
+def test_cli_edit_timezone_reaches_real_update_and_can_clear(store):
+    from types import SimpleNamespace
+    from hermes_cli.cron import cron_edit
+
+    job = jobs.create_job(name="timezone CLI regression", schedule="0 8 * * *", prompt="test", deliver="local")
+    assert cron_edit(SimpleNamespace(job_id=job["id"], job_timezone="America/Los_Angeles")) == 0
+    edited = jobs.get_job(job["id"])
+    assert edited["timezone"] == "America/Los_Angeles"
+    assert "job_timezone" not in edited
+    assert datetime.fromisoformat(edited["next_run_at"]).astimezone(LOS_ANGELES).hour == 8
+    assert cron_edit(SimpleNamespace(job_id=job["id"], job_timezone="")) == 0
+    cleared = jobs.get_job(job["id"])
+    assert cleared.get("timezone") is None
+    assert datetime.fromisoformat(cleared["next_run_at"]).astimezone(NEW_YORK).hour == 8
+    assert cleared["next_run_at"] != edited["next_run_at"]
+
+
+class TestDueScanDispatchesInTheJobZone:
+    """The due scan, not only next-run computation, must read a zoned job's wall clock in its own
+    zone: its stored offset legitimately differs from the profile's, which is not a migration."""
+
+    @pytest.mark.parametrize(
+        ("zone", "stored_next", "scan_at"),
+        [
+            # Manila is ahead of New York: the stored 08:00+08 wall clock is "in the future" when
+            # read against New York's 20:00, the shape the offset-repair path mistook for a move.
+            ("Asia/Manila", "2026-06-11T08:00:00+08:00", "2026-06-10T20:00:01-04:00"),
+            # Los Angeles is behind: normalized into New York the instant reads 11:00, off the
+            # profile-zone lattice for ``0 8 * * *``.
+            ("America/Los_Angeles", "2026-06-10T08:00:00-07:00", "2026-06-10T11:00:01-04:00"),
+        ],
+    )
+    def test_a_due_occurrence_in_the_job_zone_fires_once_and_advances_one_day(
+        self, store, monkeypatch, zone, stored_next, scan_at,
+    ):
+        job = jobs.create_job(prompt="zoned", schedule="0 8 * * *", job_timezone=zone)
+        raw = jobs.load_jobs()
+        for record in raw:
+            if record["id"] == job["id"]:
+                record["next_run_at"] = stored_next
+        jobs.save_jobs(raw)
+        monkeypatch.setattr(jobs, "_hermes_now", lambda: datetime.fromisoformat(scan_at))
+        monkeypatch.setattr(jobs, "_timezone_migration_catchups", 0)
+        monkeypatch.setattr(jobs, "_timezone_migration_catchups_recent", [])
+
+        due = jobs.get_due_jobs()
+
+        assert [row["id"] for row in due] == [job["id"]]
+        assert jobs.get_job(job["id"])["next_run_at"] == stored_next
+        # A job-zone offset is its native representation, not a profile-zone migration.
+        assert jobs.get_timezone_migration_catchup_stats()["timezone_migration_catchups"] == 0
+        nxt = datetime.fromisoformat(jobs.compute_next_run(
+            jobs.get_job(job["id"])["schedule"], scan_at, zone))
+        assert nxt.astimezone(ZoneInfo(zone)).strftime("%H:%M") == "08:00"
+        assert (nxt - datetime.fromisoformat(stored_next)).total_seconds() == 86400
+
+    def test_an_edited_expression_on_a_zoned_job_still_reanchors_without_firing(self, store, monkeypatch):
+        job = jobs.create_job(prompt="edited", schedule="0 9 * * *", job_timezone="Asia/Manila")
+        raw = jobs.load_jobs()
+        for record in raw:
+            if record["id"] == job["id"]:
+                record["next_run_at"] = "2026-06-11T08:00:00+08:00"  # computed under the old 0 8
+        jobs.save_jobs(raw)
+        monkeypatch.setattr(jobs, "_hermes_now", lambda: datetime.fromisoformat("2026-06-10T20:00:01-04:00"))
+
+        assert jobs.get_due_jobs() == []
+        stored = datetime.fromisoformat(jobs.get_job(job["id"])["next_run_at"])
+        assert stored.astimezone(ZoneInfo("Asia/Manila")).strftime("%H:%M") == "09:00"
+
+
+def test_a_zone_edit_supersedes_an_unclaimed_occurrence_from_the_old_zone(store, monkeypatch):
+    """An occurrence the dispatcher took off the schedule but never claimed belongs to the old
+    wall clock. After a zone edit the due scan must not restore it over the recomputed run: that
+    fires the job at the old zone's hour (08:00 New York = 20:00 Manila), not at 08:00 Manila."""
+    from cron.occurrences import pending_slot_stamp
+
+    now = datetime.fromisoformat("2026-06-10T08:00:30-04:00")
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(prompt="moving", schedule="0 8 * * *", deliver="local")
+    raw = jobs.load_jobs()
+    for record in raw:
+        if record["id"] == job["id"]:
+            record["next_run_at"] = "2026-06-11T08:00:00-04:00"  # advanced past the slot below
+            record["pending_slot"] = pending_slot_stamp("2026-06-10T08:00:00-04:00", now)
+    jobs.save_jobs(raw)
+
+    edited = jobs.update_job(job["id"], {"timezone": "Asia/Manila"})
+    assert edited["next_run_at"] == "2026-06-11T08:00:00+08:00"
+
+    assert jobs.get_due_jobs() == []
+    stored = jobs.get_job(job["id"])
+    assert stored["next_run_at"] == "2026-06-11T08:00:00+08:00"
+    assert "pending_slot" not in stored

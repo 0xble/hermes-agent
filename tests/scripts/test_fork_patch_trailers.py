@@ -1,0 +1,331 @@
+"""Exercise fork-patch commit classification: trailers above the floor, unit ownership of identities."""
+
+import importlib.util
+from pathlib import Path
+import subprocess
+
+
+def _checker(repo, monkeypatch):
+    path = Path(__file__).resolve().parents[2] / "scripts" / "check_fork_patches.py"
+    spec = importlib.util.spec_from_file_location("fork_patch_checker", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "REPO", repo)
+    return module
+
+
+def _repo(tmp_path):
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(tmp_path), *args], check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "core.hooksPath", "/dev/null")
+    git("config", "user.name", "Fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    git("commit", "--allow-empty", "-qm", "baseline")
+    return git
+
+
+def _units(tmp_path, *identities, prose=""):
+    (tmp_path / "MAINTENANCE.md").write_text("# root contract\n", encoding="utf-8")
+    unit_dir = tmp_path / "maintenance"
+    unit_dir.mkdir(exist_ok=True)
+    body = "".join(f"- Fork patch identity: `{i}`\n" for i in identities)
+    (unit_dir / "unit.md").write_text(body + prose, encoding="utf-8")
+
+
+def test_commits_above_the_floor_need_trailers_owned_by_a_unit(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "pre-contract patch without a trailer")
+    floor = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "new patch\n\nFork-Patch: fixture; upstream-pr: none")
+    git("commit", "--allow-empty", "-qm", "evidence\n\nFork-Patch: evidence; retirement: not a patch")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_trailers(base, floor) == []
+    # Without a floor the pre-contract commit is unclassified.
+    assert any("pre-contract patch" in f for f in checker.check_trailers(base))
+    git("commit", "--allow-empty", "-qm", "unclassified patch")
+    failures = checker.check_trailers(base, floor)
+    assert len(failures) == 1 and "unclassified patch" in failures[0]
+
+
+def test_trailer_identity_without_a_unit_owner_fails(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "orphan patch\n\nFork-Patch: orphan-slice; upstream-pr: none")
+    git("commit", "--allow-empty", "-qm", "orphan follow-up\n\nFork-Patch: orphan-slice")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    failures = checker.check_trailers(base)
+    assert len(failures) == 1  # one identity, reported once
+    assert "orphan-slice" in failures[0] and "not owned" in failures[0]
+
+
+def test_published_backfill_covers_only_the_reviewed_patch_content(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "fix").write_text("reviewed content", encoding="utf-8")
+    git("add", "fix")
+    git("commit", "-qm", "published without trailer")
+    patch_id = subprocess.run(["git", "patch-id", "--stable"],
+                              input=git("show", "--pretty=format:", "HEAD"), text=True,
+                              capture_output=True, check=True).stdout.split()[0]
+    _units(tmp_path, "fixture", prose=f"Fork-Patch-Backfill: {patch_id}; fixture\n")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_trailers(base) == []
+    (tmp_path / "fix").write_text("different content", encoding="utf-8")
+    git("add", "fix")
+    git("commit", "-qm", "unreviewed without trailer")
+    failures = checker.check_trailers(base)
+    assert len(failures) == 1 and "unreviewed without trailer" in failures[0]
+
+
+def test_backfill_ownership_ignores_the_callers_diff_algorithm(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    (tmp_path / "fix").write_text("\n".join("aaccbbaaaaaaaccbbbad") + "\n", encoding="utf-8")
+    git("add", "fix")
+    git("commit", "-qm", "baseline content")
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "fix").write_text("\n".join("aacaabbcaaeeeecbbbad") + "\n", encoding="utf-8")
+    git("add", "fix")
+    git("commit", "-qm", "published without trailer")
+
+    def patch_id(algorithm):
+        return subprocess.run(
+            ["git", "patch-id", "--stable"],
+            input=git("-c", f"diff.algorithm={algorithm}", "show", "--pretty=format:", "HEAD"),
+            capture_output=True, text=True, check=True,
+        ).stdout.split()[0]
+
+    canonical = patch_id("myers")
+    assert canonical != patch_id("histogram")  # this content needs different hunks
+    _units(tmp_path, "fixture", prose=f"Fork-Patch-Backfill: {canonical}; fixture\n")
+    checker = _checker(tmp_path, monkeypatch)
+    for algorithm in ("myers", "histogram", "patience", "minimal"):
+        git("config", "diff.algorithm", algorithm)
+        assert checker.check_trailers(base) == []
+    (tmp_path / "fix").write_text("unreviewed content\n", encoding="utf-8")
+    git("add", "fix")
+    git("commit", "-qm", "unreviewed without trailer")
+    failures = checker.check_trailers(base)
+    assert len(failures) == 1 and "unreviewed without trailer" in failures[0]
+
+
+def test_every_trailer_on_a_multi_trailer_commit_is_checked(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "squash\n\nFork-Patch: owned\nFork-Patch: never-documented")
+    _units(tmp_path, "owned")
+    checker = _checker(tmp_path, monkeypatch)
+    failures = checker.check_trailers(base)
+    assert len(failures) == 1 and "never-documented" in failures[0]
+
+
+def test_ownership_requires_the_exact_backticked_token_on_an_identity_line(tmp_path, monkeypatch):
+    """Prose substrings, longer tokens, and code spans outside identity lines do not own."""
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    for identity in ("slice", "e", "slice-9-vault", "/new", "scripts/x.py", "continued", "wrapped"):
+        git("commit", "--allow-empty", "-qm", f"x\n\nFork-Patch: {identity}")
+    _units(
+        tmp_path, "slice-9-vault-camofox",
+        prose=(
+            "The slice is maintained here; see the evidence.\n"
+            "- `/new` keeps busy semantics; run `scripts/x.py`.\n"
+            "- Fork patch identities: `owned-a`,\n"
+            "  `continued` (upstream `deadbeef`).\n"
+            "- Other item mentioning `wrapped`.\n"
+        ),
+    )
+    checker = _checker(tmp_path, monkeypatch)
+    failures = checker.check_trailers(base)
+    assert sorted(f.split("'")[1] for f in failures) == ["/new", "e", "scripts/x.py", "slice", "slice-9-vault", "wrapped"]
+
+
+def test_blank_trailer_is_not_a_classification(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "blank\n\nFork-Patch: ")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    failures = checker.check_trailers(base)
+    assert len(failures) == 1 and "no Fork-Patch trailer" in failures[0]
+
+
+def test_rewritten_floor_sha_is_located_by_subject_or_fails_clearly(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor commit")
+    git("commit", "--allow-empty", "-qm", "later\n\nFork-Patch: fixture")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    gone = "deadbeef" * 5
+    # Subject fallback: the floor is found even though the SHA no longer exists.
+    assert checker.check_trailers(base, gone, "pre-contract floor commit") == []
+    # No subject match: one clear failure, no traceback.
+    failures = checker.check_trailers(base, gone, "not a subject in this history")
+    assert len(failures) == 1 and "not an ancestor" in failures[0]
+    failures = checker.check_trailers(base, gone)
+    assert len(failures) == 1 and "not an ancestor" in failures[0]
+
+
+def test_stale_floor_object_after_a_rebase_is_not_treated_as_the_floor(tmp_path, monkeypatch):
+    """After a sync rebase the old floor object still exists in the store; only ancestry counts."""
+    git = _repo(tmp_path)
+    trunk = git("rev-parse", "--abbrev-ref", "HEAD")
+    git("checkout", "-qb", "fork")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor commit")
+    old_floor = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "later\n\nFork-Patch: fixture")
+    git("checkout", "-q", trunk)
+    git("commit", "--allow-empty", "-qm", "upstream v2 commit A")
+    new_base = git("rev-parse", "HEAD")
+    git("checkout", "-q", "fork")
+    git("rebase", "-q", new_base)
+    assert git("cat-file", "-t", old_floor) == "commit"  # the stale object survives the rebase
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_trailers(new_base, old_floor, "pre-contract floor commit") == []
+    failures = checker.check_trailers(new_base, old_floor)
+    assert len(failures) == 1 and "not an ancestor" in failures[0]
+
+
+def test_merge_commits_need_no_trailer(tmp_path, monkeypatch):
+    """A merge commit has no patch content; its parents are classified individually."""
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    trunk = git("rev-parse", "--abbrev-ref", "HEAD")
+    git("checkout", "-qb", "topic")
+    git("commit", "--allow-empty", "-qm", "patch\n\nFork-Patch: fixture")
+    git("checkout", "-q", trunk)
+    git("commit", "--allow-empty", "-qm", "other\n\nFork-Patch: fixture")
+    git("merge", "-q", "--no-ff", "-m", "Merge pull request #1 from topic", "topic")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_trailers(base) == []
+
+
+def test_immutable_home_checks_promoted_history_not_stale_checkout(tmp_path, monkeypatch, capsys):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    _units(tmp_path, "fixture")
+    git("add", "-A")
+    git("commit", "-qm", "pre-contract floor")
+    floor = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "promoted")
+    git("commit", "--allow-empty", "-qm", "missing trailer in promoted commit")
+    promoted = git("rev-parse", "HEAD")
+    git("checkout", "-q", "HEAD~1")
+    release = tmp_path / "releases" / promoted
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(promoted + "\n", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "check_extensions", lambda home: [])
+    monkeypatch.setattr(checker, "check_receipt", lambda home: [])
+    assert checker.check_trailers(base, floor) == []  # stale source HEAD misses the commit
+    assert checker.main(["--home", str(tmp_path), "--baseline", base,
+                         "--trailer-floor", floor, "--skip-config"]) == 1
+    assert "missing trailer in promoted commit" in capsys.readouterr().out
+
+
+def test_immutable_home_reads_ownership_from_the_release_not_the_stale_worktree(tmp_path, monkeypatch, capsys):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor")
+    floor = git("rev-parse", "HEAD")
+    _units(tmp_path, "old-identity")
+    git("add", "-A")
+    git("commit", "-qm", "units at the stale checkout", "--trailer", "Fork-Patch: old-identity")
+    stale = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "promoted")
+    _units(tmp_path, "old-identity", "new-identity")
+    git("add", "-A")
+    git("commit", "-qm", "own the new identity", "--trailer", "Fork-Patch: new-identity")
+    promoted = git("rev-parse", "HEAD")
+    git("checkout", "-q", stale)  # working tree lags: new-identity is unowned here
+    release = tmp_path / "releases" / promoted
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(promoted + "\n", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "check_extensions", lambda home: [])
+    monkeypatch.setattr(checker, "check_receipt", lambda home: [])
+    # The working-tree contract does not own the promoted identity.
+    assert any("new-identity" in f for f in checker.check_trailers(base, floor, revision=promoted))
+    # The release's own contract does.
+    assert checker.check_trailers(base, floor, revision=promoted, contract=promoted) == []
+    assert checker.main(["--home", str(tmp_path), "--baseline", base,
+                         "--trailer-floor", floor, "--skip-config"]) == 0
+
+
+def test_immutable_release_reads_its_baseline_helper_when_source_lags(tmp_path, monkeypatch, capsys):
+    """A stale source checkout may lack the helper introduced by the promoted release."""
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    helper = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "release_baseline.py"
+    (tmp_path / "scripts" / "ci").mkdir(parents=True)
+    (tmp_path / "scripts" / "ci" / "release_baseline.py").write_text(helper.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    _units(tmp_path, "fixture")
+    (tmp_path / "MAINTENANCE.md").write_text(
+        f"Accepted release baseline: `v2026.9.24`, `{base}`\n", encoding="utf-8"
+    )
+    git("add", "MAINTENANCE.md", "scripts", "maintenance")
+    git("commit", "-qm", "release contract")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor")
+    floor = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "fork patch\n\nFork-Patch: fixture")
+    promoted = git("rev-parse", "HEAD")
+    git("checkout", "-q", base)
+    release = tmp_path / "releases" / promoted
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(promoted + "\n", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "check_extensions", lambda home: [])
+    monkeypatch.setattr(checker, "check_receipt", lambda home: [])
+    assert checker.main(["--home", str(tmp_path), "--trailer-floor", floor, "--skip-config"]) == 0
+    assert "OK: 0 problem(s)" in capsys.readouterr().out
+
+
+def test_recorded_baseline_accepts_a_legacy_one_argument_helper(tmp_path, monkeypatch):
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "_git_raw", lambda *args: "def accepted_release_baseline(root):\n    return 'legacy'\n")
+    assert checker._recorded_baseline("a" * 40) == "legacy"
+
+
+def test_missing_maintenance_units_fail_closed(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    (tmp_path / "FORK_PATCHES.md").write_text("obsolete ledger", encoding="utf-8")
+    checker = _checker(tmp_path, monkeypatch)
+    failures = checker.check_trailers(git("rev-parse", "HEAD"))
+    assert failures and "missing" in failures[0]
+
+
+def test_release_merge_excludes_upstream_but_keeps_all_fork_commits_after_floor(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "fork")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor")
+    floor = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "owned patch\n\nFork-Patch: fixture")
+    git("commit", "--allow-empty", "-qm", "forgotten fork trailer")
+    git("checkout", "-qb", "release", base)
+    git("commit", "--allow-empty", "-qm", "upstream release without fork metadata")
+    release = git("rev-parse", "HEAD")
+    git("checkout", "-q", "fork")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert "not an ancestor" in checker.check_trailers(release, floor)[0]
+    git("merge", "--no-ff", "-m", "adopt release", release)
+    failures = checker.check_trailers(release, floor)
+    assert len(failures) == 1 and "forgotten fork trailer" in failures[0]

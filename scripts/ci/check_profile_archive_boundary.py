@@ -28,7 +28,7 @@ def find_forbidden_profile_archives(root: Path) -> list[Path]:
         dirnames[:] = [
             name
             for name in dirnames
-            if name not in {".git", ".venv", "venv", "node_modules", "__pycache__"}
+            if name not in {".git", ".ci", ".venv", "venv", "node_modules", "__pycache__"}
         ]
         for name in (*dirnames, *filenames):
             if name.casefold().endswith(_PROFILE_ARCHIVE_SUFFIXES):

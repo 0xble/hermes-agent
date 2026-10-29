@@ -6,9 +6,9 @@ transient per-cron-run connections closing many times an hour would race
 the live gateway writer and corrupt B-tree pages (#45383).
 """
 
-import sqlite3
 import logging
-from unittest.mock import MagicMock, patch
+import sqlite3
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -45,23 +45,19 @@ def db(tmp_path):
 class TestTryWalCheckpointPassive:
     """_try_wal_checkpoint() should use PASSIVE mode for periodic use."""
 
-    def test_checkpoint_uses_passive_mode(self, db):
+    def test_checkpoint_uses_passive_mode(self, db, monkeypatch):
         """PASSIVE checkpoint does not require exclusive lock — safe for large DBs."""
-        # Capture the real connection's execute before mocking
-        real_conn = db._conn
-        execute_calls = []
+        tracked = []
+        open_conn = db._open_writer_conn
 
-        def tracking_execute(sql, *args, **kwargs):
-            execute_calls.append(sql)
-            return real_conn.execute(sql, *args, **kwargs)
+        def tracking_open():
+            tracked.append(TrackingConnection(open_conn()))
+            return tracked[-1]
 
-        # sqlite3.Connection.execute is read-only (C extension) — replace _conn
-        mock_conn = MagicMock()
-        mock_conn.execute.side_effect = tracking_execute
-        mock_conn.fetchone.return_value = None
-        db._conn = mock_conn
-
+        # The periodic checkpoint runs on its own connection (outside the writer lock).
+        monkeypatch.setattr(db, "_open_writer_conn", tracking_open)
         db._try_wal_checkpoint()
+        execute_calls = [sql for conn in tracked for sql in conn.execute_calls]
 
         passive_calls = [c for c in execute_calls if "wal_checkpoint(PASSIVE)" in c]
         truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
@@ -72,22 +68,48 @@ class TestTryWalCheckpointPassive:
             "Periodic checkpoint should NOT use TRUNCATE"
         )
 
-    def test_checkpoint_logs_warning_on_failure(self, db, caplog):
-        """Failed PASSIVE checkpoint logs a warning instead of silent pass."""
+    def test_failed_checkpoint_never_raises_and_is_not_silent(self, db, caplog, monkeypatch):
+        """The periodic checkpoint runs from the write path: a failing PASSIVE
+        checkpoint must not raise into the caller, and must leave a WARNING."""
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = sqlite3.OperationalError("disk I/O error")
-        db._conn = mock_conn
-
-        with caplog.at_level(logging.WARNING):
+        monkeypatch.setattr(db, "_open_writer_conn", lambda: mock_conn)
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
             db._try_wal_checkpoint()
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
-        assert any("WAL checkpoint (PASSIVE) failed" in r.message for r in caplog.records), (
-            f"Expected warning log about PASSIVE checkpoint failure, got: {caplog.text}"
-        )
+    def test_writers_proceed_while_a_slow_checkpoint_runs(self, db, monkeypatch):
+        """On macOS checkpoint_fullfsync makes a PASSIVE checkpoint wait for the whole device's
+        dirty data. It must not hold the writer lock meanwhile: on 2026-10-11 20 turns and 41
+        threads queued on SessionDB._lock behind one periodic checkpoint."""
+        import threading
 
-    def test_checkpoint_returns_result_on_success(self, db):
-        """Successful PASSIVE checkpoint does not raise."""
-        db._try_wal_checkpoint()
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowCheckpoint(TrackingConnection):
+            def execute(self, sql, *args, **kwargs):
+                if "wal_checkpoint" in sql and threading.current_thread().name == "slow-checkpoint":
+                    entered.set()
+                    assert release.wait(10), "checkpoint never released"
+                return super().execute(sql, *args, **kwargs)
+
+        open_conn = db._open_writer_conn
+        monkeypatch.setattr(db, "_open_writer_conn", lambda: SlowCheckpoint(open_conn()))
+        monkeypatch.setattr(db, "_conn", SlowCheckpoint(db._conn))  # wherever it runs, it is slow
+        checkpointer = threading.Thread(target=db._try_wal_checkpoint, name="slow-checkpoint")
+        checkpointer.start()
+        try:
+            assert entered.wait(10), "checkpoint never started"
+            writer = threading.Thread(target=db.set_meta, args=("probe", "1"))
+            writer.start()
+            writer.join(3)
+            assert not writer.is_alive(), "a write waited on the periodic checkpoint"
+        finally:
+            release.set()
+            checkpointer.join(10)
+        assert db.get_meta("probe") == "1"
+
+
 
 
 class TestCloseUsesPassive:
@@ -119,18 +141,21 @@ class TestCloseUsesPassive:
             f"Expected 1 PASSIVE checkpoint at close, got {len(passive_calls)}"
         )
 
-    def test_close_logs_debug_on_failure(self, db, caplog):
-        """Failed PASSIVE checkpoint at close logs debug (close is best-effort)."""
+    def test_failed_checkpoint_at_close_still_releases_the_handle(self, db):
+        """close() is best-effort about the checkpoint: a failing PASSIVE at
+        close must neither raise nor leave the handle open."""
+        real_conn = db._conn
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = sqlite3.OperationalError("database is locked")
         db._conn = mock_conn
-
-        with caplog.at_level(logging.DEBUG):
+        try:
             db.close()
+        finally:
+            real_conn.close()
 
-        assert any("WAL checkpoint (PASSIVE) at close failed" in r.message for r in caplog.records), (
-            f"Expected debug log about PASSIVE failure at close, got: {caplog.text}"
-        )
+        assert db._conn is None
+        mock_conn.close.assert_called()
+
 
 
 class TestVacuumUsesPassive:
@@ -221,3 +246,38 @@ class TestCheckpointFrequency:
         assert call_count[0] == 1, (
             f"Expected 1 checkpoint after {n} writes, got {call_count[0]}"
         )
+
+
+class TestFtsMergeOffTheWriterLock:
+    def test_writers_proceed_while_a_slow_fts_merge_runs(self, db, monkeypatch):
+        """Each incremental FTS merge command commits on its own (synchronous=FULL). Under the
+        writer lock a pass stalled every writer for seconds (2026-10-11 11:39: 19 turns and 48
+        writers queued behind _merge_fts_incrementally)."""
+        import threading
+
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowMerge(TrackingConnection):
+            def execute(self, sql, *args, **kwargs):
+                if "'merge'" in sql and threading.current_thread().name == "slow-merge":
+                    entered.set()
+                    assert release.wait(10), "merge never released"
+                return super().execute(sql, *args, **kwargs)
+
+        open_conn = db._open_writer_conn
+        monkeypatch.setattr(db, "_open_writer_conn", lambda: SlowMerge(open_conn()))
+        monkeypatch.setattr(db, "_conn", SlowMerge(db._conn))  # wherever it runs, it is slow
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="merge me")
+        merger = threading.Thread(target=db._try_incremental_merge_fts, name="slow-merge")
+        merger.start()
+        try:
+            assert entered.wait(10), "merge never started"
+            writer = threading.Thread(target=db.set_meta, args=("probe", "1"))
+            writer.start()
+            writer.join(3)
+            assert not writer.is_alive(), "a write waited on the incremental FTS merge"
+        finally:
+            release.set()
+            merger.join(10)
+        assert db.get_meta("probe") == "1"

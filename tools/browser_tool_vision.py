@@ -1,4 +1,4 @@
-"""browser_vision helpers: Lightpanda pre-route, native provider vision, auxiliary-LLM screenshot analysis.
+"""browser_vision helpers: protected pixel guard, Lightpanda pre-route, native and auxiliary vision.
 
 Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt`` (``tools.browser_tool``, resolved per call) — no import cycle.
 """
@@ -14,6 +14,24 @@ from tools import browser_tool_cloud as _cloud
 from tools import browser_tool_lightpanda_fallback as _lp
 
 
+def blocked_protected_date_pixels(task_id: str) -> Optional[str]:
+    """Refuse unredactable pixels for the browser session that received a protected fill.
+
+    The refusal lasts until the session closes: the focused tab's origin cannot prove
+    the filled tab is gone, because another tab may simply have been focused.
+    """
+    from agent.redact import has_vault_date_components
+    from tools.browser_tool import _last_session_key
+    task_id = _last_session_key(task_id or "default")  # same key the fill registered under
+    if has_vault_date_components(task_id):
+        from tools.registry import tool_error
+        return tool_error(
+            "Screenshot unavailable: a protected date was filled in this browser session. "
+            "Use browser_handoff for the user to see it, or browser_close to end the session.",
+            success=False)
+    return None
+
+
 def _vision_mode_label() -> str:
     _cp = _cloud._get_cloud_provider()
     return "local" if _cp is None else f"cloud ({_cp.display_name})"
@@ -21,7 +39,7 @@ def _vision_mode_label() -> str:
 
 def _lightpanda_vision_preroute(
     effective_task_id: str, annotate: bool, screenshot_path: Path,
-) -> Tuple[bool, Optional[str], Path]:
+) -> tuple[bool, Optional[str], Path]:
     """Capture the vision screenshot via the Chrome fallback when Lightpanda is the engine
     (it has no graphical renderer). Returns ``(prerouted, fallback_warning, path)``;
     on fallback failure ``prerouted`` is False and the caller takes the normal
@@ -51,8 +69,8 @@ def _lightpanda_vision_preroute(
 
 def _native_vision_result(
     screenshot_path: Path, question: str, annotate: bool,
-    result: Dict[str, Any], lp_fallback_warning: Optional[str],
-) -> Dict[str, Any]:
+    result: dict[str, Any], lp_fallback_warning: Optional[str],
+) -> dict[str, Any]:
     """Multimodal tool-result envelope: the main model inspects the pixels itself.
 
     The embed is baked into history and re-sent every later turn, so apply the same
@@ -61,12 +79,13 @@ def _native_vision_result(
     """
     from tools.vision_tools import (
         _EMBED_MAX_DIMENSION,
-        _EMBED_TARGET_BYTES,
         _build_native_vision_tool_result,
         _resize_image_for_vision,
     )
+    from tools.vision_tools_history_budget import resolve_embed_target_bytes
 
-    data_url = _resize_image_for_vision(screenshot_path, mime_type="image/png", max_base64_bytes=_EMBED_TARGET_BYTES,
+    data_url = _resize_image_for_vision(screenshot_path, mime_type="image/png",
+                                        max_base64_bytes=resolve_embed_target_bytes(),
                                         max_dimension=_EMBED_MAX_DIMENSION, force_jpeg=True)
     native_result = _build_native_vision_tool_result(image_url=str(screenshot_path), question=question,
                                                      image_data_url=data_url,

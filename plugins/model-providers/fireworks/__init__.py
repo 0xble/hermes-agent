@@ -1,12 +1,31 @@
 """Fireworks AI provider profile. Models are addressed by full catalog ID
 (``accounts/fireworks/models/<slug>``), tracking fw-ai/fireconnect ``setup-cli``."""
 
-from hermes_cli import __version__ as _HERMES_VERSION
+from typing import Any
+
 from providers import register_provider
-from providers.base import ProviderProfile
+from providers.base import ProviderProfile, _versioned_user_agent
 
 
-fireworks = ProviderProfile(
+class FireworksProfile(ProviderProfile):
+    """Map Hermes reasoning controls onto Fireworks' OpenAI-compatible wire."""
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, **context: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        # Fireworks rejects the nested ``extra_body.reasoning`` fallback some OpenAI-compatible
+        # gateways accept (#109774); its documented control is top-level ``reasoning_effort``
+        # (``none`` disables thinking). Overriding here marks the profile reasoning-aware, so the
+        # transport never sends the generic fallback on this route.
+        if not isinstance(reasoning_config, dict):
+            return {}, {}
+        if reasoning_config.get("enabled") is False:
+            return {}, {"reasoning_effort": "none"}
+        effort = reasoning_config.get("effort")
+        return {}, ({"reasoning_effort": effort} if effort else {})
+
+
+fireworks = FireworksProfile(
     name="fireworks", aliases=("fireworks-ai", "fw"), display_name="Fireworks AI",
     description="Fireworks AI — OpenAI-compatible direct model API",
     signup_url="https://app.fireworks.ai/settings/users/api-keys", env_vars=("FIREWORKS_API_KEY",),
@@ -16,8 +35,8 @@ fireworks = ProviderProfile(
     default_headers={
         "HTTP-Referer": "https://hermes-agent.nousresearch.com",
         "X-Title": "Hermes Agent",
-        "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
     },
+    default_headers_factory=lambda: {"User-Agent": _versioned_user_agent("HermesAgent")},
     default_aux_model="accounts/fireworks/models/glm-5p2",
     # Picker safety net when the live catalog fetch fails.
     fallback_models=(

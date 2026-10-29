@@ -142,3 +142,31 @@ class TestPreUpdateBackupIntegrityGuard:
         assert snap_id is not None
         assert "integrity check FAILED" in out
         assert "Snapshot copy is valid" in out
+
+    def test_failed_snapshot_is_loud_and_records_failure(self, hermes_home, capsys, monkeypatch):
+        """A snapshot exception returns safely, warns about rollback, and records the cause."""
+        from argparse import Namespace
+
+        import hermes_cli.backup as backup_mod
+        import hermes_cli.update_cmd as update_cmd
+        from hermes_cli.update_cmd import _run_pre_update_backup
+
+        def boom(**kwargs):
+            raise PermissionError("state-snapshots is read-only")
+
+        recorded_steps = []
+        monkeypatch.setattr(
+            update_cmd, "_record_update_step",
+            lambda *args: recorded_steps.append(args),
+        )
+        monkeypatch.setattr(backup_mod, "create_quick_snapshot", boom)
+        snap_id = _run_pre_update_backup(Namespace(no_backup=False, backup=False))
+        out = capsys.readouterr().out
+        assert snap_id is None
+        assert "Pre-update snapshot FAILED" in out
+        assert "state-snapshots is read-only" in out
+        assert "no rollback point" in out
+        assert "--no-backup" in out
+        assert recorded_steps == [(
+            "pre_update_backup", False, "PermissionError: state-snapshots is read-only",
+        )]

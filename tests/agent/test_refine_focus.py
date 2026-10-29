@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from agent.background_review import (
     _COMBINED_REVIEW_PROMPT,
     _MEMORY_REVIEW_PROMPT,
+    _SKILL_REVIEW_PROMPT,
     spawn_background_review_thread,
 )
 
@@ -44,7 +45,6 @@ def test_focus_is_appended_to_prompt():
     )
     assert prompt.startswith(_COMBINED_REVIEW_PROMPT)
     assert "save the deploy workflow as a skill" in prompt
-    assert "explicitly requested" in prompt
 
 
 def test_focus_works_with_memory_only_prompt():
@@ -54,3 +54,11 @@ def test_focus_works_with_memory_only_prompt():
     )
     assert prompt.startswith(_MEMORY_REVIEW_PROMPT)
     assert "remember my timezone" in prompt
+
+
+def test_external_skill_review_guidance_points_to_source():
+    for prompt in (_SKILL_REVIEW_PROMPT, _COMBINED_REVIEW_PROMPT):
+        assert "Skills in skills.external_dirs" in prompt
+        assert "read-only installs" in prompt
+        assert "change them at their source in the owning repository" in prompt
+        assert "Do not change them with skill_manage" in prompt

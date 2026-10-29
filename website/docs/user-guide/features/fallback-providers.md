@@ -49,6 +49,34 @@ fallback:
 | Key | Default | Effect |
 |-----|---------|--------|
 | `fallback.min_switch_reset_seconds` | `0` (off) | A rate-limited primary whose declared reset is sooner than this many seconds is not swapped for a fallback; the retry backoff waits out the window instead. |
+| `fallback_providers[].max_stay_seconds` | unset (off) | After this entry has been active longer than a positive number of seconds, re-evaluate at the next model-call boundary: restore the primary if its shared cooldown permits it, otherwise retry only entries earlier in the chain. Unavailable candidates are skipped normally. If none is available, keep the current route and reset its timer without a failure notice or metric; never move to a later backup. |
+
+Long turns check the primary's shared cooldown before each new model request,
+not just between user turns. A successful primary response in another session
+clears the shared outage so this session can restore at its next request.
+This applies only to provider fallbacks with a cooldown or a held shared outage
+record. Voice turns and explicit model routes are not rechecked. A generic
+server/transport failure that never armed a cooldown keeps the primary benched
+until the next user turn; a stay-limit re-walk retries only fallback entries.
+Neither check interrupts a stream or separates a tool call from its result.
+The optional stay limit also lets an earlier fallback recover while the primary
+is still benched; it does not shorten or clear the primary's shared cooldown.
+
+```yaml
+fallback_providers:
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4
+  - provider: openai
+    model: gpt-4.1
+    max_stay_seconds: 60
+```
+
+`max_stay_seconds` is provider-independent and travels with each normalized
+entry into the agent's fallback chain. Omitted, non-positive, or invalid values
+disable the extra chain re-check. Reclaiming an earlier backup or keeping the
+current route resets the timer. Stay expiry is not a provider failure: it emits
+no failure notice or failure metric. A re-evaluation error leaves the current
+route active.
 
 Gemini fallback entries accept `gemini`, `google`, `google-gemini`, and
 `google-ai-studio`. On Google's native API endpoint, all use the native Gemini
@@ -89,7 +117,6 @@ OpenAI-compatible base URL continues to use the compatible client instead.
 | OpenCode Zen | `opencode-zen` | `OPENCODE_ZEN_API_KEY` |
 | CommandCode | `commandcode` (alias `commandcode-chat`; Claude via `commandcode-anthropic`) | `COMMANDCODE_API_KEY` |
 | OpenCode Go | `opencode-go` | `OPENCODE_GO_API_KEY` |
-| OpenCode Free | `opencode-free` | — (keyless, no credential) |
 | Kilo Code | `kilocode` | `KILOCODE_API_KEY` |
 | Ramp Router | `router` | `RAMP_ROUTER_API_KEY` |
 | Xiaomi MiMo | `xiaomi` | `XIAOMI_API_KEY` |
@@ -104,8 +131,10 @@ OpenAI-compatible base URL continues to use the compatible client instead.
 | Tencent TokenPlan | `tencent-tokenplan` | `TOKENPLAN_API_KEY` |
 | Microsoft Foundry | `azure-foundry` | `AZURE_FOUNDRY_API_KEY` + `AZURE_FOUNDRY_BASE_URL` |
 | LM Studio (local) | `lmstudio` | `LM_API_KEY` (or none for local) + `LM_BASE_URL` |
+| Local llama.cpp (managed) | `llamacpp` (aliases `llama.cpp`, `llama-cpp`) | The local model server Hermes manages (Desktop **Settings → Providers → Local models**), no `base_url` needed. If it is not running the entry is skipped — Hermes never sends the local model name to another provider |
 | Hugging Face | `huggingface` | `HF_TOKEN` |
 | Custom endpoint | `custom` | `base_url` + `key_env` (see below) |
+| Mixture of Agents preset | `moa` (`model` = preset name) | A configured MoA preset whose aggregator has credentials — the fallback runs the whole preset (references + aggregator), not the aggregator alone |
 
 ### Custom Endpoint Fallback
 
@@ -127,16 +156,19 @@ The fallback activates automatically when the primary model fails with:
 - **Server errors** (HTTP 500, 502, 503) — after exhausting retry attempts
 - **Auth failures** (HTTP 401, 403) — immediately (no point retrying)
 - **Not found** (HTTP 404) — immediately
-- **Invalid responses** — when the API returns malformed or empty responses repeatedly
+- **Invalid responses** — when the API returns malformed or empty responses repeatedly. An HTTP-200 body whose only assistant text is a router's `Connect timeout, please try again later.` with zero completion tokens counts as invalid too (streamed or not, in the main loop, the iteration-limit summary and auxiliary calls), so it is retried instead of shown as the answer. A streamed refusal (the model declining with an explanation on the refusal channel) is a terminal `content_filter` result, not an empty response, so it is surfaced rather than retried. On the native Anthropic wire a `stop_reason: refusal` arrives with an empty body; Hermes reports the reason from the response's `stop_details` (category and, when present, explanation) in the refusal message and in the log line (`native_stop_reason=… stop_details=…`).
 
 When triggered, Hermes:
 
 1. Resolves credentials for the fallback provider (including named custom providers using `key_cmd`)
 2. Builds a new API client, preserving a dynamic credential source across timeout and request-client rebuilds
 3. Swaps the model, provider, and client in-place
-4. Resets the retry counter and continues the conversation
+4. Re-resolves the reasoning effort for the fallback model (its `agent.reasoning_overrides` entry, else the global `agent.reasoning_effort`)
+5. Resets the retry counter and continues the conversation
 
 The switch is seamless — your conversation history, tool calls, and context are preserved. The agent continues from exactly where it left off, just using a different model.
+
+The same re-resolution happens when the CLI falls back at **startup** because the primary provider's auth fails before the first request: the fallback model is sent its own configured effort, not the primary's. An explicit `hermes chat --reasoning <level>` is kept across that startup switch — it is your intent for the run.
 
 :::warning Fallback resets the prompt cache
 Prompt caches are keyed to the model (and on most providers, the account) serving the request. When fallback fires, the new provider:model has no cached prefix for your conversation, so the next request re-reads the entire history at full input-token price instead of the ~75–90% discounted cached rate. The same applies when the turn ends and the primary is restored — that first request back on the primary is a full re-read too (unless the primary's cache TTL hasn't expired). This is unavoidable — it's the cost of staying alive through an outage — but it's why a long session that bounces between providers can cost noticeably more than one that stays put.
@@ -187,17 +219,18 @@ fallback_providers:
 ```yaml
 fallback_providers:
   - provider: openai-codex
-    model: gpt-5.3-codex
+    model: gpt-5.4
 ```
 
 ### Where Fallback Works
 
 | Context | Fallback Supported |
 |---------|-------------------|
-| CLI sessions | ✔ |
+| CLI sessions (interactive and `hermes -z` one-shot) | ✔ (at startup when the primary's credentials/quota fail, mid-session, and a chain added or edited while a chat is open applies from its next turn) |
 | Messaging gateway (Telegram, Discord, etc.) | ✔ |
+| Desktop app / TUI chats | ✔ (a chain added or edited while a chat is open applies from its next turn) |
 | Subagent delegation | ✔ (`delegation.fallback_providers` when set; otherwise only unpinned children inherit the parent chain; `[]` disables) |
-| Cron jobs | ✔ (cron agents inherit configured fallback providers) |
+| Cron jobs | ✔ (unpinned jobs inherit the configured chain; a job with its own provider/model/base_url never falls back to it) |
 | Auxiliary tasks on `provider: auto` | ✔ (try per-task fallback, then the main fallback chain before built-in aux discovery) |
 
 :::tip
@@ -305,7 +338,7 @@ All three — auxiliary, compression, fallback — work the same way: set `provi
 
 ### Provider Options for Auxiliary Tasks
 
-These options apply to `auxiliary:`, `compression:`, and `fallback_providers:` entries only — `"main"` is **not** a valid value for your top-level `model.provider`. For custom endpoints, use `provider: custom` in your `model:` section (see [AI Providers](/integrations/providers)).
+These options apply to `auxiliary:`, `compression:`, and `fallback_providers:` entries only — `"main"` is **not** a valid value for your top-level `model.provider`. For custom endpoints, use `provider: custom` in your `model:` section (see [AI Providers](../../integrations/providers.md)).
 
 | Provider | Description | Requirements |
 |----------|-------------|-------------|
@@ -315,6 +348,7 @@ These options apply to `auxiliary:`, `compression:`, and `fallback_providers:` e
 | `"codex"` | Force Codex OAuth | `hermes model` → ChatGPT or Codex Subscription |
 | `"main"` | Use whatever provider the main agent uses (auxiliary tasks only) | Active main provider configured |
 | `"anthropic"` | Force Anthropic native | `ANTHROPIC_API_KEY` or Claude Code credentials |
+| `"llamacpp"` | Force the managed local llama.cpp server | Local model server running; when it is off, the local model name is never sent to another provider |
 
 ### Direct Endpoint Override
 
@@ -342,6 +376,8 @@ When you set an explicit auxiliary provider (e.g. `auxiliary.vision.provider: gl
 4. **Warn + re-raise** — if every layer fails, Hermes logs `Auxiliary <task>: ... all fallbacks exhausted` at WARNING level and re-raises the original error
 
 Transient HTTP 429 rate limits (`Retry-After: ...`) are treated as request constraints, not capacity problems — they respect your explicit provider choice and do **not** trigger the fallback ladder. Only daily/monthly quota exhaustion, payment errors, and connection failures bypass the explicit-provider gate.
+
+**Auth errors (HTTP 401) on an explicit provider** walk only step 2: if you wrote `auxiliary.<task>.fallback_chain`, its entries are tried in order (and a chain entry that dies mid-request hands off to the next one); the main agent model and the auto-detection chain are never consulted, because you did not opt that task into them. Without a chain the task fails on the auth error as before. Auth is credential-wide, so chain entries on the same provider label are skipped — point the spare at a different provider (a separate `providers:` entry counts).
 
 For users on `provider: auto` (no explicit aux provider), the existing auto-detection chain runs in place of steps 2–3. Its first step is already the main agent model, so `auto` users get the same outcome with zero config.
 
@@ -415,13 +451,13 @@ delegation:
   # api_key: "local-key"
 ```
 
-See [Subagent Delegation](/user-guide/features/delegation) for full configuration details.
+See [Subagent Delegation](./delegation.md) for full configuration details.
 
 ---
 
 ## Cron Job Providers
 
-Cron jobs inherit your configured `fallback_providers` chain (or legacy `fallback_model`) when they create an agent. To use a different primary provider for a cron job, configure `provider` and `model` overrides on the cron job itself:
+Unpinned cron jobs inherit your configured `fallback_providers` chain (or legacy `fallback_model`) by default. A job pinned to its own `provider`, `model`, or `base_url` does not inherit it. Set `cron.fallback_providers` to replace the global chain for cron agents, including pinned jobs, or `[]` to disable cron provider fallback. Missing or `null` inherits the global chain only for unpinned jobs. See [cron provider recovery](cron.md#provider-recovery) for an example. To use a different primary provider for a cron job, configure `provider` and `model` overrides on the cron job itself:
 
 ```python
 cronjob(
@@ -433,7 +469,7 @@ cronjob(
 )
 ```
 
-See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration details.
+To keep fallback for a job, leave it unpinned and choose its model with `cron.model` / `cron.model_provider` instead. See [Scheduled Tasks (Cron)](./cron.md#provider-recovery) for details.
 
 ---
 
@@ -443,7 +479,7 @@ See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration d
 |---------|-------------------|----------------|
 | Main agent model | `fallback_providers` in config.yaml — per-turn failover on errors (primary restored each turn) | `fallback_providers:` (top-level list) |
 | Auxiliary tasks (any) — auto users | Full auto-detection chain (main agent model first, then provider chain) on capacity errors | `auxiliary.<task>.provider: auto` |
-| Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model → warn + raise, on capacity errors only | `auxiliary.<task>.fallback_chain` |
+| Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model → warn + raise, on capacity errors; auth errors (401) walk `fallback_chain` only | `auxiliary.<task>.fallback_chain` |
 | Vision | Layered (see above) + internal OpenRouter retry | `auxiliary.vision` |
 | Context compression | Layered (see above); degrades to no-summary if all layers unavailable | `auxiliary.compression` |
 | Skills hub | Layered (see above) | `auxiliary.skills_hub` |
@@ -452,4 +488,4 @@ See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration d
 | Title generation | Layered (see above) | `auxiliary.title_generation` |
 | Triage specifier | Layered (see above) | `auxiliary.triage_specifier` |
 | Delegation | Uses `delegation.fallback_providers` when declared; otherwise only unpinned children inherit the parent chain | `delegation.provider` / `delegation.model` / `delegation.fallback_providers` |
-| Cron jobs | Inherit the configured `fallback_providers` chain; optional per-job provider override | Per-job `provider` / `model` |
+| Cron jobs | `cron.fallback_providers` when declared (even for pinned jobs); otherwise the global chain for unpinned jobs only | `cron.fallback_providers`; per-job primary `provider` / `model` / `base_url` |

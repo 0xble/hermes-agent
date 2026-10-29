@@ -57,18 +57,18 @@ def _current_page_private_url(effective_task_id: str) -> Optional[str]:
 
 
 _RISKY_BROWSER_EVAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bdocument\s*\.\s*cookie\b", re.I), "document.cookie"),
-    (re.compile(r"\b(?:localStorage|sessionStorage)\b", re.I), "web storage"),
-    (re.compile(r"\bindexedDB\b", re.I), "IndexedDB"),
-    (re.compile(r"\bcaches\s*\.\s*(?:open|match|keys)\b", re.I), "Cache Storage"),
-    (re.compile(r"\bnavigator\s*\.\s*(?:clipboard|credentials|serviceWorker)\b", re.I), "navigator sensitive API"),
-    (re.compile(r"\b(?:fetch|XMLHttpRequest|WebSocket|EventSource)\s*\(", re.I), "network request"),
-    (re.compile(r"\bnavigator\s*\.\s*sendBeacon\s*\(", re.I), "network beacon"),
-    (re.compile(r"\bdocument\s*\.\s*forms\b.*\bvalue\b", re.I | re.S), "form value extraction"),
-    (re.compile(r"\bquerySelector(?:All)?\s*\([^)]*(?:input|textarea|password)[^)]*\).*\bvalue\b", re.I | re.S), "form value extraction"),
+    (re.compile(r"\bdocument\s*\.\s*cookie\b", re.IGNORECASE), "document.cookie"),
+    (re.compile(r"\b(?:localStorage|sessionStorage)\b", re.IGNORECASE), "web storage"),
+    (re.compile(r"\bindexedDB\b", re.IGNORECASE), "IndexedDB"),
+    (re.compile(r"\bcaches\s*\.\s*(?:open|match|keys)\b", re.IGNORECASE), "Cache Storage"),
+    (re.compile(r"\bnavigator\s*\.\s*(?:clipboard|credentials|serviceWorker)\b", re.IGNORECASE), "navigator sensitive API"),
+    (re.compile(r"\b(?:fetch|XMLHttpRequest|WebSocket|EventSource)\s*\(", re.IGNORECASE), "network request"),
+    (re.compile(r"\bnavigator\s*\.\s*sendBeacon\s*\(", re.IGNORECASE), "network beacon"),
+    (re.compile(r"\bdocument\s*\.\s*forms\b.*\bvalue\b", re.IGNORECASE | re.DOTALL), "form value extraction"),
+    (re.compile(r"\bquerySelector(?:All)?\s*\([^)]*(?:input|textarea|password)[^)]*\).*\bvalue\b", re.IGNORECASE | re.DOTALL), "form value extraction"),
 )
 
-_JS_STRING_LITERAL_RE = re.compile(r"""'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`""", re.S)
+_JS_STRING_LITERAL_RE = re.compile(r"""'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\])*`""", re.DOTALL)
 
 
 _SENSITIVE_BROWSER_EVAL_TOKENS: tuple[tuple[str, str], ...] = (
@@ -125,7 +125,7 @@ def _sensitive_browser_eval_token_reason(expression: str) -> Optional[str]:
     concatenated string literals (catches ``document["coo" + "kie"]``)."""
     literals = "".join(_decoded_js_string_literals(expression)).lower()
     return next((reason for token, reason in _SENSITIVE_BROWSER_EVAL_TOKENS
-                 if re.search(rf"\b{re.escape(token)}\b", expression, re.I) or token.lower() in literals), None)
+                 if re.search(rf"\b{re.escape(token)}\b", expression, re.IGNORECASE) or token.lower() in literals), None)
 
 
 def _risky_browser_eval_reason(expression: str) -> Optional[str]:
@@ -151,7 +151,7 @@ def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
             "browser.restrict_evaluate: false in config.yaml to allow programmatic evaluation.")
 
 
-def _camofox_current_page_private_url(tab_id: str, user_id: str) -> Optional[str]:
+def _camofox_current_page_private_url(tab_id: str, user_id: str, session: Optional[dict] = None) -> Optional[str]:
     """Camofox analogue of ``_current_page_private_url`` (evaluate endpoint instead of the CLI). Fail-open
     on probe failure, matching the snapshot/vision guards — do not make fail-closed without the sibling."""
     _bt = _origin()
@@ -163,5 +163,8 @@ def _camofox_current_page_private_url(tab_id: str, user_id: str) -> Optional[str
         if current_url and _url_blocked(_bt, current_url):
             return current_url
     except Exception as exc:
+        if session is not None:
+            from tools.browser_camofox import _clear_stale_tab
+            _clear_stale_tab(session, exc, endpoint="evaluate")
         _bt.logger.debug("_camofox_current_page_private_url: probe failed (%s)", exc)
     return None

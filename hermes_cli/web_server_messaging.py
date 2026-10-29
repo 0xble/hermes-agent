@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 from pathlib import Path
 from typing import Any, Optional
-from hermes_cli import __version__
 from hermes_cli.config import OPTIONAL_ENV_VARS, write_platform_config_field
 from hermes_cli.setup_hidden_env import is_setup_hidden_env as _is_setup_hidden_env
+from hermes_cli.version_info import get_version_info
 
 # Same logger the code used before extraction (record parity).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -70,12 +70,6 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
             "WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_DM_POLICY", "WHATSAPP_ALLOWED_USERS",
         ),
         "required_env": (),
-    },
-    "homeassistant": {
-        "name": "Home Assistant",
-        "description": "Control your smart home from Hermes via Home Assistant.",
-        "docs_url": "https://www.home-assistant.io/docs/authentication/",
-        "env_vars": ("HASS_URL", "HASS_TOKEN"), "required_env": ("HASS_URL", "HASS_TOKEN"),
     },
     "email": {
         "name": "Email", "description": "Talk to Hermes through an IMAP/SMTP mailbox.",
@@ -221,7 +215,7 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
 # the end alphabetically.
 _PLATFORM_ORDER: tuple[str, ...] = (
     "telegram", "discord", "slack", "mattermost", "matrix", "whatsapp", "signal", "bluebubbles",
-    "homeassistant", "email", "sms", "dingtalk", "feishu", "google_chat", "wecom", "wecom_callback",
+    "email", "sms", "dingtalk", "feishu", "google_chat", "wecom", "wecom_callback",
     "weixin", "qqbot", "yuanbao", "api_server", "webhook",
 )
 
@@ -374,7 +368,6 @@ def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) ->
 
 
 _TELEGRAM_ONBOARDING_DEFAULT_URL = "https://setup.hermes-agent.nousresearch.com"
-_TELEGRAM_ONBOARDING_USER_AGENT = f"HermesDashboard/{__version__}"
 
 
 @dataclass
@@ -414,7 +407,7 @@ def _telegram_onboarding_request_sync(
     method: str, path: str, *, body: dict[str, Any] | None = None, bearer_token: str | None = None
 ) -> dict[str, Any]:
     import httpx
-    headers = {"Accept": "application/json", "User-Agent": _TELEGRAM_ONBOARDING_USER_AGENT}
+    headers = {"Accept": "application/json", "User-Agent": f"HermesDashboard/{get_version_info().base_version}"}
     request_kwargs: dict[str, Any] = {}
     if body is not None:
         headers["Content-Type"] = "application/json"

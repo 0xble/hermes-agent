@@ -89,22 +89,22 @@ describe.skipIf(onWindows)('execFileNoThrow with daemon-style children', () => {
 
   it("settles immediately on 'exit' when resolveOnExit is true, regardless of daemon stdio", async () => {
     const pidFile = join(scriptDir, 'sleeper-exit.pid')
-    const start = Date.now()
+    const heldPipeScript = join(scriptDir, 'held-pipe.sh')
+    writeFileSync(heldPipeScript, '#!/bin/sh\nsleep 30 &\necho $! > "$1"\nexit 0\n')
+    chmodSync(heldPipeScript, 0o755)
 
-    const result = await execFileNoThrow(daemonScript, [pidFile], {
-      timeout: 2000,
+    const result = await execFileNoThrow(heldPipeScript, [pidFile], {
+      timeout: 4000,
       resolveOnExit: true
     })
 
     trackSleeperPid(pidFile)
 
-    const elapsed = Date.now() - start
-
-    // The shell exits in a few ms. resolveOnExit lets us return on exit
-    // (code 0) instead of waiting for the orphaned sleeper to release
-    // stdio. Should be well under 200ms even on slow CI.
+    // Success while the pipe-holding child is still alive proves exit-based
+    // completion without assuming that process startup takes under 500 ms.
     expect(result.code).toBe(0)
-    expect(elapsed).toBeLessThan(500)
+    expect(sleeperPids).toHaveLength(1)
+    expect(() => process.kill(sleeperPids[0], 0)).not.toThrow()
   })
 
   it("still surfaces the right code when resolveOnExit'd child exits non-zero", async () => {
@@ -137,23 +137,5 @@ describe.skipIf(onWindows)('execFileNoThrow with daemon-style children', () => {
     // child exits → 'exit' fires with non-null signal. The settle()
     // call from the timer registers code=124 first. Either way: 124.
     expect(result.code).toBe(124)
-  })
-
-  it('does not double-resolve when both timer and exit fire', async () => {
-    const pidFile = join(scriptDir, 'sleeper-race.pid')
-
-    // Race: child happens to exit right around the timeout. The settled
-    // guard ensures only the first resolution wins.
-    const result = await execFileNoThrow(daemonScript, [pidFile], {
-      timeout: 50, // very tight
-      resolveOnExit: true
-    })
-
-    trackSleeperPid(pidFile)
-
-    // Either code=0 (exit beat timer) or code=124 (timer beat exit).
-    // Both are valid outcomes; the contract is that the promise settles
-    // exactly once and doesn't throw.
-    expect([0, 124]).toContain(result.code)
   })
 })

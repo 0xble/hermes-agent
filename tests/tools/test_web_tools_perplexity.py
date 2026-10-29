@@ -1,6 +1,7 @@
 """Perplexity web backend — search + snippets dispatch through the real tools."""
 
 import asyncio
+import socket
 import json
 import os
 from unittest.mock import MagicMock, patch
@@ -14,6 +15,17 @@ def _ok(payload):
     resp.json.return_value = payload
     resp.text = json.dumps(payload)
     return resp
+
+
+def _assert_hermes_identity_headers(headers):
+    """Both Perplexity endpoints carry the Hermes identity headers (same set as Kimi/OpenCode)
+    plus Perplexity's integration header."""
+    from hermes_cli.version_info import get_version_info
+
+    assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
+    assert headers["X-Title"] == "Hermes Agent"
+    assert headers["User-Agent"] == f"HermesAgent/{get_version_info().base_version}"
+    assert headers["X-Pplx-Integration"] == "hermes-agent"
 
 
 def test_search_dispatch_maps_search_api_shape():
@@ -35,6 +47,7 @@ def test_search_dispatch_maps_search_api_shape():
 
     assert post.call_args.args[0] == "https://api.perplexity.ai/search"
     assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer pplx-test"
+    _assert_hermes_identity_headers(post.call_args.kwargs["headers"])
     body = post.call_args.kwargs["json"]
     assert body["query"] == "bloom filter"
     assert 1 <= body["max_results"] <= 20  # dispatcher bucket-rounds the fetch limit
@@ -48,9 +61,13 @@ def test_search_dispatch_maps_search_api_shape():
     }
 
 
-def test_extract_dispatch_snippets_per_url_and_missing_key():
+def test_extract_dispatch_snippets_per_url_and_missing_key(monkeypatch):
     """web_extract on backend=perplexity posts every URL to /sdk/content/snippets;
     a URL the backend failed carries ``error`` instead of content; no key → error, no HTTP."""
+    def public_dns(host, port, *args, **kwargs):
+        assert host in ['tokio.rs', 'docs.rs']
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))]
+    monkeypatch.setattr(socket, "getaddrinfo", public_dns)
     import tools.web_tools as wt
 
     register_all_web_providers()
@@ -65,6 +82,7 @@ def test_extract_dispatch_snippets_per_url_and_missing_key():
         out = json.loads(asyncio.run(wt.web_extract_tool(urls)))
 
     assert post.call_args.args[0] == "https://api.perplexity.ai/sdk/content/snippets"
+    _assert_hermes_identity_headers(post.call_args.kwargs["headers"])
     body = post.call_args.kwargs["json"]
     assert body["urls"] == urls
     assert body["query"] == "tokio tutorial smol"

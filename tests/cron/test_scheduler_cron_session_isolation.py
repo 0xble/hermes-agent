@@ -87,6 +87,23 @@ def _register_gateway_auto_approve(session_key: str) -> None:
         approval_module._gateway_notify_cbs[session_key] = _notify
 
 
+def test_cron_run_scope_uses_job_scoped_relay_identity(monkeypatch):
+    from cron.scheduler import _CronRunScope
+    from gateway.session_context import get_session_env, reset_session_vars
+
+    reset_session_vars()
+    monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-session")
+    scope = _CronRunScope({"id": "fleet-checker", "name": "Agent Fleet Checker"}, "fleet-checker", "run-1")
+    try:
+        scope.enter()
+        assert get_session_env("HERMES_SESSION_ID") == "cron_fleet-checker"
+        assert get_session_env("HERMES_SESSION_PROFILE") == "default"
+        assert get_session_env("HERMES_SESSION_KEY") == ""
+    finally:
+        scope.exit()
+    assert get_session_env("HERMES_SESSION_ID") == ""
+    assert os.environ["HERMES_SESSION_ID"] == "unrelated-session"
+
 def test_run_job_cron_execute_code_deny_does_not_pollute_later_gateway_execute_code(
     monkeypatch, tmp_path
 ):
@@ -111,9 +128,9 @@ def test_run_job_cron_execute_code_deny_does_not_pollute_later_gateway_execute_c
             "args": None,
         },
     )
-    monkeypatch.setattr("tools.mcp_tool_discovery.discover_mcp_tools", lambda: [])
+    monkeypatch.setattr("tools.mcp_tool_discovery.discover_mcp_tools", list)
     monkeypatch.setattr(cron_scheduler, "_get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(cron_scheduler, "get_fallback_chain", lambda _cfg: [])
+    monkeypatch.setattr(cron_scheduler, "get_cron_fallback_chain", lambda _cfg: [])
     monkeypatch.setattr(
         cron_scheduler, "_guard_job_credential_exfil", lambda _job: None
     )

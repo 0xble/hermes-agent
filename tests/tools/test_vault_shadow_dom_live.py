@@ -1,0 +1,379 @@
+"""Real Chromium regression: tab discovery, inspection and fill share DOM scope.
+
+Runs when Chrome/Chromium is installed; uses only an isolated browser profile,
+loopback pages and a temporary local vault. No personal browser or manager.
+"""
+import http.server
+import json
+import os
+import subprocess
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+from agent.vault_login_classifier import (
+    build_fill_js,
+    build_inspection_js,
+)
+from tools import browser_vault_tool as vault
+from tools.browser_supervisor import SUPERVISOR_REGISTRY
+from tools.browser_use_cli import _attach_vault_supervisor
+from tools.registry import registry
+
+
+# A payment processor's card form. The parent page cannot read it across the origin boundary, so it
+# reports its own card inputs (count and whether any holds a value) through postMessage on request.
+_PROCESSOR_FRAME = b"""<!doctype html><title>processor</title><body>
+<input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc">
+<script>
+addEventListener('message', (e) => {
+  const inputs = [...document.querySelectorAll('input')];
+  e.source.postMessage({cardInputs: inputs.filter(i => i.autocomplete === 'cc-number').length,
+                        filled: inputs.some(i => i.value !== '')}, '*');
+});
+</script></body>"""
+
+
+@pytest.fixture
+def browser(tmp_path):
+    if os.environ.get('CI'):
+        from playwright import sync_api as playwright
+    else:
+        playwright = pytest.importorskip(
+            "playwright.sync_api",
+            reason="Playwright is required for the live DOM regression",
+        )
+    with playwright.sync_playwright() as pw:
+        executable = Path(pw.chromium.executable_path)
+    if not executable.is_file():
+        if os.environ.get('CI'):
+            pytest.fail("Hosted gate requires Playwright's bundled Chromium")
+        pytest.skip("Playwright's bundled Chromium is not installed")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(_PROCESSOR_FRAME if self.path == '/processor'
+                             else b"<!doctype html><title>vault regression</title><body></body>")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f'http://127.0.0.1:{server.server_port}'
+    profile = tmp_path / 'chrome'
+    process = subprocess.Popen([str(executable), '--headless=new', '--no-sandbox',
+                                '--disable-dev-shm-usage', '--no-first-run',
+                                '--no-default-browser-check', '--remote-debugging-port=0',
+                                # The portable gate replaces HOME, so a real macOS Chrome
+                                # finds no login keychain and blocks on a modal prompt.
+                                '--use-mock-keychain', '--password-store=basic',
+                                f'--user-data-dir={profile}', origin + '/unrelated'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    task = 'vault-shadow-regression'
+    try:
+        deadline = time.monotonic() + 60
+        active_port = profile / 'DevToolsActivePort'
+        address = []
+        while time.monotonic() < deadline and process.poll() is None:
+            if active_port.exists():
+                address = active_port.read_text().splitlines()
+                if len(address) >= 2 and address[0].isdigit() and address[1].startswith('/devtools/browser/'):
+                    break
+            time.sleep(.05)
+        assert len(address) >= 2, 'isolated Chrome did not publish its DevTools address'
+        port, ws_path = address[:2]
+        _attach_vault_supervisor({'BU_CDP_WS': f'ws://127.0.0.1:{port}{ws_path}'}, task)
+        sup = SUPERVISOR_REGISTRY.get(task)
+        assert sup is not None, 'browser_exec must attach the vault supervisor'
+        def wait_page(url):
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url)
+            page_origin = f'{parsed.scheme}://{parsed.netloc}'
+            # Attach once, then poll readiness on that session. Every successful focus_page attaches a
+            # fresh CDP session (enable domains + dialog bridge), so re-focusing each poll floods a
+            # loaded Chrome with sessions and starved the page past the file timeout on full gates.
+            deadline = time.monotonic() + 60
+            focused = False
+            while time.monotonic() < deadline:
+                if not focused:
+                    focused = bool(sup.focus_page(page_origin).get('ok'))
+                if focused:
+                    ready = sup.evaluate_runtime(
+                        f'location.href === {json.dumps(url)} && document.readyState === "complete"')
+                    if ready.get('ok') and ready.get('result'):
+                        return
+                    focused = bool(ready.get('ok'))  # re-attach only if the session itself broke
+                time.sleep(.1)
+            pytest.fail('test page did not finish loading')
+
+        wait_page(origin + '/unrelated')
+
+        def new_page(url):
+            request = urllib.request.Request(f'http://127.0.0.1:{port}/json/new?{url}', method='PUT')
+            with urllib.request.urlopen(request, timeout=5) as response:
+                json.load(response)
+            wait_page(url)
+        yield sup, task, origin, new_page
+    finally:
+        SUPERVISOR_REGISTRY.stop(task)
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # A headless Chrome still busy under a loaded gate must not turn teardown into a second error.
+            process.kill()
+            process.wait(timeout=10)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def evaluate(sup, expression):
+    result = sup.evaluate_runtime(expression)
+    assert result['ok'], result
+    return result['result']
+
+
+def shadow_form(sup):
+    evaluate(sup, """(() => {
+      const host = document.createElement('div'); document.body.append(host);
+      const outer = host.attachShadow({mode:'open'});
+      outer.innerHTML = '<div id="nested"></div>';
+      const inner = outer.querySelector('#nested').attachShadow({mode:'open'});
+      inner.innerHTML = '<form><label id="pw-label">Password</label>' +
+        '<input type="password" aria-labelledby="pw-label" autocomplete="current-password">' +
+        '<input autocomplete="cc-number"><input autocomplete="postal-code">' +
+        '<input autocomplete="one-time-code"></form>';
+      window.testRoot = inner;
+      window.testInputObservers = [];
+      for (const [name, target] of [['host', host], ['document', document]]) {
+        target.addEventListener('input', event => {
+          window.testInputObservers.push({observer: name, composed: event.composed,
+            retargeted: event.target === host, inputType: event.inputType});
+        });
+      }
+    })()""")
+
+
+def test_shadow_probe_inspection_and_nonce_fill_share_scope(browser):
+    sup, _, origin, _ = browser
+    shadow_form(sup)
+    for kind in ('login', 'payment', 'address', 'otp'):
+        assert evaluate(sup, vault._TAB_PROBES[kind]), kind
+    controls = json.loads(evaluate(sup, build_inspection_js('test-nonce')))
+    password = next(c for c in controls if c['type'] == 'password')
+    assert password['label'].strip() == 'Password'
+    assert password['formIndex'] >= 0
+    fills = [{'index': password['index'], 'token': 'current-password', 'value': 'dummy-live-value'}]
+    refused = json.loads(evaluate(sup, build_fill_js(fills, origin + '.invalid', 'test-nonce')))
+    assert refused['refused'] == 'origin_changed'
+    assert evaluate(sup, "testRoot.querySelector('input').value === ''")
+    assert json.loads(evaluate(sup, build_fill_js(fills, origin, 'wrong-nonce')))['filled'] == 0
+    # A stale nonce attempt clears stamps; inspect again before the authorized write.
+    evaluate(sup, build_inspection_js('test-nonce'))
+    assert json.loads(evaluate(sup, build_fill_js(fills, origin, 'test-nonce')))['filled'] == 1
+    assert evaluate(sup, "testRoot.querySelector('input').value === 'dummy-live-value'")
+    assert evaluate(sup, "testRoot.querySelectorAll('[data-hermes-vault-slot]').length") == 0
+    # Stamps alone do not authorize a password write into a field whose type changed.
+    evaluate(sup, build_inspection_js('test-nonce'))
+    evaluate(sup, "testRoot.querySelector('input').type = 'text'; testRoot.querySelector('input').value = ''")
+    assert json.loads(evaluate(sup, build_fill_js(fills, origin, 'test-nonce')))['filled'] == 0
+    # Shadow traversal must not widen mutation scope to embedded documents.
+    evaluate(sup, """document.body.innerHTML = '<iframe></iframe>';
+      document.querySelector('iframe').contentDocument.body.innerHTML = '<input type=password>'""")
+    assert not evaluate(sup, vault._TAB_PROBES['login'])
+    assert json.loads(evaluate(sup, build_inspection_js('frame-test'))) == []
+    # Ordinary light-DOM fields keep working too.
+    evaluate(sup, "document.body.innerHTML = '<input type=password>'")
+    assert evaluate(sup, vault._TAB_PROBES['login'])
+    controls = json.loads(evaluate(sup, build_inspection_js('light-test')))
+    fills[0]['index'] = controls[0]['index']
+    assert json.loads(evaluate(sup, build_fill_js(fills, origin, 'light-test')))['filled'] == 1
+
+
+def test_birth_month_select_follows_visible_month_not_option_value(browser):
+    """Month <select>s often use zero-based values ("3" = April). The fill must pick the
+    visible month, and refuse rather than guess when the visible text is ambiguous."""
+    sup, _, origin, _ = browser
+    months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
+              'September', 'October', 'November', 'December']
+    cases = {
+        'zero-based': ''.join(f'<option value="{i}">{m}</option>' for i, m in enumerate(months)),
+        'numeric-text': ''.join(f'<option value="m{i}">{i + 1:02d}</option>' for i in range(12)),
+        'short-names': ''.join(f'<option value="x{i}">{m[:3]}.</option>' for i, m in enumerate(months)),
+    }
+    for name, options in cases.items():
+        evaluate(sup, f"""document.body.innerHTML = `<select autocomplete="bday-month">
+          <option value="">Month</option>{options}</select>`""")
+        controls = json.loads(evaluate(sup, build_inspection_js('month-' + name)))
+        fills = [{'index': controls[0]['index'], 'token': 'bday-month', 'value': '04'}]
+        result = json.loads(evaluate(sup, build_fill_js(fills, origin, 'month-' + name)))
+        assert result['filled'] == 1, name
+        label = evaluate(sup, "document.querySelector('select').selectedOptions[0].textContent")
+        assert label in ('April', '04', 'Apr.'), (name, label)
+    # A bare-number menu whose visible text never shows the month is not guessed from values.
+    evaluate(sup, """document.body.innerHTML = `<select autocomplete="bday-month">
+      <option value="">Month</option>${Array.from({length: 12}, (_, i) =>
+        `<option value="${i + 1}">&#9679;</option>`).join('')}</select>`""")
+    controls = json.loads(evaluate(sup, build_inspection_js('month-opaque')))
+    fills = [{'index': controls[0]['index'], 'token': 'bday-month', 'value': '04'}]
+    assert json.loads(evaluate(sup, build_fill_js(fills, origin, 'month-opaque')))['filled'] == 0
+    assert evaluate(sup, "document.querySelector('select').value") == ''
+
+
+def test_protected_birth_date_refuses_externally_launched_cdp_browser(browser, monkeypatch):
+    """An isolated profile is not enough: the browser was attached via CDP."""
+    from agent.vault_store import VaultItemMeta
+
+    sup, task, origin, _ = browser
+    evaluate(sup, """document.body.innerHTML = `
+      <form><label>Date of birth <input type="date" name="dob" autocomplete="bday"></label></form>`""")
+    meta = VaultItemMeta(id='op:field:external', kind='protected_field', label='Birth date',
+                         origin=origin, created_at='', allowed_origins=(origin,), field_token='bday')
+
+    class Backend:
+        name = 'onepassword'
+        needs_unlock = False
+        def get_meta(self, handle):
+            return meta if handle == meta.id else None
+        def resolve_secret(self, handle):
+            raise AssertionError('external browser must not resolve a protected field')
+
+    monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda _handle: Backend())
+    result = json.loads(registry.dispatch('browser_vault', {'action': 'fill', 'handle': meta.id}, task_id=task))
+    assert result['error_type'] == 'private_browser_required'
+    assert evaluate(sup, "document.querySelector('[name=dob]').value") == ''
+
+
+@pytest.mark.parametrize('aliased_root', [False, True])
+def test_vault_fill_finds_shadow_login_not_unrelated_first_tab(browser, aliased_root):
+    from agent.vault_store import get_vault_store
+
+    sup, task, origin, new_page = browser
+    # A distinct exact origin on the same server, leaving the original tab intact.
+    login_origin = origin.replace('127.0.0.1', 'localhost')
+    new_page(login_origin + '/page')
+    shadow_form(sup)
+    if aliased_root:
+        # Synthetic-shadow adapters can expose the same root via multiple hosts.
+        # Repeated traversal must not overwrite a control's inspection stamp.
+        evaluate(sup, """(() => {
+          const alias = document.createElement('div');
+          const root = document.body.firstElementChild.shadowRoot;
+          Object.defineProperty(alias, 'shadowRoot', {get: () => root});
+          document.body.append(alias);
+        })()""")
+    assert sup.focus_page(origin)['ok']
+    item = get_vault_store().add_item('login', 'synthetic login',
+                                    {'identifier': 'test', 'identifier_type': 'username',
+                                     'password': 'dummy-live-value'}, origin=login_origin)
+    raw = registry.dispatch('browser_vault', {'action': 'fill', 'handle': item.id}, task_id=task)
+    result = json.loads(raw)
+    assert result['success'], result
+    assert result['filled_fields'] == 1 and result['origin'] == login_origin
+    assert 'dummy-live-value' not in raw
+    assert evaluate(sup, "testRoot.querySelector('input').value === 'dummy-live-value'")
+    # Framework observers outside both shadow roots must see the input event,
+    # with normal shadow-DOM retargeting and without exposing the field value.
+    assert evaluate(sup, 'window.testInputObservers') == [
+        {'observer': observer, 'composed': True, 'retargeted': True, 'inputType': 'insertText'}
+        for observer in ('host', 'document')
+    ]
+    assert sup.focus_page(origin)['ok']
+    assert evaluate(sup, "document.querySelectorAll('input').length") == 0
+    # No tab on the bound origin: never weaken origin matching to make progress.
+    other = get_vault_store().add_item('login', 'absent origin',
+                                     {'identifier': 'test', 'identifier_type': 'username',
+                                      'password': 'another-dummy'}, origin='https://absent.invalid')
+    refusal = json.loads(registry.dispatch('browser_vault', {'action': 'fill', 'handle': other.id}, task_id=task))
+    assert refusal['error_type'] == 'origin_mismatch'
+
+
+_TEST_CARD = {'card_number': '4111111111111111', 'cardholder_name': 'A User', 'exp_month': '7',
+              'exp_year': '2029', 'cvc': '123', 'billing_postal_code': '94110'}
+
+
+def test_card_fill_asks_only_when_a_real_page_can_take_the_card(browser, monkeypatch):
+    """Real Chrome, real cross-origin frame: the Healthchecks-shaped checkout never prompts."""
+    from agent.vault_store import get_vault_store
+
+    sup, task, origin, new_page = browser
+    shop = origin.replace('127.0.0.1', 'localhost')
+    new_page(shop + '/checkout')
+    card = get_vault_store().add_item('payment', 'synthetic card', dict(_TEST_CARD), origin=shop)
+    prompts = []
+
+    def confirm(label, page_origin):
+        prompts.append(page_origin)
+        return answer['value']
+
+    answer = {'value': 'accept'}
+    monkeypatch.setattr(vault, '_confirm_payment_fill', confirm)
+
+    def fill():
+        raw = registry.dispatch('browser_vault', {'action': 'fill', 'handle': card.id}, task_id=task)
+        assert '4111111111111111' not in raw and '"123"' not in raw
+        return json.loads(raw)
+
+    # Card inputs live only in a processor iframe on another origin (the page's own
+    # cardholder name and ZIP are fillable, but without a card number the fill cannot pay).
+    evaluate(sup, f"""new Promise((resolve) => {{
+      document.body.innerHTML = `<form>
+        <input autocomplete="cc-name"><input autocomplete="postal-code">
+        <iframe src="{origin}/processor"></iframe></form>`;
+      document.querySelector('iframe').onload = resolve;
+    }})""")
+
+    def processor_state():
+        # The frame's state, read across the origin boundary through its postMessage reply.
+        return evaluate(sup, """new Promise((resolve) => {
+          addEventListener('message', (e) => resolve(e.data), {once: true});
+          document.querySelector('iframe').contentWindow.postMessage('state', '*');
+        })""")
+
+    assert processor_state() == {'cardInputs': 1, 'filled': False}
+    assert fill()['error_type'] == 'no_payment_fields'
+    assert prompts == []
+    assert evaluate(sup, "[...document.querySelectorAll('input')].every(i => i.value === '')")
+    assert processor_state() == {'cardInputs': 1, 'filled': False}
+
+    # Approved: exactly one prompt, and the card lands in the page's own fields.
+    evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
+      <input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"></form>`""")
+    answer['value'] = 'accept'
+    result = fill()
+    assert result['success'], result
+    assert prompts == [shop]
+    assert evaluate(sup, "document.querySelector('[autocomplete=cc-number]').value") == '4111111111111111'
+
+    # The form is replaced while the prompt waits: the post-consent inspection finds
+    # no card target, so nothing is written to the new page.
+    def swap_then_confirm(label, page_origin):
+        prompts.append(page_origin)
+        evaluate(sup, "document.body.innerHTML = '<form><input autocomplete=\"cc-name\"></form>'")
+        return 'accept'
+
+    monkeypatch.setattr(vault, '_confirm_payment_fill', swap_then_confirm)
+    evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
+      <input autocomplete="cc-number"></form>`""")
+    assert fill()['error_type'] == 'no_payment_fields'
+    assert evaluate(sup, "document.querySelector('input').value") == ''
+
+    # Declining is terminal for this task and origin; no repeat prompt or card write.
+    monkeypatch.setattr(vault, '_confirm_payment_fill', confirm)
+    evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
+      <input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"></form>`""")
+    answer['value'] = 'decline'
+    assert fill()['error_type'] == 'payment_declined'
+    assert fill()['error_type'] == 'payment_retry_refused'
+    assert prompts == [shop, shop, shop]
+    assert evaluate(sup, "[...document.querySelectorAll('input')].every(i => i.value === '')")

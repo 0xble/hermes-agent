@@ -23,6 +23,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import itertools
 
 LOGIN_AUTOFILL_TOKENS = ("username", "email", "tel", "current-password")
 
@@ -32,6 +33,7 @@ LOGIN_AUTOFILL_TOKENS = ("username", "email", "tel", "current-password")
 PAYMENT_AUTOFILL_TOKENS = ("cc-number", "cc-name", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc")
 ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "address-level1",
                            "postal-code", "country-name", "country")
+PROTECTED_FIELD_TOKENS = ("bday", "bday-day", "bday-month", "bday-year")
 _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan)\b"), "cc-number"),
     (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname)\b"), "cc-name"),
@@ -46,6 +48,9 @@ _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:zip|postal|postcode)\b"), "postal-code"),
     (re.compile(r"\b(?:country)\b"), "country-name"),
 )
+
+# An MM/YY placeholder does not make issue/start dates expiry targets.
+_CHECKOUT_NON_EXPIRY_DATE = re.compile(r"\b(?:issue\s*date|valid\s*from|start\s*date)\b")
 
 _EXCLUDED_AUTOCOMPLETE = {"new-password", "one-time-code"}
 
@@ -73,9 +78,17 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    empty: bool = False
+    width: float = 0
+    height: float = 0
+    container_index: Optional[int] = None
+    container_input_count: int = 0
+    container_has_password: bool = False
+    nearby_text: str = ""
+    context_truncated: bool = False
 
     @classmethod
-    def from_dict(cls, raw: Dict[str, Any]) -> "LoginControl":
+    def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
         form_index = raw.get("formIndex", raw.get("form_index"))
         max_length = raw.get("maxLength", raw.get("max_length"))
         return cls(
@@ -86,6 +99,14 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            empty=raw.get("empty") is True,
+            width=float(raw.get("width") or 0),
+            height=float(raw.get("height") or 0),
+            container_index=raw.get("containerIndex"),
+            container_input_count=int(raw.get("containerInputCount") or 0),
+            container_has_password=raw.get("containerHasPassword") is True,
+            nearby_text=str(raw.get("nearbyText") or "")[:300],
+            context_truncated=raw.get("contextTruncated") is True,
         )
 
 
@@ -136,12 +157,49 @@ _RE_OTP = re.compile(
 )
 
 
-def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
+_RE_OTP_CONTEXT = re.compile(
+    r"\b(?:verification|security\s+code|one\s+time\s+code|2fa|mfa|authenticator|"
+    r"two\s+factor|codigo\s+de\s+verificacion|code\s+de\s+verification|sicherheitscode)\b"
+)
+_RE_NOT_OTP_CONTEXT = re.compile(
+    r"\b(?:card|cc|cvv|cvc|csc|expir\w*|mm\s*yy|billing|phone|mobile|telephone|"
+    r"date|day|month|year|address|zip|postal|coupon|promo|voucher|gift)\b"
+)
+
+
+def _anonymous_otp_group(controls: List[LoginControl], code_length: Optional[int] = None) -> bool:
+    """Require a complete, compact anonymous widget; never infer OTP from box count alone."""
+    if not 4 <= len(controls) <= 8 or (code_length is not None and len(controls) != code_length):
+        return False
+    boxes = sorted(controls, key=lambda c: c.index)
+    first = boxes[0]
+    if (first.container_index is None or first.container_input_count != len(boxes)
+            or first.container_has_password or first.context_truncated
+            or first.width < 16 or first.height < 16
+            or first.width > 100 or first.height > 100):
+        return False
+    context = _normalize_text(first.nearby_text)
+    if not _RE_OTP_CONTEXT.search(context) or _RE_NOT_OTP_CONTEXT.search(context):
+        return False
+    return all(
+        c.type == first.type and c.type in ("text", "tel", "number")
+        and c.empty and not c.name.strip() and not c.label.strip() and not c.autocomplete.strip()
+        and c.container_index == first.container_index and c.form_index == first.form_index
+        and c.container_input_count == len(boxes) and not c.container_has_password
+        and not c.context_truncated
+        and abs(c.width - first.width) <= 2 and abs(c.height - first.height) <= 2
+        and _normalize_text(c.nearby_text) == context
+        and (i == 0 or c.index == boxes[i - 1].index + 1)
+        for i, c in enumerate(boxes)
+    )
+
+
+def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginControl]:
     """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
     otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
     the code into one input per digit (``maxlength=1`` boxes): they are returned in DOM order and the
     fill spreads the code across them."""
-    out: List[ClassifiedLoginControl] = []
+    out: list[ClassifiedLoginControl] = []
     for c in controls:
         tokens = c.autocomplete.lower().split()
         if "one-time-code" in tokens:
@@ -151,13 +209,23 @@ def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginC
             continue
         if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
-    return out
+    if out:
+        return out
+    groups: Dict[int, List[LoginControl]] = {}
+    for c in controls:
+        if c.container_index is not None:
+            groups.setdefault(c.container_index, []).append(c)
+    matched = [g for g in groups.values() if _anonymous_otp_group(g)]
+    # Ambiguous page: never choose between two similarly shaped widgets.
+    if len(matched) == 1:
+        return [ClassifiedLoginControl(c, 55, "anonymous-one-time-code") for c in matched[0]]
+    return []
 
 
 def select_password_fill(
-    classified: List[ClassifiedLoginControl],
+    classified: list[ClassifiedLoginControl],
     password: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Select the single best current-password control to fill.
 
     The vault fill path is password-only: the identifier is agent-visible
@@ -169,9 +237,7 @@ def select_password_fill(
     passwords = [c for c in classified if c.token == "current-password"]
     if not passwords or not password:
         return []
-    best_password = sorted(
-        passwords, key=lambda c: (-c.score, c.control.index)
-    )[0]
+    best_password = min(passwords, key=lambda c: (-c.score, c.control.index))
     return [
         {
             "index": best_password.control.index,
@@ -182,23 +248,29 @@ def select_password_fill(
 
 
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
-    """Classify one control as a payment/address fill target (autocomplete token exact match 100,
-    label/name heuristic 70), or None. Password/email inputs are never checkout targets."""
+    """Classify payment/address targets; masked passwords qualify only as CVC."""
     tokens = [t for t in control.autocomplete.lower().split() if t]
     for token in PAYMENT_AUTOFILL_TOKENS + ADDRESS_AUTOFILL_TOKENS:
         if token in tokens:
+            if control.type == "password" and token != "cc-csc":
+                return None
             return ClassifiedLoginControl(control, 100, "country-name" if token == "country" else token)
-    if control.type in ("password", "email"):
+    if control.type == "email":
         return None
     searchable = _normalize_text(" ".join(part for part in (control.name, control.label) if part))
     for pattern, token in _CHECKOUT_HEURISTICS:
         if pattern.search(searchable):
+            # Narrow guards adapted from upstream PRs 136639 and 134723.
+            if token.startswith("cc-exp") and _CHECKOUT_NON_EXPIRY_DATE.search(searchable):
+                continue
+            if control.type == "password" and token != "cc-csc":
+                continue
             return ClassifiedLoginControl(control, 70, token)
     return None
 
 
-def select_checkout_fills(classified: List[ClassifiedLoginControl], secret: Dict[str, str],
-                          field_tokens: Dict[str, str]) -> List[Dict[str, Any]]:
+def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict[str, str],
+                          field_tokens: dict[str, str]) -> list[dict[str, Any]]:
     """Map a payment/address secret payload onto the best control per autocomplete token.
 
     ``field_tokens`` is ``PAYMENT_FIELDS`` / ``ADDRESS_FIELDS`` (agent/vault_store.py). A combined
@@ -206,10 +278,10 @@ def select_checkout_fills(classified: List[ClassifiedLoginControl], secret: Dict
     month/year fills. Returns ``[{"index", "token", "value"}]``: one control per token, highest
     score then DOM order.
     """
-    values: Dict[str, str] = {tok: secret[f] for f, tok in field_tokens.items() if secret.get(f)}
+    values: dict[str, str] = {tok: secret[f] for f, tok in field_tokens.items() if secret.get(f)}
     if "cc-exp-month" in values and "cc-exp-year" in values:
         values["cc-exp"] = f"{values['cc-exp-month'].zfill(2)}/{values['cc-exp-year'][-2:]}"
-    fills: List[Dict[str, Any]] = []
+    fills: list[dict[str, Any]] = []
     for token, value in values.items():
         candidates = sorted((c for c in classified if c.token == token), key=lambda c: (-c.score, c.control.index))
         if candidates:
@@ -217,6 +289,92 @@ def select_checkout_fills(classified: List[ClassifiedLoginControl], secret: Dict
     if any(f["token"] == "cc-exp" for f in fills):
         fills = [f for f in fills if f["token"] not in ("cc-exp-month", "cc-exp-year")]
     return fills
+
+
+_RE_BDAY = re.compile(r"\b(?:date\s*of\s*birth|birth\s*date|birthdate|dob)\b")
+_DATE_PART_CONTROL_TYPES = frozenset({"select", "text", "number", "tel"})
+_PROTECTED_CONTROL_TYPES = {
+    "bday": frozenset({"date"}),
+    "bday-month": _DATE_PART_CONTROL_TYPES,
+    "bday-day": _DATE_PART_CONTROL_TYPES,
+    "bday-year": _DATE_PART_CONTROL_TYPES,
+}
+_RE_BDAY_PART = {
+    f"bday-{part}": re.compile(
+        rf"\b(?:(?:birth|dob)\s*(?:date\s*)?{part}|{part}\s*(?:of\s*)?(?:birth|dob))\b"
+    )
+    for part in ("month", "day", "year")
+}
+
+
+def classify_protected_field_control(control: LoginControl, semantic: str) -> Optional[ClassifiedLoginControl]:
+    """Classify one explicitly configured protected semantic.
+
+    Standard WHATWG autocomplete tokens are authoritative. Heuristics are
+    deliberately narrow: a birth date may match only a control whose own
+    name or label says birth date or DOB, never a generic date control.
+    """
+    if semantic != "bday":
+        return None
+    # Control type gates every match, standard token included: a page can put
+    # autocomplete="bday" on any control, and only these can show a date part.
+    allowed = _PROTECTED_CONTROL_TYPES
+    tokens = [t for t in control.autocomplete.lower().split() if t]
+    for token in PROTECTED_FIELD_TOKENS:
+        if token in tokens:
+            return ClassifiedLoginControl(control, 100, token) if control.type in allowed[token] else None
+    if control.type not in allowed["bday-day"] | allowed["bday"]:
+        return None
+    searchable = _normalize_text(" ".join(part for part in (control.name, control.label) if part))
+    for token, pattern in _RE_BDAY_PART.items():
+        if pattern.search(searchable):
+            return ClassifiedLoginControl(control, 80, token) if control.type in allowed[token] else None
+    # A heuristic combined date is safe only for a date input. Selects and
+    # numeric/text controls need an explicit day/month/year meaning.
+    if control.type == "date" and _RE_BDAY.search(searchable):
+        return ClassifiedLoginControl(control, 80, "bday")
+    return None
+
+
+def select_protected_field_fills(classified: List[ClassifiedLoginControl], semantic: str,
+                                 value: str) -> List[Dict[str, Any]]:
+    """Select one birth-date field or a complete day/month/year split."""
+    if semantic != "bday" or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""):
+        return []
+    year, month, day = value.split("-")
+    parts = {"bday-month": month, "bday-day": day, "bday-year": year}
+    # A split date is one widget only when all three controls share a real form,
+    # or, outside any form, one tight container. Form-less controls with no
+    # container are never grouped: None is "unknown", not a shared widget.
+    def group_of(c: ClassifiedLoginControl) -> Optional[tuple]:
+        if c.control.form_index is not None:
+            return ("form", c.control.form_index)
+        if c.control.container_index is not None:
+            return ("container", c.control.container_index)
+        return None
+
+    groups = {group_of(c) for c in classified if c.token in parts} - {None}
+    complete_groups = []
+    for group in groups:
+        selected: List[Dict[str, Any]] = []
+        score = 0
+        for token, part in parts.items():
+            candidates = sorted(
+                (c for c in classified if c.token == token and group_of(c) == group),
+                key=lambda c: (-c.score, c.control.index),
+            )
+            if not candidates:
+                break
+            score += candidates[0].score
+            selected.append({"index": candidates[0].control.index, "token": token, "value": part})
+        if len(selected) == 3:
+            complete_groups.append((score, min(f["index"] for f in selected), selected))
+    if complete_groups:
+        return sorted(complete_groups, key=lambda group: (-group[0], group[1]))[0][2]
+    singles = sorted((c for c in classified if c.token == "bday"),
+                     key=lambda c: (-c.score, c.control.index))
+    return ([{"index": singles[0].control.index, "token": "bday", "value": value}]
+            if singles else [])
 
 
 # JS expression evaluated in the page to inspect candidate input controls.
@@ -227,30 +385,82 @@ def select_checkout_fills(classified: List[ClassifiedLoginControl], secret: Dict
 INSPECTION_STAMP_ATTR = "data-hermes-vault-slot"
 
 
-def build_otp_fills(otp_controls: List[ClassifiedLoginControl], code: str) -> List[Dict[str, Any]]:
+def build_otp_fills(otp_controls: list[ClassifiedLoginControl], code: str) -> list[dict[str, Any]]:
     """One fill per box. Default: the single best-scoring code field takes the whole code.
 
     Per-digit entry only when the page unmistakably uses it: exactly len(code) OTP controls that are all
     ``maxlength=1``, all in the same form, and adjacent in DOM order (the classic N-box widget). Anything
     looser (several code-like inputs scattered over a page) gets ONE field, never a digit sprayed across
     unrelated inputs."""
+    if not otp_controls:
+        return []
+    if any(c.token == "anonymous-one-time-code" for c in otp_controls):
+        boxes = [c.control for c in otp_controls]
+        if not all(c.token == "anonymous-one-time-code" for c in otp_controls) or not _anonymous_otp_group(boxes, len(code)):
+            return []
+        return [{"index": c.index, "token": "one-time-code", "value": ch}
+                for c, ch in zip(sorted(boxes, key=lambda c: c.index), code)]
     best = max(otp_controls, key=lambda c: c.score)
     boxes = sorted((c for c in otp_controls if c.control.max_length == 1), key=lambda c: c.control.index)
     if (len(boxes) == len(code)
             and len({b.control.form_index for b in boxes}) == 1
-            and all(b.control.index - a.control.index == 1 for a, b in zip(boxes, boxes[1:]))):
+            and all(b.control.index - a.control.index == 1 for a, b in itertools.pairwise(boxes))):
         return [{"index": b.control.index, "token": "one-time-code", "value": ch} for b, ch in zip(boxes, code)]
     return [{"index": best.control.index, "token": "one-time-code", "value": code}]
 
 
+# Open shadow roots belong to the same document/origin. Never traverse frames:
+# their origin would need a separate binding check at the mutation boundary.
+_QUERY_ALL_JS = """const queryAll = (selector) => {
+    const roots = new Set([document]), matches = new Set();
+    // Synthetic shadow DOM can expose a root or control through multiple paths.
+    // Stamp each control once: duplicate indices would overwrite its nonce binding.
+    for (const root of roots) {
+      for (const element of root.querySelectorAll(selector)) matches.add(element);
+      for (const element of root.querySelectorAll('*')) {
+        if (element.shadowRoot) roots.add(element.shadowRoot);
+      }
+    }
+    return Array.from(matches);
+  };"""
+
+
+def build_form_probe_js(selector: str) -> str:
+    """Use the same DOM scope for tab discovery as inspection and injection."""
+    return "(() => {" + _QUERY_ALL_JS + "return queryAll(" + json.dumps(selector) + ").length > 0;})()"
+
+
 def build_inspection_js(nonce: str) -> str:
-    return _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+    return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+            .replace("__QUERY_ALL__", _QUERY_ALL_JS))
 
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
-  const elements = Array.from(document.querySelectorAll("input, select"));
-  const forms = Array.from(document.forms);
+  __QUERY_ALL__
+  const elements = queryAll("input, select");
+  const forms = queryAll("form");
+  const containerIds = new WeakMap();
+  let nextContainerId = 0;
+  const containerFor = (element) => {
+    // A tight ancestor, not merely the page's form: never combine distant fields.
+    let parent = element.parentElement;
+    for (let depth = 0; parent && depth < 4; parent = parent.parentElement, depth++) {
+      const count = parent.querySelectorAll("input").length;
+      if (count >= 4 && count <= 8) return parent;
+    }
+    return null;
+  };
+  const contextFor = (container) => {
+    if (!container) return { text: "", truncated: false };
+    let heading = "";
+    for (let node = container, depth = 0; node && depth < 7; node = node.parentElement, depth++) {
+      const h = node.querySelector("h1, h2, h3, h4, [role=heading]");
+      if (h) { heading = h.textContent || ""; break; }
+    }
+    const raw = [heading, container.parentElement && container.parentElement.textContent || ""].join(" ").replace(/\\s+/g, " ").trim();
+    return { text: raw.slice(0, 300), truncated: raw.length > 300 };
+  };
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.matches(":disabled") || element.readOnly) return [];
@@ -260,13 +470,25 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
-      .map((id) => { const n = document.getElementById(id); return n ? (n.textContent || "") : ""; })
+      .map((id) => { const n = element.getRootNode().getElementById(id); return n ? (n.textContent || "") : ""; })
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
+    const container = containerFor(element);
+    if (container && !containerIds.has(container)) containerIds.set(container, nextContainerId++);
+    const context = contextFor(container);
+    const rect = element.getBoundingClientRect();
     return [{
       autocomplete: element.getAttribute("autocomplete") || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
       index,
+      empty: element.value === "",
+      width: Math.round(rect.width * 10) / 10,
+      height: Math.round(rect.height * 10) / 10,
+      containerIndex: container ? containerIds.get(container) : null,
+      containerInputCount: container ? container.querySelectorAll("input").length : 0,
+      containerHasPassword: !!container && !!container.querySelector('input[type="password"]'),
+      nearbyText: context.text,
+      contextTruncated: context.truncated,
       maxLength: element.maxLength > 0 ? element.maxLength : null,
       label: [
         ...labels,
@@ -283,7 +505,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()"""
 
 
-def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -300,6 +522,7 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
     )
     return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
             .replace("__NONCE__", json.dumps(nonce))
+            .replace("__QUERY_ALL__", _QUERY_ALL_JS)
             .replace("__EXCLUDED_PASSWORD__", json.dumps(_RE_EXCLUDED_PASSWORD.pattern))
             .replace("__OTP_PATTERN__", json.dumps(_RE_OTP.pattern))
             .replace("__FILLS__", payload))
@@ -312,16 +535,42 @@ _FILL_JS_TEMPLATE = """(() => {
   }
   const fills = __FILLS__;
   const nonce = __NONCE__;
+  __QUERY_ALL__
+  const stamped = queryAll("[data-hermes-vault-slot]");
   let filled = 0;
+  const selectedOptions = [];
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
-    const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
+    const el = stamped.find((n) => n.getAttribute("data-hermes-vault-slot") === nonce + ':' + f.index);
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
-        const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); filled += 1; }
+        const options = Array.from(el.options);
+        const same = (t) => norm(t) === want || norm(t) === want.replace(/^0/, "");
+        let opt;
+        if (f.token === "bday-month") {
+          // Month option values are often zero-based ("3" = April): trust visible
+          // text, by month name when present, and never guess from a bare value.
+          const names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+          const monthOf = (t) => names.findIndex((n) => new RegExp("(^|[^a-z])" + n).test(norm(t)));
+          const named = options.filter((o) => monthOf(o.textContent) >= 0);
+          if (named.length) {
+            const hits = named.filter((o) => monthOf(o.textContent) === parseInt(want, 10) - 1);
+            opt = hits.length === 1 ? hits[0] : undefined;
+          } else {
+            const byText = options.filter((o) => same(o.textContent));
+            opt = byText.length === 1 ? byText[0] : undefined;
+          }
+        } else {
+          opt = options.find((o) => [o.value, o.textContent].some(same));
+        }
+        if (opt) {
+          el.value = opt.value;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          selectedOptions.push({ token: f.token, value: opt.value, label: opt.textContent });
+          filled += 1;
+        }
         continue;
       }
       el.focus();
@@ -329,7 +578,7 @@ _FILL_JS_TEMPLATE = """(() => {
         const tokens = String(el.getAttribute("autocomplete") || "").toLowerCase().split(/\\s+/);
         const labels = Array.from(el.labels || []).map((l) => l.textContent).join(" ");
         const ariaText = (el.getAttribute("aria-labelledby") || "").split(/\\s+/).filter(Boolean)
-          .map((id) => { const n = document.getElementById(id); return n ? n.textContent : ""; }).join(" ");
+          .map((id) => { const n = el.getRootNode().getElementById(id); return n ? n.textContent : ""; }).join(" ");
         const purpose = [el.name, el.id, labels, el.getAttribute("aria-label"), ariaText, el.placeholder, el.title]
           .filter(Boolean).join(" ").normalize("NFKD").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
         const style = getComputedStyle(el);
@@ -342,11 +591,11 @@ _FILL_JS_TEMPLATE = """(() => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
       if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
   }
-  document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled });
+  stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  return JSON.stringify({ filled, selectedOptions });
 })()"""

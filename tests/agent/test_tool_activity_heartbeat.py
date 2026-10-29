@@ -110,10 +110,13 @@ def test_heartbeat_touches_periodically_and_stops():
 
     touches: list = []
     stop = threading.Event()
+    repeated = threading.Event()
 
     class _Agent:
         def _touch_activity(self, desc):
             touches.append(desc)
+            if len(touches) >= 2:
+                repeated.set()
 
     thread = threading.Thread(
         target=te._run_tool_activity_heartbeat,
@@ -122,15 +125,15 @@ def test_heartbeat_touches_periodically_and_stops():
         daemon=True,
     )
     thread.start()
-    time.sleep(0.12)
-    stop.set()
-    thread.join(timeout=1.0)
+    try:
+        assert repeated.wait(5), "heartbeat did not repeat"
+    finally:
+        stop.set()
+        thread.join(timeout=5)
 
     assert not thread.is_alive(), "heartbeat thread did not exit on stop"
     assert len(touches) >= 2, f"expected periodic touches, got {len(touches)}"
-    n = len(touches)
-    time.sleep(0.1)
-    assert len(touches) == n, "heartbeat kept touching after stop_event set"
+    assert all(touch == "tool running: terminal" for touch in touches)
 
 
 def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
@@ -149,7 +152,20 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    enough = threading.Event()
+
+    def _record(desc):
+        touches.append(time.time())
+        if len(touches) >= 3:
+            enough.set()
+
+    agent._touch_activity = _record
+
+    # Event-based: hold the tool open until the mid-call heartbeats actually land,
+    # rather than assuming a fixed 0.25s covers several 0.05s wakeups on a loaded runner.
+    def _execute(next_args):
+        enough.wait(10.0)
+        return json.dumps({"ok": True})
 
     result = te._run_agent_tool_execution_middleware(
         agent,
@@ -157,16 +173,16 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.25),
+        execute=_execute,
         display_index=1,
     )
 
     assert json.loads(result.result) == {"ok": True}
 
-    # Start stamp + at least one heartbeat mid-call (0.25s run, 0.05s cadence).
+    # Start stamp + at least one heartbeat mid-call.
     assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
     spread = touches[-1] - touches[0]
-    assert spread >= 0.15, f"touches not spread across the call: {spread:.3f}s"
+    assert spread >= 0.05, f"touches not spread across the call: {spread:.3f}s"
 
 
 def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):
@@ -241,7 +257,14 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    enough = threading.Event()
+
+    def _record(desc):
+        touches.append(time.time())
+        if len(touches) >= 3:
+            enough.set()
+
+    agent._touch_activity = _record
 
     agent._execute_tool_calls_concurrent = (
         __import__("run_agent").AIAgent._execute_tool_calls_concurrent.__get__(agent)
@@ -258,7 +281,9 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
             self.tool_calls = tool_calls
 
     def _invoke(name, *a, **kw):
-        time.sleep(0.25)
+        # Event-based: keep the concurrent call open until the mid-call
+        # heartbeats land instead of relying on a fixed sleep.
+        enough.wait(10.0)
         return json.dumps({"ok": name})
 
     agent._invoke_tool = MagicMock(side_effect=_invoke)
@@ -268,3 +293,94 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
     agent._execute_tool_calls_concurrent(msg, messages, "task")
 
     assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
+
+
+def test_heartbeat_exits_once_worker_tid_is_interrupted():
+    """The heartbeat must not outlive the worker it speaks for (#111922).
+
+    The executor abandons a wedged worker by raising its interrupt bit
+    (``_interrupt_worker_tids``); that worker never reaches ``stop_event.set()``,
+    so the heartbeat has to stop on the bit itself, or the abandoned tool keeps
+    the inactivity watchdog pinned for the rest of the run.
+    """
+    import agent.tool_executor as te
+    from tools.interrupt import set_interrupt
+
+    touches: list = []
+    stop = threading.Event()
+    stamped = threading.Event()
+    fake_worker_tid = 10**9 + 111922  # not a live thread; only the bit matters
+
+    class _Agent:
+        def _touch_activity(self, desc):
+            touches.append(desc)
+            stamped.set()
+
+    thread = threading.Thread(
+        target=te._run_tool_activity_heartbeat,
+        args=(_Agent(), stop, "tool running: terminal"),
+        kwargs={"interval": 0.05, "worker_tid": fake_worker_tid},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        # Event-based: a loaded runner drifts wakeups past any fixed sleep.
+        assert stamped.wait(10.0), "heartbeat never stamped while the worker was live"
+        set_interrupt(True, fake_worker_tid)
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "heartbeat kept running after its worker was abandoned"
+        n = len(touches)
+        time.sleep(0.12)
+        assert len(touches) == n
+    finally:
+        set_interrupt(False, fake_worker_tid)
+        stop.set()
+
+
+def test_sequential_timeout_stops_abandoned_workers_heartbeat(monkeypatch):
+    """After the sequential deadline abandons a non-cooperative tool, no more
+    ``tool running:`` stamps arrive — the timed-out tool no longer fakes liveness (#111922)."""
+    import agent.tool_executor as te
+
+    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
+    monkeypatch.setattr(te, "_SEQUENTIAL_INTERRUPT_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(te, "_resolve_sequential_tool_timeout", lambda: 0.3)
+    monkeypatch.setattr(te, "_emit_terminal_post_tool_call", lambda agent, **kw: None)
+    # The middleware's execution seam: ``_run_with_activity_heartbeat`` around ``execute`` on the worker.
+    monkeypatch.setattr(
+        te, "_run_agent_tool_execution_middleware",
+        lambda agent, execute, function_name="terminal", **kw: te._ManagedToolResult(
+            result=te._run_with_activity_heartbeat(agent, function_name, lambda: execute({})),
+            args={}, middleware_trace=[], blocked=False, dispatched=True,
+        ),
+    )
+
+    class _Agent:
+        _interrupt_requested = False
+        _tool_interrupt_reason = None
+
+        def __init__(self):
+            self._tool_worker_threads = set()
+            self._tool_worker_threads_lock = threading.Lock()
+            self.stamps: list = []
+
+        def _touch_activity(self, desc):
+            self.stamps.append((time.monotonic(), desc))
+
+        def interrupt(self, *a, **k):
+            pass
+
+    agent = _Agent()
+    release = threading.Event()
+    try:
+        managed = te._run_sequential_tool_execution_middleware(
+            agent, function_name="terminal", function_args={}, effective_task_id="t",
+            tool_call_id="tc1", execute=lambda args: release.wait() or "late",
+        )
+        abandoned_at = time.monotonic()
+        assert isinstance(managed.result, te._ToolTimeoutResult)
+        time.sleep(0.3)  # several heartbeat intervals past abandonment
+        late = [d for ts, d in agent.stamps if ts > abandoned_at + 0.06 and d.startswith("tool running:")]
+        assert not late, f"abandoned tool kept stamping activity: {late[:3]}"
+    finally:
+        release.set()

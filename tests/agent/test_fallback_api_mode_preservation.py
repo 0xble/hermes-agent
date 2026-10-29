@@ -14,6 +14,8 @@ Three behaviors salvaged from PR #79787:
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -178,17 +180,17 @@ class TestOriginalUrlDetection:
 
 class TestNamedProviderDeclaredWire:
     """A fallback entry naming a ``providers.<name>`` block inherits the block's declared
-    ``api_mode``/``transport`` instead of host re-detection."""
+    ``api_mode``/``transport`` instead of host re-detection (#33062, #81932)."""
 
     def test_named_block_anthropic_messages_inherited_on_plain_host(self):
-        fbs = [{"provider": "custom:claude-proxy", "model": "claude-opus-5-5"}]
+        fbs = [{"provider": "custom:ai-proxy", "model": "claude-4.7-opus"}]
         agent = _make_agent(fallback_model=fbs)
         with patch(
             "hermes_cli.runtime_provider._get_named_custom_provider",
-            return_value={"name": "claude-proxy", "base_url": "http://127.0.0.1:8317",
+            return_value={"name": "ai-proxy", "base_url": "https://ai-proxy.example.com",
                           "api_key": "k", "api_mode": "anthropic_messages"},
         ):
-            mock_rpc = _activate(agent, "http://127.0.0.1:8317", "claude-opus-5-5")
+            mock_rpc = _activate(agent, "https://ai-proxy.example.com", "claude-4.7-opus")
         assert agent.api_mode == "anthropic_messages"
         assert mock_rpc.call_args.kwargs["api_mode"] == "anthropic_messages"
 
@@ -220,3 +222,27 @@ class TestPlainFallbackUnchanged:
         agent = _make_agent(fallback_model=fbs)
         _activate(agent, "https://api.anthropic.com/v1", "claude-opus-4-6")
         assert agent.api_mode == "anthropic_messages"
+
+
+class TestOpenCodeFamilyPerModelWire:
+    """OpenCode Zen/Go serve Responses-only, Anthropic-wire and chat-completions models behind
+    one provider; a fallback entry must land on the same wire the primary /model path picks
+    (#102148: muse-spark on opencode-go was sent to /chat/completions → deterministic 500)."""
+
+    @pytest.mark.parametrize(
+        ("entry", "resolved_base_url", "expected_mode"),
+        [
+            ({"provider": "opencode-go", "model": "muse-spark-1.3-contributor"}, "https://opencode.ai/zen/go/v1", "codex_responses"),
+            ({"provider": "opencode-go", "model": "minimax-m2.7"}, "https://opencode.ai/zen/go/v1", "anthropic_messages"),
+            ({"provider": "custom", "model": "muse-spark-1.3-contributor", "base_url": "https://opencode.ai/zen/go/v1", "api_key": "k"},
+             "https://opencode.ai/zen/go/v1", "codex_responses"),
+            # controls: a chat-completions model stays put; an explicit pin always wins.
+            ({"provider": "opencode-go", "model": "deepseek-v4-flash"}, "https://opencode.ai/zen/go/v1", "chat_completions"),
+            ({"provider": "opencode-go", "model": "muse-spark-1.3-contributor", "api_mode": "chat_completions"},
+             "https://opencode.ai/zen/go/v1", "chat_completions"),
+        ],
+    )
+    def test_fallback_wire_matches_opencode_model_table(self, entry, resolved_base_url, expected_mode):
+        agent = _make_agent(fallback_model=[entry])
+        _activate(agent, resolved_base_url, entry["model"])
+        assert agent.api_mode == expected_mode

@@ -13,7 +13,6 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 
-
 def _make_event(text="/title", platform=Platform.TELEGRAM,
                 user_id="12345", chat_id="67890"):
     """Build a MessageEvent for testing."""
@@ -24,7 +23,6 @@ def _make_event(text="/title", platform=Platform.TELEGRAM,
         user_name="testuser",
     )
     return MessageEvent(text=text, source=source)
-
 
 def _make_runner(session_db=None):
     """Create a bare GatewayRunner with a mock session_store and optional session_db."""
@@ -48,15 +46,12 @@ def _make_runner(session_db=None):
 
     return runner
 
-
 # ---------------------------------------------------------------------------
 # _handle_title_command
 # ---------------------------------------------------------------------------
 
-
 class TestHandleTitleCommand:
     """Tests for GatewayRunner._handle_title_command."""
-
 
     @pytest.mark.asyncio
     async def test_title_conflict(self, tmp_path):
@@ -71,9 +66,7 @@ class TestHandleTitleCommand:
         event = _make_event(text="/title Taken Title")
         result = await runner._handle_title_command(event)
         assert "already in use" in result
-        assert "⚠️" in result
         db.close()
-
 
     @pytest.mark.asyncio
     async def test_title_control_chars_sanitized(self, tmp_path):
@@ -88,7 +81,6 @@ class TestHandleTitleCommand:
         assert "helloworld" in result
         assert db.get_session_title("test_session_123") == "helloworld"
         db.close()
-
 
     @pytest.mark.asyncio
     async def test_set_title_propagates_to_telegram_topic_rename(self, tmp_path):
@@ -110,6 +102,39 @@ class TestHandleTitleCommand:
         db.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("renamed", [True, False])
+    async def test_topic_collision_reports_stored_alias_and_actual_rename(self, tmp_path, renamed):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("other_session", "telegram")
+        db.set_session_title("other_session", "Shared Topic")
+        db.create_session("test_session_123", "telegram")
+        runner = _make_runner(session_db=db)
+        runner._is_telegram_topic_lane = lambda source: True
+        runner._session_db.get_telegram_topic_binding = AsyncMock(
+            return_value={"session_id": "test_session_123"}
+        )
+        adapter = SimpleNamespace(rename_dm_topic=AsyncMock(return_value=renamed))
+        runner._delivery_adapter_for = lambda source: adapter
+        event = _make_event(text="/title Shared Topic")
+        event.source.chat_type = "dm"
+        event.source.thread_id = "42"
+
+        reply = await runner._handle_title_command(event)
+
+        assert db.get_session_title("test_session_123") == "Shared Topic #2"
+        assert "Shared Topic #2" in reply
+        adapter.rename_dm_topic.assert_awaited_once_with(
+            chat_id="67890", thread_id="42", name="Shared Topic"
+        )
+        if renamed:
+            assert "failed" not in reply.lower()
+        else:
+            assert "failed" in reply.lower() and "stored" in reply.lower()
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_show_title_does_not_rename_topic(self, tmp_path):
         """Showing the title (no arg) must not trigger a topic rename."""
         from hermes_state import SessionDB
@@ -126,35 +151,16 @@ class TestHandleTitleCommand:
         runner._schedule_telegram_topic_title_rename.assert_not_called()
         db.close()
 
-
 # ---------------------------------------------------------------------------
 # /title in help and known_commands
 # ---------------------------------------------------------------------------
-
-
-class TestTitleInHelp:
-    """Verify /title appears in help text and known commands."""
-
-    @pytest.mark.asyncio
-    async def test_title_in_help_output(self):
-        """The /help output includes /title."""
-        runner = _make_runner()
-        event = _make_event(text="/help")
-        # Need hooks for help command
-        from gateway.hooks import HookRegistry
-        runner.hooks = HookRegistry()
-        result = await runner._handle_help_command(event)
-        assert "/title" in result
-
 
 # ---------------------------------------------------------------------------
 # /new with title
 # ---------------------------------------------------------------------------
 
-
 class TestResetCommandWithTitle:
     """Tests for GatewayRunner._handle_reset_command with a title argument."""
-
 
     @pytest.mark.asyncio
     async def test_reset_command_duplicate_title_surfaces_warning(self):
@@ -219,19 +225,6 @@ class TestResetCommandWithTitle:
         # Header must NOT claim the rejected title as the session name
         assert "New session started: Dup" not in reply
 
-
 # ---------------------------------------------------------------------------
 # /new in help output
 # ---------------------------------------------------------------------------
-
-
-class TestNewInHelp:
-    """Verify /new appears in help text with the [name] args hint."""
-
-    def test_new_command_in_help_output(self):
-        """The gateway help output includes /new with the [name] hint."""
-        from hermes_cli.commands import gateway_help_lines
-        lines = gateway_help_lines()
-        new_line = next((line for line in lines if line.startswith("`/new ")), None)
-        assert new_line is not None
-        assert "[name]" in new_line

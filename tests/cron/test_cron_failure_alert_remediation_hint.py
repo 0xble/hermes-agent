@@ -15,10 +15,11 @@ from cron.scheduler import _summarize_cron_failure_for_delivery
 
 def test_empty_chain_alert_names_the_remediation_commands(monkeypatch):
     monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
-    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+    monkeypatch.setattr(scheduler, "get_cron_fallback_chain", lambda cfg: [])
     job = {"name": "semi-analyst-radar", "id": "aaa111"}
     msg = _summarize_cron_failure_for_delivery(job, "Request timed out.")
-    assert "No fallback chain configured" in msg
+    assert "No backup provider is configured" in msg
+    assert "cron.fallback_providers" in msg
     assert "hermes fallback add" in msg
     assert "cron.model_provider" in msg
 
@@ -29,19 +30,19 @@ def test_exhausted_chain_alert_does_not_carry_the_config_hint(monkeypatch):
         lambda: {"fallback_providers": [{"provider": "openrouter", "model": "x"}]},
     )
     monkeypatch.setattr(
-        scheduler, "get_fallback_chain",
+        scheduler, "get_cron_fallback_chain",
         lambda cfg: [{"provider": "openrouter", "model": "x"}],
     )
     job = {"name": "semi-analyst-radar", "id": "aaa111"}
     msg = _summarize_cron_failure_for_delivery(job, "Request timed out.")
-    assert "Fallback chain was exhausted or unavailable." in msg
+    assert "No backup provider succeeded either." in msg
     assert "hermes fallback add" not in msg
 
 
 def test_rate_limit_empty_chain_also_carries_the_hint(monkeypatch):
     monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
-    monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])
+    monkeypatch.setattr(scheduler, "get_cron_fallback_chain", lambda cfg: [])
     job = {"name": "kz-coverage", "id": "bbb222"}
     msg = _summarize_cron_failure_for_delivery(job, "HTTP 429: rate limit exceeded")
-    assert "No fallback chain configured" in msg
+    assert "No backup provider is configured" in msg
     assert "hermes fallback add" in msg

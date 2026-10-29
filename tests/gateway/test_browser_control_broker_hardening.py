@@ -214,6 +214,9 @@ def test_timeout_while_disconnected_flushes_cancel_before_new_dispatch():
     assert isinstance(outcome.get("error"), ControllerTimeout)
     assert broker.pending_count == 0
 
+    # The first command needs a short timeout; give the independent second
+    # dispatch enough time to be completed under parallel CI load.
+    broker._command_timeout = 2.0
     replacement_frames = []
     broker.attach(scope, replacement_frames.append, owner="replacement-owner")
     assert replacement_frames == [

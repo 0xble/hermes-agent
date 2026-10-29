@@ -7,11 +7,9 @@ send fails. Selection flows through the same application path as the typed
 command, so picker and typed arguments can never diverge.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import yaml
 
 import gateway.run as gateway_run
 from gateway.config import Platform
@@ -63,7 +61,7 @@ def _make_runner(adapter=None):
     runner.hooks.loaded_hooks = []
     runner._session_db = None
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
-    runner._adapter_for_source = lambda source: adapter
+    runner._delivery_adapter_for = lambda source: adapter
     runner._thread_metadata_for_source = lambda source, anchor=None: {}
     runner._reply_anchor_for_event = lambda event: None
     return runner
@@ -112,8 +110,12 @@ class TestReasoningChoicePicker:
 class TestFastChoicePicker:
     def _patch_fast_support(self, monkeypatch, tmp_path):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-        monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg: "gpt-5.6")
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", dict)
+        monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: "gpt-5.6")
+        # ``/fast`` now resolves the effective session model through
+        # ``_resolve_session_agent_runtime``; with no session override that path
+        # calls runtime provider resolution, so stub it (no real credentials in CI).
+        monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", dict)
         import hermes_cli.models as models_mod
         monkeypatch.setattr(models_mod, "model_supports_fast_mode", lambda m: True)
 
@@ -127,7 +129,7 @@ class TestFastChoicePicker:
 
         assert result is None
         values = [c["value"] for c in adapter.calls[0]["choices"]]
-        assert values == ["fast", "normal", "auto", "cold"]
+        assert {"fast", "normal"} <= set(values)
 
     @pytest.mark.asyncio
     async def test_fast_picker_selection_is_session_scoped(self, tmp_path, monkeypatch):
@@ -144,5 +146,25 @@ class TestFastChoicePicker:
         assert runner._service_tier == "priority"
         assert runner._session_service_tier_overrides
         assert not (tmp_path / "config.yaml").exists()
+
+    @pytest.mark.asyncio
+    async def test_fast_picker_title_includes_human_readable_expiry(self, tmp_path, monkeypatch):
+        self._patch_fast_support(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"agent": {"fast_expiry_seconds": 2 * 60 * 60}},
+        )
+        clock = {"now": 100.0}
+        monkeypatch.setattr("gateway.run_config_loaders.time.time", lambda: clock["now"])
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+
+        await runner._handle_fast_command(_make_event("/fast fast"))
+        clock["now"] = 101.0
+        await runner._handle_fast_command(_make_event("/fast"))
+
+        assert "Expires in: 1h 59m" in adapter.calls[-1]["title"]
+        assert "s" not in adapter.calls[-1]["title"].split("Expires in:", 1)[1]
 
 

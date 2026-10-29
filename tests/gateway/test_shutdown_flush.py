@@ -1,8 +1,6 @@
 """Tests for gateway/shutdown_flush.py — pending message durability (#72680)."""
 
 import json
-import os
-import stat
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -10,7 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from gateway.shutdown_flush import (
-    _serialise_value,
     flush_overflow_to_file,
     flush_pending_to_file,
     recover_pending_to_db,
@@ -98,6 +95,46 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
     assert not flush_file.exists()
 
 
+def test_recover_payload_without_session_id_uses_resolver_and_deletes_file(
+    tmp_path, monkeypatch
+):
+    """A str-pending payload carries session_key but no session_id; a resolver
+    maps key→id so the message replays and the file is removed."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    ts = int(time.time())
+    payload = {
+        "session_key": "agent:main:whatsapp:dm:15551234567",
+        "reason": "shutdown",
+        "ts": ts,
+        "data": {"text": "lost message"},
+    }
+    flush_file = flush_dir / "no_sid.json"
+    flush_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    mock_db = MagicMock()
+    routed_db = MagicMock()  # the store owning the key, as the resolver reports it
+    resolver = MagicMock(return_value=("sid-resolved", routed_db))
+    count = recover_pending_to_db(mock_db, session_resolver=resolver)
+
+    assert count == 1
+    resolver.assert_called_once_with("agent:main:whatsapp:dm:15551234567", not_after=ts)
+    routed_db.append_message.assert_called_once_with(
+        session_id="sid-resolved", role="user", content="lost message", timestamp=ts
+    )
+    # The resolver's db is authoritative: the owned default store never sees a resolved payload.
+    mock_db.append_message.assert_not_called()
+    assert not flush_file.exists()
+
+    # A resolver that names an id but no store (fail-closed profile home) preserves the file
+    # instead of appending to the owned root store.
+    flush_file.write_text(json.dumps(payload), encoding="utf-8")
+    resolver = MagicMock(return_value=("sid-resolved", None))
+    assert recover_pending_to_db(mock_db, session_resolver=resolver) == 0
+    mock_db.append_message.assert_not_called()
+    assert flush_file.exists()
+
+
 def test_recover_closes_owned_db_when_unexpected_exception_escapes(
     tmp_path, monkeypatch
 ):
@@ -134,20 +171,79 @@ def test_recover_closes_owned_db_when_unexpected_exception_escapes(
     assert db.released is True
 
 
-def test_serialise_object_with_text():
-    obj = MagicMock()
-    obj.text = "msg"
-    obj.session_id = "sid"
-    obj.platform = None
-    obj.sender_id = None
-    obj.sender_name = None
-    obj.reply_to = None
-    obj.media = None
-    obj.raw_event = None
-    result = _serialise_value(obj)
-    assert result is not None
-    assert result["text"] == "msg"
-    assert result["session_id"] == "sid"
+def _write_flush_file(flush_dir: Path, name: str, session_id: str, text: str) -> Path:
+    """Write one well-formed pending-message flush file."""
+    path = flush_dir / name
+    path.write_text(
+        json.dumps(
+            {
+                "session_key": "agent:main:telegram:supergroup:123",
+                "reason": "shutdown",
+                "ts": 1700000000,
+                "data": {"text": text, "session_id": session_id},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_recover_skips_failing_payload_and_continues(tmp_path, monkeypatch):
+    """One unrecoverable file must not abort recovery of the others.
+
+    Recovery walks ``sorted(glob("*.json"))``, so a file that raises an
+    ordinary exception used to propagate out of the whole pass.  Because
+    that file is never unlinked it would then re-poison every subsequent
+    boot, stranding a different subset of messages each time.
+    """
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    bad = _write_flush_file(flush_dir, "pending-a.json", "sid-bad", "first")
+    good = _write_flush_file(flush_dir, "pending-b.json", "sid-good", "second")
+
+    class PartiallyFailingDB:
+        def __init__(self):
+            self.appended = []
+
+        def append_message(self, **kwargs):
+            if kwargs["session_id"] == "sid-bad":
+                raise RuntimeError("session is closed")
+            self.appended.append(kwargs["session_id"])
+
+    db = PartiallyFailingDB()
+    assert recover_pending_to_db(db) == 1
+    assert db.appended == ["sid-good"]
+    # The good file is consumed; the bad one is preserved for a retry.
+    assert not good.exists()
+    assert bad.exists()
+
+
+
+
+def test_recover_reads_each_payload_once_and_warns_about_malformed(tmp_path, monkeypatch, caplog):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    healthy = _write_flush_file(flush_dir, "pending-good.json", "sid", "ready")
+    malformed = flush_dir / "pending-bad.json"
+    malformed.write_text("{not json", encoding="utf-8")
+    reads = {healthy: 0, malformed: 0}
+    original = Path.read_text
+
+    def counted_read(path, *args, **kwargs):
+        if path in reads:
+            reads[path] += 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read)
+    db = MagicMock()
+    with caplog.at_level("WARNING", logger="gateway.shutdown_flush"):
+        assert recover_pending_to_db(db) == 1
+    assert reads == {healthy: 1, malformed: 1}
+    assert "pending-bad.json" in caplog.text
+    assert malformed.exists() and not healthy.exists()
+    db.append_message.assert_called_once()
 
 
 def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
@@ -157,7 +253,6 @@ def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
     captured = {}
 
     def fake_get_hermes_home():
-        from pathlib import Path
         captured["called"] = True
         return tmp_path
 
@@ -238,3 +333,102 @@ def test_flushed_overflow_is_replayed_by_recover_pending_to_db(tmp_path, monkeyp
 def test_flush_overflow_noop_on_empty():
     assert flush_overflow_to_file({}) == 0
     assert flush_overflow_to_file({"k": []}) == 0
+
+
+def test_empty_pending_text_is_never_spooled(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    assert flush_pending_to_file({"key": "", "other": _overflow_event("")}) == 0
+    assert flush_overflow_to_file({"key": [_overflow_event(""), _overflow_event("kept")]}) == 1
+    files = list(flush_dir.glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["data"]["text"] == "kept"
+
+
+def test_draining_follow_up_is_spooled_for_startup_recovery(tmp_path, monkeypatch):
+    from gateway.run_turn import GatewayTurnMixin
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    class Runner(GatewayTurnMixin):
+        _draining = True
+
+        def _promote_queued_event(self, key, adapter, event):
+            return event
+
+        def _pending_event_audio_paths(self, event):
+            return []
+
+    monkeypatch.setattr("gateway.run._dequeue_pending_event", lambda adapter, key: _overflow_event("next turn"))
+    import asyncio
+    runner = Runner()
+    event, text = asyncio.run(runner._run_agent_drain_pending(
+        {"final_response": "done"}, object(), MagicMock(), "agent:main:telegram:dm:1"))
+    assert event is None and text is None
+    db = MagicMock()
+    assert recover_pending_to_db(db) == 1
+    assert db.append_message.call_args.kwargs["content"] == "next turn"
+    assert list(flush_dir.glob("*.json")) == []
+
+
+def test_draining_follow_up_spool_initialization_failure_does_not_abort_turn(monkeypatch, caplog):
+    """A failed spool mkdir must not replace an already-completed agent turn with an exception."""
+    from gateway.run_turn import GatewayTurnMixin
+
+    class Runner(GatewayTurnMixin):
+        _draining = True
+
+        def _promote_queued_event(self, key, adapter, event):
+            return event
+
+        def _pending_event_audio_paths(self, event):
+            return []
+
+    def fail_spool_init():
+        raise OSError("spool directory unavailable")
+
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", fail_spool_init)
+    monkeypatch.setattr("gateway.run._dequeue_pending_event", lambda adapter, key: _overflow_event("next turn"))
+    import asyncio
+    with caplog.at_level("ERROR"):
+        event, text = asyncio.run(Runner()._run_agent_drain_pending(
+            {"final_response": "done"}, object(), MagicMock(), "agent:main:telegram:dm:1"))
+    assert event is None and text is None
+    assert "Failed to preserve pending follow-up" in caplog.text
+
+
+def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monkeypatch):
+    """A scalar/list JSON spool file must not abort the drain; the healthy payload still replays."""
+    from gateway.shutdown_flush import drain_transcript_spool, spool_dropped_transcript_message
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    (flush_dir / "pending-00-scalar.json").write_text("42", encoding="utf-8")
+    (flush_dir / "pending-01-list.json").write_text("[1, 2]", encoding="utf-8")
+    spool_dropped_transcript_message("sess-1", {"role": "user", "content": "hi"})
+
+    replayed = []
+    assert drain_transcript_spool("sess-1", replayed.append) == (1, 0)
+    assert replayed == [{"role": "user", "content": "hi"}]
+
+
+def test_flush_never_spools_a_cron_review_event(tmp_path, monkeypatch):
+    """A review replayed without its capture would run visibly after restart."""
+    from concurrent.futures import Future
+
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", thread_id="139328")
+    review = MessageEvent(text="review this report", source=source, internal=True,
+                          reply_expected=False, allow_gateway_control=False,
+                          metadata={"_cron_review_capture": Future()})
+    human = MessageEvent(text="human follow-up", source=source)
+    assert flush_pending_to_file({"review_key": review}, reason="drain_arrival") == 0
+    assert flush_overflow_to_file({"key": [review, human]}, reason="shutdown") == 1
+    texts = [json.loads(p.read_text(encoding="utf-8"))["data"]["text"] for p in flush_dir.glob("*.json")]
+    assert texts == ["human follow-up"]

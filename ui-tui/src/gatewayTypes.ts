@@ -1,5 +1,6 @@
 import type { UsageModelData } from '@hermes/shared/billing'
 import type {
+  ConnectionRequestPayload,
   GatewayEvent,
   GatewayEventName,
   InflightTurn,
@@ -80,6 +81,8 @@ export interface ConfigDisplayConfig {
   /** Focus view (/focus) — display-only reduced-output mode. */
   focus_view?: boolean
   inline_diffs?: boolean
+  /** UI language id (`en`, `pl`, `pt-br`); the TUI fetches its pack via `i18n.catalog`. */
+  language?: string
   mouse_tracking?: boolean | null | number | string
   sections?: Record<string, string>
   show_cost?: boolean
@@ -179,6 +182,9 @@ export interface SystemBatteryResponse {
 export interface SessionCreateResponse {
   info?: SessionInfo & { config_warning?: string; credential_warning?: string }
   session_id: string
+  // Durable id (state.db row) — what session.resume takes; `session_id` is the
+  // process-local runtime handle.
+  stored_session_id?: string
 }
 
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working'
@@ -205,6 +211,7 @@ export interface SessionActivateResponse {
   info?: SessionInfo
   message_count?: number
   messages: TranscriptMessage[]
+  pending_connection?: ConnectionRequestPayload | null
   running?: boolean
   session_id: string
   session_key?: string
@@ -291,6 +298,8 @@ export interface SessionBranchResponse {
 
 export interface SessionCloseResponse {
   closed?: boolean
+  /** Plugin `on_session_finalize` text for the user (shown as system lines, never a model turn). */
+  messages?: string[]
   ok?: boolean
 }
 
@@ -307,6 +316,9 @@ export interface SessionSteerResponse {
 
 export interface PromptSubmitResponse {
   ok?: boolean
+  status?: 'dropped' | 'queued' | 'redirected' | 'steered' | 'streaming'
+  reason?: string
+  message?: string
   /** Set when the submitted text was a bare voice stop phrase consumed
    *  server-side to end the voice chat instead of starting a turn. */
   voice_stopped?: boolean
@@ -444,6 +456,7 @@ export interface ProcessStopResponse {
 }
 
 export interface BrowserManageResponse {
+  browser_use?: boolean
   connected?: boolean
   messages?: string[]
   url?: string

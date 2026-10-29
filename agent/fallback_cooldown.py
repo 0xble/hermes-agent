@@ -9,27 +9,39 @@ from agent.error_classifier import FailoverReason
 logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit})
+# Reasons that arm the shared primary cooldown. An overloaded primary (529, or 503 with an
+# overload body) is as unusable for the next minutes as a rate-limited one, so it takes the same
+# shared record, backoff and single outage notice. Generic 5xx and transport faults do not.
+_SHARED_COOLDOWN_REASONS = _RATE_LIMIT_FAILOVER_REASONS | {FailoverReason.overloaded}
 
 
 def _provider_reset_epoch(reset_at) -> float | None:
     """Absolute epoch for a future provider reset, or None when missing/invalid/expired."""
     from agent.credential_pool import _parse_absolute_timestamp
-    parsed = _parse_absolute_timestamp(reset_at)
+    try:
+        parsed = _parse_absolute_timestamp(reset_at)
+    except (OverflowError, ValueError, TypeError):
+        return None  # malformed provider metadata falls back to exponential backoff
     if parsed is not None and math.isfinite(parsed) and parsed > time.time():
         return float(parsed)
     return None
 
 
 def _provider_reset_delay(reset_at) -> float | None:
-    """Seconds until the provider-declared reset, or None when missing/invalid/expired."""
+    """Seconds until the provider-declared reset, or None when missing/invalid/expired/implausible.
+
+    Shares the shared record's ceiling so the in-memory cooldown can never outlive what the
+    record would accept, even when the shared state write fails.
+    """
+    from agent.shared_primary_cooldown import _MAX_PROVIDER_RESET_SECONDS
     parsed = _provider_reset_epoch(reset_at)
     delay = parsed - time.time() if parsed is not None else None
-    if delay is not None and math.isfinite(delay) and delay > 0:
+    if delay is not None and math.isfinite(delay) and 0 < delay <= _MAX_PROVIDER_RESET_SECONDS:
         return delay
     return None
 
 
-def switch_deferred_by_reset(agent, reason: "FailoverReason | None", reset_at) -> bool:
+def switch_deferred_by_reset(agent, reason: FailoverReason | None, reset_at) -> bool:
     """Opt-in ``fallback.min_switch_reset_seconds`` (default 0 = off, #117484): when the primary's
     rate limit reopens sooner than N seconds, switching model mid-task costs more than waiting, so
     the fallback walk is skipped and the retry loop's own backoff rides out the window. Only for
@@ -51,7 +63,7 @@ def switch_deferred_by_reset(agent, reason: "FailoverReason | None", reset_at) -
 
 
 def _arm_rate_limit_cooldown(
-    agent, reason: "FailoverReason | None", reset_at=None,
+    agent, reason: FailoverReason | None, reset_at=None,
 ) -> int | None:
     """Arm the primary cooldown until the provider reset, or use exponential backoff.
 
@@ -61,12 +73,14 @@ def _arm_rate_limit_cooldown(
     Only arm when leaving the primary: chain-switching from an active fallback means the primary
     was not the failing source. Return the armed cooldown in seconds, or None when not armed.
     """
-    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+    if reason not in _SHARED_COOLDOWN_REASONS:
         return None
-    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
-    primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
-    if getattr(agent, "_fallback_activated", False) and not (primary_provider and current_provider == primary_provider):
-        return None
+    if getattr(agent, "_fallback_activated", False):
+        # Compare the whole route: a same-provider fallback (another model or endpoint) failing
+        # says nothing about the primary and must not arm the primary's shared window.
+        from agent.shared_primary_cooldown import live_route_from_agent, route_from_agent
+        if live_route_from_agent(agent) != route_from_agent(agent):
+            return None
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     agent._rate_limit_backoff_count = backoff_count + 1
     provider_delay = _provider_reset_delay(reset_at)
@@ -77,6 +91,7 @@ def _arm_rate_limit_cooldown(
         backoff_seconds = min(60 * (2 ** backoff_count), 14400)
         source = "exponential fallback"
     agent._rate_limited_until = time.monotonic() + backoff_seconds
+    agent._fallback_episode_cooled = True
     # The in-memory fields remain the hot-path cache, while this record is the source of truth
     # across gateway agent eviction, delegated children, cron workers and restarts.
     agent._shared_primary_cooldown_record = None
@@ -104,31 +119,29 @@ def _arm_rate_limit_cooldown(
     return backoff_seconds
 
 
-# Codex ChatGPT-account entitlement 400 — the account can never use the named slug, so with
-# nothing to rotate it is a config error, not a transient failure (#106475).
-_CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER = "model is not supported when using codex with a chatgpt account"
-
-
 def _mark_entitlement_rejected_model(agent, api_error) -> bool:
     """Record a Codex ChatGPT-account 400 that rejects the current model for this account.
 
-    With a single credential there is no pool to rotate (#71970 covers that case), so the
-    (provider, model) pair is treated as dead for the session: the fallback walk skips it and
-    restore_primary_runtime stops switching back — otherwise every turn re-fails on the primary,
-    announces an unverified "Primary model restored", and oscillates forever (#106475).
+    Pool rotation runs first (recover_with_credential_pool benches (credential, model) and
+    moves to the next entitled entry, #71970); this runs only once no pool entry is left for
+    the model, so the (provider, model) pair is treated as dead for the session: the fallback
+    walk skips it and restore_primary_runtime stops switching back — otherwise every turn
+    re-fails on the primary, announces an unverified "Primary model restored", and oscillates
+    forever (#106475).
     """
     if getattr(api_error, "status_code", None) != 400:
         return False
-    pool = getattr(agent, "_credential_pool", None)
-    if pool is not None and len(pool.entries()) > 1:
-        return False  # another account in the pool may be entitled; leave rotation to it
+    from agent.error_classifier import CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER
     haystack = str(getattr(api_error, "message", "") or api_error).lower()
-    if _CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER not in haystack:
+    if CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER not in haystack:
         return False
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
     model = str(getattr(agent, "model", "") or "").strip()
     if not provider or not model:
         return False
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is not None and pool.has_available(model=model):
+        return False  # another pool entry is still eligible for this model; rotation owns it
     rejected = getattr(agent, "_entitlement_rejected_models", None)
     if rejected is None:
         rejected = agent._entitlement_rejected_models = set()
@@ -140,7 +153,7 @@ def _mark_entitlement_rejected_model(agent, api_error) -> bool:
         "treating it as unavailable for this session",
         model, provider,
     )
-    agent._buffer_status(
+    agent._buffer_diagnostic_status(
         f"🚫 This account is not entitled to {model} via {provider}; it will be skipped "
         "until restart. Switch to an entitled model via /model or `hermes model`."
     )

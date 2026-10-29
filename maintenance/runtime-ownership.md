@@ -11,7 +11,7 @@ health claims.
 | Surface | Owner and invariant | Required proof after an authorized change |
 |---|---|---|
 | Personal source | `~/Repos/hermes-agent`, owned fork `main` | Published and local source identity agree. |
-| Personal runtime | `~/.hermes/hermes-agent`, launchd-supervised gateway, profile `~/.hermes` | Read running-code identity, profile, and supervisor state independently of source HEAD. |
+| Personal runtime | Immutable release `~/.hermes/releases/<sha>` selected by the `~/.hermes/current` symlink (`previous` is the rollback release), launchd-supervised gateway, profile `~/.hermes`. `~/.hermes/hermes-agent` is only the updater's fetch checkout and never runs the gateway ([S2](seamless-restart-s2.md)). | Resolve `current` to its release SHA and read the gateway's pinned interpreter and import path independently of source HEAD and of the fetch checkout. |
 | LPG runtime | `~/Repos/lpg/apps/agent` signed release route, host `/opt/agent/current` and `/opt/hermes/current` | Verify both agent release and runtime artifact identities, company overlay, and supervisor. |
 | Meridian runtime | `~/Repos/meridian-next/apps/agent` signed release route | Verify agent/runtime release chain on-host. The old standalone `meridian-agent` repository is not the release owner. |
 
@@ -24,31 +24,84 @@ the migration overlay snapshot is historical evidence, not current authority.
 
 ## Scheduled procedures
 
-The personal profile's script jobs use copies under `$HERMES_HOME/scripts`.
-`scripts/install_candidate_extensions.py` owns that copy operation. Review the
-source revision, installed copies, actual job arguments, and job receipt together
-when changing a procedure. A Git update alone does not refresh these copies.
+The personal profile's script jobs and optional sync helper use regular files under `$HERMES_HOME/scripts`.
+`scripts/install_candidate_extensions.py --maintenance-only --home <profile>` installs
+sync/verifier forwarding entry points without changing plugins or configuration.
+When `<profile>/scripts` is a real directory, it preserves the existing flat
+entrypoint paths. When it is a symlink to a source-controlled scripts checkout,
+the installer refuses before writing; generated files do not belong in that checkout.
+Versioned thin entrypoints and cron path changes must be prepared separately before cutover.
+They execute `<home>/current/scripts/*` with the active release's
+`<home>/current/.venv` interpreter, so native promotion updates their implementation too.
+They refuse homes without a `current` release symlink, including legacy homes that still
+have a checkout under `<profile>/hermes-agent`. Profile plugin source is maintained in the external
+`agents` repository. Review
+source revision, installed entry points, actual arguments, and receipts together.
+The personal wrapper uses the permanent source checkout's `.venv` for tests. Its
+prerequisites include pytest and the pinned lazy Hindsight client
+(`uv pip install --python <source>/.venv/bin/python hindsight-client==0.6.1`).
+It checks these imports before beginning and records each result under
+`<profile>/maintenance/fork-sync/`. Missing dependencies are failures, not skipped tests.
 
 | Job | Canonical procedure | Invocation contract and verification |
 |---|---|---|
-| `sync-fork-candidate` | `scripts/sync_fork_candidate.py` | Host wrapper supplies `--repo`, `--candidate`, and `--current-base`. Use a dedicated sync worktree. Inspect rebased SHA and tests; `--publish` publishes only a candidate. |
-| `check-fork-patches` | `scripts/check_fork_patches.py` | Resolve installed package and intended `--home`; inspect classification and registration results plus actual runtime evidence. |
+| `sync-hermes-fork` | Agent-owned source maintenance, with optional `scripts/sync_fork_candidate.py` helper | Use `gpt-6-astra`, `custom:codex-proxy`, low reasoning, agent mode, and no automatic script pre-run. In a dedicated linked worktree, integrate the selected upstream release, resolve conflicts, repair relevant failures, obtain required independent review, and land through the protected fork PR route. Inspect tested candidate, review evidence, and published `origin/main` readback. |
+| `verify-hermes-fork` | `scripts/check_fork_patches.py` | Resolve installed package and intended `--home`; inspect trailer, unit-ownership, registration, and native receipt results plus actual runtime evidence. |
 | `curate-skill-observations` | `scripts/curate_skill_observations.py` | Host wrapper supplies a dedicated `--dotfiles` worktree. Without `--publish`, it validates then restores staging. That is not a published curation change. |
 | `snapshot-profile-state` | `candidate-profile/snapshot_profile_state.sh` | Verify the output manifest and isolated restoration. This small-state procedure does not establish a full `state.db` backup. |
 
 Schedules, delivery targets, and enabled state live in the profile's cron store.
-Do not recreate jobs from this document or add a competing scheduler. The source
-sync and curation wrappers inspected on 2026-09-19 omit `--publish`; their successful
-dry runs do not prove an automatic promotion or PR workflow. Company updates
-continue through their signed release owners, not these personal jobs.
+Edit the existing job through the supported cron interface. Do not recreate jobs
+from this document or add a competing scheduler. The agent owns diagnosis and
+repair even when the optional candidate builder stops on a conflict or failed test.
+Helper publication to `candidate/<tag>` is not protected landing on fork `main`.
+Release selection and ancestry follow the root contract. The main agent's low
+reasoning pin does not override the independent review route's effort policy.
+
+Source landing and runtime promotion remain separate. A source-only check does
+not establish runtime health. Manually promote reviewed fork `main` through
+`hermes update --yes` only with activation authority, retaining quick snapshots,
+then check the native receipt, live identity, and a real model round trip.
+Company updates continue through their signed release owners, not these personal jobs.
+
+### Progress and failure handling
+
+- Resume the existing candidate and inspect prior receipts, live process handles,
+  and locks before starting work. Preserve unfinished conflict resolutions and
+  valid exact-candidate test/review evidence. Do not reset progress each day.
+- Record immutable release and candidate SHAs. Reconcile moving `origin/main`
+  explicitly and revalidate affected evidence. Do not make unrelated changes to
+  the primary checkout's HEAD invalidate a dedicated candidate, or restore the
+  retired fork's guard/verifier machinery.
+- Preflight credentials, test dependencies, and disk headroom before expensive
+  work. Diagnose environmental failures separately from regressions. Confirm an
+  upstream failure on the frozen release when needed, without weakening backup
+  reserves, security checks, or branch protection to obtain a pass.
+- Run long tests through the canonical runner using tracked background execution
+  and a bounded completion budget. Keep process identity, logs, and exit status.
+  A short foreground terminal timeout can kill the process tree. Dispatch or
+  a surviving log file is not evidence of completion.
+- When the same blocker recurs, inspect what changed before repeating expensive
+  work. Change the diagnosis or repair strategy, or report the precise external
+  prerequisite and next action. Keep the candidate checkpoint and failed evidence
+  visible instead of producing an unchanged daily restart loop.
+- Write a per-fire receipt under `<profile>/maintenance/fork-sync/` with run and
+  candidate identity, completed stages, actual checks/review, remote readback,
+  and unresolved blockers. Receipts are evidence, not a separate completion
+  verifier. A blocked, deferred, or incomplete run must begin its final response
+  with the exact standalone line `[CRON_FAILURE]`, followed by the diagnosis and
+  next action. The native scheduler recognizes that first-line marker and records
+  failure status and streaks. Do not hide an incomplete run with silence or a
+  success summary. An already-current result still requires fresh release and
+  remote identity checks.
 
 ## Recovery and acceptance
 
-Preserve the personal capture at `~/.hermes-cutover-capture-20260919T050807Z`,
-legacy installed checkout `~/.hermes/hermes-agent.legacy`, and code archive at
-`~/Repos/archive/hermes-agent-legacy-20260919/` until independently verified
-replacement recovery and acceptance permit retirement. Revalidate existence and
-restore integrity before relying on these dated recovery locations. A Git bundle
+The personal code rollback point is the `~/.hermes/previous` release, and the
+native updater's release transaction receipts record each pointer change. The
+September 19 cutover recovery locations (`~/.hermes-cutover-capture-20260919T050807Z`,
+`~/.hermes/hermes-agent.legacy` and `~/Repos/archive/hermes-agent-legacy-20260919/`)
+were no longer present on 2026-10-11. Do not rely on them. A release or Git bundle
 preserves code, not profile databases, browser state, secrets, or external memories.
 Company recovery must include the signed prior release and its matching state.
 

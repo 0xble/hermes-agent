@@ -1,6 +1,6 @@
 import { memo, useCallback, useState } from 'react'
 
-import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
+import type { SubmitTextOptions, SubmitTextResult } from '@/app/session/hooks/use-prompt-actions/utils'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { useI18n } from '@/i18n'
@@ -12,7 +12,7 @@ import { SessionControlLoopSection } from './session-control-loop'
 
 export interface SessionControlSectionsProps {
   entry: SessionControlEntry
-  onSubmit?: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+  onSubmit?: (value: string, options?: SubmitTextOptions) => Promise<SubmitTextResult> | SubmitTextResult
   sessionId: string
 }
 

@@ -35,6 +35,24 @@ def _isolated_shared_primary_cooldown(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_structured_output_memo(monkeypatch):
+    """The aux client remembers routes that rejected ``response_format`` for the whole process;
+    a rejection recorded by one test must not strip the field from the next test's request."""
+    from agent import auxiliary_structured_output
+    monkeypatch.setattr(auxiliary_structured_output, "_REJECTED_ROUTES", set())
+
+
+@pytest.fixture(autouse=True)
+def _fresh_onepassword_listing_cache(monkeypatch):
+    """1Password item listings are reused process-wide; a listing one test's fake ``op``
+    produced must not answer the next test's backend."""
+    from agent.vault_backends import onepassword
+    onepassword.invalidate_listing_cache()
+    yield
+    onepassword.invalidate_listing_cache()
+
+
+@pytest.fixture(autouse=True)
 def _fast_retry_backoff(request, monkeypatch):
     """Short-circuit retry backoff for all tests in this directory.
 

@@ -18,7 +18,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import SendResult
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from telegram.error import BadRequest, NetworkError, TimedOut
@@ -85,6 +84,222 @@ def _rich_api_kwargs(adapter):
     return call.kwargs["api_kwargs"]
 
 
+# --- Literal hash prefixes: Telegram's rich parser accepts "#89" as a heading without a space ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit", "draft"])
+async def test_rich_delivery_keeps_literal_hash_references(operation):
+    adapter = _make_adapter({"rich_drafts": True})
+    content = (
+        "#89 remains open.\n\n- #181 reported a problem.\n\n> #tag is literal.\n\n"
+        "## Real heading\n\n- [x] rich delivery\n\n`#89` stays code."
+    )
+    if operation == "send":
+        result = await adapter.send("12345", content)
+        assert result.success
+    elif operation == "edit":
+        result = await adapter.edit_message("12345", "123", content, finalize=True)
+        assert result.success
+    else:
+        assert await adapter.send_draft("12345", 123, content)
+    assert adapter._bot is not None
+    payload = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]
+    assert r"\#89 remains open." in payload["markdown"]
+    assert r"- \#181 reported a problem." in payload["markdown"]
+    assert r"> \#tag is literal." in payload["markdown"]
+    assert "## Real heading" in payload["markdown"]
+    assert "`#89` stays code." in payload["markdown"]
+    adapter._bot.send_message.assert_not_called()
+    adapter._bot.edit_message_text.assert_not_called()
+    adapter._bot.send_message_draft.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_always_mode_prose_starting_with_pr_number_is_not_a_heading():
+    """The reported symptom: plain prose (no rich-only construct) opening with ``#426`` rendered as a
+    heading because ``always`` mode routes every reply through the rich endpoint."""
+    adapter = _make_adapter({"rich_messages": "always"})
+    content = "#426 review clean (0.9) on the new head; #430's review is in progress."
+    assert (await adapter.send("12345", content)).success
+    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert markdown.startswith(r"\#426 review clean")
+    assert "; #430's review" in markdown  # inline reference stays untouched
+
+
+@pytest.mark.parametrize("content", [
+    "# Heading\n\n## Heading 2\n\n###### Heading 6",
+    "Use #89 and https://example.com/#anchor inline.",
+    r"\#89 is already escaped.",
+    "`code\n#89\ncode`",
+    "``code ` #89``",
+    "```python\n#89 is a comment\n```",
+    "~~~python\n#89 is a comment\n~~~",
+    "````markdown\n```\n#89\n```\n````",
+    "```python\n#89 unfinished fence",
+    "$$\n#89\n$$",
+])
+def test_literal_hash_normalization_preserves_markdown_regions(content):
+    from plugins.platforms.telegram.rich_markdown import escape_literal_hash_prefixes
+
+    assert escape_literal_hash_prefixes(content) == content
+    escaped = escape_literal_hash_prefixes("1. #89\n\n> - ##tag\n\n#release")
+    assert escaped == "1. \\#89\n\n> - \\#\\#tag\n\n\\#release"
+    assert escape_literal_hash_prefixes(escaped) == escaped
+
+
+# --- Adjacent footnote refs: Telegram merges [^2][^3] into one superscript run that reads "23" ---
+
+
+def test_adjacent_footnote_refs_get_a_superscript_separator():
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
+
+    content = (
+        "Two sources.[^2][^3] Three.[^1][^2][^note] One.[^4]\n\n"
+        "Spaced [^1] [^2] and inline `[^1][^2]` stay.\n\n"
+        "```\n[^1][^2]\n```\n\n"
+        "$$\nx[^1][^2]\n$$\n\n\\[x=[^1][^2]\\]\n\n"
+        "    [^1][^2] indented code\n\n"
+        "Multiline `code\n[^1][^2]` span.\n\n"
+        "A [link](https://example.com/[^1][^2]), <a title=\"[^1][^2]\">html</a>, "
+        "<https://example.com/[^1][^2]> and escaped \\[^1][^2] stay.\n\n"
+        "Nested [x](https://e.com/a(b(c[^1][^2]))) and <a title=\"x > [^1][^2]\">y</a> stay.\n\n"
+        "Math \\(x[^1][^2]\\) and $$y[^1][^2]$$ stay.\n\n"
+        "- item\n\n      [^1][^2] code inside a list item\n\nClosing prose.\n\n"
+        "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
+    )
+    result = normalize_footnotes(content)
+    assert result == content.replace("[^2][^3]", "[^2]<sup>,</sup>[^3]", 1).replace(
+        "[^1][^2][^note]", "[^1]<sup>,</sup>[^2]<sup>,</sup>[^note]", 1)
+    assert normalize_footnotes(result) == result
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Inline $[^2][^3]$ math",
+        "Inline $x_{[^2][^3]}$ math, then prose.",
+        "See <code>[^2][^3]</code> here",
+        "Keys <kbd>[^1][^2]</kbd> and <CODE class=\"x\">a[^1][^2]</CODE> stay",
+    ],
+)
+def test_adjacent_footnote_refs_in_inline_math_and_html_code_stay_literal(content):
+    """TeX math and inline HTML code are literal for Telegram, so no separator is injected there."""
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
+
+    assert normalize_footnotes(content) == content
+    # Prose around them is still separated, and currency dollars do not open math.
+    for prose, expected in (
+        (f"{content} then refs[^1][^2]", f"{content} then refs[^1]<sup>,</sup>[^2]"),
+        ("Costs $5 and refs[^1][^2] then $6", "Costs $5 and refs[^1]<sup>,</sup>[^2] then $6"),
+        ("<b>Bold[^1][^2]</b>", "<b>Bold[^1]<sup>,</sup>[^2]</b>"),
+    ):
+        assert normalize_footnotes(prose) == expected
+
+
+def test_footnote_defs_after_a_list_get_a_spacer():
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
+
+    defs = "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
+    for body in ("- a.[^1]\n- b.[^2]\n\n", "1. a.[^1]\n\n   more.[^2]\n\n", "- a\nlazy.[^1]\n"):
+        result = normalize_footnotes(body + defs)
+        assert result == body.rstrip("\n") + "\n\n<!-- -->\n" + defs
+        assert normalize_footnotes(result) == result
+    for unchanged in (
+        "Para.[^1]\n\n" + defs,
+        "- a\n\nTail.[^1]\n\n" + defs,
+        "    indented prose.[^1]\n\n" + defs,
+        "```\n- a\n[^1]: x\n```",
+    ):
+        assert normalize_footnotes(unchanged) == unchanged
+
+
+def test_expandable_blockquote_renders_nested_markdown_as_html():
+    """Telegram does not parse Markdown nested inside an HTML blockquote."""
+    adapter = _make_adapter({"rich_messages": "always"})
+    content = (
+        "<blockquote expandable>\n"
+        "**What started it:** Brian asked why `slack` failed.\n\n"
+        "See [the issue](https://example.com) and ~~the old path~~.\n"
+        "</blockquote>"
+    )
+
+    markdown = adapter._rich_message_payload(content)["markdown"]
+
+    assert "<blockquote expandable>" in markdown
+    assert "<b>What started it:</b> Brian asked why <code>slack</code> failed." in markdown
+    assert '<a href="https://example.com">the issue</a>' in markdown
+    assert "<s>the old path</s>" in markdown
+    assert "**What started it:**" not in markdown
+    assert "`slack`" not in markdown
+    assert "<br><br>" in markdown
+
+
+def test_blockquote_markdown_normalization_does_not_touch_code_examples():
+    from plugins.platforms.telegram.rich_markdown import normalize_blockquote_markdown
+
+    fenced = "```html\n<blockquote expandable>\n**literal**\n</blockquote>\n```"
+    inline = "Use `<blockquote expandable>**literal**</blockquote>` as an example."
+
+    assert normalize_blockquote_markdown(fenced) == fenced
+    assert normalize_blockquote_markdown(inline) == inline
+
+
+def test_expandable_blockquote_preserves_code_regions_while_rendering_prose():
+    from plugins.platforms.telegram.rich_markdown import normalize_blockquote_markdown
+
+    content = (
+        "<blockquote expandable>\n"
+        "**Heading** and `**inline**`.\n"
+        "```python\n"
+        "**literal**\n"
+        "```\n"
+        "Raw <code>literal **HTML**</code>.\n"
+        "</blockquote>"
+    )
+
+    rendered = normalize_blockquote_markdown(content)
+
+    assert "<b>Heading</b>" in rendered
+    assert "<code>**inline**</code>" in rendered
+    assert "<b>**literal**</b>" not in rendered
+    assert "<code>literal <b>HTML</b></code>" not in rendered
+    assert "<code>literal **HTML**</code>" in rendered
+
+
+def test_expandable_blockquote_preserves_unfinished_code_fences():
+    from plugins.platforms.telegram.rich_markdown import normalize_blockquote_markdown
+
+    content = (
+        "<blockquote expandable>\n"
+        "```python\n"
+        "**literal**\n"
+        "</blockquote>"
+    )
+
+    rendered = normalize_blockquote_markdown(content)
+
+    assert "```python\n**literal**\n" in rendered
+    assert "<b>**literal**</b>" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit", "draft"])
+async def test_rich_delivery_separates_adjacent_footnote_refs(operation):
+    adapter = _make_adapter({"rich_messages": "always", "rich_drafts": True})
+    content = "Cited twice.[^2][^3]\n\n[^2]: <https://example.com/2>\n[^3]: <https://example.com/3>"
+    if operation == "send":
+        assert (await adapter.send("12345", content)).success
+    elif operation == "edit":
+        assert (await adapter.edit_message("12345", "123", content, finalize=True)).success
+    else:
+        assert await adapter.send_draft("12345", 123, content)
+    assert adapter._bot is not None
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    assert "[^2]<sup>,</sup>[^3]" in markdown
+    assert "[^2]: <https://example.com/2>" in markdown
+
+
 @pytest.mark.asyncio
 async def test_details_without_math_still_uses_rich_send():
     adapter = _make_adapter()
@@ -123,6 +338,19 @@ async def test_astral_cjk_rich_content_skips_rich_send_to_avoid_tdesktop_garble(
     assert result.success is True
     adapter._bot.do_api_request.assert_not_called()
     adapter._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [CJK_RICH_CONTENT, ASTRAL_CJK_RICH_CONTENT])
+async def test_cjk_rich_content_can_be_opted_in(content):
+    adapter = _make_adapter(extra={"allow_cjk_rich_messages": True})
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert api_kwargs["rich_message"]["markdown"] == content
+    adapter._bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -205,6 +433,27 @@ async def test_unknown_endpoint_error_falls_back_to_legacy():
     adapter._bot.send_message.assert_awaited()
 
 
+def test_rich_capability_latch_resets_for_new_polling_generation():
+    adapter = _make_adapter()
+    adapter._rich_send_disabled = True
+    adapter._rich_draft_disabled = True
+
+    generation, _ = adapter._begin_polling_generation()
+
+    assert generation == 1
+    assert adapter._rich_send_disabled is False
+    assert adapter._rich_draft_disabled is False
+
+
+def test_rich_capability_rejection_logs_redacted_warning(caplog):
+    adapter = _make_adapter()
+
+    with caplog.at_level(logging.WARNING):
+        assert adapter._rich_rejected(RuntimeError("Method not found"), "sendRichMessage", "MarkdownV2")
+
+    assert "sendRichMessage rejected" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_capability_error_latches_rich_send_off():
     """Endpoint-missing errors latch rich off so later sends skip the
@@ -275,7 +524,7 @@ async def test_transient_rich_error_does_not_legacy_resend(exc):
 
 @pytest.mark.asyncio
 async def test_rich_transport_error_redacts_bot_token_even_when_redaction_disabled(monkeypatch):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
     token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
@@ -297,7 +546,7 @@ async def test_rich_transport_error_redacts_bot_token_even_when_redaction_disabl
 
 @pytest.mark.asyncio
 async def test_legacy_send_error_redacts_bot_token_without_traceback(monkeypatch, caplog):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
     token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
@@ -333,32 +582,8 @@ async def test_routing_direct_messages_topic_id_drops_message_thread_id():
     assert "message_thread_id" not in api_kwargs
 
 
-@pytest.mark.asyncio
-async def test_notification_silent_by_default():
-    adapter = _make_adapter()
-
-    await adapter.send("-100123", RICH_CONTENT)
-
-    api_kwargs = _rich_api_kwargs(adapter)
-    assert api_kwargs["disable_notification"] is True
 
 
-@pytest.mark.asyncio
-async def test_table_only_uses_legacy_with_default_config():
-    """Default config (rich_messages unset → False) keeps tables on legacy path."""
-    config = PlatformConfig(enabled=True, token="fake-token")
-    adapter = TelegramAdapter(config)
-    bot = MagicMock()
-    bot.do_api_request = AsyncMock(return_value=SimpleNamespace(message_id=123))
-    bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
-    bot.send_chat_action = AsyncMock()
-    adapter._bot = bot
-
-    result = await adapter.send("12345", TABLE_ONLY_CONTENT)
-
-    assert result.success is True
-    bot.do_api_request.assert_not_called()
-    bot.send_message.assert_awaited()
 
 
 # ── Streaming drafts: sendRichMessageDraft ─────────────────────────────
@@ -439,10 +664,6 @@ async def test_legacy_draft_stream_finalizes_with_persistent_rich_message():
 # ----------------------------------------------------------------------
 
 
-def test_supports_plain_draft_streaming_when_rich_without_rich_drafts():
-    adapter = _make_adapter()  # rich_messages True, rich_drafts default False
-    assert adapter.supports_draft_streaming(chat_type="dm") is True
-    assert adapter.supports_draft_streaming(chat_type="private") is True
 
 
 @pytest.mark.asyncio
@@ -713,8 +934,24 @@ async def test_finalize_edit_dm_topic_omits_send_only_routing_fields():
 
 
 @pytest.mark.asyncio
+async def test_finalize_edit_cjk_rich_content_can_be_opted_in():
+    adapter = _make_adapter(extra={"allow_cjk_rich_messages": True})
+
+    result = await adapter.edit_message(
+        "12345", "555", CJK_RICH_CONTENT, finalize=True,
+    )
+
+    assert result.success is True
+    assert result.message_id == "555"
+    api_kwargs = _rich_edit_kwargs(adapter)
+    assert api_kwargs["message_id"] == 555
+    assert api_kwargs["rich_message"]["markdown"] == CJK_RICH_CONTENT
+    adapter._bot.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_legacy_edit_error_logs_redacted_bot_token_without_traceback(monkeypatch, caplog):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
     token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef"
@@ -832,3 +1069,196 @@ async def test_rich_reply_records_and_recovers_text(monkeypatch, tmp_path):
     )
     assert event.reply_to_message_id == "678"
     assert event.reply_to_text == "Your morning briefing: CI is green."
+
+
+@pytest.mark.parametrize('mode,ordinary_rich,table_rich', [
+    ('always', True, True), ('auto', False, True), ('never', False, False),
+    (True, False, True), (False, False, False), (None, False, False),
+    ('true', False, True), ('false', False, False),
+    ('on', False, True), ('off', False, False),
+    ('1', False, True), ('0', False, False),
+    (' ALWAYS ', True, True),
+])
+@pytest.mark.asyncio
+async def test_rich_mode_from_yaml_agrees_with_prompt_and_delivery(
+    tmp_path, monkeypatch, mode, ordinary_rich, table_rich,
+):
+    """Real YAML resolution must agree across gateway, prompt, and final send."""
+    import hermes_yaml as yaml
+    from gateway.config import load_gateway_config, Platform
+    from hermes_cli import config as config_module
+    from agent.system_prompt import _telegram_rich_messages_enabled
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(config_module, 'get_config_path', lambda: tmp_path / 'config.yaml')
+    (tmp_path / 'config.yaml').write_text(yaml.safe_dump({
+        'gateway': {'platforms': {'telegram': {'extra': {'rich_messages': mode}}}},
+    }), encoding='utf-8')
+    config = load_gateway_config().platforms[Platform.TELEGRAM]
+    assert _telegram_rich_messages_enabled() is table_rich
+    for content, expect_rich in [('## Heading\n\nHello **there**', ordinary_rich),
+                                  (RICH_CONTENT, table_rich)]:
+        adapter = TelegramAdapter(config)
+        adapter._bot = _make_adapter()._bot
+        result = await adapter.send('12345', content)
+        assert result.success
+        assert adapter._bot.do_api_request.await_count == int(expect_rich)
+        assert adapter._bot.send_message.await_count == int(not expect_rich)
+
+
+@pytest.mark.parametrize('mode', ['alway', '', [], {}, 2])
+def test_invalid_rich_mode_is_a_configuration_error(mode):
+    with pytest.raises(ValueError, match='rich_messages'):
+        TelegramAdapter(PlatformConfig(extra={'rich_messages': mode}))
+
+
+@pytest.mark.asyncio
+async def test_always_preserves_preview_and_content_safety_guards():
+    adapter = _make_adapter(extra={'rich_messages': 'always'})
+    assert adapter._rich_eligible('## Heading\n\nOrdinary prose')
+    assert not adapter._should_attempt_rich('Hello', {'expect_edits': True})
+    assert not adapter._rich_eligible(' ')
+    assert not adapter._rich_eligible(DANGEROUS_DETAILS_MATH)
+    assert not adapter._rich_eligible('x' * (adapter.RICH_MESSAGE_MAX_CHARS + 1))
+    adapter._rich_send_disabled = True
+    assert not adapter._rich_eligible('Hello')
+
+
+@pytest.mark.asyncio
+async def test_always_finalizes_ordinary_stream_as_rich():
+    adapter = _make_adapter(extra={'rich_messages': 'always'})
+    result = await adapter.edit_message('12345', '1', '## Heading\n\nHello **there**', finalize=True)
+    assert result.success
+    assert adapter._bot.do_api_request.call_args.args[0] == 'editMessageText'
+    assert 'rich_message' in adapter._bot.do_api_request.call_args.kwargs['api_kwargs']
+
+
+# --- Currency protection: paired "$" on one rich line otherwise becomes inline LaTeX ---
+
+
+@pytest.mark.asyncio
+async def test_rich_payload_protects_multiple_currency_amounts():
+    adapter = _make_adapter()
+    content = "| Item | Value |\n|---|---|\n| budget | $2,000–$3,000 |"
+    result = await adapter.send("12345", content)
+    assert result.success is True
+    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert "`$2,000`–`$3,000`" in markdown
+
+
+@pytest.mark.asyncio
+async def test_rich_prose_currency_pair_is_protected_in_always_mode():
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    content = 'I said "$18,500 collected, 8 payers." Stripe shows $18,588.50 (BGA at $3,000).'
+    assert (await adapter.send("12345", content)).success
+    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert '"`$18,500` collected, 8 payers." Stripe shows `$18,588.50` (BGA at `$3,000`).' in markdown
+
+
+@pytest.mark.asyncio
+async def test_rich_single_currency_amount_left_alone():
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    assert (await adapter.send("12345", "Total was $18,500 this month.")).success
+    assert "Total was $18,500 this month." in _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_rich_payload_leaves_math_and_code_currency_alone():
+    adapter = _make_adapter()
+    content = "| Item | Value |\n|---|---|\n| x | `$2,000` and $x^2$ |"
+    result = await adapter.send("12345", content)
+    assert result.success is True
+    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert "`$2,000`" in markdown
+    assert "$x^2$" in markdown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("math", [
+    "$5$ + $6$ = $11$",
+    "$5.00$ + $6.00$ = $11.00$",
+    "$5x$ + $6y$",
+    "$5/2$ + $6^2$",
+    "$5 + x$ and $6 + y$",
+    "$$5 + 6 = 11$$",
+])
+async def test_rich_currency_preserves_closed_math(math):
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    content = f"Math: {math}. Costs $5 or $6."
+    result = await adapter.send("12345", content)
+    assert result.success
+    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert math in markdown
+    assert "Costs `$5` or `$6`." in markdown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit", "draft"])
+async def test_dollar_entities_normalized_before_rich_fallback(operation):
+    adapter = _make_adapter(extra={"rich_messages": "always", "rich_drafts": True})
+    assert adapter._bot is not None
+    adapter._bot.do_api_request.side_effect = EndPointNotFound("endpoint unavailable")
+    content = "Costs &#36;3,000 or &#x24;15,000. Example: `&#36;5`."
+    if operation == "send":
+        result = await adapter.send("12345", content)
+        sent = adapter._bot.send_message.call_args.kwargs["text"]
+    elif operation == "edit":
+        result = await adapter.edit_message("12345", "1", content, finalize=True)
+        sent = adapter._bot.edit_message_text.call_args.kwargs["text"]
+    else:
+        result = await adapter.send_draft("12345", 1, content)
+        sent = adapter._bot.send_message_draft.call_args.kwargs["text"]
+    assert result.success
+    assert "$3,000" in sent and "$15,000" in sent
+    assert "&#36;5" in sent  # Authored code examples remain literal.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content,amounts", [
+    ("Bought $500 ($AAPL) and $300 ($MSFT) today.", ["$500", "$300"]),
+    ("Costs $5 or $6 per US$ unit.", ["$5", "$6"]),
+    ("Costs $5 or $6 ($2x$ is tax).", ["$5", "$6"]),
+])
+async def test_rich_currency_does_not_mask_financial_prose(content, amounts):
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    assert adapter._bot is not None
+    assert (await adapter.send("12345", content)).success
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    for amount in amounts:
+        assert f"`{amount}`" in markdown
+    if "$2x$" in content:
+        assert "$2x$" in markdown
+
+
+@pytest.mark.asyncio
+async def test_dollar_entities_preserve_multiple_backtick_code():
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    assert adapter._bot is not None
+    content = "Code: ``&#36;5 and `literal` ``; costs &#36;5 or &#36;6."
+    assert (await adapter.send("12345", content)).success
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    assert "``&#36;5 and `literal` ``" in markdown
+    assert "costs `$5` or `$6`." in markdown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ticks", ["`", "``"])
+async def test_stray_backticks_do_not_mask_later_currency(ticks):
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    assert adapter._bot is not None
+    content = f"Use the {ticks} character.\nCosts &#36;5 or &#x24;6. Run {ticks}ls{ticks}."
+    assert (await adapter.send("12345", content)).success
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    assert "Costs `$5` or `$6`." in markdown
+    assert "&#36;" not in markdown and "&#x24;" not in markdown
+    assert f"{ticks}ls{ticks}" in markdown
+
+
+def test_rich_limit_counts_currency_protected_payload():
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    # Each protected amount grows by two backticks; the pre-check must count the payload Telegram sees.
+    unit = "$5 or $6 "  # 9 chars raw, 13 protected
+    content = unit * (adapter.RICH_MESSAGE_MAX_CHARS // 9)
+    assert len(content) <= adapter.RICH_MESSAGE_MAX_CHARS
+    assert len(adapter._rich_message_payload(content)["markdown"]) > adapter.RICH_MESSAGE_MAX_CHARS
+    assert not adapter._content_fits_rich_limits(content)

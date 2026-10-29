@@ -8,6 +8,22 @@ from gateway.run import GatewayRunner
 from gateway.status import read_runtime_status
 
 
+@pytest.fixture(autouse=True)
+def _host_attach_gate_is_not_under_test(monkeypatch):
+    """These tests exercise the STARTUP path, not the host-attach gate that now runs in front of it.
+
+    Without the stub they pass only while the shared rendezvous dir happens to be empty: any record
+    there makes ``start_gateway`` attach and return before reaching the code under test. The host
+    role claimed along the way is released afterwards, so one test's owner is not the next one's.
+    """
+    monkeypatch.setattr("gateway.run._host_attach_or_none", AsyncMock(return_value=None))
+    yield
+    from gateway import host_rendezvous as hr
+
+    hr.release_host_lock(hr.ROLE_GATEWAY)
+    hr.clear_record(hr.ROLE_GATEWAY)
+
+
 @pytest.mark.parametrize(
     "code, expected",
     [
@@ -117,6 +133,52 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
     ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=1)
 
     assert ok is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("replace", "expected_replace", "starts_runner"), [
+    (False, False, False),
+    (True, True, True),
+])
+async def test_force_keeps_same_home_duplicate_guard_and_replace_authority(
+    monkeypatch, tmp_path, replace, expected_replace, starts_runner
+):
+    """Force bypasses host attachment, not the same-home singleton guard."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls = []
+
+    class _CleanExitRunner:
+        def __init__(self, config):
+            assert starts_runner
+            self.config = config
+            self.should_exit_cleanly = True
+            self.exit_reason = None
+            self.exit_code = None
+            self.adapters = {}
+
+        async def start(self):
+            return True
+
+        async def stop(self):
+            return None
+
+    async def _replace_existing(pid, requested):
+        calls.append((pid, requested))
+        return expected_replace
+
+    pids = iter((42, None))
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: next(pids))
+    monkeypatch.setattr("gateway.run._start_gateway_replace_existing_instance", _replace_existing)
+    monkeypatch.setattr("gateway.run.GatewayRunner", _CleanExitRunner)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+
+    from gateway.run import start_gateway
+
+    assert await start_gateway(config=GatewayConfig(), replace=replace, force=True,
+                               verbosity=None) is starts_runner
+    assert calls == [(42, replace)]
 
 
 @pytest.mark.asyncio
@@ -358,6 +420,8 @@ async def test_runner_degrades_gracefully_when_all_adapters_missing(monkeypatch,
     # Simulate _create_adapter returning None for ALL platforms (missing library /
     # missing credentials — no connection attempt ever made).
     monkeypatch.setattr(runner, "_create_adapter", lambda platform, cfg: None)
+    # ...because no plugin registered them, so the reconnect watcher may still heal them.
+    monkeypatch.setattr("gateway.platform_registry.platform_registry.is_registered", lambda name: False)
 
     import logging
     with caplog.at_level(logging.WARNING):
@@ -367,9 +431,14 @@ async def test_runner_degrades_gracefully_when_all_adapters_missing(monkeypatch,
     assert ok is True
     assert runner.should_exit_cleanly is False
     assert runner.adapters == {}
-    # Runtime state must remain "running", not "startup_failed".
+    # Cron still runs; missing enabled platforms are flagged and queued for the reconnect watcher.
     state = read_runtime_status()
     assert state["gateway_state"] == "running"
+    assert set(runner._failed_platforms) == {Platform.TELEGRAM, Platform.DISCORD}
+    for platform in ("telegram", "discord"):
+        assert state["platforms"][platform]["state"] == "retrying"
+        assert state["platforms"][platform]["error_code"] == "adapter_unavailable"
+        assert state["platforms"][platform]["needs_attention"] is True
     # A warning must be emitted explaining why no platforms connected.
     assert any(
         "No adapter could be created" in record.message
@@ -570,8 +639,195 @@ async def test_token_lock_plus_retryable_peer_stays_alive(monkeypatch, tmp_path)
         assert runner.exit_code is None
         assert set(runner._failed_platforms) == {Platform.DISCORD}
         state = read_runtime_status()
-        assert state["gateway_state"] == "running"
+        # Alive, but Telegram is parked fatal: a serving-with-a-parked-platform boot is degraded.
+        assert state["gateway_state"] == "degraded"
         assert state["platforms"]["telegram"]["state"] == "fatal"
         assert state["platforms"]["discord"]["state"] == "retrying"
     finally:
         await runner.stop()
+
+
+class _MissingCredentialAdapter(BasePlatformAdapter):
+    """An adapter whose bot token never reached the environment."""
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token=""), Platform.DISCORD)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
+        return False
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+async def _run_startup(monkeypatch, tmp_path, adapter_factory, *, secrets_degraded: bool):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.secret_sources.registry.last_apply_had_transient_failure",
+        lambda *_a, **_k: secrets_degraded,
+    )
+    config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    monkeypatch.setattr(runner, "_create_adapter", lambda p, pc: adapter_factory())
+    await runner.start()
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_transient_secret_failure_does_not_claim_a_fatal_config_fault(monkeypatch, tmp_path):
+    """A secrets backend that timed out must not be reported as broken configuration.
+
+    The fetch budget drops the WHOLE source, so its credentials never reach the
+    environment and the adapter marks itself non-retryable. Exiting with the
+    fatal-config code tells systemd (RestartPreventExitStatus) to keep the gateway down
+    permanently over a slow backend, when only a restart can refetch the token.
+    """
+    runner = await _run_startup(
+        monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
+    )
+
+    assert runner.should_exit_cleanly is True
+    assert runner.exit_code != GATEWAY_FATAL_CONFIG_EXIT_CODE, (
+        "a transient secrets failure must stay restartable under every supervisor"
+    )
+    assert runner.exit_code != 0
+    assert read_runtime_status()["gateway_state"] == "startup_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "adapter_factory, secrets_degraded, why",
+    [
+        (_MissingCredentialAdapter, False, "secrets healthy: an absent token IS misconfiguration"),
+        (_NonRetryableFailureAdapter, True, "an ownership conflict is not fixed by restarting"),
+    ],
+)
+async def test_fatal_config_exit_is_preserved(monkeypatch, tmp_path, adapter_factory,
+                                              secrets_degraded, why):
+    """The transient-secrets escape hatch must not swallow genuine fatal conflicts.
+
+    The second case is the one that sank the previous upstream attempt at this change:
+    a live foreign token holder stayed fatal only because the classifier refused to
+    generalise from 'credentials missing' to 'any non-retryable failure'.
+    """
+    runner = await _run_startup(
+        monkeypatch, tmp_path, adapter_factory, secrets_degraded=secrets_degraded
+    )
+
+    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE, why
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("missing_credentials", True),
+        ("MISSING_CREDENTIALS", True),           # Teams, Photon
+        ("yuanbao_missing_credentials", True),   # per-platform prefix
+        ("missing_slack_bot_token", True),       # Slack BUILDS this from the env-var name
+        ("missing_slack_app_token", True),
+        ("discord-bot-token_lock", False),       # ownership conflict, must stay fatal
+        ("telegram-bot-token_lock", False),
+        ("missing_dependency", False),           # the code isn't installed: a real fault
+        ("MISSING_SDK", False),
+        ("", False),
+    ],
+)
+def test_missing_credential_codes_are_matched_as_a_family(code, expected):
+    """Adapters spell the absent-credential code differently.
+
+    An exact literal covered only two of them, and a second platform with a different
+    spelling silently removed coverage the first one would have had alone.
+    """
+    assert GatewayRunner._is_missing_credential_code(code) is expected
+
+
+@pytest.mark.asyncio
+async def test_two_platforms_missing_credentials_keep_coverage(monkeypatch, tmp_path):
+    """Differently-spelled missing-credential codes must not cancel each other out."""
+    runner = await _run_startup(
+        monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
+    )
+    runner._startup_nonretryable_codes = {"missing_credentials", "MISSING_CREDENTIALS"}
+    assert runner._missing_credentials_blamed_on_secrets() is True
+
+
+def test_transient_failure_signal_is_owned_by_a_home(tmp_path):
+    """A multiplexing gateway hydrates each secondary profile through apply_all during
+    startup, so a bare global would be answered by whichever profile hydrated last."""
+    from agent.secret_sources import registry
+
+    registry._reset_registry_for_tests()
+    primary, secondary = tmp_path / "primary", tmp_path / "secondary"
+    from hermes_constants import hermes_home_key
+
+    registry._TRANSIENT_FAILURE_HOMES[hermes_home_key(primary)] = True
+    registry._TRANSIENT_FAILURE_HOMES[hermes_home_key(secondary)] = False
+
+    assert registry.last_apply_had_transient_failure(primary) is True
+    assert registry.last_apply_had_transient_failure(secondary) is False
+    registry._reset_registry_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_repeated_transient_failures_eventually_park(monkeypatch, tmp_path):
+    """A permanently dead secrets backend must stop looping and park visibly.
+
+    The generated systemd unit disables the generic start limiter and leans on the
+    fatal-config exit as its only backstop, so an unbounded restartable exit would
+    restart every RestartSec forever with no parked state for an operator to find.
+    """
+    from gateway.run_startup import _TRANSIENT_EXIT_STREAK_LIMIT
+
+    codes = []
+    for _ in range(_TRANSIENT_EXIT_STREAK_LIMIT):
+        runner = await _run_startup(
+            monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
+        )
+        codes.append(runner.exit_code)
+
+    assert all(c != GATEWAY_FATAL_CONFIG_EXIT_CODE for c in codes[:-1]), (
+        "early attempts must stay restartable so a brief outage self-heals"
+    )
+    assert codes[-1] == GATEWAY_FATAL_CONFIG_EXIT_CODE, (
+        "a backend that never comes back must park instead of looping"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_successful_connect_forgives_the_streak(monkeypatch, tmp_path):
+    """The budget is for CONSECUTIVE failures; recovering must reset it."""
+    from gateway.run_startup import _TRANSIENT_EXIT_STREAK_LIMIT
+
+    for _ in range(_TRANSIENT_EXIT_STREAK_LIMIT - 1):
+        await _run_startup(monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    GatewayRunner(GatewayConfig(platforms={}, sessions_dir=tmp_path / "s"))._reset_transient_exit_streak()
+
+    runner = await _run_startup(
+        monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
+    )
+    assert runner.exit_code != GATEWAY_FATAL_CONFIG_EXIT_CODE
+
+
+@pytest.mark.parametrize("corrupt", ["-1000", "not-a-number", ""])
+def test_a_corrupt_streak_file_cannot_buy_unbounded_restarts(monkeypatch, tmp_path, corrupt):
+    """The bound must fail CLOSED. A negative or unparseable counter previously meant
+    the limit was never reached, restoring the unbounded loop it exists to stop."""
+    from gateway.run_startup import _TRANSIENT_EXIT_STREAK_LIMIT
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig(platforms={}, sessions_dir=tmp_path / "s"))
+    runner._transient_exit_streak_path().write_text(corrupt, encoding="utf-8")
+
+    verdicts = [runner._transient_exits_exhausted() for _ in range(_TRANSIENT_EXIT_STREAK_LIMIT + 1)]
+    assert any(verdicts), "a corrupt counter must still reach the limit"

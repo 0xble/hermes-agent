@@ -1,7 +1,10 @@
 """URL safety checks — blocks requests to private/internal network addresses (SSRF).
 
 ``security.allow_private_urls: true`` disables private-IP blocking (DNS that resolves public
-names to private ranges); cloud metadata hostnames/IPs are **always** blocked. DNS rebinding
+names to private ranges); cloud metadata hostnames/IPs are **always** blocked. A local TUN proxy
+that answers DNS with a fake-ip block (Mihomo/Clash fake-ip, Surge enhanced) declares that block
+in ``security.fake_ip_ranges`` so its sentinel answers are dialable instead of looking private;
+the list is empty by default, so the sentinel stays blocked for everyone else. DNS rebinding
 (TOCTOU) is closed for Hermes-owned httpx paths by ``create_ssrf_safe_[async_]client()``, which
 re-apply the policy at TCP connect and dial the validated IP while preserving Host/SNI. Redirect
 bypass is mitigated by response hooks re-validating each target (``redirect_target_from_response``).
@@ -118,8 +121,24 @@ _MAX_SSRF_CONNECT_IPS = 8
 # ipaddress — must be blocked explicitly (Tailscale/WireGuard, cloud internal nets).
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
+# RFC 2765 IPv4-translated wrapper ``::ffff:0:a.b.c.d`` — the second form resolvers may use to
+# answer an IPv4 name (on the reporting macOS host, fake-IP TUN DNS returns it alongside the
+# plain address). ``ip.ipv4_mapped`` does not read it; ``_embedded_ipv4`` handles it explicitly.
+_IPV4_TRANSLATED_NETWORK = ipaddress.ip_network("::ffff:0:0:0/96")
+
+# Address classes a ``security.fake_ip_ranges`` declaration can never excuse: a local proxy owns
+# none of them, and a declaration is trusted like ``allow_private_urls`` for whatever it names,
+# so an entry overlapping one of these (including 0.0.0.0/0 and ::/0) would make real internal
+# hosts dialable. Such entries are dropped with a warning instead.
+_FAKE_IP_UNDECLARABLE_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/32", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",  # unspecified/loopback/RFC 1918
+    "169.254.0.0/16", "100.64.0.0/10",  # link-local, CGNAT
+    "::/128", "::1/128", "fc00::/7", "fe80::/10",  # unspecified, loopback, ULA, link-local
+))
+
 # Global toggle cache (process lifetime; see _global_allow_private_urls).
 _allow_private_resolved, _cached_allow_private = False, False
+_fake_ip_resolved, _cached_fake_ip_ranges = False, ()
 
 
 def _global_allow_private_urls() -> bool:
@@ -155,9 +174,52 @@ def _resolve_allow_private_urls() -> bool:
 
 
 def _reset_allow_private_cache() -> None:
-    """Reset the cached toggle — only for tests."""
-    global _allow_private_resolved, _cached_allow_private
-    _allow_private_resolved = _cached_allow_private = False
+    """Reset the cached toggle and the cached fake-ip ranges — only for tests."""
+    global _allow_private_resolved, _cached_allow_private, _fake_ip_resolved, _cached_fake_ip_ranges
+    _allow_private_resolved = _cached_allow_private = _fake_ip_resolved = False
+    _cached_fake_ip_ranges = ()
+
+
+def _resolve_fake_ip_ranges() -> tuple:
+    """CIDR blocks this host's local proxy answers DNS with (``security.fake_ip_ranges``).
+
+    A TUN proxy in fake-ip mode answers every non-filtered name with an address from its own
+    block; that answer is the proxy's sentinel, not an internal host's, so treating it as a
+    private target blocks every outbound fetch on such a host (web_extract, platform attachment
+    downloads, the browser relay). Empty by default: no host gets the exemption unless it
+    declares one, and the sentinel range keeps the ordinary private-address verdict otherwise.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        block = read_raw_config().get("security", {})
+        raw = block.get("fake_ip_ranges") if isinstance(block, dict) else None
+    except Exception:
+        return ()  # config unavailable (tests, early import) — keep the secure default
+    entries = [raw] if isinstance(raw, str) else raw if isinstance(raw, (list, tuple)) else ()
+    networks = []
+    for entry in entries:
+        try:
+            net = ipaddress.ip_network(str(entry).strip(), strict=False)
+        except ValueError:
+            logger.warning("Ignoring unparseable security.fake_ip_ranges entry: %r", entry)
+            continue
+        clash = next((r for r in _FAKE_IP_UNDECLARABLE_NETWORKS if r.version == net.version and net.overlaps(r)), None)
+        if clash is not None:
+            logger.warning("Ignoring security.fake_ip_ranges entry %r: it overlaps %s, which stays blocked", entry, clash)
+            continue
+        networks.append(net)
+    return tuple(networks)
+
+
+def _global_fake_ip_ranges() -> tuple:
+    """Process-lifetime cache with the same profile-scope bypass as ``_global_allow_private_urls``:
+    a multiplex gateway must not apply the first profile's declaration to later ones."""
+    global _fake_ip_resolved, _cached_fake_ip_ranges
+    if get_hermes_home_override() is not None:
+        return _resolve_fake_ip_ranges()
+    if not _fake_ip_resolved:
+        _fake_ip_resolved, _cached_fake_ip_ranges = True, _resolve_fake_ip_ranges()
+    return _cached_fake_ip_ranges
 
 
 def _normalize_hostname(host: Optional[str]) -> str:
@@ -169,7 +231,13 @@ def _parse_ip(hostname: str) -> Optional[_IPAddress]:
     try:
         return ipaddress.ip_address(hostname)
     except ValueError:
-        return None
+        # ``inet_aton`` accepts the legacy hex, octal, and shortened IPv4 forms that
+        # resolvers and http clients may also accept. Treat them as literals for the
+        # fake-IP literal-host guard, not as DNS names.
+        try:
+            return ipaddress.ip_address(socket.inet_aton(hostname))
+        except (OSError, ValueError):
+            return None
 
 
 def _iter_resolved_ips(addr_info: Any):
@@ -185,15 +253,37 @@ def _getaddrinfo(hostname: str, port: Optional[int] = None):
     return socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
 
 
+def _embedded_ipv4(ip: _IPAddress) -> _IPAddress:
+    """The IPv4 address an IPv6 wrapper stands for — IPv4-mapped (``::ffff:x.x.x.x``) or
+    IPv4-translated (``::ffff:0:x.x.x.x``); *ip* unchanged otherwise. ``ipaddress`` reads both
+    wrappers as distinct IPv6 addresses, so every classification must see through them, or a
+    resolver's sentinel / a cloud-metadata answer arrives as unrelated IPv6 space."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return ip.ipv4_mapped
+        if ip in _IPV4_TRANSLATED_NETWORK:
+            return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip
+
+
 def _is_always_blocked_ip(ip: _IPAddress) -> bool:
+    ip = _embedded_ipv4(ip)
     return ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS)
+
+
+def _is_declared_fake_ip(ip: _IPAddress) -> bool:
+    """True when *ip* falls in a block declared in ``security.fake_ip_ranges``. The dial still goes
+    to the local proxy, which resolves and connects to the real target, so a declared block grants
+    no reach an attacker lacks through the proxy's own DNS; undeclared ranges keep the private verdict."""
+    ip = _embedded_ipv4(ip)
+    return any(ip in net for net in _global_fake_ip_ranges())
 
 
 def _is_blocked_ip(ip: _IPAddress) -> bool:
     """Return True if the IP should be blocked for SSRF protection."""
-    # IPv4-mapped IPv6 (``::ffff:x.x.x.x``) is classified by its embedded IPv4.
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    # IPv4-wrapped IPv6 (mapped ``::ffff:x.x.x.x`` or translated ``::ffff:0:x.x.x.x``) is
+    # classified by its embedded IPv4.
+    ip = _embedded_ipv4(ip)
     return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
             or ip.is_multicast or ip.is_unspecified or ip in _CGNAT_NETWORK)
 
@@ -247,15 +337,17 @@ def _resolved_ip_block_reason(ip: _IPAddress, allow_private: bool) -> Optional[s
     ignores ``allow_private``; ordinary private/internal classes are blocked only when it is False."""
     if _is_always_blocked_ip(ip):
         return "cloud metadata address"
-    if not allow_private and _is_blocked_ip(ip):
+    if not allow_private and _is_blocked_ip(ip) and not _is_declared_fake_ip(ip):
         return "private/internal address"
     return None
 
 
-def is_safe_url(url: str) -> bool:
+def is_safe_url(url: str, *, allow_private: Optional[bool] = None) -> bool:
     """True if the URL target is not a private/internal address. Resolves the hostname and checks
     every answer; fails closed on DNS errors and unexpected exceptions. ``allow_private_urls``
-    skips private-IP blocking, but cloud metadata endpoints remain blocked regardless."""
+    skips private-IP blocking, but cloud metadata endpoints remain blocked regardless.
+    ``allow_private=False`` makes one caller strict regardless of that toggle (automatic fetches
+    nobody chose); ``None`` follows the configured policy."""
     try:
         parsed = urlparse(url)
         hostname = _normalize_hostname(parsed.hostname)
@@ -270,9 +362,14 @@ def is_safe_url(url: str) -> bool:
         if hostname in _BLOCKED_HOSTNAMES:
             logger.warning("Blocked request to internal hostname: %s", hostname)
             return False
-        allow_all_private = _global_allow_private_urls()
+        allow_all_private = _global_allow_private_urls() if allow_private is None else allow_private
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
         allow_private = allow_all_private or allow_private_ip
+        # A declared sentinel written as the host is not a proxy DNS answer.
+        literal = _parse_ip(hostname)
+        if literal is not None and _is_declared_fake_ip(literal) and not allow_private:
+            logger.warning("Blocked request to fake-IP address used as a URL host: %s", hostname)
+            return False
         try:
             addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
@@ -315,7 +412,7 @@ class SSRFConnectionBlocked(ValueError):
     """Raised when connect-time DNS resolution violates the URL safety policy."""
 
 
-def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
+def _resolved_http_connect_ips(host: str, port: int, scheme: str, allow_private: Optional[bool] = None) -> list[str]:
     """Resolve and validate *host* at TCP-connect time; return dialable IP strings. Closes the
     DNS-rebinding gap between pre-flight validation and connect for direct httpx clients. The
     result is capped at ``_MAX_SSRF_CONNECT_IPS``, but EVERY answer is validated."""
@@ -324,7 +421,14 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
         raise SSRFConnectionBlocked("Blocked request with empty hostname")
     if hostname in _BLOCKED_HOSTNAMES:
         raise SSRFConnectionBlocked(f"Blocked request to internal hostname: {hostname}")
-    allow_private = _global_allow_private_urls() or _allows_private_ip_resolution(hostname, scheme)
+    if allow_private is None:
+        allow_private = _global_allow_private_urls()
+    allow_private = allow_private or _allows_private_ip_resolution(hostname, scheme)
+    # Same rule as ``is_safe_url``: a declared sentinel written as the host is not a proxy DNS
+    # answer. Enforced here too, since redirects and direct guarded clients never re-run it.
+    literal = _parse_ip(hostname)
+    if literal is not None and _is_declared_fake_ip(literal) and not allow_private:
+        raise SSRFConnectionBlocked(f"Blocked request to fake-IP address used as a URL host: {hostname}")
     try:
         addr_info = _getaddrinfo(hostname, port)
     except socket.gaierror as exc:
@@ -350,13 +454,14 @@ class _SSRFGuardedBackendBase:
     Host/SNI stay on the original hostname; Unix sockets are refused outright. Candidate IPs are
     tried in order and the last connect error is re-raised so callers see the real failure."""
 
-    def __init__(self, backend: Any, schemes_by_origin_var: Any):
+    def __init__(self, backend: Any, schemes_by_origin_var: Any, allow_private: Optional[bool] = None):
         self._backend = backend
         self._schemes_by_origin_var = schemes_by_origin_var
+        self._allow_private = allow_private
 
     def _connect_ips(self, host: str, port: int) -> list[str]:
         scheme = self._schemes_by_origin_var.get({}).get((host, port)) or ("https" if port == 443 else "http")
-        return _resolved_http_connect_ips(host, port, scheme)
+        return _resolved_http_connect_ips(host, port, scheme, self._allow_private)
 
     @staticmethod
     def _connect_errors() -> tuple:
@@ -374,9 +479,9 @@ class _SSRFGuardedBackendBase:
 
 
 class _SSRFGuardedAsyncNetworkBackend(_SSRFGuardedBackendBase):
-    def __init__(self, schemes_by_origin_var: Any):
+    def __init__(self, schemes_by_origin_var: Any, allow_private: Optional[bool] = None):
         from httpcore._backends.auto import AutoBackend
-        super().__init__(AutoBackend(), schemes_by_origin_var)
+        super().__init__(AutoBackend(), schemes_by_origin_var, allow_private)
 
     async def connect_tcp(self, host: str, port: int, timeout: float | None = None,
                           local_address: str | None = None, socket_options: Any = None) -> Any:
@@ -397,9 +502,9 @@ class _SSRFGuardedAsyncNetworkBackend(_SSRFGuardedBackendBase):
 
 
 class _SSRFGuardedNetworkBackend(_SSRFGuardedBackendBase):
-    def __init__(self, schemes_by_origin_var: Any):
+    def __init__(self, schemes_by_origin_var: Any, allow_private: Optional[bool] = None):
         from httpcore._backends.sync import SyncBackend
-        super().__init__(SyncBackend(), schemes_by_origin_var)
+        super().__init__(SyncBackend(), schemes_by_origin_var, allow_private)
 
     def connect_tcp(self, host: str, port: int, timeout: float | None = None,
                     local_address: str | None = None, socket_options: Any = None) -> Any:
@@ -431,7 +536,8 @@ def _origin_scope(schemes_by_origin_var: Any, request: Any):
         schemes_by_origin_var.reset(token)
 
 
-def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any, *, is_async: bool = False) -> None:
+def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any, *, is_async: bool = False,
+                                     allow_private: Optional[bool] = None) -> None:
     """Swap the transport's pool network backend for the SSRF-guarded one (idempotent). Only the
     direct transport is guarded; proxy mounts delegate final-target resolution to the trusted proxy."""
     state = getattr(transport, "__dict__", {}) if transport is not None else {}
@@ -442,7 +548,7 @@ def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any,
     if pool is None or not hasattr(pool, "_network_backend"):
         raise SSRFConnectionBlocked(f"Unsupported {label} cannot be made SSRF-safe")
     backend_cls = _SSRFGuardedAsyncNetworkBackend if is_async else _SSRFGuardedNetworkBackend
-    pool._network_backend = backend_cls(schemes_by_origin_var)
+    pool._network_backend = backend_cls(schemes_by_origin_var, allow_private)
     method_name = "handle_async_request" if is_async else "handle_request"
     handle = getattr(transport, method_name, None)
     if handle is None:
@@ -459,12 +565,13 @@ def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any,
     transport._hermes_ssrf_guarded = True
 
 
-def _install_ssrf_guard_on_client(client: Any, *, is_async: bool = False) -> None:
+def _install_ssrf_guard_on_client(client: Any, *, is_async: bool = False, allow_private: Optional[bool] = None) -> None:
     """Guard ``client._transport`` only; ``_mounts`` (env/explicit proxies) stay untouched."""
     import contextvars
     var_name = "hermes_ssrf_async_origin_schemes" if is_async else "hermes_ssrf_origin_schemes"
     _install_ssrf_guard_on_transport(
-        getattr(client, "__dict__", {}).get("_transport"), contextvars.ContextVar(var_name), is_async=is_async)
+        getattr(client, "__dict__", {}).get("_transport"), contextvars.ContextVar(var_name), is_async=is_async,
+        allow_private=allow_private)
 
 
 def create_ssrf_safe_async_client(**kwargs: Any) -> Any:
@@ -477,11 +584,13 @@ def create_ssrf_safe_async_client(**kwargs: Any) -> Any:
     return client
 
 
-def create_ssrf_safe_client(**kwargs: Any) -> Any:
-    """Create an ``httpx.Client`` with connect-time SSRF validation."""
+def create_ssrf_safe_client(*, allow_private: Optional[bool] = None, **kwargs: Any) -> Any:
+    """Create an ``httpx.Client`` with connect-time SSRF validation. ``allow_private=False`` keeps
+    private/internal answers blocked at connect even under ``security.allow_private_urls``, closing
+    the DNS-rebinding gap for callers whose pre-flight check was strict."""
     import httpx
     client = httpx.Client(**kwargs)
-    _install_ssrf_guard_on_client(client)
+    _install_ssrf_guard_on_client(client, allow_private=allow_private)
     return client
 
 
@@ -496,60 +605,3 @@ def redirect_target_from_response(response: Any) -> Optional[str]:
         return urljoin(str(getattr(response, "url", "")), str(location))
     next_request = getattr(response, "next_request", None)
     return str(next_request.url) if next_request else None
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-def has_sensitive_query_params(url: str) -> bool:
-    """Return True when ``url`` carries likely credential-bearing query params."""
-    return sensitive_query_param_name(url) is not None
-
-def ssrf_safe_async_http_transport(**kwargs: Any) -> Any:
-    """Return an httpx async transport that pins direct TCP connects to vetted IPs."""
-    import contextvars
-    import httpx
-
-    schemes_by_origin_var = contextvars.ContextVar("hermes_ssrf_async_origin_schemes")
-
-    class _Transport(httpx.AsyncHTTPTransport):
-        def __init__(self, **transport_kwargs: Any):
-            super().__init__(**transport_kwargs)
-            self._pool._network_backend = _SSRFGuardedAsyncNetworkBackend(  # type: ignore[attr-defined]
-                schemes_by_origin_var
-            )
-
-        async def handle_async_request(self, request: Any) -> Any:
-            token = schemes_by_origin_var.set(_origin_scheme_context(request))
-            try:
-                return await super().handle_async_request(request)
-            finally:
-                schemes_by_origin_var.reset(token)
-
-    return _Transport(**kwargs)
-
-def ssrf_safe_http_transport(**kwargs: Any) -> Any:
-    """Return an httpx sync transport that pins direct TCP connects to vetted IPs."""
-    import contextvars
-    import httpx
-
-    schemes_by_origin_var = contextvars.ContextVar("hermes_ssrf_origin_schemes")
-
-    class _Transport(httpx.HTTPTransport):
-        def __init__(self, **transport_kwargs: Any):
-            super().__init__(**transport_kwargs)
-            self._pool._network_backend = _SSRFGuardedNetworkBackend(  # type: ignore[attr-defined]
-                schemes_by_origin_var
-            )
-
-        def handle_request(self, request: Any) -> Any:
-            token = schemes_by_origin_var.set(_origin_scheme_context(request))
-            try:
-                return super().handle_request(request)
-            finally:
-                schemes_by_origin_var.reset(token)
-
-    return _Transport(**kwargs)
-# ---- END PLUGIN-COMPAT ----

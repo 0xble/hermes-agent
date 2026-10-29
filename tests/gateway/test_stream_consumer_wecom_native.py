@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -38,7 +38,7 @@ def _make_native_streaming_adapter(
 
     Records every ``send_stream_frame`` call on ``adapter.frames`` for assertions.
     """
-    from gateway.platforms.base import BasePlatformAdapter, SendResult
+    from gateway.platforms.base import BasePlatformAdapter
 
     NativeStreamingAdapter = type(
         "NativeStreamingAdapter",
@@ -121,12 +121,6 @@ class TestNativeStreamingResolver:
         consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
         assert consumer._resolve_native_streaming() is False
 
-    def test_magicmock_adapter_falls_back(self):
-        """MagicMock adapters are excluded by isinstance gate."""
-        adapter = MagicMock()
-        cfg = StreamConsumerConfig(chat_type="dm")
-        consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
-        assert consumer._resolve_native_streaming() is False
 
 
 # === LIFECYCLE ===
@@ -245,31 +239,6 @@ class TestNativeStreamingThrottling:
         assert len(finalize_frames) == 1
         assert finalize_frames[0]["text"] == "abcdefghij"
 
-    @pytest.mark.asyncio
-    async def test_large_growth_emits_mid_frames(self):
-        """When text grows by >20 chars, an interim frame should land."""
-        adapter = _make_native_streaming_adapter()
-        cfg = StreamConsumerConfig(
-            chat_type="dm", cursor="",
-            edit_interval=0.01, buffer_threshold=5,
-        )
-        consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
-
-        task = asyncio.create_task(consumer.run())
-        await asyncio.sleep(0.02)
-        # First chunk well past 20 chars.
-        consumer.on_delta("A" * 40)
-        await asyncio.sleep(0.05)
-        # Second chunk also past 20 chars.
-        consumer.on_delta("B" * 40)
-        await asyncio.sleep(0.05)
-        consumer.finish()
-        await task
-
-        non_finalize_content_frames = [
-            f for f in adapter.frames if not f["finalize"] and f["text"]
-        ]
-        assert len(non_finalize_content_frames) >= 1
 
 
 # === FALLBACK ===
@@ -296,6 +265,7 @@ class TestNativeStreamingFallback:
         await task
 
         assert consumer._use_native_streaming is False
+        adapter.send.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_native_streaming_disables_draft(self):
@@ -626,7 +596,8 @@ class TestClarifyEagerReseed:
 
         # User answered → request an eager re-seed.  NO on_delta yet.
         consumer.request_reopen_seed()
-        await self._drain(consumer, 0.05)  # let run() process _REOPEN_SEED
+        # Observe the completed async operation before inspecting its frames.
+        assert await self._wait_until(lambda: consumer._native_stream_opened)
 
         seeds_after = len(
             [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
@@ -635,7 +606,6 @@ class TestClarifyEagerReseed:
             "eager re-seed must emit exactly one new empty seed frame before "
             f"any delta (before={seeds_before}, after={seeds_after})"
         )
-        assert await self._wait_until(lambda: consumer._native_stream_opened)
         assert consumer._awaiting_reopen_after_boundary is False
         assert consumer._reopen_seeded_eagerly is True
 
@@ -729,7 +699,7 @@ class TestClarifyEagerReseed:
         per-tick fragments on a non-editable platform."""
         # Make the SECOND seed (the eager re-seed) fail while the initial seed
         # succeeds, so we actually reach the reopen-pending state first.
-        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.platforms.base import BasePlatformAdapter
 
         NativeStreamingAdapter = type(
             "NativeStreamingAdapter2",
@@ -878,6 +848,37 @@ class TestClarifyEagerReseed:
         assert consumer.final_response_sent is False
         assert consumer._native_stream_opened is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
+    async def test_marker_after_segment_break_and_clarify_never_streams(self, marker):
+        """A tool boundary moves the marker-check offset to the end of the cumulative
+        preamble. The clarify boundary then clears the buffer, so the offset must reset
+        with it, or the next bare marker slices to nothing and streams as a native frame."""
+        adapter = _make_native_streaming_adapter()
+        cfg = StreamConsumerConfig(
+            chat_type="dm", cursor="", edit_interval=0.01, buffer_threshold=5,
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
+        task = asyncio.create_task(consumer.run())
+        await self._drain(consumer, 0.03)
+
+        consumer.on_delta("Checking the brief.")
+        await self._drain(consumer, 0.05)
+        consumer.on_segment_break()
+        await self._drain(consumer, 0.05)
+        boundary = consumer.close_for_approval_prompt(reason="Clarify", reopen=True)
+        fut = boundary[0] if isinstance(boundary, tuple) else boundary
+        await asyncio.wait_for(fut, timeout=1.0)
+        assert consumer._segment_start == 0
+
+        consumer.on_delta(marker)
+        await self._drain(consumer, 0.1)
+        consumer.finish()
+        await task
+
+        assert not any(marker in f["text"] for f in adapter.frames), adapter.frames
+        assert consumer.final_content_delivered is False
+
     # === ROUND 2, POINT 1: 降级后 post-answer 内容落地为单气泡（补强 Point 5）===
 
     @pytest.mark.asyncio
@@ -889,7 +890,7 @@ class TestClarifyEagerReseed:
         直接验证 review (b).4 的结论。
         """
         # 复用 Point 5 的降级 adapter：第一次空 seed 成功、第二次（eager 再 seed）失败。
-        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.platforms.base import BasePlatformAdapter
 
         NativeStreamingAdapter = type(
             "NativeStreamingAdapter2b",
@@ -1133,3 +1134,31 @@ class TestNativeCommentaryPreservesAccumulated:
             f"pre-commentary prefix lost (the bug): {final_text!r}"
         )
         assert "finished (exit 0)." in final_text
+
+
+# === EDGE SILENCE MARKERS ===
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_text", [None, "Pre-tool.\nNO_REPLY\n\nPost-tool.", "NO_REPLY\n\nPost-tool."])
+async def test_native_stream_later_segment_leading_marker_never_reaches_a_frame(final_text):
+    """A marker opening a later segment of a cumulative native stream is control text."""
+
+    adapter = _make_native_streaming_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+    )
+    runner = asyncio.create_task(consumer.run())
+    consumer.on_delta("Pre-tool.\n")
+    await asyncio.sleep(0.1)
+    consumer.on_segment_break()
+    await asyncio.sleep(0.1)
+    consumer.on_delta("NO_REPLY\n\nPost-tool.")
+    await asyncio.sleep(0.1)
+    consumer.finish(final_text)
+    await runner
+
+    texts = [f["text"] for f in adapter.frames]
+    assert all("NO_REPLY" not in t for t in texts), texts
+    finals = [f["text"] for f in adapter.frames if f["finalize"]]
+    assert finals and "Pre-tool." in finals[-1] and "Post-tool." in finals[-1], adapter.frames

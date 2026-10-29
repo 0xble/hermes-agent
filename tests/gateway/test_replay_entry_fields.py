@@ -17,7 +17,7 @@ These tests pin the expanded whitelist so it doesn't regress.
 from __future__ import annotations
 
 
-from gateway.run import _ASSISTANT_REPLAY_FIELDS, _build_replay_entry
+from gateway.run import _build_replay_entry
 
 
 class TestBuildReplayEntry:
@@ -88,16 +88,6 @@ class TestBuildReplayEntry:
         assert entry["finish_reason"] == "stop"
 
 
-    def test_replay_fields_constant_is_stable(self):
-        """Pin the whitelist explicitly so accidental renames are caught."""
-        assert _ASSISTANT_REPLAY_FIELDS == (
-            "reasoning",
-            "reasoning_content",
-            "reasoning_details",
-            "codex_reasoning_items",
-            "codex_message_items",
-            "finish_reason",
-        )
 
     def test_unrelated_keys_are_ignored(self):
         """Random keys on the message must not leak into the replay entry."""
@@ -143,3 +133,193 @@ class TestGatewayHistoryBuildForwardsSidecar:
         agent_history, _obs = _build_gateway_agent_history(history)
         assert agent_history[0]["api_content"] == "hi\n\nCTX"
 
+
+
+def test_gateway_history_keeps_sidecar_only_assistant_row():
+    """A reasoning-only clean stop persists content="" with the promoted reply in ``api_content``
+    (agent/turn_final_response.py); the gateway rebuild must replay it, not drop it (user->user)."""
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": "", "reasoning": "The answer is 4.", "api_content": "The answer is 4."},
+        {"role": "user", "content": "thanks"},
+    ]
+    agent_history, _ = _build_gateway_agent_history(history)
+    assert [m["role"] for m in agent_history] == ["user", "assistant", "user"]
+    assert agent_history[1]["api_content"] == "The answer is 4."
+    assert agent_history[1]["reasoning"] == "The answer is 4."
+
+
+def test_replay_rebuilds_the_same_conversation_so_every_role_keeps_its_identity():
+    """Gateway replay turns the stored transcript back into the SAME session's history for its next turn:
+    user, assistant, tool-calling and tool rows all keep ``message_uid`` and the merge witness."""
+    from gateway.run import _build_gateway_agent_history
+
+    call = {"id": "call_1", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+    history = [
+        {"role": "user", "content": "a\n\nb", "message_uid": "1" * 32, "_absorbed_message_uids": ["b" * 32],
+         "timestamp": 1_700_000_000.0},
+        {"role": "assistant", "content": "", "tool_calls": [call], "message_uid": "2" * 32},
+        {"role": "tool", "content": "r", "tool_call_id": "call_1", "message_uid": "3" * 32},
+        {"role": "assistant", "content": "done", "message_uid": "4" * 32, "_absorbed_message_uids": ["c" * 32]},
+    ]
+    replayed, _ = _build_gateway_agent_history(history)
+    assert [(m["role"], m.get("message_uid"), m.get("_absorbed_message_uids")) for m in replayed] == [
+        (m["role"], m["message_uid"], m.get("_absorbed_message_uids")) for m in history]
+
+
+def test_a_plain_replay_row_does_not_carry_a_tool_call_uid_map_without_its_calls():
+    """Repair can prune an assistant's unanswered tool_calls and leave its ``_tool_call_uids`` behind: the
+    replayed plain row keeps its own uid but not a map naming calls it no longer carries."""
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "q", "message_uid": "1" * 32},
+        {"role": "assistant", "content": "done", "message_uid": "2" * 32, "_tool_call_uids": {"call_1": "5" * 32}},
+    ]
+    replayed, _ = _build_gateway_agent_history(history)
+    assert replayed[1]["message_uid"] == "2" * 32
+    assert "_tool_call_uids" not in replayed[1] and "_tool_call_uid" not in replayed[1]
+
+
+def test_replay_preserves_summary_metadata_and_does_not_timestamp_summary_rows():
+    from gateway.run import _build_gateway_agent_history
+
+    stored = [{
+        "role": "user", "content": "[CONTEXT COMPACTION] summary", "message_uid": "u1",
+        "_db_row_snapshot": "snap1", "_db_persisted": True, "_compressed_summary": True,
+        "timestamp": 1_700_000_000.0, "message_id": "m1", "display_kind": "summary",
+        "display_metadata": {"source": "compression"},
+    }]
+    replayed, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+    entry = replayed[0]
+    assert entry["content"] == stored[0]["content"]
+    assert entry["_compressed_summary"] is True
+    assert entry["_db_row_snapshot"] == "snap1"
+    assert entry["message_id"] == "m1"
+    assert entry["display_kind"] == "summary"
+    assert entry["display_metadata"] == {"source": "compression"}
+
+
+
+def test_replay_drops_persistence_metadata_when_content_is_rewritten():
+    from gateway.run import _build_gateway_agent_history
+
+    stored = [{
+        "role": "user", "content": "hello", "message_uid": "u1", "_db_row_snapshot": "snap1",
+        "_db_persisted": True, "_compressed_summary": True, "message_id": "m1", "observed": True,
+        "display_kind": "summary", "display_metadata": {"source": "compression"}, "mirror": True,
+        "mirror_source": "other",
+    }]
+    replayed, _ = _build_gateway_agent_history(stored)
+    entry = replayed[0]
+    assert entry["content"].startswith("[Delivered from other]")
+    assert entry["_db_persisted"] is True
+    assert all(key not in entry for key in (
+        "_db_row_snapshot", "_compressed_summary", "message_id", "observed",
+        "platform_message_id", "display_kind", "display_metadata", "effect_disposition",
+    ))
+
+
+
+def test_timestamp_replay_persists_original_content_and_row_metadata(tmp_path):
+    from agent.message_metadata import REPLAY_PERSISTED_CONTENT
+    from hermes_state import SessionDB
+    from gateway.run import _build_gateway_agent_history
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s", "gateway")
+        stored = [{
+            "role": "user", "content": "follow up", "message_uid": "u1", "_db_row_snapshot": "snap1",
+            "_db_persisted": True, "platform_message_id": "plat-9", "display_kind": "user_text",
+            "timestamp": 1_700_000_000.0,
+        }]
+        replayed, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+        assert replayed[0]["content"] != "follow up"
+        assert replayed[0][REPLAY_PERSISTED_CONTENT] == "follow up"
+        assert replayed[0]["platform_message_id"] == "plat-9"
+        assert replayed[0]["display_kind"] == "user_text"
+        assert replayed[0]["_db_persisted"] is True
+        from agent.session_persistence import _db_flush_row
+        flush_row = _db_flush_row(object(), replayed[0], False)
+        assert flush_row["content"] == "follow up"
+        db.append_messages_batch("s", replayed)
+        persisted = db.get_messages_as_conversation("s")[0]
+        assert persisted["content"] == "follow up"
+        assert persisted["message_id"] == "plat-9"
+        assert persisted["display_kind"] == "user_text"
+    finally:
+        db.close()
+
+
+
+def test_timestamped_mirror_replay_drops_view_identity_but_keeps_persisted_content():
+    from agent.message_metadata import REPLAY_PERSISTED_CONTENT
+    from gateway.run import _build_gateway_agent_history
+
+    stored = [{
+        "role": "user", "content": "hello", "message_uid": "u1", "_db_row_snapshot": "snap1",
+        "_db_persisted": True, "message_id": "m1", "display_kind": "user_text",
+        "mirror": True, "mirror_source": "other", "timestamp": 1_700_000_000.0,
+    }]
+    replayed, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+    entry = replayed[0]
+    assert entry[REPLAY_PERSISTED_CONTENT] == "hello"
+    assert "_db_row_snapshot" not in entry
+    assert "message_id" not in entry
+    assert "display_kind" not in entry
+
+
+def test_rewritten_replay_rows_stay_out_of_the_real_flush_path(tmp_path):
+    from agent.session_persistence import SessionPersistenceMixin
+    from gateway.run import _build_gateway_agent_history
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("s", "gateway")
+        db.append_message("s", "user", content="hello")
+        stored = [{
+            "role": "user", "content": "hello", "_db_persisted": True,
+            "_db_row_snapshot": "snap1", "message_uid": "u1", "mirror": True,
+            "mirror_source": "other",
+        }]
+        replayed, _ = _build_gateway_agent_history(stored)
+        assert replayed[0]["_db_persisted"] is True
+        assert "_db_row_snapshot" not in replayed[0]
+
+        agent = object.__new__(SessionPersistenceMixin)
+        agent._session_db = db
+        agent.session_id = "s"
+        agent._session_db_created = True
+        agent._flushed_db_message_ids = set()
+        agent._last_flushed_db_idx = 0
+        agent._db_flush_scan_prefix = None
+        agent._persist_user_message_idx = None
+        agent._pending_cli_user_message = None
+        flushed = SessionPersistenceMixin._flush_messages_to_session_db.__get__(agent)
+        assert flushed(replayed) is True
+        assert [row["content"] for row in db.get_messages_as_conversation("s")] == ["hello"]
+    finally:
+        db.close()
+
+
+def test_replay_keeps_the_stored_row_version_only_for_unchanged_content():
+    from gateway.run import _build_gateway_agent_history
+
+    stored = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary", "message_uid": "u1",
+         "_db_row_snapshot": "snap1", "_db_persisted": True, "timestamp": 1_700_000_000.0},
+        {"role": "assistant", "content": "ok", "message_uid": "u2", "_db_row_snapshot": "snap2",
+         "_db_persisted": True},
+    ]
+    plain, _ = _build_gateway_agent_history(stored)
+    assert [m.get("_db_row_snapshot") for m in plain] == ["snap1", "snap2"]
+
+    rendered, _ = _build_gateway_agent_history(stored, inject_timestamps=True)
+    assert rendered[0]["content"] != stored[0]["content"]
+    assert rendered[0]["_replay_persisted_content"] == stored[0]["content"]
+    assert rendered[0]["_db_row_snapshot"] == "snap1"
+    assert rendered[1]["_db_row_snapshot"] == "snap2"

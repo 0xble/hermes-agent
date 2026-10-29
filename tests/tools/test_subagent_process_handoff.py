@@ -104,9 +104,8 @@ def test_handoff_refuses_exited_foreign_or_non_child_callers(clean_queue):
         # the one the child waited on (read) is not.
         unread = process_registry.spawn_local("echo UNREAD_RESULT", task_id=sid, owner_task_id=sid)
         unread.notify_on_complete = True
-        deadline = time.time() + 10
-        while not unread.exited and time.time() < deadline:
-            time.sleep(0.05)
+        # `exited` flips before the finalization owner publishes into `_finished`; wait for publication.
+        assert unread._completion_event.wait(10)
         ids = [s.id for s in process_registry.unread_completions_owned_by(sid)]
         assert ids == [unread.id]
         assert "UNREAD_RESULT" in _process_accounting_lines(

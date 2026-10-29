@@ -23,6 +23,7 @@ from agent.redact import redact_cdp_url
 from hermes_constants import get_hermes_home, hermes_home_key
 from utils import env_int
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
+from hermes_cli.observability.shared_metrics_loop import record_browser_call
 
 
 # Env keys re-added to the agent-browser subprocess AFTER credential stripping.
@@ -35,31 +36,64 @@ _BROWSER_PASSTHROUGH_KEYS: tuple[str, ...] = (
 )
 
 
+def warm_agent_browser_npx_cache(timeout: float = 60.0) -> bool:
+    """Frozen old-updater surface (tests/compat/old_updater_surface.json): a pre-PM ``hermes update``
+    still running mid-swap imports this from the NEW tree. Nothing is warmed — PM owns the browser
+    runtime — and the permanent definition must live here, not behind the revert-scheduled compat
+    pointer."""
+    return False
+
+
 def _build_browser_env() -> dict:
     """Credential-scrubbed env for an agent-browser subprocess (deferred import: test
-    harnesses stub the ``tools`` package)."""
-    from tools.environments.local import hermes_subprocess_env
+    harnesses stub the ``tools`` package). The passthrough keys are re-added from the active
+    profile's secret scope, never ``os.environ``: under multiplex that holds the LAUNCH profile's
+    Browserbase/Firecrawl keys, and a served profile's browser must run on its own (or none)."""
+    from agent.secret_scope import current_secret_scope, get_secret, serves_routed_profile
+    from tools.environments.local import served_profile_child_env
 
-    env = hermes_subprocess_env(inherit_credentials=False)
-    env.update({k: os.environ[k] for k in _BROWSER_PASSTHROUGH_KEYS if k in os.environ})
+    from agent.proxy_bypass import add_loopback_no_proxy
+
+    env = served_profile_child_env(inherit_credentials=False)
+    # A routed profile (multiplex, or a Desktop/dashboard backend serving ``?profile=B`` with the
+    # flag off) resolves from its bound scope only — a miss is "no key", never the launch profile's
+    # ``os.environ`` value that ``get_secret`` falls through to while multiplexing is inactive.
+    routed = serves_routed_profile()
+    scope = (current_secret_scope() or {}) if routed else None
+    for key in _BROWSER_PASSTHROUGH_KEYS:
+        value = scope.get(key) if routed else get_secret(key)
+        if value is not None:
+            env[key] = value
+    # The Browser Use harness dials the resolved local CDP URL over ``websockets``; without a
+    # loopback NO_PROXY a macOS system proxy captures that dial (#110565).
+    # Headed Chromium opens on this profile's Bot Desktop when one is running (human can take it over). Pure: this
+    # builder also serves the npx cache warmer, the Chromium auto-installer and the Lightpanda engine, none of which
+    # may bring a screen up — the auto-start hook lives at the headed Chromium spawn sites (browser_tool_session).
+    from tools.bot_desktop.runtime import desktop_env as _bot_desktop_env
+    env = add_loopback_no_proxy(_bot_desktop_env(env))
+    # Chrome puts its SingletonSocket under $TMPDIR; a deep scratch dir overflows the AF_UNIX
+    # path cap and Chrome dies at startup ("Socket path too long"), so browsers get the short root.
+    env["TMPDIR"] = _socket_safe_tmpdir()
     return env
 
 
 try:
     from tools.website_policy import check_website_access
 except Exception:
-    check_website_access = lambda url: None  # noqa: E731 — fail-open if policy module unavailable
+    check_website_access = lambda url: None
 
 try:
     from tools.url_safety import (
+        _is_declared_fake_ip,
         is_safe_url as _is_safe_url,
         is_always_blocked_url as _is_always_blocked_url,
         normalize_url_for_request as _normalize_url_for_request,
     )
 except Exception:
-    _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
-    _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
-    _normalize_url_for_request = lambda url: url  # noqa: E731 — best-effort fallback
+    _is_declared_fake_ip = lambda ip: False
+    _is_safe_url = lambda url: False
+    _is_always_blocked_url = lambda url: True
+    _normalize_url_for_request = lambda url: url
 # Browser-provider ABC + registry; per-vendor providers live under
 # ``plugins/browser/<vendor>/``. The dispatcher consults the registry. See #25214.
 from agent.browser_provider import BrowserProvider
@@ -75,20 +109,25 @@ except ImportError:
 try:
     from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
 except ImportError:
-    _is_camofox_mode = lambda: False  # noqa: E731
+    _is_camofox_mode = lambda: False
 try:
     from tools.browser_use_cli import is_browser_use_cli_mode as _is_browser_use_cli_mode
 except ImportError:
-    _is_browser_use_cli_mode = lambda: False  # noqa: E731
+    _is_browser_use_cli_mode = lambda: False
 
 logger = logging.getLogger(__name__)
 
-# PATH fallbacks for minimal-PATH environments (systemd services): Termux,
-# macOS Homebrew, and the usual system dirs — needed for agent-browser/npx/node.
+# Standard PATH entries for environments with minimal PATH (e.g. systemd services).
+# Includes macOS Homebrew locations for externally installed browser helpers.
 _SANE_PATH_DIRS = (
-    "/data/data/com.termux/files/usr/bin", "/data/data/com.termux/files/usr/sbin",
-    "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/sbin", "/usr/local/bin",
-    "/usr/sbin", "/usr/bin", "/sbin", "/bin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
 )
 _SANE_PATH = os.pathsep.join(_SANE_PATH_DIRS)
 
@@ -116,40 +155,30 @@ MIN_SNAPSHOT_THRESHOLD = 1000
 MAX_STORED_SNAPSHOT_CHARS = 2_000_000
 _EMPTY_OK_COMMANDS: frozenset = frozenset({"close", "record"})  # legitimately empty stdout
 
-# Sentinel _find_agent_browser returns/caches to mean "resolve via npx" rather
-# than a concrete path (also compared in hermes_cli/tools_config.py and doctor.py).
-NPX_AGENT_BROWSER_SENTINEL = "npx agent-browser"
-# Pinned to match scripts/install.sh / install.ps1's managed install so a bare-npx
-# resolution gets the same version instead of floating latest. Update together.
-AGENT_BROWSER_NPX_SPEC = "agent-browser@^0.26.0"
-
 # Process caches (``_cached_X`` + ``_X_resolved`` pairs) for config-derived lookups;
 # reset by ``cleanup_all_browsers``. Written/read by the sibling modules via ``browser_tool_origin``.
 # The config-derived ones are keyed by profile home (``hermes_home_key()``): the multiplexed
 # gateway serves every profile from one process, so a single slot would hand the launch
 # profile's browser settings to every other profile.
-_cached_command_timeout: Optional[Dict[str, int]] = None
+_cached_command_timeout: Optional[dict[str, int]] = None
 # Flip the resolved flag BEFORE nulling the cache so a concurrent reader never sees ``resolved=True`` with
 # ``cache=None`` (#14331).
 _command_timeout_resolved = False
-_cached_snapshot_threshold: Optional[Dict[str, int]] = None
+_cached_snapshot_threshold: Optional[dict[str, int]] = None
 _snapshot_threshold_resolved = False
 _cached_cloud_provider: Optional[BrowserProvider] = None
 _cloud_provider_resolved = False
 _cached_cloud_provider_scope: Optional[str] = None
-_cached_cloud_providers: Dict[tuple[str, tuple[int, int]], Optional[BrowserProvider]] = {}
+_cached_cloud_providers: dict[tuple[str, tuple[int, int]], Optional[BrowserProvider]] = {}
 _cloud_provider_cache_lock = threading.RLock()
 _allow_private_urls_resolved = False
 _cached_allow_private_urls: Optional[bool] = None
-_cached_agent_browser: Optional[str] = None
-_agent_browser_resolved = False
 _cached_browser_engine: Optional[str] = None  # agent-browser v0.25.3+ ``--engine lightpanda``
 _browser_engine_resolved = False
 _auto_local_for_private_urls_resolved = False
 _cached_auto_local_for_private_urls: bool = True
 _cached_headed_mode: Optional[bool] = None
 _headed_mode_resolved = False
-_cached_chromium_installed: Optional[bool] = None
 _chromium_autoinstall_attempted = False  # one-shot: a failed 170MB download must not retry per call
 
 # Mask secrets in logged CDP URLs; agent.redact.redact_cdp_url is the single policy.
@@ -236,6 +265,9 @@ from tools import browser_tool_lightpanda_fallback as _lp
 # Single shared real-profile copy-browser session: concurrent tasks reuse it
 # instead of each launching a rival Chromium on the same copied user-data-dir.
 _REAL_PROFILE_SESSION = "hermes-real-profile"
+# Keep lock contention well inside the agent's 420-second outer tool deadline.
+# The holder may be an abandoned daemon worker that Python cannot terminate.
+_REAL_PROFILE_CDP_LOCK_TIMEOUT_S = 30.0
 _real_profile_cdp_lock = threading.Lock()
 _real_profile_cdp_cache: dict = {}
 _real_profile_chrome_procs: list = []  # Popen handles of directly-launched real browsers
@@ -248,7 +280,9 @@ _PRIVATE_HOST_SUFFIXES = (".localhost", ".local", ".lan", ".internal")
 def _url_is_private(url: str) -> bool:
     """True when the URL's host is (or resolves to) a private/LAN/loopback/CGNAT address.
     Routing oracle only: DNS failures are NOT private (the configured backend surfaces the
-    error); obvious names short-circuit the DNS hop."""
+    error); obvious names short-circuit the DNS hop. A local proxy's declared fake-ip sentinel
+    (``security.fake_ip_ranges``) is not private: the name is public, the cloud browser resolves
+    it itself, so routing it to the local sidecar would send every URL local on such a host."""
     import ipaddress
     import socket
     from urllib.parse import urlparse
@@ -258,6 +292,8 @@ def _url_is_private(url: str) -> bool:
             ip = ipaddress.ip_address(host)
         except ValueError:
             return None
+        if _is_declared_fake_ip(ip):
+            return False
         return ip.is_private or ip.is_loopback or ip.is_link_local or ip in ipaddress.ip_network("100.64.0.0/10")
 
     try:
@@ -278,21 +314,26 @@ def _url_is_private(url: str) -> bool:
         return False
 
 
-def _navigation_session_key(task_id: str, url: str) -> str:
-    """Session key that should handle ``url`` for ``task_id``: ``f"{task_id}::local"`` (hybrid
-    local sidecar while the cloud session keeps serving public URLs) only when ALL hold —
-    cloud provider configured, ``browser.auto_local_for_private_urls`` on, private URL, no
-    CDP override (it owns the whole session), Camofox off (already local-only)."""
-    if task_id is None:
-        task_id = "default"
-    hybrid = (
+def _hybrid_routes_locally(url: str) -> bool:
+    """True when ``url`` belongs on the hybrid LOCAL sidecar instead of the cloud provider: a cloud provider
+    configured, ``browser.auto_local_for_private_urls`` on, a private URL, no CDP override (it owns the
+    whole session), Camofox off (already local-only). Shared by browser_navigate and browser_exec."""
+    return (
         not _cdp._get_cdp_override_raw()
         and not _is_camofox_mode()
         and _cloud._get_cloud_provider() is not None
         and _cloud._auto_local_for_private_urls()
         and _url_is_private(url)
     )
-    return f"{task_id}{_LOCAL_SUFFIX}" if hybrid else task_id
+
+
+def _navigation_session_key(task_id: str, url: str) -> str:
+    """Session key that should handle ``url`` for ``task_id``: ``f"{task_id}::local"`` (hybrid
+    local sidecar while the cloud session keeps serving public URLs) when
+    ``_hybrid_routes_locally`` holds for ``url``."""
+    if task_id is None:
+        task_id = "default"
+    return f"{task_id}{_LOCAL_SUFFIX}" if _hybrid_routes_locally(url) else task_id
 
 
 def _is_local_sidecar_key(session_key: str) -> bool:
@@ -303,7 +344,7 @@ def _bare_task_id_for_session_key(session_key: str) -> str:
     return session_key[: -len(_LOCAL_SUFFIX)] if _is_local_sidecar_key(session_key) else session_key
 
 
-def _session_info_owned_by_task(session_info: Dict[str, Any], task_id: str, session_key: str) -> bool:
+def _session_info_owned_by_task(session_info: dict[str, Any], task_id: str, session_key: str) -> bool:
     """Ownership check; entries without metadata (older in-memory / hot-reload) pass,
     any explicit mismatch fails before a non-nav tool can act on the wrong session."""
     owner = session_info.get("owner_task_id")
@@ -331,19 +372,20 @@ def _last_session_key(task_id: str) -> str:
 
 
 def _socket_safe_tmpdir() -> str:
-    """Short temp dir for Unix sockets: macOS ``TMPDIR`` + ``agent-browser-hermes_…``
-    exceeds the 104-byte AF_UNIX limit (silent screenshot failures), so use /tmp there."""
-    return "/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+    """Temp root short enough for the agent-browser socket dir and Chrome's SingletonSocket
+    (``hermes_constants.socket_safe_tmpdir``)."""
+    from hermes_constants import socket_safe_tmpdir
+    return socket_safe_tmpdir()
 
 
 # Active sessions keyed by "session key": the bare task_id, or f"{task_id}::local"
 # for a hybrid-routing local sidecar (opaque to _run_browser_command / cleanup_browser).
 # Values: session_name (always), bb_session_id + cdp_url (cloud).
-_active_sessions: Dict[str, Dict[str, Any]] = {}
+_active_sessions: dict[str, dict[str, Any]] = {}
 _recording_sessions: set = set()  # session_keys with active recordings
 # Most recent session_key per task_id (set by browser_navigate, read by every non-nav
 # tool) so click/snapshot land in the session that served the last navigation.
-_last_active_session_key: Dict[str, str] = {}
+_last_active_session_key: dict[str, str] = {}
 _LOCAL_SUFFIX = "::local"
 _cleanup_done = False
 
@@ -370,21 +412,21 @@ BROWSER_ORPHAN_REAP_INTERVAL = 300  # seconds
 # session is never touched.
 BROWSER_ORPHAN_GRACE_SECONDS = max(3600, BROWSER_SESSION_INACTIVITY_TIMEOUT * 20)
 
-_session_last_activity: Dict[str, float] = {}
+_session_last_activity: dict[str, float] = {}
 # Owner Hermes home per session: the janitor is one process-global thread, so each
 # teardown must re-enter the OWNING profile's scope (copy_context at spawn would
 # pin the first profile's secrets onto every other profile's teardown).
 # See #86402.
-_session_owner_homes: Dict[str, str] = {}
+_session_owner_homes: dict[str, str] = {}
 # Consecutive janitor failures per session; force-reaped after MAX_INACTIVITY_CLEANUP_FAILURES.
 # See #100738.
-_cleanup_failures: Dict[str, int] = {}
+_cleanup_failures: dict[str, int] = {}
 MAX_INACTIVITY_CLEANUP_FAILURES = 3
 
 # Session keys flagged suspect after a command timeout (written lock-free by
 # mark_suspect; consumed by ensure_healthy() at next use, which recycles).
 # See #72205.
-_suspect_browser_sessions: Dict[str, str] = {}
+_suspect_browser_sessions: dict[str, str] = {}
 
 
 class _BrowserSessionBackend:
@@ -436,8 +478,16 @@ atexit.register(_lifecycle._stop_browser_cleanup_thread)
 # ----------------------------------------------------------------------------
 BROWSER_TOOL_SCHEMAS = [
     {
+        "name": "browser_handoff",
+        "description": "Show a named account's browser window for a person. May restart that account's hidden Camofox browser as visible (page-only state such as half-filled forms can be lost; logins persist). Confirm no other work is using the account first, then call before the step whose page state matters, such as submitting a password when an OTP is likely. Use release=true when the user is done with the visible window to return the account to the background.",
+        "parameters": {"type": "object", "properties": {
+            "account": {"type": "string", "description": "Named Camofox account alias"},
+            "release": {"type": "boolean", "description": "Close the visible account window and return to headless-by-default when done.", "default": False},
+        }, "required": ["account"]},
+    },
+    {
         "name": "browser_navigate",
-        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer a lightweight retrieval tool when one is available (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer an available text-extraction or terminal-fetch tool; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -451,7 +501,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_snapshot",
-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
+        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate or browser_handoff first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -466,7 +516,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate or browser_handoff and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -480,7 +530,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_type",
-        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate or browser_handoff and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -514,6 +564,31 @@ BROWSER_TOOL_SCHEMAS = [
         "parameters": {
             "type": "object", "properties": {}, "required": []
         }
+    },
+    {
+        "name": "browser_upload",
+        "description": "Attach local files to the page's upload control, including one inside a cross-origin iframe, without an OS file dialog. Give the trigger that opens the chooser (the upload button itself, not menu text) as a ref from the snapshot, or as a Playwright selector; for an iframe use 'iframe[src*=\"<host>\"] >> internal:control=enter-frame >> <button selector>'. With neither, the first top-level input[type=file] is used. A named trigger is refused when the top-level page has its own file input, because that input would take the file. Afterwards take a fresh snapshot, save, and read back the persisted file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                          "description": "Absolute local file paths to attach"},
+                "ref": {"type": "string", "description": "Element ref of the upload trigger (e.g. '@e12')"},
+                "selector": {"type": "string", "description": "Playwright selector for the upload trigger, used when no ref is given"},
+            },
+            "required": ["paths"],
+        },
+    },
+    {
+        "name": "browser_downloads",
+        "description": "List captured downloads for the current Camofox tab. With download_id from the listing, save that file on the Python host and return its local output_path, never its contents. Files are limited to 20 MiB and responses to 28 MiB. Requires browser_navigate or browser_handoff first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "download_id": {"type": "string", "description": "ID from the listing to save locally. Omit to list metadata only."}
+            },
+            "required": [],
+        },
     },
     {
         "name": "browser_press",
@@ -586,7 +661,7 @@ def _err(error: str, **extra) -> dict:
     return {"success": False, "error": error, **extra}
 
 
-def _dumps(payload: Dict[str, Any], **kw) -> str:
+def _dumps(payload: dict[str, Any], **kw) -> str:
     return json.dumps(payload, ensure_ascii=False, **kw)
 
 
@@ -638,10 +713,11 @@ def _secret_url_error_normalized(url: str) -> tuple[str, Optional[dict]]:
     return url, err
 
 
-def evaluate_url_safety(url: str) -> Optional[dict]:
-    """Run URL safety checks; None if safe, else an error dict"""
+def evaluate_url_safety(url: str, *, auto_local: bool = False) -> Optional[dict]:
+    """Run URL safety checks; None if safe, else an error dict. ``auto_local`` (the URL is served by the
+    hybrid local sidecar) relaxes only the private-address floor, never the cloud-metadata one."""
     url, err = _secret_url_error_normalized(url)
-    return err or _url_policy_error(url)
+    return err or _url_policy_error(url, auto_local=auto_local)
 
 
 _BOT_DETECTION_TITLE_PATTERNS = (
@@ -673,33 +749,61 @@ def _post_redirect_block(nav_session_key: str, url: str, final_url: str, auto_lo
     return json.dumps(_err(f"Blocked: redirect landed on {what}"))
 
 
-def _snapshot_fields(snap_result: Dict[str, Any]) -> Dict[str, Any]:
+def _snapshot_fields(snap_result: Dict[str, Any], nav_session_key: str = "default") -> Dict[str, Any]:
     """``snapshot`` + ``element_count`` fields from a successful snapshot result; oversized
     snapshots truncate at line boundaries with the full tree stored for read_file paging."""
     data = snap_result.get("data", {})
     snapshot_text = data.get("snapshot", "")
     refs = data.get("refs", {})
+    from agent.redact import has_vault_scoped_components, redact_registered_vault_snapshot
+    origin = ""
+    if has_vault_scoped_components(nav_session_key):
+        from tools.browser_vault_tool import _current_page_origin
+        origin = _current_page_origin(nav_session_key) or ""
+    snapshot_text = redact_registered_vault_snapshot(snapshot_text, tab=nav_session_key, origin=origin)
     threshold = get_browser_snapshot_threshold()
     if len(snapshot_text) > threshold:
         snapshot_text = _snapshot._truncate_snapshot(snapshot_text, max_chars=threshold)
     return {"snapshot": _snapshot._redact_browser_output(snapshot_text), "element_count": len(refs) if refs else 0}
 
 
-def _merge_fallback_warning(response: Dict[str, Any], result: Dict[str, Any]) -> None:
+def _merge_fallback_warning(response: dict[str, Any], result: dict[str, Any]) -> None:
     """Copy a secondary result's fallback warning only if the response has none yet."""
     if result.get("fallback_warning") and not response.get("fallback_warning"):
         _lp._copy_fallback_warning(response, result)
 
 
-def _attach_auto_snapshot(response: Dict[str, Any], nav_session_key: str) -> None:
+def _attach_auto_snapshot(response: dict[str, Any], nav_session_key: str) -> None:
     """Add a compact snapshot to a navigate response so the model can act without browser_snapshot."""
     try:
         snap_result = _session._run_browser_command(nav_session_key, "snapshot", ["-c"])
         if snap_result.get("success"):
-            response.update(_snapshot_fields(snap_result))
+            response.update(_snapshot_fields(snap_result, nav_session_key))
             _merge_fallback_warning(response, snap_result)
     except Exception as e:
         logger.debug("Auto-snapshot after navigate failed: %s", e)
+
+
+def browser_handoff(account: str, task_id: Optional[str] = None, release: bool = False) -> str:
+    """Show or release this task's Camofox account window without navigating away."""
+    if not _is_camofox_mode():
+        return _dumps(_err("Visible account handoff requires the Camofox browser backend"))
+    return _camofox("camofox_handoff", account, task_id, release)
+
+
+def browser_upload(paths: list, ref: Optional[str] = None, selector: Optional[str] = None,
+                   task_id: Optional[str] = None) -> str:
+    """Attach local files to the page's upload control (Camofox file-chooser interception)."""
+    if not _is_camofox_mode():
+        return _dumps(_err("browser_upload requires the Camofox browser backend"))
+    return _camofox("camofox_upload", paths, ref, selector, task_id)
+
+
+def browser_downloads(download_id: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """List or locally import captured files for the current Camofox tab."""
+    if not _is_camofox_mode():
+        return _dumps(_err("browser_downloads requires the Camofox browser backend"))
+    return _camofox("camofox_downloads", download_id, task_id)
 
 
 def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
@@ -757,7 +861,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[
     return _dumps(response)
 
 
-def _add_navigate_warnings(response: Dict[str, Any], title: str, first_nav_session: Optional[Dict[str, Any]]) -> None:
+def _add_navigate_warnings(response: dict[str, Any], title: str, first_nav_session: Optional[dict[str, Any]]) -> None:
     """Bot-detection hint from the page title; on first navigation, the session's stealth features."""
     title_lower = title.lower()
     if any(pattern in title_lower for pattern in _BOT_DETECTION_TITLE_PATTERNS):
@@ -793,7 +897,7 @@ def browser_snapshot(
     if blocked is not None:
         return blocked
 
-    response = {"success": True, **_snapshot_fields(result)}
+    response = {"success": True, **_snapshot_fields(result, effective_task_id)}
     _lp._copy_fallback_warning(response, result)
 
     # Merge supervisor state (pending dialogs + frame tree) when a CDP supervisor is
@@ -811,16 +915,18 @@ def browser_snapshot(
     return _dumps(response)
 
 
-def _json_with_fallback(response: Dict[str, Any], result: Dict[str, Any]) -> str:
+def _json_with_fallback(response: dict[str, Any], result: dict[str, Any]) -> str:
     """``json.dumps`` of ``response`` with the Lightpanda fallback metadata copied from ``result``."""
     return _dumps(_lp._copy_fallback_warning(response, result))
 
 
-def _failed_response(result: Dict[str, Any], default_error: str) -> str:
-    return _json_with_fallback(_err(result.get("error", default_error)), result)
+def _failed_response(result: dict[str, Any], default_error: str) -> str:
+    # ``code`` = machine-readable refusal (human_has_control), same shape as computer_use's.
+    extra = {"code": result["code"]} if result.get("code") else {}
+    return _json_with_fallback(_err(result.get("error", default_error), **extra), result)
 
 
-def _tool_response(result: Dict[str, Any], ok: Dict[str, Any], default_error: str) -> str:
+def _tool_response(result: dict[str, Any], ok: dict[str, Any], default_error: str) -> str:
     """``{"success": True, **ok}`` or ``{"success": False, "error": result.error or default}``, plus fallback metadata."""
     if not result.get("success"):
         return _failed_response(result, default_error)
@@ -833,7 +939,7 @@ def _camofox(func_name: str, *args):
     return getattr(importlib.import_module("tools.browser_camofox"), func_name)(*args)
 
 
-def _guarded_action(task_id: Optional[str], action: str, command: str, args: list, ok: Dict[str, Any], err: str) -> str:
+def _guarded_action(task_id: Optional[str], action: str, command: str, args: list, ok: dict[str, Any], err: str) -> str:
     """Input action on the task's current page, refused when the SSRF guard flags the page."""
     effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_action(effective_task_id, action)
@@ -988,17 +1094,24 @@ def _parse_eval_value(raw_result: Any) -> Any:
     return raw_result
 
 
-def _eval_ok_response(parsed: Any, **extra) -> Dict[str, Any]:
-    return {"success": True, "result": _snapshot._redact_browser_output(parsed), "result_type": type(parsed).__name__, **extra}
+def _eval_ok_response(parsed: Any, *, vault_tab: str = "default", vault_origin: str = "", **extra) -> Dict[str, Any]:
+    return {
+        "success": True,
+        "result": _snapshot._redact_browser_output(parsed,
+                                                    vault_tab=vault_tab, vault_origin=vault_origin),
+        "result_type": type(parsed).__name__,
+        **extra,
+    }
 
 
-def _eval_result_or_blocked(effective_task_id: str, parsed: Any, result: Dict[str, Any], **extra) -> str:
+def _eval_result_or_blocked(effective_task_id: str, parsed: Any, result: dict[str, Any], **extra) -> str:
     """Eval tool JSON, unless the post-eval page-URL recheck finds an eval navigated the
     page to a private address — then the result is withheld."""
     blocked = _blocked_private_page_content(effective_task_id)
     if blocked is not None:
         return blocked
-    return _dumps(_lp._copy_fallback_warning(_eval_ok_response(parsed, **extra), result), default=str)
+    return _dumps(_lp._copy_fallback_warning(
+        _eval_ok_response(parsed, vault_tab=effective_task_id, **extra), result), default=str)
 
 
 def _eval_supervisor_fast_path(effective_task_id: str, expression: str) -> Optional[str]:
@@ -1014,7 +1127,8 @@ def _eval_supervisor_fast_path(effective_task_id: str, expression: str) -> Optio
         sup_result = supervisor.evaluate_runtime(expression)
         if sup_result.get("ok"):
             return _eval_result_or_blocked(
-                effective_task_id, _parse_eval_value(sup_result.get("result")), {}, method="cdp_supervisor")
+                effective_task_id, _parse_eval_value(sup_result.get("result")), {},
+                method="cdp_supervisor")
         err = sup_result.get("error") or "evaluate_runtime failed"
         if "supervisor" not in err.lower():
             return _dumps(_err(err))
@@ -1026,7 +1140,7 @@ def _eval_supervisor_fast_path(effective_task_id: str, expression: str) -> Optio
     return None
 
 
-def _eval_failure_response(result: Dict[str, Any]) -> str:
+def _eval_failure_response(result: dict[str, Any]) -> str:
     """Tool JSON for a failed ``agent-browser eval``, with actionable rewrites of known errors."""
     err = result.get("error", "eval failed")
     if any(hint in err.lower() for hint in ("unknown command", "not supported", "not found", "no such command")):
@@ -1063,36 +1177,49 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     if _is_camofox_mode():
         return _camofox_eval(expression, task_id)
 
-    fast = _eval_supervisor_fast_path(effective_task_id, expression)
-    if fast is not None:
-        return fast
+    # The supervisor answers over its own WebSocket and never reaches _run_browser_command, so the Bot
+    # Desktop lease fence has to bracket it here too — otherwise the one command that reads arbitrary
+    # page state is the one a human's takeover does not stop. Same fence, same session identity.
+    fenced = _session.run_fenced(_active_sessions.get(effective_task_id) or {},
+                                 lambda: {"fast": _eval_supervisor_fast_path(effective_task_id, expression)})
+    if fenced.get("code") == "human_has_control":
+        return _dumps(fenced)
+    if fenced["fast"] is not None:
+        return fenced["fast"]
 
     result = _session._run_browser_command(effective_task_id, "eval", [expression])
     if not result.get("success"):
         return _eval_failure_response(result)
-    return _eval_result_or_blocked(effective_task_id, _parse_eval_value(result.get("data", {}).get("result")), result)
+    return _eval_result_or_blocked(
+        effective_task_id, _parse_eval_value(result.get("data", {}).get("result")), result)
 
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    import requests
+    from tools.browser_camofox import (_get_session, _post, _tab_error, _NO_SESSION_ERROR,
+                                      _STALE_TAB_ERROR)
     try:
-        tab_info = _ensure_tab(task_id or "default")
-        tab_id = tab_info.get("tab_id") or tab_info.get("id")
+        tab_info = _get_session(task_id or "default")
+        tab_id = tab_info.get("tab_id")
+        if not tab_id:
+            return tool_error(_NO_SESSION_ERROR, success=False)
         user_id = tab_info["user_id"]
-        resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})
+        try:
+            resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})
+        except requests.HTTPError as exc:
+            return _tab_error(tab_info, exc, endpoint="evaluate")
         parsed = _parse_eval_value(resp.get("result") if isinstance(resp, dict) else resp)
 
         if _eval_policy._eval_ssrf_guard_active(task_id or "default"):
-            _blocked_url = _eval_policy._camofox_current_page_private_url(tab_id, user_id)
+            _blocked_url = _eval_policy._camofox_current_page_private_url(tab_id, user_id, session=tab_info)
+            if not tab_info["tab_id"]:
+                return tool_error(_STALE_TAB_ERROR, success=False)
             if _blocked_url:
                 return _blocked_private_page_json(_blocked_url, _EVAL_NAVIGATED_WHY)
 
         return _dumps(_eval_ok_response(parsed), default=str)
     except Exception as e:
-        if any(code in str(e) for code in ("404", "405", "501")):  # server without eval support
-            return json.dumps(_err("JavaScript evaluation is not supported by this Camofox server. "
-                                   "Use browser_snapshot or browser_vision to inspect page state."))
         return tool_error(str(e), success=False)
 
 
@@ -1137,11 +1264,7 @@ def _maybe_stop_recording(task_id: str):
             _recording_sessions.discard(task_id)
 
 
-_GET_IMAGES_JS = """JSON.stringify(
-        [...document.images].map(img => ({
-            src: img.src, alt: img.alt || '', width: img.naturalWidth, height: img.naturalHeight
-        })).filter(img => img.src && !img.src.startsWith('data:'))
-    )"""
+_GET_IMAGES_JS = "JSON.stringify([...document.images].map(img => ({src: img.src, alt: img.alt || '', width: img.naturalWidth, height: img.naturalHeight})).filter(img => img.src && !img.src.startsWith('data:')))"
 
 
 def browser_get_images(task_id: Optional[str] = None) -> str:
@@ -1178,11 +1301,19 @@ def _capture_vision_screenshot(effective_task_id: str, annotate: bool, screensho
         result = _lp._annotate_lightpanda_fallback(
             {"success": True, "data": {"path": str(screenshot_path)}}, _LP_VISION_FALLBACK_REASON)
     else:
-        screenshot_args = (["--annotate"] if annotate else []) + ["--full", str(screenshot_path)]
+        # In the sandbox the CLI writes to ITS filesystem; the file is fetched back below.
+        remote_path = _session.sandbox_screenshot_path(screenshot_path)
+        screenshot_args = (["--annotate"] if annotate else []) + ["--full", remote_path or str(screenshot_path)]
         # A failed Lightpanda pre-route forces Chrome so _run_browser_command
         # doesn't trigger a redundant LP fallback.
         result = _session._run_browser_command(effective_task_id, "screenshot", screenshot_args,
                                       _engine_override="auto" if lp_prerouted else None)
+        if remote_path and result.get("success"):
+            try:
+                _session.fetch_sandbox_file(str((result.get("data") or {}).get("path") or remote_path), screenshot_path)
+                result.setdefault("data", {})["path"] = str(screenshot_path)
+            except Exception as exc:
+                logger.warning("could not fetch the sandbox screenshot %s: %s", remote_path, exc)
     if not result.get("success"):
         return result, screenshot_path, _json_with_fallback(_err(
             f"Failed to take screenshot ({_vision._vision_mode_label()} mode): {result.get('error', 'Unknown error')}"
@@ -1199,25 +1330,29 @@ def _capture_vision_screenshot(effective_task_id: str, annotate: bool, screensho
     return result, screenshot_path, None
 
 
-def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> Union[str, Dict[str, Any]]:
+def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> str | dict[str, Any]:
     """Screenshot the current page for visual inspection. Native-vision models get the image
     attached to the conversation; otherwise the auxiliary vision model returns a text
     analysis. The file is kept and its path returned (MEDIA:<path>)."""
     if _is_camofox_mode():
         return _camofox("camofox_vision", question, annotate, task_id)
 
+    effective_task_id = _last_session_key(task_id or "default")
+    blocked = _vision.blocked_protected_date_pixels(effective_task_id)
+    if blocked is not None:
+        return blocked
+
     import uuid as uuid_mod
     from hermes_constants import get_hermes_dir
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
-    effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_content(effective_task_id)
     if blocked is not None:
         return blocked
 
     _lp_prerouted, _lp_fallback_warning, screenshot_path = _vision._lightpanda_vision_preroute(
         effective_task_id, annotate, screenshot_path)
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
     try:
         screenshots_dir.mkdir(parents=True, exist_ok=True)
         _lifecycle._cleanup_old_screenshots(screenshots_dir, max_age_hours=24)
@@ -1242,7 +1377,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Keep a captured screenshot — the failure is in the analysis, not the capture,
         # and deleting it loses evidence. The 24-hour cleanup bounds disk growth.
         logger.warning("browser_vision failed: %s", e, exc_info=True)
-        error_info = _err(f"Error during vision analysis: {str(e)}")
+        error_info = _err(f"Error during vision analysis: {e!s}")
         if screenshot_path.exists():
             error_info["screenshot_path"] = str(screenshot_path)
             error_info["note"] = "Screenshot was captured but vision analysis failed. You can still share it via MEDIA:<path>."
@@ -1257,6 +1392,17 @@ from tools.registry import registry, tool_error
 from tools.browser_extension_router import extension_controller_available, routed_browser_handler
 
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
+
+
+def _camofox_handoff_schema_override() -> Dict[str, Any]:
+    from tools.browser_camofox_state import get_camofox_account_aliases
+    return {"parameters": {"type": "object", "properties": {"account": {
+        "type": "string", "enum": list(get_camofox_account_aliases()),
+        "description": "Allowed account alias to bind to this task; cannot switch after binding.",
+    }, "release": {
+        "type": "boolean", "description": "Close the visible window and return the account to headless-by-default.",
+        "default": False,
+    }}, "required": ["account"]}}
 
 
 def _camofox_account_schema_override() -> Dict[str, Any]:
@@ -1283,7 +1429,7 @@ def check_browser_routed_requirements(action: str = "browser_snapshot") -> bool:
     return _install.check_browser_requirements() or extension_controller_available(action)
 
 
-def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple = ()):
+def _fallback_call(fn_name: str, arg_defaults: dict[str, Any], extra_kw: tuple = ()):
     """Adapter from the registry's ``(args, kw)`` to ``<fn_name>(**schema_args, task_id=...)``;
     the function is looked up in module globals at call time so monkeypatching works."""
     def call(args, kw):
@@ -1327,10 +1473,28 @@ def _routed_check_fn(name: str):
 
 def _routed_handler(name: str, fallback):
     def handler(args, **kw):
-        return routed_browser_handler(name, args, fallback=lambda: fallback(args, kw),
-                                      task_id=kw.get("task_id"), session_id=kw.get("session_id"))
+        return record_browser_call(lambda legacy: routed_browser_handler(
+            name, args, fallback=lambda: legacy(lambda: fallback(args, kw)),
+            task_id=kw.get("task_id"), session_id=kw.get("session_id"),
+        ), _cloud.browser_backend_name)
     return handler
 
+
+registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_handoff"],
+                  handler=lambda args, **kw: browser_handoff(args.get("account", ""), task_id=kw.get("task_id"),
+                                                               release=args.get("release") is True),
+                  check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
+                  emoji="🌐")
+
+registry.register(name="browser_upload", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_upload"],
+                  handler=lambda args, **kw: browser_upload(
+                      [str(p) for p in (args.get("paths") or []) if p], ref=args.get("ref") or None,
+                      selector=args.get("selector") or None, task_id=kw.get("task_id")),
+                  check_fn=_is_camofox_mode, emoji="📎")
+
+registry.register(name="browser_downloads", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_downloads"],
+                  handler=lambda args, **kw: browser_downloads(args.get("download_id"), task_id=kw.get("task_id")),
+                  check_fn=_is_camofox_mode)
 
 for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
     if _check_fn is None:  # also binds the legacy check_browser_<x>_requirements globals (tests + callers)
@@ -1343,52 +1507,3 @@ for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
                       ))
 
 
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import List  # noqa: F401,E402
-from typing import Tuple  # noqa: F401,E402
-import contextlib  # noqa: F401,E402
-from datetime import datetime  # noqa: F401,E402
-import functools  # noqa: F401,E402
-import re  # noqa: F401,E402
-import shutil  # noqa: F401,E402
-import signal  # noqa: F401,E402
-from datetime import timezone  # noqa: F401,E402
-
-SNAPSHOT_SUMMARIZE_THRESHOLD = DEFAULT_SNAPSHOT_THRESHOLD
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'BrowserUseProvider': ('plugins.browser.browser_use.provider', 'BrowserUseBrowserProvider'),
-    'BrowserbaseProvider': ('plugins.browser.browserbase.provider', 'BrowserbaseBrowserProvider'),
-    'CloudBrowserProvider': ('agent.browser_provider', 'BrowserProvider'),
-    'FirecrawlProvider': ('plugins.browser.firecrawl.provider', 'FirecrawlBrowserProvider'),
-    'agent_browser_runnable': ('hermes_constants', 'agent_browser_runnable'),
-    'check_browser_requirements': ('tools.browser_tool_install', 'check_browser_requirements'),
-    'check_browser_vision_requirements': ('tools.browser_tool_install', 'check_browser_vision_requirements'),
-    'cleanup_all_browsers': ('tools.browser_tool_lifecycle', 'cleanup_all_browsers'),
-    'cleanup_browser': ('tools.browser_tool_lifecycle', 'cleanup_browser'),
-    'get_hermes_home_override': ('hermes_constants', 'get_hermes_home_override'),
-    'hermes_home_key': ('hermes_constants', 'hermes_home_key'),
-    'is_truthy_value': ('utils', 'is_truthy_value'),
-    'lightpanda_engine_status': ('tools.browser_tool_lightpanda_fallback', 'lightpanda_engine_status'),
-    'node_tool_runnable': ('hermes_constants', 'node_tool_runnable'),
-    'normalize_browser_cloud_provider': ('tools.tool_backend_helpers', 'normalize_browser_cloud_provider'),
-    'reset_hermes_home_override': ('hermes_constants', 'reset_hermes_home_override'),
-    'set_hermes_home_override': ('hermes_constants', 'set_hermes_home_override'),
-    'warm_agent_browser_npx_cache': ('tools.browser_tool_install', 'warm_agent_browser_npx_cache'),
-    'windows_hide_flags': ('hermes_cli._subprocess_compat', 'windows_hide_flags'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----

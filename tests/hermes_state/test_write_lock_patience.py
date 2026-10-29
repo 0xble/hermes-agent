@@ -27,13 +27,17 @@ import pytest
 from hermes_state import SessionDB
 
 
-def _hold_write_lock(db_path, hold_s, started_evt):
-    """Hold the SQLite write lock on *db_path* for *hold_s* seconds."""
+def _hold_write_lock(db_path, hold_s, started_evt, release_evt=None):
+    """Hold the SQLite write lock on *db_path* for *hold_s* seconds, or until
+    *release_evt* is set when given (hold_s is then only a safety cap)."""
     conn = sqlite3.connect(str(db_path), timeout=1.0, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
         started_evt.set()
-        time.sleep(hold_s)
+        if release_evt is None:
+            time.sleep(hold_s)
+        else:
+            release_evt.wait(hold_s)
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -87,8 +91,11 @@ class TestTranscriptWritePatience:
         monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.2)
 
         started = threading.Event()
+        release = threading.Event()
+        # Held until the write attempt returns: a fixed hold could expire before a
+        # starved writer even starts on a loaded runner, and the write would succeed.
         holder = threading.Thread(
-            target=_hold_write_lock, args=(db.db_path, 2.0, started)
+            target=_hold_write_lock, args=(db.db_path, 60.0, started, release)
         )
         holder.start()
         try:
@@ -96,6 +103,7 @@ class TestTranscriptWritePatience:
             with pytest.raises(sqlite3.OperationalError) as excinfo:
                 db.set_meta("k", "v")  # routine write, short patience
         finally:
+            release.set()
             holder.join(timeout=10.0)
         assert not holder.is_alive()
         text = str(excinfo.value)
@@ -148,3 +156,86 @@ class TestOpenLockPatience:
             SessionDB(db_path=bad_path)
         # Must fail well before a full patience window (loose bound).
         assert time.monotonic() - t0 < 15.0
+
+
+def _use_delete_journal_mode(monkeypatch, tmp_path):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text("database:\n  journal_mode: delete\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+
+def _hold_exclusive(db_path, hold_s, started_evt):
+    """DELETE mode: only EXCLUSIVE shuts readers out (a sibling's commit or VACUUM)."""
+    conn = sqlite3.connect(str(db_path), timeout=1.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+        started_evt.set()
+        time.sleep(hold_s)
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read_only"])
+def test_open_waits_out_lock_lost_inside_fts_constructor(tmp_path, monkeypatch, read_only):
+    """A DELETE-mode sibling taking the lock between schema load and the messages_fts probe
+    makes SQLite report SQLITE_BUSY as "vtable constructor failed: messages_fts" (FTS5's
+    xConnect reads %_config). The open must wait that out like any other lock, not fail."""
+    _use_delete_journal_mode(monkeypatch, tmp_path)
+    db_path = tmp_path / "state.db"
+    seed = SessionDB(db_path=db_path)
+    assert not seed._wal_active
+    seed.create_session("s", "cli")
+    seed.append_message(session_id="s", role="user", content="needle")
+    seed.close()
+
+    started = threading.Event()
+    holder = threading.Thread(target=_hold_exclusive, args=(db_path, 2.5, started))
+    real_probe = SessionDB._fts_table_probe
+
+    def probe_after_sibling_takes_lock(self, cursor, table_name):
+        if table_name == "messages_fts" and not holder.is_alive() and not started.is_set():
+            cursor.execute("SELECT count(*) FROM sqlite_master").fetchall()  # schema cached
+            holder.start()
+            assert started.wait(5.0)
+        return real_probe(self, cursor, table_name)
+
+    monkeypatch.setattr(SessionDB, "_fts_table_probe", probe_after_sibling_takes_lock)
+    try:
+        db = SessionDB(db_path=db_path, read_only=read_only)
+    finally:
+        if started.is_set():
+            holder.join(timeout=10.0)
+    try:
+        assert started.is_set(), "the lock race was never placed"
+        assert db._fts_enabled is True
+        assert [m["content"] for m in db.get_messages("s")] == ["needle"]
+    finally:
+        db.close()
+
+
+def test_lock_lost_inside_fts_constructor_classifies_as_busy(tmp_path):
+    """When patience does run out, the same error must read as "busy" (HTTP 503, "locked"
+    guidance), not as an internal error: SQLite keeps SQLITE_BUSY but not the wording."""
+    from hermes_state_errors import classify_persistence_error, is_transient_sqlite_error
+
+    db_path = tmp_path / "fts.db"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("PRAGMA journal_mode=DELETE")
+    setup.execute("CREATE VIRTUAL TABLE messages_fts USING fts5(content)")
+    setup.commit()
+    setup.close()
+    reader = sqlite3.connect(str(db_path), timeout=0.05)
+    holder = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        reader.execute("SELECT count(*) FROM sqlite_master").fetchall()
+        holder.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
+            reader.execute("SELECT * FROM messages_fts LIMIT 0").fetchall()
+    finally:
+        holder.close()
+        reader.close()
+    assert "vtable constructor failed" in str(excinfo.value)
+    assert is_transient_sqlite_error(excinfo.value)
+    assert classify_persistence_error(excinfo.value) == "locked"

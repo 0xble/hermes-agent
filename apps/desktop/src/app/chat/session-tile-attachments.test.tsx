@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ComposerScope } from '@/app/chat/composer/scope'
 import { useSessionTileActions } from '@/app/chat/session-tile-actions'
+import type { SubmitTextResult } from '@/app/session/hooks/use-prompt-actions/utils'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import {
   type ComposerAttachment,
@@ -85,11 +86,15 @@ function installDelegate(): void {
   setSessionTileDelegate({
     archiveSession: vi.fn(async () => undefined),
     branchSession: vi.fn(async () => undefined),
+    branchSessionAtMessage: vi.fn(async () => true),
     deleteSession: vi.fn(async () => undefined),
     executeSlash: vi.fn(async () => undefined),
     interruptSession: vi.fn(async () => undefined),
     resumeTile: vi.fn(async () => RUNTIME_ID),
-    submitToSession: vi.fn(async () => undefined),
+    submitToSession: vi.fn(async () => ({
+      runtimeSessionId: RUNTIME_ID,
+      storedSessionId: null
+    })),
     updateSession
   })
 }
@@ -151,7 +156,7 @@ describe('session tile attachment occurrence ownership', () => {
       useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = result.current.submitText('describe this')
     })
@@ -197,7 +202,7 @@ describe('session tile attachment occurrence ownership', () => {
       useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = result.current.submitText('describe this')
     })
@@ -235,7 +240,7 @@ describe('session tile attachment occurrence ownership', () => {
       useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = result.current.submitText('describe this')
     })
@@ -272,7 +277,7 @@ describe('session tile attachment occurrence ownership', () => {
       useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = result.current.submitText('read this')
     })

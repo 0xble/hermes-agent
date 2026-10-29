@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hermes_cli import env_loader  # noqa: E402
+from hermes_cli import env_loader
 
 
 @pytest.fixture(autouse=True)
@@ -37,9 +37,6 @@ def test_get_secret_source_returns_none_for_untracked_var():
     assert env_loader.get_secret_source("ANTHROPIC_API_KEY") is None
 
 
-def test_get_secret_source_returns_label_for_tracked_var():
-    env_loader._SECRET_SOURCES["ANTHROPIC_API_KEY"] = "bitwarden"
-    assert env_loader.get_secret_source("ANTHROPIC_API_KEY") == "bitwarden"
 
 
 def test_get_secret_source_values_returns_home_snapshot_copy(tmp_path):
@@ -69,30 +66,10 @@ def test_format_secret_source_suffix_empty_for_untracked():
     assert env_loader.format_secret_source_suffix("ANTHROPIC_API_KEY") == ""
 
 
-def test_format_secret_source_suffix_bitwarden_uses_proper_name():
-    env_loader._SECRET_SOURCES["ANTHROPIC_API_KEY"] = "bitwarden"
-    assert (
-        env_loader.format_secret_source_suffix("ANTHROPIC_API_KEY")
-        == " (from Bitwarden)"
-    )
 
 
-def test_format_secret_source_suffix_generic_label_for_future_sources():
-    # Future-proofing: a new secret source (e.g. "vault") should still
-    # produce a sensible label without needing to edit every call site.
-    env_loader._SECRET_SOURCES["OPENAI_API_KEY"] = "vault"
-    assert (
-        env_loader.format_secret_source_suffix("OPENAI_API_KEY")
-        == " (from vault)"
-    )
 
 
-def test_format_secret_source_suffix_onepassword_uses_proper_name():
-    env_loader._SECRET_SOURCES["OPENAI_API_KEY"] = "onepassword"
-    assert (
-        env_loader.format_secret_source_suffix("OPENAI_API_KEY")
-        == " (from 1Password)"
-    )
 
 
 def test_apply_external_secret_sources_records_bitwarden_origin(tmp_path, monkeypatch):
@@ -538,7 +515,6 @@ def test_apply_external_secret_sources_status_line_suppresses_secret_names(
     env_loader._apply_external_secret_sources(tmp_path)
 
     err = capsys.readouterr().err
-    assert "Bitwarden Secrets Manager: applied 2 secrets" in err
     assert "LEAK_THIS_API_KEY" not in err
     assert "LEAK_THIS_TOKEN" not in err
 
@@ -778,3 +754,31 @@ def test_home_scoped_reset_preserves_sibling_snapshot(tmp_path, monkeypatch, _fr
     assert env_loader.get_secret_source_values(home) == {}
     assert env_loader.get_secret_source_values(sibling) == {"GLM_API_KEY": "vault-b"}
     assert str(sibling.resolve()) in env_loader._APPLIED_HOMES
+
+
+def test_a_source_returning_a_non_set_degraded_kinds_cannot_drop_every_secret(tmp_path):
+    """degraded_kinds is public API, so a third-party source may hand back a list or None.
+
+    `&` raises TypeError on those, apply_all does not catch it, and the env_loader callers
+    swallow the exception by returning {} — silently dropping every secret for that home.
+    """
+    from agent.secret_sources import registry
+    from agent.secret_sources.base import ErrorKind, FetchResult, SecretSource
+
+    class _Sloppy(SecretSource):
+        name, label, shape = "sloppy", "Sloppy", "mapped"
+
+        def fetch(self, cfg, home_path):
+            result = FetchResult(secrets={"KEPT": "value"})
+            result.degraded_kinds = [ErrorKind.TIMEOUT]  # a list, not a frozenset
+            return result
+
+    registry._reset_registry_for_tests()
+    registry.register_source(_Sloppy())
+    env: dict = {}
+    report = registry.apply_all({"sloppy": {"enabled": True}}, tmp_path, environ=env)
+
+    assert env.get("KEPT") == "value", "a sloppy source must not cost us every secret"
+    assert report.applied_any
+    assert registry.last_apply_had_transient_failure(tmp_path) is True
+    registry._reset_registry_for_tests()

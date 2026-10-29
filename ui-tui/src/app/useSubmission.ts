@@ -11,7 +11,9 @@ import { asRpcResult } from '../lib/rpc.js'
 import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js'
 import type { Msg } from '../types.js'
 
+import { reportSlashCommand } from './createSlashHandler.js'
 import type { ComposerActions, ComposerRefs, ComposerState, ComposerToken } from './interfaces.js'
+import { findSlashCommand } from './slash/registry.js'
 import { submitPrompt } from './submissionCore.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
@@ -103,7 +105,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { skipDetectDrop?: boolean } = {}
+      submitOpts: { moaToken?: string; skipDetectDrop?: boolean; literal?: boolean } = {}
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
@@ -178,18 +180,28 @@ export function useSubmission(opts: UseSubmissionOptions) {
   )
 
   const sendQueued = useCallback(
-    (text: string) => {
-      if (text.startsWith('!')) {
-        return shellExec(text.slice(1).trim())
+    (item: QueueItem) => {
+      // A token-bearing item is an opaque backend payload: no shell shortcut,
+      // interpolation, paste expansion, or slash handling may reinterpret it.
+      if (item.moaToken) {
+        return send(item.text, true, item.display, undefined, {
+          literal: true,
+          moaToken: item.moaToken,
+          skipDetectDrop: true
+        })
       }
 
-      if (hasInterpolation(text)) {
+      if (item.text.startsWith('!')) {
+        return shellExec(item.text.slice(1).trim())
+      }
+
+      if (hasInterpolation(item.text)) {
         patchUiState({ busy: true })
 
-        return interpolate(text, send)
+        return interpolate(item.text, text => send(text, true, undefined, undefined, { moaToken: item.moaToken }))
       }
 
-      send(text)
+      send(item.text, true, undefined, undefined, { moaToken: item.moaToken })
     },
     [interpolate, send, shellExec]
   )
@@ -214,13 +226,21 @@ export function useSubmission(opts: UseSubmissionOptions) {
         if (opts.fallbackToFront) {
           composerActions.prependQueue(item)
         } else {
-          composerActions.enqueue(item.text, item.display)
+          composerActions.enqueue(item.text, item.display, item.moaToken)
         }
       }
 
       const fallback = (note: string) => {
         enqueueText()
         sys(note)
+      }
+
+      // Deferred MoA prompts carry a backend-owned one-shot identity. They must
+      // never steer or interrupt the current turn, because doing so can execute
+      // the queued payload against the wrong live request. Keep the identity on
+      // the queue until the current turn settles.
+      if (item.moaToken) {
+        return enqueueText()
       }
 
       if (mode === 'queue') {
@@ -245,15 +265,34 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // the agent is in model generation, tool execution, or an older runtime.
       // Reuse the normal submit pipeline so the correction gets its user bubble
       // and file-drop interpolation exactly once.
-      send(item.text)
+      send(item.text, true, item.display, undefined, { moaToken: item.moaToken })
     },
     [composerActions, gw, send, sys]
   )
 
   const dispatchSubmission = useCallback(
-    (full: string) => {
+    (full: string, moaToken?: string) => {
       if (!full.trim()) {
         return
+      }
+
+      // Deferred MoA payloads are opaque: preserve the exact text and token on
+      // every path, including idle force-send and queue edits. Never run shell,
+      // interpolation, paste expansion, or slash parsing on them.
+      if (moaToken) {
+        const live = getUiState()
+        composerActions.pushHistory(full)
+        composerActions.clearIn()
+
+        if (!live.sid) {
+          return composerActions.enqueue(full, full, moaToken)
+        }
+
+        if (live.busy) {
+          return handleBusyInput(queueItem(full, full, moaToken))
+        }
+
+        return send(full, true, full, undefined, { literal: true, moaToken, skipDetectDrop: true })
       }
 
       // History stores resolved content, not `[[…]]` labels: tokens are cleared
@@ -264,6 +303,16 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const submissionTokens = [...composerRefs.tokensRef.current]
       const submission = prepareSubmission(full, submissionTokens)
       const toHistory = submission.text
+
+      // A deferred MoA item is already a backend-resolved payload. While the
+      // current turn is busy, bypass slash/shell interpretation entirely and
+      // return the item to the queue with its opaque identity intact.
+      if (moaToken && getUiState().busy) {
+        composerActions.pushHistory(toHistory)
+        composerActions.clearIn()
+
+        return handleBusyInput(queueItem(full, full, moaToken))
+      }
 
       if (looksLikeSlashCommand(full)) {
         const slash = prepareSlashSubmission(full, submissionTokens)
@@ -277,7 +326,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
           parsed.name === 'queue' || parsed.name === 'q' ? queueItemFromSlash(slash.display, slash.command) : undefined
 
         if (queued) {
-          composerActions.enqueue(queued.text, queued.display)
+          // Handled here, before the slash handler, so it is counted here.
+          reportSlashCommand(gw, parsed.name, getUiState().sid)
+          composerActions.enqueue(queued.text, queued.display, queued.moaToken)
           sys(`queued: "${queued.display.slice(0, 50)}${queued.display.length > 50 ? '…' : ''}"`)
         } else {
           slashRef.current(slash.command)
@@ -288,7 +339,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return
       }
 
-      if (full.startsWith('!')) {
+      if (full.startsWith('!') && !moaToken) {
         composerActions.clearIn()
 
         return shellExec(full.slice(1).trim())
@@ -326,13 +377,13 @@ export function useSubmission(opts: UseSubmissionOptions) {
           return handleBusyInput(picked, { fallbackToFront: true })
         }
 
-        return sendQueued(picked.text)
+        return sendQueued(picked)
       }
 
       composerActions.pushHistory(toHistory)
 
       if (getUiState().busy) {
-        return handleBusyInput(queueItem(full))
+        return handleBusyInput(queueItem(full, full, moaToken))
       }
 
       if (shouldInterpolateSubmission(full)) {
@@ -343,12 +394,13 @@ export function useSubmission(opts: UseSubmissionOptions) {
         )
       }
 
-      send(submission.text, true, submission.display, value => value)
+      send(submission.text, true, submission.display, value => value, { moaToken })
     },
     [
       appendMessage,
       composerActions,
       composerRefs,
+      gw,
       handleBusyInput,
       interpolate,
       send,
@@ -363,7 +415,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
     (value: string) => {
       if (composerState.completions.length) {
         const row = composerState.completions[composerState.compIdx]
-        const next = completionToApplyOnSubmit(value, row?.text, composerState.compReplace)
+
+        const next = completionToApplyOnSubmit(value, row?.text, composerState.compReplace, name =>
+          Boolean(findSlashCommand(name))
+        )
 
         if (next !== null) {
           return composerActions.setInput(next)
@@ -389,7 +444,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
           if (next) {
             composerActions.setQueueEdit(null)
-            dispatchSubmission(next)
+            dispatchSubmission(next.text, next.moaToken)
           }
         }
 
@@ -436,7 +491,7 @@ export interface UseSubmissionOptions {
   composerState: ComposerState
   gw: GatewayClient
   setLastUserMsg: (value: string) => void
-  slashRef: MutableRefObject<(cmd: string) => boolean>
+  slashRef: MutableRefObject<(cmd: string, typed?: boolean) => boolean>
   submitRef: MutableRefObject<(value: string) => void>
   sys: (text: string) => void
 }

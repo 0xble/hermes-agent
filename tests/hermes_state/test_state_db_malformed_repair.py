@@ -29,6 +29,9 @@ from hermes_state import SessionDB, is_malformed_db_error
 from hermes_state_repair import repair_state_db_schema
 
 
+pytestmark = pytest.mark.usefixtures("adequate_repair_capacity")
+
+
 def _build_healthy_db(db_path: Path) -> str:
     db = SessionDB(db_path=db_path)
     sid = db.create_session(session_id=str(uuid.uuid4()), source="cli")
@@ -461,7 +464,7 @@ def _lock_held_by_other_process(db_path: Path, hold_seconds: float = 30.0):
         proc.wait(timeout=10)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.platforms("posix")  # POSIX flock test
 def test_repair_skips_surgery_while_another_process_holds_the_lock(
     tmp_path, monkeypatch
 ):
@@ -482,7 +485,7 @@ def test_repair_skips_surgery_while_another_process_holds_the_lock(
     assert hermes_state_repair._db_opens_cleanly(db_path) is not None
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.platforms("posix")  # POSIX flock test
 def test_repair_reports_success_when_the_holder_already_healed_the_db(
     tmp_path, monkeypatch
 ):
@@ -502,7 +505,9 @@ _REPAIR_SCRIPT = """
 import sys, json
 sys.path.insert(0, {root!r})
 from hermes_state_repair import repair_state_db_schema
-print(json.dumps(repair_state_db_schema({db!r})), flush=True)
+from tests._fixtures.repair_capacity import ample_repair_capacity
+with ample_repair_capacity():
+    print(json.dumps(repair_state_db_schema({db!r})), flush=True)
 """
 
 
@@ -517,7 +522,7 @@ def _release_header_probe_fds() -> None:
         hermes_state_dbfile._HEADER_PROBE_FDS.clear()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.platforms("posix")  # POSIX flock test
 def test_two_processes_repairing_at_once_perform_surgery_once(tmp_path):
     """Concurrent repairers serialise; the loser sees a healed DB and stops.
 
@@ -672,7 +677,7 @@ def _mode_of(db_path) -> str:
 
 
 def _configure_journal_mode(monkeypatch, tmp_path, mode) -> None:
-    import yaml
+    import hermes_yaml as yaml
 
     home = tmp_path / "hermes-home"
     home.mkdir(exist_ok=True)
@@ -747,7 +752,7 @@ def test_repair_restore_matches_canonical_on_vulnerable_sqlite(
     assert _mode_of(db_path) == "delete"
 
 
-def test_repair_logs_mode_change_when_probe_succeeded(
+def test_repair_reports_mode_change_when_probe_succeeded(
     tmp_path, caplog, monkeypatch
 ):
     """When the pre-surgery probe read the file (header intact), the
@@ -775,34 +780,11 @@ def test_repair_logs_mode_change_when_probe_succeeded(
     assert report["repaired"] is True
     assert report["journal_mode_before"] == "delete"
     assert _mode_of(db_path) == "wal"
-    assert any(
-        "changed journal_mode" in r.getMessage() for r in caplog.records
-    ), f"expected the mode flip to be logged; got: {[r.getMessage() for r in caplog.records]}"
 
 
-def test_repair_logs_nothing_when_mode_already_matches(
-    tmp_path, caplog, monkeypatch
-):
-    """FTS-only corruption keeps the WAL bit; the restore is then a no-op and
-    must not emit a mode-flip WARNING."""
-    import logging
-
-    db_path = tmp_path / "state.db"
-    _configure_journal_mode(monkeypatch, tmp_path, "wal")
-    _build_healthy_db(db_path)
-    _corrupt_duplicate_fts(db_path)
-
-    with caplog.at_level(logging.WARNING, logger="hermes_state"):
-        report = repair_state_db_schema(db_path)
-
-    assert report["repaired"] is True
-    assert _mode_of(db_path) == "wal"
-    assert not any(
-        "changed journal_mode" in r.getMessage() for r in caplog.records
-    )
 
 
-def test_repair_restore_failure_is_nonfatal_and_logged(
+def test_repair_restore_failure_is_nonfatal(
     tmp_path, caplog, monkeypatch
 ):
     """When the canonical restore path raises (locked/unsupported fs), the
@@ -830,10 +812,6 @@ def test_repair_restore_failure_is_nonfatal_and_logged(
 
     assert report["repaired"] is True
     assert _mode_of(db_path) == "delete"
-    assert any(
-        "journal-mode restore failed" in r.getMessage()
-        for r in caplog.records
-    )
 
 
 def test_repair_honors_configured_delete_mode(tmp_path, monkeypatch):

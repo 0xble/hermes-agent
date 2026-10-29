@@ -8,6 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.i18n import t
+from gateway.platforms.base import unauthorized_action_notice, utf16_len
+
 # ---------------------------------------------------------------------------
 # Ensure the repo root is importable
 # ---------------------------------------------------------------------------
@@ -75,6 +78,53 @@ class TestTelegramExecApproval:
         assert "dangerous deletion" in kwargs["text"]
         assert kwargs["reply_markup"] is not None  # InlineKeyboardMarkup
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("smart_denied", [False, True])
+    async def test_oversized_escaped_approval_text_keeps_inline_keyboard(self, smart_denied):
+        """The rendered HTML card (escaped command + reason + framing) must fit Telegram's
+        4096-char cap, otherwise the API rejects it and the gateway falls back to /approve."""
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+
+        await adapter.send_exec_approval(
+            chat_id="12345",
+            command="&" * 3700,  # inside the old raw budget; 5x larger once escaped
+            session_key="s",
+            description="<reason>" * 1000,
+            smart_denied=smart_denied,
+        )
+
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+        assert "&amp;&amp;" in kwargs["text"] and "&lt;reason&gt;" in kwargs["text"]
+        assert kwargs["reply_markup"] is not None
+
+    @pytest.mark.asyncio
+    async def test_emoji_dense_approval_card_fits_in_utf16_units(self):
+        """Telegram counts UTF-16 code units (astral emoji = 2), like the adapter's chunker."""
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+
+        await adapter.send_exec_approval(chat_id="12345", command="😀" * 3000, session_key="s")
+
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert utf16_len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+        assert kwargs["reply_markup"] is not None
+
+    @pytest.mark.asyncio
+    async def test_slash_confirm_preview_fits_after_markdown_escaping(self):
+        """The slash-confirm card is measured after format_message (MarkdownV2 escaping expands
+        text), so a 3800-char raw message must still land under the 4096 cap."""
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+
+        await adapter.send_slash_confirm(
+            chat_id="12345", title="t", message="." * 3800, session_key="s", confirm_id="c1")
+
+        kwargs = adapter._bot.send_message.call_args.kwargs
+        assert utf16_len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+        assert kwargs["reply_markup"] is not None
+
 
     @pytest.mark.asyncio
     async def test_non_smart_allow_permanent_false_keeps_session(self, monkeypatch):
@@ -83,7 +133,7 @@ class TestTelegramExecApproval:
         buttons = []
         monkeypatch.setattr(
             "plugins.platforms.telegram.adapter.InlineKeyboardButton",
-            lambda text, callback_data: buttons.append(text) or text,
+            lambda text, callback_data, **kwargs: buttons.append((text, kwargs.get("style"))) or text,
         )
         monkeypatch.setattr(
             "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
@@ -94,31 +144,11 @@ class TestTelegramExecApproval:
             allow_permanent=False,
         )
 
-        assert buttons == ["✅ Allow Once", "✅ Session", "❌ Deny"]
-
-    @pytest.mark.asyncio
-    async def test_full_approval_keyboard_is_two_by_two(self, monkeypatch):
-        """Regression: d48bf743f flattened all buttons into one row (4x1)."""
-        adapter = _make_adapter()
-        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
-        captured_rows = []
-        monkeypatch.setattr(
-            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
-            lambda text, callback_data: text,
-        )
-        monkeypatch.setattr(
-            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
-            lambda rows: captured_rows.extend(rows) or rows,
-        )
-
-        await adapter.send_exec_approval(
-            chat_id="12345", command="curl example.test", session_key="s",
-        )
-
-        assert captured_rows == [
-            ["✅ Allow Once", "✅ Session"],
-            ["✅ Always", "❌ Deny"],
+        assert buttons == [
+            (t(f"platform.telegram.approval.action_{c}"), "success" if c != "deny" else None)
+            for c in ("once", "session", "deny")
         ]
+
 
 
     @pytest.mark.asyncio
@@ -129,7 +159,7 @@ class TestTelegramExecApproval:
         captured_rows = []
         monkeypatch.setattr(
             "plugins.platforms.telegram.adapter.InlineKeyboardButton",
-            lambda text, callback_data: text,
+            lambda text, callback_data, **kwargs: text,
         )
         monkeypatch.setattr(
             "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
@@ -142,8 +172,49 @@ class TestTelegramExecApproval:
         )
 
         assert captured_rows == [
-            ["✅ Allow Once", "❌ Deny"],
+            [t("platform.telegram.approval.action_once"), t("platform.telegram.approval.action_deny")],
         ]
+
+
+    @pytest.mark.asyncio
+    async def test_approve_buttons_are_success_style_and_denials_are_unstyled(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+
+        class FakeButton:
+            def __init__(self, text, callback_data, **kwargs):
+                self.text = text
+                self.callback_data = callback_data
+                self.style = kwargs.get("style")
+
+        class FakeMarkup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardButton", FakeButton)
+        monkeypatch.setattr("plugins.platforms.telegram.adapter.InlineKeyboardMarkup", FakeMarkup)
+
+        async def keyboard_for(send):
+            adapter._bot.send_message.reset_mock()
+            result = await send()
+            assert result.success
+            return adapter._bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard
+
+        update_rows = await keyboard_for(lambda: adapter.send_update_prompt("12345", "restart?"))
+        assert update_rows[0][0].style == "success"
+        assert update_rows[0][1].style is None
+
+        control_rows = await keyboard_for(lambda: adapter.send_control_request("12345", "Clear session?", "r1"))
+        assert control_rows[0][0].style == "success"
+        assert control_rows[0][1].style is None
+
+        exec_rows = await keyboard_for(lambda: adapter.send_exec_approval(
+            "12345", "echo hi", "s1", allow_permanent=True, allow_session=True))
+        assert [button.style for row in exec_rows for button in row] == ["success", "success", "success", None]
+
+        slash_rows = await keyboard_for(lambda: adapter.send_slash_confirm(
+            "12345", "Confirm", "Proceed?", "s1", "c1"))
+        assert [button.style for row in slash_rows for button in row] == ["success", "success", None]
 
 
     @pytest.mark.asyncio
@@ -236,7 +307,6 @@ class TestTelegramApprovalCallback:
         edit_kwargs = query.edit_message_text.call_args[1]
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
         assert "Alice\\_Bob" in edit_kwargs["text"]
-        assert "Approved once" in edit_kwargs["text"]
 
 
     @pytest.mark.asyncio
@@ -293,7 +363,7 @@ class TestTelegramApprovalCallback:
                 await adapter._handle_callback_query(update, context)
 
         query.answer.assert_called_once()
-        assert "not authorized" in query.answer.call_args[1]["text"].lower()
+        assert query.answer.call_args[1]["text"] == unauthorized_action_notice("telegram")
         query.edit_message_text.assert_not_called()
         assert not (tmp_path / ".update_response").exists()
 
@@ -323,7 +393,7 @@ class TestTelegramApprovalCallback:
                 await adapter._handle_callback_query(update, context)
 
         query.answer.assert_called_once()
-        assert "not authorized" in query.answer.call_args[1]["text"].lower()
+        assert query.answer.call_args[1]["text"] == unauthorized_action_notice("telegram")
         query.edit_message_text.assert_not_called()
         assert not (tmp_path / ".update_response").exists()
         assert runner.last_source is not None

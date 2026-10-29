@@ -10,9 +10,10 @@ never saw verdicts. This test locks in the fix.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -70,7 +71,17 @@ class _RecordingAdapter:
         return _R()
 
 
-def _make_runner_with_adapter(session_id: str = None):
+class _CallbackRecordingAdapter(_RecordingAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.callback_registrations: list = []
+        self._active_sessions: dict = {}
+
+    def register_post_delivery_callback(self, session_key, callback, *, generation=None):
+        self.callback_registrations.append((session_key, generation, callback))
+
+
+def _make_runner_with_adapter(session_id: str | None = None, *, callbacks: bool = False):
     from gateway.run import GatewayRunner
     import uuid
 
@@ -84,7 +95,7 @@ def _make_runner_with_adapter(session_id: str = None):
     runner._queued_events = {}
 
     src = _make_source()
-    # Default to a unique session_id so xdist parallel runs on the same worker
+    # Default to a unique session_id so parallel runs
     # don't see each other's GoalManager state (DEFAULT_DB_PATH gets frozen at
     # module-import time, defeating per-test HERMES_HOME monkeypatches).
     session_entry = SessionEntry(
@@ -100,7 +111,7 @@ def _make_runner_with_adapter(session_id: str = None):
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store._generate_session_key.return_value = build_session_key(src)
 
-    adapter = _RecordingAdapter()
+    adapter = _CallbackRecordingAdapter() if callbacks else _RecordingAdapter()
     runner.adapters[Platform.TELEGRAM] = adapter
     return runner, adapter, session_entry, src
 
@@ -130,7 +141,10 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     mgr = GoalManager(session_entry.session_id)
     mgr.set("polish the docs")
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)):
+    # Real (non-read-only) work this turn, so pacing does not park it on the no-progress ladder.
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)), \
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -138,9 +152,8 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
         )
         await _drain_until(lambda: adapter.sends and adapter._pending_messages)
 
-    # Status line sent back
-    assert len(adapter.sends) == 1
-    assert "Continuing toward goal" in adapter.sends[0]["content"]
+    # Routine continuing status is log-only; the continuation still proceeds through the FIFO.
+    assert adapter.sends == []
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
 
@@ -158,7 +171,10 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     state.turns_used = 2
     save_goal(session_entry.session_id, state)
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False, None, False)):
+    # Real (non-read-only) work this turn, so pacing does not park it on the no-progress ladder.
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False, None, False)), \
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -174,3 +190,178 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert not adapter._pending_messages
 
 
+
+
+def _blocked_goal(session_id: str):
+    """Set a goal and drive it to the judge's BLOCKED auto-pause (needs user input)."""
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_id)
+    mgr.set("run both agent sessions end to end")
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False),
+    ):
+        assert mgr.evaluate_after_turn("May I use your login?")["status"] == "paused"
+    return mgr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [
+    "success", "cancelled", "blocked-again", "stop", "exception", "failed-result", "interrupted-result",
+])
+async def test_user_turn_revives_blocked_goal_before_gateway_run(hermes_home, monkeypatch, tmp_path, outcome):
+    """Admission, not successful delivery, owns recovery; a new in-run pause wins."""
+    from hermes_cli.goals import GoalManager
+    from tests.gateway.test_duplicate_user_message import _bootstrap, _event
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    event = _event()
+    entry = runner.session_store.get_or_create_session.return_value
+    adapter = _RecordingAdapter()
+    runner.adapters[event.source.platform] = adapter
+    _blocked_goal(entry.session_id)
+    before = GoalManager(entry.session_id).state
+    observed = []
+    loop_cleanup = AsyncMock()
+    runner._post_turn_loop_completion = loop_cleanup
+
+    async def run_agent(**kwargs):
+        observed.append(GoalManager(kwargs["session_id"]).state)
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+        if outcome == "exception":
+            raise RuntimeError("fixture provider unavailable")
+        if outcome == "failed-result":
+            return {"final_response": "Provider failed before completion", "messages": [],
+                    "history_offset": 0, "failed": True, "error": "fixture provider unavailable"}
+        if outcome == "interrupted-result":
+            return {"final_response": "Interrupted before completion", "messages": [],
+                    "history_offset": 0, "interrupted": True, "completed": False}
+        if outcome in {"blocked-again", "stop"}:
+            GoalManager(entry.session_id).pause(
+                reason=before.paused_reason if outcome == "blocked-again" else "user-paused")
+        return {"final_response": "repair underway", "messages": [], "history_offset": 0}
+
+    runner._run_agent = run_agent
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "more work", False, None, False)) as judge:
+        if outcome == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await runner._handle_message(event)
+        else:
+            await runner._handle_message(event)
+    assert len(observed) == 1
+    assert observed[0].status == "active"
+    assert observed[0].paused_reason is None
+    assert observed[0].turns_used == before.turns_used
+    assert observed[0].max_turns == before.max_turns
+    state = GoalManager(entry.session_id).state
+    assert any(s["content"].startswith("▶ Goal resumed") for s in adapter.sends)
+    if outcome != "cancelled":
+        loop_cleanup.assert_awaited_once()
+    if outcome in {"blocked-again", "stop"}:
+        assert state.status == "paused"
+        judge.assert_not_called()
+        assert not adapter._pending_messages
+    elif outcome in {"cancelled", "exception", "failed-result", "interrupted-result"}:
+        assert state.status == "active"
+        assert state.turns_used == before.turns_used
+        judge.assert_not_called()
+        assert not adapter._pending_messages
+    else:
+        assert state.status == "active"
+        assert adapter._pending_messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "internal", "continuation", "heartbeat", "proactive", "user-paused", "user-interrupted (Ctrl+C)",
+    "budget", "unauthorized", "rejected-preparation", "lease-timeout",
+])
+async def test_gateway_non_user_or_rejected_input_cannot_revive(hermes_home, monkeypatch, tmp_path, case):
+    from unittest.mock import AsyncMock
+    from hermes_cli.goals import GoalManager
+    from gateway.turn_lease import TurnLeaseTimeoutError
+    from tests.gateway.test_duplicate_user_message import _bootstrap, _event
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    event = _event()
+    entry = runner.session_store.get_or_create_session.return_value
+    _blocked_goal(entry.session_id)
+    if case in {"user-paused", "user-interrupted (Ctrl+C)"}:
+        GoalManager(entry.session_id).pause(reason=case)
+    elif case == "budget":
+        GoalManager(entry.session_id).pause(reason="turn budget exhausted (20/20)")
+    elif case == "internal":
+        event.internal = True
+    elif case == "continuation":
+        # Gateway-authored continuation provenance; a human quoting the header is a user turn.
+        event = runner._synthetic_prompt_event(
+            event.source, "[Continuing toward your standing goal]\nGoal: repair",
+            reply_expected=False, goal_continuation=True,
+            goal_session_id=entry.session_id, goal_state=GoalManager(entry.session_id).state,
+        )
+    elif case == "heartbeat":
+        event = runner._synthetic_prompt_event(event.source, "[Heartbeat — periodic check]")
+        event._heartbeat_session_id = entry.session_id
+        event._heartbeat_execution_started = False
+        runner.session_store.lookup_by_session_key.return_value = entry
+    elif case == "proactive":
+        event.allow_gateway_control = False
+    elif case == "unauthorized":
+        runner._is_user_authorized = lambda source: False
+    elif case == "rejected-preparation":
+        runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value=None)
+    elif case == "lease-timeout":
+        runner._hmwa_acquire_turn_lease = AsyncMock(side_effect=TurnLeaseTimeoutError(
+            entry.session_id, owner_key=entry.session_key, generation=1, wait_seconds=0))
+    before = GoalManager(entry.session_id).state
+    observed = []
+
+    async def run_agent(**kwargs):
+        observed.append(GoalManager(kwargs["session_id"]).state)
+        return {"final_response": "noted", "messages": [], "history_offset": 0}
+
+    runner._run_agent = run_agent
+    with patch("hermes_cli.goals.judge_goal") as judge:
+        await runner._handle_message(event)
+    if case in {"continuation", "unauthorized", "rejected-preparation", "lease-timeout"}:
+        # A paused goal's continuation is rejected at ingress, not merely barred from revival.
+        assert not observed
+    else:
+        assert len(observed) == 1
+        assert observed[0].status == before.status
+        assert observed[0].paused_reason == before.paused_reason
+    after = GoalManager(entry.session_id).state
+    assert after.status == before.status
+    assert after.paused_reason == before.paused_reason
+    assert after.turns_used == before.turns_used
+    judge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_parked_goal_notice_is_deduplicated_and_persisted(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter(callbacks=True)
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_entry.session_id)
+    mgr.set("finish the task")
+    mgr.wait_for_seconds(600, reason="waiting for build")
+
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry, source=src, final_response="new result",
+    )
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry, source=src, final_response="same result",
+    )
+
+    # Parked/wait-age status is durable bookkeeping only, never a chat send.
+    assert adapter.callback_registrations == []
+    restored = GoalManager(session_entry.session_id)
+    assert restored.state.last_wait_notice_key
+
+    restored.wait_for_seconds(600, reason="waiting for tests")
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry, source=src, final_response="changed wait",
+    )
+    assert adapter.callback_registrations == []

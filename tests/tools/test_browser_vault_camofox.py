@@ -8,7 +8,8 @@ from tools import browser_camofox as camo
 def test_camofox_vault_transport_success_and_errors(monkeypatch, caplog):
     monkeypatch.setattr(camo, 'is_camofox_mode', lambda: True)
     monkeypatch.setattr(camo, 'get_camofox_url', lambda: 'http://127.0.0.1:9377')
-    monkeypatch.setattr(camo, '_ensure_tab', lambda task: {'tab_id': 'test-tab', 'user_id': 'test-identity'})
+    monkeypatch.setattr(camo, '_get_session', lambda task: {'tab_id': 'test-tab', 'user_id': 'test-identity'})
+    monkeypatch.setattr(camo, '_ensure_tab', lambda *_a, **_k: pytest.fail('vault evaluation must never open a tab'))
     monkeypatch.setattr(vault, '_ensure_supervisor', lambda _: pytest.fail('Camofox must never attach CDP'))
     calls = []
     def post(path, body, *, allow_redirects):

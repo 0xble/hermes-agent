@@ -1,7 +1,8 @@
 """Result caching for web_search / web_extract; both caches TTL-bounded (default 20 min,
 ``web.cache_ttl_minutes``; disable with ``web.cache_enabled: false``), only successful responses cache.
-* **Search memo** — in-memory, per-process, single-flighted: concurrent identical queries share one
-  paid request. Limits bucket to 10/20/50/100 so near-identical requests share an entry.
+* **Search memo** — in-memory, single-flighted, and disk-backed under ``cache/web`` so
+  concurrent CLI, gateway, cron, and subagent processes share one paid request.
+  Limits bucket to 10/20/50/100 so near-identical requests share an entry.
 * **Extract cache** — disk-backed under ``cache/web`` (cross-process) with a JSON sidecar index:
   URL digest → (file, fetched_at, title). Hits re-run the normal truncate pipeline.
 Lives here, not in tool dispatch, so hits sit *after* every safety check and skip only the vendor call.
@@ -10,12 +11,13 @@ Lives here, not in tool dispatch, so hits sit *after* every safety check and ski
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import ContextManager, Dict, Optional, Iterator, Tuple
 from urllib.parse import urlparse
 from utils import atomic_json_write
 
@@ -28,13 +30,17 @@ DEFAULT_TTL_MINUTES = 20
 
 _INDEX_FILENAME = "extract-index.json"
 _INDEX_MAX_ENTRIES = 500  # oldest entries evicted past this
+_SEARCH_INDEX_FILENAME = "search-index.json"
+_SEARCH_INDEX_MAX_ENTRIES = 1000
+_SEARCH_INDEX_LOCK_NAME = "index-update"
+_SEARCH_BUDGET_WARNING_LIMITS = (50, 100)
 
 
 def _web_config() -> dict:
     try:
         from tools.web_tools import _load_web_config
         return _load_web_config()
-    except Exception:  # noqa: BLE001 — config problems must never break tools
+    except Exception:
         return {}
 
 
@@ -75,7 +81,217 @@ def _deep_copy(response: dict) -> dict:
     return json.loads(json.dumps(response))
 
 
-# ─── Search memo (in-memory, single-flight) ───────────────────────────────────
+# ---------------------------------------------------------------------------
+# Search cache helpers (disk-backed, cross-process)
+# ---------------------------------------------------------------------------
+
+
+def _search_digest(
+    provider: str,
+    query: str,
+    limit: int,
+    *,
+    endpoint: str = "search",
+    search_type: str = "",
+    freshness_class: str = "",
+) -> str:
+    """Hash the complete search identity, including routing and freshness inputs."""
+    raw = json.dumps({
+        "endpoint": endpoint,
+        "provider": provider,
+        "query": normalize_query(query),
+        "limit": bucket_limit(limit),
+        "search_type": search_type or "",
+        "freshness_class": freshness_class or "",
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _search_index_path() -> Optional[Path]:
+    d = _cache_dir()
+    return (d / _SEARCH_INDEX_FILENAME) if d else None
+
+
+def _load_search_index() -> dict:
+    path = _search_index_path()
+    if path is None or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, TypeError, ValueError):  # corrupt/unreadable index == empty cache
+        return {}
+
+
+def _save_search_index(index: dict) -> None:
+    path = _search_index_path()
+    if path is None:
+        return
+    try:
+        if len(index) > _SEARCH_INDEX_MAX_ENTRIES:
+            newest = sorted(index.items(), key=lambda kv: kv[1].get("fetched_at", 0), reverse=True)
+            index = dict(newest[:_SEARCH_INDEX_MAX_ENTRIES])
+        atomic_json_write(path, index, indent=None, mode=0o600)
+    except (OSError, TypeError, ValueError) as exc:  # cache writes are best-effort
+        logger.debug("Failed to save web search cache index: %s", exc)
+
+
+def _search_entry_path(digest: str) -> Optional[Path]:
+    d = _cache_dir()
+    return (d / f"search-{digest}.json") if d else None
+
+
+def search_cache_get(
+    provider: str,
+    query: str,
+    limit: int,
+    *,
+    endpoint: str = "search",
+    search_type: str = "",
+    freshness_class: str = "",
+) -> Optional[dict]:
+    """Read a fresh successful search response shared by Hermes processes."""
+    if not cache_enabled():
+        return None
+    digest = _search_digest(provider, query, limit, endpoint=endpoint,
+                            search_type=search_type, freshness_class=freshness_class)
+    with _index_lock:
+        entry = _load_search_index().get(digest)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        if (time.time() - float(entry.get("fetched_at", 0))) >= ttl_seconds():
+            return None
+    except (TypeError, ValueError):
+        return None
+    try:
+        file_path, cache_root = Path(entry["file"]), _cache_dir()
+        if cache_root is None or cache_root.resolve() not in file_path.resolve().parents:
+            return None
+        response = json.loads(file_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(response, dict) or not response.get("success"):
+            return None
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError):  # evicted/tampered file == miss
+        return None
+    logger.info("web_search disk cache hit: %r via %s", query, provider)
+    return _deep_copy(response)
+
+
+def search_cache_put(
+    provider: str,
+    query: str,
+    limit: int,
+    response: dict,
+    *,
+    endpoint: str = "search",
+    search_type: str = "",
+    freshness_class: str = "",
+) -> None:
+    """Persist only a complete, non-rescued successful search response."""
+    data = response.get("data") if isinstance(response, dict) else None
+    rescued = response.get("rescued_from") if isinstance(response, dict) else None
+    rescued = rescued or (isinstance(data, dict) and data.get("rescued_from"))
+    if (
+        not cache_enabled()
+        or not isinstance(response, dict)
+        or not response.get("success")
+        or rescued
+    ):
+        return
+    digest = _search_digest(provider, query, limit, endpoint=endpoint,
+                            search_type=search_type, freshness_class=freshness_class)
+    file_path = _search_entry_path(digest)
+    if file_path is None:
+        return
+    try:
+        atomic_json_write(file_path, response, indent=None, mode=0o600)
+        with search_cache_lock(_SEARCH_INDEX_LOCK_NAME):
+            with _index_lock:
+                index = _load_search_index()
+                index[digest] = {"file": str(file_path), "fetched_at": time.time()}
+                _save_search_index(index)
+    except (OSError, TypeError, ValueError) as exc:  # cache writes are best-effort
+        logger.debug("Failed to cache web search response: %s", exc)
+
+
+@contextmanager
+def search_cache_lock(digest: str) -> Iterator[bool]:
+    """Serialize the paid call for one key across CLI, gateway, cron, and children."""
+    path = _cache_dir()
+    lock_path = path / f"search-{digest}.lock" if path else None
+    if lock_path is None:
+        yield False
+        return
+    handle = None
+    acquired = False
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+")
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        acquired = True
+        yield acquired
+    finally:
+        if handle is not None:
+            if acquired:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
+
+
+class SearchBudget:
+    """Warn-only per-session counter for remote search attempts."""
+
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+        self._warned: dict[str, set[int]] = {}
+        self._lock = threading.Lock()
+
+    def record(self, session_id: Optional[str], provider: str) -> Optional[str]:
+        if not session_id:
+            return None
+        with self._lock:
+            count = self._counts.get(session_id, 0) + 1
+            self._counts[session_id] = count
+            warned = self._warned.setdefault(session_id, set())
+            threshold = next((limit for limit in _SEARCH_BUDGET_WARNING_LIMITS
+                              if count >= limit and limit not in warned), None)
+            if threshold is None:
+                return None
+            warned.add(threshold)
+        warning = (
+            f"Web search usage warning: session has made {count} remote {provider} search attempts. "
+            f"This is a warn-only soft budget at {threshold} attempts; work will continue."
+        )
+        logger.warning(warning)
+        return warning
+
+    def clear(self) -> None:
+        with self._lock:
+            self._counts.clear()
+            self._warned.clear()
+
+
+search_budget = SearchBudget()
+
+
+# ---------------------------------------------------------------------------
+# Search memo (in-memory, single-flight)
+# ---------------------------------------------------------------------------
+
 
 class SearchMemo:
     """TTL memo + single-flight coalescer for search responses. Thread-safe: the parallel tool-dispatch pool
@@ -83,40 +299,103 @@ class SearchMemo:
     wait for (and share) the winner's response."""
 
     def __init__(self) -> None:
-        self._store: Dict[tuple, Tuple[float, dict]] = {}  # key -> (expires_at, response)
+        self._store: dict[tuple, tuple[float, dict]] = {}  # key -> (expires_at, response)
         self._store_lock = threading.Lock()
-        self._key_locks: Dict[tuple, threading.Lock] = {}
+        self._key_locks: dict[tuple, threading.Lock] = {}
 
     @staticmethod
-    def _key(provider: str, query: str, limit: int) -> tuple:
-        return (provider, normalize_query(query), bucket_limit(limit))
+    def _key(
+        provider: str,
+        query: str,
+        limit: int,
+        *,
+        endpoint: str = "search",
+        search_type: str = "",
+        freshness_class: str = "",
+    ) -> tuple:
+        return (
+            endpoint,
+            provider,
+            normalize_query(query),
+            bucket_limit(limit),
+            search_type or "",
+            freshness_class or "",
+        )
 
-    def lookup(self, provider: str, query: str, limit: int) -> Optional[dict]:
+    def lookup(
+        self,
+        provider: str,
+        query: str,
+        limit: int,
+        *,
+        endpoint: str = "search",
+        search_type: str = "",
+        freshness_class: str = "",
+    ) -> Optional[dict]:
         if not cache_enabled():
             return None
-        key = self._key(provider, query, limit)
+        key = self._key(provider, query, limit, endpoint=endpoint,
+                        search_type=search_type, freshness_class=freshness_class)
         with self._store_lock:
             hit = self._store.get(key)
             if hit is None or time.monotonic() >= hit[0]:
                 self._store.pop(key, None)
-                return None
-        logger.info("web_search cache hit: %r via %s", query, provider)
-        return _deep_copy(hit[1])
+                hit = None
+        if hit is not None:
+            logger.info("web_search cache hit: %r via %s", query, provider)
+            return _deep_copy(hit[1])
+        return search_cache_get(
+            provider, query, limit, endpoint=endpoint, search_type=search_type,
+            freshness_class=freshness_class,
+        )
 
-    def store(self, provider: str, query: str, limit: int, response: dict) -> None:
-        """Cache a SUCCESSFUL response for the bucketed key."""
-        if not cache_enabled() or not isinstance(response, dict) or not response.get("success"):
+    def store(
+        self,
+        provider: str,
+        query: str,
+        limit: int,
+        response: dict,
+        *,
+        endpoint: str = "search",
+        search_type: str = "",
+        freshness_class: str = "",
+    ) -> None:
+        """Cache a successful, non-rescued response for the bucketed key."""
+        data = response.get("data") if isinstance(response, dict) else None
+        rescued = response.get("rescued_from") if isinstance(response, dict) else None
+        rescued = rescued or (isinstance(data, dict) and data.get("rescued_from"))
+        if (
+            not cache_enabled()
+            or not isinstance(response, dict)
+            or not response.get("success")
+            or rescued
+        ):
             return
-        key = self._key(provider, query, limit)
+        key = self._key(provider, query, limit, endpoint=endpoint,
+                        search_type=search_type, freshness_class=freshness_class)
         with self._store_lock:
             now = time.monotonic()  # opportunistic expiry sweep bounds memory
             for k in [k for k, (exp, _) in self._store.items() if now >= exp]:
                 del self._store[k]
             self._store[key] = (now + ttl_seconds(), _deep_copy(response))
+        search_cache_put(
+            provider, query, limit, response, endpoint=endpoint, search_type=search_type,
+            freshness_class=freshness_class,
+        )
 
-    def flight_lock(self, provider: str, query: str, limit: int) -> threading.Lock:
+    def flight_lock(
+        self,
+        provider: str,
+        query: str,
+        limit: int,
+        *,
+        endpoint: str = "search",
+        search_type: str = "",
+        freshness_class: str = "",
+    ) -> threading.Lock:
         """Per-key lock held around lookup-miss → paid request → store."""
-        key = self._key(provider, query, limit)
+        key = self._key(provider, query, limit, endpoint=endpoint,
+                        search_type=search_type, freshness_class=freshness_class)
         with self._store_lock:
             lock = self._key_locks.get(key)
             if lock is None:
@@ -129,11 +408,45 @@ class SearchMemo:
                 lock = self._key_locks[key] = threading.Lock()
             return lock
 
+    def process_lock(
+        self,
+        provider: str,
+        query: str,
+        limit: int,
+        *,
+        endpoint: str = "search",
+        search_type: str = "",
+        freshness_class: str = "",
+    ) -> ContextManager[bool]:
+        return search_cache_lock(_search_digest(
+            provider, query, limit, endpoint=endpoint, search_type=search_type,
+            freshness_class=freshness_class,
+        ))
+
     def clear(self) -> None:
         """Drop all cached entries (tests; config changes)."""
         with self._store_lock:
             self._store.clear()
             self._key_locks.clear()
+        search_budget.clear()
+        path = _cache_dir()
+        index_path = _search_index_path()
+        # Nothing on disk means nothing to unlink. Skipping resolve() here keeps the common
+        # empty-cache clear free of filesystem path resolution.
+        if path is None or index_path is None or not index_path.exists():
+            return
+        with _index_lock:
+            cache_root = path.resolve()
+            index = _load_search_index()
+            for entry in index.values():
+                with suppress(OSError, RuntimeError, TypeError, KeyError):
+                    file_path = Path(entry["file"]).resolve()
+                    if cache_root in file_path.parents:
+                        file_path.unlink()
+            with suppress(OSError):
+                index_path = _search_index_path()
+                if index_path is not None:
+                    index_path.unlink()
 
 
 search_memo = SearchMemo()
@@ -147,7 +460,7 @@ def slice_search_response(response: dict, limit: int) -> dict:
             out = _deep_copy(response)
             out["data"]["web"] = out["data"]["web"][:limit]
             return out
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return response
 
@@ -163,15 +476,15 @@ def _cache_dir() -> Optional[Path]:
         d = get_hermes_dir("cache/web", "web_cache")
         d.mkdir(parents=True, exist_ok=True)
         return d
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
 def _load_index() -> dict:
     try:
-        data = json.loads((_cache_dir() / _INDEX_FILENAME).read_text(encoding="utf-8"))
+        data = json.loads((_cache_dir() / _INDEX_FILENAME).read_text(encoding="utf-8-sig"))
         return data if isinstance(data, dict) else {}
-    except Exception:  # noqa: BLE001 — missing/corrupt index == empty cache
+    except Exception:
         return {}
 
 
@@ -186,7 +499,7 @@ def _save_index(index: dict) -> None:
         # CLI, gateway, cron, and subagents all write this index; the replace is atomic, so the worst case
         # under concurrent writers is a lost insert, never a truncated index.
         atomic_json_write(path, index, indent=None)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("Failed to save web extract cache index: %s", exc)
 
 
@@ -228,7 +541,7 @@ def _is_cache_exempt_host(url: str) -> bool:
         if not isinstance(patterns, (list, tuple)) or not host:
             return False
         return any(_host_matches_pattern(host, str(p)) for p in patterns)
-    except Exception:  # noqa: BLE001 — config problems never break tools
+    except Exception:
         return False
 
 
@@ -249,7 +562,7 @@ def _is_local_dev_url(url: str) -> bool:
         except ValueError:
             return False  # public DNS name
         return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified
-    except Exception:  # noqa: BLE001 — on doubt, don't cache
+    except Exception:
         return True
 
 
@@ -271,8 +584,8 @@ def extract_cache_get(url: str, format: Optional[str] = None, provider: str = ""
         # The index is plain JSON on disk; never let a tampered entry read outside cache/web.
         if cache_root.resolve() not in file_path.resolve().parents:
             return None
-        content = file_path.read_text(encoding="utf-8")
-    except Exception:  # noqa: BLE001 — evicted/pruned file == miss (or no cache dir)
+        content = file_path.read_text(encoding="utf-8-sig")
+    except Exception:
         return None
     logger.info("web_extract cache hit: %s", url)
     return {"url": url, "title": entry.get("title", ""), "content": content, "error": None, "cached": True}
@@ -298,14 +611,5 @@ def extract_cache_put(
                 "url": url, "file": str(file_path), "title": title or "", "fetched_at": time.time(),
             }
             _save_index(index)
-    except Exception as exc:  # noqa: BLE001 — cache writes are best-effort
+    except Exception as exc:
         logger.debug("Failed to cache web extract for %s: %s", url, exc)
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Any  # noqa: F401,E402
-from typing import List  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

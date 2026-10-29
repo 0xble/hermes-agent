@@ -1,18 +1,46 @@
-"""Tests for file permissions hardening on sensitive files."""
+"""Tests for file permissions hardening on sensitive files.
+
+POSIX permission bits (0700/0600) are only meaningful on POSIX filesystems;
+native Windows does not implement them, so these tests are host-gated (the
+repo's host-native rule: never fake the platform).
+"""
 
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
+
+pytestmark = pytest.mark.platforms("posix")
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def unmanaged_permission_policy(monkeypatch):
+    """Exercise owner-only policy even when the test runner itself is containerized.
+
+    The container regression below opts back in through HERMES_CONTAINER, so
+    it still exercises the real shared-directory and explicit-mode branches.
+    """
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    for name in (
+        "HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_HOME_MODE",
+        "HERMES_UID", "HERMES_GID",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
+        self.tmpdir = str(Path(tempfile.mkdtemp()).resolve())
         self.cron_dir = Path(self.tmpdir) / "cron"
         self.output_dir = self.cron_dir / "output"
 
@@ -78,7 +106,7 @@ class TestConfigFilePermissions(unittest.TestCase):
     """Verify config files get secure permissions."""
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
+        self.tmpdir = str(Path(tempfile.mkdtemp()).resolve())
 
     def tearDown(self):
         import shutil

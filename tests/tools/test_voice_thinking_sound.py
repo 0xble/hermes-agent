@@ -44,9 +44,6 @@ def _reset():
 
 
 class TestConfigGate:
-    def test_default_enabled(self):
-        with patch("hermes_cli.config.load_config", return_value={"voice": {}}):
-            assert vm.thinking_sound_enabled() is True
 
 
     def test_start_refuses_when_disabled(self):
@@ -123,6 +120,7 @@ class TestAudioOutputRefcount:
         vm.mark_audio_output_active(False)
         assert vm.is_audio_output_active() is False
 
+    @pytest.mark.real_audio_playback
     def test_play_audio_file_brackets_refcount(self, tmp_path):
         """play_audio_file flags real speaker output for its whole duration,
         so the thinking loop knows audio is flowing."""

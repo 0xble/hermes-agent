@@ -1,0 +1,380 @@
+"""Exercise the login backend through run_cli and an offline executable, not mocks."""
+import json
+import logging
+import os
+from contextlib import contextmanager
+from pathlib import Path
+import sys
+
+import pytest
+
+from agent import secret_scope
+from agent.vault_backends import onepassword
+from agent.vault_backends.base import UnlockRequired
+from agent.vault_backends.onepassword import OnePasswordLoginBackend
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+
+@pytest.fixture
+def fake_op(tmp_path, monkeypatch, caplog):
+    # Pin the executable and all home paths: never discover a developer's real op.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for key in list(os.environ):
+        if key.startswith("OP_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "dummy-launch-token")
+    monkeypatch.setenv("OP_CONNECT_TOKEN", "dummy-launch-connect-token")
+    monkeypatch.setenv("OP_CONNECT_HOST", "https://invalid.example")
+    monkeypatch.setenv("OP_SESSION_other", "dummy-launch-session")
+    monkeypatch.setenv("UNRELATED_API_KEY", "dummy-unrelated-key")
+    profiles = {}
+    for name in ("a", "b", "empty"):
+        home = tmp_path / f"profile-{name}"
+        home.mkdir()
+        home.joinpath(".env").write_text(
+            "" if name == "empty" else f"OP_SERVICE_ACCOUNT_TOKEN=dummy-profile-{name}-token\n"
+        )
+        profiles[name] = home
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b"}))
+    audit = tmp_path / "audit.jsonl"
+    executable = tmp_path / "op"
+    executable.write_text(f"#!{sys.executable}\n" + r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+root = Path(__file__).parent
+state = json.loads((root / "state.json").read_text())
+args = sys.argv[1:]
+token = os.environ.get("OP_SERVICE_ACCOUNT_TOKEN")
+identity = next((name for name in ("a", "b")
+                 if token == "dummy-profile-" + name + "-token"), None)
+record = {"argv": args, "identity": identity, "stdin_eof": sys.stdin.read() == "",
+          "unexpected_env": sorted(k for k in os.environ
+              if k.startswith("OP_CONNECT_") or k.startswith("OP_SESSION")
+              or k == "UNRELATED_API_KEY")}
+with (root / "audit.jsonl").open("a") as stream:
+    stream.write(json.dumps(record) + "\n")
+if identity is None or record["unexpected_env"]:
+    print("authentication rejected", file=sys.stderr)
+    sys.exit(1)
+if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
+    records = [{"id": "item-a", "title": "First", "category": "LOGIN", "vault": {"id": "vault-a"},
+                "urls": [{"href": "https://first.example/login"}]},
+               {"id": "item-b", "title": "Second", "category": "LOGIN", "vault": {"id": state["vault"]},
+                "urls": [{"href": "https://second.example/login"}]}]
+    records.append({"id": "card-c", "title": "Card", "category": "CREDIT_CARD", "vault": {"id": "vault-c"},
+                    "additional_information": "4111 **** 1111"})
+    if state["mode"] == "ambiguous":
+        records.append(dict(records[1], vault={"id": "wrong-vault"}))
+    print(json.dumps(records))
+elif args == ["item", "get", "card-c", "--vault", "vault-c", "--format", "json"]:
+    print(json.dumps({"id": "card-c", "title": "Card", "category": "CREDIT_CARD", "state": "ACTIVE",
+                      "vault": {"id": "vault-c"}, "additional_information": "4111 **** 1111",
+                      "fields": [{"id": "cvv", "value": "must-not-be-retained"}]}))
+elif args == ["item", "get", "card-c", "--vault", "vault-c", "--format", "json", "--reveal"]:
+    print(json.dumps({"id": "card-c", "category": "CREDIT_CARD", "fields": [
+        {"id": "ccnum", "value": "4111 1111 1111 1111"}, {"id": "cvv", "value": "dummy-cvv-9876"},
+        {"id": "expiry", "value": "202907"}, {"id": "cardholder", "value": "A User"}]}))
+elif args[:3] == ["item", "get", "item-b"] and args[3:5] == ["--vault", state["vault"]] and args[5:] == ["--format", "json"]:
+    mode = state["mode"]
+    if mode == "missing":
+        print(json.dumps({"id": "item-gone", "category": "LOGIN", "state": "ACTIVE", "vault": {"id": state["vault"]}}))
+    else:
+        print(json.dumps({"id": "item-b", "title": "Second", "category": "LOGIN",
+                          "state": "ARCHIVED" if mode == "archived" else "ACTIVE",
+                          "vault": {"id": state["vault"]},
+                          "urls": [{"href": "https://second.example/login"}]}))
+elif args[:3] == ["item", "get", "item-b"] and args[3:5] == ["--vault", state["vault"]]:
+    if state["mode"] == "error":
+        # Secret-bearing stdout from a failed command must not become diagnostics.
+        print(token + " dummy-password")
+        print("synthetic read failure", file=sys.stderr)
+        sys.exit(1)
+    if args[5:] == ["--format", "json", "--reveal"]:
+        revealed = state.get("secret_item", {
+            "id": "item-b", "category": "LOGIN", "vault": {"id": state["vault"]},
+            "fields": [{"id": "password", "purpose": "PASSWORD", "value": "dummy-password"}]})
+        print(state.get("reveal_text", json.dumps(revealed)))
+    elif args[5:] == ["--otp"]:
+        print("123456")
+    else:
+        sys.exit(2)
+elif args[:2] == ["item", "get"] and "--vault" not in args:
+    print("a vault query must be provided", file=sys.stderr)
+    sys.exit(1)
+elif args[:3] == ["item", "get", "item-b"] and "--vault" in args:
+    print("item not found in vault", file=sys.stderr)
+    sys.exit(1)
+else:
+    print("unexpected selector", file=sys.stderr)
+    sys.exit(2)
+''')
+    executable.chmod(0o700)
+    caplog.set_level(logging.DEBUG)
+    previous = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+
+    @contextmanager
+    def profile(name):
+        home_token = set_hermes_home_override(profiles[name])
+        scope_token = secret_scope.set_secret_scope(
+            secret_scope.load_env_file(profiles[name] / ".env")
+        )
+        try:
+            yield OnePasswordLoginBackend({"binary_path": str(executable)})
+        finally:
+            secret_scope.reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+
+    def calls():
+        return [json.loads(line) for line in audit.read_text().splitlines()] if audit.exists() else []
+
+    try:
+        yield profile, calls, state
+    finally:
+        secret_scope.set_multiplex_active(previous)
+
+
+def assert_no_secret_diagnostics(capfd, caplog, *diagnostics):
+    captured = capfd.readouterr()
+    text = captured.out + captured.err + caplog.text + repr(diagnostics)
+    for secret in ("dummy-profile-a-token", "dummy-profile-b-token", "dummy-launch-token",
+                   "dummy-launch-connect-token", "dummy-launch-session", "dummy-password",
+                   "dummy-cvv-9876", "4111111111111111"):
+        assert secret not in text
+
+
+@pytest.mark.parametrize("fake_op", [
+    pytest.param(None, marks=pytest.mark.platforms("linux"), id="linux"),
+    pytest.param(None, marks=pytest.mark.platforms("macos"), id="macos"),
+], indirect=True)
+def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, capfd, caplog, monkeypatch):
+    profile, calls, state = fake_op
+    now = [1000.0]
+    monkeypatch.setattr(onepassword.time, "monotonic", lambda: now[0])
+
+    with profile("a") as backend:
+        metadata = backend.list_items()
+        assert [item.id for item in metadata] == ["op:item-a", "op:item-b", "op:card-c"]
+        assert backend.get_meta("op:item-b").origin == "https://second.example"
+        card = backend.get_meta("op:card-c")
+        assert card.kind == "payment" and card.origin is None and card.identifier == "1111"
+        card_secret = backend.resolve_secret("op:card-c")
+        assert card_secret["card_number"] == "4111111111111111" and card_secret["cvc"] == "dummy-cvv-9876"
+        assert (card_secret["exp_month"], card_secret["exp_year"]) == ("07", "2029")
+        with pytest.raises(RuntimeError):
+            backend.resolve_password("op:card-c")  # a card handle is never a login
+        assert backend.resolve_password("op:item-b") == "dummy-password"
+        # An already-issued handle must use newly listed metadata, not a cached vault.
+        state.write_text(json.dumps({"mode": "ok", "vault": "vault-moved"}))
+        assert backend.resolve_otp("op:item-b") == "123456"
+        state.write_text(json.dumps({"mode": "error", "vault": "vault-moved"}))
+        with pytest.raises(RuntimeError, match="synthetic read failure") as error:
+            backend.resolve_password("op:item-b")
+        assert backend.resolve_otp("op:item-b") is None
+        before = len(calls())
+        state.write_text(json.dumps({"mode": "missing", "vault": "vault-moved"}))
+        with pytest.raises(RuntimeError, match="missing"):
+            backend.resolve_password("op:item-b")
+        assert backend.resolve_otp("op:item-b") is None
+        assert all(row["argv"][1:2] in (["get"], ["list"]) for row in calls()[before:])
+        assert all("--vault" in row["argv"] for row in calls()[before:] if row["argv"][1:2] == ["get"])
+        before = len(calls())
+        state.write_text(json.dumps({"mode": "archived", "vault": "vault-moved"}))
+        with pytest.raises(RuntimeError, match="missing"):
+            backend.resolve_password("op:item-b")
+        assert backend.resolve_otp("op:item-b") is None
+        assert all(row["argv"][1:2] in (["get"], ["list"]) for row in calls()[before:])
+        assert all("--vault" in row["argv"] for row in calls()[before:] if row["argv"][1:2] == ["get"])
+    rows = calls()
+    gets = [row["argv"] for row in rows if row["argv"][1] == "get"]
+    assert gets == [
+        ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
+        ["item", "get", "card-c", "--vault", "vault-c", "--format", "json"],
+        ["item", "get", "card-c", "--vault", "vault-c", "--format", "json", "--reveal"],
+        ["item", "get", "card-c", "--vault", "vault-c", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-b", "--format", "json", "--reveal"],
+        ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--otp"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json", "--reveal"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--otp"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+    ]
+    assert all(row["identity"] == "a" and row["stdin_eof"] and not row["unexpected_env"] for row in rows)
+    assert_no_secret_diagnostics(capfd, caplog, str(error.value), rows)
+
+
+@pytest.mark.parametrize("fake_op", [
+    pytest.param(None, marks=pytest.mark.platforms("linux"), id="linux"),
+    pytest.param(None, marks=pytest.mark.platforms("macos"), id="macos"),
+], indirect=True)
+def test_real_subprocess_auth_is_scoped_and_empty_profile_fails_closed(fake_op, capfd, caplog):
+    profile, calls, _ = fake_op
+    for name in ("a", "b", "a"):
+        before = len(calls())
+        with profile(name) as backend:
+            assert backend.resolve_password("op:item-b") == "dummy-password"
+        # A listing reused within the per-fill window is the same identity's own listing.
+        assert {row["identity"] for row in calls()[before:]} == {name}
+    before = calls()
+    with profile("empty") as backend:
+        assert not backend.is_unlocked()
+        assert backend.list_items() == []
+        with pytest.raises(UnlockRequired) as error:
+            backend.resolve_password("op:item-b")
+        assert backend.resolve_otp("op:item-b") is None
+    assert calls() == before  # No fallback to launch credentials or another profile.
+    token = secret_scope.set_secret_scope(None)
+    try:
+        with pytest.raises(secret_scope.UnscopedSecretError) as unscoped:
+            OnePasswordLoginBackend()
+    finally:
+        secret_scope.reset_secret_scope(token)
+    assert calls() == before
+    assert all(row["stdin_eof"] and not row["unexpected_env"] for row in before)
+    assert_no_secret_diagnostics(capfd, caplog, str(error.value), str(unscoped.value), before)
+
+_PASSWORD_CASES = [
+    pytest.param([
+        {"label": "password", "value": "synthetic-custom"},
+        {"id": "password", "purpose": "PASSWORD", "value": "synthetic-native"},
+    ], "synthetic-native", id="native-after-custom"),
+    pytest.param([
+        {"purpose": "PASSWORD", "value": "synthetic-native"},
+        {"label": "password", "value": "synthetic-custom"},
+        {"label": "password", "value": "synthetic-other-custom"},
+    ], "synthetic-native", id="native-before-ambiguous-custom"),
+    pytest.param([
+        {"purpose": "PASSWORD", "value": " \t\r\n"},
+        {"label": "password", "value": "synthetic-custom"},
+    ], "synthetic-custom", id="blank-native-fallback"),
+    pytest.param([
+        {"label": "password", "value": ""},
+        {"label": "PASSWORD", "value": " \tsynthetic-custom\r\n\n"},
+    ], " \tsynthetic-custom\r\n\n", id="blank-custom-before-usable-preserve-bytes"),
+    pytest.param([
+        {"purpose": "PASSWORD", "value": ""},
+        {"purpose": "PASSWORD", "value": " \tsynthetic-native\r\n\n"},
+        {"label": "password", "value": "synthetic-custom"},
+    ], " \tsynthetic-native\r\n\n", id="blank-native-before-usable-preserve-bytes"),
+    pytest.param([
+        {"purpose": "USERNAME", "label": "password", "value": "not-a-password"},
+        {"purpose": "ONE_TIME_PASSWORD", "label": "password", "value": "not-a-password"},
+        {"label": "password", "value": "synthetic-custom"},
+    ], "synthetic-custom", id="other-native-purposes-are-not-custom"),
+    pytest.param([
+        {"type": "OTP", "label": "password", "value": "not-a-password"},
+        {"id": "password", "type": "CONCEALED", "value": "synthetic-custom"},
+    ], "synthetic-custom", id="custom-id-fallback-not-otp"),
+]
+
+
+def password_item(fields):
+    return {"id": "item-b", "category": "LOGIN", "vault": {"id": "vault-b"},
+            "urls": [{"href": "https://second.example/login"}], "fields": fields,
+            "passkeys": [{"credentialId": "opaque-credential", "unknown": {"nested": [None, 4]}}]}
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("method", ["resolve_password", "resolve_secret"])
+@pytest.mark.parametrize("fields,expected", _PASSWORD_CASES)
+def test_password_precedence_through_offline_cli(fake_op, fields, expected, method, capfd, caplog):
+    profile, calls, state = fake_op
+    revealed = password_item(fields)
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b", "secret_item": revealed}))
+    before = state.read_bytes()
+    with profile("a") as backend:
+        metadata = backend.list_items()
+        assert [m.id for m in metadata] == ["op:item-a", "op:item-b", "op:card-c"]
+        assert len(calls()) == 1  # Listing never fans out to secret-bearing detail reads.
+        assert backend.get_meta("op:item-b").origin == "https://second.example"
+        result = getattr(backend, method)("op:item-b")
+        assert result == (expected if method == "resolve_password" else {"password": expected})
+        assert not hasattr(backend._fill_metadata, "item")
+        assert len(calls()) == 3  # List + fresh authorization + one transient reveal.
+        assert calls()[-1]["argv"] == [
+            "item", "get", "item-b", "--vault", "vault-b", "--format", "json", "--reveal"]
+    assert state.read_bytes() == before  # Read-only, including opaque passkeys.
+    assert all(row["identity"] == "a" for row in calls())
+    cache_text = repr((metadata, onepassword._LISTING_CACHE, onepassword._ITEM_META_INFLIGHT))
+    captured = capfd.readouterr()
+    diagnostic_text = captured.out + captured.err + caplog.text + cache_text + repr(calls())
+    assert expected not in diagnostic_text
+    assert "synthetic-custom" not in diagnostic_text and "synthetic-native" not in diagnostic_text
+    assert "opaque-credential" not in diagnostic_text
+
+
+_BAD_PASSWORD_FIELDS = [
+    pytest.param(None, id="null-fields"),
+    pytest.param({}, id="mapping-fields"),
+    pytest.param("not-a-list", id="string-fields"),
+    pytest.param([], id="empty-fields"),
+    pytest.param([None, 4, {"value": "unlabeled"}], id="opaque-or-unlabeled"),
+    pytest.param([{"purpose": "PASSWORD", "value": 4}], id="non-string-value"),
+    pytest.param([{"purpose": "PASSWORD"}, {"label": "password", "value": " \n"}], id="missing-or-blank"),
+    pytest.param([{"purpose": "PASSWORD", "value": "synthetic-native"},
+                  {"purpose": "PASSWORD", "value": "synthetic-other"},
+                  {"label": "password", "value": "synthetic-custom"}], id="ambiguous-native"),
+    pytest.param([{"label": "password", "value": "synthetic-custom"},
+                  {"label": "password", "value": "synthetic-other"}], id="ambiguous-custom"),
+    pytest.param([{"purpose": "PASSWORD", "value": "same-synthetic"},
+                  {"purpose": "PASSWORD", "value": "same-synthetic"}], id="duplicate-native-even-if-equal"),
+]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("method", ["resolve_password", "resolve_secret"])
+@pytest.mark.parametrize("fields", _BAD_PASSWORD_FIELDS)
+def test_unusable_password_fields_fail_without_diagnostics(fake_op, fields, method, capfd, caplog):
+    profile, calls, state = fake_op
+    revealed = password_item(fields)
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b", "secret_item": revealed}))
+    with profile("a") as backend, pytest.raises(RuntimeError, match="1Password login") as error:
+        getattr(backend, method)("op:item-b")
+    captured = capfd.readouterr()
+    text = captured.out + captured.err + caplog.text + repr(error.value) + repr(calls())
+    assert "synthetic-" not in text and "unlabeled" not in text
+    assert not hasattr(backend._fill_metadata, "item")
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mutation", [
+    {"id": "item-other"}, {"vault": {"id": "vault-other"}}, {"vault": None},
+    {"category": "CREDIT_CARD"}, {"state": "ARCHIVED"}, {"fields": None},
+])
+def test_revealed_login_must_match_verified_identity(fake_op, mutation):
+    profile, calls, state = fake_op
+    revealed = password_item([{"purpose": "PASSWORD", "value": "synthetic-native"}])
+    revealed.update(mutation)
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b", "secret_item": revealed}))
+    with profile("a") as backend, pytest.raises(RuntimeError, match="1Password login"):
+        backend.resolve_password("op:item-b")
+    assert len(calls()) == 3
+
+
+@pytest.mark.parametrize("reveal_text", ["{synthetic-private", "null", "[]", "{}"])
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("method", ["resolve_password", "resolve_secret"])
+def test_password_precedence_malformed_reveal_is_generic(fake_op, reveal_text, method, capfd, caplog):
+    profile, _calls, state = fake_op
+    state.write_text(json.dumps({"mode": "ok", "vault": "vault-b", "reveal_text": reveal_text}))
+    with profile("a") as backend, pytest.raises(RuntimeError, match="1Password login") as error:
+        getattr(backend, method)("op:item-b")
+    captured = capfd.readouterr()
+    assert "synthetic-private" not in (repr(error.value) + captured.out + captured.err + caplog.text)
+    assert error.value.__cause__ is None
+    assert not hasattr(backend._fill_metadata, "item")

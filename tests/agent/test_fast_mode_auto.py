@@ -5,6 +5,13 @@ from types import SimpleNamespace
 from agent import fast_mode
 
 
+def test_expiry_remaining_does_not_overstate_subminute_windows():
+    for seconds, expected in ((0.5, "<1m"), (10, "<1m"), (59.9, "<1m"),
+                              (60, "1m"), (3599, "59m"), (3600, "1h 0m"),
+                              (5400, "1h 30m")):
+        assert fast_mode.format_expiry_remaining(seconds) == expected
+
+
 def _agent(**kw):
     base = dict(
         service_tier="auto",
@@ -109,6 +116,7 @@ def test_fast_auto_and_cold_parse_and_slash_command(monkeypatch):
         assert GatewayRunner._load_service_tier() == expected
     assert DEFAULT_CONFIG["agent"]["service_tier"] == ""
     assert DEFAULT_CONFIG["agent"]["fast_auto_seconds"] == 60
+    assert DEFAULT_CONFIG["agent"]["fast_expiry_seconds"] == 0
 
     # /fast auto — session-scoped, agent rebuilt, status reports the mode
     fast_cmd = next(c for c in COMMAND_REGISTRY if c.name == "fast")
@@ -141,3 +149,122 @@ def test_fast_auto_and_cold_parse_and_slash_command(monkeypatch):
     route_stub.base_url = "https://openrouter.ai/api/v1"
     route_stub.provider = "openrouter"
     assert cli_mod.HermesCLI._resolve_turn_agent_config(route_stub, "hi")["request_overrides"] is None
+
+
+class _FastRateLimitError(Exception):
+    """A fast-mode 429 shaped like the live API's: documented limit headers, no retry-after."""
+
+    def __init__(self, limit="0"):
+        super().__init__("This request would exceed your organization's rate limit of 0 fast mode input tokens per minute.")
+        self.status_code = 429
+        self.body = {"type": "error", "error": {"type": "rate_limit_error", "message": str(self)}}
+        self.response = SimpleNamespace(headers={
+            "anthropic-fast-input-tokens-limit": limit, "anthropic-fast-output-tokens-limit": limit,
+        })
+
+
+_FAST_KWARGS = {"model": "claude-opus-5", "extra_body": {"speed": "fast"}}
+
+
+def test_unprovisioned_detects_only_zero_limit_fast_429s():
+    assert fast_mode.fast_mode_unprovisioned(_FastRateLimitError("0"), _FAST_KWARGS) is True
+    # A real limit that ran out is transient: the retry-after path handles it.
+    assert fast_mode.fast_mode_unprovisioned(_FastRateLimitError("2000000"), _FAST_KWARGS) is False
+    # The request has to have asked for fast speed.
+    assert fast_mode.fast_mode_unprovisioned(_FastRateLimitError("0"), {"model": "claude-opus-5"}) is False
+    assert fast_mode.fast_mode_unprovisioned(RuntimeError("boom"), _FAST_KWARGS) is False
+
+
+class _FastCreditRefusal(Exception):
+    """Anthropic's fast-mode entitlement 429, as relayed by a proxy: no fast-limit headers."""
+
+    def __init__(self, message="Usage credits are required for fast mode."):
+        super().__init__(f"Error code: 429 - {message}")
+        self.status_code = 429
+        self.body = {"type": "error", "error": {"type": "rate_limit_error", "message": message}}
+        self.response = SimpleNamespace(headers={"retry-after": "1"})
+
+
+def test_unprovisioned_detects_the_usage_credit_refusal_without_limit_headers():
+    assert fast_mode.fast_mode_unprovisioned(_FastCreditRefusal(), _FAST_KWARGS) is True
+    assert fast_mode.fast_mode_unprovisioned(
+        _FastCreditRefusal("Fast mode requires usage credits: credits are required."), _FAST_KWARGS) is True
+    # A genuine rate limit never mentions fast-mode credits.
+    assert fast_mode.fast_mode_unprovisioned(
+        _FastCreditRefusal("Number of request tokens has exceeded your per-minute rate limit"), _FAST_KWARGS) is False
+    # Only a request that asked for fast speed is refused for it.
+    assert fast_mode.fast_mode_unprovisioned(_FastCreditRefusal(), {"model": "claude-opus-5"}) is False
+
+
+def test_unavailable_model_drops_speed_for_the_session_and_only_that_model():
+    agent = _agent(
+        service_tier="priority", model="claude-opus-5", provider="anthropic",
+        api_mode="anthropic_messages", request_overrides={"speed": "fast"},
+    )
+    assert fast_mode.effective_request_overrides(agent) == {"speed": "fast"}
+    assert fast_mode.mark_fast_mode_unavailable(agent) is True
+    assert fast_mode.mark_fast_mode_unavailable(agent) is False  # one retry per model
+    assert fast_mode.effective_request_overrides(agent) == {}
+    agent.model = "claude-opus-5-5"
+    assert fast_mode.effective_request_overrides(agent) == {"speed": "fast"}
+
+
+def test_recovery_retries_at_standard_speed_before_classification():
+    from agent.turn_recovery import recover_before_classification
+
+    printed = []
+    agent = SimpleNamespace(
+        model="claude-opus-5", provider="anthropic", log_prefix="", _fast_mode_unavailable_models=set(),
+        _vprint=lambda *a, **k: printed.append(" ".join(str(x) for x in a)),
+    )
+    retry, prompt = recover_before_classification(
+        agent, _FastRateLimitError("0"), messages=[], api_messages=[], api_kwargs=_FAST_KWARGS, active_system_prompt="sys",
+    )
+    assert (retry, prompt) == (True, "sys")
+    assert agent._fast_mode_unavailable_models == {"claude-opus-5"}
+    assert any("standard speed" in line for line in printed)
+
+
+def test_recovery_retries_a_proxied_credit_refusal_at_standard_speed():
+    from agent.turn_recovery import recover_before_classification
+
+    agent = SimpleNamespace(
+        model="claude-opus-5-5", provider="custom:claude-proxy", log_prefix="", _fast_mode_unavailable_models=set(),
+        _vprint=lambda *a, **k: None,
+    )
+    retry, _ = recover_before_classification(
+        agent, _FastCreditRefusal(), messages=[], api_messages=[],
+        api_kwargs={"model": "claude-opus-5-5", "extra_body": {"speed": "fast"}}, active_system_prompt="sys",
+    )
+    assert retry is True
+    assert agent._fast_mode_unavailable_models == {"claude-opus-5-5"}
+
+
+def test_expired_gateway_fast_overlay_is_filtered_without_mutation(monkeypatch):
+    agent = _agent(
+        service_tier="priority",
+        request_overrides={
+            "extra_body": {"fallback_route": "keep"},
+            "service_tier": "priority",
+            "speed": "fast",
+            "non_fast": {"same": "value"},
+        },
+    )
+    agent._gateway_fast_expiry_at = 100.0
+    agent._gateway_session_fast_overlay = {"service_tier": "priority", "speed": "fast"}
+    monkeypatch.setattr(fast_mode.time, "time", lambda: 100.0)
+    before = dict(agent.request_overrides)
+
+    assert fast_mode.effective_request_overrides(agent) == {
+        "extra_body": {"fallback_route": "keep"}, "non_fast": {"same": "value"},
+    }
+    assert agent.request_overrides == before
+
+
+def test_expired_gateway_fast_overlay_does_not_remove_nonmatching_values(monkeypatch):
+    agent = _agent(request_overrides={"service_tier": "provider-default", "keep": True})
+    agent._gateway_fast_expiry_at = 100.0
+    agent._gateway_session_fast_overlay = {"service_tier": "priority", "speed": "fast"}
+    monkeypatch.setattr(fast_mode.time, "time", lambda: 100.0)
+
+    assert fast_mode.effective_request_overrides(agent) == agent.request_overrides

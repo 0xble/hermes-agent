@@ -79,10 +79,11 @@ not a substitute for code review, SAST, dependency scanning, or pen testing.
 
 ## Attribution and licensing
 
-* `patterns.py` is a verbatim fork from
+* `patterns.py` is synchronized with the pattern definitions from
   [`anthropics/claude-plugins-official`](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/security-guidance/hooks)
-  (commit `0bde168`, 2026-05-26), licensed under the
+  (commit `8e749cadafe25fb861f141bfcbcb72194946515a`), licensed under the
   [Apache License 2.0](./LICENSE). See [NOTICE](./NOTICE) for the full
-  attribution.
+  attribution. Hermes intentionally omits Claude-specific telemetry-only rule
+  IDs because this plugin has no corresponding metrics consumer.
 * `__init__.py`, `plugin.yaml`, `README.md`, and tests are original work by
   NousResearch, MIT-licensed alongside the rest of hermes-agent.

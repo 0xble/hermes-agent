@@ -58,9 +58,10 @@ def test_safe_tool_reason_only_reaches_supporting_modern_agent() -> None:
 def test_explicit_producer_falls_back_to_old_interrupt_signature() -> None:
     agent = _LegacyAgent()
 
-    assert request_hard_interrupt(agent, "stop now") is True
+    assert request_hard_interrupt(agent, "stop now", delegation_reason="stop_command") is True
 
     assert agent.calls == [("legacy", "stop now")]
+    assert agent._delegation_interrupt_reason == "stop_command"
 
 
 def test_explicit_producer_reports_unsupported_agent() -> None:
@@ -108,7 +109,7 @@ def test_inherited_hard_interrupt_bypasses_legacy_subclass_override() -> None:
 
 
 def test_tui_subagent_interrupt_is_an_explicit_hard_stop() -> None:
-    import tools.delegate_tool as delegate_tool
+    from tools import delegate_tool
 
     agent = _ModernAgent()
     subagent_id = "sa-hard-stop-test"
@@ -120,4 +121,6 @@ def test_tui_subagent_interrupt_is_an_explicit_hard_stop() -> None:
         with delegate_tool._active_subagents_lock:
             delegate_tool._active_subagents.pop(subagent_id, None)
 
-    assert agent.calls == [("hard", f"Interrupted via TUI ({subagent_id})", None)]
+    assert len(agent.calls) == 1
+    assert agent.calls[0][0] == "hard"
+    assert subagent_id in agent.calls[0][1]

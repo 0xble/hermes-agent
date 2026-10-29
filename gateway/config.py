@@ -6,9 +6,10 @@ import contextlib
 import logging
 import math
 import os
+import re
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Mapping
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
@@ -18,7 +19,7 @@ from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
 )
-from utils import is_truthy_value
+from utils import fast_safe_load, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,31 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return is_truthy_value(value, default=default)
 
 
-def _env_multiplex_profiles_override() -> "bool | None":
+def normalize_telegram_rich_messages(value: Any) -> str:
+    """Resolve the shared Telegram delivery/prompt policy without enabling it by default.
+
+    YAML booleans and the previously supported string boolean tokens remain
+    compatible. Invalid modes must not silently disable an operator's preference.
+    """
+    if value is None:
+        return "never"
+    if isinstance(value, bool):
+        return "auto" if value else "never"
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return "auto" if value else "never"
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in {"always", "auto", "never"}:
+            return mode
+        parsed = _bool_token(mode)
+        if parsed is not None:
+            return "auto" if parsed else "never"
+    raise ValueError(
+        "telegram.extra.rich_messages must be always, auto, never, or a boolean"
+    )
+
+
+def _env_multiplex_profiles_override() -> bool | None:
     """GATEWAY_MULTIPLEX_PROFILES operator override: True/False for a recognized token.
 
     ``None`` when unset, blank, or unrecognized so the caller keeps the config.yaml
@@ -61,6 +86,32 @@ def _env_multiplex_profiles_override() -> "bool | None":
             raw, sorted(_TRUTHY_STRINGS), sorted(_FALSY_STRINGS),
         )
     return parsed
+
+
+# What the runner does when the last messaging adapter goes down (GatewayConfig.on_all_adapters_down).
+ON_ALL_ADAPTERS_DOWN_POLICIES = ("exit", "stay_alive")
+
+
+def _env_on_all_adapters_down_override() -> str | None:
+    """GATEWAY_ON_ALL_ADAPTERS_DOWN operator override: 'exit'/'stay_alive' for a recognized token.
+
+    ``None`` when unset, blank, or unrecognized so the caller keeps the config.yaml value
+    (env > config > default). Launchers without a supervising service manager (the desktop app
+    spawns ``hermes serve`` directly) set ``stay_alive``: a failure exit there only severs the
+    UI's websocket connections and drops in-flight assistant messages (#118080).
+    """
+    raw = os.getenv("GATEWAY_ON_ALL_ADAPTERS_DOWN")
+    if not (raw or "").strip():
+        return None
+    token = raw.strip().lower()
+    if token in ON_ALL_ADAPTERS_DOWN_POLICIES:
+        return token
+    logger.warning(
+        "Ignoring unrecognized GATEWAY_ON_ALL_ADAPTERS_DOWN=%r "
+        "(expected one of %s); falling back to config.yaml.",
+        raw, list(ON_ALL_ADAPTERS_DOWN_POLICIES),
+    )
+    return None
 
 
 def _normalize_transport_token(value: Any) -> str:
@@ -129,14 +180,41 @@ def coerce_systemd_watchdog_seconds(
     return parsed
 
 
-def _coerce_dict(value: Any) -> Dict[str, Any]:
+def _coerce_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+# "pair" DMs a pairing code, "ignore" drops silently, "decline" sends one polite refusal then goes
+# silent toward that sender for gateway.pairing.DECLINE_DEDUPE_SECONDS (#88028).
+UNAUTHORIZED_DM_BEHAVIORS = {"pair", "ignore", "decline"}
+DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE = (
+    "Hi! I'm a personal assistant and can only chat with my owner, so I can't help you directly. Sorry!"
+)
 
 
 def _normalize_choice(value: Any, choices: set, default: str) -> str:
     """Lower-cased *value* when it is one of *choices*, else *default*."""
     normalized = value.strip().lower() if isinstance(value, str) else None
     return normalized if normalized in choices else default
+
+
+_RESTART_RESUME_POLICIES = frozenset({"ask", "continue"})
+
+
+def _normalize_restart_resume_policy(value: Any, *, allow_none: bool, key: str) -> Optional[str]:
+    """Validate the restart recovery policy without silently changing intent.
+
+    Unlike ``_normalize_choice``, an unrecognized value RAISES instead of falling back: a
+    typo'd policy must fail loudly at config construction, not silently resume with the
+    opposite behavior after a restart.
+    """
+    if value is None and allow_none:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _RESTART_RESUME_POLICIES:
+            return normalized
+    raise ValueError(f"{key} must be 'ask' or 'continue'")
 
 
 def _dict_slot(container: dict, key: str) -> dict:
@@ -162,6 +240,21 @@ def _getenv_str(name: str, default: str = "") -> str:
 
 
 _Platform__bundled_plugin_names: Optional[set] = None  # cached outside the enum: never a member
+_Platform__bundled_plugin_aliases: Optional[dict] = None  # manifest ``name:`` (lower) -> directory name
+
+
+def _bundled_platform_manifest_name(plugin_dir: Path) -> Optional[str]:
+    """Lowercased ``name:`` from a bundled platform's plugin manifest (None when absent/unreadable)."""
+    try:
+        manifest_file = next(
+            (plugin_dir / m for m in ("plugin.yaml", "plugin.yml") if (plugin_dir / m).exists()), None)
+        if manifest_file is None:
+            return None
+        data = fast_safe_load(manifest_file.read_text(encoding="utf-8-sig")) or {}
+        name = data.get("name") if isinstance(data, dict) else None
+        return str(name).strip().lower() or None
+    except Exception:
+        return None
 
 
 class Platform(Enum):
@@ -176,7 +269,6 @@ class Platform(Enum):
     SIGNAL = "signal"
     MATTERMOST = "mattermost"
     MATRIX = "matrix"
-    HOMEASSISTANT = "homeassistant"
     EMAIL = "email"
     SMS = "sms"
     DINGTALK = "dingtalk"
@@ -200,11 +292,18 @@ class Platform(Enum):
         value = value.strip().lower()
         if value in cls._value2member_map_:
             return cls._value2member_map_[value]
-        global _Platform__bundled_plugin_names
+        global _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
         if _Platform__bundled_plugin_names is None:
-            _Platform__bundled_plugin_names = cls._scan_bundled_plugin_platforms()
+            _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases = cls._scan_bundled_plugin_platforms()
         registered = value in _Platform__bundled_plugin_names
         if not registered:
+            alias = _Platform__bundled_plugin_aliases.get(value)
+            if alias is not None:
+                # A bundled platform whose plugin.yaml ``name:`` differs from its directory (e.g. dir
+                # "a2a", name "a2a-platform") is configured under the manifest name — ``plugins
+                # enable`` writes that key — so resolve it to the directory-name member that the
+                # registry and every value-based consumer key on.
+                return cls._value2member_map_.get(alias) or cls._add_pseudo_member(alias)
             with contextlib.suppress(Exception):
                 from gateway.platform_registry import platform_registry
                 registered = platform_registry.is_registered(value)
@@ -220,18 +319,26 @@ class Platform(Enum):
         return pseudo
 
     @classmethod
-    def _scan_bundled_plugin_platforms(cls) -> set:
-        """Names of bundled platform plugins under ``plugins/platforms/``."""
+    def _scan_bundled_plugin_platforms(cls) -> tuple[set, dict]:
+        """Directory names of bundled platform plugins under ``plugins/platforms/``, plus a map of
+        manifest ``name:`` keys that differ from their directory (alias -> directory name). Aliases
+        never shadow a directory name, so the directory stays the canonical platform value."""
         try:
             platforms_dir = Path(__file__).parent.parent / "plugins" / "platforms"
-            return {
-                child.name.lower()
-                for child in (platforms_dir.iterdir() if platforms_dir.is_dir() else ())
+            dirs = [
+                child for child in (platforms_dir.iterdir() if platforms_dir.is_dir() else ())
                 if child.is_dir() and (child / "__init__.py").exists()
                 and ((child / "plugin.yaml").exists() or (child / "plugin.yml").exists())
-            }
+            ]
+            names = {child.name.lower() for child in dirs}
+            aliases = {}
+            for child in dirs:
+                manifest_name = _bundled_platform_manifest_name(child)
+                if manifest_name and manifest_name not in names and manifest_name not in aliases:
+                    aliases[manifest_name] = child.name.lower()
+            return names, aliases
         except Exception:
-            return set()
+            return set(), {}
 
 
 # Built-in values snapshotted before any dynamic _missing_ lookup.
@@ -260,6 +367,17 @@ def platform_binds_port(platform_value: str, extra: Optional[dict] = None) -> bo
     expected_mode = PORT_BINDING_CONDITIONAL_MODES.get(platform_value)
     return expected_mode is None or str((extra or {}).get("connection_mode", "websocket")).strip().lower() == expected_mode
 
+_DISCORD_CHANNEL_LINK_RE = re.compile(
+    r"https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/(?:[0-9]+|@me)/([0-9]+)/?")
+
+
+def discord_channel_id_from_link(value: str) -> Optional[str]:
+    """Channel id from a pasted Discord channel link (``https://discord.com/channels/<guild>/<channel>``),
+    else None. Message links (a third path segment) and anything that is not a channel link are
+    left alone so callers keep their own error path."""
+    match = _DISCORD_CHANNEL_LINK_RE.fullmatch(value)
+    return match.group(1) if match else None
+
 
 @dataclass
 class HomeChannel:
@@ -273,12 +391,18 @@ class HomeChannel:
     user_id: Optional[str] = None
     scope_id: Optional[str] = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def __post_init__(self) -> None:
+        # Copy Link is next to Copy Channel ID in Discord. Normalize at the
+        # shared home boundary so env, YAML and plugin-seeded homes agree.
+        if self.platform == Platform.DISCORD and isinstance(self.chat_id, str):
+            self.chat_id = discord_channel_id_from_link(self.chat_id.strip()) or self.chat_id
+
+    def to_dict(self) -> dict[str, Any]:
         optional = {k: v for k in ("thread_id", "user_id", "scope_id") if (v := getattr(self, k))}
         return {"platform": self.platform.value, "chat_id": self.chat_id, "name": self.name, **optional}
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "HomeChannel":
+    def from_dict(cls, data: dict[str, Any]) -> "HomeChannel":
         optional = {k: str(data[k]) if data.get(k) else None for k in ("thread_id", "user_id", "scope_id")}
         return cls(platform=Platform(data["platform"]), chat_id=str(data["chat_id"]), name=data.get("name", "Home"), **optional)
 
@@ -295,49 +419,17 @@ def persist_home_channel(home: HomeChannel, *, enabled_if_new: bool = False) -> 
 
 
 @dataclass
-class SessionResetPolicy:
-    """Inert legacy value type retained solely for the scheduled plugin-compat window.
-
-    Gateway configuration and session lifecycle do not consume this datatype.
-    """
-    mode: str = "none"
-    at_hour: int = 4  # 0-23, local time
-    idle_minutes: int = 1440
-    notify: bool = True  # Notify the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")
-    bg_process_max_age_hours: int = 24
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {**asdict(self), "notify_exclude_platforms": list(self.notify_exclude_platforms)}
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SessionResetPolicy":
-        data = _coerce_dict(data)
-        exclude = data.get("notify_exclude_platforms")
-        # Missing keys and explicit YAML nulls both take the field default.
-        plain = {
-            f.name: f.default if data.get(f.name) is None else data[f.name]
-            for f in fields(cls) if f.name not in ("notify", "notify_exclude_platforms")
-        }
-        return cls(
-            notify=_coerce_bool(data.get("notify"), True),
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
-            **plain,
-        )
-
-
-@dataclass
 class ChannelOverride:
     """Per-channel model/provider/system_prompt override (``platforms.<name>.channel_overrides[channel_id]``)."""
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ChannelOverride":
+    def from_dict(cls, data: dict[str, Any]) -> "ChannelOverride":
         return cls(**{f.name: data.get(f.name) for f in fields(cls)}) if data else cls()
 
 
@@ -346,7 +438,7 @@ class ChannelOverride:
 # authenticate another way and must never be skipped for a missing token.
 # Platforms absent from this map authenticate some other way (session files, port-bound webhooks,
 # api_key-only) and must never be skipped for a missing token. See #64674.
-PLATFORM_TOKEN_ENV_NAMES: dict["Platform", str] = {
+PLATFORM_TOKEN_ENV_NAMES: dict[Platform, str] = {
     Platform.TELEGRAM: "TELEGRAM_BOT_TOKEN",
     Platform.DISCORD: "DISCORD_BOT_TOKEN",
     Platform.SLACK: "SLACK_BOT_TOKEN",
@@ -368,10 +460,10 @@ class PlatformConfig:
     typing_indicator: bool = True  # drives _keep_typing; False where unwanted (Slack setStatus blocks compose)
     # Working-state text for text-rendering indicators (Slack status, Google Chat marker); None = platform default.
     typing_status_text: Optional[str] = None
-    channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
-    extra: Dict[str, Any] = field(default_factory=dict)  # Platform-specific settings
+    channel_overrides: dict[str, ChannelOverride] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)  # Platform-specific settings
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         result = {
             "enabled": self.enabled, "extra": self.extra, "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
@@ -393,7 +485,7 @@ class PlatformConfig:
     })
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PlatformConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "PlatformConfig":
         data = _coerce_dict(data)
         home = data.get("home_channel")
         # Adapters read their settings from ``extra`` (``config.extra.get("port")``), but users
@@ -452,11 +544,24 @@ class StreamingConfig:
     # fresh-message replacement path; set >0 to opt in.
     fresh_final_after_seconds: float = 0.0
 
-    def to_dict(self) -> Dict[str, Any]:
+    @property
+    def globally_enabled(self) -> bool:
+        """The ``streaming.enabled`` master switch (``transport: off`` also disables)."""
+        return bool(self.enabled) and self.transport != "off"
+
+    def enabled_for(self, platform_override: Any) -> bool:
+        """Effective streaming for one platform.
+
+        ``platform_override`` is ``display.platforms.<plat>.streaming`` (``None`` = follow global).
+        A per-platform value can only narrow the global switch, never enable streaming on its own.
+        """
+        return self.globally_enabled and (platform_override is None or bool(platform_override))
+
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "StreamingConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "StreamingConfig":
         if not isinstance(data, dict) or not data:
             return cls()
 
@@ -522,9 +627,9 @@ _TOPLEVEL_BOOL_DEFAULTS = {
 @dataclass
 class GatewayConfig:
     """Main gateway configuration: platform connections, session policies, delivery settings."""
-    platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
-    reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
-    quick_commands: Dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
+    platforms: dict[Platform, PlatformConfig] = field(default_factory=dict)
+    reset_triggers: list[str] = field(default_factory=lambda: ["/new", "/reset"])
+    quick_commands: dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
     # Legacy sessions.json mirror of the routing index (primary: state.db) for external tooling / downgrades.
     # The primary copy lives in state.db (gateway_routing table, #9006). Default True for backward
@@ -532,6 +637,14 @@ class GatewayConfig:
     # config.yaml to stop producing the file.
     write_sessions_json: bool = True
     always_log_local: bool = True  # Always save cron outputs to local files
+    # Empty-message resume policy for interactive adapters: ``ask`` waits for the user before
+    # running tools (asking in one line whether to carry on), ``continue`` finishes the pending work. None keeps each adapter's native
+    # default (interactive asks, event platforms continue). Per-platform
+    # ``extra.restart_resume_policy`` wins over this global value.
+    restart_resume_policy: Optional[str] = None
+    # Queue parent-facing notices for eligible interrupted delegations at gateway boot. The notice
+    # is still subject to live-route and current-authorization checks before its durable one-shot claim.
+    auto_resume_on_boot: bool = True
     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
     # channels; a substrate guard that survives prompt drift.
     filter_silence_narration: bool = True
@@ -540,9 +653,15 @@ class GatewayConfig:
     group_sessions_per_user: bool = True  # Isolate group sessions per participant when user IDs exist
     thread_sessions_per_user: bool = False  # False = threads shared across participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active sessions
-    # Opt-in: the default profile's gateway serves every profile on the host (profiles stamped into
-    # session keys, per-profile adapters/credentials).
-    multiplex_profiles: bool = False
+    restart_replay_concurrency: int = 2  # Gateway-wide cap for restart/reconnect replay admission
+    # The default profile's gateway serves every profile on the host (profiles stamped into session
+    # keys, per-profile adapters/credentials). On by default (DEFAULT_CONFIG), but UNSET here is
+    # ``None``: a request the gateway settles at boot, not a verdict. ``hermes_cli.gateway_multiplex_mode
+    # .resolve_multiplex_mode`` runs the migration preflight (default profile, >= 2 profiles, no
+    # secondary running its own gateway, no blocker, migratable host) and only then writes True/False.
+    # An explicit value (config.yaml, GATEWAY_MULTIPLEX_PROFILES, a constructor argument) is honoured
+    # verbatim. Every reader tests truthiness, so an unresolved ``None`` never multiplexes by accident.
+    multiplex_profiles: Optional[bool] = None
     # Public HTTPS endpoint for scoped RoomLink calls (an API key alone must never advertise a
     # route); HERMES_ROOM_LINK_URL overrides.
     room_link_url: Optional[str] = None
@@ -561,26 +680,47 @@ class GatewayConfig:
     loop_watchdog_probe_interval_s: float = DEFAULT_LOOP_WATCHDOG_INTERVAL_S
     loop_watchdog_probe_timeout_s: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
     loop_watchdog_max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
-    unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+    # What happens when the LAST messaging adapter goes down. ``exit`` (default) shuts the gateway
+    # down with the failure verdict so a supervising service manager (systemd/launchd) restarts it;
+    # ``stay_alive`` keeps the process running and leaves recovery to the reconnect watcher — for
+    # launchers with no supervisor (the desktop app spawns ``hermes serve`` directly), where a
+    # failure exit only severs the UI's websockets and drops in-flight assistant messages (#118080).
+    # Retryable failures are recoverable in both modes; non-retryable adapter loss always exits.
+    on_all_adapters_down: str = "exit"  # "exit" | "stay_alive"; GATEWAY_ON_ALL_ADAPTERS_DOWN overrides
+    unauthorized_dm_behavior: str = "pair"  # UNAUTHORIZED_DM_BEHAVIORS
+    unauthorized_dm_decline_message: str = ""  # "decline" reply text; empty → DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
+    durable_outbox_enabled: bool = False  # gateway.durable_outbox.enabled, opt-in
+    durable_outbox_retention_days: int = 7
+    zero_cut_handover_enabled: bool = False  # gateway.zero_cut_handover.enabled, opt-in
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
         "write_sessions_json", "always_log_local", "filter_silence_narration", "stt_enabled",
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
-        "max_concurrent_sessions", "multiplex_profiles",
+        "max_concurrent_sessions", "restart_replay_concurrency", "multiplex_profiles",
+        "on_all_adapters_down",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
-        "loop_watchdog_max_strikes", "unauthorized_dm_behavior",
+        "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "restart_resume_policy",
+        "auto_resume_on_boot",
+        "unauthorized_dm_decline_message",
     )
 
     def __post_init__(self) -> None:
+        self.restart_resume_policy = _normalize_restart_resume_policy(
+            self.restart_resume_policy, allow_none=True, key="restart_resume_policy")
+        for platform, platform_config in self.platforms.items():
+            if "restart_resume_policy" in platform_config.extra:
+                platform_config.extra["restart_resume_policy"] = _normalize_restart_resume_policy(
+                    platform_config.extra.get("restart_resume_policy"), allow_none=False,
+                    key=f"platforms.{platform.value}.extra.restart_resume_policy")
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
 
-    def get_connected_platforms(self) -> List[Platform]:
+    def get_connected_platforms(self) -> list[Platform]:
         """Enabled + configured platforms, sorted by value so the rendered "Connected
         Platforms" prompt block is byte-stable (a reorder busts the prompt cache)."""
         connected = [p for p, c in self.platforms.items() if c.enabled and self._is_platform_connected(p, c)]
@@ -628,7 +768,7 @@ class GatewayConfig:
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
         return self.platforms[platform].home_channel if self.platforms.get(platform) else None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "platforms": {p.value: c.to_dict() for p, c in self.platforms.items()},
             "reset_triggers": self.reset_triggers,
@@ -637,13 +777,18 @@ class GatewayConfig:
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
+            "durable_outbox": {"enabled": self.durable_outbox_enabled,
+                               "retention_days": self.durable_outbox_retention_days},
+            "zero_cut_handover": {"enabled": self.zero_cut_handover_enabled},
             "profile_routes": [
-                asdict(r) if is_dataclass(r) and not isinstance(r, type) else r for r in self.profile_routes
+                {k: v for k, v in asdict(r).items() if k != "user_id" or v is not None}
+                if is_dataclass(r) and not isinstance(r, type) else r
+                for r in self.profile_routes
             ],
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "GatewayConfig":
+    def from_dict(cls, data: dict[str, Any]) -> "GatewayConfig":
         data = _coerce_dict(data)
         nested_gateway = _coerce_dict(data.get("gateway"))
 
@@ -684,18 +829,34 @@ class GatewayConfig:
         systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             pick("systemd_watchdog_seconds"), key_label("systemd_watchdog_seconds")
         )
-        # env > config.yaml > False: a recognized GATEWAY_MULTIPLEX_PROFILES wins (hosted deployments
-        # stamp it on the container); blank/unrecognized falls through to the top-level VALUE when
-        # not None, else ``gateway.multiplex_profiles``.
+        # env > config.yaml > unset: a recognized GATEWAY_MULTIPLEX_PROFILES wins (hosted deployments
+        # stamp it on the container); blank/unrecognized falls through to the top-level VALUE when not
+        # None, else ``gateway.multiplex_profiles``. Nothing set stays ``None`` so the boot-time guard
+        # (``resolve_multiplex_mode``) can tell "the operator chose" from "the default applies".
         multiplex_profiles = data.get("multiplex_profiles")
         if multiplex_profiles is None:
             multiplex_profiles = nested_gateway.get("multiplex_profiles")
         env_multiplex = _env_multiplex_profiles_override()
         if env_multiplex is not None:
             multiplex_profiles = env_multiplex
+        # env > config.yaml > default: GATEWAY_ON_ALL_ADAPTERS_DOWN wins for launchers that know
+        # whether a service manager is watching (the desktop launcher sets stay_alive); anything
+        # unrecognized (env or yaml) falls back to "exit", the historical behavior (#118080).
+        on_all_adapters_down = _env_on_all_adapters_down_override()
+        if on_all_adapters_down is None:
+            on_all_adapters_down = _normalize_choice(
+                pick("on_all_adapters_down"), ON_ALL_ADAPTERS_DOWN_POLICIES, "exit"
+            )
         max_concurrent_sessions = _coerce_optional_positive_int(
             pick("max_concurrent_sessions"), key_label("max_concurrent_sessions")
         )
+        restart_replay_concurrency = _coerce_int(pick("restart_replay_concurrency"), 2)
+        if isinstance(pick("restart_replay_concurrency"), bool) or restart_replay_concurrency < 1:
+            logger.warning(
+                "Ignoring invalid %s (expected a positive integer); using 2",
+                key_label("restart_replay_concurrency"),
+            )
+            restart_replay_concurrency = 2
 
         try:
             session_store_max_age_days = max(int(data.get("session_store_max_age_days", 90)), 0)
@@ -703,6 +864,15 @@ class GatewayConfig:
             session_store_max_age_days = 90
 
         from gateway.profile_routing import parse_profile_routes
+        outbox = pick("durable_outbox")
+        if outbox is None:
+            outbox = {}
+        if not isinstance(outbox, dict):
+            raise ValueError("gateway.durable_outbox must be a mapping with an enabled boolean")
+        if type(outbox.get("enabled", False)) is not bool:
+            raise ValueError("gateway.durable_outbox.enabled must be a boolean")
+        retention = validate_outbox_retention_days(outbox.get("retention_days", 7))
+        zero_cut_handover = _coerce_dict(pick("zero_cut_handover"))
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -712,18 +882,26 @@ class GatewayConfig:
             **{name: _coerce_bool(data.get(name), default) for name, default in _TOPLEVEL_BOOL_DEFAULTS.items()},
             stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
             stt_echo_transcripts=_coerce_bool(stt_setting("stt_echo_transcripts", "echo_transcripts"), True),
-            multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            multiplex_profiles=None if multiplex_profiles is None else _coerce_bool(multiplex_profiles, True),
             room_link_url=room_link_url if isinstance(room_link_url, str) else None,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=_coerce_bool(pick("loop_watchdog"), True),
             loop_watchdog_probe_interval_s=bounded_float("loop_watchdog_probe_interval_s", DEFAULT_LOOP_WATCHDOG_INTERVAL_S, 1.0, 3600.0),
             loop_watchdog_probe_timeout_s=bounded_float("loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, 1.0, 600.0),
             loop_watchdog_max_strikes=max_strikes,
+            on_all_adapters_down=on_all_adapters_down,
             max_concurrent_sessions=max_concurrent_sessions,
-            unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), {"pair", "ignore"}, "pair"),
+            restart_replay_concurrency=restart_replay_concurrency,
+            unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), UNAUTHORIZED_DM_BEHAVIORS, "pair"),
+            restart_resume_policy=pick("restart_resume_policy"),
+            auto_resume_on_boot=_coerce_bool(pick("auto_resume_on_boot"), True),
+            unauthorized_dm_decline_message=str(data.get("unauthorized_dm_decline_message") or "").strip(),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
+            durable_outbox_enabled=outbox.get("enabled", False),
+            durable_outbox_retention_days=retention,
+            zero_cut_handover_enabled=_coerce_bool(zero_cut_handover.get("enabled"), False),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:
@@ -736,7 +914,7 @@ class GatewayConfig:
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
         """Effective unauthorized-DM behavior. Email is inbox-shaped so it defaults to ``"ignore"``
         unless its own ``unauthorized_dm_behavior`` opts in (a global default does not)."""
-        choice = self._extra_choice(platform, "unauthorized_dm_behavior", {"pair", "ignore"}, self.unauthorized_dm_behavior)
+        choice = self._extra_choice(platform, "unauthorized_dm_behavior", UNAUTHORIZED_DM_BEHAVIORS, self.unauthorized_dm_behavior)
         if choice is not None:
             return choice
         return "ignore" if platform == Platform.EMAIL else self.unauthorized_dm_behavior
@@ -745,6 +923,25 @@ class GatewayConfig:
         """Effective notice-delivery mode ("public"/"private") for a platform."""
         choice = self._extra_choice(platform, "notice_delivery", {"public", "private"}, "public")
         return "public" if choice is None else choice
+
+
+def is_zero_cut_handover_enabled(config: "GatewayConfig | Mapping[str, Any] | None") -> bool:
+    """Return the opt-in zero-cut handover flag from an effective gateway config."""
+    if isinstance(config, GatewayConfig):
+        return bool(config.zero_cut_handover_enabled)
+    if not isinstance(config, Mapping):
+        return False
+    gateway = config.get("gateway", config)
+    if not isinstance(gateway, Mapping):
+        return False
+    setting = gateway.get("zero_cut_handover", {})
+    return _coerce_bool(setting.get("enabled"), False) if isinstance(setting, Mapping) else False
+
+
+def validate_outbox_retention_days(value: Any) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("gateway.durable_outbox.retention_days must be a positive integer")
+    return value
 
 
 def load_gateway_config() -> GatewayConfig:
@@ -776,7 +973,7 @@ def load_gateway_config() -> GatewayConfig:
     return config
 
 
-def _validate_gateway_config(config: "GatewayConfig") -> None:
+def _validate_gateway_config(config: GatewayConfig) -> None:
     """Validate and sanitize a loaded GatewayConfig in place (after all sources are merged)."""
     try:
         # Reject known-weak placeholder tokens. Ported from openclaw/openclaw#64586: users who copy
@@ -811,11 +1008,3 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config (see ``gateway.config_env``)."""
     from gateway.config_env import _apply_env_overrides as _impl
     _impl(config)
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import json  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----
