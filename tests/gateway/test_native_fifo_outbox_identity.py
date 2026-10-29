@@ -1,9 +1,5 @@
 """Durable Telegram ingress and its claimed FIFO execution are different admissions."""
-import asyncio
-
 import pytest
-
-from tests.waiting import async_wait_until
 
 
 @pytest.mark.asyncio
@@ -27,7 +23,7 @@ async def test_telegram_fifo_runs_task_wakes_once_without_ingress_redelivery(mon
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
     adapter.gateway_runner = runner
     runner.adapters = {Platform.TELEGRAM: adapter}
-    monkeypatch.setattr(runner, '_read_user_config', lambda: {})
+    monkeypatch.setattr(runner, '_read_user_config', dict)
     monkeypatch.setattr(adapter, '_start_typing_refresh', lambda *a, **kw: None)
     sent, turns = [], []
 
@@ -60,12 +56,11 @@ async def test_telegram_fifo_runs_task_wakes_once_without_ingress_redelivery(mon
 
     # The task is intentionally shared, but provider occurrences are distinct.
     for message_id, update_id in [('audit', 933), ('window', 934)]:
-        await adapter.handle_message(wake(message_id, update_id))
-        await async_wait_until(
-            lambda: len(sent) >= (1 if message_id == 'audit' else 2) or
-                    bool(authority.sessions and all(not live.task or live.task.done()
-                                                    for live in authority.sessions.values())),
-            timeout=10, what='native FIFO wake to settle')
+        event = wake(message_id, update_id)
+        await adapter.handle_message(event)
+        # handle_message only hands off to this task. The authority can already
+        # have an idle session while that task is still committing its first input.
+        await adapter._session_tasks[adapter._event_session_key(event)]
         # Admission alone is not success: the actual turn body must have run.
         assert any(item[0] == message_id for item in turns), await rows()
 
@@ -74,7 +69,7 @@ async def test_telegram_fifo_runs_task_wakes_once_without_ingress_redelivery(mon
     assert sent == ['audited audit', 'audited window']
     # A genuine duplicate remains suppressed, rather than bypassing outbox dedup globally.
     await adapter.handle_message(wake('audit', 933))
-    await asyncio.sleep(0)
+    assert not adapter._session_tasks
     assert len(turns) == 2
     assert len(await rows()) == 2
     store = Outbox(get_hermes_home())
