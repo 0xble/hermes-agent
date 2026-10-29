@@ -63,6 +63,13 @@ def _health_scopes(runner) -> list[tuple[str | None, Path]]:
     return [(None, get_hermes_home())]
 
 
+def _failure_key(home: Path) -> str:
+    try:
+        return str(_marker(home))
+    except Exception:
+        return f"{__file__}:{home}"
+
+
 async def check_memory_health(runner) -> None:
     from gateway.run import _async_profile_runtime_scope
 
@@ -78,8 +85,14 @@ async def check_memory_health(runner) -> None:
                     await _check_profile_health(runner, profile, home)
             except Exception:
                 # Advisory probes must not block startup or the remaining profiles.
-                logger.error("Memory readiness check failed [profile=%s, home=%s]",
-                             profile, home, exc_info=True)
+                failures = getattr(runner, "_memory_health_failures", None)
+                if failures is None:
+                    failures = runner._memory_health_failures = set()
+                key = (profile, await asyncio.to_thread(_failure_key, home))
+                log = logger.debug if key in failures else logger.error
+                failures.add(key)
+                log("Memory readiness check failed [profile=%s, home=%s]",
+                    profile, home, exc_info=True)
 
 
 def _pending_notice(home: Path) -> tuple[Path, str, bool]:
@@ -162,12 +175,9 @@ async def install_health_notices(runner) -> None:
     try:
         from gateway.cron_store_notices import install_cron_store_notices
         install_cron_store_notices(runner, asyncio.get_running_loop())
+        schedule_memory_health(runner, asyncio.get_running_loop())
     except Exception:
         logger.error("Cron store health notice setup failed", exc_info=True)
-    try:
-        await check_memory_health(runner)
-    except Exception:
-        logger.error("Boot memory health check failed", exc_info=True)
 
 
 def health_notice_chores(runner, loop) -> list:

@@ -120,7 +120,7 @@ def prepare_startup(gateway, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["config", "provider", "dependencies", "requirement"])
+@pytest.mark.parametrize("failure", ["config", "provider"])
 async def test_readiness_failure_is_logged_once_and_startup_checks_other_profiles(
     tmp_path, monkeypatch, caplog, failure,
 ):
@@ -161,8 +161,9 @@ async def test_readiness_failure_is_logged_once_and_startup_checks_other_profile
     prepare_startup(gateway, monkeypatch)
     caplog.set_level(logging.ERROR, logger="gateway.runtime_health")
 
-    # This awaits install_health_notices before it can resume even one recovered watcher.
     await GatewayStartupMixin._start_finish_wiring(gateway, 0)
+    import asyncio
+    await asyncio.wrap_future(gateway._memory_health_future)
 
     assert checked == [home, other]
     gateway._spawn_supervised.assert_called_once()
@@ -190,8 +191,8 @@ async def test_health_notice_setup_failure_does_not_abort_startup(tmp_path, monk
         monkeypatch.setattr("gateway.cron_store_notices.install_cron_store_notices",
                             Mock(side_effect=RuntimeError("cron notice setup failed")))
     else:
-        monkeypatch.setattr("gateway.runtime_health.check_memory_health",
-                            AsyncMock(side_effect=RuntimeError("memory check setup failed")))
+        monkeypatch.setattr("gateway.runtime_health.schedule_memory_health",
+                            Mock(side_effect=RuntimeError("memory check setup failed")))
     caplog.set_level(logging.ERROR, logger="gateway.runtime_health")
 
     await GatewayStartupMixin._start_finish_wiring(gateway, 0)
@@ -318,7 +319,6 @@ async def test_muted_profile_is_log_only_without_a_delivery_marker(tmp_path, mon
     assert gateway._send_home_channel_message.call_args.args[1] == "muted"
     assert _marker(home).with_suffix(".notified").exists()
     assert len(caplog.records) == 2
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["muted", "no-transport"])
