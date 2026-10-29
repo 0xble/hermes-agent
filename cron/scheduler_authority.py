@@ -190,8 +190,10 @@ def reconcile_pending(*, allow_connect=True):
             row = get_execution(params['request_id'])
             terminal_execution = (row is not None and row['job_id'] == params['job_id']
                                   and row['status'] in {'completed', 'failed'})
+            current = get_job(params['job_id'])
+            booked_completion = row is None and params['request_id'] in (current or {}).get('canonical_completions', [])
             pending_canonical = 'worker_result' in record and not record.get('canonical_settled')
-            if terminal_execution and not pending_canonical:
+            if (terminal_execution or booked_completion) and not pending_canonical:
                 journal.unlink(missing_ok=True)
                 journal.with_suffix('.cancel').unlink(missing_ok=True)
                 continue
@@ -210,19 +212,18 @@ def reconcile_pending(*, allow_connect=True):
                     state = asyncio.run_coroutine_threadsafe(observe(), owner[1]).result(timeout=20)
                 else:
                     state = asyncio.run(observe())
-            if terminal_execution:
+            if terminal_execution or booked_completion:
                 # The worker already booked output/delivery, but the replacement
                 # owner must import its captured result before deleting the only link.
-                # cron.recover uses the same settlement path as cron.status.
-                settled = json.loads(journal.read_text(encoding='utf-8-sig')).get('canonical_settled')
-                if state['status'] == 'terminal' and settled:
+                # A terminal admission is final even if its immutable result differs
+                # from the capture and recover could not stamp canonical_settled.
+                if state['status'] == 'terminal':
                     journal.unlink(missing_ok=True)
                     journal.with_suffix('.cancel').unlink(missing_ok=True)
                 continue
             if state['status'] == 'missing':
                 # The owner holds no admission for this fire: a definite non-admission, booked as
                 # the same failed run the in-submit refusal books. Only ``unknown`` pauses.
-                current = get_job(params['job_id'])
                 if current is None:
                     if not pending_canonical:
                         journal.unlink(missing_ok=True)
@@ -246,10 +247,14 @@ def reconcile_pending(*, allow_connect=True):
             # The canonical receipt supplies the result; a dead scheduler's fire claim does not
             # authorize replay and must not prevent finishing its durable bookkeeping.
             fence = _FireOwnership(dict(job, fire_claim=None))
-            _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
+            _save_compose_deliver(delivery, fence, answer, output if output.strip() else None, adapters=None, loop=None,
                                  verbose=False, execution_token=None)
             fail_empty_response(delivery, answer)
             if finish_completed_run(delivery, None, params['request_id'], recovered=True):
+                # No execution row may remain to fence the next tick (legacy or
+                # pruned runs). Successful recovery is itself terminal bookkeeping.
+                journal.unlink(missing_ok=True)
+                journal.with_suffix('.cancel').unlink(missing_ok=True)
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
         except Exception:
             logging.getLogger(__name__).warning('Cron receipt recovery deferred: %s', journal, exc_info=True)
