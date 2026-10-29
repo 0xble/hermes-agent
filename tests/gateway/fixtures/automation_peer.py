@@ -34,6 +34,9 @@ class Model(BaseHTTPRequestHandler):
         if getattr(self.server, 'checkin', False):
             if '[Supervisor check-in]' in str(last):
                 self.server.checkin_turns += 1
+                if hasattr(self.server, 'checkin_release'):
+                    self.server.checkin_blocked.set()
+                    self.server.checkin_release.wait(60)
                 message['content'] = 'NO_REPLY'
             # Recovery guidance is API-only system text, not a new human row.
             elif any('required supervisor status' in str(m.get('content', ''))
@@ -88,7 +91,8 @@ async def probe(root, base, mode):
     model.requests = []
     model.blocked, model.release = threading.Event(), threading.Event()
     model.gate = home / 'release-terminal'
-    model.checkin = mode in {'checkin', 'peer-checkin'}
+    model.checkin = mode in ('checkin', 'peer-checkin', 'checkin-race-admission', 'checkin-race-execution')
+    race = mode.startswith('checkin-race-')
     if mode == 'peer-checkin':
         model.status_text = 'SUPERVISOR_STATUS: peer result still awaits parent verification. Next check in 30 minutes.'
     model.checkin_turns = 0
@@ -102,7 +106,7 @@ async def probe(root, base, mode):
         assert hello['platform'] == 'telegram', hello
         descriptor = {'contract_version': 1, 'platform': 'telegram', 'label': 'Fixture',
             'max_message_length': 4096, 'supports_draft_streaming': False, 'supports_edit': True,
-            'supports_threads': mode in {'checkin', 'peer-checkin'}, 'markdown_dialect': 'plain', 'len_unit': 'chars'}
+            'supports_threads': model.checkin, 'markdown_dialect': 'plain', 'len_unit': 'chars'}
         await ws.send(json.dumps({'type': 'descriptor', 'descriptor': descriptor}) + '\n')
         await ready.put(ws)
         async for line in ws:
@@ -140,11 +144,14 @@ async def probe(root, base, mode):
             env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
             env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
                 OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url, PYTHONUNBUFFERED='1',
+                HERMES_TEST_ISOLATION=str(home), SUPERVISOR_BOUNDARY=mode,
                 GATEWAY_RELAY_URL=f'ws://127.0.0.1:{relay.sockets[0].getsockname()[1]}/relay',
                 GATEWAY_RELAY_PLATFORMS='telegram', GATEWAY_RELAY_BOT_IDS='{"telegram":{"botId":"fixture-bot"}}',
                 GATEWAY_RELAY_ID='fixture-gateway', GATEWAY_RELAY_SECRET='fixture-secret')
             with (home / 'daemon.log').open('w+') as log:
-                proc = subprocess.Popen([sys.executable, '-m', 'gateway.run'], cwd=root, env=env,  # noqa: ASYNC220 -- Popen returns immediately; the test drives the child through its handle
+                launch = ([sys.executable, str(root / 'tests/gateway/fixtures/supervisor_boundary_daemon.py')]
+                          if race else [sys.executable, '-m', 'gateway.run'])
+                proc = subprocess.Popen(launch, cwd=root, env=env,  # noqa: ASYNC220 -- Popen returns immediately; the test drives the child through its handle
                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
                 try:
                     ws = await asyncio.wait_for(ready.get(), 35)
@@ -154,10 +161,10 @@ async def probe(root, base, mode):
                         await ws.send(json.dumps({'type': 'inbound', 'event': {'text': text,
                             'message_id': identity, 'source': {'platform': 'telegram', 'chat_id': 'automation-chat',
                             'chat_type': 'dm', 'user_id': 'fixture-user',
-                            **({'thread_id': '103'} if mode in {'checkin', 'peer-checkin'} else {})}}}) + '\n')
-                    await send('spawn', 'SPAWN_AUTOMATION' if mode in {'terminal', 'checkin'} else 'WARM_AUTOMATION')
+                            **({'thread_id': '103'} if model.checkin else {})}}}) + '\n')
+                    await send('spawn', 'SPAWN_AUTOMATION' if mode in {'terminal', 'checkin'} or race else 'WARM_AUTOMATION')
                     await wait_for(lambda: any(r['request_id'] == 'spawn' and r['status'] == 'terminal' for r in rows()))
-                    if mode in {'terminal', 'checkin'}:
+                    if mode in {'terminal', 'checkin'} or race:
                         assert 'REAL_TERMINAL_COMPLETION' in json.dumps(model.requests), 'model did not request real terminal'
                     elif mode == 'heartbeat':
                         await send('timer-config', '/heartbeat every 1m TIMER_AUTOMATION')
@@ -187,7 +194,7 @@ async def probe(root, base, mode):
                                 if cli.returncode is None:
                                     cli.kill()
                                     await cli.wait()
-                    if mode in {'checkin', 'peer-checkin'}:
+                    if model.checkin:
                         def state():
                             with sqlite3.connect(home / 'state.db') as db:
                                 row = db.execute('SELECT value FROM state_meta WHERE key=?', ('checkin:' + sid,)).fetchone()
@@ -201,6 +208,28 @@ async def probe(root, base, mode):
                         armed['due_at'] = time.time() - 1
                         with sqlite3.connect(home / 'state.db') as db:
                             db.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(armed), 'checkin:' + sid))
+                        if race:
+                            await wait_for((home / 'boundary-ready').exists)
+                            await send('human-race', 'HUMAN_FIFO_FOLLOWER')
+                            await wait_for((home / 'human-seen').exists)
+                            if mode == 'checkin-race-execution':
+                                await wait_for(lambda: any(r['request_id'] == 'human-race' for r in rows()))
+                            (home / 'boundary-release').touch()
+                            await wait_for(lambda: any(r['request_id'] == 'human-race' and r['status'] == 'terminal'
+                                                      for r in rows()))
+                            automatic = [r for r in rows() if 'supervisor-checkin' in r['request_id']]
+                            assert len(automatic) == 1 and automatic[0]['status'] == 'terminal', automatic
+                            assert model.checkin_turns == 0, model.requests
+                            # The native finite owner settles a no-response discard as completed.
+                            # Expendability means no model/send and no FIFO pause, not a new outcome.
+                            assert automatic[0]['outcome'] == 'completed', automatic
+                            assert not any('SUPERVISOR_STATUS' in json.dumps(f) for f in outgoing), outgoing
+                            await send('after-race', 'AFTER_RACE')
+                            await wait_for(lambda: any(r['request_id'] == 'after-race' and r['status'] == 'terminal'
+                                                      for r in rows()))
+                            print(json.dumps({'boundary': mode, 'ledger': rows(), 'model_checkin_turns': 0,
+                                              'human_follower_drained': True, 'successor_drained': True}))
+                            return
                         try:
                             await wait_for(lambda: 'SUPERVISOR_STATUS' in json.dumps(outgoing))
                         except AssertionError as exc:
@@ -284,6 +313,7 @@ async def probe(root, base, mode):
                     print(json.dumps({'daemon_pid': proc.pid, 'ledger': rows(), 'model_inputs': texts,
                                       'observer_closed_before_completion': True}))
                 except BaseException:
+                    (home / 'boundary-release').touch()
                     status_ack.set()
                     print((home / 'daemon.log').read_text()[-10000:], file=sys.stderr)
                     raise

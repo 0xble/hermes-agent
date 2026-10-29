@@ -143,8 +143,12 @@ async def poll_checkins(runner):
                                      message_id=identity, metadata={"gateway_session_key": route,
                                      "gateway_session_id": entry.session_id, "checkin": descriptor,
                                      "display_kind": DISPLAY_KIND, "display_text": "Supervisor check-in"})
-                event.source = copy.copy(source)
-                event.source.message_id = None
+                from gateway.config import Platform
+                # LOCAL sources are in-process capabilities. Cloning one invalidates
+                # the registered owner's identity, unlike a native transport route.
+                if source.platform != Platform.LOCAL:
+                    event.source = copy.copy(source)
+                    event.source.message_id = None
                 await authority.admit_automation(adapter, event, identity)
         except Exception:
             logger.warning("Supervisor check-in deferred for %s", route, exc_info=True)
@@ -271,6 +275,24 @@ def install_visible_observer(runner, adapter):
             return observed
 
         setattr(adapter, name, wrap(method, signature, name))
+
+
+async def record_local_settlement(runner, source, settled, response, captured):
+    """LOCAL delivery is the committed replayable result, never its no-op adapter send."""
+    from gateway.config import Platform
+    if source.platform != Platform.LOCAL or settled.get("outcome") != "completed" or not response:
+        return
+    result = (captured or {}).get("result") or {}
+    from gateway.response_filters import is_intentional_silence_agent_result
+    if is_intentional_silence_agent_result(result, response):
+        return
+    try:
+        adapter = runner._delivery_adapter_for(source)
+        if adapter is not None:
+            await record_visible(runner, adapter, source.chat_id, source.thread_id, source.platform)
+    except Exception:
+        # Terminal storage is already committed. An anchor failure cannot rewrite it.
+        logger.warning("Could not record supervisor LOCAL visible-output anchor", exc_info=True)
 
 
 async def record_visible(runner, adapter, chat_id, thread_id=None, platform=None):

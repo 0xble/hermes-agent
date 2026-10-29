@@ -1240,6 +1240,7 @@ class SessionAuthority:
                     return
                 raise
             settled = None
+            captured = None
             settlement = {}
             try:
                 # Redaction, encoding and the SQLite write run off-loop: one turn's settlement must
@@ -1316,6 +1317,9 @@ class SessionAuthority:
                 waiter_replies(self).pop(admission_id, None)
                 # Taken on every exit, so a turn that never settled leaves no reset for a later one.
                 reset = self.deferred_resets.pop(live.route, None)
+            if settled is not None:
+                from gateway.run_checkins import record_local_settlement
+                await record_local_settlement(self.runner, live.source, settled, response, captured)
             await self._run_deferred_reset(live.route, reset)
             from gateway.session_ingress import deliver_settled
             await deliver_settled(self, admission_id)
