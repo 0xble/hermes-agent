@@ -32,6 +32,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -124,7 +125,7 @@ def _token(nonce: str, i: int) -> str:
     return f"tok{nonce}n{i}"
 
 
-# ── scripted provider: one module-wide server, faults keyed by the prompt marker ────────
+# ── scripted provider: faults keyed by the prompt marker ─────────────────────────────
 
 
 def _tools_then_text(first: Callable[[str], ToolCall]) -> Callable[[list, str], Any]:
@@ -333,7 +334,28 @@ def _reap(gw: TuiGatewayProcess, tag: str) -> None:
         kill_tagged(tag)
 
 
-def run_scenario(scn: Scenario, srv: FakeLLMServer, root: Path) -> dict[str, Any]:
+def run_scenario(scn: Scenario, root: Path) -> dict[str, Any]:
+    drop_pending, sampled = threading.Event(), threading.Event()
+
+    def before_drop() -> None:
+        drop_pending.set()
+        assert sampled.wait(TURN_DEADLINE_S), "drop observation never finished"
+
+    def respond(record: dict[str, Any]):
+        response = responder(record)
+        if isinstance(response, DropMidStream):
+            response.before_drop = before_drop
+        return response
+
+    with FakeLLMServer(respond) as srv:
+        try:
+            return _run_scenario(scn, srv, root, drop_pending, sampled)
+        finally:
+            sampled.set()
+
+
+def _run_scenario(scn: Scenario, srv: FakeLLMServer, root: Path,
+                  drop_pending: threading.Event, sampled: threading.Event) -> dict[str, Any]:
     nonce = uuid.uuid4().hex[:10]
     marker = f"[[chaos:{scn.fault}:{nonce}]]"
     probe_marker = f"[[probe:{nonce}]]"
@@ -365,6 +387,17 @@ def run_scenario(scn: Scenario, srv: FakeLLMServer, root: Path) -> dict[str, Any
             t0 = time.monotonic()
             submitted = gw.call("prompt.submit", {"session_id": sid, "text": f"please work {marker}"})
             assert submitted.get("status") == "streaming", submitted
+            if scn.fault == "drop":
+                # A legal slow RPC can consume most of a fast failed turn. Hold the
+                # first provider request until the sampler has actually observed it,
+                # rather than infer five observations from two seconds of wall time.
+                assert drop_pending.wait(TURN_DEADLINE_S), "provider never prepared its drop"
+                observed = len(hb.latencies)
+                assert _wait_until(lambda: len(hb.latencies) >= observed + MIN_HEARTBEATS,
+                                   TURN_DEADLINE_S), "dispatcher never answered the drop-window probes"
+                assert gw.wait_event(lambda e: _is(e, "message.complete", sid),
+                                     timeout=0, start=start) is None, "turn ended before the injected drop"
+                sampled.set()
             if scn.wait_for == "provider":
                 assert _wait_until(lambda: _main_requests_for(srv, marker), TURN_DEADLINE_S), (
                     f"provider never saw the turn{gw.tail()}")
@@ -382,7 +415,8 @@ def run_scenario(scn: Scenario, srv: FakeLLMServer, root: Path) -> dict[str, Any
                     "status"] == "interrupted"
                 t0, deadline = t_int, INTERRUPT_DEADLINE_S
             done = None if scn.action in EXIT_ACTIONS else gw.wait_event(
-                lambda e: _is(e, "message.complete", sid), timeout=deadline, start=start)
+                lambda e: _is(e, "message.complete", sid),
+                timeout=max(0.0, deadline - (time.monotonic() - t0)), start=start)
             turn_s = time.monotonic() - t0
         if scn.action in EXIT_ACTIONS:
             return _exit_mid_turn(scn, gw, hb, tag, hermes_home / "state.db", stored, stats)
@@ -443,10 +477,10 @@ def scenario_futures(request: pytest.FixtureRequest, tmp_path_factory: pytest.Te
         item.callspec.params["scn"].id for item in request.session.items
         if isinstance(getattr(getattr(item, "callspec", None), "params", {}).get("scn"), Scenario)
     }
-    with FakeLLMServer(responder) as srv, ThreadPoolExecutor(
+    with ThreadPoolExecutor(
             max_workers=max(1, len(selected)), thread_name_prefix="chaos-tui") as pool:
         futures: dict[str, Future] = {
-            scn.id: pool.submit(run_scenario, scn, srv, tmp_path_factory.mktemp(scn.id))
+            scn.id: pool.submit(run_scenario, scn, tmp_path_factory.mktemp(scn.id))
             for scn in SCENARIOS if scn.id in selected
         }
         try:

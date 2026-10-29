@@ -91,6 +91,8 @@ class DropMidStream:
 
     text: str = "partial answer that never finishes"
     after_chars: int = 12
+    # An observation barrier can hold the request in flight without sleeping.
+    before_drop: Callable[[], None] | None = None
 
 
 @dataclass
@@ -319,6 +321,8 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
                 self.close_connection = True
                 return
             if isinstance(resp, DropMidStream):
+                if resp.before_drop is not None:
+                    resp.before_drop()
                 self._start_sse()
                 self._sse(_chunk({"role": "assistant", "content": ""}))
                 self._sse(_chunk({"content": resp.text[: resp.after_chars]}))

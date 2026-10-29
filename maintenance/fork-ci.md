@@ -548,6 +548,16 @@ tmux journey, assertion and deadline. Retire this fixture choice only when the
 accepted upstream scripted homes have equivalent startup isolation.
 Contract tests: `tests/ci/test_tmux_home_startup_offers.py`.
 
+The TUI gateway drop scenario holds its first provider request until five
+heartbeat RPCs have actually completed while that request is in flight. A
+legal slow first RPC otherwise consumes most of a short failed turn, so elapsed
+time cannot establish the sampler's count. Only then does the provider emit the
+same truncated SSE response. The turn's original deadline includes observation,
+and all heartbeat latency, terminal, retry-bound, history, reaping and subsequent
+prompt assertions remain. Each parallel scenario owns its provider and barrier.
+Retire this synchronization when upstream supplies equivalent observation-driven
+fault injection.
+
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
 complete-suite gap or proves an installed runtime.
