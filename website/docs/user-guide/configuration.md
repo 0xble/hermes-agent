@@ -395,6 +395,7 @@ terminal:
   # terminal call. Left unset, an existing container is kept and the CLI / Screen pane ask first.
   docker_image: "nousresearch/hermes-sandbox:desktop"
   docker_mount_cwd_to_workspace: false  # Mount launch dir into /workspace
+  docker_auto_mount_host_state: true  # Read-only credentials, skills and cache mounts
   docker_run_as_host_user: false   # See "Running container as host user" below
   docker_snap_compat: false        # See "Snap-packaged Docker (AppArmor)" below
   docker_forward_env:              # Host env vars to forward into container
@@ -475,6 +476,10 @@ Parallel subagents spawned via `delegate_task(tasks=[...])` share this one conta
 
 **Credential forwarding:** Env vars listed in `docker_forward_env` are resolved from your shell environment first, then `~/.hermes/.env`. Skills can also declare `required_environment_variables` which are merged automatically.
 
+**Automatic host-state mounts:** `docker_auto_mount_host_state` defaults to `true`. Set it to `false` to skip all automatic credential-file, skills-directory, and cache/staging mounts. Hermes does not collect these paths or create their cache directories when disabled. Explicit `docker_volumes` and the separate `docker_mount_cwd_to_workspace` opt-in still apply. Environment-variable forwarding is unchanged.
+
+The mount policy is part of container reuse identity, including explicit shared-container keys. Containers created with the opposite policy, or older containers without a policy label, are not reused. Changing the flag selects a fresh or matching-policy container and leaves the previous container intact.
+
 #### Environment variable overrides
 
 Every key under `terminal:` has an env-var override of the form `TERMINAL_<KEY_UPPERCASE>`. The most useful ones for the Docker backend:
@@ -487,6 +492,7 @@ Every key under `terminal:` has an env-var override of the form `TERMINAL_<KEY_U
 | `TERMINAL_DOCKER_VOLUMES` | `docker_volumes` | JSON array of `"host:container[:ro]"` strings |
 | `TERMINAL_DOCKER_EXTRA_ARGS` | `docker_extra_args` | JSON array |
 | `TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE` | `docker_mount_cwd_to_workspace` | `true` / `false` |
+| `TERMINAL_DOCKER_AUTO_MOUNT_HOST_STATE` | `docker_auto_mount_host_state` | `true` / `false`, default `true`. `false` skips automatic credentials, skills and cache mounts |
 | `TERMINAL_DOCKER_RUN_AS_HOST_USER` | `docker_run_as_host_user` | `true` / `false` |
 | `TERMINAL_DOCKER_SNAP_COMPAT` | `docker_snap_compat` | `true` / `false` — default `false` |
 | `TERMINAL_DOCKER_NETWORK` | `docker_network` | `true` / `false` — default `true`; `false` = `--network=none` |
