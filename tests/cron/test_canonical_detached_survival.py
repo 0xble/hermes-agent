@@ -171,7 +171,7 @@ scheduler.run_one_job(job, adapters=None, loop=None)
                 # The unknown path must not replay an agent or its pending tool.
                 wait_for(lambda: not psutil.pid_exists(worker_pid)
                     or psutil.Process(worker_pid).status() == psutil.STATUS_ZOMBIE)
-        with daemon(root, home, env, barrier=False) as (_, desc):
+        with daemon(root, home, env, barrier=False) as (_, _desc):
             if lose_worker:
                 rows = wait_for(lambda: admissions() if admissions()[0]['status'] == 'terminal' else None)
                 assert rows[0]['outcome'] == 'interrupted'
@@ -244,13 +244,127 @@ async def test_cron_worker_registration_still_requires_adoption_capability(tmp_p
         db.close()
 
 
+@pytest.fixture
+def detached_observation(tmp_path, monkeypatch):
+    from cron import executions, scheduler_authority
+    from hermes_state_keys import CRON_PRINCIPAL_ID
+
+    monkeypatch.setattr(executions, 'EXECUTIONS_FILE', tmp_path / 'executions.db')
+    execution = executions.create_execution('observe-job', source='test')
+    fire = execution['id']
+    assert executions.mark_execution_handoff_pending(fire)
+    assert executions.adopt_claimed_execution(fire)
+    row = {'request_id': f'cron:observe-job:{fire}', 'principal_id': CRON_PRINCIPAL_ID,
+           'target_session_id': 'observe-session', 'admission_id': 'observe-admission'}
+    path = tmp_path / 'receipt.json'
+    monkeypatch.setattr(scheduler_authority, 'journal_path', lambda *args: path)
+    record = {'params': {'job_id': 'observe-job', 'request_id': fire},
+              'receipt': {'session_id': row['target_session_id'],
+                          'admission_id': row['admission_id']}}
+    path.write_text(json.dumps(record))
+    return row, path, record
+
+
+@pytest.mark.parametrize('publication', ['existing', 'race', 'live', 'invalid', 'invalid-race'])
+def test_observer_captures_validated_result(detached_observation, monkeypatch, publication):
+    from cron import detached_authority, executions
+    from hermes_state_runtime import RuntimeStoreError
+
+    row, path, record = detached_observation
+    fire = row['request_id'].split(':', 2)[2]
+    result = {'result': [True, '# Output', 'CAPTURED', None], 'job_flags': {}}
+    if publication.startswith('invalid'):
+        result['result'][0] = 'not a bool'
+
+    def publish():
+        record['worker_result'] = result
+        path.write_text(json.dumps(record))
+
+    if publication in ('existing', 'invalid'):
+        publish()
+
+    actual_execution = detached_authority.detached_execution
+    checks = []
+
+    def check(job_id, execution_id):
+        if publication == 'live':
+            current = actual_execution(job_id, execution_id)
+            assert current is not None
+            checks.append(current)
+            publish()
+            return current
+        # The initial result read already missed. Publish before terminal commit,
+        # then let the real execution check observe the now-terminal ledger row.
+        publish()
+        assert executions.finish_execution(execution_id, success=True)
+        current = actual_execution(job_id, execution_id)
+        assert current is None
+        checks.append(current)
+        return current
+
+    monkeypatch.setattr(detached_authority, 'detached_execution', check)
+    if publication.startswith('invalid'):
+        with pytest.raises(RuntimeStoreError, match='^invalid_cron_result$'):
+            asyncio.run(detached_authority.observe_detached(row))
+    else:
+        assert asyncio.run(detached_authority.observe_detached(row)) == result
+    assert len(checks) == (0 if publication in ('existing', 'invalid') else 1)
+    assert executions.get_execution(fire)['status'] == (
+        'completed' if publication in ('race', 'invalid-race') else 'running')
+
+
+@pytest.mark.parametrize('worker', ['dead', 'missing', 'terminal'])
+def test_observer_lost_worker_logs_identity(detached_observation, monkeypatch, caplog, worker):
+    import logging
+    from cron import detached_authority, executions
+    from hermes_state_runtime import RuntimeStoreError
+
+    row, _, _ = detached_observation
+    fire = row['request_id'].split(':', 2)[2]
+    execution = executions.get_execution(fire)
+    if worker == 'missing':
+        with executions._transaction() as conn:
+            conn.execute('DELETE FROM executions WHERE id=?', (fire,))
+    elif worker == 'terminal':
+        assert executions.finish_execution(fire, success=True)
+    else:
+        with executions._transaction() as conn:
+            conn.execute('UPDATE executions SET process_id=? WHERE id=?', ('dead-worker', fire))
+        execution['process_id'] = 'dead-worker'
+        monkeypatch.setattr(executions, '_owner_identity', lambda *args: 'dead')
+
+    actual_result = detached_authority.detached_result
+    reads = []
+
+    def read(current):
+        result = actual_result(current)
+        reads.append(result)
+        return result
+
+    monkeypatch.setattr(detached_authority, 'detached_result', read)
+    with caplog.at_level(logging.WARNING, logger='cron.detached_authority'):
+        with pytest.raises(RuntimeStoreError, match='^detached_cron_worker_lost$'):
+            asyncio.run(detached_authority.observe_detached(row))
+    assert reads == [None, None]
+    diagnostics = [r for r in caplog.records if r.name == 'cron.detached_authority']
+    assert len(diagnostics) == 1 and diagnostics[0].levelno == logging.WARNING
+    message = diagnostics[0].getMessage()
+    expected = {'admission_id': row['admission_id'], 'job_id': 'observe-job',
+                'execution_id': fire, 'status': 'absent' if worker == 'missing' else (
+                    'completed' if worker == 'terminal' else 'running'),
+                'owner_liveness': {'dead': 'dead', 'missing': 'absent', 'terminal': 'live'}[worker]}
+    expected.update({key: None if worker == 'missing' else execution[key]
+                     for key in ('pid', 'process_id', 'process_started_at')})
+    for key, value in expected.items():
+        assert f'{key}={value}' in message
+
+
 def test_observer_teardown_is_not_explicit_cron_cancel(monkeypatch):
     from cron import detached_authority
     observed = threading.Event()
 
     def result(row):
         observed.set()
-        return None
 
     def unwanted_cancel(row):
         raise AssertionError('observer teardown must not cancel independent execution')
