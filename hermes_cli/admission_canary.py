@@ -17,11 +17,18 @@ class AdmissionCanaryError(RuntimeError):
 
 
 def settings(home: Path) -> tuple[bool, float, int]:
-    from hermes_cli.config_effective import load_user_config_effective
-    config = load_user_config_effective(home / "config.yaml", fail_closed=True)
-    section = (config.get("gateway") or {}).get("guardian", {}).get("admission_canary", {})
-    if not isinstance(section, dict):
-        raise ValueError("gateway.guardian.admission_canary must be a mapping")
+    from hermes_cli.config import require_readable_config_before_write, _expand_env_vars, _merge_managed_overlay
+    # The guardian needs its own policy even when an unrelated runtime setting is broken.
+    # Keep raw-read and overlay scope intact without admitting this document for execution.
+    config = require_readable_config_before_write(home / "config.yaml")
+    config, _ = _merge_managed_overlay(_expand_env_vars(config))
+    section = config
+    for key in ("gateway", "guardian", "admission_canary"):
+        section = section.get(key, {})
+        if section is None and key != "admission_canary":
+            section = {}
+        if not isinstance(section, dict):
+            raise ValueError("gateway.guardian.admission_canary must be a mapping")
     enabled = section.get("enabled", True)
     window = section.get("window_seconds", 180)
     threshold = section.get("refusal_threshold", 10)
