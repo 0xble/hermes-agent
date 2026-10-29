@@ -31,9 +31,14 @@ def _readiness_issue() -> str:
         return ""
     from hermes_cli.memory_setup import memory_provider_dependency_inputs
     from packaging.requirements import Requirement
-    manifest, _inputs = memory_provider_dependency_inputs(name.strip())
-    packages = [Requirement(raw).name for raw in
-                (manifest.get("python_dependencies") or manifest.get("pip_dependencies") or ())]
+    packages = []
+    try:
+        manifest, _inputs = memory_provider_dependency_inputs(name.strip())
+        packages = [Requirement(raw).name for raw in
+                    (manifest.get("python_dependencies") or manifest.get("pip_dependencies") or ())]
+    except Exception:
+        # Optional package names enrich the warning, never gate its delivery.
+        logger.debug("Could not read memory client package hints for %s", name, exc_info=True)
     detail = f" Client packages: {', '.join(packages)}." if packages else ""
     return (f"Memory provider {name} is unavailable: {reason}{detail} "
             "Run `hermes pm install` (or `hermes pm repair` for a broken client), then restart Hermes.")
