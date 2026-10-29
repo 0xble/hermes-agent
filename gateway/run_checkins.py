@@ -121,7 +121,7 @@ async def poll_checkins(runner):
                 if state is None:
                     runner._checkin_watch.pop(route, None)
                     continue
-                if state.due_at > time.time() or runner._is_session_running(route):
+                if max(state.due_at, state.next_attempt_at) > time.time() or runner._is_session_running(route):
                     continue
                 adapter = runner._delivery_adapter_for(source)
                 if adapter is None or route in getattr(adapter, "_active_sessions", {}) or _queued(adapter, route):

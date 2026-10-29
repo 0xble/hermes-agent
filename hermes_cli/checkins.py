@@ -45,6 +45,7 @@ class CheckinState:
     last_visible_at: float
     due_at: float
     fired: bool = False
+    next_attempt_at: float = 0
 
 
 class CheckinManager:
@@ -97,19 +98,26 @@ class CheckinManager:
                 state.last_visible_at = now
                 delay = self.config.interval_seconds if state.fired else self.config.first_after_seconds
                 state.due_at = now + delay
+                state.next_attempt_at = 0
             return state, None
         return self._update(mutate)
 
     def start(self, due_at, work, *, now=None):
-        """An execution-time fence, not admission-time accounting. One overdue tick coalesces."""
+        """Fence model attempts separately from the still-overdue visible update.
+
+        Native admission owns in-flight exclusion and delivery owns send retries. If a turn
+        ends without an ACK, allow at most one fresh supervision attempt per recurring interval,
+        including after restart, rather than spending a model call on every heartbeat.
+        """
         now = time.time() if now is None else now
         def mutate(state):
             if not self.config.enabled or not work:
                 return None, False
-            if state is None or state.due_at != due_at or now < state.due_at:
+            if (state is None or state.due_at != due_at
+                    or now < max(state.due_at, state.next_attempt_at)):
                 return state, False
             state.fired = True
-            state.due_at = now + self.config.interval_seconds
+            state.next_attempt_at = now + max(300, self.config.interval_seconds)
             return state, True
         return self._update(mutate)
 

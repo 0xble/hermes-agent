@@ -60,14 +60,20 @@ async def test_armed_observation_error_only_confirmed_delivery_resets(fixture, m
 
     f.adapter.send = send
     run_checkins.install_visible_observer(f.runner, f.adapter)
-    f.clock.now = 400
+    f.clock.now = 1300
+    await run_checkins.poll_checkins(f.runner)
+    event = f.authority.admit_automation.await_args.args[1]
+    assert await run_checkins.prepare_checkin(f.runner, event, f.entry, start=True)
+    f.authority.admit_automation.reset_mock()
+    f.clock.now = 1400
     await f.adapter.send("42", "not visible", metadata={"thread_id": "3"})
     await run_checkins.poll_checkins(f.runner)
-    assert f.manager.state == before
+    assert f.manager.state.due_at == before.due_at
+    assert f.manager.state.last_visible_at == before.last_visible_at
     ack = SendResult(success=True, message_id="visible")
     await f.adapter.send("42", "visible", metadata={"thread_id": "3"})
-    assert f.manager.state.due_at == 1600
-    f.clock.now = 1599
+    assert f.manager.state.due_at == 3200
+    f.clock.now = 3199
     await run_checkins.poll_checkins(f.runner)
     f.authority.admit_automation.assert_not_awaited()
     # A successful empty roster disarms, rather than generating a no-work update.

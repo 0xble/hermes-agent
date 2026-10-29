@@ -2,7 +2,7 @@
 
 ## Preserve
 
-Automatically supervise gateway-owned background work without occupying a user loop or heartbeat slot. Keep the state on the compression lineage, deliver to the proven original topic/profile/bot, and never wake a new or forked conversation for its predecessor's work. Only acknowledged visible output resets the cadence. No outstanding work means no check-in turn or status message.
+Automatically supervise gateway-owned background work without occupying a user loop or heartbeat slot. Keep the state on the compression lineage, deliver to the proven original topic/profile/bot, and never wake a new or forked conversation for its predecessor's work. Only acknowledged visible output resets the cadence. Execution start, interruption and failed, held or deferred sends retain the overdue deadline and visible anchor. A separate persisted execution fence permits at most 1 fresh model attempt per recurring interval while the update remains overdue. Native admission still excludes live or pending turns, and the existing bounded delivery ledger/outbox owns retries of produced output, not another model loop. No outstanding work means no check-in turn or status message.
 
 The `supervisor_checkin` display kind is generated machinery with a mandatory written status. It is the bounded exception to unchanged-wait silence, not permission to make ordinary goal or loop wakeups chatty. Reaction-only acknowledgement does not satisfy it. The existing one-shot gateway silence continuation owns model recovery, and normal final delivery owns the factual fallback, never a second transport send path.
 

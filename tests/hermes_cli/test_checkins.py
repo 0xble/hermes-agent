@@ -32,7 +32,8 @@ def test_delivery_resets_first_then_recurring_cadence_and_stale_tick_cannot_star
     assert manager.state.due_at == 1400
     assert not manager.start(1300, [1], now=1500)
     assert manager.start(1400, [1], now=1500)
-    assert manager.state.fired and manager.state.due_at == 3300
+    assert manager.state.fired and manager.state.due_at == 1400
+    assert manager.state.next_attempt_at == 3300
     manager.visible(1510)
     assert manager.state.due_at == 3310
     assert not manager.start(1400, [1], now=5000)
@@ -49,7 +50,14 @@ def test_state_survives_reopen_and_one_overdue_tick_coalesces(tmp_path):
         manager = CheckinManager(db, "owner", CheckinConfig())
         assert manager.start(1300, [1], now=9000)
         assert not manager.start(1300, [1], now=9000)
-        assert manager.state.due_at == 10800
+        assert manager.state.due_at == 1300
+        assert manager.state.next_attempt_at == 10800
+        db.close()
+        db = SessionDB(db_path=path)
+        manager = CheckinManager(db, "owner", CheckinConfig())
+        assert not manager.start(1300, [1], now=10799)
+        assert manager.start(1300, [1], now=10800)
+        assert manager.state.due_at == 1300
     finally:
         db.close()
 
