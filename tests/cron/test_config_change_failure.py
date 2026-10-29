@@ -24,8 +24,11 @@ def test_config_mutating_cron_failure_names_the_job_once(tmp_path, monkeypatch, 
         assert scheduler._run_one_job_body(job) is True
     saved = jobs.get_job(job["id"])
     assert saved is not None
-    assert saved["last_status"] == "error"
-    assert "config.yaml changed while cron job 'quota-burn-fixture'" in saved["last_error"]
+    assert saved["last_status"] == ("ok" if exit_code == 0 else "error")
+    if exit_code:
+        assert "config.yaml changed while cron job 'quota-burn-fixture'" in saved["last_error"]
+    else:
+        assert not saved["last_error"]
     warnings = [r.message for r in caplog.records if "config.yaml changed while cron job" in r.message]
     assert len(warnings) == 1
     assert job["id"] in warnings[0]

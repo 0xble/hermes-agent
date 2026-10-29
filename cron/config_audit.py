@@ -64,8 +64,10 @@ def audit_config_changes(run):
             raise
         warning = _changed_config_warning(job, path, before, failed=not success)
         if warning is not None:
-            # Feed the existing failure/incident delivery lane as well as the operator log.
-            # A script's zero exit must not report success after breaking config.yaml.
-            return False, f"{output}\n\n{warning}\n", "", f"{error}\n{warning}" if error else warning
+            # Audit can observe a concurrent editor, not prove the job caused the change.
+            # Retain its actual outcome and final response, with separate operator evidence.
+            output = f"{output}\n\n{warning}\n"
+            if not success:
+                error = f"{error}\n{warning}" if error else warning
         return success, output, response, error
     return audited

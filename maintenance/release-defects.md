@@ -50,14 +50,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `cron-config-change-audit`.
 - The actual cron execution owner snapshots config mtime and SHA-256 around
   agent and no-agent runs. A failed run with a changed document emits 1 warning
-  naming the job and its ID. A successful run leaving an invalid changed config
-  becomes a failure. Both flow through the existing failure/incident lane.
+  naming the job and its ID. A successful run observing an invalid changed config
+  also warns, without replacing its real outcome or final response. Warnings stay
+  in operator logs and saved output. Failed runs also use the existing incident lane.
 - This is an observation of the run interval, not attribution of a concurrent
   edit to that job. Successful valid edits and unchanged failures stay quiet.
 - Owner: `cron/config_audit.py` and `cron/scheduler.py`.
 - Guard: `tests/cron/test_config_change_failure.py` runs real config-mutating
-  scripts through canonical bookkeeping and checks `last_status=error`, the
+  scripts through canonical bookkeeping and checks actual exit status, the
   warning text and its once-only log, plus a successful valid edit.
+  `tests/cron/test_config_audit_result_preservation.py` retains real output and
+  final responses in both agent and no-agent runs. Document-shape regressions
+  reject non-mapping YAML roots rather than silently auditing an empty mapping.
 - Retire when upstream observes config mutations at the same execution boundary
   with equivalent status and operator visibility.
 
