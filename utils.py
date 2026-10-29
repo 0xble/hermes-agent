@@ -341,10 +341,10 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     removed on any failure — ``BaseException`` on purpose, so KeyboardInterrupt / SystemExit still
     clean up.
     """
-    from hermes_cli.config_write_guards import atomic_write_guard
+    from hermes_cli.config_write_guards import _is_config_document, atomic_write_guard
 
     with atomic_write_guard(path) as admit:
-        if path.name == "config.yaml":
+        if _is_config_document(path):
             # Hermes's own config writers (config set/unset, save_config, migrate_config, import-agent)
             # all funnel here, so one check stops a newer-schema build stamping a release-managed
             # config. Agent-authored file edits use tools/file_operations.py and are out of scope.
