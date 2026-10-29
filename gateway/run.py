@@ -2088,6 +2088,7 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
         "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
         "docker_env": "TERMINAL_DOCKER_ENV",
+        "docker_auto_mount_host_state": "TERMINAL_DOCKER_AUTO_MOUNT_HOST_STATE",
         "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
         "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
         "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",

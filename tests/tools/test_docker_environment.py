@@ -795,6 +795,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-auto-mount-host-state": "true",
     }
     assert re.fullmatch(r"[0-9a-f]{24}", environment_label)
 
