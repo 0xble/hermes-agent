@@ -82,12 +82,12 @@ def test_peer_resolution_retries_native_cas_without_losing_concurrent_peer(paren
     commit = goals_evaluation.commit_goal_snapshot
     raced = False
 
-    def race(session_id, state, expected, database):
+    def race(session_id, expected, state, database, **kwargs):
         nonlocal raced
         if not raced:
             raced = True
             register(goals.GoalManager("parent"), ref="concurrent-work")
-        return commit(session_id, state, expected, database)
+        return commit(session_id, expected, state, database, **kwargs)
 
     monkeypatch.setattr(goals_evaluation, "commit_goal_snapshot", race)
     assert mgr.resolve_peer(PEER, "existing-work", PROOF, expected_instance=mgr.state.created_at)["ok"]
