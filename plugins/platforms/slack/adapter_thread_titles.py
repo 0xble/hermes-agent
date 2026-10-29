@@ -54,7 +54,8 @@ def _root_title_edit(root: dict, title: str, bot_user_id: str) -> Optional[tuple
     """``("bot" | "owner", chat.update kwargs)`` for a root we may retitle; None leaves it untouched.
 
     Our bot's root gains a bold first line unless it already leads with a title. A human root
-    is edited only in the seeded opener shape, and only its bold first line changes.
+    is edited only in the seeded opener shape, never after any edit (ours or theirs, which
+    survives restarts unlike the in-memory guard), and only its bold first line changes.
     """
     text = root.get("text") or ""
     blocks = root.get("blocks")
@@ -69,7 +70,7 @@ def _root_title_edit(root: dict, title: str, bot_user_id: str) -> Optional[tuple
                 return None
             edit["blocks"] = [{"type": "section", "text": {"type": "mrkdwn", "text": heading}}, *blocks]
         return "bot", edit
-    match = _SEEDED_OPENER.fullmatch(text)
+    match = None if root.get("edited") else _SEEDED_OPENER.fullmatch(text)
     old_title = html.unescape(match.group(1)) if match else ""
     if not old_title or old_title == title:
         return None
@@ -205,6 +206,7 @@ class SlackThreadTitlesMixin:
         agents.sessions.rename covers channel threads only when Slack holds an agent session for
         them (else session_not_found); Hermes never opens one there, so channels do not use it.
         """
+        from slack_sdk.errors import SlackApiError
         try:
             title = self._reserve_title_upgrade(source, title, current)
             if not title:
@@ -225,6 +227,9 @@ class SlackThreadTitlesMixin:
                 if client is None:
                     return
             await client.chat_update(channel=source.chat_id, ts=source.thread_id, **kwargs)
+        except SlackApiError as e:
+            logger.info("[Slack] channel thread root title rejected: %s",
+                        (getattr(e, "response", None) or {}).get("error") or e)
         except Exception:
             logger.debug("[Slack] channel thread root title failed", exc_info=True)
 

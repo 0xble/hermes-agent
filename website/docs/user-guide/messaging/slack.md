@@ -534,8 +534,8 @@ session title on the thread root, once per thread:
   migrated-opener shape (a bold first line, then `Moved from Telegram...`) has
   only that bold line replaced. This needs `SLACK_USER_TOKEN` for the same
   user and workspace, with `chat:write`, as for
-  [deleted threads](#deleted-threads-in-the-owner-dm). Without it the root is
-  left as it is.
+  [deleted threads](#deleted-threads-in-the-owner-dm). Without it, or once the
+  opener has been edited, the root is left as it is.
 - Hermes never edits any other human-written root.
 
 ### Working-State Status Line

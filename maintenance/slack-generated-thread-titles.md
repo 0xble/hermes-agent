@@ -19,6 +19,7 @@ Patch identity: `slack-generated-thread-titles`.
 - Drop typographic apostrophes, which `agents.sessions.rename` rejects as `invalid_name`. Fall back to `assistant.threads.setTitle` only on `not_authorized`, which legacy Assistant roots return.
 - Do not replace the shared worker with an intake-path model request.
 - Channel threads do not call `agents.sessions.rename`: Slack documents it for channel thread sessions, but answers `session_not_found` where no agent session exists, and Hermes does not open one there.
+- Skip a seeded opener Slack marks `edited`. Our own edit sets it, so the once-only rule survives restarts, and a manual rename is never overwritten.
 - Bot-root detection compares the root's `user` with our bot user ID, never `bot_id`: user-token posts carry the posting app's `bot_id`.
 - Send blocks with every root edit when the root has blocks. `chat.update` keeps the old blocks when none are sent, so a text-only edit is invisible.
 

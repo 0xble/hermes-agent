@@ -296,6 +296,8 @@ async def test_channel_thread_gets_verb_first_title_on_its_root(adapter, channel
     ({"user": "UOTHER", "text": SEEDED, "blocks": SEEDED_BLOCKS}, "xoxp-owner", None),
     ({"user": "UOWNER", "text": SEEDED, "blocks": SEEDED_BLOCKS}, None, None),
     ({"user": "UOWNER", "text": SEEDED, "blocks": SEEDED_BLOCKS}, "xoxp-other", None),
+    ({"user": "UOWNER", "text": SEEDED, "blocks": SEEDED_BLOCKS, "edited": {"user": "UOWNER", "ts": "171234.0002"}},
+     "xoxp-owner", None),
     ({"user": "UOWNER", "text": SEEDED, "blocks": SEEDED_BLOCKS}, "xoxp-owner", "owner"),
 ])
 async def test_channel_root_rewrite_never_touches_free_human_text(adapter, channel, monkeypatch, root, token, edited_by):
