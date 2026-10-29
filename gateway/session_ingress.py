@@ -270,6 +270,10 @@ async def execute_admission(authority, ref, row):
         if 'local_automation_v1' in row['payload']:
             from gateway.session_automation import restore_local_automation
             event = restore_local_automation(authority, ref, row)
+    # The committed FIFO claim owns execution, not the transport envelope that ingress
+    # already admitted. Rehydration creates a new event, so its local outbox scope cannot
+    # survive. Give the claim a durable identity without weakening transport redelivery dedup.
+    setattr(event, '_outbox_admission_id', f"admission:{row['admission_id']}")
     if event.internal and 'gateway_session_id' in event.metadata:
         # Main's ownership proof (802fd5782f3): the session the pre-claim check just validated, so the
         # turn's resolver never re-reads (and on a transient failure drops) an admitted completion.
