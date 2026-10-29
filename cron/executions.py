@@ -16,9 +16,9 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Iterable, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -31,7 +31,12 @@ logger = logging.getLogger(__name__)
 # that temporarily enter another profile cannot leak that profile's records into the import-time
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+# A full week plus one audit period, independent of normal fleet throughput.
+TERMINAL_RETENTION_DAYS = 8
+# Runaway-write backstop, not the normal history window (see the maintenance unit).
+MAX_TERMINAL_EXECUTIONS = 100_000
+# Every terminal transition contributes one short cleanup batch, including recovery.
+TERMINAL_PRUNE_BATCH_SIZE = 500
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
@@ -109,6 +114,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
+    )
+    # Numeric instants handle timezone/DST changes. The partial index keeps age
+    # selection and oldest-first trimming off the output-bearing table pages.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_terminal_age "
+        "ON executions(COALESCE(julianday(finished_at), julianday(claimed_at)), id) "
+        "WHERE status IN ('completed','failed','unknown')"
     )
 
 
@@ -246,15 +258,46 @@ def touch_execution_progress(execution_id: str) -> bool:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    conn.execute(
+    """Age out terminal history, with a bounded runaway-write backstop.
+
+    Share one deletion budget between both policies so an upgrade or recovery
+    backlog cannot monopolize the caller's write transaction. Later transitions
+    drain any remaining excess. In-flight attempts never enter either policy.
+    """
+    cutoff = (_hermes_now().astimezone(UTC) - timedelta(days=TERMINAL_RETENTION_DAYS)).isoformat()
+    budget = TERMINAL_PRUNE_BATCH_SIZE
+    expired = conn.execute(
         """DELETE FROM executions WHERE id IN (
-             SELECT id FROM executions
+             SELECT id FROM executions INDEXED BY idx_executions_terminal_age
              WHERE status IN ('completed','failed','unknown')
-             ORDER BY julianday(finished_at) DESC, finished_at DESC,
-                      julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+               AND COALESCE(julianday(finished_at), julianday(claimed_at)) < julianday(?)
+             ORDER BY COALESCE(julianday(finished_at), julianday(claimed_at)), id LIMIT ?
            )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
-    )
+        (cutoff, budget),
+    ).rowcount
+    budget -= expired
+    if budget <= 0:
+        return
+    cap = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    # Only count enough indexed entries to fill this batch. Neither a table
+    # scan nor sorting the entire history belongs inside a terminal write.
+    remaining = conn.execute(
+        """SELECT COUNT(*) FROM (
+             SELECT 1 FROM executions INDEXED BY idx_executions_terminal_age
+             WHERE status IN ('completed','failed','unknown') LIMIT ?
+           )""",
+        (cap + budget,),
+    ).fetchone()[0]
+    excess = min(budget, remaining - cap)
+    if excess > 0:
+        conn.execute(
+            """DELETE FROM executions WHERE id IN (
+                 SELECT id FROM executions INDEXED BY idx_executions_terminal_age
+                 WHERE status IN ('completed','failed','unknown')
+                 ORDER BY COALESCE(julianday(finished_at), julianday(claimed_at)), id LIMIT ?
+               )""",
+            (excess,),
+        )
 
 
 def create_execution(
@@ -707,7 +750,7 @@ def _project_delivery_statuses(conn: sqlite3.Connection, rows: Iterable[tuple[st
 
 def record_delivery_outcome(
     execution_id: str, outcome: str, *, resolve_provisional_status: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Classify an already committed detached result once, without reopening its result fence.
 
     The same process/PID that committed the result owns this write; a replacement
