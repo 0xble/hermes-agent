@@ -1,11 +1,45 @@
 """Exact scheduled identities, independent of mutable jobs.json dispatch stamps, plus the
 profile-local stale-schedule catch-up counter marker."""
 from datetime import datetime, timedelta, timezone, UTC
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+import time
 import logging
 import sqlite3
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _CompletionReadBudget:
+    deadline: float
+    busy: bool = False
+
+
+_completion_read_budget: ContextVar[_CompletionReadBudget | None] = ContextVar("completion_read_budget", default=None)
+
+
+@contextmanager
+def completion_read_scan():
+    """Share one brief SQLite wait across a scan, not one wait per stored job."""
+    token = _completion_read_budget.set(_CompletionReadBudget(time.monotonic() + 0.05))
+    try:
+        yield
+    finally:
+        _completion_read_budget.reset(token)
+
+
+def recover_unstarted_run_claim(job, scan):
+    """A local dispatch that never entered the running set can retry on this scan."""
+    from cron.jobs import _job_running_in_this_process, _machine_id
+
+    claim = job.get("run_claim")
+    if (job.get("schedule", {}).get("kind") == "once" and isinstance(claim, dict)
+            and claim.get("by") == _machine_id() and not _job_running_in_this_process(job["id"])):
+        # Preserve outage eligibility when dispatch was refused before taking its fire claim.
+        job["run_claim"] = {"outage": True} if claim.get("outage") else None
+        scan.persist(job["id"], run_claim=job["run_claim"])
 
 
 def scheduled_instant(value):
@@ -27,10 +61,14 @@ def _completed_rows(job_id, instant):
     The due scan holds jobs.json's cross-process lock. Taking the execution writer
     mutex here lets unrelated ledger work hold that global lock for an entire scan.
     WAL readers need neither that mutex nor a fresh schema/PRAGMA pass per job.
-    Brief SQLite busy periods get 50 ms to clear before the unknown-proof fail-open policy.
+    A scan shares 50 ms for busy periods, then keeps the unknown-proof fail-open policy.
     """
     from cron.executions import _db_path, _transaction
 
+    budget = _completion_read_budget.get()
+    if budget is not None and budget.busy:
+        return []
+    timeout = 0.05 if budget is None else max(0.0, budget.deadline - time.monotonic())
     path = _db_path()
     if not path.exists():
         return []
@@ -40,10 +78,12 @@ def _completed_rows(job_id, instant):
     )
     try:
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
-                                     timeout=0.05)) as conn:
+                                     timeout=timeout)) as conn:
             conn.row_factory = sqlite3.Row
             return conn.execute(query, (str(job_id), instant)).fetchall()
     except sqlite3.OperationalError as exc:
+        if budget is not None and getattr(exc, "sqlite_errorcode", 0) & 0xff in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+            budget.busy = True
         # Preserve the legacy reader's lazy migration contract. Established ledgers
         # never enter this writer path, and a missing/unreadable DB is not initialized.
         if "no such column: scheduled_instant" not in str(exc):

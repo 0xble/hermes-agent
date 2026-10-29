@@ -135,3 +135,34 @@ def test_completed_run_bookkeeping_can_be_retried_after_contention(tmp_path, mon
         assert current["last_status"] == "ok"
         assert not current.get("fire_claim")
         assert executions.get_execution(execution["id"])["status"] == "completed"
+
+
+@pytest.mark.platforms("posix")
+def test_oneshot_refused_fire_claim_retries_next_locked_scan(tmp_path, monkeypatch):
+    from cron import scheduler
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(scheduler, "settle_unstarted_execution", Mock())
+    with jobs.use_cron_store(home):
+        job = jobs.create_job(prompt="retry unstarted one-shot", schedule="in 1m")
+        slot = (jobs._hermes_now() - timedelta(seconds=5)).isoformat()
+        jobs.update_job(job["id"], {"next_run_at": slot})
+        due = jobs.get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+        claim = jobs.get_job(job["id"])["run_claim"]
+        assert jobs._claim_is_live(claim, jobs._hermes_now(), 1800)
+        monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0)
+        with _holder(home):
+            assert not process_due_job(dict(due[0], execution_id="unstarted"), None, None, False)
+            assert jobs.get_job(job["id"])["run_claim"] == claim
+        # Queued/running workers and foreign claims still exclude another dispatch.
+        monkeypatch.setattr(jobs, "_job_running_in_this_process", lambda _: True)
+        assert jobs.get_due_jobs() == []
+        monkeypatch.setattr(jobs, "_job_running_in_this_process", lambda _: False)
+        jobs.update_job(job["id"], {"run_claim": dict(claim, by="foreign-host:123")})
+        assert jobs.get_due_jobs() == []
+        jobs.update_job(job["id"], {"run_claim": claim})
+        retry = jobs.get_due_jobs()
+        assert [j["id"] for j in retry] == [job["id"]]
+        assert retry[0]["next_run_at"] == slot
+        assert jobs.claim_job_for_fire(job["id"])

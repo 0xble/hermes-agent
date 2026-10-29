@@ -250,9 +250,9 @@ def test_skipped_oneshot_survives_recovery_by_any_save(cron_store, monkeypatch):
         assert [d["id"] for d in get_due_jobs()] == ["once"]
     save_jobs(load_jobs())  # second recovery
     assert [d["id"] for d in get_due_jobs()] == ["once"]
-    # Its fire claim never landed: the live run claim skips it (that saved scan ends the
-    # recovery window), and once the claim expires it still fires instead of staying stuck.
-    assert get_due_jobs() == []
+    # Its fire claim never landed and no worker is running here: retry on the next
+    # scan without waiting for the claim TTL, retaining outage eligibility throughout.
+    assert [d["id"] for d in get_due_jobs()] == ["once"]
     clock["now"] += timedelta(seconds=cronjobs._oneshot_run_claim_ttl_seconds() + 60)
     assert [d["id"] for d in get_due_jobs()] == ["once"]
     cronjobs.clear_run_claim("once")  # its dispatch failed (pool shut down): still not missed

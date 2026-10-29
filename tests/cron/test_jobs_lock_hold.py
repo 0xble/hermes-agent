@@ -28,7 +28,7 @@ def _completed_job():
     job = jobs.create_job(prompt="completion proof", schedule="every 4h")
     slot = (jobs._hermes_now() - timedelta(seconds=10)).isoformat()
     records = jobs.load_jobs()
-    records[0]["next_run_at"] = slot
+    next(record for record in records if record["id"] == job["id"])["next_run_at"] = slot
     jobs.save_jobs(records)
     record = executions.create_execution(job["id"], source="builtin", scheduled_instant=slot)
     executions.finish_execution(record["id"], success=True)
@@ -91,41 +91,69 @@ def test_missing_completion_ledger_is_not_created(ledger):
     assert not ledger.exists()
 
 
-def test_completion_read_waits_briefly_for_transient_sqlite_busy(ledger, monkeypatch):
-    slot = "2026-01-01T00:00:00+00:00"
-    with sqlite3.connect(ledger) as conn:
-        conn.execute("CREATE TABLE executions (id, job_id, scheduled_instant, status, finished_at, claimed_at)")
-        conn.execute("INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?)",
-                     ("proof", "job", slot, "completed", slot, slot))
-    held, reading = threading.Event(), threading.Event()
+def test_completion_read_configures_bounded_sqlite_busy_timeout(ledger, monkeypatch):
+    job, slot = _completed_job()
     connect = sqlite3.connect
-
-    def hold_until_read():
-        with connect(ledger) as writer:
-            writer.execute("BEGIN EXCLUSIVE")
-            held.set()
-            assert reading.wait(5)
-            # Simulate a short schema/commit lock, not an execution writer mutex wait.
-            threading.Event().wait(0.005)
-            writer.rollback()
+    timeouts = []
 
     class CompletionReader(sqlite3.Connection):
         def execute(self, query, *args, **kwargs):
             if query.startswith("SELECT id, finished_at"):
-                assert super().execute("PRAGMA busy_timeout").fetchone()[0] == 50
-                reading.set()
+                timeouts.append(super().execute("PRAGMA busy_timeout").fetchone()[0])
             return super().execute(query, *args, **kwargs)
 
-    holder = threading.Thread(target=hold_until_read)
-    holder.start()
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: connect(*a, **kw, factory=CompletionReader))
+    assert completed_occurrence(job, slot)
+    assert timeouts == [50]
+
+
+def test_successful_reads_share_one_scan_deadline(ledger, monkeypatch):
+    from types import SimpleNamespace
+    from cron import occurrences
+
+    job, slot = _completed_job()
+    clock = iter([100.0, 100.01, 100.04, 100.06])
+    monkeypatch.setattr(occurrences, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    connect = sqlite3.connect
+    waits = []
+
+    def reader(*args, **kwargs):
+        waits.append(kwargs["timeout"])
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", reader)
+    with occurrences.completion_read_scan():
+        for _ in range(3):
+            assert completed_occurrence(job, slot)
+    assert waits == pytest.approx([0.04, 0.01, 0.0])
+
+
+def test_busy_ledger_wait_is_shared_by_scan_and_resets_next_scan(ledger, monkeypatch):
+    completed = [_completed_job() for _ in range(8)]
+    writer = sqlite3.connect(ledger)
+    connect = sqlite3.connect
+    waits = []
+
+    def reader(*args, **kwargs):
+        waits.append(kwargs["timeout"])
+        return connect(*args, **kwargs)
+
     try:
-        assert held.wait(5)
-        monkeypatch.setattr(sqlite3, "connect", lambda *a, **kw: connect(*a, **kw, factory=CompletionReader))
-        assert completed_occurrence({"id": "job"}, slot)
+        writer.execute("PRAGMA journal_mode=DELETE")
+        writer.execute("BEGIN EXCLUSIVE")
+        monkeypatch.setattr(sqlite3, "connect", reader)
+        # After the first busy read, the remaining jobs use unknown-proof fail-open.
+        assert {j["id"] for j in jobs.get_due_jobs()} == {j["id"] for j, _ in completed}
+        assert len(waits) == 1
+        assert 0 <= waits[0] <= 0.05
+        writer.rollback()
+        # A subsequent scan has a fresh budget and can see every completion again.
+        waits.clear()
+        assert jobs.get_due_jobs() == []
+        assert len(waits) == len(completed)
     finally:
-        reading.set()
-        holder.join(timeout=5)
-    assert not holder.is_alive()
+        writer.rollback()
+        writer.close()
 
 
 def test_busy_completion_read_remains_unknown_after_bounded_wait(ledger, caplog):

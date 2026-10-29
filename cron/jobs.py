@@ -3,6 +3,7 @@
 ~/.hermes/cron/output/{job_id}/{timestamp}.md"""
 
 import contextlib
+import errno
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -242,15 +243,8 @@ def _oneshot_run_claim_ttl_seconds() -> float:
 
 
 def _job_running_in_this_process(job_id: str) -> bool:
-    """True when the scheduler in THIS process is still running ``job_id``: the run_claim TTL alone
-    cannot distinguish "claiming tick died" from "alive but slow". Lazy import: scheduler imports
-    us.
-
-    Direct liveness signal for stale-entry recovery (#62002): the run_claim TTL alone cannot distinguish
-    "the claiming tick died" from "the run is alive but slow" — a run stalled on network I/O (or a laptop
-    that slept mid-run) legitimately outlives the TTL. The in-process ticker and the run share this process,
-    so the scheduler's running set settles the common single-gateway case without any claim-age guesswork.
-
+    """Check local liveness, not claim age: a slow run may outlive its TTL (#62002).
+    Import lazily because scheduler imports us.
     Home-scoped: one process ticks every profile, so the host-wide union of bare job ids would let
     profile A's running ``daily-brief`` keep profile B's stale one-shot alive forever.
     """
@@ -281,7 +275,9 @@ def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return True
-            except OSError:
+            except OSError as exc:
+                if exc.errno not in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise
                 if time.monotonic() >= deadline:
                     return False
                 time.sleep(0.1)
@@ -305,7 +301,7 @@ def _release_flock(lock_fd) -> None:
 
 
 class JobsLockContended(RuntimeError):
-    """A refused store write without lock ownership, safe to retry after contention."""
+    """A refused store write after a real lock acquisition timeout, safe to retry."""
 
 
 @contextlib.contextmanager
@@ -326,12 +322,9 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
-        # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
-        # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
-        # stamps from unlocked loads or prior sections can never suppress a needed merge.
-        # See #80703.
+        # Reset the #80703 shrink-merge stamp so earlier reads cannot suppress a needed merge.
         _jobs_lock_state.load_stamp = None
-        _jobs_lock_state.write_error = "Refusing cron write: cross-process jobs lock not owned"
+        _jobs_lock_state.write_error = OSError(errno.ENOLCK, "Refusing cron write: cross-process jobs lock not owned")
         lock_fd = None
         owner = None
         from cron.lock_owner import clear_owner, describe_owner, write_owner
@@ -347,7 +340,7 @@ def _jobs_lock():
                         "jobs lock (%s) — another process is holding "
                         "it. Reads may proceed with in-process locking only; writes are refused. %s",
                         _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file(), describe_owner(lock_fd))
-                    _jobs_lock_state.write_error = (
+                    _jobs_lock_state.write_error = JobsLockContended(
                         f"Refusing cron write: timed out waiting for {_jobs_lock_file()}; "
                         f"{describe_owner(lock_fd)}")
                     with contextlib.suppress(OSError):
@@ -358,9 +351,11 @@ def _jobs_lock():
                     with contextlib.suppress(OSError):
                         owner = write_owner(lock_fd, sys._getframe(2).f_code.co_name)
                 else:
-                    logger.error("jobs.json cross-process lock backend unavailable; writes are refused")
-            except OSError as e:
-                logger.error("jobs.json cross-process lock unavailable (%s); writes are refused", e)
+                    _jobs_lock_state.write_error = OSError(errno.ENOSYS, "Refusing cron write: lock backend unavailable")
+                    logger.error("%s", _jobs_lock_state.write_error)
+            except OSError as exc:
+                _jobs_lock_state.write_error = OSError(exc.errno, f"Refusing cron write: {exc}", str(_jobs_lock_file()))
+                logger.error("%s", _jobs_lock_state.write_error)
             try:
                 yield
             finally:
@@ -377,7 +372,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.load_stamp = None
-            _jobs_lock_state.write_error = "Refusing cron write: cross-process jobs lock not owned"
+            _jobs_lock_state.write_error = OSError(errno.ENOLCK, "Refusing cron write: cross-process jobs lock not owned")
 
 
 @contextlib.contextmanager
@@ -1691,10 +1686,10 @@ def _save_jobs_unlocked(
     rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes).
     ``document`` preserves an existing dict/list wrapper for exact recovery writes.
     """
-    error = getattr(_jobs_lock_state, "write_error", "Refusing cron write: jobs lock not held")
+    error = getattr(_jobs_lock_state, "write_error", OSError(errno.ENOLCK, "Refusing cron write: jobs lock not held"))
     if error is not None:
         logger.warning("%s", error)
-        raise JobsLockContended(error)
+        raise error
     jobs_file = _current_cron_store().jobs_file
     removed_ids = tuple(str(job_id) for job_id in (removed_ids or ()) if job_id)
     snapshot = jobs
@@ -3091,7 +3086,9 @@ def get_due_jobs() -> list[dict[str, Any]]:
     This prevents the perpetual-defer loop (#33315) where a job whose runtime exceeds ``interval + grace``
     would be skipped forever.
     """
-    with _jobs_lock():
+    from cron.occurrences import completion_read_scan
+
+    with _jobs_lock(), completion_read_scan():
         return _get_due_jobs_locked()
 
 
@@ -3470,6 +3467,9 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     Ordering matters: recover missing next_run_at, repair timezone shifts, re-arm stale-error
     recurring jobs; then once due: re-anchor stale cron instants, fast-forward missed recurring
     runs, retire/guard one-shots, and finally stamp the run claim / dispatch record."""
+    from cron.occurrences import recover_unstarted_run_claim
+
+    recover_unstarted_run_claim(job, scan)
     now = scan.now
     # Cross-process guard: another process's live one-shot run_claim (younger than TTL) — do NOT
     # re-dispatch. Malformed/future-dated claims (clock/TZ skew) count as stale, never eternally
