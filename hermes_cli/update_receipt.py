@@ -740,14 +740,16 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
 def _collection_enabled_now() -> Optional[bool]:
     """Shared-metrics consent via the ALREADY-LOADED config module (never an import: this interpreter
     predates the checkout swap). None when it cannot tell (not loaded, unreadable config)."""
-    reader = getattr(sys.modules.get("hermes_cli.config"), "read_raw_config_readonly", None)
+    module = sys.modules.get("hermes_cli.config")
+    reader = getattr(module, "read_raw_config_readonly", None)
     if reader is None:
         return None
     try:
         config: Any = reader()
     except Exception:
         return None
-    if type(config) is not dict:  # FailedConfigRead: a fallback, not what the user chose
+    failed_read = getattr(module, "FailedConfigRead", ())
+    if not isinstance(config, dict) or isinstance(config, failed_read):
         return None
     for key in ("telemetry", "shared_metrics"):
         config = config.get(key) if isinstance(config, dict) else None
