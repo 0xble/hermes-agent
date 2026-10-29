@@ -23,13 +23,13 @@ def _changed_config_warning(job: dict, path: Path, before: tuple, *, failed: boo
     after = _revision(path)
     if before == after:
         return None
-    from hermes_cli.config import read_user_config_raw, validate_config_for_write
+    from hermes_cli.config import require_readable_config_before_write, validate_config_for_write
 
     invalid = None
     try:
         if not path.exists():
             raise ValueError("config.yaml was removed")
-        validate_config_for_write(read_user_config_raw(path))
+        validate_config_for_write(require_readable_config_before_write(path))
     except Exception as exc:
         invalid = str(exc)
     if not failed and invalid is None:
