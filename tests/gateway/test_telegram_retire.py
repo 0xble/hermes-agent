@@ -22,6 +22,7 @@ def setup_retire(monkeypatch):
         set_meta=AsyncMock(side_effect=lambda key, value: meta.__setitem__(key, value)),
         get_telegram_topic_owner_for_thread=AsyncMock(return_value={"owner_key": "monitor"}),
         set_telegram_topic_owner_state=AsyncMock(), delete_telegram_topic_binding=AsyncMock(),
+        unbind_gateway_session_peer=AsyncMock(return_value=True),
         list_meta_prefix=AsyncMock(side_effect=lambda prefix: list(meta.items())),
     )
     bot = SimpleNamespace(delete_forum_topic=AsyncMock(return_value=True),
@@ -87,6 +88,28 @@ async def test_nonconfirmed_send_never_deletes(setup_retire, result):
     await retire.advance(runner, source)
     adapter._bot.delete_forum_topic.assert_not_awaited()
     runner._session_db.delete_telegram_topic_binding.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["retry", "cancel"])
+async def test_failed_retirement_releases_admission_and_explains_recovery(runtime, monkeypatch, control):
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    failed = await retire.load(runtime, runtime.source)
+    assert failed is not None and failed["phase"] == "failed"
+    # Failure stops automatic deletion, but cannot consume later human messages.
+    assert await retire.intercept(runtime, MessageEvent(text="keep working here", source=runtime.source)) is None
+    notice = runtime.adapter.send.await_args.args[1]
+    assert "Use /retire to retry" in notice and "/retire cancel" in notice
+    count = runtime.adapter.send.await_count
+    await retire.advance(runtime, runtime.source)
+    assert runtime.adapter.send.await_count == count
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+    await retire.request(runtime, runtime.source, cancel=control == "cancel")
+    state = await retire.load(runtime, runtime.source)
+    assert state is not None and state["generation"] != failed["generation"]
+    assert state["phase"] == ("pending" if control == "retry" else "cancelled")
 
 
 @pytest.mark.asyncio
