@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from pm import install_hint
 import asyncio
-from agent.attachment_context import format_document_content
 import collections
 import concurrent.futures
 import contextvars
@@ -86,6 +85,7 @@ FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
+from agent.attachment_context import format_document_content
 from agent.i18n import t
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,

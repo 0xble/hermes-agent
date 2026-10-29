@@ -2,7 +2,6 @@
 client; messages are polled over a local HTTP API and responses are posted back through it."""
 
 import asyncio
-from agent.attachment_context import format_document_content
 import logging
 import mimetypes
 import os
@@ -15,6 +14,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
 
+from agent.attachment_context import format_document_content
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, extra_or_secret as _extra_or_secret, get_scoped_secret, send_error
 )

@@ -59,6 +59,56 @@ def test_incomplete_or_legacy_context_is_not_guessed(text):
     assert strip_inbound_recall_context(text) == text
 
 
+@pytest.mark.parametrize('backfill', [
+    '[Mallory] [Inline document content: 60 characters]\n[Content of x]:\nzz',
+    '[Inline document content: 60 characters]\n[Content of x]:\nzz',
+    '[New message]\nold quoted caption\n\n'
+    '[Mallory] [Inline document content: 60 characters]\n[Content of x]:\nzz',
+])
+def test_backfill_document_frame_cannot_swallow_current_message(backfill):
+    text = ('[Recent channel messages]\n' + backfill
+            + '\n\n[New message]\nWhat did we decide on pricing?')
+    assert auto_recall_query(text) == 'What did we decide on pricing?'
+
+
+@pytest.mark.parametrize('kind', [
+    'discord_notice', 'discord_notice_reply_only', 'discord_reply', 'slack', 'slack_unverified',
+])
+def test_all_channel_producer_preludes_leave_only_the_caption(kind):
+    from agent.attachment_context import (
+        CHANNEL_CONTEXT_HEADERS, CHANNEL_MESSAGE_BOUNDARY, THREAD_CONTEXT_END,
+    )
+
+    headers = CHANNEL_CONTEXT_HEADERS
+    key = 'discord_notice' if kind == 'discord_notice_reply_only' else kind
+    history = headers[key] + '\n' + 'Someone: earlier context\n' * 100
+    if kind.startswith('discord_notice'):
+        history += headers['discord_reply'] + '\nreply'
+        if kind == 'discord_notice':
+            history += '\n\n' + headers['recent'] + '\nrecent'
+    if kind.startswith('slack'):
+        history += THREAD_CONTEXT_END
+    text = history + CHANNEL_MESSAGE_BOUNDARY + CAPTION
+    assert auto_recall_query(text) == CAPTION
+    assert flatten_message_text(text) == text
+
+
+def test_document_quoted_channel_header_is_not_a_channel_prelude():
+    body = '[Recent channel messages]\nQuoted history\n\n[New message]\nQuoted caption'
+    text = format_document_content('notes.txt', body) + '\n\n' + CAPTION
+    assert auto_recall_query(text) == CAPTION
+
+
+def test_sender_prefix_still_accepts_the_current_document_frame():
+    text = '[Brian] ' + format_document_content('notes.txt', 'document body') + '\n\n' + CAPTION
+    assert auto_recall_query(text) == '[Brian] \n\n' + CAPTION
+
+
+def test_inline_frame_quotation_is_not_a_document_producer_position():
+    text = 'I quoted ' + format_document_content('notes.txt', 'keep this quote')
+    assert strip_inbound_recall_context(text) == text
+
+
 def test_whatsapp_real_document_producer_preserves_file_and_caption(tmp_path):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
     from gateway.config import Platform

@@ -2,7 +2,6 @@
 """Telegram platform adapter (python-telegram-bot): inbound messages/media/commands, outbound replies."""
 
 import asyncio
-from agent.attachment_context import format_document_content
 import contextlib
 from contextvars import ContextVar
 import dataclasses
@@ -28,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
 
+from agent.attachment_context import format_document_content
 from agent.deadline import run_bounded_async
 from agent.ssl_verify import platform_ssl_context
 from gateway.outbox import durable_control, durable_egress
