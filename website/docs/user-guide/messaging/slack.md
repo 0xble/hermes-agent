@@ -816,8 +816,8 @@ Scope and safety:
   modern bot token (`xoxb-`) posts with the same `user` + `app_id` shape, so
   trusting an app would also admit its own bot posts and defeat the loop guard.
 - An allowlisted user's post counts as human even though it carries the app's
-  `bot_id`, `bot_profile` or `app_id`. Events with `subtype: bot_message` or no
-  `user` at all are always bot posts, and Hermes's own bot user is never
+  `bot_id`, `bot_profile` or `app_id`. Events with `subtype: bot_message`, a bot
+  user profile, or no `user` at all are always bot posts, and Hermes's own bot user is never
   treated as human even if listed.
 - The rest of the pipeline is unchanged: mention gating, `allowed_channels`,
   and `SLACK_ALLOWED_USERS` still apply to the (now human) sender.

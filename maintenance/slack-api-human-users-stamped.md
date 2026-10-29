@@ -5,7 +5,7 @@ Load this unit when changing `_event_declares_bot_sender`, `_slack_api_human_use
 ## Required behavior
 
 - A Slack message whose `user` is in `platforms.slack.extra.api_human_users` is human-authored even when Slack stamps it with the posting app's `bot_id`, `bot_profile` or `app_id` and no `client_msg_id`, as user-token (`xoxp-`) `chat.postMessage` deliveries are. Its `source.is_bot` is False and it takes the normal human path.
-- `subtype: bot_message` and user-less posts stay bots. Hermes's own bot user (`_bot_user_id` or any `_team_bot_user_ids` value) stays a bot even if listed, so its posts keep the echo-loop guard.
+- `subtype: bot_message`, a bot `user_profile`, and user-less posts stay bots. Hermes's own bot user (`_bot_user_id` or any `_team_bot_user_ids` value) stays a bot even if listed, so its posts keep the echo-loop guard.
 - Other bots' posts keep their existing classification.
 
 ## Provenance

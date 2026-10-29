@@ -89,10 +89,11 @@ def test_allowlisted_user_api_post_is_human():
 
 
 def test_bot_message_subtype_wins_over_allowlist():
-    """``subtype: bot_message`` is bot-authored no matter what — allowlisting a user
+    """``subtype: bot_message`` (or a bot user profile) is bot-authored no matter what — allowlisting a user
     never admits classic bot posts, so ``xoxb`` traffic cannot loop back in."""
     adapter = _make_adapter({"api_human_users": HUMAN_ID})
     assert adapter._event_declares_bot_sender(_api_post(subtype="bot_message")) is True
+    assert adapter._event_declares_bot_sender(_api_post(user_profile={"is_bot": True})) is True
 
 
 def test_bot_profile_stamped_user_token_post_is_human():

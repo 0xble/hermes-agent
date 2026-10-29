@@ -60,7 +60,7 @@ def _adapter(monkeypatch):
     }
     bot.chat_delete.return_value = user.chat_delete.return_value = {"ok": True}
     user.auth_test.return_value = {"ok": True, "team_id": TEAM, "user_id": OWNER}
-    monkeypatch.setattr(slack, "_get_scoped_secret", lambda key: "test-user-token")
+    monkeypatch.setattr(slack, "_get_scoped_secret", lambda key, default=None: "test-user-token" if key == "SLACK_USER_TOKEN" else default)
     monkeypatch.setattr(adapter, "_new_web_client", Mock(return_value=user))
     return adapter, bot, user
 
@@ -151,7 +151,7 @@ async def test_cascade_scope_and_single_failure_notice(monkeypatch, case):
         case "foreign_reply":
             bot.conversations_replies.return_value["messages"][2]["user"] = "U_OTHER"
         case "missing_token":
-            monkeypatch.setattr(slack, "_get_scoped_secret", lambda key: None)
+            monkeypatch.setattr(slack, "_get_scoped_secret", lambda key, default=None: None if key == "SLACK_USER_TOKEN" else default)
         case "wrong_token_team":
             user.auth_test.return_value["team_id"] = "T_OTHER"
         case "wrong_token_user":

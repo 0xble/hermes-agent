@@ -2880,25 +2880,24 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
                 str(p).strip() for p in parts if str(p).strip())
         return cached
 
+    def _is_own_bot_user(self, user_id: Optional[str]) -> bool:
+        """True when ``user_id`` is this adapter's bot user in any workspace."""
+        return bool(user_id) and user_id in {self._bot_user_id, *self._team_bot_user_ids.values()}
+
     def _event_declares_bot_sender(self, event: dict) -> bool:
         """Return True when the Slack event itself identifies a bot sender."""
-        # ``subtype: bot_message`` is always a bot. A user-token (``xoxp-``) post can be stamped with
-        # the posting app's ``bot_id``/``bot_profile``/``app_id`` yet carry the real author's ``user``,
-        # so an allowlisted user is human before any bot marker is read. Our own bot user never is,
-        # even if listed, so its posts keep the echo-loop guard.
-        user = event.get("user")
-        if event.get("subtype") == "bot_message":
-            return True
-        if user and user in self._slack_api_human_users() and user not in {
-                self._bot_user_id, *self._team_bot_user_ids.values()}:
-            return False
-        if event.get("bot_id") or event.get("bot_profile"):
-            return True
+        # A user-token (``xoxp-``) post can be stamped with the posting app's ``bot_id``/
+        # ``bot_profile``/``app_id`` yet carry the real author's ``user``, so an allowlisted user is
+        # human before those markers are read; never our own bot user (echo-loop guard).
         profile = event.get("user_profile")
-        if isinstance(profile, dict) and bool(profile.get("is_bot")):
+        if event.get("subtype") == "bot_message" or (isinstance(profile, dict) and profile.get("is_bot")):
             return True
+        user = event.get("user")
+        if user and user in self._slack_api_human_users() and not self._is_own_bot_user(user):
+            return False
         # Real human messages carry client_msg_id: app_id without it is app/bot-authored (#35777).
-        return bool(event.get("app_id") and not event.get("client_msg_id"))
+        return bool(event.get("bot_id") or event.get("bot_profile")
+                    or (event.get("app_id") and not event.get("client_msg_id")))
 
     def _resolve_thread_ts(
         self, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None
