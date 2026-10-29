@@ -126,7 +126,10 @@ correction for restart-resume identity coverage. The fixture uses the runner's
 native lazy session-state map rather than shadowing its admission methods. This
 owns only that test correction, not a new admission implementation. Autonomous
 control-receipt regressions exercise the business `goals.notices` switch in both
-states. Explicit receipts remain visible and must not invent Telegram approval.
+states: enabled receipts retain truthful autonomous attribution, while disabled
+receipts settle both cosmetic recipients as skipped with an empty durable outbox.
+Both states preserve continuation admission and cleanup. Explicit quote, button
+and session receipts remain visible and must not invent Telegram approval.
 
 Default-install worktrees can place their shared Git metadata inside the real
 Hermes home. Startup recovery must apply its existing pytest checkout exclusion
