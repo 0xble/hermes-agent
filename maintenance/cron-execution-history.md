@@ -6,18 +6,37 @@ Patch identity: `cron-execution-history`.
 
 The profile-local execution ledger must support a weekly health audit, failure
 streaks, and unknown-attempt coverage without normal fleet volume shortening
-history to hours. Retain every terminal status for 8 elapsed days after finish,
+history to hours. By default, retain every terminal status for 8 elapsed days after finish,
 falling back to claim time for legacy rows without a usable finish timestamp.
 The 100,000-terminal-row ceiling is a runaway-write backstop and may shorten
 that window only when reached. Claimed and running attempts are excluded.
 This is a row ceiling, not a strict byte quota: output sizes can change.
 
+`cron.execution_retention_days` sets the elapsed-day window in `config.yaml`
+(default `8`, `0` disables age expiration while retaining the row backstop).
+Read it in the owning profile at each terminal transition. The virtual-clock
+DST soak configures a window longer than its full simulated span: it proves
+every fire and delivery across that span, while dedicated retention tests prove
+expiration. Its final all-runs ledger assertions remain unchanged.
+
+Both policies preserve the attempts being settled by the current transition
+and each job's latest attempt, using the same parsed claim
+instant and tie-breakers as `hermes cron list`. They also preserve attempts
+with queued/pending/delivering or provisional delivery state, and any attempt
+with an admission journal still present. A terminal detached worker may still
+owe canonical settlement, so journal removal by the recovery owner releases
+that protection. These current-state and recovery obligations take precedence
+over the row ceiling. Cleanup converges to the ceiling only when enough rows
+are eligible. Incidents retain their own error and output-file evidence in
+`cron_incidents`, with no execution-ID reference requiring a ledger-row pin.
+
 Keep cleanup in the shared terminal-transition path. Each call deletes at most
 500 rows across age expiration and ceiling trimming combined, oldest first.
 An existing backlog converges over later terminal writes instead of requiring
 one large write transaction. The partial numeric-time index serves expiration,
-ordering, and bounded counting without scanning output-bearing table pages or
-sorting the ledger. Compute the cutoff in UTC before subtracting the duration,
+ordering, and bounded counting. A numeric per-job claim index serves the latest
+attempt exclusion without repeatedly sorting each job's history. Eligibility
+also checks delivery state and journal presence. Compute the cutoff in UTC before subtracting the duration,
 and compare parsed instants so offset changes and DST do not move the window.
 The index is additive, preserving named-column reads/writes by older releases.
 
@@ -50,14 +69,15 @@ is an issue, not a PR. Its associated open
 comparison, with a separate unbounded-by-count unknown population. Neither
 satisfies this contract. These were inspected as prior art, not adopted patches.
 The fork implementation deliberately uses one time policy and one ceiling for
-all terminal states, with no new configuration surface or scheduler owner.
+all terminal states, with a profile-local age-window setting and no new scheduler owner.
 Upstream state was checked on 2026-10-29. No upstream write is part of this unit.
 
 ## Verification and Retirement
 
 `tests/cron/test_execution_retention.py` owns the time-window and bounded-cleanup
 invariants, including mixed offsets, DST, the cutoff boundary, missing finish
-times, combined policy budgets, and preservation of in-flight work. Run it
+times, combined policy budgets, configurable windows, and preservation of
+in-flight work, current job status, pending delivery, and canonical recovery. Run it
 alongside `test_execution_ledger.py` and
 `test_restart_safe_worker_death_evidence.py` to cover ordinary finishes,
 restart recovery, and dead-worker terminalization.
