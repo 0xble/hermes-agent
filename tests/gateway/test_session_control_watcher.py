@@ -90,6 +90,9 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
         def _is_session_running(self, _key):
             return False
 
+        def _active_profile_name(self):
+            return "default"  # the real runner names its served profile; plugin-home routing reads it
+
         def _queue_depth(self, _key, adapter=None):
             return 0
 
