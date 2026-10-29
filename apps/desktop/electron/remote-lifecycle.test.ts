@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, execFile as execFileCallback, spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
 
 import { test } from 'vitest'
@@ -844,7 +846,7 @@ test.skipIf(process.platform === 'win32')(
     const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
 
     await promisify(execFileCallback)('python3', ['-m', 'venv', '--without-pip', path.join(installDir, 'venv')])
-    await writeFile(entrypoint, 'import time\ntime.sleep(30)\n', 'utf8')
+    await writeFile(entrypoint, 'import time\nprint("READY", flush=True)\ntime.sleep(30)\n', 'utf8')
     await writeFile(launcher, `#!/usr/bin/env bash\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
     await chmod(launcher, 0o755)
 
@@ -864,27 +866,23 @@ test.skipIf(process.platform === 'win32')(
         '--ssh-owner-nonce',
         SPAWN_NONCE
       ],
-      { stdio: 'ignore' }
+      { stdio: ['ignore', 'pipe', 'pipe'] }
     )
 
+    const started = once(child, 'spawn')
+    const output = createInterface({ input: child.stdout })
+    const ready = output[Symbol.asyncIterator]().next()
     const exited = new Promise(resolve => child.once('exit', resolve))
 
     try {
-      let execed = false
-
-      for (let attempt = 0; attempt < 40 && !execed; attempt += 1) {
-        const command = (await exec(`ps -ww -o command= -p ${child.pid}`)).stdout
-
-        execed = command.includes(entrypoint)
-
-        if (!execed) {
-          await new Promise(resolve => setTimeout(resolve, 25))
-        }
-      }
-
-      assert.equal(execed, true, 'wrapper must exec into the fake installer entrypoint')
+      // The real entrypoint, not elapsed scheduling time, proves the wrapper exec completed.
+      await started
+      assert.deepEqual(await ready, { value: 'READY', done: false }, 'installer must become ready before ownership proof')
+      const command = (await exec(`ps -ww -o command= -p ${child.pid}`)).stdout
+      assert.equal(command.includes(entrypoint), true, 'wrapper must exec into the fake installer entrypoint')
 
       let creationTime: string
+
       if (process.platform === 'darwin') {
         creationTime = `darwin:${(await exec(`ps -o lstart= -p ${child.pid}`)).stdout.trim()}`
       } else {
@@ -923,6 +921,7 @@ test.skipIf(process.platform === 'win32')(
         assert.equal(child.signalCode, 'SIGTERM')
       }
     } finally {
+      output.close()
       child.kill('SIGKILL')
       await rm(temp, { force: true, recursive: true })
     }
