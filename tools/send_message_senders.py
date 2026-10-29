@@ -461,7 +461,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
-def _live_adapter(platform, *, lookup_failed_warning=None):
+def _live_adapter(platform, *, lookup_failed_warning=None, reaction=False):
     """``(runner, adapter)`` for the in-process gateway; ``(None, None)`` standalone (cron);
     ``(runner, None)`` when the lookup fails — logged when a warning is given, never silently
     swallowed (a silent fall-through could recreate a reconnect storm).
@@ -479,6 +479,11 @@ def _live_adapter(platform, *, lookup_failed_warning=None):
     if runner is None:
         return None, None
     try:
+        if reaction:
+            from gateway.session_context import current_turn_source
+            source = current_turn_source()
+            if source is not None and source.platform == platform:
+                return runner, runner._delivery_adapter_for(source)
         resolve = getattr(runner, "_authorization_adapter", None)
         if not callable(resolve):  # bare runner stubs without the authz mixin
             return runner, runner.adapters.get(platform)

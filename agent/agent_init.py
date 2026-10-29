@@ -2390,6 +2390,8 @@ def init_agent(
 ):
     _install_safe_stdio()
 
+    from tools.react_to_message_tool import reaction_disabled_toolsets
+    disabled_toolsets = reaction_disabled_toolsets(disabled_toolsets, platform)
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:
         setattr(agent, _name, _params[_name])

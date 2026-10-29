@@ -2435,6 +2435,9 @@ class MatrixAdapter(BasePlatformAdapter):
 
         return False, ""
 
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        return bool(await self._send_reaction(chat_id, message_id, emoji))
+
     async def _send_reaction(self, room_id: str, event_id: str, emoji: str) -> Optional[str]:
         """Send an emoji reaction; returns the reaction event_id, or None on failure."""
         if not self._client:
@@ -2443,7 +2446,7 @@ class MatrixAdapter(BasePlatformAdapter):
         try:
             resp_event_id = await self._client.send_message_event(RoomID(room_id), EventType.REACTION, content)
             logger.debug("Matrix: sent reaction %s to %s", emoji, event_id)
-            return str(resp_event_id)
+            return str(resp_event_id) if resp_event_id else None
         except Exception as exc:
             logger.debug("Matrix: reaction send error: %s", exc)
             return None

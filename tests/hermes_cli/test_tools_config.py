@@ -68,6 +68,50 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("platform", ["cli", "feishu", "discord"])
+def test_explicit_empty_platform_pin_does_not_gain_reactions(platform):
+    """Empty reaction pins stay empty, independent of older Feishu native recovery."""
+    assert "reactions" not in _get_platform_tools(
+        {"platform_toolsets": {platform: []}}, platform,
+        include_default_mcp_servers=False,
+    )
+
+
+@pytest.mark.parametrize("platform", ["cli", "slack", "telegram", "discord"])
+def test_reaction_toolset_respects_explicit_selection(platform):
+    """A new configurable capability must not expand an authored toolset pin."""
+    config = {"platform_toolsets": {platform: ["web"]}}
+    enabled = _get_platform_tools(config, platform, include_default_mcp_servers=False)
+    assert "web" in enabled
+    assert "reactions" not in enabled
+
+    config["platform_toolsets"][platform].append("reactions")
+    assert "reactions" in _get_platform_tools(
+        config, platform, include_default_mcp_servers=False,
+    )
+
+    config["agent"] = {"disabled_toolsets": ["reactions"]}
+    assert "reactions" not in _get_platform_tools(
+        config, platform, include_default_mcp_servers=False,
+    )
+
+
+@pytest.mark.parametrize("platform", ["slack", "telegram", "discord"])
+def test_default_gateway_toolsets_include_reactions(platform):
+    assert "reactions" in _get_platform_tools(
+        {}, platform, include_default_mcp_servers=False,
+    )
+
+
+@pytest.mark.parametrize("selection", [None, ["terminal", "file"]])
+def test_native_recovery_keeps_non_checklist_toolsets_on_non_empty_saves(selection):
+    """Feishu's non-checklist tools survive defaults and non-empty selections."""
+    config = {} if selection is None else {"platform_toolsets": {"feishu": selection}}
+    assert {"feishu_doc", "feishu_drive"} <= _get_platform_tools(
+        config, "feishu", include_default_mcp_servers=False,
+    )
+
+
 def test_null_platform_toolsets_fall_back_to_platform_default():
     """A YAML ``platform:`` value is absent, not an explicit empty list."""
     config = {"platform_toolsets": {"cli": None}}

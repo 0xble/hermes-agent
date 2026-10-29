@@ -21,7 +21,7 @@ _HERMES_CORE_TOOLS = [
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
     "browser_vault_list",  # explicit list surface retained for browser toolset discovery
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
-    "text_to_speech",
+    "text_to_speech", "react_to_message",
     "todo_list", "memory", "compact_context",
     "session_search",
     "clarify",
@@ -135,6 +135,7 @@ TOOLSETS = {
     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
     "bot_room": _ts("Verified text-only Group Chat turn capabilities"),
 
+    "reactions": _ts("React to the triggering messaging-platform message or a desktop message", ["react_to_message"]),
     # GUI-renderer affordances, enabled per desktop-sourced SESSION by the GUI
     # gateway (tui_gateway/server.py::_load_enabled_toolsets) — never by a
     # process env var, which is blind to a desktop client on a remote backend.

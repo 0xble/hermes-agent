@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set, cast
 from hermes_cli import setup_platforms
 
+from gateway.platforms.reaction_lifecycle import reaction_operation
+
 logger = logging.getLogger(__name__)
 
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
@@ -8912,14 +8914,23 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         if not self._bot:
             return False
         try:
-            await self._bot.set_message_reaction(chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reaction=emoji)
-            return True
+            return bool(await self._bot.set_message_reaction(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), reaction=emoji))
         except Exception as e:
             if emoji is None:
                 logger.debug("[%s] clear reactions failed: %s", self.name, _redact_telegram_error_text(e))
             else:
                 logger.debug("[%s] set_message_reaction failed (%s): %s", self.name, emoji, _redact_telegram_error_text(e))
             return False
+
+    async def add_reaction(self, chat_id: str, message_id: str, emoji: str, **routing: Any) -> bool:
+        from telegram.constants import ReactionEmoji
+        if emoji not in {item.value for item in ReactionEmoji}:
+            return False
+        async with reaction_operation(self, chat_id, message_id) as state:
+            delivered = await self._set_reaction(chat_id, message_id, emoji)
+            state.explicit |= delivered
+            return delivered
 
     async def _clear_reactions(self, chat_id: str, message_id: str) -> bool:
         """Clear all bot-set reactions."""
@@ -8932,21 +8943,25 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+            async with reaction_operation(self, chat_id, message_id, start=True, event=event):
+                await self._set_reaction(chat_id, message_id, "\U0001f440")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction (set_message_reaction
         replaces, not adds); CANCELLED explicitly clears the 👀."""
-        if not self._reactions_enabled():
-            return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return
-        if outcome == ProcessingOutcome.CANCELLED:
-            await self._clear_reactions(chat_id, message_id)
-        else:
-            await self._set_reaction(chat_id, message_id, "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e")
+        async with reaction_operation(self, chat_id, message_id, complete=True, event=event) as state:
+            if state.explicit:
+                return
+            if not self._reactions_enabled():
+                return
+            if outcome == ProcessingOutcome.CANCELLED:
+                await self._clear_reactions(chat_id, message_id)
+            else:
+                await self._set_reaction(chat_id, message_id, "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e")
 
 
 # -- Plugin registration glue: register(ctx) plus the hook implementations (adapter factory, YAML→env/extra
