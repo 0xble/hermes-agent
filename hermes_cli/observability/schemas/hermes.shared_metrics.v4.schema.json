@@ -4609,6 +4609,7 @@
                 "browser_back",
                 "browser_cdp",
                 "browser_click",
+                "browser_close",
                 "browser_console",
                 "browser_dialog",
                 "browser_downloads",
