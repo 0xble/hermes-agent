@@ -108,7 +108,10 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                         validate_candidate(loaded)
                     return _effective({})
                 raw = loaded if isinstance(loaded, dict) else {}
-                _config._raw_config_cache_store(path_key, user_sig, copy.deepcopy(raw))
+                from hermes_cli.config_write_guards import snapshot
+                _config._raw_config_cache_store(
+                    path_key, user_sig, snapshot(copy.deepcopy(raw), config_path, user_sig),
+                )
                 _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)
                 # Same copy load_config keeps: a fresh process recovers from it (see _recover_user_raw).
                 # Only for the ACTIVE home — a read of another profile's file (doctor, TUI cwd lookup)
