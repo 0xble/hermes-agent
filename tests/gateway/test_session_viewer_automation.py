@@ -4,6 +4,7 @@ Real authority + SQLite: every mutation lands in the owner's ``state_meta`` row 
 target, the goal judge runs here (patched), a manager refusal comes back as main's exception text, and a
 session driven this way is skipped by the gateway's own post-turn goal hook (never judged twice).
 """
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -26,7 +27,8 @@ async def owner(tmp_path, monkeypatch):
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
-                             _cached_agent_for=lambda route: None)
+                             _cached_agent_for=lambda route: None,
+                             _run_in_executor_with_context=asyncio.to_thread)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path / 'fixture'), instance_id='owner')
     monkeypatch.setattr(goals, '_get_session_db', lambda: authority.db)  # the owner's own store
