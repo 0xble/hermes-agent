@@ -104,6 +104,10 @@ finally:
                                   env={**env, "PYTHONPATH": str(gateway_root)},
                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         try:
+            # Keep the private server alive between chat sessions so new-session cannot
+            # connect to a server still shutting down after the last kill-session.
+            result = tmux("-f", os.devnull, "start-server", ";", "set-option", "-s", "exit-empty", "off")
+            assert result.returncode == 0, result.stderr
             deadline = time.monotonic() + 40
             descriptor = {}
             while daemon.poll() is None and time.monotonic() < deadline:
