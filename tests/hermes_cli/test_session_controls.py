@@ -27,6 +27,39 @@ def _user(db, sid, text, *, display_kind=""):
     db.append_message(sid, "user", text, display_kind=display_kind)
 
 
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("entry", ["apply", "request"])
+def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    GoalManager("target").set("watch the build")
+    quote = "Pause the target goal."
+    _user(state, "requester", quote)
+    control = session_controls.apply_control if entry == "apply" else session_controls.request_control
+    kwargs = {"user_quote": quote} if quoted and entry == "apply" else {}
+    result = control("goal", "pause", "target", requester_sid="requester", **kwargs)
+    assert result["ok"] and result["status"] == "applied"
+    record = session_controls._load_record(result["record"]["id"])
+    durable = load_goal("target")
+    if quoted and entry == "apply":
+        assert durable.status == "paused" and not durable.waiting_until
+        assert record["authority"]["via"] == "quote"
+        assert "outcome" not in record and "notice" not in result
+    else:
+        assert durable.status == "active" and durable.paused_reason is None
+        assert record["authority"]["via"] == "autonomy"
+        assert record["outcome"] == result["outcome"] == "timed_wait"
+        assert record["wait_seconds"] == result["wait_seconds"] == durable.waiting_seconds == 900
+        assert record["waiting_until"] == result["waiting_until"] == durable.waiting_until
+        assert record["notice"] == result["notice"] == (
+            "Goal waiting 15 min (autonomous timed wait, no approval); still active"
+        )
+        assert "paused" not in result["notice"] and "Telegram" not in result["notice"]
+
+
 def test_quote_applies_cross_session_clear_and_audits(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control, pending_outbox
