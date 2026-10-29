@@ -375,6 +375,8 @@ DEFAULT_CONFIG = {
         # ["/home/user/.hermes/cache/documents:/output"]. For gateway MEDIA delivery, write to
         # /output/... inside Docker and emit the host-visible path in MEDIA:, not the container one.
         "docker_volumes": [],
+        # Read-only credential, skills and cache mounts. Disable to skip automatic collection.
+        "docker_auto_mount_host_state": True,
         "docker_mount_cwd_to_workspace": False,  # mount host cwd at /workspace (weakens isolation)
         "docker_network": True,  # false = --network=none, no network access from commands
         "docker_extra_args": [],        # Extra flags passed verbatim to docker run
@@ -677,7 +679,7 @@ DEFAULT_CONFIG = {
         # Inactivity budget for in-agent compress_context (loop, /compress, preflight); same
         # progress-aware semantics as hygiene_timeout_seconds. 0 = disable the owned wrapper
         # (callers passing commit_fence, e.g. gateway hygiene, never use it). Floored at the auxiliary
-        # compression request timeout (auxiliary.compression.timeout, min 300s): the host never judges
+        # compression request timeout (300s when unset): the host never judges
         # silence before the summary request itself would time out.
         "context_timeout_seconds": 120,
         # Absolute cap on the *pre-commit* compress_context wait (summary/stream phase) even while
@@ -838,7 +840,7 @@ DEFAULT_CONFIG = {
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
-        "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
+        "goal_judge": _aux(30),          # /goal satisfaction + contract drafting; 30s kept, measured p95 under 25s
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
         # of skills); route cheaper via `hermes model` → auxiliary → Curator.
         "curator": _aux(600),
@@ -1479,6 +1481,12 @@ DEFAULT_CONFIG = {
         "min_continuation_gap_seconds": 900,
         # Fork patch: committed agent goal_set receipts surface as notices; /goal replies don't.
         "auto_notices": True,
+    },
+    # Supervisor check-ins, automatic reassurance while gateway-owned work remains.
+    "checkins": {
+        "enabled": True,
+        "first_after_seconds": 1200,  # Both durations have a 300-second floor.
+        "interval_seconds": 1800,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially

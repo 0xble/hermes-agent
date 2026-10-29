@@ -884,6 +884,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   release uses the canonical source module, not the removed status export.
   Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
 - Fork patch identity: `v0225-merge-integration`.
+- The Windows gateway checks the legacy venv's Python major/minor before processing
+  its site-packages or .pth files. Missing version metadata refuses the overlay,
+  while same-ABI and committed-generation behavior remain unchanged.
+  Guard: `tests/gateway/test_windows_venv_import_guard.py`.
 - Integrating fork main through #818 keeps atomic fanout prepare/stamp/admission alongside
   overflow resume notices and their physical-drain barrier. Routing replacement performs its
   diff and retirement-fence check in SQLite and returns only rejected route keys, without

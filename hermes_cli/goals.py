@@ -53,6 +53,7 @@ from hermes_cli.goals_autonomy import (
     autonomous_verdict,
 )
 from hermes_cli.goals_status import GoalStatusMixin
+from hermes_cli.goals_peers import GoalPeersMixin, parse_pending_peers, validate_peer_completion
 from hermes_cli.lifecycle_snapshot import snapshot_control
 from hermes_time import safe_strftime
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
@@ -1068,6 +1069,8 @@ class GoalState:
     # Whether a session target was live when this barrier was set. A target that was already
     # finished (or unknown) is stale state, not a fresh event wake when observed by an idle surface.
     waiting_on_session_live_at_park: Optional[bool] = None
+    # Verified by the parent, independent of ephemeral process/time barriers.
+    pending_peers: List[Dict[str, str]] = field(default_factory=list)
     waiting_on_user_message: bool = False
     waiting_until: float = 0.0
     # Live delegation batches when a timed WAIT was set because of them; the barrier lifts as soon
@@ -1133,6 +1136,7 @@ class GoalState:
                 bool(data["waiting_on_session_live_at_park"])
                 if data.get("waiting_on_session_live_at_park") is not None else None
             ),
+            pending_peers=parse_pending_peers(data.get("pending_peers", [])),
             waiting_on_user_message=bool(data.get("waiting_on_user_message")),
             waiting_reason=data.get("waiting_reason"),
             contract=GoalContract.from_dict(data.get("contract")),
@@ -1415,6 +1419,7 @@ def save_goal(session_id: str, state: GoalState, *, cursor=None) -> None:
             raise RuntimeError("session-control store unavailable")
         _warn_dropped_write("GoalManager", "goal", session_id)
         return
+    validate_peer_completion(state)
     try:
         state.mutation_id = uuid.uuid4().hex
         if cursor is None:
@@ -2728,18 +2733,21 @@ from hermes_cli.goals_authority import (
 
 
 # One notice per judge outage for the whole process, not one per goal: a provider outage
-# hits every active goal at once. Any successful judge response ends the outage.
+# hits every active goal at once. Require a later failed attempt; any success resets both flags.
 _JUDGE_OUTAGE_LOCK = threading.Lock()
-_JUDGE_OUTAGE_ACTIVE = False
+_JUDGE_OUTAGE_PENDING = _JUDGE_OUTAGE_ACTIVE = False
 JUDGE_OUTAGE_NOTICE = "⚠ Goal judge unavailable; goals stay active and back off until it recovers."
 
 
 def _judge_outage_notice(*, failed: bool) -> str:
-    """Return the outage notice exactly once per outage; ``failed=False`` ends the outage."""
-    global _JUDGE_OUTAGE_ACTIVE
+    """Announce only consecutive failed attempts; ``failed=False`` ends the outage."""
+    global _JUDGE_OUTAGE_PENDING, _JUDGE_OUTAGE_ACTIVE
     with _JUDGE_OUTAGE_LOCK:
         if not failed:
-            _JUDGE_OUTAGE_ACTIVE = False
+            _JUDGE_OUTAGE_PENDING = _JUDGE_OUTAGE_ACTIVE = False
+            return ""
+        if not _JUDGE_OUTAGE_PENDING:
+            _JUDGE_OUTAGE_PENDING = True
             return ""
         if _JUDGE_OUTAGE_ACTIVE:
             return ""
@@ -2780,7 +2788,7 @@ def _live_goal(state: Optional[GoalState]) -> GoalState:
     return state
 
 
-class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalContractCommandsMixin):
+class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalContractCommandsMixin):
     """Per-session goal state + continuation decisions.
 
     The CLI and gateway each hold one per live session. ``evaluate_after_turn`` calls the judge and
@@ -2896,6 +2904,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             seen.append(None if live is None else GoalState.from_json(live.to_json()))
             try:
                 result = mutate(live)
+                if live is not None:
+                    validate_peer_completion(live)
             except Exception as exc:
                 raise _GoalMutationRefused(exc) from exc   # rolls the transaction back
             if live is not None and live.to_json() != original:
@@ -2988,6 +2998,8 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
         # A cached manager may predate a restored row or a failed read. Re-read before replacing
         # rather than interpreting its stale None as proof that the durable goal is absent.
         live = load_goal(self.session_id)
+        if live is not None and live.pending_peers and live.status not in {"cleared", "done"}:
+            raise ValueError("resolve pending peer work or explicitly clear the goal before setting another")
         if getattr(live, "_legacy_migration_pending", False):
             self._state = live
             raise GoalPersistenceError(
@@ -3089,17 +3101,6 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             self._cleared_instance = self._state.created_at
         self._state = None
         self._unreadable = None
-
-    @snapshot_control
-    def mark_done(self, reason: str) -> None:
-        def _apply(state):
-            if state is None:
-                return
-            state.clear_wait()
-            state.status = "done"
-            state.last_verdict = "done"
-            state.last_reason = reason
-        self._mutate_current(_apply)
 
     # --- /goal wait barrier -------------------------------------------
 
@@ -3652,6 +3653,9 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             resume_override=state.resume_override_reasons(),
             user_messages_block=_render_user_messages_block(self.session_id, state.created_at),
         )
+        # Track attempts before early returns so successes reset the outage; parse failures stay silent.
+        outage_notice = "" if parse_failed else _judge_outage_notice(failed=bool(transport_failed))
+
         verdict, reason, wait_directive = autonomous_verdict(state, verdict, reason, wait_directive)
         state.last_verdict = verdict
         state.last_reason = reason
@@ -3700,15 +3704,7 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             return blocked_goal_decision(self, reason)
 
         if verdict == "done":
-            state.status = "done"
-            self._save()
-            return _decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
-
-        # Judge outages fail open as CONTINUE (judge_goal already maps them) and take the normal
-        # continue/ladder path below, so a persistent outage backs off instead of pausing. One
-        # process-wide notice per outage, not one per goal.
-        # Unparseable output is a model-quality problem, not an outage: it continues silently.
-        outage_notice = "" if parse_failed else _judge_outage_notice(failed=bool(transport_failed))
+            return self._finish_judged_goal(reason)
 
         def _with_outage(decision: Dict[str, Any]) -> Dict[str, Any]:
             if outage_notice and decision.get("status") == "active":

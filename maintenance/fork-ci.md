@@ -272,6 +272,20 @@ class, and omits upstream opt-out tests the fork already removed. A logging
 `afplay` shim on `PATH` recorded one call on the base and none with the patch.
 Retire when a released upstream revision carries equivalent guard coverage.
 
+## Desktop handoff fixture teardown
+
+The `fork-ci-reliability` identity covers the sidecar-publication timeout cell in
+`tests/scripts/desktop_update/test_handoff_delegate_publication.py`. Releasing
+A7 lets the real handoff finish naturally. A later `os.killpg` races that exit:
+surviving, reparented helpers cannot prove test ancestry after their leader has
+exited, so the live-system guard correctly refuses the group signal. Release A7
+and join the handoff under the existing 10-second teardown bound instead. Require
+exit code 3 and marker removal as well as the original parked-update and
+no-delegate assertions. Product code, the real 10-second lock deadline, and the
+live-system guard are unchanged. A Linux probe that lets the leader exit before
+group inspection reproduces the old guard refusal. Retire when upstream adopts
+cooperative teardown for this cell.
+
 ## Linked worktree test venv
 
 The `fork-ci-reliability` identity also covers the canonical runner's venv

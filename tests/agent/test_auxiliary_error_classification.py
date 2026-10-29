@@ -31,6 +31,26 @@ def test_openrouter_limit_403_is_billing_for_main_loop_and_aux_ladder(body):
     assert all(p in ac._PAYMENT_KEYWORDS for p in classify_api_error.__globals__["_BILLING_PATTERNS"])
 
 
+@pytest.mark.parametrize("body, reason, ttl", [
+    ('Error code: 500 - {\'error\': {\'message\': \'Post "https://api.meta.ai/v1/responses": EOF\', '
+     "'type': 'server_error', 'code': 'internal_server_error'}}", "connection error", 60.0),
+    ('Error code: 500 - {\'error\': {\'message\': \'Post "https://chatgpt.com/backend-api/codex/responses": '
+     "utls: TLS handshake: EOF', 'type': 'server_error', 'code': 'internal_server_error'}}", "connection error", 60.0),
+    ('Error code: 500 - {\'type\': \'error\', \'error\': {\'type\': \'api_error\', \'message\': '
+     '\'Post "https://api.anthropic.com/v1/messages?beta=true": claude tls: handshake upstream: EOF\'}}',
+     "connection error", 60.0),
+    ("internal server error", "provider unavailable", None),
+])
+def test_wrapped_transport_500_uses_connection_quarantine(body, reason, ttl):
+    from agent.auxiliary_health import fallback_candidate_quarantine_ttl
+
+    exc = _Err(body, 500)
+    assert ac._is_connection_error(exc) is (reason == "connection error")
+    assert ac._is_server_error(exc) is (reason == "provider unavailable")
+    assert next(label for predicate, label in ac._FALLBACK_REASONS if predicate(exc)) == reason
+    assert fallback_candidate_quarantine_ttl(reason) == ttl
+
+
 def test_absent_credentials_quarantine_is_debug_and_names_the_real_reason(caplog):
     ac._reset_aux_unhealthy_cache()
     with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):

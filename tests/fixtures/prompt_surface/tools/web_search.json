@@ -13,6 +13,14 @@
       "query": {
         "description": "The search query to look up on the web. You may include backend-supported operators such as site:example.com, filetype:pdf, intitle:word, -term, or \"exact phrase\".",
         "type": "string"
+      },
+      "stakes": {
+        "description": "Optional. standard: low-stakes lookups where some error is cheap (docs, APIs, product specs, how-tos, recipes, navigation, background); may use a cheaper search tier. Omit or pass high for legal, financial, tax, medical, compliance, official sources, news, prices, safety, time-sensitive or costly-if-wrong work. When unsure, omit.",
+        "enum": [
+          "standard",
+          "high"
+        ],
+        "type": "string"
       }
     },
     "required": [
