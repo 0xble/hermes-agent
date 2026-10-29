@@ -104,7 +104,7 @@ async def test_queued_delivery_uses_its_own_reaction_receipt(text, acknowledged)
     from gateway.run import GatewayRunner
     runner = GatewayRunner(GatewayConfig())
     runner._deliver_queued_first_response = AsyncMock()
-    ctx = SimpleNamespace(
+    ctx = TurnContext(
         session_key="key", stream_consumer_holder=[None], mute_notification_reply=False,
         persist_user_display_kind=None, source=SessionSource(platform=Platform.SLACK, chat_id="chat"),
         _status_thread_metadata=None, event_message_id=None, inbound_message_id="queued", run_generation=1,

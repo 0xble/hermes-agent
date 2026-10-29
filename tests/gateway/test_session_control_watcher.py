@@ -641,21 +641,26 @@ async def test_autonomous_goal_outbox_attributes_both_notices_to_autonomy(
         await runner._drain_session_controls()
         await runner._drain_session_controls()
 
-    # Control receipts keep their existing delivery policy, independent of routine goal notices.
-    assert len(runner.adapter.sends) == len(runner.injections) == 1
-    target = runner.adapter.sends[0][1]
-    requester = runner.injections[0]["content"]
-    assert "(applied autonomously without approval)" in target
-    assert "was applied autonomously without approval." in requester
-    assert "Telegram" not in target + requester
-    assert "your words" not in target + requester
+    assert len(runner.adapter.sends) == len(runner.injections) == int(notices)
     assert runner.adapter.requests == []
-    assert runner.injections[0]["expected_session_id"] == "requester"
-    assert session_controls._load_record(record["id"])["authority"] == record["authority"]
+    persisted = session_controls._load_record(record["id"])
+    assert persisted is not None
+    assert persisted["authority"] == record["authority"]
+    assert persisted["outbox_done"]
+    assert persisted["target_notice_skipped"] is not notices
+    assert persisted["requester_notification_skipped"] is not notices
     assert session_controls.pending_outbox() == []
-    if action == "replace":
-        assert "Affected: goal: old objective\nProposed goal: new objective" in target
-        assert "Affected: goal: old objective\nProposed goal: new objective" in requester
+    if notices:
+        target = runner.adapter.sends[0][1]
+        requester = runner.injections[0]["content"]
+        assert "(applied autonomously without approval)" in target
+        assert "was applied autonomously without approval." in requester
+        assert "Telegram" not in target + requester
+        assert "your words" not in target + requester
+        assert runner.injections[0]["expected_session_id"] == "requester"
+        if action == "replace":
+            assert "Affected: goal: old objective\nProposed goal: new objective" in target
+            assert "Affected: goal: old objective\nProposed goal: new objective" in requester
 
 
 @pytest.mark.parametrize("authority", [{}, {"via": "future-authority"}])

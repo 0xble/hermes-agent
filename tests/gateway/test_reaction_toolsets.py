@@ -40,7 +40,9 @@ def test_gateway_reaction_selection(config, override, expected_enabled, expected
     assert ("reactions" in enabled) is expected_enabled
     assert disabled == expected_disabled
     if config == {"platform_toolsets": {"telegram": []}}:
-        assert enabled == []
+        # Non-configurable platform-native tools survive checklist pins. The
+        # empty selection still excludes reactions and configurable toolsets.
+        assert set(enabled) == {"session_state", "telegram_topic"}
     tools = get_tool_definitions(
         enabled_toolsets=enabled,
         disabled_toolsets=reaction_disabled_toolsets(disabled, source.platform.value),

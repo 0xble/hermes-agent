@@ -43,6 +43,7 @@ def test_empty_final_after_reaction_is_a_clean_stop(monkeypatch, delivered, fini
                 _turn_exit_reason=None, _preflight_compression_blocked=False,
                 codex_ack_continuations=0, truncated_response_parts=[], length_continue_retries=0,
                 _pending_verification_response=None, _pending_verification_response_previewed=False,
+                effective_task_id="reaction-task",
             )
         if delivered and finish_reason == "stop":
             assert verdict.action == "break"
