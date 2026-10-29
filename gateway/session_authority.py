@@ -177,10 +177,11 @@ class SessionAuthority:
         # reset while that turn's admission is started, so the drain runs it once the turn settles.
         self.deferred_resets = {}
 
-    def authorize(self, actor, ref, capability):
+    def authorize(self, actor, ref, capability, *, superseded_ok=False):
         """Every handler calls this first, so a later ``self.sessions[ref.session_id]`` is
         safe: a deleted/evicted live entry surfaces here as ``not_found``, not as a KeyError
-        deeper in the handler."""
+        deeper in the handler. ``superseded_ok``: the caller touches only this session's own
+        ledger (a receipt, cancelling its own queued row), never the lane's newer conversation."""
         from gateway.session_authorities import require_serving
         require_serving(self)
         if actor.profile_id != self.profile_id or ref.profile_id != self.profile_id:
@@ -205,7 +206,7 @@ class SessionAuthority:
                     from gateway.session_api import restore_api_session
                     restore_api_session(self, ref.session_id)
         from gateway.config import Platform
-        if self.sessions[ref.session_id].superseded and capability != 'session:read':
+        if self.sessions[ref.session_id].superseded and capability != 'session:read' and not superseded_ok:
             # One gateway owns every session and never crosses them: the lane's route now belongs to
             # its newer conversation, so a write here would land there. Named, so a viewer can say so.
             raise RuntimeStoreError('session_superseded', field='session_id',
@@ -723,7 +724,9 @@ class SessionAuthority:
                 'Releasing refused attachments of request %s failed', request.request_id)
 
     async def receipt(self, actor, ref, admission_id):
-        self.authorize(actor, ref, 'session:submit')
+        # A superseded session's rows stay readable and cancellable: they can never run (their lane
+        # is the newer conversation's), so cancelling is the only way out and frees the delete.
+        self.authorize(actor, ref, 'session:submit', superseded_ok=True)
         row = get_session_admission(self.db, admission_id=admission_id)
         if row is None or row['target_session_id'] != ref.session_id:
             raise RuntimeStoreError('not_found')
@@ -742,10 +745,11 @@ class SessionAuthority:
         # Write off the shared loop; commit and observer settlement are one tracked task the
         # caller cannot cancel between (an exact retry still pays a left-over obligation).
         row = await asyncio.shield(track_mutation(self, self._commit_cancel(ref, admission_id, before)))
-        # Media collection is its own write txn after the committed, settled cancellation: its
-        # failure surfaces to the caller, and an exact retry collects again without re-settling.
-        from gateway.session_ingress_media import release_admission_media
-        await asyncio.to_thread(release_admission_media, self.db, admission_id)
+        # Media collection is its own write txn after the committed, settled cancellation, queued
+        # rather than awaited: /stop and /new cancel every queued row and must not wait one
+        # transcript scan per row. An exact retry queues it again without re-settling.
+        from gateway.session_ingress_media import release_admission_media_later
+        release_admission_media_later(self, admission_id)
         return self._receipt(row)
 
     async def cancel_or_claimed(self, actor, ref, admission_id):
@@ -854,9 +858,10 @@ class SessionAuthority:
                     _publish_completion(self, live, ref, row, row,
                                         captured['result'].get('final_response') or '', captured)
         # Its own write txn + unlink, so it runs after the resolution commits; a discarded image
-        # would otherwise stay on disk forever (the drain releases only settled turns).
-        from gateway.session_ingress_media import release_admission_media
-        await asyncio.to_thread(release_admission_media, self.db, admission_id)
+        # would otherwise stay on disk forever (the drain releases only settled turns). Queued, not
+        # awaited: the successor below must not wait on its transcript scan.
+        from gateway.session_ingress_media import release_admission_media_later
+        release_admission_media_later(self, admission_id)
         # Before the successor can run: a committed captured answer reaches the chat it was
         # owed to (a turn fenced unknown already released its delivery waiter), exactly once.
         from gateway.session_ingress import deliver_resolved
