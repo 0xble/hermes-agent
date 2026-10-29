@@ -34,7 +34,7 @@ def search(tmp_path, local_env, monkeypatch, request):
     ):
         file = tmp_path / name
         file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text("fixture\n")
+        file.write_text("fixture\n", encoding="utf-8")
 
     def run(pattern, **kwargs):
         return ops.search(pattern, str(tmp_path), target="files", **kwargs)
@@ -58,15 +58,55 @@ def test_filename_globs_preserve_alternatives_paths_and_hidden_default(search, p
     run, root, _ = search
     if ".githooks/" in pattern:
         (root / ".githooks").mkdir()
-        (root / ".githooks/pre-commit").write_text("hook\n")
+        (root / ".githooks/pre-commit").write_text("hook\n", encoding="utf-8")
     result = run(pattern)
     assert result.error is None, result.to_dict()
     assert {Path(file).relative_to(root).as_posix() for file in result.files} == expected
 
 
+@pytest.mark.parametrize("pattern", ["**/tests", "**/emptydir", "**/**/emptydir"])
+def test_recursive_basename_globs_include_nested_and_empty_directories(search, pattern):
+    run, root, _ = search
+    basename = pattern.rsplit("/", 1)[-1]
+    expected = {basename, f"nested/{basename}"}
+    for name in expected:
+        (root / name).mkdir(parents=True)
+    (root / basename / "fixture.txt").write_text("fixture\n", encoding="utf-8")
+    result = run(pattern)
+    assert result.error is None, result.to_dict()
+    assert {Path(file).relative_to(root).as_posix() for file in result.files} == expected
+
+
+@pytest.mark.parametrize("pattern,expected", [
+    ("./hooks/*", {"hooks/pre-commit", "nested/hooks/decoy"}),
+    ("/hooks/*", {"hooks/pre-commit"}),
+    ("{root}/hooks/*", {"hooks/pre-commit"}),
+    ("./main.py", {"main.py", "sub/main.py"}),
+    ("/main.py", {"main.py"}),
+    ("{root}/main.py", {"main.py"}),
+])
+def test_filename_globs_normalize_relative_and_root_anchored_prefixes(search, pattern, expected):
+    run, root, _ = search
+    (root / "nested/hooks").mkdir(parents=True)
+    (root / "nested/hooks/decoy").write_text("fixture\n", encoding="utf-8")
+    (root / "main.py").write_text("fixture\n", encoding="utf-8")
+    result = run(pattern.format(root=root))
+    assert result.error is None, result.to_dict()
+    assert {Path(file).relative_to(root).as_posix() for file in result.files} == expected
+
+
 @pytest.mark.parametrize("order", ["discovery", "modified"])
-def test_filename_failures_report_bounded_diagnostics_separate_from_paths(search, order):
+def test_filename_failures_report_bounded_diagnostics_separate_from_paths(search, order, monkeypatch):
     run, _, ops = search
+    executions = []
+    execute = ops.env.execute
+
+    def record_execute(*args, **kwargs):
+        result = execute(*args, **kwargs)
+        executions.append(result)
+        return result
+
+    monkeypatch.setattr(ops.env, "execute", record_execute)
     result = run("*}", order=order)
     payload = result.to_dict()
     assert not result.files
@@ -89,3 +129,5 @@ def test_filename_failures_report_bounded_diagnostics_separate_from_paths(search
     assert transport.stdout == "only-path.py\n"
     assert transport.stderr.startswith("rg diagnostic ")
     assert len(transport.stderr) == 4096
+    if not ops._native_read_enabled():
+        assert executions[-1]["cwd_observed"] is True

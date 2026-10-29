@@ -9,8 +9,10 @@ filename search into a whole-machine parallel walk. An unknown CPU count uses on
 thread. Content searches keep their existing ripgrep command and parallelism.
 
 Filename globs retain their complete path and brace syntax in both ripgrep
-transports. Slash-bearing patterns match the complete suffix at any depth within
-the selected roots, while ordinary basename globs keep their existing matching.
+transports. Unanchored slash-bearing patterns match the complete suffix at any
+depth within the selected roots, while ordinary basename globs keep their
+existing matching. Leading `./` is removed. Absolute patterns within a search
+root become root-relative, and other leading `/` patterns anchor to the root.
 The historical basename reduction belongs only to the `find -name` fallback,
 whose parser does not support ripgrep's path and brace syntax. That fallback was
 the original reason for the reduction (`533c064269417`), not a requirement to
@@ -21,8 +23,12 @@ engine stderr in the structured `error`, never in the returned paths. Native
 execution drains stderr separately even after reaching the capture bound. Shell
 execution separates diagnostics from paths without creating backend temp files.
 Admission locks, root selection, traversal bounds, pagination, ignore rules, and
-hidden-directory defaults remain unchanged. Complex globs do not use the
-basename-only directory supplement, which cannot interpret their syntax.
+hidden-directory defaults remain unchanged. Basename globs, including paths
+whose directory components are only `**`, retain the directory supplement so
+empty and nested directories remain discoverable. Other path globs and brace
+alternation exceed that supplement's basename-only syntax. Shell status
+propagation lets the environment wrapper finish capturing status, saving its
+snapshot, and reporting the observed working directory.
 
 ## Provenance and patch
 
@@ -64,8 +70,11 @@ The filename-glob regression suite is
 `tests/tools/test_search_filename_globs.py`. It exercises the exact hook-config
 brace union, basename and path globs, hidden-directory pruning, malformed-glob
 status and diagnostics, and bounded draining of a noisy stderr stream in both
-native and shell transports. The base fails 10 cases and passes 6 unchanged
-basename/alternative cases. The corrected implementation passes all 16 cases.
+native and shell transports. It also covers recursive directory matches,
+relative and root-anchored prefixes, and the shell wrapper's observed working
+directory after a failed search. On 2026-10-29, the expanded suite against a
+detached checkout at `1f1d80a42a69` produced 20 failed and 14 passed cases. The
+corrected implementation passes all 34 cases.
 
 Also run the relevant broader tools tests through the canonical runner.
 Recovery verification through machine-wide `heavy-slot` admission observed:
