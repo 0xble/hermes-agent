@@ -13,10 +13,11 @@ def _readiness_issue() -> str:
     from hermes_constants import get_hermes_home
     from pm.plugins_state import read_home_selection
     from plugins.memory import load_memory_provider
+    from agent.memory_provider import is_core_memory_provider
 
     config = read_home_selection(get_hermes_home()) or {}
     name = (config.get("memory") or {}).get("provider")
-    if not name or not name.strip():
+    if is_core_memory_provider(name):
         return ""
     provider = load_memory_provider(name.strip(), register_skills=False)
     if provider is None:
