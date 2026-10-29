@@ -38,7 +38,7 @@ class Model(BaseHTTPRequestHandler):
             # Recovery guidance is API-only system text, not a new human row.
             elif any('required supervisor status' in str(m.get('content', ''))
                      for m in messages if m['role'] in ('system', 'developer')):
-                message['content'] = 'SUPERVISOR_STATUS: tests are running. Next check in 30 minutes.'
+                message['content'] = getattr(self.server, 'status_text', 'SUPERVISOR_STATUS: tests are running. Next check in 30 minutes.')
             elif 'REAL_TERMINAL_COMPLETION' in str(last):
                 message['content'] = 'COMPLETION_STATUS: background work finished.'
         if 'SPAWN_AUTOMATION' in str(last) and messages[-1]['role'] != 'tool':
@@ -88,7 +88,9 @@ async def probe(root, base, mode):
     model.requests = []
     model.blocked, model.release = threading.Event(), threading.Event()
     model.gate = home / 'release-terminal'
-    model.checkin = mode == 'checkin'
+    model.checkin = mode in {'checkin', 'peer-checkin'}
+    if mode == 'peer-checkin':
+        model.status_text = 'SUPERVISOR_STATUS: peer result still awaits parent verification. Next check in 30 minutes.'
     model.checkin_turns = 0
     threading.Thread(target=model.serve_forever, daemon=True).start()
     ready = asyncio.Queue()
@@ -99,7 +101,7 @@ async def probe(root, base, mode):
         assert hello['platform'] == 'telegram', hello
         descriptor = {'contract_version': 1, 'platform': 'telegram', 'label': 'Fixture',
             'max_message_length': 4096, 'supports_draft_streaming': False, 'supports_edit': True,
-            'supports_threads': mode == 'checkin', 'markdown_dialect': 'plain', 'len_unit': 'chars'}
+            'supports_threads': mode in {'checkin', 'peer-checkin'}, 'markdown_dialect': 'plain', 'len_unit': 'chars'}
         await ws.send(json.dumps({'type': 'descriptor', 'descriptor': descriptor}) + '\n')
         await ready.put(ws)
         async for line in ws:
@@ -148,24 +150,48 @@ async def probe(root, base, mode):
                         await ws.send(json.dumps({'type': 'inbound', 'event': {'text': text,
                             'message_id': identity, 'source': {'platform': 'telegram', 'chat_id': 'automation-chat',
                             'chat_type': 'dm', 'user_id': 'fixture-user',
-                            **({'thread_id': '103'} if mode == 'checkin' else {})}}}) + '\n')
+                            **({'thread_id': '103'} if mode in {'checkin', 'peer-checkin'} else {})}}}) + '\n')
                     await send('spawn', 'SPAWN_AUTOMATION' if mode in {'terminal', 'checkin'} else 'WARM_AUTOMATION')
                     await wait_for(lambda: any(r['request_id'] == 'spawn' and r['status'] == 'terminal' for r in rows()))
                     if mode in {'terminal', 'checkin'}:
                         assert 'REAL_TERMINAL_COMPLETION' in json.dumps(model.requests), 'model did not request real terminal'
-                    else:
+                    elif mode == 'heartbeat':
                         await send('timer-config', '/heartbeat every 1m TIMER_AUTOMATION')
                         await wait_for(lambda: 'Heartbeat' in json.dumps(outgoing))
                     sid = rows()[0]['target_session_id']
-                    if mode == 'checkin':
+                    if mode == 'peer-checkin':
+                        async with websocket(home, desc) as parent:
+                            await rpc(parent, 'session.resume', session_id=sid)
+                            async def goal(call, *args, **kwargs):
+                                reply = await rpc(parent, 'session.automation', session_id=sid,
+                                                  kind='goal', call=call, args=list(args), kwargs=kwargs)
+                                assert 'result' in reply, reply
+                                return reply['result']
+                            result = await goal('set', 'Verify the peer artifact')
+                            instance = json.loads(result['state'])['created_at']
+                            await goal('wait_for_seconds', 3600, reason='await the peer artifact')
+                            cli = await asyncio.create_subprocess_exec(
+                                sys.executable, '-m', 'hermes_cli.goal_peer_command', 'wait', str(instance),
+                                'hermes:default/idle-peer', 'existing-peer-work', 'artifact readback',
+                                cwd=root, env={**env, 'HERMES_SESSION_ID': sid},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            try:
+                                stdout, stderr = await asyncio.wait_for(cli.communicate(), 30)
+                                assert cli.returncode == 0, stdout.decode() + stderr.decode()
+                                assert json.loads(stdout)['value']['ok'], stdout
+                            finally:
+                                if cli.returncode is None:
+                                    cli.kill()
+                                    await cli.wait()
+                    if mode in {'checkin', 'peer-checkin'}:
                         def state():
                             with sqlite3.connect(home / 'state.db') as db:
                                 row = db.execute('SELECT value FROM state_meta WHERE key=?', ('checkin:' + sid,)).fetchone()
                                 return json.loads(row[0]) if row and row[0] else None
                         # Native execution settles before transport final delivery. Wait for
                         # the acknowledged initial reply's timer reset before advancing it.
-                        await wait_for(lambda: 'initial' in outbound_at and state() is not None
-                                       and state()['last_visible_at'] >= outbound_at['initial'])
+                        await wait_for(lambda: state() is not None and (mode == 'peer-checkin' or
+                                       'initial' in outbound_at and state()['last_visible_at'] >= outbound_at['initial']))
                         armed = state()
                         # Advance only this test timer, not the daemon's clock or production config.
                         armed['due_at'] = time.time() - 1
@@ -192,6 +218,21 @@ async def probe(root, base, mode):
                         retries = [r for r in model.requests if any('required supervisor status' in str(m.get('content', ''))
                                    for m in r['messages'] if m['role'] in ('system', 'developer'))]
                         assert len(retries) == 1, retries
+                        if mode == 'peer-checkin':
+                            async with websocket(home, desc) as parent:
+                                await rpc(parent, 'session.resume', session_id=sid)
+                                unchanged = await goal('state')
+                                assert len(json.loads(unchanged['state'])['pending_peers']) == 1
+                                refused = await goal('resolve_peer', 'hermes:default/idle-peer', 'existing-peer-work',
+                                                     'pytest artifact: 1 passed', expected_instance=instance)
+                                assert not refused['value']['ok'], refused
+                                assert state() is not None
+                                await goal('clear')
+                            await wait_for(lambda: state() is None)
+                            print(json.dumps({'peer_only': True, 'unverified_idle_still_pending': True,
+                                'supervisor_turns': model.checkin_turns, 'silence_recovered': True,
+                                'explicit_user_clear_disarmed': True, 'topic': '103'}))
+                            return
                         model.gate.touch()
                         await wait_for(lambda: 'COMPLETION_STATUS' in json.dumps(outgoing))
                         await wait_for(lambda: state() is None)

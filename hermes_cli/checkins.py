@@ -151,6 +151,10 @@ def outstanding_work(db, session_id):
     raw = db.get_meta("goal:" + lineage[-1])
     goal = GoalState.from_json(raw) if raw else None
     if goal is not None and goal.status == "active":
+        work.extend({"kind": "peer", "id": row["ref"], "peer": row["peer"],
+                     "name": row["peer"] + " " + row["result"], "status": "awaiting parent verification",
+                     "started_at": goal.created_at, "last_activity_at": None}
+                    for row in goal.pending_peers)
         dependency = None
         if goal.waiting_on_session:
             outcome = _process_outcome(goal.waiting_on_session)

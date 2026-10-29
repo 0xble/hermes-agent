@@ -26,9 +26,24 @@ def _manager(runner, entry):
                           CheckinConfig.load())
 
 
+def _observe(manager, session_id):
+    if not manager.config.enabled:
+        return []
+    try:
+        return outstanding_work(manager.db, session_id)
+    except Exception:
+        # An error is neither completion nor a new dependency. Retain only a previously
+        # armed clock, including after restart, and tell the truth in its normal status.
+        if manager.state is None:
+            return []
+        logger.warning("Supervisor roster unknown for %s", session_id, exc_info=True)
+        return [{"kind": "unknown", "id": "roster-unavailable", "name": "unknown outstanding work, local roster unavailable",
+                 "status": "unknown, inspect the local roster before claiming completion"}]
+
+
 def _reconcile(runner, entry):
     manager = _manager(runner, entry)
-    work = outstanding_work(manager.db, entry.session_id) if manager.config.enabled else []
+    work = _observe(manager, entry.session_id)
     visible = getattr(runner, "_checkin_visible", {}).get((entry.session_key, manager.root))
     return manager.reconcile(work, last_visible_at=visible)
 
@@ -166,7 +181,7 @@ async def prepare_checkin(runner, event, entry, *, start=False):
 
     def observe():
         manager = _manager(runner, entry)
-        work = outstanding_work(manager.db, entry.session_id) if manager.config.enabled else []
+        work = _observe(manager, entry.session_id)
         state = manager.reconcile(work)
         if (not state or tick != [manager.root, state.due_at] or time.time() < state.due_at):
             return None
@@ -195,7 +210,7 @@ async def silence_fallback(runner, event, entry, result):
 
     def observe():
         manager = _manager(runner, entry)
-        work = outstanding_work(manager.db, entry.session_id)
+        work = _observe(manager, entry.session_id)
         manager.reconcile(work)
         return fallback_status(work, manager.config)
 

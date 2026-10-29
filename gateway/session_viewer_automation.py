@@ -25,7 +25,7 @@ _CALLS = {
                        "clear_subgoals", "add_gate", "remove_gate", "clear_gates", "wait_on", "wait_on_session",
                        "wait_for_seconds", "stop_waiting", "is_waiting", "evaluate_after_turn", "command",
                        "resume_for_user_input", "lifted_barrier_prompt", "mark_automatic_continuation_dispatched",
-                       "clear_lifted_wait", "remove_contract_item", "replace"}),
+                       "clear_lifted_wait", "remove_contract_item", "replace", "wait_on_peer", "resolve_peer"}),
     "loop": frozenset({"state", "set", "pause", "resume", "clear", "fire_tick", "abandon_tick", "complete_tick",
                        "goal_blocks_tick"}),
     "heartbeat": frozenset({"state", "set", "pause", "resume", "clear", "due_prompt", "abandon_fire"}),
@@ -159,12 +159,18 @@ async def automation(connection, ref, params):
         from gateway.run import _profile_runtime_scope
         from gateway.session_commands import _session_workspace
         with _profile_runtime_scope(home), _session_workspace(runner, live.source):
-            return invoke(runner, kind, target, call, args, kwargs)
+            from gateway.session_context import scoped_current_session_id
+            with scoped_current_session_id(target):
+                return invoke(runner, kind, target, call, args, kwargs)
     rows = lambda: tuple(authority.db.get_meta(f"{k}:{target}") for k in ("goal", "loop", "heartbeat"))
     # Publish read-side writes if any, but pure barrier checks leave the wait for wake admission.
     before = rows() if call in _READS else None
     # The judge and gates block for seconds: off the loop, with the caller's context (profile scope).
     result = await asyncio.to_thread(run)
+    if kind == "goal" and (call in {"wait_on_peer", "resolve_peer"}
+                           or call == "command" and args and str(args[0]).startswith("peer ")):
+        from gateway.run_checkins import reconcile_turn
+        await reconcile_turn(runner, live.source, live.route)
     if before is None or rows() != before:
         # The classic CLI drives this session's automation: other viewers (Ink, Desktop) repaint from the event.
         from gateway.session_control_actions import publish
