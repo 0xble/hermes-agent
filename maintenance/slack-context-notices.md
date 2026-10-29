@@ -36,7 +36,7 @@ agent producers never load the gateway package
 | Display/busy settings, `gateway/slash_commands.py` | Saved verbose, busy and footer receipts, retaining busy's `EphemeralReply` contract | Status, usage, unknown values, disabled controls and failed saves |
 | Command producers, `gateway/slash_commands_model.py` | Model/reasoning/fast/personality/runtime setting confirmations | Invalid selections, failed saves, guard/approval prompts |
 | Resume producer, `gateway/slash_commands_session.py` | Successful resume/already-current confirmations | Missing or disallowed target and empty selection lists |
-| Background task producer, `gateway/slash_commands.py`, `gateway/run_turn.py` | Start and successful completion receipt | Actual result body, execution errors |
+| Background task producer, `gateway/slash_commands.py`, `gateway/run_turn.py` | Start receipt | Completion attribution and actual result in one send, execution errors |
 | Cron-store transition producer, `gateway/cron_store_notices.py` | Recovered/writable-again receipt within the owning profile's language, home-channel route and warning opt-out | Unwritable/degraded warning. Scheduled-job reports remain real content |
 | Startup/update producers, `gateway/run_notifications.py` | Online, restart complete, operation progress and successful update receipt | Failed updates and restart resend/recovery decisions |
 | Moved-out-of-core producers, `hermes_cli/left_core_migration.py`, `hermes_cli/memory_provider_migration.py` | Successful installation receipts | Installation failures |

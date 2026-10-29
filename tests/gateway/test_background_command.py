@@ -126,10 +126,8 @@ class TestRunBackgroundTask:
             await runner._run_background_task("say hello", source, "bg_test")
 
         # Should have sent the result
-        assert mock_adapter.send.await_count == (2 if platform == Platform.SLACK else 1)
-        if platform == Platform.SLACK:
-            assert mock_adapter.send.await_args_list[0].kwargs["metadata"]["notice_style"] == "context"
-            assert "notice_style" not in (mock_adapter.send.await_args_list[1].kwargs["metadata"] or {})
+        assert mock_adapter.send.await_count == 1
+        assert "notice_style" not in (mock_adapter.send.await_args.kwargs["metadata"] or {})
         call_args = mock_adapter.send.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "Hello from background!" in content
