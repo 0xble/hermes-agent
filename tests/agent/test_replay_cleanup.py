@@ -84,6 +84,15 @@ def test_sanitize_replay_history_combines_both():
     assert out[-1] == _user("second")
 
 
+def test_rewritten_interrupted_tool_result_drops_the_stored_row_version():
+    stored = {**_tool("[Command interrupted]"), "_db_row_snapshot": "snap", "_db_persisted": True}
+    out = sanitize_replay_history([_user("first"), _assistant_tc("terminal"), stored])
+
+    assert out[2]["content"] != stored["content"]
+    assert "_db_row_snapshot" not in out[2]
+    assert out[2]["_db_persisted"] is True
+
+
 def test_sanitize_replay_history_noop_on_clean_history():
     history = [_user("hi"), {"role": "assistant", "content": "hello"}]
     assert sanitize_replay_history(history) == history

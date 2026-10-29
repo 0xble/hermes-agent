@@ -16,7 +16,7 @@ import logging
 import math
 import os
 import shutil
-import subprocess  # noqa: F401 — tests monkeypatch ``op.subprocess.run``
+import subprocess  # tests monkeypatch ``op.subprocess.run``; production goes through run_cli
 import sys
 import tempfile
 import time
@@ -55,7 +55,7 @@ _OP_ENV_ALLOWLIST = (
 # L1 key folds in str(home_path) so a HERMES_HOME switch inside one long-lived
 # process (the gateway) can't return another profile's secrets. The disk key
 # omits home because the file already lives under <home>/cache/.
-_CacheKey = Tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
+_CacheKey = tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
 _DISK_CACHE_BASENAME = "op_cache.json"
 
 
@@ -101,10 +101,10 @@ _AUTH_ERROR_KINDS = frozenset({ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED})
 _STALE_OK_KINDS = frozenset({ErrorKind.NETWORK, ErrorKind.TIMEOUT, ErrorKind.RATE_LIMITED})
 
 
-def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
+def _validate_references(references: Optional[dict[str, str]]) -> tuple[dict[str, str], list[str]]:
     """``(valid_refs, warnings)``: keep valid env names bound to stripped ``op://`` strings."""
-    valid: Dict[str, str] = {}
-    warnings: List[str] = []
+    valid: dict[str, str] = {}
+    warnings: list[str] = []
     for name, ref in (references or {}).items():
         if not is_valid_env_name(name):
             warnings.append(f"Skipping {name!r}: not a valid env-var name")
@@ -121,14 +121,14 @@ def _auth_fingerprint(token_env: str) -> str:
     """SHA-256 prefix over everything `op` would authenticate with (token, account,
     Connect host/token, ``OP_SESSION_*``), so a new identity never sees old cached values."""
     source_env = get_source_environment()
-    parts: List[str] = [f"{label}={source_env.get(var, '')}" for label, var in (
+    parts: list[str] = [f"{label}={source_env.get(var, '')}" for label, var in (
         ("token", token_env), ("account", "OP_ACCOUNT"),
         ("connect_host", "OP_CONNECT_HOST"), ("connect_token", "OP_CONNECT_TOKEN"))]
     parts += [f"{key}={source_env[key]}" for key in sorted(source_env) if key.startswith("OP_SESSION_")]
     return _fingerprint("\n".join(parts))
 
 
-def _refs_fingerprint(references: Dict[str, str]) -> str:
+def _refs_fingerprint(references: dict[str, str]) -> str:
     return _fingerprint("\n".join(f"{name}={references[name]}" for name in sorted(references)))
 
 
@@ -151,7 +151,7 @@ def _cooldown_path(home_path: Optional[Path] = None) -> Path:
 
 def _read_cooldowns(home_path: Optional[Path]) -> Dict[str, float]:
     try:
-        payload = json.loads(_cooldown_path(home_path).read_text(encoding="utf-8"))
+        payload = json.loads(_cooldown_path(home_path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     if not isinstance(payload, dict):
@@ -191,7 +191,7 @@ def _scrub(text: str) -> str:
     return strip_ansi(text).replace("\x1b", "").strip()
 
 
-def _op_child_env(token_value: str) -> Dict[str, str]:
+def _op_child_env(token_value: str) -> dict[str, str]:
     source_env = get_source_environment()
     env = {k: source_env[k] for k in _OP_ENV_ALLOWLIST if k in source_env}
     env.update((k, v) for k, v in source_env.items() if k.startswith("OP_SESSION_"))
@@ -201,6 +201,12 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     return env
 
 
+def _batch_safe_reference(reference: str) -> bool:
+    # op run parses dotenv before resolving refs. Keep parser-sensitive paths on
+    # op read's exact argv contract instead of inventing another quoting parser.
+    return reference == reference.strip() and not any(c in reference for c in "\n\r$#\"'\\")
+
+
 def _run_op_batch(op: Path, references: Dict[str, str], *, account: str = "",
                   token_value: str = "") -> Dict[str, str]:
     """Resolve unique refs in one op invocation, never putting values on stdout.
@@ -208,8 +214,8 @@ def _run_op_batch(op: Path, references: Dict[str, str], *, account: str = "",
     The temporary directory is private; both files are 0600 and removed on every
     path. The child receives only synthetic env keys, not Hermes's other secrets.
     """
-    if any("\n" in ref or "\r" in ref for ref in references.values()):
-        raise RuntimeError("op run cannot encode a newline in a secret reference")
+    if any(not _batch_safe_reference(ref) for ref in references.values()):
+        raise RuntimeError("secret reference requires exact op read resolution")
     unique = list(dict.fromkeys(references.values()))
     names = [f"HERMES_OP_BATCH_{i}" for i in range(len(unique))]
     scratch = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
@@ -240,7 +246,7 @@ def _run_op_batch(op: Path, references: Dict[str, str], *, account: str = "",
             err = _scrub(proc.stderr or "")[-300:]
             raise RuntimeError(f"op run failed: {err or f'exited {proc.returncode}'}")
         try:
-            payload = json.loads(output.read_text(encoding="utf-8"))
+            payload = json.loads(output.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
             raise RuntimeError("op run did not produce a valid result") from exc
         if not isinstance(payload, dict) or any(
@@ -254,7 +260,7 @@ def _run_op_batch(op: Path, references: Dict[str, str], *, account: str = "",
 def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: str = "") -> str:
     """Resolve one ``op://`` reference; raises ``RuntimeError`` on any failure, including
     an exit-0 empty value (applying it would clobber a good credential with ``""``)."""
-    cmd: List[str] = [str(op), "read"]
+    cmd: list[str] = [str(op), "read"]
     if account:
         cmd += ["--account", account]
     cmd += ["--", reference]  # `--` so a reference can never parse as an op flag
@@ -281,11 +287,11 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
 
 
 def fetch_onepassword_secrets(
-    *, references: Dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
+    *, references: dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
     binary: Optional[Path] = None, binary_path: str = "", use_cache: bool = True,
     cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
     cache_max_stale_seconds: float = _DEFAULT_MAX_STALE_SECONDS,
-) -> Tuple[Dict[str, str], List[str]]:
+) -> tuple[dict[str, str], list[str]]:
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
 
     Raises ``RuntimeError`` only when no ``op`` binary is available; per-ref
@@ -332,8 +338,10 @@ def fetch_onepassword_secrets(
     else:
         pending = {name: valid[name] for name in sorted(valid) if name not in secrets}
         if pending:
+            batch = {name: ref for name, ref in pending.items() if _batch_safe_reference(ref)}
             try:
-                secrets.update(_run_op_batch(op, pending, account=account, token_value=token_value))
+                if batch:
+                    secrets.update(_run_op_batch(op, batch, account=account, token_value=token_value))
             except (RuntimeError, OSError) as exc:
                 kind = _classify_op_error(str(exc))
                 if kind is ErrorKind.RATE_LIMITED:
@@ -342,20 +350,25 @@ def fetch_onepassword_secrets(
                     failure_kinds.append(kind)
                     if use_cache:
                         _record_rate_limit_cooldown(cooldown_key, home_path)
-                else:
-                    # One invalid ref makes op run fail wholesale; isolate the failure
-                    # with the existing per-ref path and preserve partial cache semantics.
-                    for name, ref in pending.items():
-                        try:
-                            secrets[name] = _run_op_read(op, ref, account=account, token_value=token_value)
-                        except RuntimeError as read_exc:
-                            warnings.append(str(read_exc))
-                            read_kind = _classify_op_error(str(read_exc))
-                            failure_kinds.append(read_kind)
-                            if read_kind is ErrorKind.RATE_LIMITED:
-                                if use_cache:
-                                    _record_rate_limit_cooldown(cooldown_key, home_path)
-                                break
+            if ErrorKind.RATE_LIMITED not in failure_kinds:
+                # Isolate failed batches and parser-sensitive refs through the
+                # existing exact read path, preserving successful partial results.
+                resolved_refs: Dict[str, str] = {}
+                for name, ref in pending.items():
+                    if name in secrets:
+                        continue
+                    try:
+                        if ref not in resolved_refs:
+                            resolved_refs[ref] = _run_op_read(op, ref, account=account, token_value=token_value)
+                        secrets[name] = resolved_refs[ref]
+                    except RuntimeError as read_exc:
+                        warnings.append(str(read_exc))
+                        read_kind = _classify_op_error(str(read_exc))
+                        failure_kinds.append(read_kind)
+                        if read_kind is ErrorKind.RATE_LIMITED:
+                            if use_cache:
+                                _record_rate_limit_cooldown(cooldown_key, home_path)
+                            break
 
     # An IDENTITY rejection fails every read it is asked to make; a single item the
     # identity may not read is a permission on that item, and `op` reports both as
@@ -421,7 +434,7 @@ def _missing_binary_error(binary_path: str) -> str:
 
 
 def apply_onepassword_secrets(
-    *, enabled: bool, env: Optional[Dict[str, str]] = None, account: str = "",
+    *, enabled: bool, env: Optional[dict[str, str]] = None, account: str = "",
     service_account_token_env: str = _DEFAULT_TOKEN_ENV, binary_path: str = "",
     override_existing: bool = True, cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
 ) -> FetchResult:
@@ -556,26 +569,3 @@ def clear_caches(home_path: Optional[Path] = None) -> None:
 
 
 _reset_cache_for_tests = clear_caches
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import hashlib  # noqa: F401,E402
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'DiskCache': ('agent.secret_sources._cache', 'DiskCache'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----

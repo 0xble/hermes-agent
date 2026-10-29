@@ -231,7 +231,13 @@ def _parse_ip(hostname: str) -> Optional[_IPAddress]:
     try:
         return ipaddress.ip_address(hostname)
     except ValueError:
-        return None
+        # ``inet_aton`` accepts the legacy hex, octal, and shortened IPv4 forms that
+        # resolvers and http clients may also accept. Treat them as literals for the
+        # fake-IP literal-host guard, not as DNS names.
+        try:
+            return ipaddress.ip_address(socket.inet_aton(hostname))
+        except (OSError, ValueError):
+            return None
 
 
 def _iter_resolved_ips(addr_info: Any):
@@ -359,6 +365,11 @@ def is_safe_url(url: str, *, allow_private: Optional[bool] = None) -> bool:
         allow_all_private = _global_allow_private_urls() if allow_private is None else allow_private
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
         allow_private = allow_all_private or allow_private_ip
+        # A declared sentinel written as the host is not a proxy DNS answer.
+        literal = _parse_ip(hostname)
+        if literal is not None and _is_declared_fake_ip(literal) and not allow_private:
+            logger.warning("Blocked request to fake-IP address used as a URL host: %s", hostname)
+            return False
         try:
             addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
@@ -413,6 +424,11 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str, allow_private:
     if allow_private is None:
         allow_private = _global_allow_private_urls()
     allow_private = allow_private or _allows_private_ip_resolution(hostname, scheme)
+    # Same rule as ``is_safe_url``: a declared sentinel written as the host is not a proxy DNS
+    # answer. Enforced here too, since redirects and direct guarded clients never re-run it.
+    literal = _parse_ip(hostname)
+    if literal is not None and _is_declared_fake_ip(literal) and not allow_private:
+        raise SSRFConnectionBlocked(f"Blocked request to fake-IP address used as a URL host: {hostname}")
     try:
         addr_info = _getaddrinfo(hostname, port)
     except socket.gaierror as exc:
@@ -589,60 +605,3 @@ def redirect_target_from_response(response: Any) -> Optional[str]:
         return urljoin(str(getattr(response, "url", "")), str(location))
     next_request = getattr(response, "next_request", None)
     return str(next_request.url) if next_request else None
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-def has_sensitive_query_params(url: str) -> bool:
-    """Return True when ``url`` carries likely credential-bearing query params."""
-    return sensitive_query_param_name(url) is not None
-
-def ssrf_safe_async_http_transport(**kwargs: Any) -> Any:
-    """Return an httpx async transport that pins direct TCP connects to vetted IPs."""
-    import contextvars
-    import httpx
-
-    schemes_by_origin_var = contextvars.ContextVar("hermes_ssrf_async_origin_schemes")
-
-    class _Transport(httpx.AsyncHTTPTransport):
-        def __init__(self, **transport_kwargs: Any):
-            super().__init__(**transport_kwargs)
-            self._pool._network_backend = _SSRFGuardedAsyncNetworkBackend(  # type: ignore[attr-defined]
-                schemes_by_origin_var
-            )
-
-        async def handle_async_request(self, request: Any) -> Any:
-            token = schemes_by_origin_var.set(_origin_scheme_context(request))
-            try:
-                return await super().handle_async_request(request)
-            finally:
-                schemes_by_origin_var.reset(token)
-
-    return _Transport(**kwargs)
-
-def ssrf_safe_http_transport(**kwargs: Any) -> Any:
-    """Return an httpx sync transport that pins direct TCP connects to vetted IPs."""
-    import contextvars
-    import httpx
-
-    schemes_by_origin_var = contextvars.ContextVar("hermes_ssrf_origin_schemes")
-
-    class _Transport(httpx.HTTPTransport):
-        def __init__(self, **transport_kwargs: Any):
-            super().__init__(**transport_kwargs)
-            self._pool._network_backend = _SSRFGuardedNetworkBackend(  # type: ignore[attr-defined]
-                schemes_by_origin_var
-            )
-
-        def handle_request(self, request: Any) -> Any:
-            token = schemes_by_origin_var.set(_origin_scheme_context(request))
-            try:
-                return super().handle_request(request)
-            finally:
-                schemes_by_origin_var.reset(token)
-
-    return _Transport(**kwargs)
-# ---- END PLUGIN-COMPAT ----

@@ -171,6 +171,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     release_worker = threading.Event()
     committed = threading.Event()
     cleanup_done = threading.Event()
+    worker_gave_up = threading.Event()
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
 
@@ -205,7 +206,8 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
             # would hang at interpreter exit joining executor threads).
             _spin_started = time.monotonic()
             while not release_worker.is_set():
-                if time.monotonic() - _spin_started > 20:
+                if time.monotonic() - _spin_started > 120:
+                    worker_gave_up.set()
                     return (messages, None)
                 if commit_fence is not None:
                     commit_fence.touch_progress()
@@ -232,14 +234,18 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     adapter = _CaptureAdapter()
     runner = _build_runner(gateway_run, adapter, fake_db)
 
-    started = time.monotonic()
-    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
-    elapsed = time.monotonic() - started
+    # Generous outer bound only, kept under the 60s hygiene timeout so that path cannot pass for
+    # this one: the release is proven by ordering below, not by wall-clock speed.
+    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=45)
 
-    # #90845/#92318 invariant intact: the turn is released at the budget.
+    # #90845/#92318 invariant intact: the turn is released at the budget, i.e. it completed
+    # while the worker was still streaming. The worker only ends once the test releases it,
+    # so a turn that waited for it could not have returned with these events unset.
     assert result == "ok"
-    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
     assert worker_started.is_set()
+    assert not release_worker.is_set() and not committed.is_set() and not worker_gave_up.is_set(), (
+        "turn returned only after the worker finished despite the turn-hold budget"
+    )
     assert runner._run_agent.await_count == 1
 
     # (b) NO retry-after was armed while the attempt is still running —
@@ -271,11 +277,12 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     # advances it (the deferral is not a failure).
     assert not fake_db.increment_hygiene_failure_streak.called
     assert fake_db.reset_hygiene_failure_streak.called
-    # Deferral notice still reaches the user.
+    # The summary was adopted: the turn-hold is internal lifecycle, so the user sees nothing.
     sent = [m["content"] for m in adapter.sent]
-    assert any(
-        "deferred" in c.lower() or "still streaming" in c.lower() for c in sent
-    ), f"turn-hold must send deferral notice, got: {sent}"
+    assert sent == [], f"adopted turn-hold must not notify the user, got: {sent}"
+    # The pre-compaction prompt count is dropped so the next turn does not re-fire hygiene.
+    assert runner.session_store.get_or_create_session.return_value.last_prompt_tokens == 0
+    assert runner._hygiene_deferred_adoption_epoch("agent:main:telegram:dm:12345") == 1
 
 
 @pytest.mark.asyncio
@@ -357,6 +364,77 @@ async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commit
     assert not fake_db.increment_hygiene_failure_streak.called, (
         "turn-hold deferral must never advance the failure streak"
     )
+    # Nothing was adopted, but nothing failed either: a superseded/no-op attempt stays silent.
+    assert [m["content"] for m in adapter.sent] == []
+
+
+@pytest.mark.asyncio
+async def test_turn_hold_kept_admission_summary_failure_warns_user(
+    monkeypatch, tmp_path
+):
+    """A kept-admission worker whose summary really fails after the turn-hold
+    posts the ordinary hygiene-failure warning (and never the deferral notice):
+    nothing will be adopted, so the user is told, exactly once."""
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    fake_db = MagicMock()
+    fake_db.get_compression_failure_cooldown.return_value = None
+
+    class FencedFailingAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "sess-97963")
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_summary_error=None,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
+            if commit_fence is not None:
+                commit_fence.mark_commit_watermark_fenced()
+            worker_started.set()
+            _spin_started = time.monotonic()
+            while not release_worker.is_set():
+                if time.monotonic() - _spin_started > 20:
+                    break
+                if commit_fence is not None:
+                    commit_fence.touch_progress()
+                time.sleep(0.01)
+            self.context_compressor._last_compress_aborted = True
+            self.context_compressor._last_summary_error = "summary model returned 500"
+            return (messages, None)
+
+    gateway_run = importlib.import_module("gateway.run")
+    _write_turnhold_config(tmp_path)
+    _install_fakes(monkeypatch, gateway_run, tmp_path, FencedFailingAgent)
+
+    adapter = _CaptureAdapter()
+    runner = _build_runner(gateway_run, adapter, fake_db)
+
+    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
+    assert result == "ok"
+    assert worker_started.is_set()
+    # The turn-hold itself is silent while the worker may still be adopted.
+    assert [m["content"] for m in adapter.sent] == []
+
+    release_worker.set()
+    await _drain_deferred(runner)
+    for _ in range(100):
+        if adapter.sent:
+            break
+        await asyncio.sleep(0.05)
+
+    sent = [m["content"] for m in adapter.sent]
+    from agent.i18n import t
+    assert sent == [t("gateway.compress.hygiene_failed")], sent
+    # A real failure escalates like the inline abort path.
+    assert fake_db.increment_hygiene_failure_streak.called
+    assert fake_db.record_compression_failure_cooldown.called
 
 
 @pytest.mark.asyncio
@@ -430,3 +508,65 @@ async def test_turn_hold_without_watermark_fence_still_cancels(
     # Legacy path still records the flat retry-after immediately.
     assert fake_db.record_compression_failure_cooldown.called
     assert not fake_db.increment_hygiene_failure_streak.called
+    # Cancelled: nothing will be adopted, so the deferral notice is the user's only signal.
+    from agent.i18n import t
+    assert [m["content"] for m in adapter.sent] == [t("gateway.compress.turnhold_deferred")]
+
+
+class _OrderedStore:
+    """``update_session`` in completion order, like the off-loop facade. *during_first_write* runs while the
+    turn's own write is in flight, before it lands."""
+
+    def __init__(self, during_first_write=None):
+        self.last_prompt_tokens = None
+        self.writes = []
+        self._during_first_write = during_first_write
+
+    async def update_session(self, _key, last_prompt_tokens=None, touch_activity=True):
+        hook, self._during_first_write = self._during_first_write, None
+        if hook is not None:
+            await hook(self)
+        self.writes.append(last_prompt_tokens)
+        self.last_prompt_tokens = last_prompt_tokens
+
+
+def _bare_runner():
+    gateway_run = importlib.import_module("gateway.run")
+    return object.__new__(gateway_run.GatewayRunner)
+
+
+@pytest.mark.asyncio
+async def test_adoption_landing_while_the_turn_count_is_written_still_ends_at_zero():
+    """The turn checks the adoption epoch, then writes its count off-loop. An adoption that lands in that
+    window bumps the epoch and its own ``last_prompt_tokens=0`` write can finish FIRST; the turn's stale
+    pre-compaction count then lands on top and re-fires hygiene next turn. The re-check after the write
+    must leave 0."""
+    runner = _bare_runner()
+    key = "agent:main:telegram:dm:12345"
+
+    async def _adoption_lands(store):
+        runner._note_hygiene_deferred_adoption(key)
+        store.writes.append(0)
+        store.last_prompt_tokens = 0
+
+    store = _OrderedStore(during_first_write=_adoption_lands)
+    await runner._hmwa_store_turn_prompt_tokens(store, key, key, 91_000, 0, touch_activity=True)
+    assert store.writes == [0, 91_000, 0]
+    assert store.last_prompt_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_turn_count_is_kept_when_no_adoption_lands():
+    runner = _bare_runner()
+    store = _OrderedStore()
+    await runner._hmwa_store_turn_prompt_tokens(store, "k", "k", 91_000, 0, touch_activity=True)
+    assert store.writes == [91_000]
+
+
+@pytest.mark.asyncio
+async def test_adoption_before_the_write_stores_zero_once():
+    runner = _bare_runner()
+    runner._note_hygiene_deferred_adoption("k")
+    store = _OrderedStore()
+    await runner._hmwa_store_turn_prompt_tokens(store, "k", "k", 91_000, 0, touch_activity=True)
+    assert store.writes == [0]

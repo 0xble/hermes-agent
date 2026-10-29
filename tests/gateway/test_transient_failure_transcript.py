@@ -63,6 +63,20 @@ class TestTransientFailureKeepsUserMessage:
         assert failed
         assert not ctx_overflow
 
+    def test_retained_input_is_not_context_overflow(self):
+        agent_result = {
+            "failed": True,
+            "failure_reason": "input_retained",
+            "error": (
+                "The complete request cannot safely fit the model window. "
+                "automatic compression is disabled; use /new or choose a model "
+                "with a larger context window."
+            ),
+        }
+        failed, ctx_overflow = _classify(agent_result, history_len=2)
+        assert failed
+        assert not ctx_overflow
+
 
 class TestSuccessfulResultUnaffected:
     def test_successful_result_neither_failed_nor_overflow(self):

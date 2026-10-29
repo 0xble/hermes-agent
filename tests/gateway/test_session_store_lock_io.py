@@ -107,6 +107,38 @@ def _seed_entry(store, key, session_id) -> SessionEntry:
 # Tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("race", ["none", "newer_activity", "repoint"])
+def test_activity_refresh_reads_outside_lock_and_rechecks_live_entry(tmp_path, race):
+    db = _db_with_rows({})
+    store = _make_store(tmp_path, db)
+    key = store._generate_session_key(_source())
+    entry = _seed_entry(store, key, "original")
+    old = entry.last_user_activity_at = datetime.now() - timedelta(minutes=10)
+    newer = old + timedelta(minutes=5)
+    payload = entry.to_dict()
+    payload["last_user_activity_at"] = newer.isoformat()
+    expected = newer
+
+    def load(*args, **kwargs):
+        nonlocal expected
+        assert not store._lock.held
+        # Simulate a worker publishing while the durable read is in flight.
+        with store._lock:
+            if race == "newer_activity":
+                expected = entry.last_user_activity_at = newer + timedelta(minutes=1)
+            elif race == "repoint":
+                replacement = _seed_entry(store, key, "replacement")
+                expected = replacement.last_user_activity_at = old
+        return json.dumps(payload)
+
+    db.load_gateway_routing_entry.side_effect = load
+    try:
+        assert store.get_last_user_activity_at(key, refresh=True) == expected
+        db.load_gateway_routing_entry.assert_called_once()
+    finally:
+        store.close_all_db_handles()
+
+
 class TestStaleCheckOutsideLock:
     def test_is_session_ended_not_holding_lock(self, tmp_path):
         """``_is_session_ended_in_db`` must run with the lock released."""

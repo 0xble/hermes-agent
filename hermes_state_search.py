@@ -5,6 +5,7 @@ Must never import hermes_state (cycle); shared constants live in hermes_state_co
 """
 
 import contextlib
+import functools
 import logging
 import re
 import sqlite3
@@ -12,6 +13,7 @@ import time
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
+from hermes_state_errors import is_malformed_db_error, is_sqlite_lock_error
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
@@ -53,8 +55,16 @@ _LIKE_COALESCED_COLUMN_SQL = (
     "COALESCE(m.tool_name, '') LIKE ? ESCAPE '\\' OR "
     "COALESCE(m.tool_calls, '') LIKE ? ESCAPE '\\')"
 )
-# ``sort`` -> ORDER BY for the FTS routes; unknown values are rank-only (user input passes through).
-_FTS_ORDER_BY = {"newest": "ORDER BY m.timestamp DESC, rank", "oldest": "ORDER BY m.timestamp ASC, rank"}
+# Discovery searches conversation text, not the agent's tool-call JSON: the same predicates with
+# the tool_calls column replaced by an empty literal keep the bind count (``_like_params``) intact.
+_LIKE_ANY_COLUMN_NO_TOOL_CALLS_SQL = _LIKE_ANY_COLUMN_SQL.replace("m.tool_calls", "''")
+_LIKE_COALESCED_NO_TOOL_CALLS_SQL = _LIKE_COALESCED_COLUMN_SQL.replace("COALESCE(m.tool_calls, '')", "''")
+# ``sort`` -> ORDER BY for the FTS routes. Relevance stays primary; temporal order is
+# a stable tie-breaker so a recent weak match cannot displace a strong older match.
+_FTS_ORDER_BY = {
+    "newest": "ORDER BY rank, m.timestamp DESC, m.id DESC",
+    "oldest": "ORDER BY rank, m.timestamp ASC, m.id ASC",
+}
 # Indexed neighbor seeks avoid scanning whole sessions for a sparse set of hits.
 _CONTEXT_WINDOW_SQL = """WITH target AS (
     SELECT session_id, timestamp, id FROM messages WHERE id IN ({ids})
@@ -90,20 +100,109 @@ def _is_cjk(cp: int) -> bool:
     return any(lo <= cp <= hi for lo, hi in _CJK_RANGES)
 
 
-def _non_operator_tokens(raw_query: str) -> List[str]:
-    return [t for t in raw_query.split() if t.upper() not in _FTS_OPERATORS]
+def _non_operator_tokens(raw_query: str) -> list[str]:
+    """Non-operator term bodies; a sanitized ``"quoted phrase"`` stays one term without its quotes."""
+    return [t[1:-1] if len(t) >= 2 and t.startswith('"') and t.endswith('"') else t
+            for t in _LIKE_TOKEN_RE.findall(raw_query) if t.upper() not in _FTS_OPERATORS]
 
 
 def _quote_fts_tokens(raw_query: str) -> str:
-    """Quote each non-operator token (neutralising FTS5 special characters), keeping AND/OR/NOT."""
+    """Quote each non-operator token (neutralising FTS5 special characters), keeping AND/OR/NOT
+    and already-quoted sanitized phrases (``notes "100%完成"`` must not lose one phrase quote)."""
     return " ".join(
-        tok if tok.upper() in _FTS_OPERATORS else '"' + tok.replace('"', '""') + '"' for tok in raw_query.split()
+        tok if tok.upper() in _FTS_OPERATORS or (len(tok) >= 2 and tok.startswith('"') and tok.endswith('"'))
+        else '"' + tok.replace('"', '""') + '"' for tok in _LIKE_TOKEN_RE.findall(raw_query)
     )
 
 
-def _like_params(term: str) -> List[str]:
+def _like_params(term: str) -> list[str]:
     """One ``%term%`` bind per column of ``_LIKE_ANY_COLUMN_SQL``."""
     return [f"%{_escape_like(term)}%"] * 3
+
+
+def _phrase_column_sql(columns: tuple[str, ...]) -> str:
+    """Per-column ``LIKE`` prefilter ANDed with the exact separator check (``_phrase_params`` binds)."""
+    return "(" + " OR ".join(
+        f"({col} LIKE ? ESCAPE '\\' AND {_PHRASE_MATCH_FN}({col}, ?))" for col in columns) + ")"
+
+
+_PHRASE_MATCH_FN = "hermes_phrase_match"
+_PHRASE_ANY_COLUMN_SQL = _phrase_column_sql(("m.content", "m.tool_name", "m.tool_calls"))
+_PHRASE_ANY_COLUMN_NO_TOOL_CALLS_SQL = _phrase_column_sql(("m.content", "m.tool_name", "''"))
+_PHRASE_COALESCED_COLUMN_SQL = _phrase_column_sql(
+    ("COALESCE(m.content, '')", "COALESCE(m.tool_name, '')", "COALESCE(m.tool_calls, '')"))
+_PHRASE_COALESCED_NO_TOOL_CALLS_SQL = _phrase_column_sql(
+    ("COALESCE(m.content, '')", "COALESCE(m.tool_name, '')", "''"))
+
+
+@functools.lru_cache(maxsize=256)
+def _phrase_regex(term: str) -> re.Pattern[str]:
+    # unicode61 splits on every non-alphanumeric run (``_`` included), so a sanitized gap is one or
+    # more separator characters: ``don t`` matches ``don't``/``don’t``/``don t`` but not ``donut``.
+    return re.compile(r"[\W_]+".join(re.escape(word) for word in term.split()), re.IGNORECASE)
+
+
+def _phrase_match(value: Any, term: str) -> int:
+    """SQL ``hermes_phrase_match(text, phrase)``: the adjacency check LIKE cannot express."""
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    return 1 if _phrase_regex(term).search(str(value)) else 0
+
+
+def _phrase_params(term: str) -> list[str]:
+    """Binds for ``_PHRASE_*_SQL``: an in-order ``%w1%w2%`` LIKE prefilter plus the phrase per column.
+
+    ``_sanitize_fts5_query`` turns punctuation into the space unicode61 would split on
+    (``don't`` -> ``don t``, ``foo,bar`` -> ``foo bar``); the phrase check keeps that adjacency.
+    """
+    pattern = "%".join(_escape_like(word) for word in term.split())
+    return [f"%{pattern}%", term] * 3
+
+
+def _like_term_predicate(term: str, *, coalesced: bool, exclude_tool_calls: bool) -> tuple[str, list[str]]:
+    """Column predicate and binds for one LIKE-route term; multi-word (sanitized) phrases need adjacency."""
+    if len(term.split()) > 1:
+        if coalesced:
+            sql = _PHRASE_COALESCED_NO_TOOL_CALLS_SQL if exclude_tool_calls else _PHRASE_COALESCED_COLUMN_SQL
+        else:
+            sql = _PHRASE_ANY_COLUMN_NO_TOOL_CALLS_SQL if exclude_tool_calls else _PHRASE_ANY_COLUMN_SQL
+        return sql, _phrase_params(term)
+    if coalesced:
+        sql = _LIKE_COALESCED_NO_TOOL_CALLS_SQL if exclude_tool_calls else _LIKE_COALESCED_COLUMN_SQL
+    else:
+        sql = _LIKE_ANY_COLUMN_NO_TOOL_CALLS_SQL if exclude_tool_calls else _LIKE_ANY_COLUMN_SQL
+    return sql, _like_params(term)
+
+
+def _register_search_functions(conn: sqlite3.Connection) -> None:
+    """Register canonical-table search predicates on every reader and writer connection."""
+    conn.create_function(_PHRASE_MATCH_FN, 2, _phrase_match, deterministic=True)
+
+
+def _strip_cjk_wildcards(raw_query: str) -> str:
+    """Drop the trailing prefix wildcard callers append for ASCII ("nimb" -> "nimb*").
+
+    None of the CJK routes can honour that star: the bigram and trigram routes
+    quote every token before MATCH (so ``*`` matches a literal asterisk) and
+    LIKE has no ``*`` wildcard at all (only ``%``/``_``). Left in place, every
+    CJK search arriving from the web/desktop search box — which appends the
+    star to each unquoted token so partial English words match — searches for
+    a term ending in a literal ``*`` and returns nothing (#90636). Only
+    TRAILING stars go: a star written inside a quoted phrase is the user's
+    own text, and a token that is ALL stars keeps its original form so it
+    cannot degrade to a match-everything empty term.
+    """
+    if "*" not in raw_query:
+        return raw_query
+    stripped: list[str] = []
+    for token in raw_query.split():
+        if token.upper() in _FTS_OPERATORS:
+            stripped.append(token)
+        else:
+            stripped.append(token.rstrip("*") or token)
+    return " ".join(stripped) or raw_query
 
 
 def _flatten_text(decoded: Any) -> str:
@@ -121,7 +220,7 @@ def _positive_int(name: str, value: Any) -> None:
         raise ValueError(f"{name} must be greater than zero")
 
 
-def _search_select_sql(snippet_sql: str, from_sql: str, where: List[str], order_by: str, limit_sql: str) -> str:
+def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_by: str, limit_sql: str) -> str:
     """Result-row SELECT shared by the FTS and LIKE routes (SQL text is pinned)."""
     return f"""
             SELECT m.id, m.session_id, m.role,
@@ -136,8 +235,8 @@ def _search_select_sql(snippet_sql: str, from_sql: str, where: List[str], order_
 
 
 def _search_filter_clauses(
-    where: List[str], params: list, *, include_inactive: bool, source_filter: Optional[List[str]],
-    exclude_sources: Optional[List[str]], role_filter: Optional[List[str]],
+    where: list[str], params: list, *, include_inactive: bool, source_filter: Optional[list[str]],
+    exclude_sources: Optional[list[str]], role_filter: Optional[list[str]],
     after_ts: Optional[int] = None, before_ts: Optional[int] = None) -> None:
     """Append the visibility/source/role/session-start predicates every search route shares. Live
     rows (active=1) AND compaction-archived rows (compacted=1) are discoverable; only
@@ -173,7 +272,7 @@ class SessionSearchMixin:
     )
 
     @classmethod
-    def _search_message_fields(cls, fields: Optional[Collection[str]]) -> Optional[Tuple[str, ...]]:
+    def _search_message_fields(cls, fields: Optional[Collection[str]]) -> Optional[tuple[str, ...]]:
         """Validate and canonically order an optional result projection."""
         if fields is None:
             return None
@@ -193,25 +292,26 @@ class SessionSearchMixin:
             return
         try:
             self._merge_fts_incrementally(max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX)
-        except Exception as exc:  # noqa: BLE001 - post-commit maintenance
+        except Exception as exc:
             # The canonical write is already committed before this cadence runs. No maintenance failure —
             # including the bare SystemError the CPython sqlite3 layer can raise under cross-thread errmsg
             # scrambling — may escape and make the caller replay an ambiguous, possibly-durable write
-            # (#90734, #85079).
-            logger.warning("FTS incremental merge failed after commit: %s", exc)
+            # (#90734, #85079). A busy database just defers the pass to the next cadence boundary.
+            (logger.debug if is_sqlite_lock_error(exc) else logger.warning)(
+                "FTS incremental merge failed after commit: %s", exc)
 
     # ── Deferred rebuild engine (base + CJK backfills) ─────────────────────
 
-    def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
+    def fts_rebuild_status(self) -> Optional[dict[str, Any]]:
         """Deferred-rebuild progress ``{"pending", "total", "indexed", "percent"}`` or None. Reads
         via the pooled reader (not get_meta/self._lock) so search never blocks on the writer."""
         return self._rebuild_status("fts_rebuild")
 
-    def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
+    def fts_cjk_rebuild_status(self) -> Optional[dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
         return self._rebuild_status("fts_cjk_rebuild")
 
-    def _rebuild_status(self, prefix: str) -> Optional[Dict[str, Any]]:
+    def _rebuild_status(self, prefix: str) -> Optional[dict[str, Any]]:
         rows = self._read_all("SELECT key, value FROM state_meta WHERE key IN (?, ?)",
                               (f"{prefix}_high_water", f"{prefix}_progress"))
         meta = {r["key"]: r["value"] for r in rows}
@@ -276,7 +376,7 @@ class SessionSearchMixin:
         self._fts_cjk_available = True
         logger.info("CJK FTS index backfill complete — serving CJK search.")
 
-    def _rebuild_finish(self, prefix: str, sweep_sqls: List[Tuple[str, bool]]) -> None:
+    def _rebuild_finish(self, prefix: str, sweep_sqls: list[tuple[str, bool]]) -> None:
         """Sweep a generous window around the high-water boundary, then clear the markers.
         ``(sql, bounded)``: a bounded sweep takes the tool-content prefix_chars param first."""
         def _do(conn):
@@ -309,7 +409,7 @@ class SessionSearchMixin:
         return self._rebuild_step("fts_cjk_rebuild", [insert], finish=self._fts_cjk_rebuild_finish,
                                   fail_msg="CJK FTS rebuild chunk failed (will retry): %s")
 
-    def _rebuild_step(self, prefix: str, insert_sqls: List[str], *, fail_msg: str, finish,
+    def _rebuild_step(self, prefix: str, insert_sqls: list[str], *, fail_msg: str, finish,
                       finish_when_empty: bool = False) -> bool:
         """Shared chunk engine for the base and CJK deferred backfills. ``finish_when_empty``
         finalizes a high_water <= 0 marker (empty messages table) instead of leaving it pending."""
@@ -624,8 +724,8 @@ class SessionSearchMixin:
         return None
 
     def optimize_fts_storage(
-        self, *, progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None, vacuum: bool = True
-    ) -> Dict[str, Any]:
+        self, *, progress_cb: Optional[Callable[[dict[str, Any]], None]] = None, vacuum: bool = True
+    ) -> dict[str, Any]:
         """Repair an older FTS layout into the current v23 shape, foreground and to completion:
         legacy-v22 inline -> external-content, or a v23 ``messages_fts_trigram`` that still stores
         ``tool_calls``. Re-running resumes. ``progress_cb`` receives {"phase", "percent",
@@ -706,7 +806,7 @@ class SessionSearchMixin:
 
     def get_anchored_view(
         self, session_id: str, around_message_id: int, window: int = 5, bookend: int = 3,
-        keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant")) -> Dict[str, Any]:
+        keep_roles: Optional[tuple[str, ...]] = ("user", "assistant")) -> dict[str, Any]:
         """Anchored window (``get_messages_around``) plus session bookends, so one call yields the
         goal and the resolution of a long session. ``window`` is filtered to ``keep_roles``
         (None disables) EXCEPT the anchor; ``bookend_start`` / ``bookend_end`` are the
@@ -723,8 +823,8 @@ class SessionSearchMixin:
         if keep_roles is not None:
             keep_set = set(keep_roles)
             filtered_window = [m for m in window_rows if m.get("id") == around_message_id or m.get("role") in keep_set]
-        bookend_start_rows: List[Any] = []
-        bookend_end_rows: List[Any] = []
+        bookend_start_rows: list[Any] = []
+        bookend_end_rows: list[Any] = []
         if bookend > 0:
             role_clause = "" if keep_roles is None else f" AND role IN ({','.join('?' for _ in keep_roles)})"
             role_params = [] if keep_roles is None else list(keep_roles)
@@ -741,7 +841,7 @@ class SessionSearchMixin:
                 # End rows come back DESC for the LIMIT cap; flip to ASC.
                 bookend_end_rows = list(reversed(_bookend(">", window_rows[-1]["id"], "DESC")))
 
-        def _hydrate(row) -> Dict[str, Any]:
+        def _hydrate(row) -> dict[str, Any]:
             return self._row_to_message_dict(row, warn_context="get_anchored_view", summary_flag=False)
         return {
             "window": filtered_window, "messages_before": primitive["messages_before"],
@@ -751,7 +851,7 @@ class SessionSearchMixin:
         }
 
     def list_recent_user_messages(
-        self, session_id: str, limit: int = 20, include_inactive: bool = False) -> List[Dict[str, Any]]:
+        self, session_id: str, limit: int = 20, include_inactive: bool = False) -> list[dict[str, Any]]:
         """The *limit* most-recent real user turns, newest first, as ``{id, timestamp, preview}``
         (80 chars, whitespace collapsed); used by /rewind and ``/undo [N]``. Bookkeeping rows
         (``display_kind`` set) are excluded. Legacy compaction handoffs are role='user' rows
@@ -770,7 +870,7 @@ class SessionSearchMixin:
                 (session_id, int(limit) * 2 + 5),
             ).fetchall()
         from agent.context_compressor import ContextCompressor
-        result: List[Dict[str, Any]] = []
+        result: list[dict[str, Any]] = []
         for row in rows:
             if len(result) >= int(limit):
                 break
@@ -791,40 +891,57 @@ class SessionSearchMixin:
 
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
-        """Sanitize user input for FTS5 MATCH (raw special characters raise): preserve paired
-        quoted phrases, strip unmatched special characters, and quote hyphenated/dotted
-        terms so FTS5 matches them as phrases (``chat-send``, ``P2.2``, ``my-app.config.ts``)."""
-        # Cap before any regex processing so adversarial input stays bounded.
+        """Sanitize user input for FTS5 MATCH while keeping structured identifiers one unit.
+
+        FTS5 treats punctuation as query grammar (``:`` is a column selector and ``-``
+        can be a token boundary). Quote every unquoted token that contains punctuation
+        so hashes, timestamps, paths, and hyphenated names retain their token boundary;
+        boolean operators and explicitly quoted phrases keep their existing semantics.
+        """
         query = query[:MAX_FTS5_QUERY_CHARS]
-
-        # 1. Protect balanced quoted phrases via numbered placeholders (``"[^"]*"`` pairs
-        # left-to-right without backtracking); a leftover unmatched quote becomes whitespace.
-        _quoted_parts: list = []
-
-        def _hold(m: "re.Match[str]") -> str:
-            _quoted_parts.append(m.group(0))
-            return f"\x00Q{len(_quoted_parts) - 1}\x00"
-
-        sanitized = _QUOTED_PHRASE_RE.sub(_hold, query).replace('"', " ")
-
-        # 2. Strip FTS5-special characters (an unquoted ``TODO: fix`` parses as
-        # ``column:term``). ``%`` is only spared for the CJK LIKE fallback.
-        sanitized = _FTS5_SPECIAL_RE.sub(" ", sanitized)
-        if "%" in sanitized and not SessionSearchMixin._contains_cjk(sanitized):
-            sanitized = sanitized.replace("%", " ")
-        # 3. Collapse repeated * and drop leading * (prefix needs a char).
-        sanitized = re.sub(r"\*+", "*", sanitized)
-        sanitized = re.sub(r"(^|\s)\*", r"\1", sanitized)
-        # 4. Drop dangling boolean operators at start/end (syntax errors).
-        sanitized = re.sub(r"(?i)^(AND|OR|NOT)\b\s*", "", sanitized.strip())
-        sanitized = re.sub(r"(?i)\s+(AND|OR|NOT)\s*$", "", sanitized.strip())
-        # 5. Quote dotted/hyphenated/underscored terms in ONE pass (sequential passes
-        # double-quote ``my-app.config``).
-        sanitized = re.sub(r"\b(\w+(?:[._-]\w+)+)\b", r'"\1"', sanitized)
-        # 6. Restore preserved quoted phrases.
-        for i, quoted in enumerate(_quoted_parts):
-            sanitized = sanitized.replace(f"\x00Q{i}\x00", quoted)
-        return sanitized.strip()
+        tokens = _LIKE_TOKEN_RE.findall(query)
+        # FTS5 only treats uppercase AND/OR/NOT as operators; lowercase ones are words.
+        while tokens and tokens[0] in _FTS_OPERATORS:
+            tokens.pop(0)
+        while tokens and tokens[-1] in _FTS_OPERATORS:
+            tokens.pop()
+        sanitized: list[str] = []
+        for token in tokens:
+            if token.startswith('"') and token.endswith('"') and len(token) >= 2:
+                sanitized.append(token)
+                continue
+            if token in _FTS_OPERATORS:
+                sanitized.append(token)
+                continue
+            # Keep FTS prefix semantics, but quote the structured token before the '*'.
+            suffix = "*" if token.endswith("*") else ""
+            body = token[:-1] if suffix else token
+            if not body:
+                continue
+            # Keep identifier punctuation, but retain the historical fail-closed behavior
+            # for FTS operators/wildcards such as ``+`` and ``%``.
+            # A colon is meaningful inside ISO timestamps, but remains an FTS
+            # column selector in ordinary prose (``TODO: fix``).
+            allowed = "#:/._-@"
+            if ":" in body and not re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", body):
+                allowed = allowed.replace(":", "")
+            unsafe = "".join(ch for ch in _FTS5_SPECIAL_CHARS if ch not in allowed)
+            # Unsafe punctuation splits words the way the unicode61 tokenizer does
+            # (``don't`` -> ``don t``); the pieces stay one adjacent phrase below.
+            body = re.sub(f"[{re.escape(unsafe)}]", " ", body)
+            body = body.replace("*", " ")
+            if "%" in body and not SessionSearchMixin._contains_cjk(body):
+                body = body.replace("%", " ")
+            body = " ".join(body.split())
+            if not body:
+                continue
+            # Quote punctuated phrases and mixed-case operator words (``not`` stays a term
+            # on every route, including the LIKE fallbacks that compare case-insensitively).
+            if re.search(r"[^\w]", body, flags=re.UNICODE) or body.upper() in _LIKE_SKIP_TOKENS:
+                sanitized.append('"' + body.replace('"', '""') + '"' + suffix)
+            else:
+                sanitized.append(body + suffix)
+        return " ".join(sanitized)
 
     @staticmethod
     def _contains_cjk(text: str) -> bool:
@@ -854,7 +971,7 @@ class SessionSearchMixin:
         relaxation does not apply: fewer than two searchable units (a single term cannot relax)
         or explicit ``OR``/``NOT`` (the caller expressed exact semantics). Quoted phrases stay
         whole units: ``"docker networking" tls`` -> ``"docker networking" OR tls``."""
-        units: List[str] = []
+        units: list[str] = []
         for raw_token in _LIKE_TOKEN_RE.findall(query):
             upper = raw_token.upper()
             if upper in {"OR", "NOT"}:
@@ -867,7 +984,7 @@ class SessionSearchMixin:
     def _trigram_eligible_tokens(query: str) -> bool:
         """True when every non-operator token is >=3 chars: a shorter token produces no
         trigrams, and with FTS5's implicit AND one such token empties the whole MATCH."""
-        tokens = _non_operator_tokens(query.strip('"').strip())
+        tokens = _non_operator_tokens(query.strip())
         return bool(tokens) and all(len(t) >= 3 for t in tokens)
 
     @classmethod
@@ -892,7 +1009,7 @@ class SessionSearchMixin:
                 return "empty"
             if not self._contains_cjk(sanitized):
                 return "fts5"
-            raw = sanitized.strip('"').strip()
+            raw = sanitized.strip()
             if self._fts_cjk_available and not self._has_lone_cjk_run(raw):
                 return "fts_cjk"
             return "trigram" if self._trigram_route_ok(raw) else "like_scan"
@@ -903,8 +1020,12 @@ class SessionSearchMixin:
 
     @staticmethod
     def _fts_match_sql(table: str, match_query: str, order_by_sql: str, *, limit: int, offset: int,
-                       **filters) -> Tuple[str, list]:
+                       **filters) -> tuple[str, list]:
         """MATCH query + params against one FTS5 index joined to messages/sessions."""
+        if filters.pop("exclude_tool_calls", False):
+            # Column filter, not a row filter: assistant prose on a row that also made tool
+            # calls stays searchable; only the tool-call JSON column stops matching.
+            match_query = f"{{content}} : ({match_query})"
         where = [f"{table} MATCH ?"]
         params: list = [match_query]
         _search_filter_clauses(where, params, **filters)
@@ -916,7 +1037,7 @@ class SessionSearchMixin:
         return sql, params
 
     def _match_rows(self, table: str, match_query: str, order_by_sql: str, *, fail_open: Optional[str] = None,
-                    operational_debug: Optional[str] = None, **kwargs) -> Optional[List[Dict[str, Any]]]:
+                    operational_debug: Optional[str] = None, **kwargs) -> Optional[list[dict[str, Any]]]:
         """Run one MATCH against *table*; ``None`` when the query cannot execute (tokenizer /
         syntax) so the caller falls back. *fail_open* names the index for the
         substring-capable routes: a corruption-class ``DatabaseError`` there detaches the
@@ -937,16 +1058,17 @@ class SessionSearchMixin:
                 fail_open, exc)
             return None
 
-    def _like_rows(self, where: List[str], params: list, *, order_by: str, limit_sql: str) -> List[Dict[str, Any]]:
+    def _like_rows(self, where: list[str], params: list, *, order_by: str, limit_sql: str) -> list[dict[str, Any]]:
         """Canonical-table LIKE scan; ``params[0]`` is the snippet anchor term."""
         sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", where, order_by, limit_sql)
         return [dict(row) for row in self._read_all(sql, params)]
 
     @staticmethod
-    def _compile_like_boolean_query(query: str) -> Tuple[str, List[Any], Optional[str]]:
+    def _compile_like_boolean_query(
+            query: str, exclude_tool_calls: bool = False) -> tuple[str, list[Any], Optional[str]]:
         """Compile the supported FTS boolean subset into LIKE predicates: terms within an OR
         group are ANDed (FTS5's implicit conjunction) and ``NOT`` negates the next term."""
-        groups: List[List[Tuple[str, bool]]] = [[]]
+        groups: list[list[tuple[str, bool]]] = [[]]
         negate_next = False
         for raw_token in _LIKE_TOKEN_RE.findall(query):
             operator = raw_token.upper()
@@ -965,25 +1087,28 @@ class SessionSearchMixin:
                 groups[-1].append((term, negate_next))
                 negate_next = False
 
-        compiled_groups: List[str] = []
-        params: List[Any] = []
+        compiled_groups: list[str] = []
+        params: list[Any] = []
         snippet_term: Optional[str] = None
         for group in groups:
             if not group or not any(not negated for _, negated in group):
                 continue
-            clauses: List[str] = []
+            clauses: list[str] = []
             for term, negated in group:
-                clauses.append(f"NOT {_LIKE_COALESCED_COLUMN_SQL}" if negated else _LIKE_COALESCED_COLUMN_SQL)
-                params.extend(_like_params(term))
+                column_sql, term_params = _like_term_predicate(
+                    term, coalesced=True, exclude_tool_calls=exclude_tool_calls)
+                clauses.append(f"NOT {column_sql}" if negated else column_sql)
+                params.extend(term_params)
                 if snippet_term is None and not negated:
                     snippet_term = term
             compiled_groups.append(f"({' AND '.join(clauses)})")
         return " OR ".join(compiled_groups), params, snippet_term
 
     def _search_messages_like_fallback(
-        self, query: str, *, limit: int, offset: int, sort: Optional[str], **filters) -> List[Dict[str, Any]]:
+        self, query: str, *, limit: int, offset: int, sort: Optional[str], **filters) -> list[dict[str, Any]]:
         """Search canonical messages while derived FTS state is stale."""
-        predicate, params, snippet_term = self._compile_like_boolean_query(query)
+        predicate, params, snippet_term = self._compile_like_boolean_query(
+            query, exclude_tool_calls=filters.pop("exclude_tool_calls", False))
         if not predicate or snippet_term is None:
             return []
         where = [f"({predicate})"]
@@ -1005,7 +1130,7 @@ class SessionSearchMixin:
             self._fts_enabled = self._trigram_available = self._fts_cjk_available = False
 
     def _finalize_search_matches(
-        self, matches: List[Dict[str, Any]], result_fields: Optional[Collection[str]] = None) -> List[Dict[str, Any]]:
+        self, matches: list[dict[str, Any]], result_fields: Optional[Collection[str]] = None) -> list[dict[str, Any]]:
         """Attach neighboring messages in bounded batches, only when context is requested."""
         if result_fields is None or "context" in result_fields:
             for start in range(0, len(matches), 500):
@@ -1036,11 +1161,12 @@ class SessionSearchMixin:
     # ── search_messages ────────────────────────────────────────────────────
 
     def search_messages(
-        self, query: str, source_filter: List[str] = None, exclude_sources: List[str] = None,
-        role_filter: List[str] = None, limit: int = 20, offset: int = 0, sort: str = None,
+        self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+        exclude_tool_calls: bool = False,
+    ) -> list[dict[str, Any]]:
         """:meth:`_search_messages_impl` plus one log line per slow search with the routing
         path taken. Threshold HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call)."""
         started = time.time()
@@ -1049,7 +1175,7 @@ class SessionSearchMixin:
             rows = self._search_messages_impl(
                 query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
                 limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
-                after_ts=after_ts, before_ts=before_ts)
+                after_ts=after_ts, before_ts=before_ts, exclude_tool_calls=exclude_tool_calls)
             return rows
         finally:
             elapsed_ms = (time.time() - started) * 1000.0
@@ -1059,15 +1185,16 @@ class SessionSearchMixin:
                             query[: 200])
 
     def _search_messages_impl(
-        self, query: str, source_filter: List[str] = None, exclude_sources: List[str] = None,
-        role_filter: List[str] = None, limit: int = 20, offset: int = 0, sort: str = None,
+        self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
+        role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+        exclude_tool_calls: bool = False,
+    ) -> list[dict[str, Any]]:
         """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
         Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
-        projection. ``sort``: None = BM25 rank; "newest"/"oldest" = timestamp then rank (the
-        CJK LIKE fallback ignores it). Rewound rows (``active=0, compacted=0``) are excluded
+        projection. ``sort``: None = BM25 rank; "newest"/"oldest" = BM25 rank with timestamp/id
+        tie-breakers (the CJK LIKE fallback ignores it). Rewound rows (``active=0, compacted=0``) are excluded
         by default; compaction-archived rows ARE included; ``include_inactive`` = every row.
         ``after_ts``/``before_ts`` bound ``sessions.started_at`` on every route (FTS5, CJK,
         trigram, LIKE fallback, unindexed-gap supplement)."""
@@ -1079,7 +1206,8 @@ class SessionSearchMixin:
             return []
         filters = dict(include_inactive=include_inactive, source_filter=source_filter,
                        exclude_sources=exclude_sources, role_filter=role_filter,
-                       after_ts=after_ts, before_ts=before_ts)
+                       after_ts=after_ts, before_ts=before_ts,
+                       exclude_tool_calls=exclude_tool_calls)
         # New oversized tool results index only a bounded prefix; an explicit tool-role search is the
         # opt-in full-body path and scans canonical rows via LIKE.
         if role_filter and "tool" in role_filter:
@@ -1087,6 +1215,11 @@ class SessionSearchMixin:
             return self._finalize_search_matches(matches, result_fields=result_fields)
         self._refresh_fts_stale_state()
         if self._fts_stale:
+            matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+            return self._finalize_search_matches(matches, result_fields=result_fields)
+        # Pre-v23 inline FTS stores content, tool_name, and tool_calls in one column, so a
+        # column-qualified MATCH cannot exclude only tool_calls there: scan canonical rows.
+        if exclude_tool_calls and self._read_retrying_ioerr(self._db_has_legacy_inline_fts):
             matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
             return self._finalize_search_matches(matches, result_fields=result_fields)
         if not self._fts_enabled:
@@ -1135,7 +1268,7 @@ class SessionSearchMixin:
         # tokens). Gated on a miss so hits keep their ranking ("cat" may then match
         # "concatenate"). Skipped for role='tool' (both indexes exclude tool rows).
         if not matches and not is_cjk and not (bool(role_filter) and "tool" in role_filter):
-            fb_query = _quote_fts_tokens(query.strip('"').strip())
+            fb_query = _quote_fts_tokens(query.strip())
             # ── CJK-bigram route (messages_fts_cjk, cjk_unicode61) ────── When the bigram index is
             # available it serves EVERY CJK query shape the legacy code split between trigram (>=3
             # chars/token) and LIKE full scans (1-2 char tokens) — the whole point of the index (PR #65544).
@@ -1153,7 +1286,7 @@ class SessionSearchMixin:
         # scheduled" vs "Sarah prefers the standup meeting scheduled ... Thursday mornings"). Once
         # the exact query and the substring fallbacks all miss, retry the unicode61 index matching
         # ANY term. The caller's ``sort`` still applies (``route`` carries order_by_sql): rank order
-        # puts rows covering more terms first, newest/oldest keep their timestamp order. Gated on a
+        # puts rows covering more terms first, newest/oldest only break rank ties. Gated on a
         # zero-result miss so hits keep exact-match semantics; explicit OR/NOT, single-term and
         # CJK-routed queries are left alone.
         if not matches and not is_cjk and not self._fts_stale:
@@ -1164,14 +1297,16 @@ class SessionSearchMixin:
                                            **route) or matches
         return self._finalize_search_matches(matches, result_fields=result_fields)
 
-    def _search_cjk(self, query: str, wants_unindexed_rows: bool, route: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _search_cjk(self, query: str, wants_unindexed_rows: bool, route: dict[str, Any]) -> list[dict[str, Any]]:
         """CJK routing: the unicode61 table splits CJK into single characters (false positives,
         missed phrases). cjk-bigram serves every shape except queries wanting rows the
         substring indexes exclude (role='tool', cron/subagent sources) and LONE
         1-char CJK runs (bigrams only exist for runs >=2 — LIKE is broader); then trigram
         (>=3 CJK chars per token); then a LIKE substring scan with one clause per
         non-operator token so "广西 OR 桂林 OR 漓江" matches each term."""
-        raw_query = query.strip('"').strip()
+        # Strip quotes per token, never off the whole query: ``notes "100%完成"`` would keep a
+        # dangling quote and the literal ``%`` phrase would be lost.
+        raw_query = _strip_cjk_wildcards(query).strip()
         match_query = _quote_fts_tokens(raw_query)
         if self._fts_cjk_available and not wants_unindexed_rows and not self._has_lone_cjk_run(raw_query):
             matches = self._match_rows(
@@ -1183,9 +1318,19 @@ class SessionSearchMixin:
             matches = self._match_rows("messages_fts_trigram", match_query, fail_open="Trigram", **route)
             if matches is not None:
                 return matches
-        non_op_tokens = _non_operator_tokens(raw_query) or [raw_query]
-        like_params: list = [p for tok in non_op_tokens for p in _like_params(tok)]
-        like_where = [f"({' OR '.join([_LIKE_ANY_COLUMN_SQL] * len(non_op_tokens))})"]
+        non_op_tokens = [
+            tok.strip('"').strip("*").strip()
+            for tok in _LIKE_TOKEN_RE.findall(raw_query)
+            if tok.upper() not in _LIKE_SKIP_TOKENS
+        ] or [raw_query]
+        predicates: list[str] = []
+        like_params: list = []
+        for term in non_op_tokens:
+            column_sql, term_params = _like_term_predicate(
+                term, coalesced=False, exclude_tool_calls=route.get("exclude_tool_calls", False))
+            predicates.append(column_sql)
+            like_params.extend(term_params)
+        like_where = [f"({' OR '.join(predicates)})"]
         filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
                                          "after_ts", "before_ts")}
         _search_filter_clauses(like_where, like_params, **filters)
@@ -1193,7 +1338,7 @@ class SessionSearchMixin:
         return self._like_rows(like_where, [non_op_tokens[0], *like_params, route["limit"], route["offset"]],
                                order_by="ORDER BY m.timestamp DESC", limit_sql="LIMIT ? OFFSET ?")
 
-    def _search_unindexed_gap(self, fts_query: str, limit: int, **filters) -> List[Dict[str, Any]]:
+    def _search_unindexed_gap(self, fts_query: str, limit: int, **filters) -> list[dict[str, Any]]:
         """LIKE-scan ids in (fts_rebuild_progress, fts_rebuild_high_water] — rows the deferred
         rebuild hasn't indexed yet. The FTS query degrades to AND-joined substring terms
         (quoted phrases kept whole): recall-over-precision mid-rebuild."""
@@ -1204,15 +1349,23 @@ class SessionSearchMixin:
                  if tok and tok.upper() not in _LIKE_SKIP_TOKENS]
         if not terms:
             return []
-        where = ["m.id > ? AND m.id <= ?", *([_LIKE_ANY_COLUMN_SQL] * len(terms))]
-        params: list = [status["indexed"], status["total"], *(p for term in terms for p in _like_params(term))]
+        exclude_tool_calls = filters.pop("exclude_tool_calls", False)
+        predicates: list[str] = []
+        term_params: list[str] = []
+        for term in terms:
+            column_sql, params_for_term = _like_term_predicate(
+                term, coalesced=False, exclude_tool_calls=exclude_tool_calls)
+            predicates.append(column_sql)
+            term_params.extend(params_for_term)
+        where = ["m.id > ? AND m.id <= ?", *predicates]
+        params: list = [status["indexed"], status["total"], *term_params]
         _search_filter_clauses(where, params, **filters)
         return self._like_rows(where, [terms[0], *params, limit], order_by="ORDER BY m.timestamp DESC",
                                limit_sql="LIMIT ?")
 
     def search_sessions_by_id(
-        self, query: str, limit: int = 20, include_archived: bool = True, source: str = None,
-        sources: List[str] = None, exclude_sources: List[str] = None) -> List[Dict[str, Any]]:
+        self, query: str, limit: int = 20, include_archived: bool = True, source: str | None = None,
+        sources: list[str] | None = None, exclude_sources: list[str] | None = None) -> list[dict[str, Any]]:
         """Search surfaced sessions by exact/prefix/substring session id. Also matches
         ``_lineage_root_id`` so an old compression root id resolves to the live continuation."""
         needle = (query or "").strip().lower()
@@ -1224,7 +1377,7 @@ class SessionSearchMixin:
             source=source, sources=sources, exclude_sources=exclude_sources, limit=max(limit * 4, limit),
             offset=0, include_archived=include_archived, order_by_last_active=True, id_query=needle)
 
-        def score(row: Dict[str, Any]) -> int:
+        def score(row: dict[str, Any]) -> int:
             normalized = [v.lower() for v in (str(row.get("id") or ""), str(row.get("_lineage_root_id") or "")) if v]
             if any(value == needle for value in normalized):
                 return 0
@@ -1234,16 +1387,17 @@ class SessionSearchMixin:
 
     # ── FTS maintenance commands ───────────────────────────────────────────
 
-    def _fts_table_exists(self, name: str) -> bool:
+    def _fts_table_exists(self, name: str, *, conn=None) -> bool:
         """True if an FTS5 virtual table is queryable ("no such table" and "vtable
-        constructor failed" — missing tokenizer / mid-teardown — both count as not)."""
+        constructor failed" — missing tokenizer / mid-teardown — both count as not).
+        *conn* defaults to the writer connection (caller holds ``self._lock``)."""
         try:
-            self._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
+            (self._conn if conn is None else conn).execute(f"SELECT 1 FROM {name} LIMIT 0")
             return True
         except sqlite3.DatabaseError:
             return False
 
-    def _present_fts_tables(self) -> List[str]:
+    def _present_fts_tables(self) -> list[str]:
         """Queryable FTS tables (caller holds ``self._lock``)."""
         return [tbl for tbl in self._FTS_TABLES if self._fts_table_exists(tbl)]
 
@@ -1263,7 +1417,7 @@ class SessionSearchMixin:
                 try:
                     self._conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('optimize')")
                     optimized += 1
-                except sqlite3.OperationalError as exc:
+                except sqlite3.DatabaseError as exc:  # SQLITE_CORRUPT is not an OperationalError
                     logger.warning("FTS optimize failed for %s: %s", tbl, exc)
         return optimized
 
@@ -1302,9 +1456,15 @@ class SessionSearchMixin:
                         self._conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')")
                         self._conn.commit()
                         rebuilt += 1
-                    except sqlite3.OperationalError as exc:
+                    except sqlite3.DatabaseError as exc:  # SQLITE_CORRUPT is not an OperationalError (#133375)
                         self._conn.rollback()
-                        logger.warning("FTS rebuild failed for %s: %s", tbl, exc)
+                        if is_malformed_db_error(exc):
+                            logger.error(
+                                "FTS rebuild failed with a corruption-class error for %s: %s; "
+                                "run 'hermes sessions repair' (or 'hermes doctor --fix') to rebuild the index offline",
+                                tbl, exc)
+                        else:
+                            logger.warning("FTS rebuild failed for %s: %s", tbl, exc)
         return rebuilt
 
     def _merge_fts_incrementally(self, *, max_pages: int, max_commands: Optional[int] = None) -> int:
@@ -1323,24 +1483,21 @@ class SessionSearchMixin:
             max_commands = self._FTS_MERGE_COMMANDS_PER_PASS
         _positive_int("max_commands", max_commands)
         executed = 0
-        with self._lock:
-            for tbl in self._present_fts_tables():
+        # On the maintenance connection, NOT under self._lock: each command commits on its own
+        # (synchronous=FULL), and holding the in-process writer lock across a whole pass stalled every
+        # writer for seconds on a busy disk (2026-10-11 11:39: 19 turns, 48 writers queued). SQLite's
+        # own write lock still serializes each command against every other writer.
+        with self._maintenance_conn() as conn:
+            if conn is None:
+                return 0
+            for tbl in [t for t in self._FTS_TABLES if self._fts_table_exists(t, conn=conn)]:
                 if not self._fts_usermerge_floor_applied:
-                    self._conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
+                    conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
                 for _ in range(max_commands):
-                    before = self._conn.total_changes
-                    self._conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
+                    before = conn.total_changes
+                    conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
                     executed += 1
-                    if self._conn.total_changes - before < 2:
+                    if conn.total_changes - before < 2:
                         break
             self._fts_usermerge_floor_applied = True
         return executed
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import json  # noqa: F401,E402
-import os  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

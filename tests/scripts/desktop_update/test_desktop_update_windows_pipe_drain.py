@@ -39,7 +39,7 @@ and finally paths can write the result, remove the marker, and relaunch Desktop.
 So the contract is: bounded when a descendant holds the pipe open, never slower
 than the step can write, and bounded when the step itself remains alive without
 observable progress. All arms live in the script's own
-``-SelfTestPipeDrain`` fixture, which is ``windows_only`` because Linux CI
+``-SelfTestPipeDrain`` fixture, which is ``platforms("windows")`` because Linux CI
 cannot execute the PowerShell hand-off.
 """
 
@@ -56,9 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 WINDOWS_PS1 = REPO_ROOT / "scripts" / "desktop-update" / "windows.ps1"
 
 
-
-
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
     tmp_path: Path,
 ) -> None:
@@ -108,6 +106,10 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         # TEMP; point that at tmp_path so the test leaves nothing behind.
         "TEMP": str(tmp_path),
         "TMP": str(tmp_path),
+        # The runner's autouse home guard exports HERMES_HOME under its own
+        # relocated home.  The script prefers HERMES_HOME over TEMP for its
+        # durable hand-off log, so pin it to this fixture root as well.
+        "HERMES_HOME": str(tmp_path),
         # Keep the test quick. The grace is what the fix bounds; the hold is
         # how long the leaking grandchild lives. hold >> grace is what makes a
         # regression measurable rather than lucky.
@@ -137,6 +139,7 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         timeout=300,
         env=env,
         cwd=str(REPO_ROOT),
+        check=False,
     )
 
     def diagnosis() -> str:

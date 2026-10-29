@@ -48,5 +48,5 @@ class TestEndToEndHint:
         assert count == 0
         from tools.fuzzy_match import format_no_match_hint
         hint = format_no_match_hint(err, count, old, content)
-        assert "Did you mean" in hint
+        assert "Closest region in the file" in hint
         assert "Whitespace difference detected" in hint

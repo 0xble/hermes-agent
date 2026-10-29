@@ -21,7 +21,6 @@ from gateway.config import Platform
 from tests.gateway.restart_test_helpers import make_restart_runner
 from tools import browser_tool_lifecycle as bt_lifecycle
 
-
 @pytest.fixture(autouse=True)
 def _reset_cron_running_set():
     import cron.scheduler as sched
@@ -32,7 +31,6 @@ def _reset_cron_running_set():
     sched._running_job_ids.clear()
     sched._interrupted_job_ids.clear()
 
-
 def _telegram_job(job_id="be62d36a9914", name="daily-digest", chat_id="123456"):
     return {
         "id": job_id,
@@ -40,10 +38,8 @@ def _telegram_job(job_id="be62d36a9914", name="daily-digest", chat_id="123456"):
         "deliver": f"telegram:{chat_id}",
     }
 
-
 def _telegram_target(chat_id="123456"):
     return {"platform": "telegram", "chat_id": chat_id, "thread_id": None}
-
 
 def _bind_notifier(runner):
     from gateway.run import GatewayRunner
@@ -56,11 +52,12 @@ def _bind_notifier(runner):
     )
     return runner
 
-
 class TestNotifyInterruptedCronJobs:
     @pytest.mark.asyncio
-    async def test_owner_is_told_the_run_was_killed(self):
+    @pytest.mark.parametrize("restarting", [False, True])
+    async def test_owner_is_told_the_run_stopped_before_finishing(self, restarting):
         runner, adapter = make_restart_runner()
+        runner._restart_requested = restarting
         _bind_notifier(runner)
         job = _telegram_job()
 
@@ -72,6 +69,11 @@ class TestNotifyInterruptedCronJobs:
         assert sent == 1
         assert len(adapter.sent) == 1
         body = adapter.sent[0]
+        for cause in ("restart", "shutdown", "killed", "shutting down"):
+            assert cause not in body.lower()
+        assert "stopped before finishing" in body
+        assert "If it is still scheduled" in body
+        assert f"hermes cron run {job['id']}" in body
         assert "daily-digest" in body
         assert adapter.sent_calls[0][0] == "123456"
 
@@ -93,7 +95,6 @@ class TestNotifyInterruptedCronJobs:
         expected = 0 if setting is True else 1
         assert sent == expected
         assert len(adapter.sent) == expected
-
 
     @pytest.mark.asyncio
     async def test_local_only_job_stays_silent(self):
@@ -198,7 +199,6 @@ class TestNotifyInterruptedCronJobs:
         assert sent == 1
         assert len(adapter.sent) == 1
 
-
 class TestShutdownDeliversNoticeBeforeDisconnect:
     @pytest.mark.asyncio
     async def test_notice_is_sent_while_the_adapter_is_still_connected(self, monkeypatch):
@@ -221,7 +221,7 @@ class TestShutdownDeliversNoticeBeforeDisconnect:
         real_send = adapter.send
 
         async def _tracking_send(chat_id, content, reply_to=None, metadata=None):
-            if "was cut short" in content:
+            if "stopped before finishing" in content:
                 events.append("cron_notice")
             return await real_send(chat_id, content, reply_to=reply_to, metadata=metadata)
 
@@ -244,5 +244,3 @@ class TestShutdownDeliversNoticeBeforeDisconnect:
         assert events.index("cron_notice") < events.index("disconnect"), (
             f"notice sent after adapter teardown — it would be lost: {events}"
         )
-
-

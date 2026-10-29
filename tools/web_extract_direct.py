@@ -60,7 +60,7 @@ def _local_docs(url: str) -> Optional[dict[str, Any]]:
             resolved = candidate.resolve()
             if resolved.is_relative_to(docs) and resolved.is_file():
                 return {"url": url, "title": f"{resolved.stem} (local Hermes docs checkout)",
-                        "content": resolved.read_text(encoding="utf-8"), "error": None}
+                        "content": resolved.read_text(encoding="utf-8-sig"), "error": None}
     except (OSError, ValueError, RuntimeError, UnicodeError):
         return None
     return None

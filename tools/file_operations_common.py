@@ -7,7 +7,7 @@ the model.
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -25,11 +25,21 @@ class ReadResult:
     mime_type: Optional[str] = None
     dimensions: Optional[str] = None  # For images: "WIDTHxHEIGHT"
     error: Optional[str] = None
-    similar_files: List[str] = field(default_factory=list)
+    #: True only when the path is genuinely absent. An error with this False is a read that
+    #: FAILED (transport down, no byte transport installed); callers deciding whether a path
+    #: is free must not read that as "absent". See patch_parser._apply_add.
+    not_found: bool = False
+    similar_files: list[str] = field(default_factory=list)
+    resolved_path: Optional[str] = None
     _snapshot: Optional[tuple] = None
+    # sha256 of the exact on-disk bytes ``read_file_raw`` decoded (BOM included).
+    _content_sha256: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if not k.startswith("_") and v is not None and v != []}
+        result = {k: v for k, v in self.__dict__.items() if not k.startswith("_") and v is not None and v != []}
+        if self.not_found:
+            result["similar_files"] = self.similar_files
+        return result
 
 
 @dataclass
@@ -41,7 +51,7 @@ class WriteResult:
     # backend couldn't verify (no sha256sum). A mismatch is a hard error, never a flag.
     verified: Optional[bool] = None
     _content_sha256: Optional[str] = None
-    lint: Optional[Dict[str, Any]] = None
+    lint: Optional[dict[str, Any]] = None
     # LSP semantic diagnostics, kept separate from ``lint`` (syntax) so the model
     # reads the two as independent signals. None when LSP is off/inapplicable.
     lsp_diagnostics: Optional[str] = None
@@ -57,24 +67,32 @@ class PatchResult:
     """Result from patching a file."""
     success: bool = False
     diff: str = ""
-    files_modified: List[str] = field(default_factory=list)
-    files_created: List[str] = field(default_factory=list)
-    files_deleted: List[str] = field(default_factory=list)
-    lint: Optional[Dict[str, Any]] = None
+    files_modified: list[str] = field(default_factory=list)
+    files_created: list[str] = field(default_factory=list)
+    files_deleted: list[str] = field(default_factory=list)
+    lint: Optional[dict[str, Any]] = None
     lsp_diagnostics: Optional[str] = None  # see WriteResult.lsp_diagnostics
     error: Optional[str] = None
+    match_count: Optional[int] = None
+    match_lines: List[int] = field(default_factory=list)
+    match_lines_truncated: bool = False
     # Success-shaped no-op: the edit was already present, nothing written; ``note`` says why.
     no_change: bool = False
     note: Optional[str] = None
+    # One ``(path, read_sha256, written_sha256)`` per file write, in order: the sha256 of the
+    # bytes the edit read ("" when it created the file, None when unknown) and of the bytes it
+    # wrote (None when unknown). patch_tool carries a task's full-file baseline across them.
+    _writes: list[tuple[str, Optional[str], Optional[str]]] = field(default_factory=list)
 
     # Emission order is part of the output contract.
     _DICT_FIELDS: ClassVar[tuple] = (
         "diff", "files_modified", "files_created", "files_deleted",
-        "lint", "lsp_diagnostics", "error",
+        "lint", "lsp_diagnostics", "error", "match_count", "match_lines",
+        "match_lines_truncated",
     )
 
     def to_dict(self) -> dict:
-        result: Dict[str, Any] = {"success": self.success}
+        result: dict[str, Any] = {"success": self.success}
         if self.no_change:
             result["no_change"] = True
         if self.note:
@@ -98,14 +116,18 @@ class SearchMatch:
 @dataclass
 class SearchResult:
     """Result from searching."""
-    matches: List[SearchMatch] = field(default_factory=list)
-    files: List[str] = field(default_factory=list)
-    counts: Dict[str, int] = field(default_factory=dict)
+    matches: list[SearchMatch] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+    counts: dict[str, int] = field(default_factory=dict)
     total_count: int = 0
     truncated: bool = False
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
+
+    resolved_path: Optional[str] = None
+    resolved_cwd: Optional[str] = None
+    nearest_existing_parent: Optional[str] = None
 
     # Below this many matches the verbose array is already compact enough that
     # a path-grouping header would cost more tokens than it saves.
@@ -149,7 +171,8 @@ class SearchResult:
         if self.truncated:
             result["truncated"] = True
             result["total_count_is_lower_bound"] = True
-        for key in ("limit_reason", "warning", "error"):
+        for key in ("limit_reason", "warning", "error", "resolved_path",
+                    "resolved_cwd", "nearest_existing_parent"):
             value = getattr(self, key)
             if value:
                 result[key] = value
@@ -192,8 +215,8 @@ _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
 
 
-_CONFLICT_OPEN = re.compile(r"^\s*\d+\|<<<<<<< ", re.M)
-_CONFLICT_CLOSE = re.compile(r"^\s*\d+\|>>>>>>> ", re.M)
+_CONFLICT_OPEN = re.compile(r"^\s*\d+\|<<<<<<< ", re.MULTILINE)
+_CONFLICT_CLOSE = re.compile(r"^\s*\d+\|>>>>>>> ", re.MULTILINE)
 
 
 def count_conflict_blocks(formatted_content: str) -> int:
@@ -209,7 +232,7 @@ def _strip_terminal_fence_leaks(text: str) -> str:
     command output; drops lines that were nothing but wrapper."""
     if not text:
         return text
-    cleaned_lines: List[str] = []
+    cleaned_lines: list[str] = []
     for line in text.splitlines(keepends=True):
         had_terminal_wrapper = "__HERMES_FENCE_" in line or "\x1b]" in line
         cleaned = _FENCE_MARKER_RE.sub("", _OSC_SEQUENCE_RE.sub("", line)).replace("\x07", "")

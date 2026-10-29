@@ -30,7 +30,7 @@ def _isolated_cache(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache" / "web"
     cache_dir.mkdir(parents=True)
     monkeypatch.setattr(wrc, "_cache_dir", lambda: cache_dir)
-    monkeypatch.setattr(wrc, "_web_config", lambda: {})
+    monkeypatch.setattr(wrc, "_web_config", dict)
     yield cache_dir
 
 
@@ -113,6 +113,90 @@ def test_search_memo_hit_returns_copy():
     first["data"]["web"].clear()
     second = memo.lookup("firecrawl", "q", 5)
     assert len(second["data"]["web"]) == 10
+
+
+def test_search_memo_disk_cache_survives_new_instance():
+    first = SearchMemo()
+    first.store("firecrawl", "q", 5, _ok_response())
+    second = SearchMemo()
+    second_hit = second.lookup("firecrawl", "q", 5)
+    assert second_hit is not None and second_hit["success"]
+
+
+def test_search_memo_key_includes_search_type_and_freshness():
+    memo = SearchMemo()
+    memo.store("firecrawl", "q", 5, _ok_response(), search_type="fast", freshness_class="stable")
+    assert memo.lookup("firecrawl", "q", 5, search_type="fast", freshness_class="stable") is not None
+    assert memo.lookup("firecrawl", "q", 5, search_type="instant", freshness_class="stable") is None
+    assert memo.lookup("firecrawl", "q", 5, search_type="fast", freshness_class="volatile") is None
+
+
+def test_search_memo_never_caches_rescued_success():
+    memo = SearchMemo()
+    memo.store("exa", "q", 5, {
+        "success": True,
+        "data": {"web": [], "rescued_from": "exa"},
+    })
+    assert memo.lookup("exa", "q", 5) is None
+
+
+def test_search_cache_index_serializes_concurrent_distinct_writers(_isolated_cache):
+    """Concurrent writers must not overwrite each other's search-index entries."""
+    barrier = threading.Barrier(2)
+
+    def writer(provider):
+        barrier.wait()
+        wrc.search_cache_put(provider, "q", 5, _ok_response())
+
+    threads = [threading.Thread(target=writer, args=(provider,)) for provider in ("p1", "p2")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    index = json.loads((_isolated_cache / "search-index.json").read_text())
+    assert len(index) == 2
+
+
+def test_search_cache_lock_waits_for_existing_holder(_isolated_cache):
+    """A slow winner keeps followers out of the paid path until it publishes."""
+    entered = threading.Event()
+    release = threading.Event()
+    acquired = threading.Event()
+
+    def holder():
+        with wrc.search_cache_lock("same-query"):
+            entered.set()
+            release.wait(2)
+
+    def waiter():
+        entered.wait(2)
+        with wrc.search_cache_lock("same-query"):
+            acquired.set()
+
+    first = threading.Thread(target=holder)
+    second = threading.Thread(target=waiter)
+    first.start()
+    assert entered.wait(2)
+    second.start()
+    assert not acquired.wait(0.1)
+    release.set()
+    first.join(2)
+    second.join(2)
+    assert acquired.is_set()
+
+
+def test_search_budget_warns_without_stopping():
+    budget = wrc.SearchBudget()
+    for _ in range(49):
+        assert budget.record("session-1", "exa") is None
+    first_warning = budget.record("session-1", "exa")
+    assert first_warning and "warn-only" in first_warning
+    assert budget.record("session-1", "exa") is None
+    for _ in range(48):
+        assert budget.record("session-1", "exa") is None
+    second_warning = budget.record("session-1", "exa")
+    assert second_warning and "100" in second_warning
 
 
 def test_single_flight_coalesces_concurrent_identical_queries():

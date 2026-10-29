@@ -58,7 +58,7 @@ def declared_tables() -> set[str]:
         if {"tests", ".venv", "venv", ".worktrees"}.intersection(path.relative_to(REPO).parts[:-1]):
             continue
         try:
-            names.update(pattern.findall(path.read_text(encoding="utf-8", errors="ignore")))
+            names.update(pattern.findall(path.read_text(encoding="utf-8-sig", errors="ignore")))
         except OSError:
             continue
     return names
@@ -109,10 +109,22 @@ def probes(path: Path) -> dict:
 
 def open_with_candidate(copy: Path, scratch_home: Path, python: str) -> dict:
     """Open the copy through the candidate's SessionDB in a fresh process under a scratch home."""
+    scratch_home = scratch_home.resolve()
+    from hermes_constants import get_hermes_home
+    live_home = get_hermes_home().resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    scratch_root = (live_home / "cache" / "scratch").resolve()
+    under_temp = scratch_home.is_relative_to(temp_root)
+    under_scratch = scratch_home.is_relative_to(scratch_root)
+    safe_live_temp = temp_root != live_home and temp_root.is_relative_to(live_home) and under_temp
+    if (scratch_home == live_home or live_home.is_relative_to(scratch_home)
+            or not (under_temp or under_scratch)
+            or (scratch_home.is_relative_to(live_home) and not (under_scratch or safe_live_temp))):
+        raise SystemExit("refusing: HERMES_HOME must be a fresh scratch directory")
     scratch_home.mkdir(parents=True, exist_ok=True)
     target = scratch_home / "state.db"
-    if target.exists() or target.is_symlink():
-        target.unlink()
+    if target.exists() or target.is_symlink() or any(scratch_home.iterdir()):
+        raise SystemExit("refusing: scratch home must be fresh, without an existing state.db")
     os.symlink(copy, target)
     code = (
         "import json, time; t=time.time(); import hermes_state; db=hermes_state.SessionDB(); "
@@ -230,7 +242,8 @@ def main(argv: list[str] | None = None) -> int:
     copy = args.copy.resolve()
     if not copy.is_file():
         raise SystemExit(f"{copy} is not a file")
-    if str(copy).startswith(str(Path.home() / ".hermes")):
+    from hermes_constants import get_hermes_home
+    if any(copy.is_relative_to(home.resolve()) for home in (get_hermes_home(), Path.home() / ".hermes")):
         raise SystemExit("refusing: that path is inside the live profile; pass a copy")
 
     report: dict = {"copy": str(copy), "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}

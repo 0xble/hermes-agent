@@ -331,6 +331,9 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
         sessions_dir,
         GatewayConfig(sessions_dir=sessions_dir, write_sessions_json=False),
     )
+    # SessionDB opens are lazy; route the store's production routing-home lookup to this
+    # fixture DB so _ensure_loaded performs the first failing access before retry reset.
+    store._routing_home = db_path.parent
     store._ensure_loaded()
     store._db_handle_cache._unavailable[db_path].next_retry_at = 0
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional
@@ -470,26 +471,38 @@ class ModelFlagParseResult:
     force_refresh: bool = False
     is_session: bool = False
     is_once: bool = False
+    is_all: bool = False
 
 
 # --- Flag parsing
 
-_BOOL_FLAGS = {"--global": "is_global", "--session": "is_session", "--refresh": "force_refresh", "--once": "is_once"}
+_BOOL_FLAGS = {
+    "--global": "is_global", "--session": "is_session", "--refresh": "force_refresh",
+    "--once": "is_once", "--all": "is_all",
+}
 _VALUE_FLAGS = {"--provider": "explicit_provider", "--reasoning": "reasoning_effort"}
+_UNICODE_DASH_CHARS = "".join(
+    chr(code) for code in range(0x110000)
+    if code != 0x002D and unicodedata.category(chr(code)) == "Pd"
+) + "\u2212"
+_UNICODE_FLAG_RE = re.compile(
+    f"[{re.escape(_UNICODE_DASH_CHARS)}](provider|reasoning|global|session|refresh|once|all)"
+)
 
 
 def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     """Parse /model flags: ``--provider X``, ``--reasoning <level>``, ``--global``, ``--session``,
-    ``--refresh``, ``--once``.
+    ``--refresh``, ``--once``, ``--all``.
 
     ``--once`` is parsed here but interpreted by each caller (each frontend has its own
-    live-session restore hook). ``is_global`` / ``is_session`` are raw flag presences; the
-    effective persistence decision belongs to :func:`resolve_persist_behavior`. ``reasoning_effort``
+    live-session restore hook). ``--all`` is an administrative reset modifier handled by the gateway;
+    other surfaces must reject it rather than treating it as a model id. ``is_global`` / ``is_session`` are raw
+    flag presences; the effective persistence decision belongs to :func:`resolve_persist_behavior`. ``reasoning_effort``
     is the raw level word (validated by :func:`hermes_constants.parse_reasoning_effort` at apply
     time) so a model pick and its effort travel as ONE request on every surface."""
-    # Telegram/iOS auto-convert ``--`` to an em/en dash: normalize a single Unicode dash before
-    # a flag keyword.
-    raw_args = re.sub(r'[\u2012\u2013\u2014\u2015](provider|reasoning|global|session|refresh|once)', r'--\1', raw_args)
+    # Normalize only a Unicode dash that introduces a known flag, so a dash inside
+    # a model id remains opaque.
+    raw_args = _UNICODE_FLAG_RE.sub(r"--\1", raw_args)
 
     # Hand-rolled: model IDs may contain colons/slashes and the historical parser did not
     # require shell quoting.
@@ -507,12 +520,6 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     return ModelFlagParseResult(model_input=" ".join(filtered).strip(), **values, **flags)
 
 
-def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
-    """Legacy 5-tuple ``(model_input, explicit_provider, is_global, force_refresh, is_session)``."""
-    p = parse_model_flags_detailed(raw_args)
-    return (p.model_input, p.explicit_provider, p.is_global, p.force_refresh, p.is_session)
-
-
 def resolve_persist_behavior(
     is_global: bool, is_session: bool, is_once: bool = False, explicit_provider: str = "") -> bool:
     """Decide whether a ``/model`` switch should persist to ``config.yaml``.
@@ -520,17 +527,14 @@ def resolve_persist_behavior(
     Order: ``--once`` / ``--session`` -> False; ``--global`` -> True; no default configured yet
     (neither ``model.default`` nor ``model.provider`` — a fresh install's first pick) -> True, so
     the pick does not evaporate into whatever ``*_API_KEY`` is lying around on the next launch;
-    ``--provider`` without a persist flag -> False (exploratory); else
-    ``model.persist_switch_by_default`` (default False). A flat-string ``model`` IS a configured
+    ``model.persist_switch_by_default`` -> True (the user's explicit opt-in to persistence);
+    ``--provider`` without a persist flag -> False (exploratory). A flat-string ``model`` IS a configured
     default; an unreadable config -> False.
 
     1. ``--once`` explicitly opts out → ``False`` (next turn only). 2. ``--session`` explicitly opts out →
     ``False`` (this session only). 3. 4. Applies to every surface (CLI, gateway, Desktop picker) so no
-    client has to hardcode ``--global``. 5. Provider switches are typically exploratory — the user is trying
-    a different backend for this conversation, not reconfiguring the default. 6. Otherwise defer to
-    ``model.persist_switch_by_default`` in ``config.yaml`` (defaults to ``False``: a plain ``/model <name>``
-    affects only the current session). Users who want the old persist-by-default behavior can set the key to
-    ``true``; a one-off ``--global`` always persists. See #86414.
+    client has to hardcode ``--global``. 5. ``model.persist_switch_by_default: true`` also covers provider picks (a pick between two providers sharing one ``base_url`` is tenant selection on the same backend, not exploration;
+    session-scoping it silently serves the next chat with the other twin's key). 6. Without that opt-in, provider switches stay exploratory — the user is trying a different backend for this conversation, not reconfiguring the default. The key defaults to ``False`` (a plain ``/model <name>`` affects only the current session); users who want the old persist-by-default behavior can set it to ``true``; a one-off ``--global`` always persists, and ``--session`` / ``--once`` always opt out. See #86414.
     """
     if is_once or is_session:
         return False
@@ -544,9 +548,11 @@ def resolve_persist_behavior(
     if isinstance(model_cfg, dict):
         if not (model_cfg.get("default") or model_cfg.get("provider")):
             return True
+        if bool(model_cfg.get("persist_switch_by_default", False)):
+            return True
         if explicit_provider:
             return False
-        return bool(model_cfg.get("persist_switch_by_default", False))
+        return False
     return not model_cfg
 
 
@@ -583,6 +589,7 @@ class ModelSwitchRequest:
     is_global: bool = False
     is_session: bool = False
     is_once: bool = False
+    is_all: bool = False
     force_refresh: bool = False
     scope: str = "default"
     errors: tuple = ()
@@ -621,7 +628,7 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
     return ModelSwitchRequest(
         raw=raw, target=parsed.model_input, scope=scope, errors=tuple(errors),
         **{f: getattr(parsed, f)
-           for f in ("explicit_provider", "reasoning_effort", "is_global", "is_session", "is_once", "force_refresh")})
+           for f in ("explicit_provider", "reasoning_effort", "is_global", "is_session", "is_once", "is_all", "force_refresh")})
 
 
 def _effective_model_candidate(value: Any) -> str:
@@ -725,7 +732,7 @@ class AmbiguousAliasError(Exception):
         super().__init__(f"alias {alias!r} matches {len(candidates)} models on {provider}")
 
 
-def _ambiguous_alias_message(err: "AmbiguousAliasError") -> str:
+def _ambiguous_alias_message(err: AmbiguousAliasError) -> str:
     """User-facing disambiguation list for an ambiguous alias."""
     shown = err.candidates[:10]
     lines = "\n".join(f"  {i}. {m}" for i, m in enumerate(shown, 1))
@@ -842,7 +849,7 @@ def _external_process_match(catalog: list[str], aliases: dict[str, str], typed: 
 
 
 def get_authenticated_provider_slugs(
-    current_provider: str = "", user_providers: dict = None, custom_providers: list | None = None
+    current_provider: str = "", user_providers: dict | None = None, custom_providers: list | None = None
 ) -> list[str]:
     """Slugs of providers that have credentials (models.dev in-memory cache + disk catalog cache;
     stale catalogs warm in the background, never in this call)."""
@@ -988,7 +995,7 @@ def _duplicates_configured_row(
                  if identity == row or (provider_key == row_slug.lower() and identity[1:3] == row[1:3])), None)
 
 
-def _current_provider_match(st: "_Switch", cfg_matches: dict[str, str]) -> Optional[str]:
+def _current_provider_match(st: _Switch, cfg_matches: dict[str, str]) -> Optional[str]:
     """The slug in *cfg_matches* the session already runs on: an exact hit, or — for a session on
     the compat projection slug (``custom:relay``) of ``providers.relay`` — that row's slug, so a
     same-provider switch keeps the caller's slug instead of flipping it (#112788)."""
@@ -1112,7 +1119,7 @@ def _config_declares_model(
     return False
 
 
-def _apply_direct_alias_endpoint(st: "_Switch", da: DirectAlias) -> None:
+def _apply_direct_alias_endpoint(st: _Switch, da: DirectAlias) -> None:
     """Route a direct alias to its own base_url and decide its credential (mutates ``st``).
 
     Credentials were resolved against the DEFAULT provider; carrying that key onto the alias
@@ -1610,6 +1617,15 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
     st.new_model = _resolve_named_custom_model_id(st.new_model, st.target_provider, st.custom_providers)
     st.new_model = normalize_model_for_provider(st.new_model, st.target_provider)
 
+    from hermes_cli.chat_catalog import is_known_non_chat_model
+    if is_known_non_chat_model(st.new_model):
+        return st.fail(
+            f"`{st.new_model}` is a generation model and cannot be used for chat. "
+            "Pick a chat model, or use image generation for image models.",
+            new_model=st.new_model, target_provider=st.target_provider,
+            provider_label=st.provider_label,
+        )
+
     if st.target_provider.strip().lower() == "ollama":
         headers = {} if st.suppress_ollama_headers else (st.validation_headers or _get_ollama_request_headers())
     else:
@@ -1623,7 +1639,10 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
     validate_as = st.target_provider
     if not validate_as.lower().startswith("custom"):
         pdef = resolve_provider_full(validate_as, st.user_providers, st.custom_providers)
-        if pdef is not None and pdef.source == "user-config":
+        # A settings-only ``providers.<slug>`` block (no endpoint of its own) is not a
+        # user-defined endpoint: only a block declaring a base_url takes the custom
+        # validation branch (#120020; mirrors ``_lap_lmstudio_row``'s endpoint test).
+        if pdef is not None and pdef.source == "user-config" and (pdef.base_url or ""):
             validate_as = f"custom:{validate_as}"
     try:
         validation = validate_requested_model(
@@ -1735,7 +1754,7 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
 def switch_model(
     raw_input: str, current_provider: str, current_model: str, current_base_url: str = "",
     current_api_key: str = "", is_global: bool = False, explicit_provider: str = "",
-    user_providers: dict = None, custom_providers: list | None = None) -> ModelSwitchResult:
+    user_providers: dict | None = None, custom_providers: list | None = None) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
     Route (PATH A with ``--provider``, else PATH B) -> credentials -> validation -> result; each
@@ -1778,6 +1797,13 @@ def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg:
         "default": result.new_model, "provider": result.target_provider,
         "base_url": result.base_url or None, "api_mode": result.api_mode or None,
     }
+    # A concrete selection replaces the authored reference, regardless of its
+    # spelling. Keeping one beside the inline route makes the next load invalid.
+    if "model_preset" in model_cfg:
+        updates["model_preset"] = None
+    from hermes_cli.model_presets import preset_ref_name
+    if preset_ref_name(model_cfg.get("model")):
+        updates["model"] = None
     if "context_length" in model_cfg:
         from hermes_cli.route_identity import should_clear_context_pin
         if should_clear_context_pin(
@@ -1819,15 +1845,16 @@ def persist_model_selection(result: ModelSwitchResult, config_path: Any = None) 
     """Write a successful :func:`switch_model` result to ``config_path`` (default:
     ``HERMES_HOME/config.yaml`` — the context override or ``HERMES_HOME`` at call time).
 
-    Targeted key writes, not a whole-``model:`` rewrite: a block rewrite destroys sibling keys the
-    user set there (``model_slots``, ``model_fallback``, ...). ``should_clear_context_pin`` can do
-    cold-start disk I/O — async callers run this on a worker thread."""
+    Merge a raw-derived full state, not a replacement ``model:`` block: sibling settings
+    (``model_slots``, ``model_fallback``, ...) must survive. One atomic replacement keeps readers
+    from observing a preset reference beside a partial concrete route. ``should_clear_context_pin``
+    can do cold-start disk I/O, so async callers run this on a worker thread."""
     from pathlib import Path
-    from hermes_cli.config import get_config_path, read_user_config_raw
-    from utils import atomic_roundtrip_yaml_update
+    from hermes_cli.config import atomic_config_replace, get_config_path, read_user_config_raw
     path = Path(config_path) if config_path else get_config_path()
-    for key, value in model_selection_config_updates(result, read_user_config_raw(path).get("model")).items():
-        atomic_roundtrip_yaml_update(path, f"model.{key}", value)
+    config = read_user_config_raw(path)
+    config["model"] = apply_model_selection(config.get("model"), result)
+    atomic_config_replace(path, config)
     try:  # owner-only: config files contain API keys
         os.chmod(path, 0o600)
     except (OSError, NotImplementedError):
@@ -1861,31 +1888,3 @@ def _scoped_key_env(name: str) -> str:
         return (get_env_prefer_dotenv(name) or "").strip()
     except Exception:
         return ""
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import List  # noqa: F401,E402
-import http.client  # noqa: F401,E402
-import time  # noqa: F401,E402
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'base_url_host_matches': ('utils', 'base_url_host_matches'),
-    'custom_provider_slug': ('hermes_cli.providers', 'custom_provider_slug'),
-    'list_picker_providers': ('hermes_cli.model_switch_providers', 'list_picker_providers'),
-    'prewarm_picker_cache_async': ('hermes_cli.model_switch_providers', 'prewarm_picker_cache_async'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----

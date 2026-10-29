@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_state_common import (
-    AUTO_VACUUM_MIN_FREELIST_RATIO, _id_chunks, _placeholders, _sql_session_last_active, escape_like as _escape_like
+    AUTO_VACUUM_MIN_FREELIST_RATIO, _id_chunks, _non_continuation_child_sql, _placeholders, _sql_session_last_active,
+    escape_like as _escape_like
 )
 from hermes_startup_watchdog import report_startup_progress
 
@@ -24,7 +25,7 @@ def _like(value: str) -> str:
     return f"%{_escape_like(value.lower())}%"
 
 
-def _cwd_prefix_filter(value: str) -> Tuple[List[str], list]:
+def _cwd_prefix_filter(value: str) -> tuple[list[str], list]:
     from hermes_state_sessions import _cwd_prefix_clause
     clause, params = _cwd_prefix_clause(value)
     return [clause], list(params)
@@ -74,11 +75,42 @@ _PRUNE_FILTERS = (
 )
 _PRUNE_FILTER_NAMES = frozenset(name for name, _, _ in _PRUNE_FILTERS) | {"archived", "include_pinned", "lineage_tips_only"}
 
+# Child ``c`` continues compression-ended ``p`` (same predicate as compression's child lookup).
+_CONTINUATION_EDGE_SQL = "p.end_reason = 'compression'\n" + _non_continuation_child_sql("c.", "p.id")
+
+
+def _continued_ancestors_sql(candidates_where: str) -> str:
+    """Compression ancestors of every row *candidates_where* (alias ``s``) does not select."""
+    return ("WITH RECURSIVE kept(id) AS ("
+            " SELECT p.id FROM sessions c JOIN sessions p ON p.id = c.parent_session_id"
+            f" WHERE {_CONTINUATION_EDGE_SQL}"
+            f" AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = c.id AND {candidates_where})"
+            " UNION"
+            " SELECT p.id FROM kept k JOIN sessions c ON c.id = k.id JOIN sessions p ON p.id = c.parent_session_id"
+            f" WHERE {_CONTINUATION_EDGE_SQL}"
+            ") SELECT id FROM kept")
+
+
+# A pin covers the whole conversation, but a store can hold a pinned segment whose later
+# continuations were published unpinned; those still belong to the pinned chat.
+_PINNED_TAIL_SQL = ("WITH RECURSIVE tail(id) AS ("
+                    " SELECT c.id FROM sessions c JOIN sessions p ON p.id = c.parent_session_id"
+                    f" WHERE COALESCE(p.pinned, 0) = 1 AND {_CONTINUATION_EDGE_SQL}"
+                    " UNION"
+                    " SELECT c.id FROM tail t JOIN sessions p ON p.id = t.id JOIN sessions c ON c.parent_session_id = p.id"
+                    f" WHERE {_CONTINUATION_EDGE_SQL}"
+                    ") SELECT id FROM tail")
+
+
+def _not_pinned_sql(alias: str = "s") -> str:
+    """Predicate sparing pinned rows and the unpinned continuations a pinned segment covers."""
+    return f"COALESCE({alias}.pinned, 0) = 0 AND {alias}.id NOT IN ({_PINNED_TAIL_SQL})"
+
 
 class SessionMaintenanceMixin:
     """Retention pruning, stale-session archiving and VACUUM policy for SessionDB."""
 
-    def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
+    def prune_empty_ghost_sessions(self, sessions_dir: Optional[Path] = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
         cutoff = time.time() - 86400
         def _do(conn):
@@ -102,6 +134,20 @@ class SessionMaintenanceMixin:
             self._remove_session_files(sessions_dir, sid)
         return len(removed_ids)
 
+    def _guarded_ids(self, conn, ids: Iterable[str]) -> set:
+        """Ids in *ids* protected by a live turn lease / compression lock. Idle compression-ended
+        parents are closed, not live, so they are not guarded (prune and delete share this)."""
+        return {sid for sid in ids if self._write_guards_reject(conn, sid, allow_closed_compression_parent=True)}
+
+    def _holds_guard_readonly(self, conn, sid: str) -> bool:
+        """True when ``sid`` has a compression lock or turn lease whose holder is not provably dead.
+        Never deletes: expiry alone is not proof the holder is gone (a starved refresher renews it)."""
+        from hermes_state import _compression_lock_holder_process_is_dead
+        rows = [conn.execute("SELECT holder FROM compression_locks WHERE session_id = ?", (sid,)).fetchone(),
+                conn.execute("SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
+                             (self._session_turn_lease_key_on_conn(conn, sid),)).fetchone()]
+        return any(row is not None and not _compression_lock_holder_process_is_dead(row["holder"]) for row in rows)
+
     def _write_guards_reject(self, conn, sid: str, **kwargs) -> bool:
         """True when a live turn lease / compression lock protects ``sid``; expired or
         dead-holder guards are reclaimed and fenced as a side effect."""
@@ -116,11 +162,11 @@ class SessionMaintenanceMixin:
         return False
 
     def sweep_orphaned_sessions(
-        self, *, max_idle_seconds: float, sources: Tuple[str, ...] = ("tui", "desktop", "subagent"),
-        exclude_ids: Tuple[str, ...] = (), exclude_pinned: bool = False,
+        self, *, max_idle_seconds: float, sources: tuple[str, ...] = ("tui", "desktop", "subagent"),
+        exclude_ids: tuple[str, ...] = (), exclude_pinned: bool = False,
         heartbeat_staleness_seconds: Optional[float] = None,
         heartbeat_ownership_grace_seconds: Optional[float] = None, respect_gateway_heartbeats: bool = True,
-    ) -> List[str]:
+    ) -> list[str]:
         """Close session rows orphaned by a dead gateway process (its in-process disconnect grace timer died
         with it, leaving ``ended_at IS NULL`` forever).  Rows of ``sources`` whose ``started_at`` AND
         canonical last activity are both older than ``max_idle_seconds`` get
@@ -149,9 +195,9 @@ class SessionMaintenanceMixin:
         if not (hb_grace is not None and hb_grace >= 0):
             hb_grace = hb_staleness
         cutoff = (now := time.time()) - max_idle_seconds
-        pin_scope = " AND COALESCE(pinned, 0) = 0" if exclude_pinned else ""
+        pin_scope = f" AND {_not_pinned_sql('sessions')}" if exclude_pinned else ""
         orphan_predicate = f"started_at < ? AND {_sql_session_last_active('sessions')} < ?"
-        heartbeat_params: Tuple[float, ...] = ()
+        heartbeat_params: tuple[float, ...] = ()
         if respect_gateway_heartbeats:
             orphan_predicate += (" AND NOT EXISTS (SELECT 1 FROM gateway_heartbeats h WHERE"
                                  " h.last_heartbeat >= ? AND h.started_at <= sessions.started_at + ?)")
@@ -176,7 +222,7 @@ class SessionMaintenanceMixin:
 
     @staticmethod
     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
-                            lineage_tips_only: bool = False, **filters) -> Tuple[str, list]:
+                            lineage_tips_only: bool = False, **filters) -> tuple[str, list]:
         """Shared WHERE clause for bulk prune/archive selection (alias ``s``): ``_PRUNE_FILTERS``
         AND together, only ended sessions are ever candidates, ``archived`` is tri-state
         (None = both), ``*_like`` are case-insensitive substrings, the rest exact.
@@ -186,7 +232,7 @@ class SessionMaintenanceMixin:
         unknown = set(filters) - _PRUNE_FILTER_NAMES
         if unknown:
             raise TypeError("SessionMaintenanceMixin._prune_filter_where() got an unexpected "
-                            f"keyword argument {sorted(unknown)[0]!r}")
+                            f"keyword argument {min(unknown)!r}")
         clauses = ["s.ended_at IS NOT NULL"]
         if lineage_tips_only:
             clauses.append("COALESCE(s.end_reason, '') <> 'compression'")
@@ -201,11 +247,13 @@ class SessionMaintenanceMixin:
             clauses.append(f"s.archived = {int(archived)}")
         # Pinned is a durable "keep" flag: bulk prune/delete/archive exclude pinned rows unless opted in.
         if not include_pinned:
-            clauses.append("COALESCE(s.pinned, 0) = 0")
+            clauses.append(_not_pinned_sql())
         return " AND ".join(clauses), params
 
-    def _prune_where(self, older_than_days, source, filters) -> Tuple[str, list]:
-        """Translate the legacy age window into the shared activity filter, then build WHERE."""
+    def _prune_where(self, older_than_days, source, filters, *, whole_lineages: bool = False) -> tuple[str, list]:
+        """Translate the legacy age window into the shared activity filter, then build WHERE.
+        ``whole_lineages`` (prune) keeps a compression ancestor while any continuation after it
+        is unmatched."""
         if (older_than_days is not None and filters.get("last_active_before") is None
                 and filters.get("started_before") is None):
             if older_than_days < 0:
@@ -213,13 +261,18 @@ class SessionMaintenanceMixin:
                     f"older_than_days must be >= 0, got {older_than_days!r}: a negative "
                     "retention builds a future cutoff that matches every ended session.")
             filters["last_active_before"] = time.time() - (older_than_days * 86400)
-        return self._prune_filter_where(source=source, **filters)
+        where, params = self._prune_filter_where(source=source, **filters)
+        if not whole_lineages:
+            return where, params
+        # A compressed-away segment ages with its conversation, not on its own: while any later
+        # segment stays, deleting it would cut the start off a chat that is still in use.
+        return f"{where} AND s.id NOT IN ({_continued_ancestors_sql(where)})", [*params, *params]
 
-    def list_prune_candidates(self, older_than_days: Optional[float] = None, source: str = None,
-                              **filters) -> List[Dict[str, Any]]:
+    def list_prune_candidates(self, older_than_days: Optional[float] = None, source: str | None = None, *,
+                              whole_lineages: bool = False, **filters) -> list[dict[str, Any]]:
         """Dry-run: sessions a matching prune/archive would touch, oldest first (``older_than_days``
         = inactivity threshold: freshest of ``last_activity_at`` / latest message / ``started_at``)."""
-        where, params = self._prune_where(older_than_days, source, filters)
+        where, params = self._prune_where(older_than_days, source, filters, whole_lineages=whole_lineages)
         return [dict(row) for row in self._read_all(
             f"""SELECT s.id, s.source, s.title, s.model, s.started_at,
                            {_LAST_ACTIVE_SQL} AS last_active,
@@ -227,13 +280,18 @@ class SessionMaintenanceMixin:
                     FROM sessions s WHERE {where}
                     ORDER BY last_active ASC, s.started_at ASC""", params)]
 
-    def count_prune_matches(self, older_than_days: Optional[float] = None, source: str = None,
-                            **filters) -> int:
-        """Count-only :meth:`list_prune_candidates` (CLI reports spared pinned sessions)."""
+    def count_prune_matches(self, older_than_days: Optional[float] = None, source: str | None = None, *,
+                            pinned_only: bool = False, **filters) -> int:
+        """Count-only :meth:`list_prune_candidates`; ``pinned_only`` counts rows carrying the pin
+        itself, not the continuations it protects (CLI reports spared pinned sessions)."""
+        if pinned_only:
+            filters["include_pinned"] = True
         where, params = self._prune_where(older_than_days, source, filters)
+        if pinned_only:
+            where += " AND COALESCE(s.pinned, 0) = 1"
         return int(self._read_one(f"SELECT COUNT(*) FROM sessions s WHERE {where}", params)[0])
 
-    def count_open_prune_matches(self, older_than_days: Optional[float] = None, source: str = None,
+    def count_open_prune_matches(self, older_than_days: Optional[float] = None, source: str | None = None,
                                  **filters) -> int:
         """Count open sessions a matching prune skips (``ended_at`` guard inverted); visibility-only."""
         where, params = self._prune_where(older_than_days, source, filters)
@@ -254,7 +312,7 @@ class SessionMaintenanceMixin:
         if idle_days is None or idle_days < 0:
             return 0
         cutoff = time.time() - float(idle_days) * 86400.0
-        pin_clause = "AND s.pinned = 0" if exclude_pinned else ""
+        pin_clause = f"AND {_not_pinned_sql()}" if exclude_pinned else ""
         rows = self._read_all(
             f"""
             SELECT s.id FROM sessions s
@@ -266,10 +324,11 @@ class SessionMaintenanceMixin:
             ORDER BY s.started_at ASC
             """, (self.CANONICAL_BOT_CHAT_TITLE, cutoff))
         for row in rows:
-            self.set_session_archived(row[0], True)
+            # Sweep provenance: a later compression/resume of this lineage un-hides it (#117713).
+            self._auto_archive_lineage(row[0])
         return len(rows)
 
-    def prune_sessions(self, older_than_days: Optional[float] = 90, source: str = None,
+    def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,
                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
                        **filters) -> int:
         """Delete ended sessions inactive for ``older_than_days`` (an explicit ``started_before`` /
@@ -277,32 +336,83 @@ class SessionMaintenanceMixin:
         Children outside the window are orphaned (parent NULLed), not cascade-deleted.  With
         *sessions_dir*, transcript files are removed outside the DB transaction.
         ``exclude_active_write_guards`` (automatic maintenance) skips rows under a live turn lease
-        or compression lock while expired/dead holders are reclaimed and fenced."""
-        where, where_params = self._prune_where(older_than_days, source, filters)
-        removed_ids: list[str] = []
-        def _do(conn):
-            cursor = conn.execute(f"SELECT s.id FROM sessions s WHERE {where}", where_params)
-            session_ids = {row["id"] for row in cursor.fetchall()}
-            if exclude_active_write_guards:
-                session_ids -= {sid for sid in session_ids
-                                if self._write_guards_reject(conn, sid, allow_closed_compression_parent=True)}
-            if not session_ids:
-                return 0
-            # Batched: a cron-heavy store prunes tens of thousands of ids in one call.
-            for chunk in _id_chunks(session_ids):
-                ph = _placeholders(chunk)
-                conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
-                removed_ids.extend(chunk)
-            self._delete_unreferenced_system_prompts(conn)
-            return len(session_ids)
-        count = self._execute_write(_do)
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
-        return count
+        or compression lock while expired/dead holders are reclaimed and fenced.  A compression
+        ancestor is deleted only together with every continuation after it (``whole_lineages``)."""
+        where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
+        # Select outside the write transaction.  The old implementation selected and deleted every
+        # victim inside one BEGIN IMMEDIATE, so a large FTS cascade could hold every foreground writer
+        # out for minutes.  Each short transaction rechecks the full predicate and the active guards;
+        # a concurrent change therefore turns into a harmless no-op, and the callback remains
+        # idempotent under _execute_write's whole-callback retry contract.
+        # Newest first: a continuation starts after its compression ancestor, so it is deleted in an
+        # earlier (or the same) batch and a later recheck can never strand it without its start.
+        candidate_rows = self._read_all(
+            f"SELECT s.id FROM sessions s WHERE {where} ORDER BY s.started_at DESC", where_params)
+        candidate_ids = [str(row["id"]) for row in candidate_rows]
+        removed_count = 0
 
-    def _page_pragmas(self, names: Tuple[str, ...], fail_msg: str) -> Optional[list]:
+        # Keep each transaction small enough that message/FTS triggers release the WAL write lock
+        # promptly.  The pause is intentional: without yielding between transactions, a maintenance
+        # loop can reacquire the lock often enough to starve a live turn.
+        batch_size = 25
+        batches = list(_id_chunks(candidate_ids, size=batch_size))
+        for batch_index, requested in enumerate(batches):
+            def _do(conn, requested=requested):
+                ph = _placeholders(requested)
+                rows = conn.execute(
+                    f"SELECT s.id FROM sessions s WHERE {where} AND s.id IN ({ph})",
+                    (*where_params, *requested),
+                ).fetchall()
+                session_ids = [str(row["id"]) for row in rows]
+                if exclude_active_write_guards:
+                    # UNION, not UNION ALL: a parent_session_id cycle would otherwise recurse
+                    # forever while this transaction holds the write lock.
+                    lineage_rows = conn.execute(
+                        f"WITH RECURSIVE lineage(root, id) AS ("
+                        f"SELECT id, id FROM sessions WHERE id IN ({ph}) "
+                        f"UNION SELECT lineage.root, child.id FROM sessions child "
+                        f"JOIN lineage ON child.parent_session_id = lineage.id) "
+                        f"SELECT root, id FROM lineage",
+                        requested,
+                    ).fetchall()
+                    # Reclaim stale guards only on rows this transaction may delete (the victims, as
+                    # before batching). Descendants outside the batch are probed read-only: an expired
+                    # lease can still belong to a live holder whose refresher was starved.
+                    victims = set(session_ids)
+                    guarded = self._guarded_ids(conn, victims) | {
+                        str(row["id"]) for row in lineage_rows
+                        if str(row["id"]) not in victims and self._holds_guard_readonly(conn, str(row["id"]))
+                    }
+                    guarded_roots = {
+                        str(row["root"]) for row in lineage_rows if str(row["id"]) in guarded
+                    }
+                    session_ids = [sid for sid in session_ids if sid not in guarded_roots]
+                if not session_ids:
+                    return []
+                ph = _placeholders(session_ids)
+                conn.execute(
+                    f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})",
+                    session_ids)
+                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", session_ids)
+                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", session_ids)
+                return session_ids
+
+            batch_removed = self._execute_write(_do) or []
+            removed_count += len(batch_removed)
+            for sid in batch_removed:
+                self._remove_session_files(sessions_dir, sid)
+            if batch_index + 1 < len(batches):
+                time.sleep(0.01)
+
+        if removed_count:
+            while True:
+                deleted_prompts = self._execute_write(
+                    lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100))
+                if not deleted_prompts or deleted_prompts < 100:
+                    break
+        return removed_count
+
+    def _page_pragmas(self, names: tuple[str, ...], fail_msg: str) -> Optional[list]:
         """Integer PRAGMAs over the existing connection (never a byte probe); None + debug log on failure."""
         try:
             with self._read_ctx() as conn:
@@ -372,7 +482,7 @@ class SessionMaintenanceMixin:
         self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True,
         sessions_dir: Optional[Path] = None, min_vacuum_interval_days: int = 30,
         min_vacuum_freelist_ratio: float = AUTO_VACUUM_MIN_FREELIST_RATIO,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Idempotent startup auto-maintenance (never raises): prune inactive sessions, reap stale open
         state-owned rows, optional VACUUM.  Runs at most once per ``min_interval_hours``; VACUUM has its own
         ``min_vacuum_interval_days`` throttle and also requires ``freelist_count / page_count`` >
@@ -390,9 +500,14 @@ class SessionMaintenanceMixin:
         When *sessions_dir* is provided, on-disk transcript files (``.json`` / ``.jsonl`` /
         ``request_dump_*``) for pruned sessions are removed as part of the same sweep (issue #3015).
         Messaging and UI sources are never touched here. See #54189.
+
+        The active profile's ``maintenance.deletion_window`` is an invariant of
+        automatic pruning, not only a caller convention. Calls outside that
+        window return before acquiring the maintenance lock or spending the
+        24-hour throttle.
         """
         from hermes_state_repair import _release_auto_maintenance_lock, _try_acquire_auto_maintenance_lock
-        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "closed": 0, "vacuumed": False}
+        result: dict[str, Any] = {"skipped": False, "pruned": 0, "closed": 0, "vacuumed": False}
         if retention_days is None or retention_days < 0:
             # A negative retention would build a future cutoff and match every ended
             # session; auto_prune=false is the disable switch, not a negative bound.
@@ -400,6 +515,11 @@ class SessionMaintenanceMixin:
                 "state.db auto-maintenance skipped: sessions.retention_days=%r is outside the allowed "
                 "range (a whole number of days >= 0); set sessions.auto_prune: false to disable pruning",
                 retention_days)
+            result["skipped"] = True
+            return result
+        from hermes_cli.maintenance_window import deletion_window_open
+        if not deletion_window_open():
+            logger.debug("state.db auto-maintenance skipped: outside maintenance.deletion_window")
             result["skipped"] = True
             return result
         maintenance_lock = _try_acquire_auto_maintenance_lock(self.db_path)

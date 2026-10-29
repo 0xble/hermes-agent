@@ -120,7 +120,7 @@ def test_served_secondary_resolves_its_own_setting(monkeypatch, module, var, def
     assert served == standalone, f"{var}: served={served!r} standalone={standalone!r}"
 
 
-def test_signal_startup_gate_reads_the_profile_env(monkeypatch):
+def test_signal_profile_env_is_scoped(monkeypatch):
     """A secondary whose SIGNAL_HTTP_URL/SIGNAL_ACCOUNT live only in its own .env must pass the startup
     gate served exactly as it does standalone; a secondary WITHOUT them must not borrow the default's."""
     from gateway.platforms import signal as sig

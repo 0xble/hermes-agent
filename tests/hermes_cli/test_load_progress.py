@@ -11,12 +11,21 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import hermes_cli.local_runtime.load_progress as lp
 
 
-def setup_function(_fn):
-    with lp._lock:
-        lp._snapshot.clear()
+@pytest.fixture(autouse=True)
+def _isolated_load_progress(monkeypatch):
+    # These tests inject events directly; the real SSE watcher can clear the
+    # snapshot concurrently when no managed endpoint is available. Do not start
+    # a process-lifetime thread, give each test its own event state, and make a
+    # watcher already started by another test in this process unable to clear it.
+    monkeypatch.setattr(lp, "_ensure_watcher", lambda: None)
+    monkeypatch.setattr(lp, "_clear_snapshot", lambda: None)
+    monkeypatch.setattr(lp, "_snapshot", {})
+    yield
 
 
 # ── composite percent ────────────────────────────────────────
@@ -96,7 +105,7 @@ def test_stale_entries_expire():
 
 
 def test_load_notice_for_managed_model(tmp_path, monkeypatch):
-    from agent.chat_completion_helpers import _managed_local_load_notice
+    from agent.chat_completion_local import _managed_local_load_notice
 
     state = tmp_path / "server.json"
     state.write_text(json.dumps({"base_url": "http://127.0.0.1:18434/v1",
@@ -128,7 +137,7 @@ def test_load_notice_for_managed_model(tmp_path, monkeypatch):
 
 
 def test_prefill_notice_for_managed_model(tmp_path, monkeypatch):
-    from agent.chat_completion_helpers import _managed_local_load_notice
+    from agent.chat_completion_local import _managed_local_load_notice
 
     state = tmp_path / "server.json"
     state.write_text(json.dumps({"base_url": "http://127.0.0.1:18434/v1",
@@ -161,7 +170,7 @@ def test_load_notice_outranks_prefill(tmp_path, monkeypatch):
     """While a load entry exists the load notice wins — prefill can't start
     before the model is resident, so a simultaneous claim means the load
     snapshot is authoritative."""
-    from agent.chat_completion_helpers import _managed_local_load_notice
+    from agent.chat_completion_local import _managed_local_load_notice
 
     state = tmp_path / "server.json"
     state.write_text(json.dumps({"base_url": "http://127.0.0.1:18434/v1",

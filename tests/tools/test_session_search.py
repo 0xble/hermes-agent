@@ -10,11 +10,13 @@ All run zero LLM calls.
 """
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_common import LEGACY_FTS_SQL, _FTS_TRIGGERS
+from hermes_state_search import SessionSearchMixin
 from tools.session_search_tool import (
     _format_timestamp,
     _is_compacted_message,
@@ -62,8 +64,182 @@ def _seed_modpack_sessions(db):
 
 
 # =========================================================================
-# Schema invariants
+# Retrieval boundary evals (synthetic versions of the private misses)
 # =========================================================================
+
+
+def _seed_boundary_message(db, content, *, tool_calls=None):
+    db.create_session("boundary", source="cli")
+    db.append_message("boundary", "assistant", content, tool_calls=tool_calls)
+    db._conn.commit()
+
+
+class TestRetrievalBoundaryEvals:
+    def test_long_multiword_miss_retries_with_any_term(self, db):
+        _seed_boundary_message(db, "Sarah prefers the standup meeting on Thursday mornings")
+        rows = db.search_messages("when does Sarah like her standup scheduled")
+        assert any(row["session_id"] == "boundary" for row in rows)
+
+    @pytest.mark.parametrize("query, content, token", [
+        ("#b380c9eee3a19b4c2f01", "release #b380c9eee3a19b4c2f01-prod", '"#b380c9eee3a19b4c2f01"'),
+        ("2026-09-03T02:02:24", "auth recovery at 2026-09-03T02:02:24", '"2026-09-03T02:02:24"'),
+        ("saved-unassigned", "the saved-unassigned router decision", '"saved-unassigned"'),
+    ])
+    def test_boundary_tokens_survive_fts_sanitization(self, db, query, content, token):
+        _seed_boundary_message(db, content)
+        assert token in SessionSearchMixin._sanitize_fts5_query(query)
+        assert db.search_messages(query)
+
+    def test_discovery_does_not_match_session_search_tool_call_json(self, db):
+        _seed_boundary_message(
+            db,
+            "I checked the history and found nothing useful.",
+            tool_calls=[{"function": {"name": "session_search", "arguments":
+                                      '{"query":"saved-unassigned router"}'}}],
+        )
+        result = json.loads(session_search(query="saved-unassigned router", db=db))
+        assert result["success"] is True
+        assert result["count"] == 0
+
+    def test_tool_call_filter_keeps_matching_assistant_prose(self, db):
+        _seed_boundary_message(
+            db,
+            "The saved-unassigned router decision is staged.",
+            tool_calls=[{"function": {"name": "terminal", "arguments": "echo unrelated"}}],
+        )
+        rows = db.search_messages("saved-unassigned router decision", exclude_tool_calls=True)
+        assert any(row["session_id"] == "boundary" for row in rows)
+
+    @pytest.mark.parametrize("query, content", [
+        ("build not passing", "The build is not passing on main."),
+        ("don't", "I don't like Sarah's standup time."),
+        ("Sarah's", "I don't like Sarah's standup time."),
+        ("foo,bar", "The foo bar migration is ready."),
+    ])
+    def test_natural_language_punctuation_and_lowercase_words_are_searchable(self, db, query, content):
+        _seed_boundary_message(db, content)
+        rows = db.search_messages(query)
+        assert any(row["session_id"] == "boundary" for row in rows)
+
+    @pytest.mark.parametrize("query, content", [
+        ("don't", "I don't like Sarah's standup time."),
+        ("Sarah's", "I don't like Sarah's standup time."),
+        ("foo,bar", "The foo bar migration is ready."),
+    ])
+    def test_stale_fts_like_fallback_matches_split_punctuation(self, db, query, content):
+        _seed_boundary_message(db, content)
+        db._fts_stale = True
+        rows = db.search_messages(query)
+        assert any(row["session_id"] == "boundary" for row in rows)
+
+    @pytest.mark.parametrize("query, content", [
+        ("don't", "I like donut glaze."),
+        ("foo,bar", "The fooXbar migration is ready."),
+    ])
+    def test_stale_fts_like_fallback_phrase_gap_is_a_separator(self, db, query, content):
+        _seed_boundary_message(db, content)
+        db._fts_stale = True
+        assert db.search_messages(query) == []
+
+    @pytest.mark.parametrize("query, content", [
+        ("foo,bar", "The foo, bar migration is ready."),
+        ("don't", "I don\u2019t like Sarah's standup time."),
+    ])
+    def test_stale_fts_like_fallback_matches_multi_char_and_curly_separators(self, db, query, content):
+        _seed_boundary_message(db, content)
+        db._fts_stale = True
+        assert any(row["session_id"] == "boundary" for row in db.search_messages(query))
+
+    @staticmethod
+    def _seed_unindexed_gap(db, content):
+        """One canonical row the deferred FTS rebuild has not indexed yet (progress=0)."""
+        triggers = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'messages_fts%'").fetchall()
+        for (name,) in triggers:
+            db._conn.execute(f"DROP TRIGGER {name}")
+        db.create_session("gap", source="cli")
+        db.append_message("gap", "assistant", content)
+        high_water = db._conn.execute("SELECT MAX(id) FROM messages").fetchone()[0]
+        db.set_meta("fts_rebuild_high_water", str(high_water))
+        db.set_meta("fts_rebuild_progress", "0")
+        db._conn.commit()
+        assert db.fts_rebuild_status()["indexed"] == 0
+
+    @pytest.mark.parametrize("query, content, kwargs", [
+        ("don't", "I don't like Sarah's standup time.", {}),
+        ("Sarah's", "I don't like Sarah's standup time.", {"exclude_tool_calls": True}),
+        ("12:30", "The standup moved to 12:30 today.", {}),
+        ("error:timeout", "upstream returned error:timeout twice", {}),
+        ("http://example.com/a", "see http://example.com/a for details", {}),
+    ])
+    def test_unindexed_gap_matches_punctuated_phrases(self, db, query, content, kwargs):
+        self._seed_unindexed_gap(db, content)
+        rows = db.search_messages(query, **kwargs)
+        assert any(row["session_id"] == "gap" for row in rows)
+
+    def test_unindexed_gap_phrase_gap_is_a_separator(self, db):
+        self._seed_unindexed_gap(db, "I like donut glaze.")
+        assert db.search_messages("don't") == []
+
+    @pytest.mark.parametrize("query", ["100%完成", "xyzabc 100%完成", "notes 100%完成"])
+    def test_cjk_percent_token_matches_literally_in_multi_token_query(self, db, query):
+        db._fts_cjk_available = False  # pin the LIKE route (the bigram index is optional)
+        db.create_session("cjk", source="cli")
+        db.append_message("cjk", "user", "the 100%完成 marker is set")
+        db.create_session("wild", source="cli")
+        db.append_message("wild", "user", "the 100X完成 marker is set")
+        db._conn.commit()
+        rows = db.search_messages(query)
+        assert {row["session_id"] for row in rows} == {"cjk"}
+
+    def test_legacy_inline_fts_discovery_ignores_tool_call_json(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        initial = SessionDB(path)
+        if not initial._fts_enabled:
+            initial.close()
+            pytest.skip("SQLite FTS5 unavailable")
+        for trigger in _FTS_TRIGGERS:
+            initial._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        initial._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        initial._conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+        initial._conn.execute("DROP TABLE IF EXISTS messages_fts")
+        initial._conn.executescript(LEGACY_FTS_SQL)
+        initial.close()
+
+        legacy = SessionDB(path)
+        try:
+            assert legacy._db_has_legacy_inline_fts(legacy._conn.cursor()) is True
+            legacy.create_session("leaky", source="cli")
+            legacy.append_message(
+                "leaky", "assistant", "I checked the history and found nothing useful.",
+                tool_calls=[{"function": {"name": "session_search", "arguments":
+                                          '{"query":"saved-unassigned router"}'}}],
+            )
+            legacy.create_session("prose", source="cli")
+            legacy.append_message(
+                "prose", "assistant", "The saved-unassigned router decision is staged.",
+                tool_calls=[{"function": {"name": "terminal", "arguments": "echo unrelated"}}],
+            )
+            legacy._conn.commit()
+            # The legacy inline index really does carry the tool-call JSON.
+            assert {r["session_id"] for r in legacy.search_messages("saved-unassigned router")} == {
+                "leaky", "prose"}
+            rows = legacy.search_messages("saved-unassigned router", exclude_tool_calls=True)
+            assert {r["session_id"] for r in rows} == {"prose"}
+            result = json.loads(session_search(query="saved-unassigned router", db=legacy))
+            assert result["success"] is True
+            assert "leaky" not in json.dumps(result)
+        finally:
+            legacy.close()
+
+    def test_exact_quoted_phrase_stays_exact(self, db):
+        _seed_boundary_message(db, "docker networking tls configuration")
+        db.create_session("near", source="cli")
+        db.append_message("near", "assistant", "docker config for networking")
+        db._conn.commit()
+        rows = db.search_messages('"docker networking"')
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "boundary"
 
 
 class TestFormatTimestamp:
@@ -266,18 +442,64 @@ class TestDiscoveryShape:
 
 
 class TestDiscoverySort:
-    def test_sort_newest_orders_by_recency(self, db):
-        _seed_modpack_sessions(db)
-        result = json.loads(session_search(query="modpack", limit=3, sort="newest", db=db))
-        # First result should be the most recent session
-        first = result["results"][0]
-        assert first["session_id"] == "s_newest" or "Newest" in (first.get("title") or "")
+    def test_sort_newest_orders_equal_relevance_by_recency(self, db):
+        now = int(time.time())
+        for session_id, age in (("s_oldest", 30000), ("s_middle", 15000), ("s_newest", 1000)):
+            db.create_session(session_id, source="cli")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - age, session_id),
+            )
+            db.append_message(
+                session_id,
+                role="assistant",
+                content="same modpack marker",
+                timestamp=now - age,
+            )
+        db._conn.commit()
+
+        result = json.loads(session_search(query="same modpack marker", limit=3, sort="newest", db=db))
+
+        assert [row["session_id"] for row in result["results"]] == [
+            "s_newest", "s_middle", "s_oldest",
+        ]
 
     def test_sort_oldest_orders_by_age(self, db):
-        _seed_modpack_sessions(db)
-        result = json.loads(session_search(query="modpack", limit=3, sort="oldest", db=db))
-        first = result["results"][0]
-        assert first["session_id"] == "s_oldest"
+        now = int(time.time())
+        for session_id, age in (("s_oldest", 30000), ("s_middle", 15000), ("s_newest", 1000)):
+            db.create_session(session_id, source="cli")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - age, session_id),
+            )
+            db.append_message(session_id, role="assistant", content="same modpack marker")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="same modpack marker", limit=3, sort="oldest", db=db))
+
+        assert [row["session_id"] for row in result["results"]] == [
+            "s_oldest", "s_middle", "s_newest",
+        ]
+
+    def test_temporal_sort_does_not_override_relevance(self, db):
+        now = int(time.time())
+        db.create_session("s_relevant", source="cli")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 30000, "s_relevant"))
+        db.append_message(
+            "s_relevant", role="assistant",
+            content="quartz atlas " * 12 + "The migration decision is documented.",
+        )
+        db.create_session("s_recent", source="cli")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 10, "s_recent"))
+        db.append_message(
+            "s_recent", role="assistant",
+            content="A recent status note mentions quartz atlas once.",
+        )
+        db._conn.commit()
+
+        result = json.loads(session_search(query="quartz atlas", limit=2, sort="newest", db=db))
+
+        assert result["results"][0]["session_id"] == "s_relevant"
 
 
 # =========================================================================
@@ -1148,7 +1370,7 @@ class TestNewResetLineageBrowse:
 
 
 def _unix(year, month, day):
-    return int(datetime(year, month, day, tzinfo=timezone.utc).timestamp())
+    return int(datetime(year, month, day, tzinfo=UTC).timestamp())
 
 
 def _set_started(db, **started_at_by_sid):

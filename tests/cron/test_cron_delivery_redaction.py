@@ -121,3 +121,18 @@ def test_delivery_redaction_is_forced_and_fails_closed(mode, monkeypatch):
     assert FAKE_SECRET not in delivered, f"{mode}: secret reached the platform send"
     if mode == "redactor_raises":
         assert "REDACTED" in delivered
+
+
+def test_copy_block_bodies_are_redacted_before_egress():
+    """Copy blocks leave as their own sends, so they cross the same redaction boundary."""
+    from cron.scheduler_delivery import _deliver_result
+
+    send = AsyncMock(return_value={"success": True})
+    with patch("gateway.config.load_gateway_config", return_value=_telegram_cfg()), \
+         patch("tools.send_message_tool._send_to_platform", new=send), \
+         patch("sys.is_finalizing", return_value=False):
+        _deliver_result(_job(), f"{BODY}\n[[copy]]\nexport KEY={FAKE_SECRET}\n[[/copy]]")
+    assert send.call_count >= 2, "copy block was not sent separately"
+    sent = " ".join(_flat(call) for call in send.call_args_list)
+    assert "3 tasks done" in sent and "export KEY=" in sent
+    assert FAKE_SECRET not in sent, "secret reached a copy-block send"

@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.auxiliary_client import call_llm
+from agent.auxiliary_call_policy import completed_response_as_stream_chunk
+from agent.moa_fallback import slot_fallback_kwargs
 from agent.message_content import flatten_message_text
 from agent.moa_alternation import destination_key, is_role_alternation_rejection, merge_same_role_messages
 from agent.transports import get_transport
@@ -300,6 +302,37 @@ def _with_cache_disabled(runtime: dict[str, Any], cache_disabled: Any) -> dict[s
     return runtime if cache_disabled is None else {**runtime, "_cache_disabled": cache_disabled}
 
 
+def _reference_liveness_hook(agent: Any, label: str) -> Any:
+    """Thread-local aux progress hook bridging advisor stream chunks to the agent's
+    activity clock.
+
+    The MoA fan-out runs in worker threads outside the main agent loop, so without this
+    bridge nothing stamps the turn's activity clock while advisors stream — the
+    turn-liveness watchdog then reads the clock frozen at the last main-loop stamp and
+    force-aborts healthy, still-streaming advisor turns at ``agent.turn_liveness.timeout_s``
+    (default 600s) even though the aux stream layer deliberately permits
+    ``max(600, 4 × timeout)``. ``call_llm`` preserves a thread-local hook across its
+    dispatch/protected-daemon paths and ticks it per substantive stream chunk, so each
+    chunk re-arms the watchdog. A failed touch must never break the advisor call.
+    """
+    touch = getattr(agent, "_touch_activity", None)
+
+    def _touch_on_progress() -> None:
+        if callable(touch):
+            touch(f"MoA reference {label}: stream progress")
+
+    return _touch_on_progress
+
+
+def _touch_fanout_progress(agent: Any, description: str) -> None:
+    """Best-effort activity stamp for fan-out milestones; never raises (display of
+    progress must not decide turn liveness on its own, it only supports it)."""
+    touch = getattr(agent, "_touch_activity", None)
+    if callable(touch):
+        with contextlib.suppress(Exception):
+            touch(description)
+
+
 def _maybe_apply_moa_cache_control(
     messages: list[dict[str, Any]], runtime: dict[str, Any], *, cache_disabled: bool | None = None,
     cache_ttl: str | None = None,
@@ -367,12 +400,13 @@ def _price_reference_response(
 def _run_reference(
     slot: dict[str, Any], ref_messages: list[dict[str, Any]], *, temperature: float | None = None,
     max_tokens: int | None = None, reference_timeout: float | None = None, context_length_cache: Any = None,
-    cache_disabled: bool | None = None, cache_ttl: str | None = None,
+    cache_disabled: bool | None = None, cache_ttl: str | None = None, agent: Any = None,
 ) -> tuple[str, str, Any]:
     """Call one reference model; return ``(label, text, accounting)``. Never raises:
     a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool."""
     label = _slot_label(slot)
-    runtime = _slot_runtime(slot)
+    runtime = dict(_slot_runtime(slot))
+    selected = dict(slot)
     trace_fields = {"model": slot.get("model"), "provider": runtime.get("provider") or slot.get("provider"), "temperature": temperature}
     # The advisory view already stripped the agent's system prompt; this is the only one.
     messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
@@ -389,18 +423,26 @@ def _run_reference(
         )
         trimmed = _maybe_apply_moa_cache_control(trimmed, _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl)
 
-        # Copilot gates premium models on request attribution; MoA fan-out serves the
-        # user's current turn, so mirror the main agent's x-initiator header.
-        from agent.auxiliary_client import _normalize_aux_provider
+        def prepare_fallback(candidate, destination):
+            nonlocal trimmed
+            candidate_messages = _trim_messages_for_reference(
+                messages, candidate, destination, reserve_output_tokens=max_tokens, context_length_cache=context_length_cache)
+            trimmed = _maybe_apply_moa_cache_control(
+                candidate_messages, _with_cache_disabled(destination, cache_disabled), cache_ttl=cache_ttl)
+            return trimmed, None
+
+        from agent.auxiliary_client import _normalize_aux_provider, aux_progress_hook
         is_copilot = _normalize_aux_provider(str(runtime.get("provider") or "")) in ("copilot", "copilot-acp")
-        response = call_llm(
-            task="moa_reference", messages=trimmed, temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
-            extra_headers={"x-initiator": "user"} if is_copilot else None, **runtime,
-        )
+        with aux_progress_hook(_reference_liveness_hook(agent, label)):
+            response = call_llm(
+                task="moa_reference", messages=trimmed, temperature=temperature,
+                max_tokens=max_tokens, timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
+                extra_headers={"x-initiator": "user"} if is_copilot else None,
+                **slot_fallback_kwargs(slot, selected, runtime, prepare_fallback), **runtime,
+            )
+        trace_fields.update(model=selected.get("model"), provider=runtime.get("provider"))
         output_text = _extract_text(response) or "(empty response)"
-        acct = _RefAccounting(*_price_reference_response(response, slot, runtime), messages=trimmed, output=output_text, **trace_fields)
+        acct = _RefAccounting(*_price_reference_response(response, selected, runtime), messages=trimmed, output=output_text, **trace_fields)
         return label, output_text, acct
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
@@ -516,6 +558,7 @@ def _trim_messages_for_reference(
 
 
 _REFERENCE_POLL_INTERVAL_S = 5.0
+_REFERENCE_INTERRUPT_SETTLE_S = 0.05
 
 # Sentinel for a reference aborted by user interrupt; the facade must never cache it.
 _INTERRUPTED_REFERENCE_NOTE = "[skipped: interrupted by user]"
@@ -586,31 +629,54 @@ def _run_references_parallel(
     # Shared per-fan-out context-length cache (dict get/set is GIL-atomic).
     ctx_len_cache: dict[tuple[str, str], int | None] = {}
     cache_disabled, cache_ttl = _agent_cache_opts(agent)
+
+    def collect(done: set[Any]) -> None:
+        nonlocal completed
+        for future in done:
+            idx = futures[future]
+            results[idx] = future.result()
+            completed += 1
+            # Each completion is fan-out progress the main loop cannot see: the
+            # fan-out blocks it, so stamp the turn's activity clock here (non-streaming
+            # advisors otherwise tick nothing between dispatch and completion).
+            _touch_fanout_progress(agent, f"MoA: {completed} of {total} references complete")
+            if progress_callback is not None:
+                try:
+                    progress_callback(completed, total, _slot_label(reference_models[idx]))
+                except Exception as exc:  # pragma: no cover - display must never break
+                    logger.debug("MoA progress_callback failed: %s", exc)
+
     try:
         for idx, slot in enumerate(reference_models):
             if slot.get("provider") == "moa":
                 results[idx] = _placeholder_output(slot, "[skipped: MoA presets cannot recursively reference MoA]")
                 continue
-            futures[executor.submit(
-                propagate_context_to_thread(_run_reference), slot, ref_messages, temperature=temperature,
-                max_tokens=max_tokens, reference_timeout=reference_timeout, context_length_cache=ctx_len_cache,
-                cache_disabled=cache_disabled, cache_ttl=cache_ttl,
-            )] = idx
+            futures[
+                executor.submit(
+                    propagate_context_to_thread(_run_reference),
+                    slot,
+                    ref_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reference_timeout=reference_timeout,
+                    context_length_cache=ctx_len_cache,
+                    cache_disabled=cache_disabled,
+                    cache_ttl=cache_ttl,
+                    agent=agent,
+                )
+            ] = idx
 
         # Collect every reference (no early exit except a user interrupt).
         pending = set(futures)
         while pending:
             done, pending = _futures_wait(pending, timeout=_REFERENCE_POLL_INTERVAL_S)
-            for future in done:
-                idx = futures[future]
-                results[idx] = future.result()
-                completed += 1
-                if progress_callback is not None:
-                    try:
-                        progress_callback(completed, total, _slot_label(reference_models[idx]))
-                    except Exception as exc:  # pragma: no cover - display must never break
-                        logger.debug("MoA progress_callback failed: %s", exc)
+            collect(done)
             if pending and agent is not None and getattr(agent, "_interrupt_requested", False):
+                # A worker can raise the interrupt immediately before publishing
+                # its own result. Give concurrently-finishing work one scheduler
+                # turn so completed output is not replaced by an interrupt note.
+                done, pending = _futures_wait(pending, timeout=_REFERENCE_INTERRUPT_SETTLE_S)
+                collect(done)
                 interrupted = True
                 _settle_interrupted(futures, results, reference_models, late_accounting_sink)
                 break
@@ -882,6 +948,9 @@ def aggregate_moa_context(
     agg_label = _slot_label(aggregator)
     agg_runtime = _slot_runtime(aggregator)
     cache_disabled, cache_ttl = _agent_cache_opts(agent)
+    _touch_fanout_progress(
+        agent, f"MoA: synthesizing aggregator guidance ({agg_label})"
+    )
     try:
         # Same cache_control decoration as the advisor calls; this synthesis call is
         # a third independent MoA call path that otherwise re-bills its full input.
@@ -903,36 +972,6 @@ def aggregate_moa_context(
         f"Aggregator: {agg_label}\n"
         f"References: {_slot_labels(reference_models)}\n\n"
         f"{(synthesis or joined).strip()}"
-    )
-
-
-def _completed_response_as_stream_chunk(response: Any) -> Any:
-    """Adapt a completed response into one delta stream chunk (facade boundary only)."""
-    choices = getattr(response, "choices", None)
-    first_choice = choices[0] if isinstance(choices, (list, tuple)) and choices else None
-    message = getattr(first_choice, "message", None)
-    raw_tool_calls = getattr(message, "tool_calls", None)
-    tool_call_deltas = None
-    if isinstance(raw_tool_calls, (list, tuple)) and raw_tool_calls:
-        tool_call_deltas = [
-            SimpleNamespace(
-                index=getattr(tc, "index", index), id=getattr(tc, "id", None), type=getattr(tc, "type", None) or "function",
-                function=SimpleNamespace(
-                    name=getattr(getattr(tc, "function", None), "name", None),
-                    arguments=getattr(getattr(tc, "function", None), "arguments", None),
-                ),
-            )
-            for index, tc in enumerate(raw_tool_calls)
-        ]
-    delta = SimpleNamespace(
-        content=getattr(message, "content", None), tool_calls=tool_call_deltas,
-        **{k: getattr(message, k, None) for k in ("reasoning_content", "reasoning", "reasoning_details")},
-    )
-    choice = SimpleNamespace(
-        index=getattr(first_choice, "index", 0), delta=delta, finish_reason=getattr(first_choice, "finish_reason", None) or "stop",
-    )
-    return SimpleNamespace(
-        id=getattr(response, "id", None), model=getattr(response, "model", None), choices=[choice], usage=getattr(response, "usage", None),
     )
 
 
@@ -1127,7 +1166,8 @@ class MoAChatCompletions:
         aggregator = prepared["aggregator"]
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
-        agg_runtime = _slot_runtime(aggregator)
+        agg_runtime = dict(_slot_runtime(aggregator))
+        selected = self.last_aggregator_slot = dict(aggregator)
         agg_messages, tools = self._plan_aggregator_cache(
             prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
         )
@@ -1153,8 +1193,16 @@ class MoAChatCompletions:
         merged = destination in remembered
         if merged:
             agg_messages = merge_same_role_messages(agg_messages)
+        def prepare_fallback(candidate, destination):
+            if trace is not None:
+                trace["aggregator_slot"] = dict(candidate)
+                trace["aggregator_label"] = _slot_label(candidate)
+            return self._plan_aggregator_cache(
+                prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), destination)
+
         send = functools.partial(
             call_llm, task="moa_aggregator", temperature=prepared["aggregator_temperature"],
+            **slot_fallback_kwargs(aggregator, selected, agg_runtime, prepare_fallback, aggregator=True),
             max_tokens=api_kwargs.get("max_tokens"), tools=tools, extra_body=agg_extra_body,
             reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
             **stream_kwargs, **agg_runtime,
@@ -1189,7 +1237,7 @@ class MoAChatCompletions:
         if stream and hasattr(agg_response, "choices"):
             # Some adapters (openai-codex Responses) return a completed response even
             # when streaming was requested; hand the loop a one-chunk iterator.
-            return iter((_completed_response_as_stream_chunk(agg_response),))
+            return iter((completed_response_as_stream_chunk(agg_response),))
         return agg_response
 
     def _fanout_cache_key(

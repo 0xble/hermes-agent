@@ -12,10 +12,52 @@ import logging
 from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
+from agent.reasoning_promotion import answer_in_reasoning_capability
+from agent.reasoning_summaries import is_responses_reasoning_summary
+from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
+from agent.turn_failure_copy import stamp_failure
 from agent.turn_empty_response import recover_empty_response
 from agent.turn_stop_gates import apply_stop_gates
+from agent.turn_truncation import partial_result, repetition_copy
 
+_REPETITION_STOPPED = repetition_copy(
+    "before delivery",
+    "so the repeated output was discarded.",
+    "; refusing to return a",
+)
 logger = logging.getLogger("agent.conversation_loop")
+
+
+def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
+    """Drop standalone silence-marker lines opening or ending an interactive reply.
+
+    Decide on the visible text (inline think blocks removed), because a reply that is
+    only reasoning plus a marker is intended silence: stripping the marker from the raw
+    text would leave a think-only response and send the turn into empty-response
+    recovery. Autonomous cron/webhook lanes keep their own first/last-line semantics.
+    """
+    if not isinstance(text, str) or str(getattr(agent, "platform", "") or "").lower() in {"cron", "webhook"}:
+        return text
+    from gateway.response_filters import is_intentional_silence_response, strip_edge_silence_markers
+    try:
+        visible = agent._strip_think_blocks(text)
+    except Exception:
+        visible = text
+    visible_result = strip_edge_silence_markers(visible)
+    if is_intentional_silence_response(visible_result):
+        # Bare marker (with or without reasoning) stays as-is for the silence path; a
+        # marker-only run collapses to one marker.
+        return text if is_intentional_silence_response(visible) else visible_result
+    if visible_result == visible:
+        return text
+    # The visible text proved the trailing marker lines are top-level. A fence opened inside
+    # a think block must not hide them in the raw text, so strip the raw text fence-blind.
+    # Keep the raw form (reasoning intact) only when it removed every marker the visible
+    # pass did; a think block opening the raw text hides a leading marker from the raw pass.
+    raw_result = strip_edge_silence_markers(text, respect_fences=False)
+    # ``visible == text`` covers both "no think block" and "stripping raised above".
+    raw_visible = raw_result if visible == text else agent._strip_think_blocks(raw_result)
+    return raw_result if raw_result != text and raw_visible.strip() == visible_result.strip() else visible_result
 
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
@@ -40,7 +82,8 @@ class FinalResponseVerdict:
     length_continue_retries: Any
     _pending_verification_response: Any
     _pending_verification_response_previewed: Any
-    result: Optional[Dict[str, Any]] = None
+    api_call_count: int
+    result: Optional[dict[str, Any]] = None
 
 
 def finish_text_response(
@@ -50,6 +93,7 @@ def finish_text_response(
     _preflight_compression_blocked: Any, codex_ack_continuations: Any,
     truncated_response_parts: Any, length_continue_retries: Any,
     _pending_verification_response: Any, _pending_verification_response_previewed: Any,
+    effective_task_id: Any,
 ) -> FinalResponseVerdict:
     """Finish (or defer) a text-only assistant response in the original guard order. Every
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
@@ -60,7 +104,7 @@ def finish_text_response(
         _join_truncated_parts
     )
 
-    def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> FinalResponseVerdict:
+    def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> FinalResponseVerdict:
         return FinalResponseVerdict(
             action=action, active_system_prompt=active_system_prompt, final_response=final_response,
             _turn_exit_reason=_turn_exit_reason,
@@ -70,20 +114,22 @@ def finish_text_response(
             length_continue_retries=length_continue_retries,
             _pending_verification_response=_pending_verification_response,
             _pending_verification_response_previewed=_pending_verification_response_previewed,
+            api_call_count=api_call_count,
             result=result,
         )
 
-    # Reasoning-only clean stop: some reasoning parsers (vLLM nemotron_v3 past ~500K
-    # prompt tokens) file the whole answer as reasoning when the model omits the closing
-    # delimiter. ``finish_reason == "stop"`` means the provider considers generation
-    # complete, so the empty-response ladder would only re-bill the same input to arrive
-    # at a truncated preview of this text; promote the reasoning to the visible answer
-    # BEFORE the ladder. ``length`` (cut off mid-thought) stays on the continuation path.
+    # Reasoning-only clean stop on a trusted route (elsewhere reasoning is private and takes the
+    # ladder): some parsers (vLLM nemotron_v3 past ~500K prompt tokens) file the whole answer as
+    # reasoning when the closing delimiter is missing; ``stop`` means generation is complete, so
+    # promote it BEFORE the ladder. ``length`` (cut off mid-thought) stays on the continuation path.
     # The promoted text is RETURNED as the answer but never written into the assistant
     # row's ``content``: chain-of-thought stored as ordinary content is indistinguishable
     # from a real reply on every history surface (#111761). The row keeps ``content``
     # empty with the text in its reasoning fields and carries the promoted text as the
     # ``api_content`` sidecar, so the next turn still replays it byte-identically.
+    # Anthropic thinking (signed ``thinking`` block, or a plugin's ``*.native_assistant`` carrier
+    # of native Claude turns) is a summary written by a separate model, never the answer: it
+    # takes the empty-response continuation below instead.
     _content = assistant_message.content
     _promoted = None
     from gateway.session_context import current_message_reaction_acknowledged
@@ -92,11 +138,28 @@ def finish_text_response(
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
         and not truncated_response_parts and current_message_reaction_acknowledged()
     )
-    if (
-        not _reaction_stop
-        and finish_reason == "stop"
+    # Responses/Codex reasoning is a provider-generated summary, not the assistant's visible
+    # answer. The encrypted item and its summary are retained for replay, but must never enter
+    # final_response or api_content. Chat-completions parsers (including vLLM's Nemotron route)
+    # have no codex_reasoning_items carrier and keep the legacy promotion behavior.
+    _responses_reasoning_summary = is_responses_reasoning_summary(agent, assistant_message)
+    _contentless_stop = (
+        finish_reason == "stop"
         and not assistant_message.tool_calls
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
+    )
+    if (
+        _contentless_stop
+        and not _reaction_stop
+        and not _responses_reasoning_summary
+        and not any(
+            isinstance(d, dict) and (
+                (d.get("type") in ("thinking", "redacted_thinking") and (d.get("signature") or d.get("data")))
+                or str(d.get("type") or "").endswith(".native_assistant")
+            )
+            for d in getattr(assistant_message, "reasoning_details", None) or ()
+        )
+        and answer_in_reasoning_capability(agent)
     ):
         _promoted = agent._extract_reasoning(assistant_message) or None
         if _promoted:
@@ -109,6 +172,20 @@ def finish_text_response(
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
     final_response = _promoted or assistant_message.content or ""
+    # A gateway turn that explicitly does not expect a reply treats a contentless Responses
+    # reasoning summary like the ordinary silence token. Keep the assistant row's visible content
+    # empty and never copy the summary into api_content; the gateway suppresses [SILENT].
+    # Only a contentless stop qualifies: visible text on a goal wake or relay turn is a real reply.
+    if (
+        _contentless_stop
+        and _responses_reasoning_summary
+        and getattr(agent, "_turn_reply_expected", None) is False
+    ):
+        final_response = "[SILENT]"
+    # Interactive gateway replies may contain a control marker on a final standalone line after
+    # substantive prose. Strip it before the assistant row is flushed; autonomous cron/webhook
+    # lanes keep their existing first/last-line silence semantics.
+    final_response = _strip_interactive_trailing_marker(agent, final_response)
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
     agent._mute_post_response = False
@@ -126,6 +203,7 @@ def finish_text_response(
         _turn_exit_reason = _ev.turn_exit_reason
         active_system_prompt = _ev.active_system_prompt
         _preflight_compression_blocked = _ev.preflight_compression_blocked
+        api_call_count = _ev.api_call_count
         if _ev.action == "return":
             return _verdict("return", _ev.result)
         if _ev.action == "break":
@@ -238,7 +316,7 @@ def finish_text_response(
     codex_ack_continuations = 0
 
     if truncated_response_parts:
-        final_response = _join_truncated_parts([*truncated_response_parts, final_response])
+        final_response = _join_truncated_parts([*truncated_response_parts, (final_response, False)])
         truncated_response_parts = []
         length_continue_retries = 0
         # The continuation recovered, so the fragments stay in the transcript.
@@ -249,7 +327,32 @@ def finish_text_response(
 
     final_response = agent._strip_think_blocks(final_response).strip()
 
+    # A provider may end a degenerate loop normally with finish_reason="stop" instead of
+    # exhausting its output cap (#100716). Check every completed visible text response before
+    # any verify/kanban interim emission or durable transcript write.
+    # Runaway scale and shape only: a completed answer the user asked to be repetitive is
+    # delivered, unlike a length-truncated fragment that burned the whole budget.
+    if (
+        final_response
+        and len(final_response) >= STOP_PATH_MIN_CHARS
+        and is_runaway_repetition(final_response)
+    ):
+        line, user_response, error = _REPETITION_STOPPED
+        agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
+        agent._cleanup_task_resources(effective_task_id)
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", stamp_failure(
+            partial_result(messages, api_call_count, user_response, error), "truncated", True,
+        ))
+
     final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+    # ``_build_assistant_message`` stores the provider content, while ``final_response`` is
+    # the delivery/persistence-normalized text. Keep the assistant row aligned when the
+    # trailing interactive silence marker was removed (autonomous lanes stay unchanged).
+    if not _promoted:
+        _stored_content = final_msg.get("content")
+        if isinstance(_stored_content, str):
+            final_msg["content"] = _strip_interactive_trailing_marker(agent, _stored_content)
     if _promoted:
         # Replay sidecar only: ``content`` stays empty so the row is never mistaken for a
         # real reply; ``build_api_messages`` substitutes ``api_content`` on the wire.

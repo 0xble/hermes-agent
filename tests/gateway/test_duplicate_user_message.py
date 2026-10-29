@@ -27,6 +27,7 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_transcript import TranscriptReadError
+from hermes_state import AsyncSessionDB
 
 
 def _bootstrap(monkeypatch, tmp_path):
@@ -45,7 +46,10 @@ def _bootstrap(monkeypatch, tmp_path):
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._handle_active_session_busy_message = AsyncMock(return_value=False)
-    runner._session_db = MagicMock()
+    # Ingress reads topic-retirement metadata through the production async facade.
+    session_db = MagicMock()
+    session_db.get_meta.return_value = None
+    runner._session_db = AsyncSessionDB(session_db)
     runner._recover_telegram_topic_thread_id = lambda _source: None
     runner._cache_session_source = lambda _key, _source: None
     runner._is_session_run_current = lambda _key, _gen: True

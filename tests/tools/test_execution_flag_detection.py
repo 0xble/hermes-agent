@@ -25,7 +25,7 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     if shutil.which(argv[0]) is None:
         pytest.skip(f"{argv[0]} is not installed")
 
-    completed = subprocess.run(argv, input=stdin, text=True, capture_output=True)
+    completed = subprocess.run(argv, input=stdin, text=True, capture_output=True, check=False)
 
     assert completed.returncode == expected_returncode
     assert completed.stdout == expected_output
@@ -36,10 +36,10 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     [
         ("rg", ["--pre", "-payload-marker", "needle", "{input}"], None, False),
         ("rg", ["--hostname-bin=-payload-marker", "needle", "{input}"], None, False),
-        pytest.param("sort", ["--buffer-size=1K", "--compress-program", "-payload-marker"], "{bulk}", False, marks=pytest.mark.linux_only),
-        pytest.param("ag", ["--pager=-payload-marker", "needle", "{input}"], None, True, marks=pytest.mark.linux_only),
-        pytest.param("man", ["--pager", "-payload-marker", "ls"], None, True, marks=pytest.mark.linux_only),
-        pytest.param("man", ["-P", "-payload-marker", "ls"], None, True, marks=pytest.mark.linux_only),
+        pytest.param("sort", ["--buffer-size=1K", "--compress-program", "-payload-marker"], "{bulk}", False, marks=pytest.mark.platforms("linux")),
+        pytest.param("ag", ["--pager=-payload-marker", "needle", "{input}"], None, True, marks=pytest.mark.platforms("linux")),
+        pytest.param("man", ["--pager", "-payload-marker", "ls"], None, True, marks=pytest.mark.platforms("linux")),
+        pytest.param("man", ["-P", "-payload-marker", "ls"], None, True, marks=pytest.mark.platforms("linux")),
     ],
 )
 def test_real_binaries_execute_leading_dash_program_payload(

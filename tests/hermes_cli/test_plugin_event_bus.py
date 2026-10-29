@@ -21,6 +21,8 @@ import threading
 
 import pytest
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from hermes_cli.plugins import (
     _EVENT_EMIT_DEPTH_CAP,
     PluginContext,
@@ -40,7 +42,7 @@ def _make_ctx(manager: PluginManager, name: str, key: str = "") -> PluginContext
 
 def _fresh_manager() -> PluginManager:
     manager = PluginManager()
-    manager._discovered = True  # skip auto-discovery
+    mark_plugin_discovery_complete(manager)  # skip auto-discovery
     return manager
 
 
@@ -358,7 +360,7 @@ def test_recursion_cap_terminates(caplog):
 
 def test_manifest_parse_reads_emits_listens(tmp_path):
     """parse_manifest_file picks up optional emits/listens from plugin.yaml."""
-    import yaml
+    import hermes_yaml as yaml
 
     plugin_dir = tmp_path / "myplug"
     plugin_dir.mkdir()
@@ -386,7 +388,7 @@ def test_manifest_parse_reads_emits_listens(tmp_path):
 
 
 def test_plugins_show_includes_emits_listens(tmp_path, monkeypatch, capsys):
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli import plugins_cmd
 
     plugin_dir = tmp_path / "showplug"
@@ -422,7 +424,7 @@ def test_plugins_show_includes_emits_listens(tmp_path, monkeypatch, capsys):
 def test_plugins_show_not_found_exits(monkeypatch):
     from hermes_cli import plugins_cmd
 
-    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: [])
+    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", list)
     with pytest.raises(SystemExit) as exc:
         plugins_cmd.cmd_show("nope")
     assert exc.value.code not in (0, None)

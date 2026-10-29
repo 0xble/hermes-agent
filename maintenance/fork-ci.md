@@ -20,6 +20,25 @@ Hermes application checkout. A selected lane (`check --lane`) is partial evidenc
 profile uses changed-file classification, and the complete profile never substitutes a
 smoke manifest for complete discovery.
 
+Shared update E2E signal injection must never enumerate or signal another file's
+processes when CI lacks usable bubblewrap. The existing fixture HOME boundary
+scopes the command agent's process table and each signal request. Fallback close
+kills captured kernel process incarnations, including detached completion
+children, before the leak check reaps them. Kernel PID namespaces remain in use
+where available. NamespaceHost explicitly passes `HERMES_E2E_NAMESPACE_MODE`
+through the agent invocation environment: `pid` preserves every PID-namespace
+process even when its HOME changes or is absent; `home` alone enables fallback
+HOME filtering. Missing/invalid mode or missing fallback HOME fails closed.
+Controlled process-table regressions cover both modes without host signalling;
+controlled host regressions load the actual NamespaceHost implementation with
+local helper/reaper stubs, without importing Unix-only dependencies. All eight
+controlled cases remain unmarked for Linux, macOS and Windows. Native Linux
+regressions retain foreign-sibling refusal and detached cleanup.
+No test is skipped and no worker count or timeout is relaxed.
+The post-commit restart oracle follows the pause-record recovery warning rather
+than the older fleet-restart wording, while still proving that the warning
+clears only after a gateway serves the new commit.
+
 Portable Python execution passes `--file-retries 0`, including E2E and native OS
 qualification. A fail-once test stays failed at the gate entrypoint. Interactive
 runner defaults remain unchanged. The Windows Desktop cwd self-test retains its
@@ -176,6 +195,31 @@ host fixture defects addressed here. Focused reruns establish repaired fixtures;
 the original full run is not reported as green. Candidate extension files are
 additionally included in both bounded and full fork validation.
 
+## Display watcher hosted-load race
+
+The `fork-ci-reliability` identity also covers `tests/tui_gateway/test_display_watch.py`.
+The process-wide lease watcher runs `_poll_runtime_files` every 0.5 seconds, while these tests
+invoke the same pass directly. Under hosted load, the background pass could claim a launcher
+liveness transition and update `_runtime_marks`, then spend time building the snapshot; the manual
+pass returned before that broadcast, so the test saw no `display.status` event. The test helper now
+serializes lease/runtime polls with one lock, preserving the real watcher and exact one-event
+assertion while making the observation wait for the claimed broadcast. The external-start test also
+holds that lock across its two start writes (`launcher.pid`, then `env`), so a background pass
+cannot broadcast the half-written start as a separate transition. The runtime already treats
+zombie launchers as dead in `tools/bot_desktop/runtime.py::_pid_alive`, so this is test-only
+synchronization, not a production liveness correction. Retire when the watcher exposes an owned
+synchronous poll/flush boundary or upstream makes this test isolation unnecessary.
+
+## Update pause consumer publish race
+
+The `fork-ci-reliability` identity also covers
+`tests/hermes_cli/test_update_pause_boundaries.py::test_consumption_checkpoints_debt_before_unlink_and_producer_death`.
+Its consumer subprocess published `consumed` with a plain `write_text`, while the test waited only
+for the path to exist and then parsed it. Under hosted load the reader could open the file between
+create and payload write and fail with `JSONDecodeError`. The subprocess now writes a sibling and
+`os.replace`s it into place, so existence implies a complete payload. Product code is unchanged.
+Retire with the test if upstream rewrites this cell harness.
+
 ## Nightly Linux notification regression
 
 The `fork-ci-reliability` identity covers the cut-completion notice assertion in
@@ -240,7 +284,121 @@ checkout, and fails on the previous probe order. Upstream main (after
 each worktree. Retire this probe when the fork adopts a released upstream
 runner with that activation.
 
+## Hosted load-progress fixture isolation
+
+The `fork-ci-reliability` identity covers `tests/hermes_cli/test_load_progress.py`.
+The tests inject events directly, but `get_loading_progress()` started the real
+process-lifetime SSE watcher. With no managed endpoint, its first iteration
+cleared the injected snapshot between event application and assertion. Hosted
+run 38038101921, job 114172687324, failed with `assert 'm1' in {}`. A per-test
+snapshot, disabled watcher startup, and a no-op `_clear_snapshot` (so a watcher
+already started by another test in the same process cannot clear it) isolate
+this unit boundary; the endpoint ownership and event-consumer assertions remain
+unchanged. A forcing probe that
+waits for the watcher's first clear failed 200/200 before and passed 200/200
+after. Retire this adaptation when upstream isolates these direct-event tests.
+
+## Hosted OpenRouter browser observation
+
+The `fork-ci-reliability` identity also covers the nonce-path HTTP test in
+`tests/hermes_cli/test_auth_commands.py`. Hosted run 38039556937, job
+114176942229, raised `KeyError: 'genuine_status'`: returning the authorization
+code means the callback server has accepted it, not that the browser worker has
+published its response status. Join the real client thread with a bounded,
+explicit failure before asserting its result, and surface client exceptions in
+the test thread. If the loopback call fails, bounded cleanup attaches unfinished
+worker and redirect-error diagnostics as notes to that same exception, preserving
+its traceback instead of replacing it with an assertion. Both forged-path
+rejection and genuine-path success assertions are retained. Delaying the client
+after it receives the genuine response caused
+188 failures in 200 iterations before and none in 200 afterward. No callback
+port, server behavior, timeout policy, retry, or assertion was relaxed. Retire
+this adaptation when upstream synchronizes the browser test's result owner.
+
+## Metrics worker phase drain
+
+The `fork-ci-reliability` identity also covers the suite's phase-boundary wait for
+the gateway shared-metrics worker. Cron and gateway code hand each metric to one
+background thread (`hermes_cli/observability/shared_metrics_gateway.py::_submit`).
+That thread's first job lazily imports the metrics runtime, which registers named
+loggers. Pytest starts every setup, call and teardown phase with
+`catching_logs.__enter__`, and that method iterates the live
+`logging.Logger.manager.loggerDict`. A job still running from the previous phase
+raised `RuntimeError: dictionary changed size during iteration` at teardown of
+`tests/cron/test_warning_execution_outcome.py` (hosted job 114104725116). The
+next setup then cascaded into "previous item was not torn down properly". The
+loop belongs to pytest, so `tests/conftest.py` drains the worker at the end of
+each phase hook. `drain()` no longer starts a worker when none exists. Upstream
+main has the same worker and loop. Retire this when upstream drains or joins the
+worker in its suite, or when pytest copies `loggerDict` before iterating it.
+
+## Hostile Git file budgets
+
+The hostile Git commit and post-commit suites use bounded test files with at most
+two expensive cells each. Shared setup and helpers live in `_hostile_commit.py`,
+`_hostile_post.py`, and `_hostile_diagnostics.py`; underscored modules are not extra
+runner tasks. Commit cells retain a fresh install per test, since they deliberately
+corrupt their checkout. Post-commit cells retain module-scoped worlds within each
+bounded file; the SIGKILL and interrupted-tail cells have their own worlds. All
+17 original cells, marks, and assertions remain. The 900-second file bounds are
+unchanged.
+
+Phase markers identify installation, namespace startup/CLI/teardown, the active
+cell, and sandbox mode. Passive watchdogs emit bounded owned-log tails at
+180/360/540/720 seconds and Python stacks every 240 seconds, using original stderr
+so timeout kills do not discard pytest-captured diagnostics. They never query a
+potentially stuck namespace RPC.
+
+A file split is not Linux qualification. Before hosted hostile signal cells run
+without bubblewrap, require a verified namespace-containment prerequisite that
+restricts enumeration, signaling, and teardown to fixture-owned processes only
+in fallback mode, while preserving the full namespace process view under
+bubblewrap. Without that prerequisite, keep the draft unqualified and block
+hosted proof rather than dispatching unsafe cells or weakening them.
+
+Compare complete test-function ASTs against the exact base (including decorators,
+parameters, and assertions), verify that each of the 17 cells is collected once,
+and run `scripts/run_tests.sh tests/scripts/test_upgrade_hostile_diagnostics.py`
+through the canonical harness. On macOS the hostile cells retain their existing
+Linux platform skips; this proves collection, not Linux behavior. Require safe,
+exact-head hosted Linux proof before qualifying the regrouping. Retire this
+adaptation when the accepted upstream harness independently schedules the cells
+within the same finite budget without sacrificing fresh-install isolation.
+
 ## Verification and retirement
+
+The host-installation tripwire also protects the captured account's `.local/bin`
+and `Library/LaunchAgents` from Python writes, removals and link publication.
+Reads remain available for command and service discovery. Script/installer tests
+own a temporary machine home through `HOME`, `Path.home()` and the current-UID
+`pwd` lookup, and their ordinary subprocesses inherit that home. Ordinary tests
+may opt into the same fixture when a real repair also publishes machine-level
+CLI paths, including the doctor stale-iterations repair regression. Other tests
+retain stable HOME semantics from upstream commit `ea8adb5e222d`; this is not a
+sandbox for native children that discard the fixture environment.
+
+Desktop smoke listener discovery on macOS intersects its existing ownership
+candidates with the listening port before opening process descriptors, and skips
+the native query when there are no candidates. This keeps unrelated host processes
+outside fixture discovery while retaining the OS-listener and provenance checks.
+
+Two disposable regressions were red on `cc277b4e2ffe`: host-installation paths
+were mutable, and installer subprocess destinations used the operator's home.
+Run `scripts/run_tests.sh tests/hermes_cli/test_real_home_tripwire.py
+tests/scripts/test_installer_home_isolation.py` for the boundary, then the full
+`tests/scripts` subsystem. Check the doctor opt-in with
+`scripts/run_tests.sh tests/hermes_cli/test_doctor.py -k TestDoctorStaleMaxIterationsDrift`.
+The Node gate covers `tests-js/scripts/desktop-smoke.test.ts`, including native
+host-ledger ownership and candidate-scoped discovery. Related upstream [PR #111453](https://github.com/NousResearch/hermes-agent/pull/111453)
+isolates individual host-service leaks, and [PR #76464](https://github.com/NousResearch/hermes-agent/pull/76464)
+skips legacy Node link publication during recovery. Both are merged, but neither
+replaces this shared write boundary. No new upstream contribution is claimed.
+Retire this adaptation when the accepted upstream release protects those
+destinations and installer machine homes through equivalent executable coverage.
+Rollback removes the added host-directory registry, restores the guard's app-only
+write callback, and removes the shared machine-home fixture, its consumers and
+regression. Reverting candidate-scoped native discovery restores the prior smoke
+helper without changing product runtime.
 
 The qualified checkpoint `ca6782850432927f33df4775cb6dd45bb51460d2`
 adds real-process Kanban and tenancy fixtures. Their OS home is separate from

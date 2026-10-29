@@ -17,8 +17,8 @@ the hygiene-compression block already uses) and must actually reach
 ``preprocess_context_references_async`` with a real context length.
 """
 import logging
-import threading
 from contextlib import contextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -30,20 +30,12 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
-def _make_runner() -> GatewayRunner:
-    runner = object.__new__(GatewayRunner)
-    runner.config = GatewayConfig(
+def _make_runner(tmp_path) -> GatewayRunner:
+    # Runtime resolution hydrates persisted session routing, including named roles.
+    return GatewayRunner(GatewayConfig(
+        sessions_dir=tmp_path / "sessions",
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")},
-    )
-    runner.adapters = {}
-    # Attrs touched by _resolve_session_agent_runtime on a bare test runner
-    # (mirrors tests/gateway/test_empty_model_recovery.py).
-    runner._session_model_overrides = {}
-    runner._last_resolved_model = {}
-    runner._service_tier = None
-    runner._agent_cache = {}
-    runner._agent_cache_lock = threading.Lock()
-    return runner
+    ))
 
 
 def _source() -> SessionSource:
@@ -84,14 +76,14 @@ def _patch_runtime_resolution(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_at_reference_reaches_preprocessor_with_real_context_length(
-    monkeypatch, caplog
+    tmp_path, monkeypatch, caplog
 ):
     """A message containing "@" must reach preprocess_context_references_async
     with a real (int > 0) context_length, and the except branch must not
     fire. This fails on unfixed code with AttributeError:
     'GatewayRunner' object has no attribute '_model' (swallowed as a debug
     log, so pre-fix this assertion sees no expansion and no captured call)."""
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
     source = _source()
     _patch_runtime_resolution(monkeypatch)
 
@@ -142,9 +134,9 @@ async def test_at_reference_reaches_preprocessor_with_real_context_length(
 
 
 @pytest.mark.asyncio
-async def test_at_reference_ignores_global_context_for_runtime_route_override(monkeypatch):
+async def test_at_reference_ignores_global_context_for_runtime_route_override(tmp_path, monkeypatch):
     """Context expansion must not inherit a global pin from another route."""
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
     source = _source()
     captured = {}
 
@@ -162,15 +154,15 @@ async def test_at_reference_ignores_global_context_for_runtime_route_override(mo
     )
     monkeypatch.setattr(
         runner,
-        "_resolve_session_agent_runtime",
-        lambda **_kwargs: (
+        "_resolve_session_agent_runtime_async",
+        AsyncMock(return_value=(
             "shared-model",
             {
                 "provider": "custom",
                 "api_key": "test",
                 "base_url": "https://small.example/v1",
             },
-        ),
+        )),
     )
 
     import agent.context_references as ctx_mod
@@ -203,7 +195,7 @@ async def test_codex_proxy_at_reference_uses_transport_context_window(tmp_path, 
         "provider": "custom:codex-proxy", "base_url": "http://127.0.0.1:8317/v1",
         "api_key": "test-key", "api_mode": "codex_responses",
     }
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"model": {"default": model}})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: model)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: route)
@@ -234,7 +226,7 @@ async def test_codex_proxy_at_reference_uses_transport_context_window(tmp_path, 
 async def test_oversized_file_reference_reaches_gateway_as_tool_readable_path(
     tmp_path, monkeypatch
 ):
-    runner = _make_runner()
+    runner = _make_runner(tmp_path)
     source = _source()
     _patch_runtime_resolution(monkeypatch)
 

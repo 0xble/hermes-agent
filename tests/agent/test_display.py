@@ -45,12 +45,43 @@ class TestBuildToolPreview:
         """Empty dict has no keys to preview."""
         assert build_tool_preview("terminal", {}) is None
 
+    def test_terminal_preview_redacts_hermes_state_db_inspection(self):
+        result = build_tool_preview(
+            "terminal",
+            {"command": 'sqlite3 "$HOME/.hermes/state.db" "SELECT id FROM messages"'},
+        )
+
+        assert result == "checking Hermes state"
+        assert "state.db" not in result
+
+    def test_terminal_preview_keeps_unrelated_sqlite_commands(self):
+        command = 'sqlite3 /tmp/other.db "SELECT id FROM messages"'
+
+        assert build_tool_preview("terminal", {"command": command}) == command
+
+    def test_state_db_redaction_is_terminal_only(self):
+        code = 'sqlite3.connect("$HOME/.hermes/state.db")'
+
+        assert build_tool_preview("execute_code", {"code": code}) == code
+
+    def test_terminal_preview_redacts_python_sqlite_and_sessiondb_forms(self):
+        for command in (
+            'python3 -c "import sqlite3; sqlite3.connect(\"file:$HOME/.hermes/state.db?mode=ro\")"',
+            'python -c "from hermes_state import SessionDB; SessionDB(\"$HOME/.hermes/state.db\")"',
+        ):
+            assert build_tool_preview("terminal", {"command": command}) == "checking Hermes state"
 
 
 
 
 
 
+
+
+    def test_memory_patch_preview_shows_the_span_being_edited(self):
+        args = {"action": "patch", "target": "memory", "old_text": "port 8080", "content": "port 9090"}
+        assert build_tool_preview("memory", args) == '~memory: "port 8080"'
+        assert '~memory: "port 8080"' in get_cute_tool_message("memory", args, 0.1)
 
     def test_browser_type_preview_redacts_api_key(self):
         secret = "sk-proj-ABCD1234567890EFGH"

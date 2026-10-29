@@ -1,0 +1,26 @@
+{
+  "description": "Show a named account's browser window for a person. May restart that account's hidden Camofox browser as visible (page-only state such as half-filled forms can be lost; logins persist). Confirm no other work is using the account first, then call before the step whose page state matters, such as submitting a password when an OTP is likely. Use release=true when the user is done with the visible window to return the account to the background.",
+  "name": "browser_handoff",
+  "parameters": {
+    "properties": {
+      "account": {
+        "description": "Allowed account alias to bind to this task; cannot switch after binding.",
+        "enum": [
+          "brianle",
+          "lpg",
+          "meridian"
+        ],
+        "type": "string"
+      },
+      "release": {
+        "default": false,
+        "description": "Close the visible window and return the account to headless-by-default.",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "account"
+    ],
+    "type": "object"
+  }
+}

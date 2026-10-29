@@ -79,7 +79,7 @@ def test_topic_reads_selfheal_pre_v3_tables(tmp_path: Path):
     rows = db.list_telegram_topic_bindings_for_chat(chat_id=CHAT, profile_name="default")
     assert [row["session_id"] for row in rows] == ["legacy-sess"]
     assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id="7", profile_name="default") is None
-    assert db.get_meta("telegram_dm_topic_schema_version") == "3"
+    assert db.get_meta("telegram_dm_topic_schema_version") == "4"
     # Profile isolation still holds after the heal.
     assert not db.is_telegram_topic_mode_enabled(
         chat_id=CHAT, user_id=CHAT, profile_name="coder",

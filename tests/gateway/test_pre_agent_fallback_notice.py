@@ -53,6 +53,13 @@ def _runner_with_real_runtime_resolution():
     runner._peek_session_state.return_value = None
     runner._sessions_map.return_value = {}
     runner._resolve_session_agent_runtime = types.MethodType(GatewayTurnMixin._resolve_session_agent_runtime, runner)
+    # The resolver snapshots, loads detached and commits on the caller; bind those production
+    # helpers too so this drives the real path end to end rather than MagicMock stand-ins.
+    for helper in ("_snapshot_session_runtime_state", "_commit_session_agent_runtime"):
+        setattr(runner, helper, types.MethodType(getattr(GatewayTurnMixin, helper), runner))
+    runner._load_session_agent_runtime = GatewayTurnMixin._load_session_agent_runtime
+    runner._session_model_override.return_value = None
+    runner._session_model_override_epoch.return_value = 0
     # Pass the resolved runtime straight through so the kwargs handed to AIAgent are the resolved ones.
     # (Production pops ``request_overrides`` out of the runtime into the route; mirror that so the
     # resolved kwargs never carry it twice.)
@@ -101,9 +108,30 @@ def test_model_override_fast_path_clears_stale_notice():
     runner = _runner_with_real_runtime_resolution()
     runner._pre_agent_fallback_notice = "⚠️ Provider fallback: stale"
     override = {"model": "claude-sonnet-5", "provider": "anthropic", "api_key": "k", "base_url": "u"}
-    runner._peek_session_state.return_value = SimpleNamespace(conversation=SimpleNamespace(model_override=override))
+    runner._peek_session_state.return_value = SimpleNamespace(
+        conversation=SimpleNamespace(model_override=override, last_resolved_model=""))
+    runner._session_model_override.return_value = override
     with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.6-sol"), \
          patch("gateway.run._credential_pool_for_provider", return_value=None):
         model, runtime = runner._resolve_session_agent_runtime(session_key="test-session-key")
     assert (model, runtime["provider"]) == ("claude-sonnet-5", "anthropic")
     assert runner._pre_agent_fallback_notice is None
+
+
+def test_pre_agent_fallback_notice_isolated_between_sessions():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    for key in ("session-a", "session-b"):
+        runner._session_state(key)
+
+    runner._commit_session_agent_runtime(
+        "session-a", ("model-a", {}, "notice-a", False),
+    )
+    runner._commit_session_agent_runtime(
+        "session-b", ("model-b", {}, "notice-b", False),
+    )
+
+    assert runner._consume_pre_agent_fallback_notice("session-a") == "notice-a"
+    assert runner._consume_pre_agent_fallback_notice("session-b") == "notice-b"
+    assert runner._consume_pre_agent_fallback_notice("session-a") is None

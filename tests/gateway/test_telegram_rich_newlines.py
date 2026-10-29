@@ -106,6 +106,34 @@ class TestRichMessageTableProtection:
 
         assert md == content
 
+    def test_prose_directly_under_table_is_not_a_table_row(self, adapter):
+        """GFM continues a table until a blank line, so a bare newline made the prose a third row."""
+        from markdown_it import MarkdownIt
+
+        md = adapter._rich_message_payload("| a | b |\n|---|---|\n| 1 | 2 |\nAfter text")["markdown"]
+        tokens = MarkdownIt("commonmark").enable("table").parse(md)
+
+        assert md == "| a | b |\n|---|---|\n| 1 | 2 |\n\nAfter text"
+        assert [t.type for t in tokens].count("tr_open") == 2
+        assert any(t.type == "inline" and t.content == "After text" for t in tokens)
+
+    @pytest.mark.parametrize(
+        "content, expected",
+        [
+            ("**Caption**\n| a | b |\n|---|---|\n| 1 | 2 |", "**Caption**\n\n| a | b |\n|---|---|\n| 1 | 2 |"),
+            ("```py\nx = 1\n```\n| a | b |\n|---|---|\n| 1 | 2 |", "```py\nx = 1\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |"),
+        ],
+    )
+    def test_line_directly_above_table_gets_a_blank_line(self, adapter, content, expected):
+        """Telegram's rich parser keeps a table in the caption's open paragraph (upstream PR #102929).
+
+        Local markdown-it opens the table either way; this pins the payload shape, idempotently.
+        """
+        md = adapter._rich_message_payload(content)["markdown"]
+
+        assert md == expected
+        assert adapter._rich_message_payload(md)["markdown"] == md
+
 
 class TestRichMessageStructuralBoundaries:
     """Paragraph materialization must not erase Markdown block boundaries."""

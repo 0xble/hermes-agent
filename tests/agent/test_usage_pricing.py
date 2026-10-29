@@ -48,7 +48,7 @@ _USAGE = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_r
 @pytest.fixture
 def models_dev_registry(monkeypatch):
     """A models.dev cache holding the vendors' rate cards; the providers' own /models carry no prices."""
-    import agent.models_dev as models_dev
+    from agent import models_dev
 
     monkeypatch.setattr(models_dev, "_models_dev_cache", _MODELS_DEV_REGISTRY)
     monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_a, **_k: {})
@@ -179,8 +179,8 @@ def test_unknown_model_falls_back_to_endpoint_metadata(monkeypatch):
 
     assert entry is not None
     assert entry.source == "provider_models_api"
-    assert entry.input_cost_per_million == Decimal("1")
-    assert entry.output_cost_per_million == Decimal("2")
+    assert entry.input_cost_per_million == Decimal(1)
+    assert entry.output_cost_per_million == Decimal(2)
 
 
 
@@ -283,9 +283,31 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     assert result.amount_usd is not None
 
 
+@pytest.mark.parametrize("bare", ["claude-opus-5", "claude-opus-5-5"])
+@pytest.mark.parametrize("scope", ["", "us.", "global."])
+def test_bedrock_claude_opus_5_prices_like_direct_anthropic(bare, scope):
+    """Regression for #100848: Bedrock bills Claude at Anthropic's per-token
+    rates, so a Bedrock Opus 5 / 5.5 session must price from the snapshot at
+    the direct-Anthropic rates instead of falling through to ``unknown``."""
+    direct = get_pricing_entry(bare, provider="anthropic")
+    scoped = get_pricing_entry(f"{scope}anthropic.{bare}", provider="bedrock")
+    assert direct is not None and scoped is not None
+    assert scoped.source == "official_docs_snapshot"
+    for field in ("input", "output", "cache_read", "cache_write"):
+        attr = f"{field}_cost_per_million"
+        assert getattr(scoped, attr) == getattr(direct, attr), attr
 
 
+def test_static_bedrock_catalog_claude_models_price_from_snapshot():
+    """Every Claude id Hermes offers in the offline Bedrock picker must price
+    from the official snapshot; a missing row records $0 / ``unknown``."""
+    from hermes_cli.models_catalog_static import _PROVIDER_MODELS
 
+    claude_ids = [m for m in _PROVIDER_MODELS["bedrock"] if "anthropic.claude" in m]
+    assert claude_ids
+    for model in claude_ids:
+        entry = get_pricing_entry(model, provider="bedrock")
+        assert entry is not None and entry.source == "official_docs_snapshot", model
 
 
 def test_fireworks_router_fast_tier_prices_distinctly():
@@ -399,7 +421,7 @@ class TestFormatCostLabel:
     """Tests for magnitude-scaled cost label formatting."""
 
     def test_zero_renders_as_dollar_zero(self):
-        assert format_cost_label(Decimal("0")) == "$0.00"
+        assert format_cost_label(Decimal(0)) == "$0.00"
 
     def test_sub_cent_renders_4dp(self):
         """Costs below $0.01 render at 4 decimal places (#79220)."""
@@ -455,7 +477,7 @@ class TestSubscriptionIncludedNotes:
             provider="openai-codex",
         )
         assert result.status == "included"
-        assert result.amount_usd == Decimal("0")
+        assert result.amount_usd == Decimal(0)
         assert len(result.notes) > 0
 
 
@@ -902,3 +924,45 @@ def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
     result = estimate_usage_cost("claude-sonnet-4-6", _anthropic_usage("fast"), provider="anthropic")
     assert result.amount_usd is None
     assert result.status == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"cost_details": {"upstream_inference_cost": 0.0042}}, Decimal("0.0042")),  # Nous
+        ({"cost": 0.0042}, Decimal("0.0042")),  # OpenRouter flat
+        ({"cost": 0.0042, "cost_details": {"upstream_inference_cost": 0}}, Decimal("0.0042")),
+        ({"cost": 0.009, "cost_details": {"upstream_inference_cost": 0.003}}, Decimal("0.003")),
+        ({"cost": 0}, Decimal("0")),
+        ({"cost": -1}, None),
+        ({"cost": float("nan")}, None),
+        ({"cost": float("inf")}, None),
+        ({"cost": True}, None),
+        ({"cost": "0.01"}, None),
+        ({}, None),
+    ],
+)
+def test_provider_reported_cost_shapes(raw, expected):
+    from agent.usage_pricing import provider_reported_cost
+
+    usage = normalize_usage({"prompt_tokens": 10, "completion_tokens": 2, **raw})
+    assert provider_reported_cost(usage) == expected
+
+
+def test_provider_reported_cost_wins_over_table_estimate_and_is_actual():
+    usage = normalize_usage(SimpleNamespace(prompt_tokens=1_000_000, completion_tokens=0, cost=0.0123))
+    result = estimate_usage_cost("openai/gpt-5.4-mini", usage, provider="openrouter")
+    assert result.amount_usd == Decimal("0.0123")
+    assert (result.status, result.source) == ("actual", "provider_cost_api")
+    assert result.label == "$0.01"
+    # Without a reported amount the same call stays a local estimate.
+    plain = estimate_usage_cost("openai/gpt-5.4-mini", normalize_usage({"prompt_tokens": 1_000_000}),
+                                provider="openrouter")
+    assert plain.status != "actual"
+
+
+def test_format_cost_label_exact_variant_drops_the_tilde():
+    assert format_cost_label(Decimal("0.0046"), approx=False) == "$0.0046"
+    assert format_cost_label(Decimal("1.234"), approx=False) == "$1.23"
+    assert format_cost_label(Decimal("0.00001"), approx=False) == "$<0.0001"
+    assert format_cost_label(Decimal("1.234")) == "~$1.23"

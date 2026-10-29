@@ -14,6 +14,7 @@ logger = logging.getLogger("tools.web_tools")
 _RING_KEY_VARS = {
     "exa": "EXA_API_KEY", "parallel": "PARALLEL_API_KEY",
     "firecrawl": "FIRECRAWL_API_KEY", "keenable": "KEENABLE_API_KEY",
+    "tavily": "TAVILY_API_KEY",
 }
 
 
@@ -25,7 +26,7 @@ def _keyless_rescue_enabled() -> bool:
     try:
         from agent.web_search_registry import _keyless_tier_enabled
         return _keyless_tier_enabled()
-    except Exception as exc:  # noqa: BLE001 — registry optional
+    except Exception as exc:
         logger.debug("keyless rescue tier check failed: %s", exc)
         return False
 
@@ -47,6 +48,35 @@ def _ring_vendor_keyless(name: str) -> bool:
     return use_keyless(name, get_provider_env(key_var) if key_var else "")
 
 
+def _managed_search_fallback(provider, original_error: str, query: str, limit: int, session_id=None):
+    """Return ``(response, budget_warning)`` for this billed fallback, or ``(None, warning)`` on failure.
+
+    A caller on free fast search alone never reaches this managed fallback.
+    """
+    from agent.web_search_provider import get_provider_env
+    from tools import web_tools as _wt
+    if (getattr(provider, "name", "") != "perplexity"
+            or get_provider_env("PERPLEXITY_API_KEY") or not _wt._managed_web_search() or not _wt._is_tool_gateway_ready()):
+        return None, None
+    logger.warning("web_search managed Perplexity failed (%s); serving this call from managed Firecrawl", (original_error or "")[:200])
+    from tools.web_result_cache import search_budget
+    budget_warning = search_budget.record(session_id, "firecrawl")
+    try:
+        from agent.web_search_registry import get_provider
+        resp = get_provider("firecrawl").search(query, limit)
+    except Exception as exc:
+        resp = {"success": False, "error": str(exc)}
+    if not resp.get("success"):
+        logger.warning("managed Firecrawl fallback failed too: %s", str(resp.get("error", ""))[:200])
+        return None, budget_warning
+    resp.setdefault("data", {}).update(
+        fallback_from="managed_primary",
+        backend_error=f"Primary managed search failed this call ({(original_error or 'unknown error')[:300]}); "
+                      "result served by the managed fallback. The next call will use the primary again.",
+    )
+    return resp, budget_warning
+
+
 def _rescue_eligible(provider) -> bool:
     """True when a failed call on *provider* should get a one-shot rescue.
 
@@ -60,7 +90,7 @@ def _rescue_eligible(provider) -> bool:
         from plugins.web.keyless_mcp import _KEYLESS_RING
         name = getattr(provider, "name", "")
         return name not in _KEYLESS_RING or not _ring_vendor_keyless(name)
-    except Exception as exc:  # noqa: BLE001 — rescue is best-effort
+    except Exception as exc:
         logger.debug("rescue eligibility check failed: %s", exc)
         return False
 

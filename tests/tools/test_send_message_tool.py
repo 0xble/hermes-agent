@@ -773,7 +773,180 @@ class TestSendTelegramHtmlDetection:
 
         assert result["success"] is True
         assert bot.send_message.await_count == 2
-        sleep_mock.assert_awaited_once()
+        # The 502 backs off once; the retry then also waits for the chat's outbound budget slot,
+        # because a retry spends the same per-chat allowance as the first attempt.
+        from plugins.platforms.telegram.chat_budget import PRIVATE_GAP_SECS
+        waits = [c.args[0] for c in sleep_mock.await_args_list]
+        assert waits[0] == 1.0
+        assert len(waits) <= 2 and all(0 < w <= PRIVATE_GAP_SECS for w in waits[1:])
+
+
+class TestStandaloneTelegramRichMessages:
+    """Cron/CLI sends must honor the same rich policy as live gateway replies."""
+
+    @pytest.fixture
+    def bot(self, monkeypatch):
+        bot = MagicMock()
+        bot.do_api_request = AsyncMock(return_value={"message_id": 123})
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=2))
+        # Drive the standalone sender without touching real credentials, quotas, or chats.
+        monkeypatch.setattr("tools.send_message_senders._telegram_bot", lambda _token: bot)
+        return bot
+
+    def test_always_sends_one_rich_message_from_resolved_platform_config(self, bot):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        # This size used to split a daily brief into two MarkdownV2 messages.
+        message = "## Daily brief\n\n- **Findings**\n" + "Useful detail. " * 300
+        assert 4096 < len(message) < 32768
+        result = asyncio.run(_send_to_platform(
+            Platform.TELEGRAM,
+            SimpleNamespace(token="test-token", extra={"rich_messages": "always", "disable_link_previews": True}),
+            "-100123", message, thread_id="234",
+        ))
+
+        assert result["success"] is True
+        assert result["message_id"] == "123"
+        bot.do_api_request.assert_awaited_once_with("sendRichMessage", api_kwargs={
+            "chat_id": -100123, "message_thread_id": 234,
+            "rich_message": TelegramAdapter.__new__(TelegramAdapter)._rich_message_payload(message),
+            "link_preview_options": {"is_disabled": True},
+        })
+        markdown = bot.do_api_request.await_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+        assert "## Daily brief" in markdown and "**Findings**" in markdown
+        assert "\\#" not in markdown
+        bot.send_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("mode", ["never", False, None])
+    def test_never_keeps_markdownv2_path(self, bot, mode):
+        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages=mode))
+        assert result["success"] is True
+        bot.do_api_request.assert_not_awaited()
+        bot.send_message.assert_awaited_once()
+        assert bot.send_message.await_args.kwargs["parse_mode"] == "MarkdownV2"
+
+    @pytest.mark.parametrize("mode", ["auto", True, "true"])
+    @pytest.mark.parametrize("message,rich", [
+        ("## A heading\n\nAn ordinary reply.", False),
+        ("| Item | Value |\n| --- | --- |\n| A | B |", True),
+        ("- [x] Completed task", True),
+        ("<details>\n<summary>More</summary>\nText\n</details>", True),
+        ("$$x^2$$", True),
+    ])
+    def test_auto_mirrors_adapter_construct_selection(self, bot, mode, message, rich):
+        result = asyncio.run(_send_telegram("test-token", "123", message, rich_messages=mode))
+        assert result["success"] is True
+        assert bot.do_api_request.await_count == int(rich)
+        assert bot.send_message.await_count == int(not rich)
+
+    @pytest.mark.parametrize("error", [
+        type("BadRequest", (Exception,), {})("rich parser rejected message"),
+        RuntimeError("Method not found"),
+        type("EndPointNotFound", (Exception,), {})("missing endpoint"),
+    ])
+    def test_permanent_rejection_falls_back(self, bot, error):
+        bot.do_api_request.side_effect = error
+        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages="always"))
+        assert result["success"] is True
+        bot.do_api_request.assert_awaited_once()
+        bot.send_message.assert_awaited_once()
+        assert bot.send_message.await_args.kwargs["parse_mode"] == "MarkdownV2"
+
+    @pytest.mark.parametrize("error", [
+        TimeoutError("timed out"), RuntimeError("502 Bad Gateway"), RuntimeError("unknown failure"),
+    ])
+    def test_transient_or_unknown_error_never_legacy_resends(self, bot, error):
+        bot.do_api_request.side_effect = error
+        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages="always"))
+        assert "error" in result
+        bot.do_api_request.assert_awaited_once()
+        bot.send_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("message", ["x" * 32769, "line\n" * 5000])
+    def test_oversized_raw_or_normalized_payload_uses_legacy_chunks(self, bot, message):
+        from gateway.platforms.base import utf16_len
+        result = asyncio.run(_send_telegram("test-token", "123", message, rich_messages="always"))
+        assert result["success"] is True
+        bot.do_api_request.assert_not_awaited()
+        assert bot.send_message.await_count > 1
+        for call in bot.send_message.await_args_list:
+            assert utf16_len(call.kwargs["text"]) <= 4096
+            assert call.kwargs["parse_mode"] == "MarkdownV2"
+
+    @pytest.mark.parametrize("message", ["中文", "<details>\n$$x^2$$\n</details>"])
+    def test_desktop_safety_guards_match_adapter(self, bot, message):
+        result = asyncio.run(_send_telegram("test-token", "123", message, rich_messages="always"))
+        assert result["success"] is True
+        bot.do_api_request.assert_not_awaited()
+        bot.send_message.assert_awaited_once()
+
+    def test_cjk_opt_in_is_forwarded_from_platform_config(self, bot):
+        result = asyncio.run(_send_to_platform(
+            Platform.TELEGRAM,
+            SimpleNamespace(token="test-token", extra={"rich_messages": "always", "allow_cjk_rich_messages": True}),
+            "123", "中文",
+        ))
+        assert result["success"] is True
+        bot.do_api_request.assert_awaited_once()
+        bot.send_message.assert_not_awaited()
+
+    def test_general_topic_omitted_and_preview_default_unchanged(self, bot):
+        result = asyncio.run(_send_telegram("test-token", "123", "hello", thread_id="1", rich_messages="always"))
+        assert result["success"] is True
+        payload = bot.do_api_request.await_args.kwargs["api_kwargs"]
+        assert "message_thread_id" not in payload
+        assert "link_preview_options" not in payload
+
+    @pytest.mark.parametrize("second_error", [None, type("BadRequest", (Exception,), {})("rejected"), TimeoutError("timed out")])
+    def test_missing_thread_retries_rich_without_thread(self, bot, second_error):
+        seen = []
+        async def send(_endpoint, *, api_kwargs):
+            seen.append(dict(api_kwargs))
+            if len(seen) == 1:
+                raise RuntimeError("Bad Request: message thread not found")
+            if second_error is not None:
+                raise second_error
+            return {"message_id": 456}
+        bot.do_api_request.side_effect = send
+        result = asyncio.run(_send_telegram("test-token", "123", "hello", thread_id="234", rich_messages="always"))
+        assert len(seen) == 2
+        assert seen[0]["message_thread_id"] == 234
+        assert "message_thread_id" not in seen[1]
+        if second_error is None:
+            assert result["success"] is True and result["message_id"] == "456"
+            bot.send_message.assert_not_awaited()
+        elif second_error.__class__.__name__ == "BadRequest":
+            assert result["success"] is True
+            bot.send_message.assert_awaited_once()
+            assert "message_thread_id" not in bot.send_message.await_args.kwargs
+        else:
+            assert "error" in result
+            bot.send_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("copy_block,message", [(True, "**copy exactly**"), (True, "x" * 5000)])
+    def test_copy_block_remains_plain_or_document(self, bot, copy_block, message):
+        result = asyncio.run(_send_telegram("test-token", "123", message, copy_block=copy_block, rich_messages="always"))
+        assert result["success"] is True
+        bot.do_api_request.assert_not_awaited()
+        if len(message) > 4096:
+            bot.send_document.assert_awaited_once()
+            bot.send_message.assert_not_awaited()
+        else:
+            bot.send_message.assert_awaited_once()
+            assert bot.send_message.await_args.kwargs["text"] == message
+            assert bot.send_message.await_args.kwargs["parse_mode"] is None
+
+    def test_media_stays_on_existing_caption_path(self, bot, tmp_path):
+        path = tmp_path / "doc.txt"
+        path.write_text("attachment")
+        result = asyncio.run(_send_telegram(
+            "test-token", "123", "**caption**", media_files=[(str(path), False)], rich_messages="always"))
+        assert result["success"] is True
+        bot.do_api_request.assert_not_awaited()
+        bot.send_document.assert_awaited_once()
+        assert bot.send_document.await_args.kwargs["parse_mode"] == "MarkdownV2"
+        bot.send_message.assert_not_awaited()
 
 
 class TestSendTelegramThreadIdMapping:
@@ -951,7 +1124,7 @@ class TestParseTargetRef:
             ("email", "user@.com"),
         ]
         for platform, target in cases:
-            chat_id, _, is_explicit = _parse_target_ref(platform, target)
+            _chat_id, _, is_explicit = _parse_target_ref(platform, target)
             assert is_explicit is False, f"{platform}:{target}"
 
     def test_prefixes_and_suffixes_are_platform_scoped(self):
@@ -1300,7 +1473,6 @@ class TestSendDiscordForumMedia:
         session.post = MagicMock(return_value=thread_resp)
 
         post_calls = []
-        orig_post = session.post
 
         def track_post(url, **kwargs):
             post_calls.append({"url": url, "kwargs": kwargs})

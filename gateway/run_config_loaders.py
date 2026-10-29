@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from contextlib import suppress
@@ -32,8 +33,8 @@ from hermes_cli.fallback_config import get_fallback_chain
 from utils import is_truthy_value
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
-    from gateway.run import GatewayRunner  # noqa: F401
-    from gateway.run_turn_runner import TurnRunner  # noqa: F401
+    from gateway.run import GatewayRunner
+    from gateway.run_turn_runner import TurnRunner
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -58,7 +59,7 @@ class GatewayConfigLoadersMixin:
         return os.getenv(env_var, "").strip() or cls._cfg_str(section, key)
 
     @staticmethod
-    def _load_prefill_messages() -> List[Dict[str, Any]]:
+    def _load_prefill_messages() -> list[dict[str, Any]]:
         """Load ephemeral prefill messages from config or env var.
 
         HERMES_PREFILL_MESSAGES_FILE env wins, then top-level prefill_messages_file in config.yaml,
@@ -80,7 +81,7 @@ class GatewayConfigLoadersMixin:
             logger.warning("Prefill messages file not found: %s", path)
             return []
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if not isinstance(data, list):
                 logger.warning("Prefill messages file must contain a JSON array: %s", path)
@@ -147,17 +148,26 @@ class GatewayConfigLoadersMixin:
         return self._load_ephemeral_system_prompt()
 
     @staticmethod
-    def _load_reasoning_config(model: str = "") -> dict | None:
-        """Reasoning effort from config.yaml via :func:`hermes_constants.resolve_reasoning_config`.
+    def _load_reasoning_config(
+        model: str = "", *, profile_home: Path | None = None, config: Optional[dict] = None,
+    ) -> dict | None:
+        """Reasoning effort from the owning profile's config.yaml via
+        :func:`hermes_constants.resolve_reasoning_config`.
 
-        Per-model override > global ``agent.reasoning_effort``; YAML False = disabled. Empty
-        ``model`` uses ``model.default``.
+        Precedence lives in that resolver: the default route's declared preset
+        effort, then the per-model override, then global ``agent.reasoning_effort``.
+        YAML False = disabled. Empty ``model`` uses the default route.
+        ``profile_home`` is supplied by multiplexed callers so readback never
+        falls through to the launch profile's config.
 
         Closes #21256.
         """
         from gateway.run import _load_gateway_config
         from hermes_constants import resolve_reasoning_config
-        return resolve_reasoning_config(_load_gateway_config(), model)
+        if config is None:
+            config = (_load_gateway_config() if profile_home is None
+                      else _load_gateway_config(profile_home / "config.yaml"))
+        return resolve_reasoning_config(config, model)
 
     @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
@@ -170,12 +180,12 @@ class GatewayConfigLoadersMixin:
             tokens = shlex.split(text)
         except ValueError:
             tokens = text.split()
-        value = " ".join(token for token in tokens if token != "--global")
+        value = " ".join(token for token in tokens if token not in {"--global", "--session"})
         return value.strip().lower(), "--global" in tokens
 
     def _resolve_session_reasoning_config(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        model: str = "",
+        model: str = "", profile_home=None, user_config=None, assignment=None,
     ) -> dict | None:
         """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
 
@@ -183,63 +193,189 @@ class GatewayConfigLoadersMixin:
         empty uses ``model.default``.
         """
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
-        override = self._session_reasoning_override(resolved_session_key)
+        override = (assignment.get("reasoning_override") if assignment is not None
+                    else self._session_reasoning_override(resolved_session_key))
         if override is not None:
             return override
-        return self._load_reasoning_config(model)
+        resolve_profile_home = getattr(self, "_resolve_profile_home_for_source", None)
+        if (profile_home is None
+                and getattr(getattr(self, "config", None), "multiplex_profiles", False)
+                and source is not None and callable(resolve_profile_home)):
+            profile_home = resolve_profile_home(source)
+        loader = getattr(self, "_load_reasoning_config")
+        native_loader = getattr(type(self), "_load_reasoning_config", None)
+        native_loader = getattr(native_loader, "__func__", native_loader)
+        loader_func = getattr(loader, "__func__", loader)
+        if loader_func is native_loader:
+            from gateway.run import _load_gateway_config
+            if user_config is None:
+                user_config = (
+                    _load_gateway_config()
+                    if profile_home is None
+                    else _load_gateway_config(profile_home / "config.yaml")
+                )
+            baseline = loader(model, profile_home=profile_home, config=user_config) or {}
+        else:
+            # Tests and integrations replace this loader with small lambdas. Preserve their
+            # calling convention and, more importantly, the old single-call disabled path.
+            baseline = (
+                loader(model)
+                if profile_home is None
+                else loader(model, profile_home=profile_home)
+            ) or {}
+        # Attended routing is resolved in one place. Do not independently inspect
+        # activity here: the runtime and reasoning paths must make the same choice.
+        resolver = getattr(self, "_attended_resolution_for_session", None)
+        if callable(resolver) and resolved_session_key and user_config is not None:
+            try:
+                from gateway.attended_model import parse_attended_config
+                attended_cfg = parse_attended_config(user_config)
+                attended_baseline = {}
+                if attended_cfg.enabled and attended_cfg.model:
+                    attended_baseline = (
+                        loader(attended_cfg.model, profile_home=profile_home, config=user_config)
+                    ) or {}
+                decision = resolver(
+                    source=source, session_key=resolved_session_key,
+                    user_config=user_config,
+                    override=self._session_model_override(resolved_session_key),
+                    default_reasoning=baseline or {},
+                    attended_reasoning=attended_baseline, assignment=assignment,
+                )
+                effort = getattr(decision, "reasoning_effort", "") if decision is not None else ""
+                if effort:
+                    from hermes_constants import parse_reasoning_effort
+                    return parse_reasoning_effort(effort)
+            except Exception:
+                logger.debug("attended reasoning resolution failed", exc_info=True)
+        return baseline
 
     def _session_reasoning_override(self, session_key: Optional[str]) -> dict | None:
         """The session's explicit ``/reasoning`` pick, or ``None`` when it runs on config."""
         if not session_key:
             return None
+        self._apply_pending_bulk_reset_if_idle(session_key)
         _r_state = self._peek_session_state(session_key)
-        return None if _r_state is None else _r_state.conversation.reasoning_override
+        if _r_state is not None and _r_state.conversation.reasoning_override is not None:
+            return _r_state.conversation.reasoning_override
+        # After a gateway restart the in-memory pick is gone; rehydrate it from the routing entry
+        # (written through by _set_session_reasoning_override), the same way /model overrides are.
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return None
+        from gateway.session import sanitize_reasoning_override
+        try:
+            persisted = sanitize_reasoning_override(store.get_reasoning_override(session_key))
+        except Exception:
+            logger.debug("Failed to read persisted session reasoning override", exc_info=True)
+            return None
+        if not persisted:
+            return None
+        conversation = self._session_state(session_key).conversation
+        conversation.reasoning_override = dict(persisted)
+        with suppress(Exception):
+            conversation.reasoning_override_scope = store.get_reasoning_override_scope(session_key)
+        logger.info("Rehydrated persisted /reasoning override for session=%s: %s", session_key, persisted)
+        return conversation.reasoning_override
 
-    def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:
-        """Set or clear the session-scoped reasoning override."""
+    def _set_session_reasoning_override(
+        self, session_key: str, reasoning_config: Optional[dict], *, scope: Optional[str] = None,
+    ) -> None:
+        """Set or clear the session-scoped reasoning override, writing it through to the session
+        store so the pick survives a gateway restart."""
         if not session_key:
             return
         # Per-session field write: a lazy ``_session_reasoning_overrides = {}`` init replaced the
         # WHOLE dict, racing concurrent sessions; a SessionState field reset cannot cross sessions.
-        self._session_state(session_key).conversation.reasoning_override = (
+        conversation = self._session_state(session_key).conversation
+        conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+        conversation.reasoning_override_scope = scope if scope in ("session", "temporary") else "session"
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            try:
+                if reasoning_config is not None and conversation.reasoning_override_scope != "session":
+                    store.set_reasoning_override(session_key, reasoning_config, scope=conversation.reasoning_override_scope)
+                else:
+                    store.set_reasoning_override(session_key, reasoning_config)
+            except Exception:
+                logger.debug("Failed to persist session reasoning override", exc_info=True)
 
-    def _resolve_session_service_tier(self, source=None, session_key: Optional[str] = None) -> Optional[str]:
-        """Effective service tier: a session-scoped /fast override beats the config default.
-
-        The override stores "priority" or None (explicit normal), so presence — not truthiness — decides.
-        """
+    def _resolve_session_service_tier(
+        self, source=None, session_key: Optional[str] = None, *, report_transition: bool = False,
+    ) -> Optional[str] | tuple[Optional[str], Optional[str]]:
+        """Resolve the session tier, lazily expiring static Fast as explicit normal."""
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
+        transition_notice = None
         if resolved_session_key:
             _t_state = self._peek_session_state(resolved_session_key)
             if _t_state is not None and _t_state.conversation.service_tier_override is not _SERVICE_TIER_UNSET:
-                return _t_state.conversation.service_tier_override
-        return self._load_service_tier()
+                conversation = _t_state.conversation
+                expires_at = conversation.service_tier_override_expires_at
+                if expires_at and time.time() >= expires_at:
+                    duration = conversation.service_tier_override_expiry_seconds
+                    conversation.service_tier_override = None
+                    conversation.service_tier_override_expires_at = 0.0
+                    conversation.service_tier_override_expiry_seconds = 0.0
+                    self._apply_live_service_tier(resolved_session_key, None)
+                    from agent.fast_mode import format_expiry_duration
+                    from agent.i18n import t
+                    transition_notice = t(
+                        "gateway.fast.expired", duration=format_expiry_duration(duration),
+                    )
+                result = conversation.service_tier_override
+                return (result, transition_notice) if report_transition else result
+        result = self._load_service_tier()
+        return (result, None) if report_transition else result
 
-    def _set_session_service_tier_override(self, session_key: str, service_tier, clear: bool = False) -> None:
-        """Set ("priority" / None = explicit normal) or ``clear`` the session-scoped /fast override."""
+    def _set_session_service_tier_override(
+        self, session_key: str, service_tier, clear: bool = False, expiry_seconds: float | None = None,
+    ) -> None:
+        """Set or clear a session tier and start a static Fast deadline when enabled."""
         if not session_key:
             return
-        # Presence-sensitive: "priority" or None (explicit normal) both count as an override; the
-        # sentinel means "no override". Per-session field write: a lazy dict replace races sessions.
-        self._session_state(session_key).conversation.service_tier_override = (
-            _SERVICE_TIER_UNSET if clear else service_tier
-        )
+        conversation = self._session_state(session_key).conversation
+        conversation.service_tier_override = _SERVICE_TIER_UNSET if clear else service_tier
+        conversation.service_tier_override_expires_at = 0.0
+        conversation.service_tier_override_expiry_seconds = 0.0
+        from agent.fast_mode import STATIC_TIERS
+        if not clear and service_tier in STATIC_TIERS:
+            seconds = self._load_fast_expiry_seconds() if expiry_seconds is None else expiry_seconds
+            if seconds > 0:
+                conversation.service_tier_override_expires_at = time.time() + seconds
+                conversation.service_tier_override_expiry_seconds = seconds
+
+    @classmethod
+    def _load_fast_expiry_seconds(cls) -> float:
+        """Read the gateway-only Fast expiry; invalid values warn and disable it."""
+        from gateway.run import _load_gateway_config
+        raw = cfg_get(_load_gateway_config(), "agent", "fast_expiry_seconds", default=0)
+        try:
+            if isinstance(raw, bool):
+                raise ValueError(raw)
+            value = float(raw)
+            if value < 0 or not math.isfinite(value):
+                raise ValueError(raw)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("agent.fast_expiry_seconds=%r is not a non-negative finite number; using 0", raw)
+            return 0.0
+        return value
+
+    def _session_service_tier_expiry(self, session_key: Optional[str]) -> tuple[float, float]:
+        """Return the active session deadline and configured duration."""
+        state = self._peek_session_state(session_key) if session_key else None
+        if state is None:
+            return 0.0, 0.0
+        conversation = state.conversation
+        return conversation.service_tier_override_expires_at, conversation.service_tier_override_expiry_seconds
 
     @classmethod
     def _load_service_tier(cls) -> str | None:
-        """``agent.service_tier``: fast/priority/on => "priority"; normal/off => None; None when unset/unknown."""
-        raw = cls._cfg_str("agent", "service_tier")
-        value = raw.lower()
-        if not value or value in {"normal", "default", "standard", "off", "none"}:
-            return None
-        if value in {"fast", "priority", "on"}:
-            return "priority"
-        if value in {"auto", "cold"}:
-            return value
-        logger.warning("Unknown service_tier '%s', ignoring", raw)
-        return None
+        """``agent.service_tier`` parsed like the CLI (``hermes_cli.cli_config_load``); None when unset/unknown."""
+        from hermes_cli.cli_config_load import _parse_service_tier_config
+
+        return _parse_service_tier_config(cls._cfg_str("agent", "service_tier"))
 
     @staticmethod
     def _load_show_reasoning() -> bool:
@@ -469,7 +605,7 @@ class GatewayConfigLoadersMixin:
 
     @classmethod
     def _load_cron_drain_timeout(cls) -> float:
-        """The cron-only floor under the stop()/drain wait.
+        """The cron and api_server (/v1) floor under the stop()/drain wait.
 
         See #82161.
         """
@@ -530,11 +666,13 @@ class GatewayConfigLoadersMixin:
     @staticmethod
     def _load_fallback_model() -> list | None:
         """Fallback chain: ``fallback_providers`` (kept first) merged with legacy ``fallback_model``."""
-        from gateway.run import _load_gateway_config
+        from gateway.run import _load_gateway_runtime_config
         try:
-            # Canonical gateway loader (fail-open): managed overlay + ${VAR} expansion apply here too.
-            return get_fallback_chain(_load_gateway_config()) or None
-        except Exception:
+            return get_fallback_chain(_load_gateway_runtime_config()) or None
+        except Exception as exc:
+            from hermes_cli.model_presets import ModelPresetError
+            if isinstance(exc, ModelPresetError):
+                raise
             return None
 
     def _refresh_fallback_model(self) -> list | None:
@@ -573,6 +711,8 @@ class GatewayConfigLoadersMixin:
             logger.debug("fallback_providers refresh: config.yaml read failed; keeping last known-good chain", exc_info=True)
             self._fallback_model = by_home.get(home_key, self._fallback_model)
             return self._fallback_model
+        from hermes_cli.model_presets import expand_model_presets
+        cfg = expand_model_presets(cfg)
         by_home[home_key] = self._fallback_model = get_fallback_chain(cfg) or None
         return self._fallback_model
 

@@ -24,6 +24,17 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolated_shared_primary_cooldown(monkeypatch, tmp_path):
+    """Keep file-backed cooldown state isolated between unit tests."""
+    from agent import shared_primary_cooldown
+    monkeypatch.setattr(
+        shared_primary_cooldown,
+        "_state_path",
+        lambda: tmp_path / "state" / "model_cooldowns.json",
+    )
+
+
+@pytest.fixture(autouse=True)
 def _fresh_structured_output_memo(monkeypatch):
     """The aux client remembers routes that rejected ``response_format`` for the whole process;
     a rejection recorded by one test must not strip the field from the next test's request."""
@@ -33,10 +44,12 @@ def _fresh_structured_output_memo(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fresh_onepassword_listing_cache(monkeypatch):
-    """1Password item listings are reused process-wide for a short window; a listing one test's
-    fake ``op`` produced must not answer the next test's backend."""
+    """1Password item listings are reused process-wide; a listing one test's fake ``op``
+    produced must not answer the next test's backend."""
     from agent.vault_backends import onepassword
-    monkeypatch.setattr(onepassword, "_LISTING_CACHE", {})
+    onepassword.invalidate_listing_cache()
+    yield
+    onepassword.invalidate_listing_cache()
 
 
 @pytest.fixture(autouse=True)

@@ -4,8 +4,8 @@ TLS boundary.
 Hermes routes to its native Gemini adapter only for the real Google host
 (``generativelanguage.googleapis.com``), so the fake is reached the way any corporate egress
 proxy would be: an HTTPS ``CONNECT`` proxy on loopback that terminates TLS for the Google host
-with a leaf certificate signed by a throwaway CA. The child trusts that CA through the standard
-``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` channel and reaches the proxy through
+with a leaf certificate signed by a throwaway CA. The child trusts that CA through explicit
+provider ``ssl_ca_cert`` configuration and reaches the proxy through
 ``HTTPS_PROXY`` (see :meth:`GeminiFake.child_env`). Every other host is refused and recorded,
 so a test also proves the turn made no other egress.
 
@@ -38,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
+import itertools
 
 GEMINI_HOST = "generativelanguage.googleapis.com"
 MODEL_ID = "gemini-3-flash-preview"
@@ -342,7 +343,7 @@ def validate_generate_request(body: Any, version: str, model: str, issued: set[s
             raise InvalidArgument(f"* GenerateContentRequest.contents[{ci}].parts: contents.parts must not be empty.")
         norm.append({"role": role, "parts": [_validate_part(p, f"contents[{ci}].parts[{pi}]")
                                               for pi, p in enumerate(parts)]})
-    for a, b in zip(norm, norm[1:]):
+    for a, b in itertools.pairwise(norm):
         if a["role"] == b["role"]:
             raise InvalidArgument("Please ensure that multiturn requests alternate between user and model.")
     if norm[-1]["role"] != "user":
@@ -396,7 +397,7 @@ def _write_tls_material(directory: Path) -> tuple[Path, Path, Path]:
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     ca_key = ec.generate_private_key(ec.SECP256R1())
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hermes-e2e gemini fake CA")])
     ca = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
@@ -458,11 +459,11 @@ class GeminiFake:
         self._thread = threading.Thread(target=self._server.serve_forever, name="gemini-fake", daemon=True)
 
     # lifecycle ---------------------------------------------------------------------------------
-    def __enter__(self) -> "GeminiFake":
+    def __enter__(self) -> GeminiFake:
         self._thread.start()
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=10)
@@ -478,6 +479,17 @@ class GeminiFake:
                 "HTTP_PROXY": self.proxy_url, "http_proxy": self.proxy_url,
                 "NO_PROXY": "", "no_proxy": "",
                 "SSL_CERT_FILE": ca, "REQUESTS_CA_BUNDLE": ca, "CURL_CA_BUNDLE": ca}
+
+    def configure_home(self, home: Path) -> None:
+        """Declare this test endpoint's CA through Hermes' provider TLS contract."""
+        import hermes_yaml as yaml
+        path = home / "config.yaml"
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+        base_url = cfg["model"].get("base_url") or "https://generativelanguage.googleapis.com/v1beta"
+        cfg.setdefault("providers", {})["gemini-test-tls"] = {
+            "base_url": base_url, "ssl_ca_cert": str(self.ca_pem),
+        }
+        path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
     # views ------------------------------------------------------------------------------------
     def generate_calls(self) -> list[Recorded]:
@@ -587,10 +599,10 @@ class GeminiFake:
             protocol_version = "HTTP/1.1"
             tunneled = False
 
-            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - base signature
+            def log_message(self, format: str, *args: Any) -> None:
                 return
 
-            def do_CONNECT(self) -> None:  # noqa: N802 - http.server naming
+            def do_CONNECT(self) -> None:
                 host = self.path.split(":", 1)[0].lower()
                 if self.tunneled or host != GEMINI_HOST:
                     with fake._lock:
@@ -621,12 +633,12 @@ class GeminiFake:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            def do_GET(self) -> None:  # noqa: N802
+            def do_GET(self) -> None:
                 if not self.tunneled:
                     return self._refuse_plain()
                 fake._handle(self, "GET")
 
-            def do_POST(self) -> None:  # noqa: N802
+            def do_POST(self) -> None:
                 if not self.tunneled:
                     return self._refuse_plain()
                 fake._handle(self, "POST")

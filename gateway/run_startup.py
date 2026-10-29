@@ -10,16 +10,21 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import faulthandler
+import inspect
 import logging
 import os
 import signal
+import threading
 import time
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
-from datetime import datetime
 from pathlib import Path
+from agent.i18n import t
+from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
+from gateway.delivery_recovery import RuntimeDeliveryRecoveryMixin
+from gateway.run_restart_recovery import RestartRecoveryMixin, ResumeCandidates
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
@@ -40,10 +45,35 @@ from typing import Any, Dict, Optional, Tuple
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
-_NOT_SUPPLIED = object()
+# Long turns release opening admission after this window, without releasing session ownership.
+_STARTUP_RESUME_CONCURRENCY = 4
+_STARTUP_RESUME_OPENING_S = 15.0
 
 
-class GatewayStartupMixin:
+def recover_left_core_in(home: Path, *, hydrate_secrets: bool = True) -> None:
+    """Install the catalog plugin of every feature that left core (Home Assistant) *home* uses, in
+    *home*'s runtime scope (its config, secrets and allow_lazy_installs); once per process per home.
+    Blocking: call it off the event loop."""
+    from gateway.run import _profile_runtime_scope
+    from hermes_cli.left_core_migration import recover_at_startup
+    with _profile_runtime_scope(Path(home), hydrate_secrets=hydrate_secrets):
+        recover_at_startup()
+
+
+def recover_left_core_at_gateway_start() -> None:
+    """Left-core migration for the homes whose platform config the runner loads first: the launch
+    home and the default root (the multiplex primary; a named launcher is then served as a
+    secondary). Every secondary runs :func:`recover_left_core_in` before its plugins are discovered,
+    so a platform plugin it gets starts its adapter in the same gateway start."""
+    from hermes_cli.left_core_migration import recover_at_startup
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+    recover_at_startup()
+    root = Path(get_default_hermes_root())
+    if root.resolve() != Path(get_hermes_home()).resolve():
+        recover_left_core_in(root)
+
+
+class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
     @staticmethod
@@ -64,87 +94,107 @@ class GatewayStartupMixin:
     def _serving_state(self) -> str:
         return "degraded" if self._startup_parked_platforms else "running"
 
-    async def _run_startup_resume_event(
-        self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
+    def _queue_startup_restore_event(
+        self, event: MessageEvent, *, front: bool = False, session_key: Optional[str] = None,
     ) -> None:
-        """Dispatch one synthetic startup resume and wait for its agent turn (inbound stays queued
-        until it finishes, else a user message can race it)."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
-        try:
-            await adapter.handle_message(event)
-            session_tasks = getattr(adapter, "_session_tasks", {})
-            task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
-            if task is not None:
-                await asyncio.shield(task)
-        finally:
-            # Release the pre-claimed slot if handle_message raised before _handle_message took ownership.
-            _pre_state = self._peek_session_state(session_key)
-            if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(session_key)
-
-    def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
-        queue.append(event)
+        # Keep source order independent of scheduler priority and dropped-item callback order.
+        sequence = self._startup_restore_sequence = getattr(self, "_startup_restore_sequence", 0) + 1
+        setattr(event, "_hermes_startup_restore_order", -sequence if front else sequence)
+        if front:
+            queue.insert(0, event)
+        else:
+            queue.append(event)
+        key = getattr(event, "_hermes_recovery_session_key", None)
+        if key is not None:
+            claimed = getattr(self, "_restart_followup_keys", None)
+            if claimed is None:
+                claimed = self._restart_followup_keys = set()
+            claimed.add(key)
+        key = session_key or key or self._session_key_for_source(
+            self._normalize_source_for_session_key(event.source)
+        )
+        restore_keys = getattr(self, "_startup_restore_keys", None)
+        if restore_keys is None:
+            restore_keys = self._startup_restore_keys = {}
+        restore_keys[key] = restore_keys.get(key, 0) + 1
         with suppress(Exception):
             source = event.source
+            kind = (
+                "recovered_followup"
+                if getattr(event, "_hermes_recovered_followup", False)
+                else "startup_queued_human"
+            )
             logger.info(
-                "Queued inbound message during gateway startup restore: platform=%s chat=%s",
-                source.platform.value if source and source.platform else "unknown",
-                source.chat_id if source else "unknown",
+                "Queued replay source: kind=%s session_key=%s",
+                kind,
+                key,
+                extra={"replay_scheduler": "source_queued", "kind": kind},
             )
 
-    async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None) -> int:
-        """Replay ready inbound, leaving sessions owned by another restore in order."""
-        drained = 0
-        queue = getattr(self, "_startup_restore_queue", None) or []
-        def ready(event):
-            key = self._session_key_for_source(self._normalize_source_for_session_key(event.source))
-            if keys is not None and key not in keys:
-                return False
-            # Our own gate permits one claimant; every other owner's gate must be fully open.
-            limit = 1 if owned_keys and key in owned_keys else 0
-            return getattr(self, "_reconnect_restore_keys", {}).get(key, 0) <= limit
+    def _requeue_startup_restore_event(self, event: MessageEvent, *, session_key: str) -> None:
+        """Return a replay item to the restore queue without creating a second claim.
 
-        while True:
-            index = next((i for i, event in enumerate(queue) if ready(event)), None)
-            if index is None:
-                break
-            event = queue.pop(index)
-            try:
-                source = getattr(event, "source", None)
-                adapter = self._intake_adapter_for(source)
-                if adapter is None and getattr(event, "_hermes_recovered_followup", False):
-                    adapter = self._delivery_adapter_for(source)
-                if adapter is None:
-                    logger.debug(
-                        "Dropping startup-restore queued message: adapter unavailable for %s",
-                        getattr(getattr(source, "platform", None), "value", None),
-                    )
-                    continue
-                # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
-                with suppress(Exception):
-                    setattr(event, "_hermes_startup_restore_replay", True)
-                await adapter.handle_message(event)
-                spool = getattr(event, "_hermes_recovery_spool", None)
-                if spool is not None:
-                    spool.unlink(missing_ok=True)
-            except Exception:
-                # One bad replay must not abort the drain: the remaining queued
-                # events still deserve their turn, and a raise here used to skip
-                # the gate release in _finish_startup_restore entirely.
-                logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
-                continue
-            drained += 1
-        if queue and keys is None:
-            logger.warning("Startup-restore drain left %d queued message(s) awaiting a reconnect owner", len(queue))
-        return drained
+        Scheduler shutdown can cancel an item after it has been removed from the
+        restore queue but before its turn starts.  The existing restore-key claim
+        remains outstanding so the shutdown flush sees this copy exactly once.
+        Restore source order before releasing a failed resume's session claim,
+        or newer queued input could overtake this item on the next drain.
+        """
+        queue = getattr(self, "_startup_restore_queue", None)
+        if queue is None:
+            queue = self._startup_restore_queue = []
+        if not any(existing is event for existing in queue):
+            order = getattr(event, "_hermes_startup_restore_order", 0)
+            index = next(
+                (i for i, existing in enumerate(queue)
+                 if getattr(existing, "_hermes_startup_restore_order", 0) > order),
+                len(queue),
+            )
+            queue.insert(index, event)
+        with suppress(Exception):
+            logger.info(
+                "Returned dropped replay to restore queue: session_key=%s",
+                session_key,
+                extra={"replay_scheduler": "source_requeued", "session_key": session_key},
+            )
+
+    def _schedule_startup_restore_drain(self) -> None:
+        if not getattr(self, "_startup_restore_queue", None):
+            return
+        scheduler = getattr(self, "_replay_scheduler", None)
+        if scheduler is not None and getattr(scheduler, "_closed", False):
+            return
+        current = getattr(self, "_startup_restore_drain_task", None)
+        if current is not None and not current.done():
+            # A release may land after ready() scanned the queue but before this
+            # pass reports no progress. Retain the wakeup for a follow-up pass.
+            self._startup_restore_drain_requested = True
+            return
+
+        async def drain() -> None:
+            while queue := getattr(self, "_startup_restore_queue", None):
+                self._startup_restore_drain_requested = False
+                before = {id(event) for event in queue}
+                await self._drain_startup_restore_queue(wait=True)
+                if (
+                    before.issubset({id(event) for event in queue})
+                    and not self._startup_restore_drain_requested
+                ):
+                    break
+
+        task = asyncio.create_task(drain())
+        self._startup_restore_drain_task = task
+        self._retain_background_task(task)
+        task.add_done_callback(
+            self._late_failure_callback("background startup restore drain failed", level=logging.DEBUG)
+        )
 
     @staticmethod
     def _start_free_tier_bootstrap() -> None:
-        """One bootstrap per process. `run_bootstrap` already records its own failure in the boot record
-        and never raises, so this is a plain call; it exists as a method so tests can seam it."""
+        """Run the one-per-process free-tier identity bootstrap; it records failures itself."""
         from hermes_cli.free_tier_bootstrap import run_bootstrap
         run_bootstrap(announce=False)
 
@@ -159,8 +209,7 @@ class GatewayStartupMixin:
 
     async def _run_boot_probe_in_launch_scope(self, fn):
         """Run a boot-time probe on the default executor under the LAUNCH profile's scope when
-        multiplexing (the ``_discover_gateway_mcp_tools`` shape). Boot probes (``check_fn``s, the
-        free-tier bootstrap) read profile-scoped secrets; an unscoped read under multiplex fails
+        multiplexing (the ``_discover_gateway_mcp_tools`` shape). Boot probes (``check_fn``s) read profile-scoped secrets; an unscoped read under multiplex fails
         closed, so routing overrides resolve as absent and default routing applies. ``copy_context``
         carries the contextvars across the executor hop; single-profile keeps environ semantics."""
         loop = asyncio.get_running_loop()
@@ -178,8 +227,7 @@ class GatewayStartupMixin:
         return await loop.run_in_executor(None, copy_context().run, fn)
 
     async def _run_free_tier_bootstrap(self) -> None:
-        """The free-tier bootstrap mints the Portal identity through the same profile-scoped routing
-        overrides the warm-up resolves, so it takes the same launch-profile binding."""
+        """Run free-tier identity bootstrap under the same launch-profile scope as warm-ups."""
         await self._run_boot_probe_in_launch_scope(self._start_free_tier_bootstrap)
 
     async def _warm_turn_prerequisites(self) -> None:
@@ -214,6 +262,40 @@ class GatewayStartupMixin:
             "boot turn-machinery warm-up failed after gate release", level=logging.DEBUG,
         )
 
+    def _start_mcp_discovery(self) -> None:
+        """Start MCP discovery before adapter connects so it overlaps transport startup."""
+        from gateway.run import _discover_gateway_mcp_tools
+
+        async def _discover_mcp_in_background() -> None:
+            try:
+                await _discover_gateway_mcp_tools(self.config)
+            except Exception as exc:
+                logger.debug("MCP tool discovery failed: %s", exc)
+            finally:
+                self._mcp_discovery_ready.set()
+
+        # Not in ``_background_tasks``: stop() cancels those, but cancelling cannot stop the executor
+        # thread mid-connect. Shutdown waits on this handle before MCP teardown instead.
+        task = asyncio.create_task(_discover_mcp_in_background())
+        self._mcp_discovery_task = task
+        task.add_done_callback(
+            self._late_failure_callback("background MCP tool discovery failed", level=logging.DEBUG)
+        )
+
+    async def _await_mcp_discovery(self) -> None:
+        """Bound boot auto-resume until MCP discovery has published the tools it may need."""
+        from gateway.run import _startup_restore_drain_timeout_secs
+        ready = getattr(self, "_mcp_discovery_ready", None)
+        if not isinstance(ready, asyncio.Event) or ready.is_set():
+            return
+        wait_task = asyncio.create_task(ready.wait())
+        await self._wait_bounded_or_release(
+            {wait_task}, _startup_restore_drain_timeout_secs(),
+            "MCP tool discovery still running after %.0fs; starting boot auto-resume without late MCP tools",
+            "background MCP discovery wait failed before boot auto-resume",
+            level=logging.WARNING,
+        )
+
     async def _wait_bounded_or_release(
         self, tasks: set, timeout: float, warn_fmt: str, late_msg: str, *,
         level: int = logging.WARNING, track: bool = False,
@@ -236,45 +318,64 @@ class GatewayStartupMixin:
                     self._retain_background_task(task)
         return done
 
+    async def _recover_pending_shutdown_flush_off_loop(
+        self, *, candidates, platform=None, failure_message: str,
+    ) -> list[MessageEvent]:
+        """Claim pending follow-ups off-loop and publish them before another pass may start.
+
+        The lock deliberately covers both the worker-thread scan and loop-side queue publication.
+        A lock around only ``to_thread`` leaves a duplicate-claim window while the caller transfers
+        its local event list into ``_startup_restore_queue``.
+        """
+        from gateway.run_pending_recovery import recover_pending_shutdown_flush
+
+        completion = getattr(self, "_pending_recovery_complete", None)
+        if completion is None or completion.is_set():
+            completion = self._pending_recovery_complete = asyncio.Event()
+        lock = getattr(self, "_pending_recovery_lock", None)
+        if lock is None:
+            # Bare test runners do not execute GatewayRunner.__init__; creation is synchronous before
+            # the first await, so two callers on this loop cannot create separate locks.
+            lock = self._pending_recovery_lock = asyncio.Lock()
+        try:
+            async with lock:
+                recovered_events: list[MessageEvent] = []
+                try:
+                    await asyncio.to_thread(
+                        recover_pending_shutdown_flush,
+                        self, candidates=candidates, platform=platform,
+                        recovered_events=recovered_events,
+                    )
+                except Exception:
+                    logger.warning(failure_message, exc_info=True)
+                # Recovered follow-ups precede inbound messages queued during startup restore.
+                for event in reversed(recovered_events):
+                    self._queue_startup_restore_event(event, front=True)
+                return recovered_events
+        finally:
+            completion.set()
+
     async def _finish_startup_restore(self) -> None:
-        """Wait (BOUNDED by ``_startup_restore_drain_timeout_secs``) for startup auto-resume, then
-        release + drain inbound. On timeout the gate opens and resume turns finish in the background
-        (NOT cancelled) — safe because ``_schedule_resume_pending_sessions`` claims each
-        ``_running_agents`` slot SYNCHRONOUSLY first, so drained inbound queues behind."""
-        from gateway.run import _startup_restore_drain_timeout_secs
+        """Open fresh inbound after warm-up and replay admission, without waiting for replay turns."""
         drained = 0
         try:
-            tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
-            if tasks:
-                # Tasks outliving the gate get a late-failure callback (their done-callback only discards them).
-                done = await self._wait_bounded_or_release(
-                    set(tasks), _startup_restore_drain_timeout_secs(),
-                    "Startup-restore gate released after %.0fs with %d boot auto-resume turn(s) "
-                    "still running; draining inbound queue now (resume slots already claimed, so no "
-                    "duplicate agents). Slow turn(s) continue in the background.",
-                    "background startup auto-resume task failed after gate release", level=logging.DEBUG,
-                )
-                report = self._late_failure_callback("startup auto-resume task failed", level=logging.DEBUG)
-                for task in done:
-                    report(task)
-            self._startup_restore_tasks = []
-            # Warm the turn machinery BEFORE the queue drains: inbound turns must not build skeleton prompts.
             await self._await_startup_warmup()
-            drained = await self._drain_startup_restore_queue()
+            # Replay turns run under the shared scheduler, not under the inbound gate. Queue one
+            # claimant per session so the per-session fence remains ordered while unrelated sessions
+            # retain concurrency; recovered follow-ups await their own resume task before admission.
+            drained = await self._drain_startup_restore_queue(wait=False)
         finally:
-            # The inbound gate must open no matter what raised above it (bounded wait, warm-up,
-            # drain): a stuck _startup_restore_in_progress would queue every non-internal inbound
-            # forever (run_inbound.py reads this flag first). See #116514.
             self._startup_restore_in_progress = False
+            self._schedule_startup_restore_drain()
         if drained:
-            logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+            logger.info("Admitted %d inbound message(s) queued during startup restore", drained)
 
     @staticmethod
     def _late_failure_callback(message: str, *, level: int = logging.WARNING):
         """Done-callback for boot-path tasks that outlive the startup-restore gate: surface a late
         failure otherwise swallowed once the task leaves ``_background_tasks``. Cancellation is
         expected (shutdown), not an error."""
-        def _report(task: "asyncio.Task") -> None:
+        def _report(task: asyncio.Task) -> None:
             if task.cancelled():
                 return
             exc = task.exception()
@@ -282,7 +383,10 @@ class GatewayStartupMixin:
                 logger.log(level, message, exc_info=(type(exc), exc, exc.__traceback__))
         return _report
 
-    async def _await_startup_boot_sends(self, *, planned_restart_notification_pending: bool) -> None:
+    async def _await_startup_boot_sends(
+        self, *, planned_restart_notification_pending: bool, interrupted_note_keys=(),
+        claimed=None,
+    ) -> None:
         """Run boot-path sends without letting them pin the inbound restore gate (one Telegram
         flood-control sleep must not freeze inbound on every platform): same bounded wait as the
         resume gate, sends finish in the background on timeout. The ledger claim + ``resume_pending``
@@ -293,14 +397,24 @@ class GatewayStartupMixin:
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
         from gateway.run import _startup_restore_drain_timeout_secs
-        claimed = await self._claim_pending_obligations()
+        claimed_rows: list = (await self._claim_pending_obligations() if claimed is None else claimed)
+
+        # S2 interruption notes have a stricter lifecycle than the other boot sends: a resumed turn
+        # must not be scheduled until this bounded, cancel-on-timeout step has completed. The sender
+        # owns its timeout and cancel_task_with_grace behavior, so keep it outside the detachable
+        # boot-send task below.
+        if interrupted_note_keys:
+            await self._send_interrupted_turn_notes(
+                interrupted_note_keys, reclaim_pending=True,
+                cancel_on_timeout=True, timeout=_startup_restore_drain_timeout_secs(),
+            )
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
             self._schedule_update_notification_watch()
             if planned_restart_notification_pending:
                 await self._replay_pending_planned_restart_notification()
-            await self._redeliver_claimed_obligations(claimed)
+            await self._redeliver_claimed_obligations(claimed_rows)
 
         boot_task = asyncio.create_task(_boot_sends())
         timeout = _startup_restore_drain_timeout_secs()
@@ -317,9 +431,10 @@ class GatewayStartupMixin:
     async def _clear_resume_pending_for_claimed_obligations(
         self, claimed: list, *, require_success: bool = False
     ) -> list:
-        """Clear resume flags and return rows safe to redeliver. Startup recovery is best-effort;
-        runtime reconnect recovery (``require_success``) is stricter: if the session-store write
-        fails the response must not be sent, or the turn could be resumed too."""
+        """Clear only the resume owner answered by each row and return rows safe to redeliver.
+        Startup recovery is best-effort, so an ownership mismatch leaves a successor marker in place
+        while its predecessor remains sendable. Runtime reconnect recovery (``require_success``) is
+        stricter: if the session-store compare-and-swap fails the response must not be sent."""
         sendable = []
         for row in claimed:
             session_key = row.get("session_key") or ""
@@ -327,7 +442,35 @@ class GatewayStartupMixin:
                 sendable.append(row)
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                expected_marker = row.get("resume_marker")
+                expected_turn_id = row.get("resume_turn_id")
+                # Rows written before ownership fields existed get a marker snapshot immediately
+                # before the compare-and-swap. This keeps a successor marked after the snapshot from
+                # being cleared, while new rows carry the exact owner captured at record time.
+                if expected_marker is None and expected_turn_id is None:
+                    marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+                    if callable(marker_reader):
+                        marker = marker_reader(session_key)
+                        if inspect.isawaitable(marker):
+                            marker = await marker
+                        if isinstance(marker, tuple) and len(marker) == 3:
+                            expected_marker = marker
+                clear_kwargs = {}
+                if expected_marker is not None:
+                    clear_kwargs["expected_marker"] = expected_marker
+                if expected_turn_id is not None:
+                    clear_kwargs["expected_turn_id"] = expected_turn_id
+                cleared = await self.async_session_store.clear_resume_pending(session_key, **clear_kwargs)
+                if require_success and not cleared:
+                    # False is also the normal result when this row's session has no resume marker.
+                    # Re-read after the CAS attempt so a successor marker still blocks delivery,
+                    # while an already-cleared session remains sendable on reconnect.
+                    marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+                    marker = marker_reader(session_key) if callable(marker_reader) else None
+                    if inspect.isawaitable(marker):
+                        marker = await marker
+                    if marker is not None:
+                        continue
             except Exception:
                 logger.debug("clear_resume_pending failed for %s", session_key, exc_info=True)
                 if require_success:
@@ -355,7 +498,7 @@ class GatewayStartupMixin:
             # Claim only rows whose exact transport owner is connected: platform-only filtering would spend
             # a disconnected bot's retry budget because another bot on that platform is online.
             _profile_adapters = getattr(self, "_profile_adapters", None) or {}
-            _pval = lambda p: getattr(p, "value", str(p))  # noqa: E731
+            _pval = lambda p: getattr(p, "value", str(p))
             _deliverable_targets = {(_pval(p), "default") for p in self.adapters}
             # Legacy rows (no adapter_profile) are unambiguous only without multiplexing; else fail closed.
             if not _profile_adapters:
@@ -405,7 +548,7 @@ class GatewayStartupMixin:
             # Remember refusals arriving during a threaded SELECT or a send. An empty stale
             # snapshot cannot retire this worker until it has observed the wake.
             wakes[key].set()
-            return None
+            return
         wake = wakes[key] = asyncio.Event()
 
         async def _redeliver_after_wait():
@@ -423,7 +566,7 @@ class GatewayStartupMixin:
                     try:
                         await asyncio.wait_for(wake.wait(), timeout=delay)
                         continue  # A shorter sibling may now be due first.
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
                     if getattr(self, "_running", False):
                         await self._redeliver_failed_obligations_for_platform(target, profile=profile)
@@ -431,7 +574,7 @@ class GatewayStartupMixin:
                 pending.pop(key, None)
                 wakes.pop(key, None)
 
-        task = asyncio.create_task(_redeliver_after_wait(), name="flood-redelivery:%s:%s" % key)
+        task = asyncio.create_task(_redeliver_after_wait(), name="flood-redelivery:{}:{}".format(*key))
         pending[key] = task
         # The gateway's ordinary shutdown drain must cancel sleeping timers too.
         background = getattr(self, "_background_tasks", None)
@@ -444,7 +587,41 @@ class GatewayStartupMixin:
         for row in await asyncio.to_thread(pending_retries):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
-    async def _redeliver_claimed_obligations(self, claimed: list) -> int:
+    async def _redelivery_restart_note_event(self, row: dict) -> Optional[MessageEvent]:
+        """Snapshot the note owned by this delivery before its network await.
+
+        A resumed final may have failed both its note deletion and answer send. Ledger recovery must
+        reconcile that note too, but not a successor interruption arriving while the send is in flight.
+        Lookup failures are best-effort and never prevent redelivery.
+        """
+        session_key = row.get("session_key") or ""
+        if not session_key:
+            return None
+        try:
+            entry = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+            source = getattr(entry, "origin", None)
+            if (source is None or str(source.chat_id) != str(row.get("chat_id", ""))
+                    or source.platform.value != row.get("platform")
+                    or source.thread_id != row.get("thread_id")):
+                return None
+            note = await self.async_session_store.get_restart_note(session_key)
+            if not note or not note[3] or note[0] != entry.session_id:
+                return None
+            marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+            marker_available = callable(marker_reader)
+            marker = await marker_reader(session_key) if marker_available else None
+            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            event._restart_note_expected = note
+            event._restart_note_marker_api_available = marker_available
+            # A recovered turn normally cleared resume_pending before its ledger row was written;
+            # retain the note's owner marker for the cleared-state CAS fallback.
+            event._restart_note_expected_marker = marker or tuple(note[:3])
+            return event
+        except Exception:
+            logger.debug("Restart-note snapshot failed for recovered %s", session_key, exc_info=True)
+            return None
+
+    async def _redeliver_claimed_obligations(self, claimed: list, *, runtime_settlement=None) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
         reopening the turn-replay window. Returns the redelivered count."""
@@ -456,39 +633,79 @@ class GatewayStartupMixin:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
         redelivered = 0
+        blocked_chats = runtime_settlement.blocked_chats if runtime_settlement is not None else {}
         for row in claimed:
+            # Ordering is per bot identity: one bot's refusal never holds another bot's messages.
+            chat_key = (row.get("platform"), row.get("profile") or "default", row.get("chat_id"), row.get("thread_id"))
+            if chat_key in blocked_chats and not row.get("adopted"):
+                # An earlier message to this chat was refused: sending this one now would put it
+                # ahead of that one. It goes back to failed and is retried after it, in order.
+                await self._release_runtime_claim_quiet(
+                    row["obligation_id"], "failed to release held obligation %s", error=blocked_chats[chat_key])
+                continue
             if row.get("adopted"):
+                # Later messages to this chat must wait for it, so they are released behind it.
+                blocked_chats.setdefault(chat_key, row.get("last_error") or "send_path_degraded")
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
                 continue
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
-            content = row["content"]
+            note_event = await self._redelivery_restart_note_event(row)
+            from gateway.copy_blocks import split_copy_blocks_for
+            # Separate copy messages only where the adapter sends them plain; elsewhere the
+            # recovered reply renders its blocks inline, as normal delivery does.
+            content, copy_blocks = split_copy_blocks_for(adapter, row["content"])
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
-            except Exception as send_err:
-                logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
-                result = None
+            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else {}
+            payloads = [(content, metadata)] if content.strip() else []
+            payloads.extend((block, {**metadata, "copy_block": True, "plain": True}) for block in copy_blocks)
+            if runtime_settlement is not None and runtime_settlement.cancelled:
+                # Cancellation during adapter/note admission must not begin a send.
+                await self._release_runtime_claim_quiet(
+                    row["obligation_id"], "failed to release cancelled runtime delivery claim %s",
+                    error=row.get("last_error") or "send_path_degraded",
+                )
+                continue
+            result = None
+            for payload, payload_metadata in payloads:
+                try:
+                    result = await adapter.send(chat_id=row["chat_id"], content=payload, metadata=payload_metadata)
+                except Exception as send_err:
+                    logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
+                    result = None
+                if result is None or not getattr(result, "success", False):
+                    break
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    if note_event is not None:
+                        reconcile = getattr(adapter, "_reconcile_restart_note_after_delivery", None)
+                        if callable(reconcile):
+                            try:
+                                await reconcile(note_event, row["session_key"])
+                            except Exception:
+                                logger.debug(
+                                    "Recovered obligation %s: restart-note reconciliation failed",
+                                    row["obligation_id"], exc_info=True,
+                                )
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
+                    blocked_chats[chat_key] = str(getattr(result, "error", "") or "send failed")
                     await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                        mark_failed, row["obligation_id"], blocked_chats[chat_key]
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
-        with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
-            await self._arm_flood_timers_for_waiting_rows()
+        if runtime_settlement is None:
+            with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
+                await self._arm_flood_timers_for_waiting_rows()
         return redelivered
 
     async def _obligation_adapter(self, row: dict):
@@ -524,134 +741,73 @@ class GatewayStartupMixin:
         calls the halves separately so the DB half runs inline before the abandonable send task."""
         return await self._redeliver_claimed_obligations(await self._claim_pending_obligations())
 
-    async def _redeliver_failed_obligations_for_platform(
-        self, platform: Platform, *, profile: Optional[str] = None,
-    ) -> int:
-        """Replay one adapter identity's transient failures after reconnect: the startup sweep cannot
-        claim live-owner rows, so ``send_path_degraded`` responses would otherwise stay failed until
-        the next restart. Best-effort; reuses the startup redelivery contract."""
-        try:
-            from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
-            if not await asyncio.to_thread(ledger_enabled):
-                return 0
-            claimed = await asyncio.to_thread(sweep_failed_for_runtime, platform.value, profile=profile)
-        except Exception:
-            logger.debug(
-                "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,
-            )
-            return 0
-        if not claimed:
-            return 0
-        # Clear before any send so the reconnect path cannot both redeliver AND resume the same turn.
-        sendable = await self._clear_resume_pending_for_claimed_obligations(claimed, require_success=True)
-        sendable_ids = {row["obligation_id"] for row in sendable}
-        for row in claimed:
-            if row["obligation_id"] not in sendable_ids:
-                await self._release_runtime_claim_quiet(
-                    row["obligation_id"], "failed to release runtime delivery claim %s",
-                    error=row.get("last_error") or "send_path_degraded",
-                )
-        return await self._redeliver_claimed_obligations(sendable)
-
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
-                candidates = [
+                candidates = ResumeCandidates([
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
-                ]
+                    and (platform is None or getattr(entry.origin, "platform", None) == platform)
+                ])
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
-        # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
-        # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
-        if candidates and record_boot:
+        # Only boots with restart-interrupted sessions count. Shutdown stamps one-shot planned
+        # intent after draining; recent chat/home notification markers remain a fallback.
+        # The guard gives the first planned boot one chain-local allowance; repeated planned boots count.
+        candidates.breaker_tripped = bool(getattr(self, "_restart_resume_breaker_tripped", False))
+        if record_boot:
             try:
                 from gateway import restart_loop_guard as _rlg
+                from gateway.run import _hermes_home, _planned_restart_notification_path
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                if _rlg.check_and_record(_max_restarts, _window, max_gap_seconds=_max_gap):
-                    return None
+                _planned_exit = _rlg.consume_planned_exit(_window, max_gap_seconds=_max_gap)
+                if not candidates:
+                    return candidates
+                _planned_restart = _planned_exit or _rlg.planned_marker_is_recent(
+                    _hermes_home / ".restart_notify.json", window_seconds=_window,
+                    max_gap_seconds=_max_gap, use_mtime=True,
+                ) or _rlg.planned_marker_is_recent(
+                    _planned_restart_notification_path(), window_seconds=_window, max_gap_seconds=_max_gap,
+                )
+                candidates.breaker_tripped = _rlg.check_and_record(
+                    _max_restarts, _window, max_gap_seconds=_max_gap, planned_restart=_planned_restart,
+                )
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
 
-    def _resume_owner_authorized(self, session_key: str, source) -> bool | None:
-        """True for an authorized owner, False for denial, None when checking failed."""
-        try:
-            if self._is_user_authorized_for_source(source):
-                return True
-            logger.warning(
-                "Skipping auto-resume for %s: session owner is no "
-                "longer authorized under the current allowlist", session_key,
-            )
-        except Exception as exc:
-            logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
-            return None
-        return False
+    async def _resume_pending_candidates_async(self, platform=None, *, record_boot=True) -> Optional[list]:
+        """Snapshot resume-pending entries without running the state.db load on the gateway loop."""
+        return await asyncio.to_thread(
+            self._resume_pending_candidates, platform, record_boot=record_boot,
+        )
 
-    def _auto_resume_ready(self, entry, *, require_adapter=True) -> tuple | None:
-        """Shared admission for deferred follow-ups and synthetic resume turns."""
-        from gateway.run import _auto_continue_freshness_window
-        marker = entry.last_resume_marked_at or entry.updated_at
-        if marker is not None and (datetime.now() - marker).total_seconds() > _auto_continue_freshness_window():
-            return None
-        if self._is_session_running(entry.session_key):
-            return None
-        source = self._restored_source(entry)
-        adapter = self._delivery_adapter_for(source)
-        if not self._resume_owner_authorized(entry.session_key, source) or (require_adapter and adapter is None):
-            return None
-        return adapter, source
+    @staticmethod
+    def _build_startup_resume_event(source: SessionSource, resume_marker: Optional[str]) -> MessageEvent:
+        """Build the exact internal event used to auto-continue one restart marker."""
+        event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
+                             message_id=getattr(source, "message_id", None), internal=True)
+        if resume_marker:
+            # Keep the transport reply anchor for threading, but admit each interruption marker
+            # under its own outbox identity so one marker resumes at most once.
+            setattr(event, "_outbox_admission_id", f"resume:{resume_marker}")
+        return event
 
-    def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None,
-                                          candidates=_NOT_SUPPLIED) -> int:
-        """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
-        ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
-        ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
-        sessions with a running agent are skipped so none is resumed twice."""
+    async def _drop_queued_resume(self, session_key: str) -> None:
+        """Release a shutdown-dropped resume sentinel and keep the durable marker recoverable."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        candidates = self._resume_pending_candidates(platform) if candidates is _NOT_SUPPLIED else candidates
-        if candidates is None:
-            return 0
-        scheduled = 0
-        for entry in candidates:
-            if platform is not None and entry.origin.platform != platform:
-                continue
-            ready = self._auto_resume_ready(entry)
-            if ready is None:
-                continue
-            adapter, source = ready
-            # Claim the slot *before* spawning so an inbound message arriving before the task's first
-            # await queues instead of building a duplicate AIAgent.
-            _resume_state = self._session_state(entry.session_key)
-            _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
-            _resume_state.turn.started_ts = time.time()
-            self._persist_active_agents()
-            # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
-            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
-                                 message_id=getattr(source, "message_id", None), internal=True)
-            task = self._retain_background_task(
-                asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
-            )
-            if restore_tasks is not None:
-                restore_tasks.append(task)
-            if restore_keys is not None:
-                restore_keys.add(entry.session_key)
-            if getattr(self, "_startup_restore_in_progress", False):
-                tasks = getattr(self, "_startup_restore_tasks", None)
-                if tasks is None:
-                    tasks = self._startup_restore_tasks = []
-                tasks.append(task)
-            scheduled += 1
-        if scheduled:
-            logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
-        return scheduled
+        getattr(self, "_startup_resume_inflight", set()).discard(session_key)
+        state = self._peek_session_state(session_key)
+        if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL:
+            return
+        # No turn was admitted, so the original reason, turn ID and marker token still own recovery.
+        self._release_running_agent_state(session_key)
 
     def _schedule_auto_resume_delegations(self) -> int:
         """Queue bounded parent notices for eligible abandoned single-task rows.
@@ -783,8 +939,12 @@ class GatewayStartupMixin:
                     getattr(guard, method)()
 
     async def _consume_clean_shutdown_marker(self, marker_path) -> int:
-        """Discard orphan turn markers before consuming a clean-exit receipt. Raises (fail closed):
-        continuing with the old receipt would let a later unclean exit masquerade as clean."""
+        """Discard orphan turn markers before consuming a clean-exit receipt.
+
+        The receipt is consumed only after the marker cleanup succeeds. Callers that need to
+        continue serving after a cleanup failure must retire the receipt first, otherwise a
+        later crash could be misclassified as clean.
+        """
         discarded = await self.async_session_store.discard_active_turn_markers()
         marker_path.unlink()
         return discarded
@@ -804,6 +964,17 @@ class GatewayStartupMixin:
             resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
         return resumed, ledgered
 
+    def _snapshot_active_turns_for_recovery(self) -> list:
+        """Read active-turn recovery rows under the store lock off the gateway loop."""
+        with self.session_store._lock:
+            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            return [
+                (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
+                 e.transport_profile)
+                for e in self.session_store._entries.values()
+                if e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
+            ]
+
     async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
         """Settle every marked turn whose final reply was persisted and clear its marker, so
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
@@ -812,14 +983,7 @@ class GatewayStartupMixin:
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
         ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
-        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-            self.session_store._ensure_loaded_locked()  # noqa: SLF001
-            marked = [
-                (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
-                 e.transport_profile)
-                for e in self.session_store._entries.values()  # noqa: SLF001
-                if e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
-            ]
+        marked = await asyncio.to_thread(self._snapshot_active_turns_for_recovery)
         ledgered = 0
         for key, session_id, token, started_at, origin, profile in marked:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
@@ -830,24 +994,59 @@ class GatewayStartupMixin:
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
-                await asyncio.to_thread(
-                    record_crash_left_reply,
-                    obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
-                    platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+                for ref, content in await asyncio.to_thread(
+                        self._crash_left_parts, key, token, text, started, origin):
+                    await asyncio.to_thread(
+                        record_crash_left_reply,
+                        obligation_id=compute_obligation_id(key, ref, content), session_key=key,
+                        platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
+                        thread_id=origin.thread_id, content=content, since=started, adapter_profile=profile,
+                        # Parts were matched against the ledger above; only a single whole-reply
+                        # row still needs the content-based duplicate check.
+                        resume_turn_id=token, part=ref != f"crash:{token}" or text != content)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
 
+    @staticmethod
+    def _crash_left_parts(key: str, token: str, text: str, started: float, origin) -> list:
+        """The ``(message_ref, content)`` rows a crash-left reply still owes.
+
+        Where copy blocks go out as separate messages, the reply is owed as one ledger row per
+        message (its ordinary text, then each block), so a retry of one refused part never
+        resends parts that landed. Live delivery records the same rows as it sends; a part this
+        turn already recorded (matched by exact content, one row per occurrence) is not owed
+        again. Elsewhere the reply is one message and one row."""
+        from gateway.copy_blocks import extract_copy_blocks, platform_sends_copy_blocks, wrap_copy_block
+        from gateway.delivery_ledger import recorded_contents_since
+        if not platform_sends_copy_blocks(getattr(origin, "platform", None)):
+            return [(f"crash:{token}", text)]
+        ordinary, blocks = extract_copy_blocks(text)
+        if not blocks:
+            return [(f"crash:{token}", text)]
+        parts = [(f"crash:{token}", ordinary.strip())] if ordinary.strip() else []
+        parts += [(f"crash:{token}#copy{index}", wrap_copy_block(block)) for index, block in enumerate(blocks)]
+        recorded = recorded_contents_since(key, started)
+        owed = []
+        for ref, content in parts:
+            if recorded.get(content, 0) > 0:
+                recorded[content] -= 1  # this exact message was already ledgered by live delivery
+            else:
+                owed.append((ref, content))
+        return owed
+
     def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
         persisted a final reply after *started*; ``""`` when nothing would have been presented (a
-        silence marker on a machinery turn, a muted diagnostic wake); else the text to send, with a
-        human turn's bare silence marker replaced by the same notice the live path sends."""
+        silence marker on a machinery turn or on a turn the adapter reported as not addressed to the
+        bot, a muted diagnostic wake); else the text to send, with any other bare silence marker
+        replaced by the same notice the live path sends."""
         from gateway.platforms.base import _strip_media_directives
-        from gateway.response_filters import is_intentional_silence_response, is_machinery_display_kind
+        from gateway.response_filters import (
+            is_intentional_silence_response, is_machinery_display_kind, silence_allowed,
+        )
         from gateway.run import _sanitize_gateway_final_response
-        from gateway.run_turn import _UNEXPECTED_SILENCE_REPLY
+        from gateway.run_turn import _unexpected_silence_reply
         from gateway.warning_notifications import diagnostic_turn_muted
         from hermes_cli.timefmt import coerce_epoch
         visible = [m for m in history if m.get("role") not in ("session_meta", "system")]
@@ -856,8 +1055,7 @@ class GatewayStartupMixin:
                 or (coerce_epoch(last.get("timestamp")) or 0) < started):
             return None
         prompt = next((m for m in reversed(visible) if m.get("role") == "user"), {})
-        machinery = is_machinery_display_kind(prompt.get("display_kind"))
-        if machinery:
+        if is_machinery_display_kind(prompt.get("display_kind")):
             try:  # the owning profile's display policy, as the adapter reads it at delivery
                 scope = self._media_delivery_scope_for_source(origin)
             except Exception:
@@ -867,20 +1065,31 @@ class GatewayStartupMixin:
                 if diagnostic_turn_muted(prompt.get("display_metadata"), origin.platform):
                     return ""
         if is_intentional_silence_response(last["content"]):
-            return "" if machinery else _UNEXPECTED_SILENCE_REPLY
+            silent_ok = silence_allowed(
+                prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"))
+            return "" if silent_ok else _unexpected_silence_reply()
         # The ledger redelivers text only, so a reply that carries attachments is not settled here:
         # it stays marked and resumes, instead of being redelivered with its attachments dropped.
+        from gateway.copy_blocks import map_outside_copy_blocks, strip_copy_blocks
         from gateway.platforms.base import BasePlatformAdapter
-        media, rest = BasePlatformAdapter.extract_media(last["content"])
+        # Copy bodies are literal paste-ready text: only text outside them can carry attachments
+        # or directives, as in live delivery.
+        outside = strip_copy_blocks(last["content"])
+        media, rest = BasePlatformAdapter.extract_media(outside)
         images, rest = BasePlatformAdapter.extract_images(rest)
         if media or images or BasePlatformAdapter.extract_local_files(rest)[0]:
             return None
-        return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        # Sanitize first (provider terminal tokens), then hide the /loop marker, matching the
+        # normal and queued delivery lanes. Markers stay so redelivery can split or inline them.
+        sanitized = strip_trailing_loop_complete_marker(
+            _sanitize_gateway_final_response(origin.platform, last["content"]))
+        return map_outside_copy_blocks(sanitized, _strip_media_directives, keep_markers=True).strip() or None
 
     @staticmethod
     def _start_hosted_room_worker_sync():
         """Start the local Group Chat worker without importing the dashboard."""
-        import tui_gateway.server  # noqa: F401
+        import tui_gateway.server
         from tui_gateway import methods_groups
         service = methods_groups.get_hosted_room_service()
         if service is None:
@@ -933,7 +1142,7 @@ class GatewayStartupMixin:
         from gateway.run import get_hermes_home
         log_dir = getattr(self.config, "log_dir", None) or os.path.join(str(get_hermes_home()), "logs")
         os.makedirs(log_dir, exist_ok=True)
-        return open(os.path.join(log_dir, "gateway_faulthandler.log"), "a", encoding="utf-8")
+        return open(os.path.join(log_dir, "gateway_faulthandler.log"), "a", encoding="utf-8")  # windows-footgun: ok (append log writer, not a read)
 
     def _start_install_faulthandler(self) -> None:
         """Enable faulthandler (stderr or a log file) plus the SIGUSR2 stack-dump hook."""
@@ -963,6 +1172,8 @@ class GatewayStartupMixin:
         except RuntimeError:
             self._gateway_loop = None
         if self._gateway_loop is not None:
+            # From here until shutdown disarms it, a state.db wait on this thread is reported.
+            set_loop_thread(threading.get_ident())
             self._start_loop_liveness_guards(self._gateway_loop)
             # Loop live: the loop-liveness watchdog takes over from the startup watchdog. Disarm even
             # when loop guards are config-disabled; only inside this branch (no live loop = stay armed).
@@ -971,6 +1182,7 @@ class GatewayStartupMixin:
                 disarm_startup_watchdog()
         logger.info("Session storage: %s", self.config.sessions_dir)
         self._start_log_systemd_timing_alignment()
+        self._start_log_retired_session_reset()
         self._log_agent_budget()
         # Warn prominently when redaction is opted out; the redactor snapshots its state at import time,
         # so this line is the source of truth for the process lifetime.
@@ -1020,6 +1232,19 @@ class GatewayStartupMixin:
             if _adv_msg:
                 logger.warning("%s", _adv_msg)
                 logger.warning("Run `hermes doctor` on the gateway host for full remediation steps.")
+
+    def _start_log_retired_session_reset(self) -> None:
+        """Warn per served profile whose config still declares an idle/daily ``session_reset``,
+        unless the plugin that honours it is enabled. Never raises."""
+        with _log_suppressed(logging.DEBUG, "retired session_reset check failed", exc_info=True):
+            from gateway.config_loader import read_yaml_layers
+            from hermes_cli.profiles import profiles_to_serve
+            from hermes_cli.session_reset_retirement import format_notice, reset_plugin_enabled, retired_reset_policy
+            hits = [(name, found) for name, home in profiles_to_serve(bool(self.config.multiplex_profiles))
+                    if (found := retired_reset_policy(read_yaml_layers(home)))]
+            if hits and not reset_plugin_enabled():
+                for name, (path, mode) in hits:
+                    logger.warning("Profile %s: %s", name, format_notice(path, mode))
 
     def _start_log_systemd_timing_alignment(self) -> None:
         """Warn when systemd's TimeoutStopSec does not cover the drain window (a unit file from before
@@ -1101,12 +1326,14 @@ class GatewayStartupMixin:
 
     @staticmethod
     def _start_register_plugins_relay_hooks() -> None:
-        """Plugin discovery, relay registration and shell-hook/webhook registration. Never raises."""
+        """Require complete plugin policy before registering relay and config hooks."""
         # Discover plugins before shell hooks (plugin block decisions win ties). Explicit: the gateway
         # lazily imports run_agent, so model_tools' discover_plugins() side-effect may not have run.
-        with _log_suppressed(logging.WARNING, "plugin discovery failed at gateway startup", exc_info=True):
-            from hermes_cli.plugins import discover_plugins
-            discover_plugins()
+        from hermes_cli.plugins import discover_plugins
+        with _log_suppressed(logging.WARNING, "pending plugin deletion failed at gateway startup", exc_info=True):
+            from hermes_cli.plugins_cmd_remove import sweep_pending_plugin_deletes
+            sweep_pending_plugin_deletes()  # trees a previous life still held when they were uninstalled
+        discover_plugins(require_complete=True)
         # Relay entrypoints share the effective profile opt-out, including when a
         # deployment injects a URL. No URL or explicitly disabled -> no side effects.
         try:
@@ -1179,15 +1406,51 @@ class GatewayStartupMixin:
                 logger.warning("Process checkpoint recovery for profile %r failed", profile_name, exc_info=True)
         return recovered
 
+    async def _start_prime_session_db_after_ready(self) -> None:
+        """Open the shared state.db handles only after adapters are ready, never on the loop."""
+        store = getattr(self, "session_store", None)
+        open_store = getattr(store, "_open_session_db_for_active_scope", None)
+        open_runner = getattr(self, "_open_session_db_for_active_scope", None)
+        if not callable(open_store) or not callable(open_runner):
+            return
+        try:
+            await asyncio.to_thread(open_store)
+            await asyncio.to_thread(open_runner, True)
+        except Exception as exc:
+            # First-use async callers retain the existing recoverable fallback/backoff behavior.
+            logger.warning("SQLite session store not available after adapter readiness: %s", exc)
+            self._session_db_init_error = str(exc)
+        await self._prime_profile_session_dbs((getattr(self, "_served_profile_homes", None) or {}).items())
+
+    async def _prime_profile_session_dbs(self, profile_homes) -> None:
+        """Open each served secondary profile's state.db handles off the loop. Both caches open per
+        profile scope on first access, and that first access is otherwise a loop-thread SessionDB open
+        (holder scan, schema check) the first time a served profile's chat touches the store."""
+        from gateway.run import _profile_runtime_scope
+        from hermes_constants import get_hermes_home
+        store = getattr(self, "session_store", None)
+        open_store = getattr(store, "_open_session_db_for_active_scope", None)
+        open_runner = getattr(self, "_open_session_db_for_active_scope", None)
+        if not callable(open_store) or not callable(open_runner):
+            return
+        launch_home = get_hermes_home().resolve()
+        homes = [(name, Path(home)) for name, home in profile_homes if Path(home).resolve() != launch_home]
+
+        def _prime(home: Path) -> None:
+            with _profile_runtime_scope(home, {}):
+                open_store()
+                open_runner()
+
+        for name, home in homes:
+            try:
+                await asyncio.to_thread(_prime, home)
+            except Exception:
+                # Best-effort: an unprimed profile keeps the first-use open and its backoff.
+                logger.warning("Priming state.db for served profile %r failed", name, exc_info=True)
+
     async def _start_recover_previous_run(self) -> None:
-        """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
+        """Recover prior processes and sessions after adapters are ready."""
         from gateway.run import _hermes_home
-        self._start_register_plugins_relay_hooks()
-        # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
-        with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
-            from hermes_cli.plugins import get_plugin_manager
-            self._subscribe_plugin_rewire(get_plugin_manager())
-        self.hooks.discover_and_load()
         # Recover background processes from checkpoint (crash recovery). ``_checkpoint_path`` is
         # scope-relative, so a served secondary's turn wrote ITS home's processes.json; recover each
         # served profile's file under its scope or those processes are never re-adopted.
@@ -1202,6 +1465,7 @@ class GatewayStartupMixin:
         _clean_marker = _hermes_home / ".clean_shutdown"
         if _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")
+            discarded = 0
             try:
                 discarded = await self._consume_clean_shutdown_marker(_clean_marker)
             except Exception as exc:
@@ -1222,14 +1486,15 @@ class GatewayStartupMixin:
         # Stuck-loop detection: a session active across 3+ consecutive restarts is auto-suspended.
         with _log_suppressed(logging.DEBUG, "Stuck-loop detection failed: %s"):
             # Auto-suspend it so the user gets a clean slate on the next message. See #7536.
-            stuck = self._suspend_stuck_loop_sessions()
+            stuck = await asyncio.to_thread(self._suspend_stuck_loop_sessions)
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
 
-    async def _start_prefilter_platforms(self) -> Tuple[bool, int, list, list]:
+    async def _start_prefilter_platforms(self) -> tuple[bool, int, list, list]:
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
         from gateway.run import _platform_has_bot_credential
+        from gateway.run_adapters import _adapter_unavailable_message
         enabled_platform_count = 0
         _multiplex_on = self._multiplex_on()
         _multiplex_skipped_platforms: list[Platform] = []
@@ -1239,12 +1504,7 @@ class GatewayStartupMixin:
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
             if not platform_config.enabled:
                 continue
-            # Multiplex: a platform enabled in the shared config.yaml may hold its token only in a
-            # secondary profile's .env; an empty primary would queue a reconnect loop that never heals.
-            # Starting that primary adapter with an empty token fails immediately and queues an infinite
-            # reconnect loop that can never heal (#64674). Secondary profiles still start their own adapters
-            # under _profile_runtime_scope with the real token -- skip the empty primary instead of failing
-            # loudly.
+            # Skip empty primary credentials in multiplex mode; secondary profiles may supply the token.
             if _multiplex_on and not _platform_has_bot_credential(platform, platform_config):
                 logger.info(
                     "Skipping %s on default profile: no bot credential in this "
@@ -1252,6 +1512,9 @@ class GatewayStartupMixin:
                     "provide the token will still connect.", platform.value,
                 )
                 _multiplex_skipped_platforms.append(platform)
+                continue
+            from gateway import zero_cut_standby as zcs  # after credential gating, like active startup
+            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config):
                 continue
             enabled_platform_count += 1
             adapter = self._create_adapter(platform, platform_config)
@@ -1264,6 +1527,17 @@ class GatewayStartupMixin:
                         "No adapter for '%s' -- is the plugin installed? "
                         "(platform is enabled in config.yaml but no plugin registered it)", platform.value,
                     )
+                # Only a platform that can heal on its own is queued for the reconnect watcher; either way
+                # flag it so the unserved enabled platform is visible.
+                heals = self._adapter_may_heal(platform, platform_config)
+                self._update_platform_runtime_status(
+                    platform.value, platform_state="retrying" if heals else "fatal",
+                    error_code="adapter_unavailable",
+                    error_message=_adapter_unavailable_message(platform, retrying=heals),
+                    needs_attention=True,
+                )
+                if heals:
+                    self._failed_platforms[platform] = self._startup_retry_entry(platform, None, platform_config)
                 continue
             # Under multiplexing the default profile needs the same whole-handler runtime scope as a
             # secondary (authorization and prompt rendering run before the agent-turn scope).
@@ -1284,7 +1558,7 @@ class GatewayStartupMixin:
             )
             try:
                 ok = await self._connect_initial_adapter_with_timeout(adp, p)
-            except Exception as _exc:  # noqa: BLE001 - surfaced below as a retryable error
+            except Exception as _exc:
                 return (p, adp, p_cfg, "exception", _exc)
             return (p, adp, p_cfg, "ok" if ok else "failed", None)
 
@@ -1395,7 +1669,8 @@ class GatewayStartupMixin:
     def _transient_exit_streak_path():
         from hermes_cli.config import get_hermes_home
 
-        return get_hermes_home() / ".transient_startup_exits"
+        from gateway.gateway_slot import process_slot_filename
+        return get_hermes_home() / process_slot_filename(".transient_startup_exits")
 
     def _reset_transient_exit_streak(self) -> None:
         """A platform connected, so the backend recovered; forget the retry budget."""
@@ -1415,7 +1690,7 @@ class GatewayStartupMixin:
         """
         path = self._transient_exit_streak_path()
         try:
-            previous = int(path.read_text(encoding="utf-8").strip() or 0)
+            previous = int(path.read_text(encoding="utf-8-sig").strip() or 0)
         except Exception:  # noqa: BLE001 — absent or unreadable means no streak yet
             previous = 0
         # Clamp: a negative or absurd value in the file (corruption, a stray write, a
@@ -1502,9 +1777,17 @@ class GatewayStartupMixin:
 
     async def _start_secondary_profiles(
         self, connected_count: int, _multiplex_skipped_platforms: list
-    ) -> Tuple[bool, int]:
+    ) -> tuple[bool, int]:
         """Bring up multiplexed secondary-profile adapters. Returns (aborted, connected_count)."""
         from gateway.run import MultiplexConfigError
+        from tools.process_registry import process_registry as _pr
+        # The launch profile's durable completions replay here, not at import (#123265); the
+        # secondaries' ledgers are replayed by _restore_secondary_completion_ledgers below.
+        # Off the loop: the replay writes state.db, and the liveness watchdog is already armed.
+        # A standby must not touch the shared ledger while the active gateway serves; promotion replays it.
+        from gateway.zero_cut_standby import is_standby
+        if not is_standby():
+            await asyncio.to_thread(_pr.restore_completions)
         # Secondary-profile adapters connect under their own home + credential scope.
         try:
             connected_count += await self._start_secondary_profile_adapters()
@@ -1537,15 +1820,12 @@ class GatewayStartupMixin:
         self, connected_count: int, enabled_platform_count: int, startup_retryable_errors: list,
         startup_nonretryable_errors: list,
     ) -> bool:
-        """Log/degrade when a configured platform failed to start; return True when startup must exit.
-
-        The SHARED gate for every platform, not the api_server path: a configured platform that never
-        came up must leave a loud, observable trace (ERROR + a ``degraded`` runtime state) even while
-        sibling platforms serve normally. One WARNING next to "Gateway running with N platform(s)" let
-        a gateway with no API server at all look healthy for half an hour (api_server lost the bind
-        race against the gateway it was replacing, and nothing retried).
-        """
+        """Log/degrade when a configured platform failed to start; return True when startup must exit."""
         from gateway.run import _write_runtime_status_quiet
+        from gateway.zero_cut_standby import is_standby
+        if is_standby() and getattr(self, "_standby_deferred", None):
+            logger.info("Standby has deferred platforms; continuing without connections until promotion")
+            return False
         if connected_count != 0:
             self._reset_transient_exit_streak()  # a platform connected: the backend recovered
             if startup_nonretryable_errors:
@@ -1603,22 +1883,16 @@ class GatewayStartupMixin:
             logger.info("Gateway will continue running for cron job execution.")
             return False
         if startup_retryable_errors:
-            # All retryable: stay alive (cron runs, watcher recovers) rather than systemd restart-loop.
             logger.warning(
                 "Gateway started with no connected platforms — %d platform(s) queued for retry: %s",
-                len(self._failed_platforms), "; ".join(startup_retryable_errors),
+                len(startup_retryable_errors), "; ".join(startup_retryable_errors),
             )
             _write_runtime_status_quiet(gateway_state="degraded", exit_reason=None)
-        # No adapter for any enabled platform: fleet nodes share one config.yaml but hold a subset of
-        # credentials, so degrade gracefully.
         logger.warning(
-            # Fall through to the normal "running" state — reconnect watcher takes it from here. In fleet
-            # deployments the same config.yaml is shared across nodes that may only have credentials for a
-            # subset of platforms. Rather than failing hard, degrade gracefully and allow cron jobs to run
-            # (#5196).
             "No adapter could be created for any of the %d configured platform(s). "
             "Check that required dependencies are installed and credentials are set. "
-            "Gateway will continue for cron job execution.", enabled_platform_count,
+            "Gateway will continue for cron job execution; platforms whose plugin may still register "
+            "are queued for background retry.", enabled_platform_count,
         )
         return False
 
@@ -1659,7 +1933,11 @@ class GatewayStartupMixin:
 
     async def _start_finish_wiring(self, connected_count: int) -> None:
         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            return
         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
+        self._restart_resume_outcomes = set()
         await self._start_post_connect_services(connected_count)
         # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
         if connected_count > 0:
@@ -1668,32 +1946,50 @@ class GatewayStartupMixin:
         # One-shot signal for _is_stale_restart_redelivery.
         if _restart_notification_pending():
             self._booted_from_restart = True
-        # Boot-path adapter.send() calls must not pin the inbound restore gate (a Telegram flood-
-        # control sleep here once froze every platform).
-        # Restart notification, home-channel startup notice, and obligation redelivery all call
-        # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
+        # Claim delivery-ledger obligations before snapshotting resume-pending sessions. Claiming an
+        # answered turn clears its live resume flag; taking this snapshot first replays the turn (#91969).
+        claimed = await self._claim_pending_obligations()
+        candidates = await self._resume_pending_candidates_async()
+        breaker_tripped = bool(getattr(candidates, "breaker_tripped", False))
+        # Only this version's durable turn markers may create a startup interruption note. Legacy
+        # resume_pending rows have no resume_turn_id; apply the same freshness/authorization/adapter
+        # admission as auto-resume before routing note sends through the bounded boot-send task.
+        interrupted_note_keys = self._startup_interrupted_note_candidates(candidates)
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
+            interrupted_note_keys=interrupted_note_keys,
+            claimed=claimed,
         )
-        # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
-        # interrupted session must wait as a distinct event, not enter that turn's history.
-        from gateway.run_pending_recovery import recover_pending_shutdown_flush
-        candidates = self._resume_pending_candidates()
-        try:
-            recover_pending_shutdown_flush(self, candidates=candidates)
-        except Exception:
-            logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
-        # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
-        # auto-resume stays visible on the next user message.
-        self._schedule_resume_pending_sessions(candidates=candidates)
+        # Refresh before follow-up recovery without spending boot budget or overriding a tripped verdict.
+        if candidates is not None:
+            refreshed = await self._resume_pending_candidates_async(record_boot=False)
+            if refreshed is not None:
+                refreshed = ResumeCandidates(refreshed)
+                refreshed.breaker_tripped = breaker_tripped
+            candidates = refreshed
+        await self._recover_pending_shutdown_flush_off_loop(
+            candidates=candidates,
+            failure_message="Pending-message recovery failed; spools retained",
+        )
+        # Resume turns must not start before background MCP discovery has published the tool set they may
+        # rely on. This wait is bounded so a wedged discovery cannot stall gateway availability.
+        await self._await_mcp_discovery()
+        # The boot decision survives the async refresh and reconnect path. Never evade the
+        # breaker merely because an interruption-note send is unavailable or ambiguous.
+        self._restart_resume_breaker_tripped = breaker_tripped
+        self._schedule_resume_pending_sessions(
+            candidates=candidates, allow_resume=not breaker_tripped, start_scheduler=False,
+        )
         await self._finish_startup_restore()
         # Queue bounded parent-facing recovery notices after adapters/session restore are ready.
         # The async delegation watcher performs the route/authorization preflight and durable
         # trigger claim; this startup hook never reconstructs a child process.
-        self._schedule_auto_resume_delegations()
+        await asyncio.to_thread(self._schedule_auto_resume_delegations)  # reads every profile's state.db
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.
         await self._send_session_db_warning_notifications()
+        from gateway.cron_store_notices import install_cron_store_notices
+        install_cron_store_notices(self, asyncio.get_running_loop())
         # Resume recovered process watchers. Detach the batch atomically (fresh list, not clear(): a
         # concurrent append during the yield must not be lost); yield every 100 to keep the loop live.
         with _log_suppressed(logging.ERROR, "Recovered watcher setup error: %s"):
@@ -1716,11 +2012,15 @@ class GatewayStartupMixin:
         "_kanban_notifier_watcher", "_kanban_dispatcher_watcher",
     )
     _POST_RECONNECT_WATCHERS = (
-        "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_profile_reconcile_watcher",
+        "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_session_control_watcher", "_profile_reconcile_watcher",
     )
 
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            self._spawn_reconnect_watcher()
+            return
         for method in self._PRE_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         if self._failed_platforms:
@@ -1728,9 +2028,9 @@ class GatewayStartupMixin:
                 "Starting reconnection watcher for %d failed platform(s): %s",
                 len(self._failed_platforms), ", ".join(p.value for p in self._failed_platforms),
             )
-        # Supervised: an escaping exception is restarted with backoff instead of stranding queued
-        # platforms (the ensure hook only runs on a NEW fatal). ``on_spawn`` keeps the handle current.
-        self._spawn_reconnect_watcher()
+        # Supervised reconnect watcher; a standby already spawned it, so promotion must not add a second.
+        if getattr(self, "_reconnect_watcher_task", None) is None or self._reconnect_watcher_task.done():
+            self._spawn_reconnect_watcher()
         for method in self._POST_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         # Scale-to-zero watcher ONLY when opted in, messaging is relay-only/absent, and a wakeUrl exists.
@@ -1744,10 +2044,10 @@ class GatewayStartupMixin:
             else:
                 # Say WHY an OPTED-IN instance didn't arm (non-opted stays silent).
                 self._log_scale_to_zero_not_armed_reason()
-        except Exception:  # noqa: BLE001 - arming must never block startup
+        except Exception:
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
+        self._start_zero_cut_busy_watcher()
         # Drain-control watcher: reconciles new-turn acceptance with the dashboard's ``.drain_request.json``
-        # marker (prior-instantiation markers are ignored via epoch).
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
     @staticmethod
@@ -1762,15 +2062,37 @@ class GatewayStartupMixin:
 
     async def start(self) -> bool:
         """Start the gateway and all configured platform adapters."""
+        startup_succeeded = False
         try:
-            return await self._start_impl()
+            result = await self._start_impl()
+            startup_succeeded = bool(result and getattr(self, "_running", False))
+            return result
+        except Exception:
+            # Fail closed through the normal stop path: adapters may already be connected and inbound
+            # may be queued behind restore, so spool it and disconnect before the error propagates. A
+            # failed boot never writes a clean receipt: the next start must still recover this run.
+            self._suppress_clean_shutdown_receipt = True
+            try:
+                await self.stop()
+            except Exception:
+                logger.exception("Gateway cleanup failed after startup error")
+            raise
         finally:
+            # Early startup aborts can return before the normal finish-wiring discovery phase; release any
+            # API requests waiting on the readiness barrier when the runner is no longer starting.
+            mcp_ready = getattr(self, "_mcp_discovery_ready", None)
+            if isinstance(mcp_ready, asyncio.Event) and not startup_succeeded:
+                mcp_ready.set()
             # Every startup path (early aborts included) ends here: bound startup on the latest
             # diagnostic snapshot once, instead of flushing at each return.
             await self._start_flush_runtime_status()
 
     async def _start_impl(self) -> bool:
         logger.info("Starting Hermes Gateway...")
+        # Until the previous-run recovery decision completes, shutdown must not write a fresh
+        # clean receipt: an abort during adapter startup would otherwise turn an unclean boot into
+        # a clean one on the next restart.
+        self._suppress_clean_shutdown_receipt = True
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
         # Spools remain on disk on early aborts: only a boot with an initialized session
@@ -1779,18 +2101,24 @@ class GatewayStartupMixin:
             return True
         if self._start_check_access_policy():
             return True
-        await self._start_recover_previous_run()
-        # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
-        # demand-time site (provider resolution, /login, the connector token) is a read that needs the
-        # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast
-        # first DM from arriving with nothing to resolve. With the launch gate unset this is a local
-        # inventory and no network.
+        # Register plugins, the relay adapter, and hooks before creating platform adapters. Relay
+        # self-provisioning may disable direct platforms, leaving Platform.RELAY as the only ingress.
+        await asyncio.to_thread(self._start_register_plugins_relay_hooks)
+        # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
+        with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
+            from hermes_cli.plugins import get_plugin_manager
+            self._subscribe_plugin_rewire(get_plugin_manager())
+        self.hooks.discover_and_load()
+        # The free-tier bootstrap resolves demand-time identity locally before inbound admission; it does
+        # not touch state.db.
         await self._run_free_tier_bootstrap()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
+        self._mcp_discovery_ready = asyncio.Event()
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        self._start_mcp_discovery()
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()
@@ -1823,22 +2151,16 @@ class GatewayStartupMixin:
             return True
         if await self._abort_startup_if_shutdown_requested():
             return True
+        from gateway.zero_cut_standby import is_standby
+        if not is_standby():
+            await self._start_recover_previous_run()
+        self._suppress_clean_shutdown_receipt = False
+        if not is_standby():  # a standby opens no shared store until promotion
+            await self._start_prime_session_db_after_ready()
         self.delivery_router.adapters = self.adapters
-        if getattr(self.config, "durable_outbox_enabled", False):
-            from gateway.outbox import open_outbox, recover
-            from gateway.run import _multiplex_profile_homes
-            from hermes_constants import get_hermes_home
-
-            destinations = [(get_hermes_home(), self.adapters.get(Platform.TELEGRAM))]
-            for profile_name, profile_home in _multiplex_profile_homes(self.config):
-                if profile_name != "default":
-                    adapters = (getattr(self, "_profile_adapters", None) or {}).get(profile_name, {})
-                    destinations.append((Path(profile_home), adapters.get(Platform.TELEGRAM)))
-            for home, adapter in destinations:
-                if adapter is not None:
-                    sent, held = await recover(await open_outbox(home), adapter)
-                    if sent or held:
-                        logger.info("Gateway outbox recovery for %s: sent=%s held=%s", home, sent, held)
+        if getattr(self.config, "durable_outbox_enabled", False) and not is_standby():
+            from gateway.outbox import recover_gateway_destinations
+            await recover_gateway_destinations(self)  # a standby replays after promotion
         self._wire_teams_pipeline_runtime()
         self._running = True
         self._install_plugin_message_injector()
@@ -1848,6 +2170,8 @@ class GatewayStartupMixin:
         self._update_runtime_status(self._serving_state())
         await self._start_finish_wiring(connected_count)
         self._start_spawn_background_watchers()
+        from hermes_cli.observability.shared_metrics_startup import record_process_ready
+        record_process_ready("gateway_boot", background=True)
         logger.info("Press Ctrl+C to stop")
         return True
 
@@ -1883,8 +2207,8 @@ class GatewayStartupMixin:
             raise RuntimeError(f"could not load config for profile '{profile_name}': {exc}") from exc
 
     async def _handoff_resolve_destination(
-        self, row: Dict[str, Any], profile_name: Optional[str]
-    ) -> "GatewayStartupMixin._HandoffDestination":
+        self, row: dict[str, Any], profile_name: Optional[str]
+    ) -> GatewayStartupMixin._HandoffDestination:
         """Resolve platform, transport, home channel, thread and destination source for a row."""
         from gateway.delivery import resolve_delivery_transport
         cli_session_id = row["id"]
@@ -1911,7 +2235,7 @@ class GatewayStartupMixin:
         cli_title = row.get("title") or cli_session_id[:8]
         try:
             new_thread_id = await transport.adapter.create_handoff_thread(
-                home_chat_id, f"Hermes — {cli_title}",
+                home_chat_id, t("gateway.startup.handoff_thread_title", title=cli_title),
             )
         except Exception as exc:
             logger.debug("Handoff: create_handoff_thread raised on %s: %s", platform_name, exc, exc_info=True)
@@ -1995,7 +2319,7 @@ class GatewayStartupMixin:
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
 
-    async def _process_handoff(self, row: Dict[str, Any], profile_name: Optional[str] = None) -> None:
+    async def _process_handoff(self, row: dict[str, Any], profile_name: Optional[str] = None) -> None:
         """Execute one handoff row; raises on failure (caller marks failed). ``profile_name`` (None =
         root) is the profile whose store queued it — load-bearing under multiplex: secondaries live in
         ``_profile_adapters`` and the key must be namespaced ``agent:<profile>:...`` or nobody reads it."""
@@ -2005,7 +2329,9 @@ class GatewayStartupMixin:
         # Ensure a session_store entry exists for this key; switch_session then re-points it.
         await self.async_session_store.get_or_create_session(dest.source)
         # switch_session ends the prior session and reopens the CLI session under the new key.
-        switched = await self.async_session_store.switch_session(session_key, cli_session_id)
+        switched = await self.async_session_store.switch_session(
+            session_key, cli_session_id, preserve_prompt_pin=False,
+        )
         if switched is None:
             raise RuntimeError(f"could not switch session key {session_key} → {cli_session_id}")
         # Evict the cached AIAgent (rebuild against the CLI session_id, like /resume) and clear stale

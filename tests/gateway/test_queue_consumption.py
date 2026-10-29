@@ -220,6 +220,22 @@ class TestBusyInputModeQueueFifo:
 
 
 
+    def test_arrival_during_drain_stays_behind_existing_overflow(self):
+        """A dispatched head leaves an empty slot, not an empty FIFO."""
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = "telegram:user:fifo"
+        events = [self._text_event(text) for text in ("first", "second", "third", "fourth")]
+        for event in events[:3]:
+            runner._enqueue_fifo(session_key, event, adapter)
+
+        # The drain owns the first input while the runner yields on lock lookup.
+        assert adapter._pending_messages.pop(session_key) is events[0]
+        runner._enqueue_fifo(session_key, events[3], adapter)
+
+        assert adapter._pending_messages[session_key] is events[1]
+        assert runner._overflow_queue(session_key) == events[2:]
+        assert events[3]._gateway_accepted
+
     def _media_event(self, path: str, mime: str, message_type: MessageType, text: str = "") -> MessageEvent:
         source = MagicMock(chat_id="c1", platform=Platform.TELEGRAM, profile=None)
         return MessageEvent(

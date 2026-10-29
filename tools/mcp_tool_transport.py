@@ -13,8 +13,12 @@ from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
 from agent import runtime_cwd as _runtime_cwd
 from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
-from tools.mcp_tool_lifecycle import _filter_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
+from tools.mcp_tool_lifecycle import (
+    _filter_mcp_children, _leader_start_time, _orphan_stdio_pid_servers, _orphan_stdio_pids,
+    _stdio_pgids, _stdio_processes, _stdio_sessions, _stdio_pids, _stdio_starttimes,
+)
 from tools.mcp_tool_common import _core
+from tools.mcp_tool_node_abi import node_abi_error
 from tools import mcp_tool_config as _config
 from tools import mcp_tool_lifecycle as _lifecycle
 from tools import mcp_tool_registration as _registration
@@ -77,15 +81,6 @@ def _mcp_proxy_mounts(httpx_mod, url: str, ssl_verify, client_cert, server_name:
     return mounts or None
 
 
-def _pgroup_alive(pgid: Optional[int]) -> bool:
-    """Signal 0 to the group succeeds iff any member is alive (POSIX only)."""
-    try:
-        os.killpg(pgid, 0)  # windows-footgun: ok — guarded by AttributeError below
-        return True
-    except (AttributeError, TypeError, OSError):  # non-POSIX / pgid None / gone
-        return False
-
-
 class LiveEndpointUnavailable(ConnectionError):
     """A declared runtime file did not provide a usable live endpoint."""
 
@@ -109,6 +104,43 @@ def _live_endpoint(server_name: str) -> Optional[tuple[str, dict]]:
         register_vault_redaction_value(endpoint.token)
     headers = {"Authorization": f"Bearer {endpoint.token}"} if endpoint.token else {}
     return endpoint.url, headers
+
+
+def _http_endpoint(server_name: str, config: dict) -> tuple[str, dict]:
+    """URL + configured headers, overlaid by a ``server_json`` live endpoint's URL and bearer."""
+    url, headers = config["url"], dict(config.get("headers") or {})
+    live = _live_endpoint(server_name)
+    if live is not None:
+        url, live_headers = live
+        headers.update(live_headers)
+    return url, headers
+
+
+def _stdio_launch(config: dict) -> tuple:
+    """(command, env, cwd) a stdio child is spawned with, resolved in the current profile's scope."""
+    command, env = _config._resolve_stdio_command(config["command"], _config._build_safe_env(config.get("env")))
+    # A stdio child inherits this process's cwd when none is configured. Hosted sessions (ACP,
+    # gateway) pin a logical cwd via agent.runtime_cwd; without it the child resolves relative
+    # paths against the daemon's launch dir, not the session workspace. Explicit config always
+    # wins; an existing session/TERMINAL_CWD anchor becomes the default; else native (None).
+    # The resolved default is fixed for the connection's lifetime.
+    cwd = config.get("cwd")
+    if cwd is None:
+        cwd = _runtime_cwd.resolve_context_cwd() or None
+    return command, env, cwd
+
+
+def _connect_inputs(server_name: str, config: dict) -> tuple[list, set]:
+    """What a connection is opened with, resolved in the current profile's scope: stdio
+    ``[command, env, cwd]``; HTTP ``[url, headers]`` after the live endpoint and the identity
+    header. The owner hashes this very list and an adopter recomputes it, so both digests are
+    built from one code path. Also returns the configured header names (HTTP only), captured
+    before the identity header is merged in, for the strict-redirect boundary."""
+    if "url" in config:
+        url, headers = _http_endpoint(server_name, config)
+        configured_header_names = {key.lower() for key in headers}
+        return [url, _apply_identity_header(server_name, config, headers)], configured_header_names
+    return list(_stdio_launch(config)), set()
 
 
 class MCPServerTransportMixin:
@@ -194,7 +226,7 @@ class MCPServerTransportMixin:
         keeps later requests legacy-shaped (envelope and MCP-Protocol-Version header), the form the
         handshake itself just proved the server accepts. The returned result keeps the server's own
         version for logging/diagnostics."""
-        import mcp.types as types  # late: keeps the SDK import lazy
+        from mcp import types  # late: keeps the SDK import lazy
         offered = _core.LATEST_HANDSHAKE_VERSION
         build_caps = getattr(session, "_build_capabilities", None)
         capabilities = build_caps(offered) if callable(build_caps) else types.ClientCapabilities()
@@ -253,13 +285,18 @@ class MCPServerTransportMixin:
 
     # ------------------------------------------------------------------ stdio
 
-    def _track_spawned_children(self, new_pids: Set[int]) -> None:
+    def _track_spawned_children(self, new_pids: set[int]) -> None:
         """Ledger the freshly spawned stdio children (pids, pgids, machine spawn ledger). pgids are
         captured while alive (getpgid fails after exit; the sweep needs them for reparented descendants)."""
-        new_pgids: Dict[int, int] = {}
+        new_pgids: dict[int, int] = {}
+        new_sessions: Dict[int, int] = {}
+        new_starts: dict[int, int] = {}
+        _lifecycle._remember_mcp_processes(new_pids)
         for pid in new_pids:
             try:
                 new_pgids[pid] = os.getpgid(pid)
+                if hasattr(os, "getsid"):
+                    new_sessions[pid] = os.getsid(pid)
             except ProcessLookupError:
                 # Raced and already exited. The SDK spawns with start_new_session=True, so the
                 # child was its own group leader (pgid == pid): keep that group covered — any
@@ -268,9 +305,16 @@ class MCPServerTransportMixin:
                 new_pgids[pid] = pid
             except (AttributeError, OSError):  # Windows (os.getpgid is POSIX-only)
                 pass
+            # Record the leader's start time so a later sweep can detect PID/PGID
+            # recycling before signalling (see _stdio_starttimes, #43044).
+            start = _leader_start_time(pid)
+            if start is not None:
+                new_starts[pid] = start
         with _core._lock:
             _stdio_pids.update(dict.fromkeys(new_pids, self.name))
             _stdio_pgids.update(new_pgids)
+            _stdio_sessions.update(new_sessions)
+            _stdio_starttimes.update(new_starts)
         # Machine spawn ledger (startup sweeps reap orphans after an unclean exit); best-effort.
         for _pid in new_pids:
             try:
@@ -284,25 +328,49 @@ class MCPServerTransportMixin:
         # _kill_orphaned_mcp_children) still reap as before; this only covers when they never run.
         _core._update_death_supervisor("register", new_pgids.values())
 
-    def _release_spawned_children(self, new_pids: Set[int]) -> None:
+    def _release_spawned_children(self, new_pids: set[int]) -> None:
         """Drop the ledger entries; a child (or its pgroup) still alive means SDK teardown failed
         (common on mid-way cancel on Linux: setsid() children escape) — mark it orphaned for the sweep."""
-        from gateway.status import _pid_exists
-        # Groups with nothing left alive; the supervisor forgets them after the lock is released.
-        # Groups still alive stay registered on purpose, so the supervisor still reaps them if this
-        # process dies before the orphan sweep runs.
+        # A child (or its pgroup) still alive means SDK teardown failed; mark it
+        # orphaned for the sweep.  A recorded session that enumerates empty is
+        # the only case where release may unregister the group immediately.
         released_pgids: list = []
         with _core._lock:
             for pid in new_pids:
                 _stdio_pids.pop(pid, None)
-                # Windows-safe pid probe; the child may be gone while descendants remain in its pgroup.
-                if _pid_exists(pid) or _pgroup_alive(_stdio_pgids.get(pid)):
+                pgid = _stdio_pgids.get(pid)
+                session_id = _stdio_sessions.get(pid)
+                original = _stdio_processes.get(pid, {})
+                members = _lifecycle._owned_mcp_processes(
+                    original, pgid, os.getpgrp() if hasattr(os, "getpgrp") else None,
+                    session_id=session_id,
+                )
+                # Keep the original leader handle as well as any late-discovered
+                # members so a later sweep refreshes only through live witnesses.
+                retained = dict(original)
+                retained.update(members)
+                _stdio_processes[pid] = retained
+                group_scan = (
+                    _lifecycle._enumerate_mcp_group(pgid, session_id)
+                    if pgid is not None else None
+                )
+                group_empty = (
+                    pgid is not None
+                    and (group_scan == {} or getattr(group_scan, "foreign", False))
+                )
+                if members or (pgid is not None and not group_empty):
                     _orphan_stdio_pids.add(pid)
                     _orphan_stdio_pid_servers[pid] = self.name
-                else:  # nothing to reap — drop the pgid so PID reuse can't surface stale pgroup state
+                else:  # no group and no verified process left to reap
+                    _lifecycle._stdio_processes.pop(pid, None)
                     dropped = _stdio_pgids.pop(pid, None)
+                    _stdio_sessions.pop(pid, None)
+                    _stdio_starttimes.pop(pid, None)
                     if dropped is not None:
                         released_pgids.append(dropped)
+        # Do not unregister a recorded POSIX group merely because its current
+        # members were temporarily unverifiable; the death supervisor remains
+        # the safety net for that group.
         _core._update_death_supervisor("unregister", released_pgids)
 
     async def _run_stdio(self, config: dict):
@@ -316,20 +384,28 @@ class MCPServerTransportMixin:
         command = config.get("command")
         if not command:
             raise ValueError(f"MCP server '{self.name}' has no 'command' in config")
-        command, safe_env = _config._resolve_stdio_command(command, _config._build_safe_env(config.get("env")))
+        inputs, _ = _connect_inputs(self.name, config)
+        # Hash the inputs this attempt spawns with, never a second resolution of them.
+        self._resolved_identity = _registration._identity_digest(inputs)
+        command, safe_env, stdio_cwd = inputs
         # OSV malware preflight, then the cached-npx swap (ordering enforced there).
         command, args = await _core._preflight_stdio_command(self.name, command, config.get("args", []))
-        # A stdio child inherits this process's cwd when none is configured. Hosted sessions (ACP,
-        # gateway) pin a logical cwd via agent.runtime_cwd; without it the child resolves relative
-        # paths against the daemon's launch dir, not the session workspace. Explicit config always
-        # wins; an existing session/TERMINAL_CWD anchor becomes the default; else native (None).
-        stdio_cwd = config.get("cwd")
-        if stdio_cwd is None:
-            stdio_cwd = _runtime_cwd.resolve_context_cwd() or None
         server_params = _core.StdioServerParameters(
             command=command, args=args, env=safe_env or None, cwd=stdio_cwd,
             # Windows pipes can split non-UTF-8 bytes at chunk boundaries; substitute, don't raise.
             encoding_error_handler="replace")
+        # Windows has no POSIX parent-death supervisor / killpg safety net (#61059): when this
+        # process dies ungracefully (crash, force-quit), the stdio child trees — npx.cmd →
+        # node.exe — survive as orphans with ParentId=null and pile up across restarts. Attaching
+        # THIS process to a KILL_ON_JOB_CLOSE job before the spawn makes every child (and
+        # grandchild) created after it die with the parent at the kernel level, so no orphan can
+        # outlive us. Idempotent; BREAKAWAY_OK keeps deliberate breakaway children escaping.
+        # Self-guards: a cheap no-op returning False on non-Windows.
+        try:
+            from hermes_cli.process_identity import attach_self_to_kill_on_close_job
+            attach_self_to_kill_on_close_job()
+        except Exception:
+            logger.debug("job-object self-attach failed before stdio spawn", exc_info=True)
         # Reap orphans of prior attempts first (else retries pile up zombie pairs); unscoped on purpose;
         # off-loop because the reaper blocks up to 2s.
         await asyncio.to_thread(_lifecycle._kill_orphaned_mcp_children)
@@ -344,21 +420,36 @@ class MCPServerTransportMixin:
         new_pids: set = set()
         # Subprocess stderr goes to ~/.hermes/logs/mcp-stderr.log so banners can't corrupt the TUI.
         _config._write_stderr_log_header(self.name)
+        stderr = _config._StderrTee(_config._get_mcp_stderr_log())
         try:
-            errlog = _config._get_mcp_stderr_log()
-            async with _core.stdio_client(server_params, errlog=errlog) as (read_stream, write_stream):
+            async with _core.stdio_client(server_params, errlog=stderr.sink) as (read_stream, write_stream):
                 # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
                 # into the window: they share the TUI's pgid — leaking them would killpg() the TUI.
                 new_pids = _filter_mcp_children(_lifecycle._snapshot_child_pids() - pids_before)
                 if new_pids:
                     self._track_spawned_children(new_pids)
                 self._stdio_child_pids = set(new_pids)  # so in-flight calls fail fast when the child dies
-                async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
-                    # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
-                    # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
-                    connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
-                    return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
+                try:
+                    async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
+                        # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
+                        # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
+                        connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
+                        return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
+                finally:
+                    # Capture late npx/mcp-remote helpers BEFORE stdio_client's
+                    # __aexit__ closes stdin and waits for the wrapper to exit.
+                    # Release runs afterward, when that ancestry is already gone.
+                    # Synchronous capture also runs under task cancellation.
+                    if new_pids:
+                        _lifecycle._remember_mcp_processes(new_pids, refresh=True)
+        except Exception as exc:
+            # The SDK only sees "Connection closed"; the child's stderr says why (#124264).
+            abi_error = node_abi_error(self.name, await asyncio.to_thread(stderr.close))
+            if abi_error is not None:
+                raise abi_error from exc
+            raise
         finally:  # clean exit, exceptions AND cancellation
+            stderr.close(timeout=0)
             if new_pids:
                 self._release_spawned_children(new_pids)
 
@@ -528,18 +619,15 @@ class MCPServerTransportMixin:
             raise ImportError(f"MCP server '{self.name}' requires HTTP transport but "
                               "mcp.client.streamable_http is not available. "
                               "Upgrade the mcp package to get HTTP support.")
-        url = config["url"]
-        headers = dict(config.get("headers") or {})
-        live = _live_endpoint(self.name)
-        if live is not None:
-            url, live_headers = live
-            headers.update(live_headers)
+        # Agent Plugins v1 strict_redirect_headers: configured headers MUST NOT follow a cross-origin
+        # redirect — their names are captured BEFORE client-generated headers are merged in.
+        inputs, configured_header_names = _connect_inputs(self.name, config)
+        # Hash the endpoint this attempt connects to: a second read of the runtime file could
+        # publish another endpoint's identity alongside this session.
+        self._resolved_identity = _registration._identity_digest(inputs)
+        url, headers = inputs
         logger.debug("MCP server '%s': connecting to %s", self.name, url)
         self._http_rejection = {}  # last 4xx/5xx the owned client saw this attempt (recorder hook)
-        # Agent Plugins v1 strict_redirect_headers: configured headers MUST NOT follow a cross-origin
-        # redirect — capture their names BEFORE client-generated headers are merged in.
-        configured_header_names = {key.lower() for key in headers}
-        headers = _apply_identity_header(self.name, config, headers)  # explicit same-name headers win
         # Seed MCP-Protocol-Version (user override wins) from the HANDSHAKE version, not the latest: a
         # 2026-07-28 header routes the handshake-era ``initialize()`` onto the envelope ladder, which rejects it.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):

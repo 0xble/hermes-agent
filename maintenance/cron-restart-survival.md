@@ -1,16 +1,30 @@
 # Cron restart survival on macOS
 
-Patch identities: `cron-macos-detached`, `cron-restart-survival`.
+Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`.
 
 ## Contract
 
 Under a launchd-managed macOS gateway, hand each cron execution to the existing external worker in a new session, rather than running it in the gateway process. The worker adopts the durable execution claim, owns its (PID, process-start fingerprint) liveness, completes the ledger, and queues delivery for the replacement gateway. Honor `cron.require_restart_safe_scope` without requiring systemd on macOS. Foreground/desktop invocations and Linux systemd dispatch retain their current behavior. A worker that has recorded an inactivity timeout but still has an abandoned non-daemon executor thread must retain its hard-wall watchdog until the process exits; a terminal delivery receipt from normal send, restart recovery, or wait timeout must project onto its execution row without replaying an uncertain send.
 
+The gateway's in-process dedupe claim is owned by the detached worker waiter until the worker process actually exits. A terminal execution row is not sufficient proof that teardown and delivery have stopped: the waiter must keep blocking a concurrent fire while the PID is live, then release only the owner-fenced claim on process exit. The shared release path fences every ordinary waiter/pool cleanup while that worker claim is live; only the owner-authorized reaper or forced-release path may override it. Forced-release and shutdown-drain paths remain authoritative if the waiter itself is lost.
+
 This is a core scheduler/dispatch invariant; a plugin or skill cannot atomically own cron's claim, worker handoff and recovery. Revert this unit's dispatch selection and regression when an upstream release proves the same launchd restart-survival contract. The Linux transient-scope worker and delivery queue are upstream-owned infrastructure reused here.
 
 ## Proof and limitation
 
-Run `tests/cron/test_restart_safe_worker.py`, `tests/cron/test_bounded_worker_recovery.py`, `tests/cron/test_delivery_queue.py`, `tests/cron/test_hard_wall_real_path.py`, `tests/cron/test_double_fork_sweep.py` and `tests/cron/test_hard_wall_completion_race.py` on macOS, then `./bin/ci preflight` and the exact-SHA `gate`. The SQLite execution row is the sole completion fence: worker output is composed and, for gateway-queued notices, an idempotent gated queue item is admitted before the terminal result commits. The gateway cannot claim a gated item until that result commits with a matching outcome. At the cap the watchdog CAS-writes failed(timeout) only if the row remains running. A pre-committed success notice is suppressed when timeout wins, and the occurrence is never retried. When completion won, the watchdog grants a config-derived, finite post-commit allowance (up to 60s including descendant cleanup), then exits with the recorded result. An abandoned executor never disarms the cap. Once a queue receipt exists its status projects onto the execution row; an eligible delivery survives a worker exit after terminal commit and drains once. Only unprojected terminal queue receipts/tombstones are reconciled, in one indexed scan and one execution-ledger connection per drain. The E2E uses a disposable profile, script and fake `ai.hermes-test.*` identity; never touch the live gateway job.
+Run `tests/cron/test_restart_safe_worker.py`, `tests/cron/test_bounded_worker_recovery.py`, `tests/cron/test_delivery_queue.py`, `tests/cron/test_hard_wall_real_path.py`, `tests/cron/test_double_fork_sweep.py` and `tests/cron/test_hard_wall_completion_race.py` on macOS, then `./bin/ci preflight` and the exact-SHA `gate`. The SQLite execution row is the sole completion fence: worker output is composed and, for gateway-queued notices, an idempotent gated queue item is admitted before the terminal result commits. The gateway cannot claim a gated item until that result commits with a matching outcome. At the cap the watchdog CAS-writes failed(timeout) only if the row remains running. A pre-committed success notice is suppressed when timeout wins, and the occurrence is never retried. When completion won, the watchdog grants a config-derived, finite post-commit allowance (up to 60s including descendant cleanup), then exits with the recorded result. An abandoned executor never disarms the cap. Once a queue receipt exists its status projects onto the execution row; an eligible delivery survives a worker exit after terminal commit and drains once. Only unprojected terminal queue receipts/tombstones are reconciled, in one indexed scan and one execution-ledger connection per drain. The E2E uses a disposable profile, script and fake `ai.hermes-test.*` identity; never touch the live gateway job. The real-path test's default synthetic watchdog cap is 10 seconds, not the production profile cap; its completion-versus-delivery fence case uses 30 seconds because it tests terminal arbitration rather than timeout ownership. The watchdog starts before `run_one_job`, so native macOS process/import/SQLite startup consumes the same budget. A 3-second test cap passed in isolation but flaked under the nightly's four-file concurrency (runs `38548768361`, `38717597758`, and `38765700954`); keep the default test budget at or above 10 seconds unless the worker startup contract changes.
+
+## Operator-selected job deadlines
+
+The `cron-restart-survival` patch also permits a persisted, CLI-only per-job
+`hard_wall_timeout_seconds` override for detached/external workers. Unset or
+cleared jobs retain the profile cap; malformed legacy overrides fall back to it.
+The in-process gateway path remains outside this process-termination guarantee.
+Upstream adoption must preserve both per-job selection and watchdog ownership
+after an inactivity future is abandoned. Additional proof:
+`tests/cron/test_job_wall_timeout.py` and `tests/cron/test_immutable_worker_real.py`.
+Pinned-release fixtures must stage the candidate scheduler with its job and
+deadline dependencies, not mix its facade with older committed implementations.
 
 ## Cross-store state machine
 

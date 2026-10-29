@@ -29,7 +29,7 @@ def _receipt(home: Path, **fields):
     (directory / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_maintenance_installer_keeps_flat_profiles_working(tmp_path):
+def test_maintenance_installer_targets_current_release(tmp_path):
     mod = _load("install_candidate_extensions")
     home = tmp_path / "profile"
     home.mkdir()
@@ -41,12 +41,27 @@ def test_maintenance_installer_keeps_flat_profiles_working(tmp_path):
     assert all((scripts / name).stat().st_mode & stat.S_IXUSR for name in installed)
     shell = (scripts / "sync_fork_candidate_job.sh").read_text(encoding="utf-8")
     assert '$profile_home/scripts/sync_fork_candidate.py' in shell
+    assert 'runtime_python="$profile_home/current/.venv/bin/python"' in shell
+    assert '$profile_home/hermes-agent/venv/bin/python' not in shell
+    checker = (scripts / "check_fork_patches.py").read_text(encoding="utf-8-sig")
+    assert "home / 'current'" in checker
+    assert "--repo" in checker
+    assert "home / 'hermes-agent'" not in checker
 
-    runtime_scripts = home / "hermes-agent" / "scripts"
+    release = home / "releases" / ("a" * 40)
+    runtime_scripts = release / "scripts"
     runtime_scripts.mkdir(parents=True)
+    (release / ".hermes_build_sha").write_text("a" * 40, encoding="utf-8")
+    python = release / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
     (runtime_scripts / "sync_fork_candidate.py").write_text("print('forwarded')\n", encoding="utf-8")
+    (home / "current").symlink_to(release, target_is_directory=True)
+    legacy_scripts = home / "hermes-agent" / "scripts"
+    legacy_scripts.mkdir(parents=True)
+    (legacy_scripts / "sync_fork_candidate.py").write_text("print('stale')\n", encoding="utf-8")
     env = os.environ.copy()
-    env.pop("HERMES_HOME", None)
+    env["HERMES_HOME"] = str(home)
     completed = subprocess.run([sys.executable, str(scripts / "sync_fork_candidate.py")],
                                env=env, capture_output=True, text=True, check=True)
     assert completed.stdout.strip() == "forwarded"
@@ -87,6 +102,71 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     _receipt(tmp_path, sha=head)  # the legacy shape the old check accepted
     (tmp_path / "logs/update_receipts/latest.json").write_text(json.dumps({"sha": head}), encoding="utf-8")
     assert any("not a native" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_check_receipt_ignores_pm_latest_for_the_newest_update(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})  # nothing running
+    _receipt(tmp_path)
+    directory = tmp_path / "logs" / "update_receipts"
+    native = directory / "update_20261005_045152_65780_a276f85a563a4f74983a41e34995844a.json"
+    native.write_text((directory / "latest.json").read_text(encoding="utf-8"), encoding="utf-8")
+    (directory / "latest.json").write_text(json.dumps({"kind": "sync", "outcome": "ok", "steps": []}), encoding="utf-8")
+
+    assert mod.check_receipt(tmp_path) == []
+
+
+def test_check_receipt_treats_lone_pm_latest_as_no_update(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    monkeypatch.setattr(mod, "_git", lambda *args: "b" * 40)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    (directory / "latest.json").write_text(json.dumps({"kind": "sync", "outcome": "ok", "steps": []}), encoding="utf-8")
+    assert mod.check_receipt(tmp_path) == []
+    # A non-PM legacy pointer is still schema-checked, not silently skipped.
+    (directory / "latest.json").write_text(json.dumps({"sha": "b" * 40}), encoding="utf-8")
+    assert any("not a native" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_newest_update_receipt_orders_by_mtime_not_local_name(tmp_path):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    # When DST ends the local-time stamp repeats, so a later run can sort earlier by name.
+    later_by_name = directory / "update_20261101_015900_1_a.json"
+    newer_on_disk = directory / "update_20261101_011000_2_b.json"
+    later_by_name.write_text("{}", encoding="utf-8")
+    newer_on_disk.write_text("{}", encoding="utf-8")
+    os.utime(later_by_name, (1_000, 1_000))
+    os.utime(newer_on_disk, (2_000, 2_000))
+    assert mod._newest_update_receipt(tmp_path) == newer_on_disk
+
+
+def test_newest_update_receipt_skips_a_receipt_pruned_after_glob(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    kept = directory / "update_20261005_045152_1_a.json"
+    kept.write_text("{}", encoding="utf-8")
+    pruned = directory / "update_20261005_045153_2_b.json"
+    real_glob = Path.glob
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: [*real_glob(self, pattern), pruned])
+    assert mod._newest_update_receipt(tmp_path) == kept
+
+
+def test_newest_update_receipt_ignores_non_regular_entries(tmp_path):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    kept = directory / "update_20261005_045152_1_a.json"
+    kept.write_text("{}", encoding="utf-8")
+    os.utime(kept, (1_000, 1_000))
+    (directory / "update_20261005_045153_2_dir.json").mkdir()
+    os.mkfifo(directory / "update_20261005_045154_3_fifo.json")
+    assert mod._newest_update_receipt(tmp_path) == kept
 
 
 @pytest.mark.parametrize("kind", ["directory", "file"])
@@ -308,3 +388,35 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     assert mod.check_config(tmp_path) == []
     values["memory.write_approval"] = "true"
     assert mod.check_config(tmp_path) == ["config memory.write_approval = 'true', expected 'false'"]
+
+
+def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    release = tmp_path / "releases" / ("b" * 40)
+    python = release / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("placeholder", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    calls = []
+    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m"}
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+    assert all(call[0][0] == str(python) for call in calls)
+    assert all(call[1]["cwd"] == str(release) for call in calls)
+    assert all(call[1]["env"]["PYTHONPATH"] == str(release) for call in calls)
+
+
+def test_runtime_checks_fail_closed_when_release_interpreter_is_missing(tmp_path):
+    mod = _load("check_fork_patches")
+    release = tmp_path / "releases" / ("c" * 40)
+    release.mkdir(parents=True)
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+
+    context = mod._runtime_context(tmp_path)
+    assert isinstance(context, str) and "release interpreter" in context
+    assert mod.check_config(tmp_path) == [context]

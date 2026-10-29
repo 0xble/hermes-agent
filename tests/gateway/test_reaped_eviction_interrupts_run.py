@@ -53,8 +53,9 @@ def _build_gateway(agent, events: list[tuple]):
     return gateway, state
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entrypoint", ("direct", "reaped"))
-def test_eviction_interrupts_before_release_and_drops_cached_agent(entrypoint: str) -> None:
+async def test_eviction_interrupts_before_release_and_drops_cached_agent(entrypoint: str) -> None:
     events: list[tuple] = []
     gateway = None
 
@@ -73,7 +74,7 @@ def test_eviction_interrupts_before_release_and_drops_cached_agent(entrypoint: s
     gateway._release_running_agent_state = release_with_record
     if entrypoint == "reaped":
         gateway.session_store = _ReapedStore()
-        gateway._hm_evict_reaped_agent(KEY)
+        await gateway._hm_evict_reaped_agent(KEY)
     else:
         gateway._hm_evict_running_agent(KEY, "stale_running_agent_eviction")
 
@@ -190,3 +191,44 @@ def test_displaced_turn_lease_release_by_owning_generation() -> None:
     assert gateway._release_turn_lease(KEY, run_generation=1) is True
     assert token1.released is True
     assert 1 not in state.turn.lease_tokens
+
+
+@pytest.mark.asyncio
+async def test_reaped_probe_runs_off_the_event_loop() -> None:
+    """peek_session_id waits on the session-store lock a turn worker holds across a state.db
+    write; the 2026-10-11 09:22 watchdog kill had the loop thread parked there."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    probed_on: list[int] = []
+
+    class _Store(_ReapedStore):
+        def peek_session_id(self, session_key: str) -> str:
+            probed_on.append(threading.get_ident())
+            return super().peek_session_id(session_key)
+
+    events: list[tuple] = []
+    agent = _RecordingAgent(events, lambda: None)
+    gateway, state = _build_gateway(agent, events)
+    gateway.session_store = _Store()
+    await gateway._hm_evict_reaped_agent(KEY)
+    assert probed_on and loop_thread not in probed_on
+    assert agent.interrupted and state.turn.agent is None
+
+
+@pytest.mark.asyncio
+async def test_reaped_probe_never_evicts_a_turn_that_replaced_the_probed_run() -> None:
+    """A fresh turn that took the slot while the probe waited off-loop is not the reaped run."""
+    events: list[tuple] = []
+    stale = _RecordingAgent(events, lambda: None)
+    fresh = _RecordingAgent(events, lambda: None)
+    gateway, state = _build_gateway(stale, events)
+
+    class _Store(_ReapedStore):
+        def peek_session_id(self, session_key: str) -> str:
+            state.turn.agent = fresh  # the slot is re-claimed mid-probe
+            return super().peek_session_id(session_key)
+
+    gateway.session_store = _Store()
+    await gateway._hm_evict_reaped_agent(KEY)
+    assert not fresh.interrupted and state.turn.agent is fresh

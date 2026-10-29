@@ -13,10 +13,12 @@ Tests cover:
 """
 
 import asyncio
+import hashlib
 import json
 import time
 import types
 import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,6 +29,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    _admit_api_agent_request,
     _api_request_profile,
     _IdempotencyCache,
     _derive_chat_session_id,
@@ -289,12 +292,59 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
+class TestApiAdmissionMcpReadiness:
+    @pytest.mark.asyncio
+    async def test_pending_mcp_discovery_returns_bounded_503(self, monkeypatch):
+        from gateway.platforms import api_server as api_module
+
+        adapter = _make_adapter()
+        runner = types.SimpleNamespace(_mcp_discovery_ready=asyncio.Event())
+        adapter.gateway_runner = runner
+        request = types.SimpleNamespace(headers={}, app={"gateway_runner": runner})
+        called = []
+
+        async def handler(_self, _request):
+            called.append(True)
+            return web.Response(status=200)
+
+        monkeypatch.setenv("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", "0.01")
+        monkeypatch.setattr(api_module._api_runs, "_uses_room_run_auth", lambda *_args: False)
+        wrapped = _admit_api_agent_request(handler)
+
+        response = await wrapped(adapter, request)
+
+        assert response.status == 503
+        assert response.headers["Retry-After"] == "1"
+        assert json.loads(response.body)["error"]["code"] == "mcp_discovery_pending"
+        assert called == []
+
+    @pytest.mark.asyncio
+    async def test_admission_waits_for_discovery_within_startup_bound(self, monkeypatch):
+        """A turn arriving while discovery is still finishing is admitted once it publishes, not refused."""
+        from gateway.platforms import api_server as api_module
+
+        adapter = _make_adapter()
+        runner = types.SimpleNamespace(_mcp_discovery_ready=asyncio.Event())
+        adapter.gateway_runner = runner
+        request = types.SimpleNamespace(headers={}, app={"gateway_runner": runner})
+
+        async def handler(_self, _request):
+            return web.Response(status=200)
+
+        monkeypatch.setattr(api_module._api_runs, "_uses_room_run_auth", lambda *_args: False)
+        asyncio.get_running_loop().call_later(3.5, runner._mcp_discovery_ready.set)
+
+        response = await _admit_api_agent_request(handler)(adapter, request)
+
+        assert response.status == 200
+
+
+
+
+
+
+
 class TestConcurrencyCap:
-
-
-
-
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize("at_cap", [True, False], ids=["at-cap", "under-cap"])
     @pytest.mark.parametrize(
@@ -326,6 +376,52 @@ class TestConcurrencyCap:
         if at_cap:
             assert response.headers.get("Retry-After")
             assert mock_run.await_count == 0, "the turn must not start once the cap is reached"
+
+
+class TestRuntimeStatusMetrics:
+    def test_completed_buffered_runs_are_not_reported_active(self, adapter):
+        adapter._run_statuses = {
+            "done": {"status": "completed"},
+            "failed": {"status": "failed"},
+        }
+        adapter._run_streams = {"done": object(), "failed": object()}
+        adapter._inflight_agent_runs = 0
+
+        assert adapter._api_server_status_payload()["active_runs"] == 0
+
+    def test_record_api_metrics_publishes_status(self, adapter):
+        adapter._running = True
+
+        with patch.object(adapter, "_write_runtime_status_safe") as mock_write:
+            adapter._record_api_metrics({"total_tokens": 17}, 0.125)
+
+        assert adapter._metrics_requests_today == 1
+        assert adapter._metrics_messages_today == 1
+        assert adapter._metrics_tokens_today == 17
+        mock_write.assert_called_once()
+        _, kwargs = mock_write.call_args
+        assert kwargs["platform_state"] == "connected"
+        metrics = kwargs["platform_metrics"]
+        assert metrics["metrics_today"]["requests"] == 1
+        assert metrics["metrics_today"]["messages"] == 1
+        assert metrics["metrics_today"]["tokens"] == 17
+        assert metrics["metrics_today"]["latency_p95_ms"] == 125.0
+        assert metrics["last_request_at"] is not None
+        assert metrics["last_heartbeat"] is not None
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_loop_publishes_once_when_stopped(self, adapter):
+        adapter._running = True
+        calls = []
+
+        def publish_once():
+            calls.append(True)
+            adapter._running = False
+
+        with patch.object(adapter, "_publish_runtime_status", side_effect=publish_once):
+            await adapter._heartbeat_loop()
+
+        assert calls == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +790,7 @@ class TestDisconnectedAgentReap:
 
         deadline = time.time() + 1.0
         while not calls and time.time() < deadline:
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
         assert calls == [("run-stop-sess", frozenset(), "api_server_run_stop")]
         agent.interrupt.assert_called_once()
 
@@ -766,7 +862,8 @@ class TestHealthEndpoint:
             data = await resp.json()
             assert "version" in data
             assert isinstance(data["version"], str)
-            assert data["version"] != ""
+            from hermes_cli.version_info import get_version_info
+            assert data["version"] == get_version_info().base_version
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +875,9 @@ class TestHealthDetailedEndpoint:
     @pytest.mark.asyncio
     async def test_health_detailed_returns_ok(self, adapter):
         """GET /health/detailed returns status, platform, and runtime fields."""
+        adapter._running = True
+        with patch.object(adapter, "_write_runtime_status_safe"):
+            adapter._record_api_metrics({"total_tokens": 9}, 0.02)
         app = _create_app(adapter)
         with patch("gateway.status.read_runtime_status", return_value={
             "gateway_state": "running",
@@ -796,7 +896,10 @@ class TestHealthDetailedEndpoint:
                 assert data["status"] == "ok"
                 assert data["platform"] == "hermes-agent"
                 assert data["gateway_state"] == "running"
-                assert data["platforms"] == {"telegram": {"state": "connected"}}
+                assert data["platforms"]["telegram"] == {"state": "connected"}
+                assert data["platforms"]["api_server"]["metrics"]["metrics_today"]["requests"] == 1
+                assert data["metrics_today"]["tokens"] == 9
+                assert data["last_heartbeat"] is not None
                 assert data["active_agents"] == 2
                 # Derived busy/drainable: this endpoint is served BY the live
                 # gateway, so running + 2 agents ⇒ busy and drainable.
@@ -1348,6 +1451,30 @@ class TestDeriveChatSessionId:
         a = _derive_chat_session_id("You are a pirate.", "Hello")
         b = _derive_chat_session_id("You are a robot.", "Hello")
         assert a != b
+
+    def test_routed_profile_namespaces_the_id_without_moving_default(self):
+        """Two header-less conversations opening with identical text on different profiles must
+        not share one session/sandbox key (#123989); default/standalone ids stay byte-identical
+        so live conversations survive the upgrade."""
+        legacy = "api-" + hashlib.sha256(b"sys\nhello").hexdigest()[:16]
+        assert _derive_chat_session_id("sys", "hello") == legacy
+        assert _derive_chat_session_id("sys", "hello", "default") == legacy
+        research = _derive_chat_session_id("sys", "hello", "research")
+        assert research != legacy
+        assert research == _derive_chat_session_id("sys", "hello", "research")
+
+    def test_launch_profile_prefix_keeps_the_unprefixed_id(self, monkeypatch, tmp_path):
+        """A gateway launched as ``work`` serves ``/p/work/`` and the bare route as ONE profile:
+        both must derive one id, or the same conversation forks by URL."""
+        import hermes_constants
+        from hermes_cli import profiles
+
+        work = tmp_path / "profiles" / "work"
+        work.mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "get_routing_process_hermes_home", lambda: work)
+        monkeypatch.setattr(profiles, "get_profile_dir", lambda name: tmp_path / "profiles" / name)
+        assert _derive_chat_session_id("sys", "hello", "work") == _derive_chat_session_id("sys", "hello")
+        assert _derive_chat_session_id("sys", "hello", "research") != _derive_chat_session_id("sys", "hello")
 
 
 # ---------------------------------------------------------------------------
@@ -2207,13 +2334,6 @@ class TestChatCompletionsAgentIncomplete:
 
 
 class TestCORS:
-    def test_origin_allowed_for_non_browser_client(self, adapter):
-        assert adapter._origin_allowed("") is True
-
-
-    def test_origin_allowed_for_allowlist_match(self):
-        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
-        assert adapter._origin_allowed("http://localhost:3000") is True
 
 
     @pytest.mark.asyncio
@@ -2227,23 +2347,6 @@ class TestCORS:
 
 
     @pytest.mark.asyncio
-    async def test_cors_allows_idempotency_key_header(self):
-        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.options(
-                "/v1/chat/completions",
-                headers={
-                    "Origin": "http://localhost:3000",
-                    "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "Idempotency-Key",
-                },
-            )
-            assert resp.status == 200
-            assert "Idempotency-Key" in resp.headers.get("Access-Control-Allow-Headers", "")
-
-
-    @pytest.mark.asyncio
     async def test_cors_options_preflight_allowed_for_configured_origin(self):
         """Configured origins can complete browser preflight."""
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -2254,12 +2357,49 @@ class TestCORS:
                 headers={
                     "Origin": "http://localhost:3000",
                     "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "Authorization, Content-Type",
+                    "Access-Control-Request-Headers": "Authorization, Content-Type, Idempotency-Key",
                 },
             )
             assert resp.status == 200
             assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:3000"
-            assert "Authorization" in resp.headers.get("Access-Control-Allow-Headers", "")
+            allowed = resp.headers.get("Access-Control-Allow-Headers", "")
+            assert "Authorization" in allowed
+            assert "Idempotency-Key" in allowed
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("live_bot_chat", [False, True], ids=["agent_turn", "live_bot_chat"])
+    async def test_cors_headers_present_on_session_chat_stream(self, live_bot_chat):
+        """Both session SSE writers (agent turn and live Bot Chat hand-off) must
+        resolve CORS up front: the middleware can't touch headers after
+        ``prepare()`` flushes them (#72892).
+        """
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        admitted = (Path("unused"), {"delivery_id": "d1", "status": "queued"}) if live_bot_chat else None
+        settled = {"delivery_id": "d1", "status": "settled", "reply": "ok"}
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_get_existing_session_or_404", return_value=({"id": "s1"}, None)),
+                patch.object(adapter, "_conversation_history_for_session", return_value=[]),
+                patch.object(adapter, "_admit_to_live_bot_chat", new_callable=AsyncMock, return_value=admitted),
+                patch.object(adapter, "_await_live_bot_chat_receipt", new_callable=AsyncMock, return_value=settled),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/api/sessions/s1/chat/stream",
+                    json={"message": "hi"},
+                    headers={"Origin": "http://localhost:3000"},
+                )
+                assert resp.status == 200
+                await resp.text()  # consume SSE stream fully
+                assert mock_run.called is not live_bot_chat
+        assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:3000"
+        assert "POST" in resp.headers.get("Access-Control-Allow-Methods", "")
 
 
 # ---------------------------------------------------------------------------
@@ -2487,7 +2627,7 @@ def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
         },
     )
     monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "global/model")
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._load_gateway_config", dict)
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda model="": {})
     )
@@ -3075,3 +3215,43 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="s2", gateway_session_key="ch")
         assert captured[1]["model"] == "anthropic/claude-opus-4.6"
+
+
+@pytest.mark.asyncio
+async def test_api_admission_waits_for_mcp_discovery(monkeypatch):
+    """Authenticated API turns cannot enter a handler before startup tool discovery completes."""
+    import gateway.platforms.api_server as api_server
+
+    ready = asyncio.Event()
+    calls = []
+
+    class Adapter:
+        gateway_runner = types.SimpleNamespace(_mcp_discovery_ready=ready)
+        _pending_agent_requests = 0
+
+        @staticmethod
+        def _check_auth(request):
+            del request
+            return None
+
+        @staticmethod
+        def _draining_response():
+            return None
+
+    monkeypatch.setattr(api_server._api_runs, "_uses_room_run_auth", lambda *_args: False)
+
+    @_admit_api_agent_request
+    async def handler(self, request):
+        del request
+        calls.append(True)
+        return "ok"
+
+    adapter = Adapter()
+    task = asyncio.create_task(handler(adapter, types.SimpleNamespace(app={})))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert calls == []
+    assert adapter._pending_agent_requests == 1
+    ready.set()
+    assert await task == "ok"
+    assert adapter._pending_agent_requests == 0

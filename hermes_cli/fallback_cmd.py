@@ -16,25 +16,25 @@ _read_chain = get_fallback_chain
 _MISSING_ACTIVE_PROVIDER = object()
 
 
-def _identity(entry: Dict[str, Any]):
+def _identity(entry: dict[str, Any]):
     """BackendIdentity for a ``{provider, model, base_url?}`` entry."""
     from agent.backend_identity import BackendIdentity
     return BackendIdentity.build(provider=entry.get("provider"), model=entry.get("model"), base_url=entry.get("base_url"))
 
 
-def _write_chain(config: Dict[str, Any], chain: List[Dict[str, Any]]) -> None:
+def _write_chain(config: dict[str, Any], chain: list[dict[str, Any]]) -> None:
     """Persist the chain to ``fallback_providers``; drop the legacy key so there is one source of truth."""
     config["fallback_providers"] = chain
     config.pop("fallback_model", None)
 
 
-def _format_entry(entry: Dict[str, Any]) -> str:
+def _format_entry(entry: dict[str, Any]) -> str:
     """One-line human-readable rendering of a fallback entry."""
     base = entry.get("base_url")
     return f"{entry.get('model', '?')}  (via {entry.get('provider', '?')}){f'  [{base}]' if base else ''}"
 
 
-def _extract_fallback_from_model_cfg(model_cfg: Any) -> Optional[Dict[str, Any]]:
+def _extract_fallback_from_model_cfg(model_cfg: Any) -> Optional[dict[str, Any]]:
     """Pull the ``{provider, model, base_url?, api_mode?}`` dict from a ``config["model"]`` snapshot."""
     if not isinstance(model_cfg, dict):
         return None
@@ -42,7 +42,7 @@ def _extract_fallback_from_model_cfg(model_cfg: Any) -> Optional[Dict[str, Any]]
     model = (model_cfg.get("default") or model_cfg.get("model") or "").strip()  # the picker writes ``model.default``
     if not provider or not model:
         return None
-    entry: Dict[str, Any] = {"provider": provider, "model": model}
+    entry: dict[str, Any] = {"provider": provider, "model": model}
     entry.update({key: value for key in ("base_url", "api_mode") if (value := (model_cfg.get(key) or "").strip())})
     return entry
 
@@ -99,7 +99,7 @@ def _entries(n: int) -> str:
     return f"{n} {'entry' if n == 1 else 'entries'}"
 
 
-def _print_chain(heading: str, chain: List[Dict[str, Any]]) -> None:
+def _print_chain(heading: str, chain: list[dict[str, Any]]) -> None:
     print(f"  {heading} ({_entries(len(chain))}):")
     print("".join(f"    {i}. {_format_entry(entry)}\n" for i, entry in enumerate(chain, 1)))
 
@@ -114,7 +114,7 @@ def _load_chain(empty_message: str):
     return config, chain or None
 
 
-def _describe_primary(config: Dict[str, Any]) -> Optional[str]:
+def _describe_primary(config: dict[str, Any]) -> Optional[str]:
     """One-line description of the primary model for display purposes."""
     model_cfg = config.get("model")
     if isinstance(model_cfg, dict):
@@ -124,7 +124,7 @@ def _describe_primary(config: Dict[str, Any]) -> Optional[str]:
     return model_cfg.strip() or None if isinstance(model_cfg, str) else None
 
 
-def cmd_fallback_list(args) -> None:  # noqa: ARG001
+def cmd_fallback_list(args) -> None:
     """Print the current fallback chain."""
     config, chain = _load_chain("  No fallback providers configured.")
     if chain is None:
@@ -194,7 +194,7 @@ def cmd_fallback_add(args) -> None:
     print("  Run `hermes fallback list` to view, or `hermes fallback remove` to delete.")
 
 
-def cmd_fallback_remove(args) -> None:  # noqa: ARG001
+def cmd_fallback_remove(args) -> None:
     """Pick an entry from the chain and remove it."""
     from hermes_cli.config import save_config
     config, chain = _load_chain("  No fallback providers configured — nothing to remove.")
@@ -214,7 +214,7 @@ def cmd_fallback_remove(args) -> None:  # noqa: ARG001
     print(f"  Chain is now {_entries(len(chain))} long.\n" if chain else "  Fallback chain is now empty.\n")
 
 
-def cmd_fallback_clear(args) -> None:  # noqa: ARG001
+def cmd_fallback_clear(args) -> None:
     """Remove all fallback entries (with confirmation)."""
     from hermes_cli.config import save_config
     config, chain = _load_chain("  No fallback providers configured — nothing to clear.")
@@ -235,13 +235,78 @@ def cmd_fallback_clear(args) -> None:  # noqa: ARG001
     print("\n  Fallback chain cleared.\n")
 
 
+def cmd_fallback_status(args) -> None:  # noqa: ARG001
+    """Show active shared primary-model cooldowns (``hermes fallback status`` / ``cooldowns``)."""
+    from datetime import datetime
+    from agent.shared_primary_cooldown import list_cooldowns
+    try:
+        records = list_cooldowns(strict=True)
+    except OSError as exc:
+        print(f"\n  Primary-model cooldown state is unreadable: {exc}\n")
+        return
+    print()
+    if not records:
+        print("  No primary-model cooldowns active.\n")
+        return
+    print("  Shared primary-model cooldowns:\n")
+    for record in records:
+        try:
+            reset_at = float(record.get("reset_at", 0) or 0)
+            reset = datetime.fromtimestamp(reset_at).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        except (TypeError, ValueError, OSError, OverflowError):
+            reset = "unknown"
+        print(
+            f"  {record.get('model', '?')} via {record.get('provider', '?')} "
+            f"(reset {reset}; reason {record.get('reason', '?')}; "
+            f"backoff {record.get('backoff_count', 0)})"
+        )
+    print()
+
+
+def cmd_fallback_cooldowns_clear(args) -> None:
+    """Clear shared primary cooldowns: ``--all``, or one exact ``provider/model`` or model.
+
+    Never touches the configured fallback chain (that is ``hermes fallback clear``). Running
+    agents pick the change up at their next turn start, which re-reads the shared record.
+    """
+    from agent.shared_primary_cooldown import clear_cooldowns
+    target = str(getattr(args, "target", None) or "").strip()
+    clear_all = bool(getattr(args, "all", False))
+    if clear_all == bool(target):
+        print("\n  Specify exactly one of --all or an exact provider/model (or model) to clear.")
+        print("  Run `hermes fallback cooldowns` to list active cooldowns.\n")
+        raise SystemExit(2)
+    try:
+        removed = clear_cooldowns(target or None, all_routes=clear_all)
+    except OSError as exc:
+        print(f"\n  Could not update the shared cooldown state: {exc}\n")
+        raise SystemExit(1) from exc
+    print()
+    if not removed:
+        print(f"  No shared primary cooldown matches {target!r}.\n" if target else "  No shared primary cooldowns to clear.\n")
+        return
+    for record in removed:
+        if record.get("quarantined"):
+            print(f"  Quarantined unreadable cooldown state: {record['quarantined']}")
+        else:
+            print(f"  Cleared: {record.get('model', '?')} via {record.get('provider', '?')}")
+    print("\n  Running agents retry the primary at their next turn start.\n")
+
+
+def cmd_fallback_cooldowns(args) -> None:
+    """Dispatch ``hermes fallback cooldowns [clear]``; listing is the default."""
+    if getattr(args, "cooldowns_command", None) == "clear":
+        cmd_fallback_cooldowns_clear(args)
+    else:
+        cmd_fallback_status(args)
+
+
 def cmd_fallback(args) -> None:
-    """Top-level dispatcher for ``hermes fallback [subcommand]``."""
     sub = getattr(args, "fallback_command", None)
     handler = _SUBCOMMANDS.get(sub)
     if handler is None:
         print(f"Unknown fallback subcommand: {sub}")
-        print("Use one of: list, add, remove, clear")
+        print("Use one of: list, add, remove, clear, status, cooldowns")
         raise SystemExit(2)
     handler(args)
 
@@ -249,4 +314,5 @@ def cmd_fallback(args) -> None:
 _SUBCOMMANDS = {
     **dict.fromkeys((None, "", "list", "ls"), cmd_fallback_list), "add": cmd_fallback_add,
     **dict.fromkeys(("remove", "rm"), cmd_fallback_remove), "clear": cmd_fallback_clear,
+    "status": cmd_fallback_status, "cooldowns": cmd_fallback_cooldowns,
 }

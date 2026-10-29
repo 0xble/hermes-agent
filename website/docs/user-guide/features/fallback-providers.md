@@ -49,6 +49,34 @@ fallback:
 | Key | Default | Effect |
 |-----|---------|--------|
 | `fallback.min_switch_reset_seconds` | `0` (off) | A rate-limited primary whose declared reset is sooner than this many seconds is not swapped for a fallback; the retry backoff waits out the window instead. |
+| `fallback_providers[].max_stay_seconds` | unset (off) | After this entry has been active longer than a positive number of seconds, re-evaluate at the next model-call boundary: restore the primary if its shared cooldown permits it, otherwise retry only entries earlier in the chain. Unavailable candidates are skipped normally. If none is available, keep the current route and reset its timer without a failure notice or metric; never move to a later backup. |
+
+Long turns check the primary's shared cooldown before each new model request,
+not just between user turns. A successful primary response in another session
+clears the shared outage so this session can restore at its next request.
+This applies only to provider fallbacks with a cooldown or a held shared outage
+record. Voice turns and explicit model routes are not rechecked. A generic
+server/transport failure that never armed a cooldown keeps the primary benched
+until the next user turn; a stay-limit re-walk retries only fallback entries.
+Neither check interrupts a stream or separates a tool call from its result.
+The optional stay limit also lets an earlier fallback recover while the primary
+is still benched; it does not shorten or clear the primary's shared cooldown.
+
+```yaml
+fallback_providers:
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4
+  - provider: openai
+    model: gpt-4.1
+    max_stay_seconds: 60
+```
+
+`max_stay_seconds` is provider-independent and travels with each normalized
+entry into the agent's fallback chain. Omitted, non-positive, or invalid values
+disable the extra chain re-check. Reclaiming an earlier backup or keeping the
+current route resets the timer. Stay expiry is not a provider failure: it emits
+no failure notice or failure metric. A re-evaluation error leaves the current
+route active.
 
 Gemini fallback entries accept `gemini`, `google`, `google-gemini`, and
 `google-ai-studio`. On Google's native API endpoint, all use the native Gemini
@@ -103,6 +131,7 @@ OpenAI-compatible base URL continues to use the compatible client instead.
 | Tencent TokenPlan | `tencent-tokenplan` | `TOKENPLAN_API_KEY` |
 | Microsoft Foundry | `azure-foundry` | `AZURE_FOUNDRY_API_KEY` + `AZURE_FOUNDRY_BASE_URL` |
 | LM Studio (local) | `lmstudio` | `LM_API_KEY` (or none for local) + `LM_BASE_URL` |
+| Local llama.cpp (managed) | `llamacpp` (aliases `llama.cpp`, `llama-cpp`) | The local model server Hermes manages (Desktop **Settings → Providers → Local models**), no `base_url` needed. If it is not running the entry is skipped — Hermes never sends the local model name to another provider |
 | Hugging Face | `huggingface` | `HF_TOKEN` |
 | Custom endpoint | `custom` | `base_url` + `key_env` (see below) |
 | Mixture of Agents preset | `moa` (`model` = preset name) | A configured MoA preset whose aggregator has credentials — the fallback runs the whole preset (references + aggregator), not the aggregator alone |
@@ -319,6 +348,7 @@ These options apply to `auxiliary:`, `compression:`, and `fallback_providers:` e
 | `"codex"` | Force Codex OAuth | `hermes model` → ChatGPT or Codex Subscription |
 | `"main"` | Use whatever provider the main agent uses (auxiliary tasks only) | Active main provider configured |
 | `"anthropic"` | Force Anthropic native | `ANTHROPIC_API_KEY` or Claude Code credentials |
+| `"llamacpp"` | Force the managed local llama.cpp server | Local model server running; when it is off, the local model name is never sent to another provider |
 
 ### Direct Endpoint Override
 

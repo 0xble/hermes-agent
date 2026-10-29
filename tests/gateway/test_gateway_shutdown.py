@@ -1,4 +1,5 @@
 import asyncio
+import time
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,7 +21,6 @@ async def test_cancel_background_tasks_cancels_inflight_message_processing():
 
     async def block_forever(_event):
         await release.wait()
-        return None
 
     adapter.set_message_handler(block_forever)
     event = MessageEvent(text="work", source=make_restart_source(), message_id="1")
@@ -61,7 +61,6 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 
     async def block_forever(_event):
         await release.wait()
-        return None
 
     adapter.set_message_handler(block_forever)
     event = MessageEvent(text="work", source=make_restart_source(), message_id="1")
@@ -96,9 +95,11 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 
 
 @pytest.mark.asyncio
-async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect():
+async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner, adapter = make_restart_runner()
     runner._completion_notification_batch_window = 3600
+    runner._session_state("telegram:dm:123456:u1").conversation.last_turn_started_at = time.time()
     event = {
         "session_id": "shutdown-batch",
         "started_at": 1.0,
@@ -133,7 +134,8 @@ async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect()
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
         await runner.stop()
 
-    assert await asyncio.wait_for(pending, timeout=1.0) is False
+    # The held result was released before teardown and preserved (drain FIFO or spool), not dropped.
+    assert await asyncio.wait_for(pending, timeout=1.0) is True
     assert call_order == ["batch_cancel_start", "batch_cancel_done", "disconnect"]
     assert runner._completion_notification_batch_flush_tasks == set()
 
@@ -216,7 +218,11 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
 
     call_order: list[str] = []
 
-    def _fake_kill_all(task_id=None):
+    def _fake_kill_all(task_id=None, **kwargs):
+        # kwargs carry kill_all's keyword-only args (source, consume_output);
+        # the shutdown sweep passes source="gateway_shutdown" so a
+        # persist_on_release job (#41225) is still killed on host exit.
+        assert kwargs.get("source") == "gateway_shutdown", kwargs
         call_order.append("kill_all")
         return 2
 
@@ -232,7 +238,7 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
     # Patch the module-level names the stop() helper imports lazily.
     import tools.process_registry as _pr
     import tools.terminal_tool as _tt
-    import tools.terminal_tool_lifecycle as terminal_tool_lifecycle
+    from tools import terminal_tool_lifecycle
     monkeypatch.setattr(_pr.process_registry, "kill_all", _fake_kill_all)
     monkeypatch.setattr(_tt, "cleanup_all_environments", _fake_cleanup_envs)
     monkeypatch.setattr(terminal_tool_lifecycle, "cleanup_all_environments", _fake_cleanup_envs)

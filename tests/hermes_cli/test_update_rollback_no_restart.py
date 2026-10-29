@@ -31,11 +31,9 @@ def test_rollback_no_gateway_restart_refused_before_state_change(tmp_path, monke
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update",
                         lambda *_args, **_kwargs: pytest.fail("fleet restarted"))
-    try:
+    with update_receipt.update_receipt_scope():
         with pytest.raises((SystemExit, ValueError, RuntimeError), match="rollback.*no-gateway-restart"):
             update_cmd._cmd_update_impl(args, gateway_mode=False)
-    finally:
-        update_receipt._current = None
     assert [(home / name).readlink() for name in ("current", "previous")] == before_links
     assert journal.read_bytes() == before[journal.name]
     assert not (home / "logs").exists()

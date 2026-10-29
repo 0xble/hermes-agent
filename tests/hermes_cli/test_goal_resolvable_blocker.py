@@ -27,15 +27,14 @@ def test_external_input_blocks_without_declaring_goal_unachievable(tmp_path, mon
     with patch("agent.auxiliary_client.call_llm", side_effect=reply):
         decision = manager.evaluate_after_turn("All local checks passed. Publication requires user approval.")
 
-    assert decision["verdict"] == "blocked"
-    assert decision["status"] == "paused"
+    # Needing the user is a user-message wait, not a pause and never "unachievable".
+    assert decision["verdict"] == "wait"
+    assert decision["status"] == "active"
     assert "unachievable" not in decision["message"].lower()
     assert "unachievable" not in manager.status_line().lower()
     assert "user input" in captured["prompt"].lower()
     assert "independent authorized work" in captured["prompt"].lower()
-    paused = goals.load_goal("external-blocker")
-    assert paused is not None and paused.status == "paused"
-    assert goals.GoalManager("external-blocker").resume_for_user_input()
-    resumed = goals.load_goal("external-blocker")
-    assert resumed is not None and resumed.status == "active" and resumed.turns_used == 1
+    waiting = goals.load_goal("external-blocker")
+    assert waiting is not None and waiting.status == "active" and waiting.waiting_on_user_message
+    assert goals.GoalManager("external-blocker").resume_for_user_input() is False
     goals._DB_CACHE.clear()

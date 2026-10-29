@@ -14,6 +14,7 @@ export interface QueueIfBusyInput {
   foregroundBusy?: boolean
   text: string
   displayText?: string
+  moaToken?: string
 }
 
 /**
@@ -28,18 +29,21 @@ export interface QueueIfBusyInput {
 export function queueKickoffIfSessionBusy({
   displayText,
   foregroundBusy = false,
+  moaToken,
   sessionId,
   storedSessionId,
   text
 }: QueueIfBusyInput): 'busy' | 'idle' | 'queued' {
   const states = $sessionStates.get()
 
-  if (!isTargetSessionBusy(states, sessionId, foregroundBusy)) {
+  if (!moaToken && !isTargetSessionBusy(states, sessionId, foregroundBusy)) {
     return 'idle'
   }
 
   const stored = storedSessionId ?? states[sessionId]?.storedSessionId ?? null
   const queueKey = resolveComposerSessionKey(stored, $sessions.get()) || stored || sessionId
 
-  return enqueueQueuedPrompt(queueKey, { attachments: [], displayText, text }) ? 'queued' : 'busy'
+  return enqueueQueuedPrompt(queueKey, { attachments: [], displayText, ...(moaToken ? { moaToken } : {}), text })
+    ? 'queued'
+    : 'busy'
 }

@@ -271,6 +271,50 @@ class TestTerminalToolSchema:
         assert array_alts and array_alts[0]["items"] == {"type": "string"}
 
 
+    @pytest.mark.parametrize("notify", ["true", "false", "on_exit", 1, {}])
+    def test_invalid_notify_teaches_unquoted_booleans_without_running(self, notify):
+        from tools import terminal_tool  # registers the real handler
+        from tools.registry import registry
+
+        with patch.object(terminal_tool, "terminal_tool") as run:
+            raw = registry.dispatch(
+                "terminal", {"command": "echo hi", "background": True, "notify": notify},
+            )
+
+        run.assert_not_called()
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+        assert "error" in result
+        assert "JSON boolean" in result["error"]
+        assert "not strings" in result["error"]
+        assert "notify=true" in result["error"]
+        assert "notify=false" in result["error"]
+        assert "notify=['ready']" in result["error"]
+
+    @pytest.mark.parametrize(("notify", "on_complete", "patterns"), [
+        (True, True, None),
+        (False, False, None),
+        (["ready"], False, ["ready"]),
+        (["ready", "ERROR"], False, ["ready", "ERROR"]),
+        ([], False, []),
+    ])
+    def test_valid_notify_keeps_exit_and_pattern_routing(self, notify, on_complete, patterns):
+        from tools import terminal_tool
+        from tools.registry import registry
+
+        with patch.object(terminal_tool, "terminal_tool", return_value='{"output": "ok"}') as run:
+            raw = registry.dispatch("terminal", {
+                "command": "echo hi", "background": True, "notify": notify,
+                "notify_on_complete": True, "watch_patterns": ["legacy"],
+            })
+
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+        assert result == {"output": "ok"}
+        run.assert_called_once()
+        assert run.call_args.kwargs["notify_on_complete"] is on_complete
+        assert run.call_args.kwargs["watch_patterns"] == patterns
+
     def test_foreground_watch_patterns_rejected_with_teaching_error(self):
         """Background-only modifiers on a foreground call fail loud with the
         corrected call shape instead of being silently ignored."""

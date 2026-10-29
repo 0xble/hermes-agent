@@ -4,7 +4,7 @@ Load when changing process heartbeat delivery, state DB writability preflight an
 
 ## Required behavior
 
-A heartbeat carries output written before it was armed and cannot follow the completion notice. A concurrent opener may quarantine a damaged state DB between a peer's `is_file` and `os.access` checks; a vanished file is not a read-only file. The native ACP E2E must actually summarize an old tool result through the ACP provider while preserving the active tail and validating subsequent prompt grounding.
+A heartbeat carries output written before it was armed and cannot follow the completion notice. A concurrent opener may quarantine a damaged state DB between a peer's `is_file` and `os.access` checks, or recreate that primary or a SQLite WAL before the failed access verdict is consumed. Revalidate the current file before refusing: a vanished path or a readable/writable replacement is not read-only. Preserve the directory check, home-scoped chmod repair, genuinely read-only refusal and WAL warning. The native ACP E2E must actually summarize an old tool result through the ACP provider while preserving the active tail and validating subsequent prompt grounding.
 
 ## Provenance and patch
 
@@ -16,8 +16,10 @@ Fork nightly [run 36274304491](https://github.com/0xble/hermes-agent/actions/run
 
 Upstream design checked against `NousResearch/hermes-agent` main `9bb2ea1b5c316578d00c826833f0ba01f09d1788` (root and area AGENTS plus CONTRIBUTING). Related open [upstream PR #122852](https://github.com/NousResearch/hermes-agent/pull/122852) independently fixes the early heartbeat cursor; this fork patch also guards the completion-order race. No upstream merge or release is claimed for it or for the two other repairs.
 
+The writable-replacement check adapts the final access revalidation from [upstream PR #142486](https://github.com/NousResearch/hermes-agent/pull/142486), merged as `ef9643393323dcf7675c467be9036aace4ee0c09`. Regressions force quarantine/recreation of the primary and a real SQLite sibling-close/recreated WAL outside the chmod scope. This does not establish the exact interleaving of an earlier hosted failure.
+
 ## Verification and retirement
 
-Run `scripts/run_tests.sh --file-retries 0` on `tests/e2e/core/providers/test_native_copilot_acp.py` (Linux non-root), `tests/hermes_state/test_zeroed_state_db.py`, and `tests/tools/test_process_heartbeat.py` in a pinned Linux CI container. The forced quarantine preflight race and heartbeat ordering tests are event-synchronized. Run `scripts/check_fork_patches.py --repo . --source-only` with a clean HOME and HERMES_HOME after committing.
+Run `scripts/run_tests.sh --file-retries 0` on `tests/e2e/core/providers/test_native_copilot_acp.py` (Linux non-root), `tests/hermes_state/test_zeroed_state_db.py`, `tests/hermes_state/test_hermes_state_readonly_preflight.py`, and `tests/tools/test_process_heartbeat.py` in a pinned Linux CI container. The forced quarantine preflight race and heartbeat ordering tests are event-synchronized. Run `scripts/check_fork_patches.py --repo . --source-only` with a clean HOME and HERMES_HOME after committing.
 
-Retire the fork patch only after the accepted upstream release has equivalent behavior and all three focused tests pass without these local changes. Reverting a single aspect requires retaining its invariant test and reassessing this unit's scope; no stored-state migration is involved.
+Retire the fork patch only after the accepted upstream release has equivalent behavior and all focused regressions pass without these local changes. Reverting a single aspect requires retaining its invariant test and reassessing this unit's scope; no stored-state migration is involved.

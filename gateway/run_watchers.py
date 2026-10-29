@@ -49,6 +49,8 @@ class GatewaySessionWatchersMixin:
 
     async def _session_housekeeping(self) -> None:
         """Idle/pressure agent-cache sweeps plus the hourly SessionStore prune."""
+        from gateway.telegram_retire import resume_all
+        await resume_all(self)
         try:
             if evicted := self._sweep_idle_cached_agents():
                 logger.info("Agent cache idle sweep: evicted %d agent(s)", evicted)
@@ -94,10 +96,10 @@ class GatewaySessionWatchersMixin:
             return None
         return summary if isinstance(summary, dict) else None
 
-    def _stall_candidates(self) -> Dict[str, tuple[Any, Any]]:
+    def _stall_candidates(self) -> dict[str, tuple[Any, Any]]:
         """session_key -> (adapter, pending event) from every live adapter's pending slot (default
         + multiplex profiles, deduped by identity), then the overflow queues; first one wins."""
-        candidates: Dict[str, tuple[Any, Any]] = {}
+        candidates: dict[str, tuple[Any, Any]] = {}
         maps = (getattr(self, "adapters", {}), *getattr(self, "_profile_adapters", {}).values())
         adapters = {id(a): a for m in maps for a in list(m.values()) if a is not None}
         for adapter in adapters.values():
@@ -187,10 +189,12 @@ class GatewaySessionWatchersMixin:
                 nonlocal result
                 # Bound the send: a wedged adapter transport (network hang, dead websocket) must not
                 # block the watcher pass — siblings would go unevaluated and the watcher stop.
-                result = await asyncio.wait_for(
-                    adapter.send(str(source.chat_id), notice, metadata=metadata),
-                    timeout=_STALL_NOTIFY_SEND_TIMEOUT_SECONDS,
-                )
+                from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+                with outbound_class(OUTBOUND_NOTICE):
+                    result = await asyncio.wait_for(
+                        adapter.send(str(source.chat_id), notice, metadata=metadata),
+                        timeout=_STALL_NOTIFY_SEND_TIMEOUT_SECONDS,
+                    )
             async with _async_profile_runtime_scope(self._resolve_profile_home_for_source(source)):
                 presented = await present_notification(send_notice, platform=source.platform)
             if not presented:
@@ -199,7 +203,7 @@ class GatewaySessionWatchersMixin:
             # Adapters often return SendResult(success=False) instead of raising.
             if result is not None and getattr(result, "success", True) is False:
                 raise RuntimeError(getattr(result, "error", "send returned success=False"))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "Session stall notify send timed out after %.0fs for %s; will retry next tick",
                 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS, session_key,

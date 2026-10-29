@@ -236,6 +236,42 @@ def test_immutable_home_reads_ownership_from_the_release_not_the_stale_worktree(
                          "--trailer-floor", floor, "--skip-config"]) == 0
 
 
+def test_immutable_release_reads_its_baseline_helper_when_source_lags(tmp_path, monkeypatch, capsys):
+    """A stale source checkout may lack the helper introduced by the promoted release."""
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    helper = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "release_baseline.py"
+    (tmp_path / "scripts" / "ci").mkdir(parents=True)
+    (tmp_path / "scripts" / "ci" / "release_baseline.py").write_text(helper.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    _units(tmp_path, "fixture")
+    (tmp_path / "MAINTENANCE.md").write_text(
+        f"Accepted release baseline: `v2026.9.24`, `{base}`\n", encoding="utf-8"
+    )
+    git("add", "MAINTENANCE.md", "scripts", "maintenance")
+    git("commit", "-qm", "release contract")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor")
+    floor = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "fork patch\n\nFork-Patch: fixture")
+    promoted = git("rev-parse", "HEAD")
+    git("checkout", "-q", base)
+    release = tmp_path / "releases" / promoted
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(promoted + "\n", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "check_extensions", lambda home: [])
+    monkeypatch.setattr(checker, "check_receipt", lambda home: [])
+    assert checker.main(["--home", str(tmp_path), "--trailer-floor", floor, "--skip-config"]) == 0
+    assert "OK: 0 problem(s)" in capsys.readouterr().out
+
+
+def test_recorded_baseline_accepts_a_legacy_one_argument_helper(tmp_path, monkeypatch):
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "_git_raw", lambda *args: "def accepted_release_baseline(root):\n    return 'legacy'\n")
+    assert checker._recorded_baseline("a" * 40) == "legacy"
+
+
 def test_missing_maintenance_units_fail_closed(tmp_path, monkeypatch):
     git = _repo(tmp_path)
     (tmp_path / "FORK_PATCHES.md").write_text("obsolete ledger", encoding="utf-8")

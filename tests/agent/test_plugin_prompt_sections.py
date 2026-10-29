@@ -7,6 +7,8 @@ import subprocess
 import sys
 import textwrap
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from agent.system_prompt import build_system_prompt, invalidate_system_prompt
 from hermes_cli import plugins
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -28,7 +30,7 @@ def _real_agent(*, session_id: str = "plugin-section-test") -> AIAgent:
 
 
 def _install_test_section(manager: PluginManager, content) -> None:
-    manager._discovered = True
+    mark_plugin_discovery_complete(manager)
     ctx = PluginContext(
         PluginManifest(name="example-plugin", key="example-plugin", source="user"),
         manager,
@@ -44,8 +46,8 @@ def _install_test_section(manager: PluginManager, content) -> None:
 def test_real_aiagent_freezes_section_within_life_and_rerenders_on_invalidate(monkeypatch):
     # Pin the workspace snapshot: build_coding_workspace_block shells out to
     # live `git status`/`git log` on every build, and a git call failing or
-    # timing out under xdist contention makes the two builds differ in the
-    # Branch/Recent-commits lines — a flake unrelated to what this test
+    # timing out under test-suite contention makes the two builds differ in
+    # the Branch/Recent-commits lines — a flake unrelated to what this test
     # asserts (plugin sections). Byte-stability of the REAL workspace block
     # is coding_context's contract, covered by its own tests.
     monkeypatch.setattr(
@@ -102,6 +104,7 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
         from agent.system_prompt import build_system_prompt, invalidate_system_prompt
         from hermes_cli import plugins
         from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        from tests.plugin_helpers import mark_plugin_discovery_complete
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
@@ -122,7 +125,7 @@ def test_fresh_process_resume_restores_identical_full_prompt_without_callback(tm
         )
 
         manager = PluginManager()
-        manager._discovered = True
+        mark_plugin_discovery_complete(manager)
         ctx = PluginContext(
             PluginManifest(name="example-plugin", key="example-plugin", source="user"),
             manager,

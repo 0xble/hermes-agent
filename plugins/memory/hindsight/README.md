@@ -72,6 +72,7 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
+| `recall_owner_subject` | — | Bank owner's name. A first-person auto-recall query ("what car do I drive") is also recalled with the name appended, and the two result lists are merged round-robin within one `recall_max_tokens` budget. First-person queries name no subject, so without this the owner's facts never enter Hindsight's candidate pool. Empty disables it. |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |

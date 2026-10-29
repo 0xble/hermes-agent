@@ -1,0 +1,22 @@
+{
+  "description": "List saved vault items without returning secret values.",
+  "name": "browser_vault_list",
+  "parameters": {
+    "properties": {
+      "kind": {
+        "enum": [
+          "login",
+          "payment",
+          "address",
+          "protected_field"
+        ],
+        "type": "string"
+      },
+      "origin": {
+        "type": "string"
+      }
+    },
+    "required": [],
+    "type": "object"
+  }
+}

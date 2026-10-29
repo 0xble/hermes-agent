@@ -3,7 +3,7 @@
 import argparse
 import time
 from argparse import Namespace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from types import SimpleNamespace
 
 import pytest
@@ -131,6 +131,44 @@ class TestCronCommandLifecycle:
         assert jobs[0]["name"] == "Skill combo"
 
 
+class TestCronEditPromptGuard:
+    """`hermes cron edit` shares the tool's prompt-update guard; --allow-shrink overrides it."""
+
+    _LONG = ("Summarize every open incident, its owner, and the next action. " * 12).strip()
+
+    def _run(self, *argv):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        return cron_command(parser.parse_args(["cron", "edit", *argv]))
+
+    def test_edit_refuses_placeholder_prompt(self, tmp_cron_dir, capsys):
+        job = create_job(prompt=self._LONG, schedule="every 1h")
+        assert self._run(job["id"], "--prompt", "__FILE__") == 1
+        out = capsys.readouterr().out
+        assert "placeholder" in out
+        assert f"{len(self._LONG)} chars" in out and "8 chars" in out
+        assert get_job(job["id"])["prompt"] == self._LONG
+
+    def test_edit_refuses_drastic_shrink(self, tmp_cron_dir, capsys):
+        job = create_job(prompt=self._LONG, schedule="every 1h")
+        assert self._run(job["id"], "--prompt", "Summarize incidents.") == 1
+        assert "shrink" in capsys.readouterr().out
+        assert get_job(job["id"])["prompt"] == self._LONG
+
+    def test_edit_allow_shrink_flag_overrides(self, tmp_cron_dir, capsys):
+        job = create_job(prompt=self._LONG, schedule="every 1h")
+        assert self._run(job["id"], "--prompt", "Summarize incidents.", "--allow-shrink") == 0
+        assert get_job(job["id"])["prompt"] == "Summarize incidents."
+        assert "Updated job" in capsys.readouterr().out
+
+    def test_edit_similar_length_prompt_allowed(self, tmp_cron_dir, capsys):
+        job = create_job(prompt=self._LONG, schedule="every 1h")
+        revised = self._LONG.replace("owner", "assignee")
+        assert self._run(job["id"], "--prompt", revised) == 0
+        assert get_job(job["id"])["prompt"] == revised
+
+
 class TestUnverifiedDeliveryVisibility:
     """An evidence-free live-adapter ack (Slack/Matrix/Mattermost bare
     ``SendResult(success=True)``) is accepted as delivered, but the UNVERIFIED
@@ -225,11 +263,11 @@ class TestCronDoctor:
         assert "unknown error" not in out
 
     def test_doctor_flags_overdue_next_run(self, tmp_cron_dir, capsys):
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         create_job(prompt="Hourly ping", schedule="every 1h")
         jobs = load_jobs()
-        stale = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        stale = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
         jobs[0]["next_run_at"] = stale
         save_jobs(jobs)
 
@@ -241,12 +279,12 @@ class TestCronDoctor:
         assert "not firing" in out
 
     def test_doctor_tolerates_slightly_late_next_run(self, tmp_cron_dir, capsys):
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         create_job(prompt="Hourly ping", schedule="every 1h")
         jobs = load_jobs()
         # 5 minutes late is within the ticker grace window — healthy.
-        recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        recent = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
         jobs[0]["next_run_at"] = recent
         save_jobs(jobs)
 
@@ -321,7 +359,7 @@ class TestGatewayNotRunningWarning:
 
     def test_list_warns_when_gateway_absent(self, tmp_cron_dir, capsys, monkeypatch):
         create_job(prompt="Daily report", schedule="0 11 * * *")
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", list)
         cron_command(Namespace(cron_command="list", all=True))
         out = capsys.readouterr().out
         assert "Scheduler is not ready" in out
@@ -345,14 +383,14 @@ class TestExternalCronProviderStatus:
         )
         # Even with NO gateway process and NO ticker heartbeat, Chronos status
         # must NOT report a stall / "not firing".
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", list)
         cron_command(Namespace(cron_command="status"))
         out = capsys.readouterr().out
         assert "chronos" in out
         assert "managed scheduler" in out
         assert "not firing" not in out.lower()
         assert "STALLED" not in out
-        assert "No gateway is running on this host" not in out
+        assert "No scheduler is serving profile" not in out
         # Still surfaces the active-job summary.
         assert "active job(s)" in out
 
@@ -365,7 +403,7 @@ class TestExternalCronProviderStatus:
         monkeypatch.setattr(
             "hermes_cli.cron._active_cron_provider_name", lambda: "chronos"
         )
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", list)
         cron_command(
             Namespace(
                 cron_command="create",
@@ -576,7 +614,7 @@ class TestStatusSurfacesDeadScheduler:
         # tests/conftest.py hook in #118097 once that lands.)
         lock_dir.mkdir(exist_ok=True)
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(lock_dir))
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", list)
         monkeypatch.setattr(
             "hermes_cli.gateway.named_profile_served_by_running_multiplexer", lambda: None
         )
@@ -592,7 +630,7 @@ class TestStatusSurfacesDeadScheduler:
     ):
         job = create_job(prompt="Hourly", schedule="every 60m")
         self._dead_gateway(monkeypatch, tmp_cron_dir / "locks")
-        self._park_next_run(job["id"], datetime.now(timezone.utc) - timedelta(hours=7))
+        self._park_next_run(job["id"], datetime.now(UTC) - timedelta(hours=7))
         (tmp_cron_dir / "cron" / "ticker_heartbeat").write_text(str(time.time() - 25 * 3600))
 
         cron_command(Namespace(cron_command="status"))
@@ -600,7 +638,7 @@ class TestStatusSurfacesDeadScheduler:
         cron_command(Namespace(cron_command="list", all=False, json=False))
         list_out = capsys.readouterr().out
 
-        assert "No gateway is running on this host" in status_out
+        assert "No scheduler is serving profile" in status_out
         assert "Scheduler last ticked" in status_out
         assert "OVERDUE" in status_out and "7h ago" in status_out
         # The stale timestamp must no longer read as an upcoming run on either surface.
@@ -613,7 +651,7 @@ class TestStatusSurfacesDeadScheduler:
         # not flash OVERDUE while doctor calls the same job healthy.
         job = create_job(prompt="Hourly", schedule="every 60m")
         self._dead_gateway(monkeypatch, tmp_cron_dir / "locks")
-        self._park_next_run(job["id"], datetime.now(timezone.utc) - timedelta(minutes=5))
+        self._park_next_run(job["id"], datetime.now(UTC) - timedelta(minutes=5))
 
         cron_command(Namespace(cron_command="status"))
         status_out = capsys.readouterr().out
@@ -635,7 +673,7 @@ class TestStatusSurfacesDeadScheduler:
 
         stale = create_job(prompt="Hourly", schedule="every 60m")
         paused = create_job(prompt="Parked", schedule="every 60m")
-        when = datetime.now(timezone.utc) - timedelta(hours=7)
+        when = datetime.now(UTC) - timedelta(hours=7)
         self._park_next_run(stale["id"], when)
         self._park_next_run(paused["id"], when)
         jobs = load_jobs()

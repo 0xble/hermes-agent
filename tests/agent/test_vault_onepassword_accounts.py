@@ -34,13 +34,25 @@ item = {"personal": ("item-p", "vault-p", "https://personal.example/login"),
 if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
     print(json.dumps([{"id": item[0], "title": account, "category": "LOGIN", "vault": {"id": item[1]},
                        "urls": [{"href": item[2]}], "additional_information": account + "@example.com"}]))
-elif args == ["item", "get", item[0], "--vault", item[1], "--fields", "label=password", "--reveal"]:
-    print("dummy-" + account + "-password")
+elif args == ["item", "get", item[0], "--vault", item[1], "--format", "json"]:
+    print(json.dumps({"id": item[0], "title": account, "category": "LOGIN", "state": "ACTIVE",
+                      "vault": {"id": item[1]}, "urls": [{"href": item[2]}],
+                      "additional_information": account + "@example.com",
+                      "fields": [{"id": "password", "value": "must-not-be-retained"}]}))
+elif args == ["item", "get", item[0], "--vault", item[1], "--format", "json", "--reveal"]:
+    print(json.dumps({"id": item[0], "category": "LOGIN", "vault": {"id": item[1]}, "fields": [
+        {"label": "password", "value": "synthetic-wrong-custom"},
+        {"purpose": "PASSWORD", "value": "dummy-" + account + "-password"}]}))
+elif args[:2] == ["item", "get"] and "--vault" not in args:
+    print("a vault query must be provided", file=sys.stderr)
+    sys.exit(1)
+elif args[:3] == ["item", "get", item[0]]:
+    print("item not found in vault", file=sys.stderr)
+    sys.exit(1)
 else:
     print("unknown item", file=sys.stderr)
     sys.exit(2)
 '''
-
 
 def _write_config(home: Path, op: Path, accounts) -> None:
     lines = ["vault:", "  onepassword:", f"    binary_path: {op}", "    accounts:"]
@@ -54,8 +66,8 @@ _BUSINESS = {"alias": "business", "account": "business.example.com",
 
 
 @pytest.fixture(params=[
-    pytest.param(None, marks=pytest.mark.linux_only, id="linux"),
-    pytest.param(None, marks=pytest.mark.macos_only, id="macos"),
+    pytest.param(None, marks=pytest.mark.platforms("linux"), id="linux"),
+    pytest.param(None, marks=pytest.mark.platforms("macos"), id="macos"),
 ])
 def env(request, tmp_path, monkeypatch):
     for key in list(os.environ):
@@ -107,7 +119,8 @@ def test_business_handle_cannot_resolve_personal_item(env):
     business = backend_for_handle("op@business:item-p")
     with pytest.raises(RuntimeError):
         business.resolve_password("op@business:item-p")
-    assert all(c["argv"][:2] != ["item", "get"] for c in calls())
+    assert all("--reveal" not in c["argv"] for c in calls())
+    assert any(c["argv"][:2] == ["item", "list"] for c in calls())
 
 
 def test_missing_token_is_reported_and_never_falls_back(env, monkeypatch):
@@ -148,8 +161,8 @@ def test_browser_account_pin_refuses_other_browser_before_resolving(env):
     home, op, calls = env
     _write_config(home, op, [_BUSINESS])
     with patch("tools.browser_camofox.get_session_account", return_value="personal"):
-        fill = json.loads(registry.dispatch("browser_vault_fill", {"handle": "op@business:item-b"}, task_id="t1"))
-        code = json.loads(registry.dispatch("browser_vault_enter_code", {"handle": "op@business:item-b"},
+        fill = json.loads(registry.dispatch("browser_vault", {"action": "fill", "handle": "op@business:item-b"}, task_id="t1"))
+        code = json.loads(registry.dispatch("browser_vault", {"action": "enter_code", "handle": "op@business:item-b"},
                                             task_id="t1"))
     assert fill["error_type"] == code["error_type"] == "browser_account_mismatch"
     assert "dummy-business-password" not in json.dumps([fill, code])
@@ -234,7 +247,7 @@ def test_fill_authorization_sees_a_website_change_the_display_cache_has_not(env)
 
 
 def test_failed_listing_is_not_reused(env, monkeypatch):
-    home, op, calls = env
+    home, op, _calls = env
     _write_config(home, op, [_BUSINESS])
     monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "rejected-token")
     with pytest.raises(RuntimeError):

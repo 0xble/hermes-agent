@@ -411,3 +411,24 @@ def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monke
     replayed = []
     assert drain_transcript_spool("sess-1", replayed.append) == (1, 0)
     assert replayed == [{"role": "user", "content": "hi"}]
+
+
+def test_flush_never_spools_a_cron_review_event(tmp_path, monkeypatch):
+    """A review replayed without its capture would run visibly after restart."""
+    from concurrent.futures import Future
+
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", thread_id="139328")
+    review = MessageEvent(text="review this report", source=source, internal=True,
+                          reply_expected=False, allow_gateway_control=False,
+                          metadata={"_cron_review_capture": Future()})
+    human = MessageEvent(text="human follow-up", source=source)
+    assert flush_pending_to_file({"review_key": review}, reason="drain_arrival") == 0
+    assert flush_overflow_to_file({"key": [review, human]}, reason="shutdown") == 1
+    texts = [json.loads(p.read_text(encoding="utf-8"))["data"]["text"] for p in flush_dir.glob("*.json")]
+    assert texts == ["human follow-up"]

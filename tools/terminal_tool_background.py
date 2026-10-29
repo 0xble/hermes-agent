@@ -87,12 +87,15 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty):
+           session_key, effective_pty, persist_on_release: bool = False,
+           survive_restart: bool = False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
-                  owner_task_id=task_id or effective_task_id, session_key=session_key)
+                  owner_task_id=task_id or effective_task_id, session_key=session_key,
+                  persist_on_release=persist_on_release)
     if env_type == "local":
         return process_registry.spawn_local(
-            env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
+            env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
+            survive_restart=survive_restart, **common)
     return process_registry.spawn_via_env(env=env, **common)
 
 
@@ -141,10 +144,13 @@ def _register_completion_watcher(process_registry, proc_session, session_key) ->
 def spawn_background_process(
     *, command: str, env: Any, env_type: str, effective_task_id: str, task_id: Optional[str],
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,
-    notify_on_complete: bool, watch_patterns: Optional[List[str]], approval_note: Optional[str],
+    notify_on_complete: bool, watch_patterns: Optional[list[str]], approval_note: Optional[str],
     completion_output_chars: int = 0,
     pty_disabled_reason: Optional[str],
     heartbeat_seconds: int = 0,
+    persist_on_release: bool = False,
+    survive_restart: bool = False,
+    mounted_host: Optional[str] = None,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -152,21 +158,35 @@ def spawn_background_process(
     exit_code 0 immediately, so the stale-interrupt kill cannot occur here.
     """
     from tools.process_registry import process_registry
+    from agent.delegation_context import is_delegated_child_context
+
+    if survive_restart and is_delegated_child_context():
+        return json.dumps({"output": "", "exit_code": -1, "status": "error",
+                           "error": "survive_restart is unavailable in delegated child contexts: "
+                                    "the child cannot receive the completion after restart. "
+                                    "Ask the parent to launch this command."})
     from tools.terminal_tool import (
         _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
     )
 
     effective_cwd = _resolve_command_cwd(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
+        mounted_host=mounted_host if mounted_host is not None else getattr(env, "host_cwd", None),
+        env=env,
     )
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
-            effective_pty=effective_pty,
+            effective_pty=effective_pty, persist_on_release=persist_on_release,
+            survive_restart=survive_restart,
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
+        if persist_on_release:
+            result_data["persist_on_release"] = True
+        if survive_restart:
+            result_data["survive_restart"] = True
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:
@@ -206,6 +226,10 @@ def spawn_background_process(
         if watch_patterns:
             proc_session.watch_patterns = list(watch_patterns)
             result_data["watch_patterns"] = proc_session.watch_patterns
+        if survive_restart:
+            # Spawn checkpoints before notification routing is available. Persist the final
+            # owner/route/notify metadata before returning the restart-survival contract.
+            process_registry._write_checkpoint()
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
         return json.dumps({

@@ -39,6 +39,18 @@ def _make_agent(fallback_model=None):
         return agent
 
 
+def _expire_shared_window(agent):
+    """Move the shared record's reset into the past: the cooldown is over for every process,
+    not only for this agent's in-memory deadline (turn start re-reads the shared record)."""
+    import time
+    from agent.shared_primary_cooldown import _locked_state, _write_state, route_from_agent, route_key
+    route = route_from_agent(agent)
+    with _locked_state() as (path, state):
+        entry = state["routes"][route_key(provider=route[0], base_url=route[1], model=route[2])]
+        entry["reset_at"] = time.time() - 1
+        _write_state(path, state)
+
+
 def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     mock = MagicMock()
     mock.base_url = base_url
@@ -131,6 +143,39 @@ class TestExhaustionArmsCooldown:
             cooldown = getattr(agent, "_rate_limited_until", 0)
         assert cooldown == far_future
 
+    def test_overload_from_an_active_fallback_still_arms_the_short_window(self):
+        """An overload from a fallback arms no shared primary window, so exhausting the chain on
+        it must keep the short window instead of letting the next turn replay every provider."""
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._rate_limited_until = 0
+        frozen = 1_000.0
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "resolved"),
+            ),
+        ):
+            assert agent._try_activate_fallback() is True  # primary failed for a non-shared reason
+            assert agent._try_activate_fallback(reason=FailoverReason.overloaded) is False
+            cooldown = getattr(agent, "_rate_limited_until", 0)
+        assert cooldown == frozen + _FALLBACK_EXHAUSTED_COOLDOWN_S
+
+    def test_same_provider_fallback_overload_does_not_arm_the_primary_window(self):
+        """Same provider, different model: the fallback's overload says nothing about the
+        primary, so it must not arm the primary's shared cooldown."""
+        from agent import fallback_cooldown
+        from agent.shared_primary_cooldown import active_cooldown, route_from_agent
+        agent = _make_agent(fallback_model=[{"provider": "openrouter", "model": "fallback/model"}])
+        agent._primary_runtime.update(provider="openrouter", model="primary/model")
+        agent.provider, agent.model = "openrouter", "fallback/model"
+        agent._fallback_activated = True
+        agent._rate_limited_until = 0
+        assert fallback_cooldown._arm_rate_limit_cooldown(agent, FailoverReason.overloaded) is None
+        assert agent._rate_limited_until == 0
+        assert active_cooldown(route_from_agent(agent)) is None
+
 
 class TestRateLimitBackoffEscalation:
     """Exponential backoff for consecutive rate-limit failures (#29702).
@@ -145,10 +190,16 @@ class TestRateLimitBackoffEscalation:
         """Simulate the primary provider rate-limiting again on a later turn
         (without a successful restore, which would reset the counter): put
         the agent's identity back on the primary and reset the turn-scoped
-        fallback chain state."""
+        fallback chain state. A later turn only re-probes the primary once the
+        shared window has lapsed (turn start adopts an active record and stays
+        on fallback), so expire it; a 429 inside the window is an in-flight
+        request and must not escalate."""
+        from agent.shared_primary_cooldown import get_cooldown, route_from_agent
         agent.provider, agent.model, agent.base_url = snapshot
         agent._fallback_activated = False
         agent._fallback_index = 0
+        if get_cooldown(route_from_agent(agent)) is not None:
+            _expire_shared_window(agent)
 
     def test_backoff_doubles_per_consecutive_rate_limit(self):
         """Each consecutive primary rate-limit doubles the cooldown:
@@ -174,6 +225,39 @@ class TestRateLimitBackoffEscalation:
                 )
                 assert agent._rate_limit_backoff_count == n + 1
 
+    def test_restore_without_primary_success_keeps_shared_backoff_level(self):
+        """A turn-start restore is only a recovery probe: if the primary rate-limits again
+        before any primary request succeeds, the shared level keeps escalating."""
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        snapshot = (agent.provider, agent.model, agent.base_url)
+        frozen = 1_000.0
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "resolved"),
+            ),
+        ):
+            agent._rate_limited_until = 0
+            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+            self._back_on_primary(agent, snapshot)
+            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+        agent._fallback_activated = True
+        agent._rate_limited_until = 0
+        _expire_shared_window(agent)
+        assert agent._restore_primary_runtime() is True
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "resolved"),
+            ),
+        ):
+            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+        assert agent._rate_limit_backoff_count == 3
+        assert agent._rate_limited_until == frozen + 240
+
     def test_backoff_caps_at_four_hours(self):
         """Escalation is capped at 14400s (4h) no matter how many
         consecutive rate-limits occurred."""
@@ -192,6 +276,59 @@ class TestRateLimitBackoffEscalation:
         ):
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
         assert agent._rate_limited_until == frozen + 14400
+
+    def test_implausible_provider_reset_is_ignored_when_the_shared_write_fails(self):
+        """The in-memory cooldown shares the record's 31-day ceiling: an absurd provider reset
+        falls back to exponential backoff even when the shared state cannot be written."""
+        import time as _time
+        from agent import fallback_cooldown
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._rate_limited_until = 0
+        agent._rate_limit_backoff_count = 0
+        frozen = 1_000.0
+        with (
+            patch("agent.fallback_cooldown.time.monotonic", return_value=frozen),
+            patch("agent.shared_primary_cooldown.arm_cooldown", side_effect=OSError("read-only state")),
+        ):
+            seconds = fallback_cooldown._arm_rate_limit_cooldown(
+                agent, FailoverReason.rate_limit, _time.time() + 365 * 86_400)
+        assert seconds == 60
+        assert agent._rate_limited_until == frozen + 60
+
+    def test_multi_day_provider_reset_is_honored_when_the_shared_write_fails(self):
+        import time as _time
+        from agent import fallback_cooldown
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._rate_limited_until = 0
+        agent._rate_limit_backoff_count = 0
+        frozen = 1_000.0
+        three_days = 3 * 86_400
+        with (
+            patch("agent.fallback_cooldown.time.monotonic", return_value=frozen),
+            patch("agent.shared_primary_cooldown.arm_cooldown", side_effect=OSError("read-only state")),
+        ):
+            seconds = fallback_cooldown._arm_rate_limit_cooldown(
+                agent, FailoverReason.rate_limit, _time.time() + three_days)
+        assert three_days - 5 <= seconds <= three_days + 1
+
+    def test_unrepresentable_provider_reset_falls_back_to_backoff(self):
+        """An integer reset too large for a float must not abort fallback activation."""
+        from agent import fallback_cooldown
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._rate_limited_until = 0
+        agent._rate_limit_backoff_count = 0
+        frozen = 1_000.0
+        with (
+            patch("agent.fallback_cooldown.time.monotonic", return_value=frozen),
+            patch("agent.shared_primary_cooldown.arm_cooldown", side_effect=OSError("read-only state")),
+        ):
+            seconds = fallback_cooldown._arm_rate_limit_cooldown(
+                agent, FailoverReason.rate_limit, 10 ** 400)
+        assert seconds == 60
+        assert agent._rate_limited_until == frozen + 60
 
     def test_backoff_counter_resets_on_successful_primary_restore(self):
         """A successful restore_primary_runtime resets the backoff counter,
@@ -217,8 +354,14 @@ class TestRateLimitBackoffEscalation:
         # Cooldown expired; the primary restores successfully.
         agent._fallback_activated = True
         agent._rate_limited_until = 0
+        _expire_shared_window(agent)
         assert agent._restore_primary_runtime() is True
         assert agent._rate_limit_backoff_count == 0
+        # Restoring only makes the primary eligible for a probe; the shared outage (and its
+        # backoff level) ends when a primary request actually succeeds. The request wrappers
+        # call complete_primary_recovery after every successful response.
+        from agent.shared_primary_cooldown import complete_primary_recovery
+        assert complete_primary_recovery(agent) is True
 
         # The next rate-limit is treated as a fresh first failure: 60s.
         with (

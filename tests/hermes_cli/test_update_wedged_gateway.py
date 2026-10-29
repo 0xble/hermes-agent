@@ -44,7 +44,6 @@ _NEEDS_UNIX_SOCKETS = pytest.mark.skipif(
     "(socket.AF_UNIX / asyncio.start_unix_server), unavailable on native Windows",
 )
 
-
 @pytest.fixture()
 def tmp_path():
     """Short-path override for this module (macOS AF_UNIX ~104-byte limit).
@@ -62,7 +61,6 @@ def tmp_path():
     finally:
         shutil.rmtree(path, ignore_errors=True)
 
-
 def _write_heartbeat(home, pid, age_s=0.0):
     """Write a heartbeat file for ``pid`` whose mtime is ``age_s`` old."""
     path = get_loop_heartbeat_path(home)
@@ -71,7 +69,6 @@ def _write_heartbeat(home, pid, age_s=0.0):
         stamp = time.time() - age_s
         os.utime(path, (stamp, stamp))
     return path
-
 
 def _mark_witness_flag(home, armed, age_s=0.0):
     """Set ``loop_tick_socket`` on the heartbeat payload; re-stamp mtime."""
@@ -83,7 +80,6 @@ def _mark_witness_flag(home, armed, age_s=0.0):
         stamp = time.time() - age_s
         os.utime(path, (stamp, stamp))
     return path
-
 
 def _silent_socket_node(path):
     """Create a socket node at ``path`` that never answers.
@@ -99,7 +95,6 @@ def _silent_socket_node(path):
         srv.listen(1)
     finally:
         srv.close()
-
 
 def _start_freezeable_producer(tmp_path, block_s, errors, write_stall_s=1.5):
     """Run the real heartbeat producer on a loop that can be frozen on demand.
@@ -132,7 +127,7 @@ def _start_freezeable_producer(tmp_path, block_s, errors, write_stall_s=1.5):
             await freeze_evt.wait()
             freeze_evt.clear()
             # Synchronous sleep: freezes the entire loop for block_s.
-            time.sleep(block_s)
+            time.sleep(block_s)  # noqa: ASYNC251 -- deliberately freezes the loop for block_s
 
     async def producer() -> None:
         loop = asyncio.get_running_loop()
@@ -170,7 +165,6 @@ def _start_freezeable_producer(tmp_path, block_s, errors, write_stall_s=1.5):
     state["thread"] = thread
     return state, ready
 
-
 def _wait_heartbeat_stale(tmp_path, stale_after, timeout_s=5.0):
     """Block until the heartbeat file is older than ``stale_after``."""
     hb_path = get_loop_heartbeat_path(tmp_path)
@@ -186,7 +180,6 @@ def _wait_heartbeat_stale(tmp_path, stale_after, timeout_s=5.0):
             return
         assert time.monotonic() < deadline, "heartbeat never went stale"
         time.sleep(0.02)
-
 
 def _launchd_harness(monkeypatch, tmp_path, pid):
     """Patch the launchd_restart path so the REAL probe drives it.
@@ -253,7 +246,6 @@ def _launchd_harness(monkeypatch, tmp_path, pid):
     )
     return events
 
-
 class TestProbeGatewayLoopLiveness:
     def test_fresh_heartbeat_is_alive(self, tmp_path):
         """A gateway that refreshed its heartbeat recently is busy, not wedged."""
@@ -314,7 +306,6 @@ class TestProbeGatewayLoopLiveness:
             == gateway_cli.GATEWAY_LOOP_UNKNOWN
         )
 
-
     def test_probe_never_raises_on_unreadable_path(self, monkeypatch):
         monkeypatch.setattr(
             "gateway.shutdown_watchdog.get_loop_heartbeat_path",
@@ -324,7 +315,6 @@ class TestProbeGatewayLoopLiveness:
             gateway_cli.probe_gateway_loop_liveness(4242)
             == gateway_cli.GATEWAY_LOOP_UNKNOWN
         )
-
 
 class TestEscalateWedgedGateway:
     def test_sigterm_grace_suffices_without_sigkill(self, monkeypatch):
@@ -400,6 +390,51 @@ class TestEscalateWedgedGateway:
 
         assert gateway_cli._escalate_wedged_gateway(4242) is False
         assert calls == [False, True]
+
+    def test_start_time_drift_does_not_skip_sigkill(self, monkeypatch):
+        """macOS start-time readings drift; drift must still escalate to SIGKILL."""
+        signals, waits = [], []
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False, **kwargs: signals.append("kill" if force else "term"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_pid_exit",
+            lambda pid, timeout, **_: waits.append(timeout) or len(waits) > 1,
+        )
+        readings = iter([1000, 1050, 1080, 1090, 1100])
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: next(readings))
+
+        assert gateway_cli._escalate_wedged_gateway(4242) is True
+        assert signals == ["term", "kill"]
+
+    def test_replaced_incarnation_is_not_signalled(self, monkeypatch):
+        signals = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False, **kwargs: signals.append(force),
+        )
+
+        # The first reading is the recorded process; the next proves PID reuse.
+        readings = iter([99999])
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: next(readings))
+        assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000) is True
+        assert signals == []
+
+
+def test_review3_drifted_live_process_still_receives_guarded_signals(monkeypatch):
+    """Drift within tolerance must not make terminate_pid's strict guard refuse both signals."""
+    from gateway import status
+    sent = []
+    readings = iter([1000, 1050, 1050, 1050, 1050, 1050, 1050])
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: next(readings))
+    monkeypatch.setattr(status.os, "kill", lambda pid, sig: sent.append(sig))
+    monkeypatch.setattr(gateway_cli, "_wait_for_pid_exit", lambda pid, timeout, **_: len(sent) > 1)
+    assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000, term_grace=0, kill_wait=0) is True
+    assert len(sent) == 2
 
 
 class TestLaunchdRestartWedgedIntegration:
@@ -479,7 +514,6 @@ class TestLaunchdRestartWedgedIntegration:
         assert "escalate" not in events
         assert ("drain", 4242, 195.0) in events
 
-
 class TestLoopTickWitness:
     """Two-witness liveness (#90502 review).
 
@@ -488,7 +522,6 @@ class TestLoopTickWitness:
     answers a UNIX socket instead; the probe only escalates when BOTH
     witnesses agree the loop stopped scheduling.
     """
-
 
     @_NEEDS_UNIX_SOCKETS
     def test_off_loop_completion_cannot_manufacture_fresh_liveness(self, tmp_path):
@@ -566,7 +599,6 @@ class TestLoopTickWitness:
             )
             == gateway_cli.GATEWAY_LOOP_ALIVE
         )
-
 
     def test_witness_vanishing_mid_window_is_unknown(self, tmp_path, monkeypatch):
         """A witness that disappears mid-window is ambiguity, not a wedge.
@@ -802,7 +834,6 @@ class TestLoopTickWitness:
             state["thread"].join(timeout=5.0)
             assert not errors, errors
 
-
 class TestLoopTickTcpWitness:
     """Non-POSIX arm: the producer publishes ``loop_tick_tcp_port`` and the
     consumer probes 127.0.0.1:<port> instead of the AF_UNIX node. The
@@ -821,7 +852,7 @@ class TestLoopTickTcpWitness:
             while not stop.is_set():
                 try:
                     conn, _ = srv.accept()
-                except socket.timeout:
+                except TimeoutError:
                     continue
                 try:
                     conn.sendall(b"1")
@@ -908,5 +939,3 @@ class TestLoopTickTcpWitness:
             gateway_cli.probe_gateway_loop_liveness(4346, home=tmp_path)
             == gateway_cli.GATEWAY_LOOP_UNKNOWN
         )
-
-

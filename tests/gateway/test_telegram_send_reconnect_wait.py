@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 def _make_adapter() -> TelegramAdapter:
@@ -60,6 +60,7 @@ async def test_send_delegates_to_replacement_adapter_installed_mid_wait():
 
     runner = MagicMock()
     runner.adapters = {}
+    runner._authorization_adapter = lambda platform, profile=None: runner.adapters.get(platform)
     old.gateway_runner = runner
 
     async def install_replacement() -> None:
@@ -82,6 +83,7 @@ async def test_send_delegates_immediately_when_replacement_already_live():
     live._bot = _connected_bot()
     runner = MagicMock()
     runner.adapters = {old.platform: live}
+    runner._authorization_adapter = lambda platform, profile=None: runner.adapters.get(platform)
     old.gateway_runner = runner
     old._wait_for_reconnection = AsyncMock(
         side_effect=AssertionError("must not wait when replacement is already live")

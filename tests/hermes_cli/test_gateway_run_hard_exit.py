@@ -43,19 +43,6 @@ def _prepare(monkeypatch):
     return gateway_cli
 
 
-def test_standby_has_no_active_banner_or_release_watcher(monkeypatch, capsys):
-    gateway_cli = _prepare(monkeypatch)
-    watched = []
-    async def ack():
-        watched.append(True)
-    monkeypatch.setattr(gateway_cli, "_acknowledge_release_when_running", ack)
-    with pytest.raises(_HardExitObserved) as excinfo:
-        gateway_cli.run_gateway(standby=True)
-    assert excinfo.value.code == 0
-    assert "Messaging platforms + cron scheduler" not in capsys.readouterr().out
-    assert not watched
-
-
 def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
     gateway_cli = _prepare(monkeypatch)
 

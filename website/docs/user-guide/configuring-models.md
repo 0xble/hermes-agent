@@ -21,6 +21,66 @@ This page covers configuring both from the dashboard. If you prefer config files
 On a brand-new install the bundled default config has `model: ""` (an empty string sentinel meaning "not configured yet"). The first time you run `hermes setup` or `hermes model`, that key is upgraded in-place to a mapping with `provider`, `default`, `base_url`, and `api_mode` sub-keys — the shape shown throughout this page and in [`profiles.md`](./profiles.md) / [`configuration.md`](./configuration.md). If you ever see an empty string in `config.yaml`, run `hermes model` (or click **Change** in the dashboard) and Hermes will write the dict form for you.
 :::
 
+## Reusing a named route
+
+Use `model_presets` to name a provider/model route and refer to it with the canonical
+`model_preset: NAME` form or the `@NAME` shorthand. Presets are expanded at the point each consumer runs.
+
+The `@NAME` shorthand is a preset reference only when the whole value is `@` followed by letters, digits,
+`_` or `-`. A value containing `/`, `.` or `:` is a literal model ID and is passed through unchanged with its
+own provider and `base_url`, so IDs such as `@cf/meta/llama-3.3-70b-instruct-fp8-fast` and `@hf/...` work
+as written. An unknown bare name such as `@missing` is still an error. Saving the config keeps `@NAME`
+strings exactly as you wrote them.
+Cron jobs re-read and resolve their route at fire time. Editing a preset affects the next use
+of that config without rewriting the stored job.
+
+```yaml
+model_presets:
+  attended-fast:
+    provider: openrouter
+    model: google/gemini-3-flash-preview
+    reasoning_effort: medium
+  coding:
+    provider: openrouter
+    model: anthropic/claude-sonnet-4.6
+    fallbacks:
+      - provider: openai
+        model: gpt-5.4
+
+model:
+  model_preset: coding
+# Equivalent shorthand in supported model slots: model: "@coding"
+delegation:
+  model_preset: coding
+```
+
+Presets must define `provider` and `model`. Definitions are flat, with no nested preset references.
+The names `attended` and `default` are reserved for the runtime config resolver. Unknown names,
+nested references and conflicting inline route fields are rejected. A concrete `/model` selection
+replaces the preset reference while preserving unrelated settings and comments.
+
+## Topic Model Roles
+
+In the gateway, `/model @coding` stores the role name, not a concrete route.
+`/model @attended` follows `model.attended`, and `/model @default` follows the
+configured default. Every API boundary resolves the role from the topic's
+current profile config. Changes to presets take effect on the next request,
+including within a long turn, without rewriting sessions. Fallback routes never
+replace the stored role.
+
+A held role is immune to attended idle expiry and does not emit switch cards.
+Explicit session and one-turn picks take precedence. A durable concrete pick
+replaces the role, while `--once` leaves it available after that turn. `/model
+reset`, `/model reset --all` and `/new` clear role state. Role picks cannot be
+combined with model-selection flags.
+
+The `telegram_topic` tool accepts the same `@NAME` values for create and edit.
+It reads route and reasoning from the routed profile, not the gateway's launch
+profile. `/status` shows the held role. The admin command `/model --all attended`
+converts existing concrete Telegram topic picks to `@attended` under the session
+store lock, writes one routing snapshot, and returns the converted session keys.
+It skips sessions already following a role and does not interrupt active agents.
+
 ## The Models page
 
 Open the dashboard and click **Models** in the sidebar. You get two sections:
@@ -46,6 +106,12 @@ The picker has two columns:
 Type in the filter box to narrow by provider name, slug, or model ID.
 
 Pick a model, hit **Switch**, and Hermes writes it to `~/.hermes/config.yaml` under the `model` section. **This applies to new sessions only** — any chat tab you already have open keeps running whatever model it started with. To hot-swap the current chat, use the `/model` slash command inside it.
+
+### Subscription speed and extended context
+
+Speed is separate from reasoning effort. On supported subscription models, **Fast** requests Priority; **Ultrafast** requests the Ultrafast tier. Selecting one clears the other. The chosen tier is remembered per model and carried into a new chat. The profile default lives under **Settings → Model → Main model → Speed** (`agent.service_tier`: `normal`, `fast` or `ultrafast`); Ultrafast is listed only for models that offer it, and on a subscription only when your account's Codex catalog lists it for that model. A legacy setting can be cleared with **Use standard speed**. An accepted request does not guarantee that OpenAI served the requested tier.
+
+Hermes creates the **GPT-6.1 Sol-900k** choice from an eligible discovered GPT-6.1 Sol model. The `-900k` suffix is a local context choice, removed from the model ID sent to OpenAI. Hermes limits its budget to the account catalog's maximum, and Codex may report a smaller usable context after its own reserve. Use **Refresh models** if a new model is absent. A failed discovery uses short-lived compatibility hints instead of caching them as a successful account catalog.
 
 ### Mid-session switches and context warnings
 
@@ -262,6 +328,28 @@ host, or model family. The marker layout follows the configured transport:
 `anthropic_messages` uses the native inner-block layout. Set
 `prompt_caching: false` to explicitly disable cache markers for a model; when
 omitted, Hermes keeps its normal provider and model capability detection.
+
+Some OpenAI-compatible servers return the whole answer in the `reasoning`
+field with empty `content`. Hermes does not show reasoning as the reply by
+default, because most providers put private chain-of-thought there. It retries
+instead. If your server's parser really does put the final answer in
+`reasoning`, opt that model in with `answer_in_reasoning`:
+
+```yaml
+providers:
+  local-vllm:
+    api: http://127.0.0.1:8000/v1
+    models:
+      my-reasoner:
+        answer_in_reasoning: true
+```
+
+To opt in every model on a provider, put the flag in a provider-level
+`capabilities:` block (`capabilities: {answer_in_reasoning: true}`). Hermes
+re-reads the opt-in on the active route on every turn, in the CLI, TUI and
+gateway alike, so it survives a `/model` switch to another model on the same
+provider. A fallback or any other provider does not inherit it, and OpenRouter
+routes are never trusted, even with the flag set.
 
 :::note Legacy format
 Older configs used a top-level `custom_providers:` list (with `base_url` instead of `api`). It still works and is auto-migrated to the `providers:` dict on `hermes update` (config v12).

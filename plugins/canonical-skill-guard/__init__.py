@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import os
 import json
+import re
+import stat
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterable
 
 
 _WRITE_ACTIONS = {"create", "patch", "edit", "delete", "write_file", "remove_file"}
+_SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
 def _operations(args: Any) -> Iterable[dict[str, Any]]:
@@ -58,25 +60,45 @@ def _write_observations(args: Any, blocked: list[str]) -> None:
     The guard owns intake only: it never edits the canonical skill projection and
     records the exact requested operation for later review by the curator.
     """
-    home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
-    root = home / "observations"
-    root.mkdir(parents=True, exist_ok=True)
+    if any(not _SKILL_NAME.fullmatch(skill) for skill in blocked):
+        raise ValueError("unsafe observation skill name")
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("this host cannot safely open the observation inbox")
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
     operations = list(_operations(args))
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    for skill in blocked:
-        selected = [op for op in operations if str(op.get("name") or "").strip() == skill]
-        path = root / f"{skill}.md"
-        with path.open("a", encoding="utf-8") as handle:
-            for operation in selected:
-                handle.write(
-                    f"## Observation — {timestamp}\n\n"
-                    f"- skill: `{skill}`\n"
-                    f"- provenance: `canonical-skill-guard`\n"
-                    f"- recorded_at: `{timestamp}`\n\n"
-                    "```json\n"
-                    f"{json.dumps(operation, sort_keys=True, indent=2)}\n"
-                    "```\n\n"
-                )
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            os.mkdir("observations", dir_fd=home_fd)
+        except FileExistsError:
+            pass
+        root_fd = os.open("observations", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
+        try:
+            for skill in blocked:
+                selected = [op for op in operations if str(op.get("name") or "").strip() == skill]
+                fd = os.open(f"{skill}.md", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o600, dir_fd=root_fd)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                        raise OSError("observation target is not a regular file")
+                    for operation in selected:
+                        handle.write(
+                            f"## Observation — {timestamp}\n\n"
+                            f"- skill: `{skill}`\n"
+                            f"- provenance: `canonical-skill-guard`\n"
+                            f"- recorded_at: `{timestamp}`\n\n"
+                            "```json\n"
+                            f"{json.dumps(operation, sort_keys=True, indent=2)}\n"
+                            "```\n\n"
+                        )
+        finally:
+            os.close(root_fd)
+    finally:
+        os.close(home_fd)
 
 
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | None:
@@ -85,8 +107,10 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> dict[s
     blocked = _blocked_skill_names(args)
     if not blocked:
         return None
-    _write_observations(args, blocked)
-    home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    try:
+        _write_observations(args, blocked)
+    except (ValueError, OSError, NotImplementedError) as exc:
+        return {"action": "block", "message": f"canonical-skill-guard refused this skill update. Observation was not recorded: {exc}."}
     observations = ", ".join(f"$HERMES_HOME/observations/{name}.md" for name in blocked)
     return {
         "action": "block",

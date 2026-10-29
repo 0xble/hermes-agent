@@ -34,6 +34,7 @@ def _git(args, cwd, env=None):
         e.update(env)
     result = subprocess.run(
         ["git", *args], capture_output=True, text=True, cwd=str(cwd), env=e,
+        check=False,
     )
     assert result.returncode == 0, f"git {args} failed: {result.stderr}"
     return result.stdout.strip()
@@ -117,6 +118,21 @@ class TestAuditVerdicts:
         record = _verdict(records, "hermes-scratch")
         assert record.verdict == "reap-archive"
         assert record.untracked == ["PR_BODY_DRAFT.md"]
+
+    def test_host_global_excludes_cannot_hide_untracked_file(self, repo, tmp_path, monkeypatch):
+        """Production cleanup must not let a host global excludesFile hide real work."""
+        host_excludes = tmp_path / "host-global-ignore"
+        host_excludes.write_text("HOST-HIDDEN.txt\n")
+        host_config = tmp_path / "host-global.gitconfig"
+        host_config.write_text(f"[core]\n\texcludesFile = {host_excludes}\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(host_config))
+        tree, _ = _add_worktree(repo, "hermes-host-ignore")
+        (tree / "HOST-HIDDEN.txt").write_text("must survive detection\n")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-host-ignore")
+        assert record.verdict == "reap-archive"
+        assert record.untracked == ["HOST-HIDDEN.txt"]
 
     def test_unique_unpushed_commits_keep(self, repo):
         tree, _ = _add_worktree(repo, "hermes-work")
@@ -217,6 +233,7 @@ class TestReclaim:
         probe = subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", branch],
             capture_output=True, text=True, cwd=str(repo),
+            check=False,
         )
         assert probe.returncode != 0, "branch should be gone with its tree"
 
@@ -236,6 +253,185 @@ class TestReclaim:
         assert archived, "untracked file must be archived under the profile home, not destroyed"
         assert archived[0].read_text() == "important scribbles\n"
         assert not (native_home / ".hermes").exists()
+
+    def test_reclaim_preserves_quoted_untracked_filenames(self, repo, tmp_path, monkeypatch):
+        """An ordinary file must not mask a quoted filename lost during archive."""
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        tree, _ = _add_worktree(repo, "hermes-quoted")
+        names = ("normal.txt", "é.txt", 'quote"name.txt', "line\nbreak.txt")
+        notes = tree / "notes"
+        notes.mkdir()
+        for name in names:
+            (notes / name).write_text(name)
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        assert _verdict(records, "hermes-quoted").verdict == "reap-archive"
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("removed hermes-quoted" in action for action in actions)
+        assert not tree.exists()
+        archives = list((archive_home / "archive" / "worktree-prune").glob("hermes-quoted-*"))
+        assert len(archives) == 1
+        assert {file.name: file.read_text() for file in (archives[0] / "notes").iterdir()} == {
+            name: name for name in names
+        }
+
+    @pytest.mark.parametrize("with_dangling", [False, True])
+    def test_ignored_directory_archives_nested_links_without_following_them(
+        self, repo, tmp_path, monkeypatch, with_dangling,
+    ):
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        # The ignore rule is versioned in the repo, not supplied by host config.
+        (repo / ".gitignore").write_text("ignored/\n")
+        _git(["add", ".gitignore"], repo)
+        _git(["commit", "-m", "ignore scratch"], repo)
+        _git(["push", "origin", "main"], repo)
+        tree, _ = _add_worktree(repo, "hermes-ignored-links")
+        ignored = tree / "ignored"
+        nested = ignored / "nested"
+        nested.mkdir(parents=True)
+        (ignored / "link").symlink_to("../README.md")
+        if with_dangling:
+            (nested / "dangling").symlink_to("missing")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret").write_text("not archive content")
+        (nested / "directory-link").symlink_to(outside, target_is_directory=True)
+        (nested / "note").write_text("scratch")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-ignored-links")
+        assert record.verdict == "reap-archive"
+        assert record.untracked == ["ignored/"]
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("removed hermes-ignored-links" in action for action in actions)
+        assert not tree.exists()
+        archives = list((archive_home / "archive" / "worktree-prune").glob("hermes-ignored-links-*"))
+        assert len(archives) == 1
+        archived = archives[0] / "ignored"
+        links = [
+            (archived / "link", "../README.md"),
+            (archived / "nested" / "directory-link", str(outside)),
+        ]
+        if with_dangling:
+            links.append((archived / "nested" / "dangling", "missing"))
+        for path, target in links:
+            assert path.is_symlink(), f"archive lost symlink: {path}"
+            assert os.readlink(path) == target
+        assert (archived / "nested" / "note").read_text() == "scratch"
+
+    def test_regenerable_directories_go_with_the_tree_while_other_scratch_is_archived(
+        self, repo, tmp_path, monkeypatch,
+    ):
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        (repo / ".gitignore").write_text(".ci/\nbuild/\n.env\nscratch/\n", encoding="utf-8")
+        # A tracked source folder that happens to be named like build output.
+        (repo / "scripts" / "build").mkdir(parents=True)
+        (repo / "scripts" / "build" / "tool.py").write_text("print()\n", encoding="utf-8")
+        _git(["add", ".gitignore"], repo)
+        _git(["add", "-f", "scripts/build/tool.py"], repo)
+        _git(["commit", "-m", "ignore local state"], repo)
+        _git(["push", "origin", "main"], repo)
+        tree, _ = _add_worktree(repo, "hermes-regenerable")
+        regenerable = (".venv/lib/site.py", "node_modules/pkg/index.js", "pkg/__pycache__/m.pyc",
+                       ".ci/cache/blob", "build/out.bin")
+        kept = {
+            ".env": "TOKEN=local\n",
+            "dist/notes.md": "hand-made, not ignored\n",
+            "scripts/build/.env": "ignored for another reason inside tracked source\n",
+            # An ignored parent is listed whole, so a cache inside it is archived with it.
+            "scratch/notes.md": "scratch\n",
+            "scratch/.venv/marker": "inside an ignored parent\n",
+        }
+        for rel, text in [*((rel, "regenerable") for rel in regenerable), *kept.items()]:
+            (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tree / rel).write_text(text, encoding="utf-8")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-regenerable")
+        assert record.verdict == "reap-archive"
+        assert sorted(record.untracked) == [".env", "dist/notes.md", "scratch/", "scripts/build/.env"]
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+
+        assert not tree.exists()
+        (archive,) = (archive_home / "archive" / "worktree-prune").glob("hermes-regenerable-*")
+        archived = {str(path.relative_to(archive)): path.read_text(encoding="utf-8-sig")
+                    for path in archive.rglob("*") if path.is_file()}
+        assert archived == kept
+
+    def test_tree_with_only_regenerable_dirt_reaps_without_an_archive(self, repo, tmp_path, monkeypatch):
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        tree, _ = _add_worktree(repo, "hermes-caches")
+        (tree / ".venv" / "lib").mkdir(parents=True)
+        (tree / ".venv" / "lib" / "site.py").write_text("x", encoding="utf-8")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        assert _verdict(records, "hermes-caches").verdict == "reap"
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert not tree.exists()
+        assert not (archive_home / "archive").exists()
+
+    def test_dry_run_reports_archive_size_without_sizing_whole_trees(
+        self, repo, tmp_path, monkeypatch, capsys,
+    ):
+        import json
+
+        from hermes_cli.worktree_cmd import cmd_worktree
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "archive-home"))
+        monkeypatch.setattr(worktree_gc, "_tree_size_mb", lambda *a, **k: pytest.fail("sized a whole tree"))
+        tree, _ = _add_worktree(repo, "hermes-sized")
+        (tree / "scratch.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+        (tree / ".venv").mkdir()
+        (tree / ".venv" / "big.bin").write_bytes(b"x" * (3 * 1024 * 1024))
+
+        args = TestCmdWorktreeJson._ns(None, repo, "prune", dry_run=True, trees_only=True)
+        assert cmd_worktree(args) == 0
+        (action,) = [a for a in json.loads(capsys.readouterr().out)["actions"] if "hermes-sized" in a]
+        assert action.endswith(": archives ~2M")
+        assert tree.exists()
+
+    def test_top_level_untracked_links_are_archived_as_links(self, repo, tmp_path, monkeypatch):
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        tree, _ = _add_worktree(repo, "hermes-top-links")
+        outside = tmp_path / "outside-dir"
+        outside.mkdir()
+        (outside / "secret").write_text("not archive content")
+        links = {"file-link": "README.md", "dangling": "missing", "dir-link": str(outside)}
+        for name, target in links.items():
+            (tree / name).symlink_to(target, target_is_directory=name == "dir-link")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-top-links")
+        assert record.verdict == "reap-archive"
+        assert sorted(record.untracked) == sorted(links)
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("removed hermes-top-links" in action for action in actions)
+        assert not tree.exists()
+        archives = list((archive_home / "archive" / "worktree-prune").glob("hermes-top-links-*"))
+        assert len(archives) == 1
+        for name, target in links.items():
+            archived = archives[0] / name
+            assert archived.is_symlink(), f"archive lost symlink: {archived}"
+            assert os.readlink(archived) == target
+        assert (outside / "secret").read_text() == "not archive content"
+
+    def test_reclaim_keeps_tree_when_an_untracked_file_cannot_be_archived(self, repo, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "archive-home"))
+        tree, _ = _add_worktree(repo, "hermes-missing")
+        (tree / "normal.txt").write_text("keep this")
+        missing = tree / "gone.txt"
+        missing.write_text("listed at audit")
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        missing.unlink()
+
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("kept hermes-missing" in action for action in actions)
+        assert tree.exists() and (tree / "normal.txt").read_text() == "keep this"
 
     def test_dry_run_changes_nothing(self, repo):
         tree, _ = _add_worktree(repo, "hermes-clean")
@@ -365,7 +561,7 @@ class TestExternalTrees:
         external = worktree_gc.audit_external_trees(str(repo))
         paths = [record.path for record in external]
         assert any("elsewhere-tree" in p for p in paths)
-        record = [r for r in external if "elsewhere-tree" in r.path][0]
+        record = next(r for r in external if "elsewhere-tree" in r.path)
         assert record.branch == "ext/branch"
         assert not record.missing
 
@@ -388,7 +584,7 @@ class TestExternalTrees:
         _shutil.rmtree(ext)
 
         external = worktree_gc.audit_external_trees(str(repo))
-        record = [r for r in external if "vanished-tree" in r.path][0]
+        record = next(r for r in external if "vanished-tree" in r.path)
         assert record.missing
 
         planned = worktree_gc.prune_missing_registrations(str(repo), dry_run=True)
@@ -429,7 +625,7 @@ class TestCmdWorktreeJson:
         assert set(payload) == {"repo", "trees", "external_trees", "branches"}
         names = [t["name"] for t in payload["trees"]]
         assert "hermes-json" in names
-        tree = [t for t in payload["trees"] if t["name"] == "hermes-json"][0]
+        tree = next(t for t in payload["trees"] if t["name"] == "hermes-json")
         assert {"verdict", "reason", "age_days", "branch"} <= set(tree)
 
     def test_prune_dry_run_json(self, repo, capsys):

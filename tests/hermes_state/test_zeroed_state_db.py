@@ -189,27 +189,39 @@ def test_concurrent_quarantine_no_clobber(tmp_path):
     conn.close()
 
 
-def test_quarantine_during_writability_preflight_is_not_readonly(tmp_path, monkeypatch):
-    """A sibling may rename a damaged file after is_file() but before os.access()."""
+@pytest.mark.parametrize("next_opener_recreates", [False, True], ids=["vanished", "recreated"])
+def test_quarantine_during_writability_preflight_is_not_readonly(
+    tmp_path, monkeypatch, next_opener_recreates
+):
+    """A quarantined primary may be recreated before the failed access is rechecked."""
     import os
     import threading
 
     import hermes_state as hs
     import hermes_state_repair as repair
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Outside the chmod repair scope, so repair cannot mask a false verdict.
     db = tmp_path / "state.db"
     db.write_bytes(bytes(4096))
     checking = threading.Event()
     quarantined = threading.Event()
+    access_checked = threading.Event()
+    replacement_ready = threading.Event()
     original_access = os.access
     errors = []
 
     def access_after_rename(path, mode, *args, **kwargs):
-        if Path(path) == db and not quarantined.is_set():
-            checking.set()
-            assert quarantined.wait(timeout=5), "quarantine did not finish"
-        return original_access(path, mode, *args, **kwargs)
+        if Path(path) != db or checking.is_set():
+            return original_access(path, mode, *args, **kwargs)
+        checking.set()
+        assert quarantined.wait(timeout=5), "quarantine did not finish"
+        verdict = original_access(path, mode, *args, **kwargs)
+        access_checked.set()
+        assert replacement_ready.wait(timeout=5), "replacement opener did not finish"
+        return verdict
 
     monkeypatch.setattr(repair.os, "access", access_after_rename)
 
@@ -217,6 +229,8 @@ def test_quarantine_during_writability_preflight_is_not_readonly(tmp_path, monke
         try:
             sdb = hs.SessionDB(db_path=db)
             try:
+                if next_opener_recreates:
+                    assert sdb.get_session("peer-replacement") is not None
                 sdb.create_session(session_id="after-race", source="test")
             finally:
                 sdb.close()
@@ -229,8 +243,17 @@ def test_quarantine_during_writability_preflight_is_not_readonly(tmp_path, monke
         assert checking.wait(timeout=5), "preflight did not inspect the damaged file"
         backup = hs.quarantine_invalid_state_db(db)
         assert backup is not None and backup.read_bytes() == bytes(4096)
+        quarantined.set()
+        assert access_checked.wait(timeout=5), "preflight did not observe the vanished file"
+        if next_opener_recreates:
+            replacement = hs.SessionDB(db_path=db)
+            try:
+                replacement.create_session(session_id="peer-replacement", source="test")
+            finally:
+                replacement.close()
     finally:
         quarantined.set()
+        replacement_ready.set()
         thread.join(timeout=10)
     assert not thread.is_alive()
     assert not errors, errors

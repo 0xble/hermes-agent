@@ -11,6 +11,8 @@ from agent.title_generator import (
     derive_title,
     generate_title,
     auto_title_session,
+    is_junk_title,
+    is_titleable_user_message,
     maybe_auto_title,
     wait_for_title_upgrades,
     _title_language,
@@ -54,6 +56,36 @@ class TestGenerateTitle:
             assert title_input.startswith(preview)
             assert "---" not in title_input and "@file:" not in title_input
             assert derive_title(ref + footer, preview).startswith("Quarterly incident analysis")
+
+    def test_manual_attachment_only_opener_yields_no_path_title(self):
+        """#92068: the manual-attach path (composer attach chip / hand-typed
+        ``@file:``) sends NO Desktop paste preview, so the build_title_input
+        ref-only shortcut cannot rescue it. The titler must still refuse to
+        name the session after the truncated file path."""
+        msg = "@file:AppData/Local/hermes/profiles/local/attachments/report.pdf"
+
+        assert is_titleable_user_message(msg) is False
+        assert derive_title(msg) is None
+        assert derive_title(msg + "\n\n--- Attached Context ---\n(file content)") is None
+        # Backtick-quoted (space-bearing) paths and @folder: refs too.
+        assert is_titleable_user_message("@file:`my file.txt`") is False
+        assert is_titleable_user_message("@folder:/some/dir") is False
+        # A quoted path with a line range is one reference token for the
+        # canonical parser (context_references.REFERENCE_PATTERN), so the
+        # guard must strip the range too, not leave ":3" behind as "prose".
+        assert is_titleable_user_message("@file:`my file.txt`:3") is False
+        assert is_titleable_user_message('@file:"spaced name.md":12-14') is False
+        assert is_titleable_user_message("@file:'single quoted.md':1") is False
+        # The background model-title path refuses the same opener.
+        assert generate_title(msg) is None
+
+    def test_attachment_plus_instruction_titles_from_the_instruction(self):
+        """Prose around a manual attachment keeps driving the title — an
+        attachment WITH a typed request is a real question, not a file drop."""
+        msg = "Review @file:notes.txt and fix the off-by-one"
+
+        assert is_titleable_user_message(msg) is True
+        assert derive_title(msg) == "Review @file:notes.txt and fix the off-by-one"
 
     def test_title_input_budget_and_manual_attachments_stay_unread(self):
         title_input = build_title_input("Describe the release plan", "p" * MAX_TITLE_INPUT_CHARS)
@@ -285,13 +317,111 @@ class TestGenerateTitle:
         assert captured[0][1] is exc
 
 
+@pytest.mark.parametrize("title, junk", [
+    ("None", True),
+    ("Investigation", True),
+    ("Unspecified Subject", True),
+    ("Unspecified Claim Verification", True),
+    ("Slack Thread C0BN2V5734G", True),
+    ("Slack Message C0BN2V5734G", True),
+    ("YouTube Video MgRynDGk-4Y", True),
+    ("Slack Thread p1789666668950939", True),
+    ("a1b2c3d4e5f60718", True),
+    ("Slack Billing Thread", False),
+    ("Q3 Billing Dispute", False),
+    ("Theo on Smarter Models", False),
+    # Plain hyphenated compounds are words, not IDs.
+    ("aux-from-main", False),
+    ("Sci-Fi Dark Ambiance", False),
+    ("Planning-to-Deploy Delays", False),
+    ("南京市秦淮区 小时级天气预报", False),
+    ("Русский прогноз погоды", False),
+])
+def test_junk_title_detector(title, junk):
+    assert is_junk_title(title) is junk
 
 
+def test_abstain_payload_is_an_empty_title():
+    from agent.title_generator import _extract_json_title
+    assert _extract_json_title('{"title": "", "abstain": true}') == ""
+    assert _extract_json_title('{"title": "Q3 Billing", "abstain": false}') == "Q3 Billing"
+    assert _extract_json_title('Result: {"title": "Generic Title", "abstain": true}') == ""
 
 
+@pytest.mark.parametrize("result", ["abstain", "loose_abstain", "failure", "truncated"])
+def test_title_worker_distinguishes_abstention_from_provider_failure(tmp_path, result):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="active", source="telegram")
+    response = MagicMock()
+    response.choices[0].finish_reason = "length" if result == "truncated" else "stop"
+    payload = '{"title": "Generic Title", "abstain": true}'
+    response.choices[0].message.content = ("Result: " if result == "loose_abstain" else "") + payload
+    with patch("agent.title_generator.call_llm", return_value=response,
+               side_effect=RuntimeError("provider unavailable") if result == "failure" else None):
+        auto_title_session(db, "active", "Investigate billing dispute", conversation_history=[
+            {"role": "user", "content": "Investigate billing dispute"},
+        ])
+    if result in {"abstain", "loose_abstain"}:
+        assert db.get_session_title("active") is None
+    else:
+        assert db.get_session_title("active") == "Investigate billing dispute"
+        assert db.get_session_title_source("active") == "derived"
 
 
+@pytest.mark.parametrize("existing, generated", [
+    ("Influence and Persuasion", "Influence and Persuasion"),
+    ("INFLUENCE AND PERSUASION #2", "Influence and Persuasion"),
+    ("Review PR #586", "Review PR #586"),
+])
+@pytest.mark.parametrize("turns, hold", [(1, True), (3, True), (1, False)])
+def test_duplicate_model_title_is_held_or_replaced_by_derived(tmp_path, existing, generated, turns, hold):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="taken", source="telegram")
+    db.set_session_title("taken", existing)
+    # The collision must not disappear merely because many newer topics exist.
+    for index in range(101):
+        db.create_session(session_id=f"other-{index}", source="telegram")
+        db.set_session_title(f"other-{index}", f"Other Subject {index}")
+    db.create_session(session_id="active", source="telegram")
+    opener = "Relay to the owner of the influence and persuasion topic"
+    seen = []
+    with patch("agent.title_generator.generate_title", return_value=generated), \
+         patch("agent.title_generator._hold_until_reply_enabled", return_value=hold):
+        auto_title_session(db, "active", opener,
+                           conversation_history=[{"role": "user", "content": opener}] * turns,
+                           title_callback=lambda *args, **kwargs: seen.append((args, kwargs)))
+    if turns < 3 and hold:
+        assert db.get_session_title("active") is None
+        assert seen == []
+    else:
+        assert db.get_session_title("active") == derive_title(opener)
+        assert db.get_session_title_source("active") == "derived"
+        assert seen[0][1]["display_title"] == derive_title(opener)
 
+
+@pytest.mark.parametrize("existing, generated", [
+    ("Review PR #586", "Review PR #597"),
+    ("Influence and Persuasion", "Influence and Persuasion #3"),
+])
+def test_candidate_number_is_part_of_the_subject(tmp_path, existing, generated):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="taken", source="telegram")
+    db.set_session_title("taken", existing)
+    db.create_session(session_id="active", source="telegram")
+    with patch("agent.title_generator.generate_title", return_value=generated):
+        auto_title_session(db, "active", "Review the requested subject")
+    assert db.get_session_title("active") == generated
+    assert db.get_session_title_source("active") == "llm"
+
+
+def test_collision_lookup_failure_keeps_auto_title_fail_open(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="active", source="telegram")
+    with patch.object(db, "has_auto_title_collision", side_effect=RuntimeError("unavailable")), \
+         patch("agent.title_generator.generate_title", return_value="Review Requested Subject"):
+        auto_title_session(db, "active", "Review the requested subject")
+    assert db.get_session_title("active") == "Review Requested Subject"
+    assert db.get_session_title_source("active") == "llm"
 
 
 class TestAutoTitleSession:
@@ -325,9 +455,67 @@ class TestAutoTitleSession:
         assert db.get_session_title("sess-1") == "Manual Title"
         assert seen == []
 
+    def test_abstain_keeps_placeholder_and_reply_titles_next(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="telegram")
+        history = [
+            {"role": "user", "content": "look at this"},
+            {"role": "assistant", "content": "The thread is about the Q3 billing dispute."},
+        ]
+        with patch("agent.title_generator.generate_title", return_value=""):
+            auto_title_session(db, "sess-1", "look at this", conversation_history=history)
+        assert db.get_session_title_source("sess-1") in (None, "derived")
+
+        with patch("agent.title_generator.generate_title", return_value="Q3 Billing Dispute") as generate:
+            auto_title_session(db, "sess-1", "look at this", conversation_history=history)
+        assert generate.call_args.kwargs["reply_excerpt"].startswith("The thread is about")
+        assert db.get_session_title("sess-1") == "Q3 Billing Dispute"
+        assert db.get_session_title_source("sess-1") == "llm"
+
+    def test_junk_title_does_not_lock(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="telegram")
+        history = [{"role": "user", "content": "https://slack.com/archives/C0BN2V5734G"}]
+        with patch("agent.title_generator.generate_title", return_value="Slack Thread C0BN2V5734G"):
+            auto_title_session(db, "sess-1", history[0]["content"], conversation_history=history)
+        assert db.get_session_title_source("sess-1") != "llm"
+
+    def test_junk_title_uses_derived_at_turn_three(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="telegram")
+        history = [{"role": "user", "content": "go"} for _ in range(3)]
+        with patch("agent.title_generator.generate_title", return_value="Investigation"):
+            auto_title_session(db, "sess-1", "go", conversation_history=history)
+        assert db.get_session_title("sess-1") == "go"
+        assert db.get_session_title_source("sess-1") == "derived"
+
+    def test_process_notifications_are_not_retry_turns(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cli")
+        notice = "[IMPORTANT: Background process proc_1 exited (exit code 7).\nCommand: review]"
+        history = [{"role": "user", "content": "Run the background review"},
+                   {"role": "assistant", "content": "Coordinator finished."},
+                   {"role": "user", "content": notice},
+                   {"role": "user", "content": "[ASYNC DELEGATION BATCH COMPLETE — deleg_1]"}]
+        with patch("agent.title_generator.auto_title_session") as worker:
+            assert maybe_auto_title(db, "sess-1", notice, conversation_history=history) is None
+        worker.assert_not_called()
+
+    def test_manual_title_wins_over_held_upgrade(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="telegram")
+        db.set_session_title("sess-1", "Manual Title")
+        with patch("agent.title_generator.generate_title", return_value="Model Title") as generate:
+            auto_title_session(db, "sess-1", "look at this", conversation_history=[
+                {"role": "user", "content": "look at this"},
+            ])
+        generate.assert_not_called()
+        assert db.get_session_title("sess-1") == "Manual Title"
+
     def test_invokes_title_callback_after_setting_title(self):
         db = MagicMock()
         db.get_session_title_source.return_value = None
+        db.has_auto_title_collision.return_value = False
         db.set_auto_title.return_value = True
         seen = []
         with patch("agent.title_generator.generate_title", return_value="Readable Session"):
@@ -429,8 +617,14 @@ class TestMaybeAutoTitle:
                 main_runtime=None,
                 title_callback=None,
                 runtime_validator=None,
+                conversation_history=[{"role": "user", "content": "hello"}],
                 icon_context=None,
             )
+
+    def test_link_deferral_does_not_fetch_on_turn_start(self):
+        from agent.title_generator import opener_needs_reply
+        with patch("agent.title_generator._title_link_context", side_effect=AssertionError("network on turn start")):
+            assert opener_needs_reply("https://example.com/article") is True
 
     @pytest.mark.parametrize(
         "main_runtime, title_cfg, deferred",
@@ -834,13 +1028,15 @@ class TestAutoTitleDuplicateHandling:
         db.create_session(session_id="taken", source="cli")
         db.set_session_title("taken", "hi")
         db.create_session(session_id="sess-1", source="cli")
-        with patch("agent.title_generator.generate_title", return_value=None):
+        with patch("agent.title_generator.generate_title", return_value=None), \
+             patch("agent.title_generator._hold_until_reply_enabled", return_value=False):
             auto_title_session(db, "sess-1", "hi")
         assert db.get_session_title("sess-1") == "hi #2"
 
-    def test_dedupes_duplicate_title_via_lineage(self):
+    def test_collision_at_persistence_never_notifies_unsuffixed_title(self):
         db = MagicMock()
         db.get_session_title_source.return_value = None
+        db.has_auto_title_collision.return_value = False
         # Atomic write path: collision raises ValueError, retry persists.
         db.set_auto_title.side_effect = [ValueError("in use"), True]
         db.get_next_title_in_lineage.return_value = "Debugging Import Error #2"
@@ -864,9 +1060,9 @@ class TestAutoTitleDuplicateHandling:
             "sess-1",
             "Debugging Import Error #2",
         )
-        # callback receives the persisted alias plus the original visible title
+        # The concurrent winner was not in the earlier snapshot. Show only the persisted alias.
         assert seen == [
-            ("Debugging Import Error #2", "llm", "Debugging Import Error")
+            ("Debugging Import Error #2", "llm", "Debugging Import Error #2")
         ]
 
 
@@ -993,6 +1189,13 @@ class TestForkTitleContracts:
             with patch("agent.title_generator.call_llm", return_value=response):
                 assert generate_title("real user request") is None
 
+    def test_icon_payload_abstain_is_respected(self):
+        response = MagicMock(); response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Unspecified Subject", "abstain": true, "icons": []}'
+        with patch("agent.title_generator.call_llm", return_value=response), \
+             patch("agent.title_generator._title_link_context", return_value=None):
+            assert generate_title("look at this", icon_options=["🧪"], icon_callback=lambda *_: None) == ""
+
     def test_icon_request_precedes_examples_and_title_contract_closes_the_prompt(self):
         """The icon block rides inside the rules so the title examples and reply contract stay last;
         examples are rendered in the configured case style as Bad/Good pairs."""
@@ -1004,7 +1207,7 @@ class TestForkTitleContracts:
             generate_title("testing topic icons", icon_options=["🧪", "📊"], icon_callback=lambda *_: None)
         prompt = call.call_args.kwargs["messages"][0]["content"]
         assert prompt.index("pick icons") < prompt.index("Bad: {") < prompt.index("Reply with JSON only")
-        assert prompt.rstrip().endswith('{"title": "...", "icons": ["...", "..."]}')
+        assert prompt.rstrip().endswith('{"title": "...", "abstain": false, "icons": ["...", "..."]}')
         assert 'Good: {"title": "iCloud+ 2TB Subscription Review"}' in prompt
         assert "subscription review" not in prompt  # sentence-case pairs are not mixed in
 

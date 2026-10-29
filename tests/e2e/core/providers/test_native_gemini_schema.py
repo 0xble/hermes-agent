@@ -118,6 +118,7 @@ def _scenario(root: Path, schema: dict[str, Any], base_url: str | None) -> Outco
     home = nh.make_home(root, hermes_model(base_url), env_file=HERMES_ENV, extra_config=extra)
     script = [Calls([Call(TOOL, {"query": "q1", "mode": "fast"})]), Text(DONE)]
     with GeminiFake(root / "fake", script) as fake:
+        fake.configure_home(home.hermes_home)
         result = nh.run_chat(home, "Use the lookup tool for q1.", env=fake.child_env())
     return Outcome(result, fake.generate_calls(), fake.rejections())
 

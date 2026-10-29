@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-import yaml
+import hermes_state
+import hermes_yaml as yaml
 
 from tests.fakes.fake_llm_provider import FakeLLMServer
 
@@ -87,6 +88,7 @@ def hermetic_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, s
         # The live-DB guard treats $HOME/.hermes/state.db of a pytest descendant as production;
         # this HOME is the test's own tmp dir (asserted above).
         HERMES_STATE_DB_GUARD_BYPASS="1",
+        HERMES_DISABLE_LAZY_INSTALLS="1",
     )
     env.update(extra or {})
     return env
@@ -184,6 +186,12 @@ def write_profile_home(p: Profile, extra_config: dict[str, Any] | None = None) -
     (p.home / ".env").write_text(f"{PROVIDER_KEY_ENV}={p.provider_key}\n", encoding="utf-8")
 
 
+def _select_test_dependencies(sb: Sandbox) -> None:
+    from tests.e2e.core._pm_dependencies import select_test_dependencies
+
+    select_test_dependencies(sb.hermes_home, REPO_ROOT)
+
+
 def make_sandbox(root: Path, names: tuple[str, ...] = ("default",),
                  responder: Callable[[Profile], Any] | None = None) -> Sandbox:
     """Launch profile at HOME/.hermes, the rest under profiles/<name>; each owns a started provider
@@ -200,6 +208,7 @@ def make_sandbox(root: Path, names: tuple[str, ...] = ("default",),
         write_profile_home(p)
         profiles[name] = p
     sb = Sandbox(root=root, profiles=profiles)
+    _select_test_dependencies(sb)
     _assert_profiles_root_under(sb)
     (root / "web_dist").mkdir(exist_ok=True)
     (root / "web_dist" / "index.html").write_text(
@@ -213,6 +222,7 @@ def _assert_profiles_root_under(sb: Sandbox) -> None:
     probe = subprocess.run(
         [sys.executable, "-c", "from hermes_cli.profiles import _get_profiles_root as r; print(r())"],
         env=sb.env(), cwd=str(sb.home), capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+        check=False,
     )
     assert probe.returncode == 0, probe.stderr[-2000:]
     got = Path(probe.stdout.strip().splitlines()[-1]).resolve()
@@ -236,7 +246,7 @@ class Dashboard:
                  argv: tuple[str, ...] = ()) -> None:
         self.sb = sb
         self.log_path = log_path
-        self._log = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - closed in close()
+        self._log = open(log_path, "a", encoding="utf-8")
         env = sb.env({"HERMES_WEB_DIST": str(sb.root / "web_dist"), **(extra_env or {})})
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "hermes_cli.main", "dashboard", "--no-open", "--skip-build",
@@ -314,18 +324,31 @@ def group_members(pgid: int) -> dict[_reaper.Identity, str]:
 
 
 def db_rows(db: Path, sql: str, args: tuple = ()) -> list[tuple]:
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
-    try:
-        return conn.execute(sql, args).fetchall()
-    finally:
-        conn.close()
+    """Read-only query that tolerates the transient SQLITE_IOERR a concurrent WAL writer's
+    checkpoint can surface to a ``mode=ro`` reader. It uses the same bounded budget and
+    error marker as production read-only opens (#100436). Lock waits and other errors
+    are not retried."""
+    for attempt in range(hermes_state._READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
+            return conn.execute(sql, args).fetchall()
+        except sqlite3.OperationalError as err:
+            transient = hermes_state._DISK_IO_ERROR_MARKER in str(err).lower()
+            if attempt >= hermes_state._READ_ONLY_IOERR_RETRY_ATTEMPTS or not transient:
+                raise
+            time.sleep(hermes_state._READ_ONLY_IOERR_RETRY_BACKOFF_S)
+        finally:
+            if conn is not None:
+                conn.close()
+    raise AssertionError("unreachable")
 
 
 def run_py(sb: Sandbox, code: str, *args: str, hermes_home: Path | None = None,
            timeout: float = 120.0) -> subprocess.CompletedProcess:
     extra = {"HERMES_HOME": str(hermes_home)} if hermes_home else None
     return subprocess.run([sys.executable, "-c", code, *args], env=sb.env(extra), cwd=str(sb.home),
-                          capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+                          capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, check=False)
 
 
 SEED_SESSIONS = """

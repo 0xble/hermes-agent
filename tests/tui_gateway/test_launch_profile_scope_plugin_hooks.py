@@ -20,12 +20,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from agent.secret_scope import set_multiplex_active
 from hermes_cli import plugins as plugins_mod
 from hermes_constants import get_hermes_home, get_hermes_home_override
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
-import tui_gateway.server as server
+from tui_gateway import server
 from tui_gateway import launch_profile_policy as lpp
 
 
@@ -51,7 +53,6 @@ def two_homes(tmp_path, monkeypatch):
         entry = ((load_config_readonly().get("plugins") or {}).get("entries") or {}).get("stub") or {}
         seen.append({"home": get_hermes_home().name, "x": (entry.get("settings") or {}).get("x"),
                      "bound": get_hermes_home_override() is not None})
-        return None
 
     # Plugin managers are keyed per home: each profile loads its own copy of the plugin.
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -61,7 +62,7 @@ def two_homes(tmp_path, monkeypatch):
             manager = plugins_mod.get_plugin_manager()
         finally:
             reset_hermes_home_override(token)
-        manager._discovered = True  # never scan the real plugin tree
+        mark_plugin_discovery_complete(manager)  # never scan the real plugin tree
         manager._hooks.setdefault("pre_tool_call", []).append(stub_pre_tool_call)
     yield launch, routed, seen
     set_multiplex_active(False)

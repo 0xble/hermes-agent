@@ -50,7 +50,7 @@ jobs:
           apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
           python3 ci/install-linux-tools.py amd64
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
-          uv python install 3.11.16
+          uv python install 3.14.7
           npm install --global npm@12.0.0
       - name: Broad exact-SHA source profile
         shell: bash
@@ -97,7 +97,7 @@ jobs:
           apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
           python3 ci/install-linux-tools.py amd64
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
-          uv python install 3.11.16
+          uv python install 3.14.7
           npm install --global npm@12.0.0
       - name: Exact-SHA Python shard
         shell: bash
@@ -146,7 +146,7 @@ jobs:
           version: '0.12.13'
       - name: Install pinned checkout Python
         shell: bash
-        run: uv python install 3.11.16
+        run: uv python install 3.14.7
       - name: Initialize Windows MSVC linker for Rust builds
         if: matrix.os == 'windows-2025-vs2026'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1

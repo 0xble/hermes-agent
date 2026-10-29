@@ -25,14 +25,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from agent.vault_login_classifier import (  # noqa: E402
+from agent.vault_login_classifier import (
     ClassifiedLoginControl,
     LoginControl,
     build_fill_js,
     classify_login_control,
     select_password_fill,
 )
-from agent.vault_store import (  # noqa: E402
+from agent.vault_store import (
     VaultError,
     VaultStore,
     normalize_origin,
@@ -647,7 +647,7 @@ def test_every_registered_tool_schema_declares_openai_style_parameters():
     """The registry emits ``parameters`` (OpenAI function shape) and every provider adapter converts from
     it; a schema that spells it ``input_schema`` (Anthropic shape) ships with NO parameters, so the model is
     told the tool takes nothing and calls browser_vault_fill without a handle."""
-    import model_tools  # noqa: F401 — triggers discovery
+    import model_tools
     from tools.registry import registry
 
     missing = [entry.name for entry in registry.get_all_entries()
@@ -718,7 +718,7 @@ def test_every_vault_tool_is_in_the_browser_toolset():
     """toolsets.py is a hand-maintained list; a tool registered here but missing there is invisible to the model
     (live: browser_vault_save_login was registered, tested, and never offered)."""
     import toolsets
-    from tools import browser_vault_tool  # noqa: F401  (registers)
+    from tools import browser_vault_tool
     from tools.registry import registry
 
     registered = {e.name for e in registry.get_all_entries() if e.name.startswith("browser_vault_")}
@@ -819,7 +819,7 @@ class TestTwoFactor:
         # the real widget
         assert [f["value"] for f in build_otp_fills([ctl(i + 4, maxlen=1) for i in range(6)], "246810")] == list("246810")
 
-    def test_no_code_field_points_at_passkey_or_device_approval(self):
+    def test_no_code_field_describes_supported_passkey_and_approval_routes(self):
         from tools import browser_vault_tool
 
         fake_eval = lambda t, e: {"success": True, "result": json.dumps([{"index": 0, "type": "text", "name": "q", "label": "Search", "autocomplete": ""}]) if "querySelectorAll" in e else "https://acme.test/approve"}
@@ -827,3 +827,9 @@ class TestTwoFactor:
              patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval):
             out = json.loads(browser_vault_tool.browser_vault_enter_code(task_id="t"))
         assert out["error_type"] == "no_code_field"
+        assert "1Password passkey" in out["error"]
+        assert "issuer's web or desktop path" in out["error"]
+        assert "phone-only approval" in out["error"]
+        assert "Never use iPhone Mirroring" in out["error"]
+        assert "passkey not in 1Password" in out["error"]
+        assert "intended identity" in out["error"]

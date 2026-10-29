@@ -22,6 +22,8 @@ def test_explicit_auto_prune_false_is_respected(monkeypatch, tmp_path: Path):
         lambda: {"sessions": {"auto_prune": False, "retention_days": 90}},
     )
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    import hermes_cli.maintenance_window
+    monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: True)
 
     cli._run_state_db_auto_maintenance(session_db)
 
@@ -51,12 +53,57 @@ def test_negative_retention_days_in_config_deletes_nothing(monkeypatch, tmp_path
             lambda: {"sessions": {"auto_prune": True, "retention_days": -1}},
         )
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+        import hermes_cli.maintenance_window
+        monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: True)
 
         cli._run_state_db_auto_maintenance(session_db)
 
         assert session_db.get_session("ended") is not None
     finally:
         session_db.close()
+
+
+def test_cli_ghost_prune_outside_deletion_window_stays_unlatched(monkeypatch, tmp_path: Path):
+    import cli
+    import hermes_cli.config
+    import hermes_cli.maintenance_window
+    import hermes_constants
+
+    session_db = MagicMock()
+    session_db.get_meta.return_value = None
+    monkeypatch.setattr(
+        hermes_cli.config,
+        "load_config",
+        lambda: {"sessions": {"auto_prune": False}},
+    )
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: False)
+
+    cli._run_state_db_auto_maintenance(session_db)
+
+    session_db.prune_empty_ghost_sessions.assert_not_called()
+
+
+def test_cli_auto_prune_outside_deletion_window_leaves_throttle_unspent(monkeypatch, tmp_path: Path):
+    import cli
+    import hermes_cli.config
+    import hermes_cli.maintenance_window
+    import hermes_constants
+
+    session_db = MagicMock()
+    session_db.get_meta.return_value = "already-done"
+    monkeypatch.setattr(
+        hermes_cli.config,
+        "load_config",
+        lambda: {"sessions": {"auto_prune": True, "retention_days": 30}},
+    )
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: False)
+
+    cli._run_state_db_auto_maintenance(session_db)
+
+    session_db.maybe_auto_prune_and_vacuum.assert_not_called()
+    session_db.set_meta.assert_not_called()
 
 
 def test_cli_auto_maintenance_forwards_vacuum_interval(monkeypatch, tmp_path: Path):
@@ -80,6 +127,8 @@ def test_cli_auto_maintenance_forwards_vacuum_interval(monkeypatch, tmp_path: Pa
         },
     )
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    import hermes_cli.maintenance_window
+    monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: True)
 
     cli._run_state_db_auto_maintenance(session_db)
 

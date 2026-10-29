@@ -51,6 +51,32 @@ def extract_archive(source: tarfile.TarFile, destination: Path) -> None:
                 if linked_member is None or not linked_member.isfile():
                     raise RuntimeError(f'Archive hard link must target an ordinary file: {name}')
 
+    def resolve_link(parts, active=()):
+        resolved = []
+        for part in parts:
+            if part == '.':
+                continue
+            if part == '..':
+                if not resolved:
+                    raise RuntimeError('Archive link chain escapes extraction root')
+                resolved.pop()
+                continue
+            resolved.append(part)
+            name = '/'.join(resolved)
+            linked = members.get(name)
+            if linked is not None and linked.issym():
+                if name in active:
+                    raise RuntimeError('Archive link chain is cyclic')
+                target = (*resolved[:-1], *PurePosixPath(linked.linkname).parts)
+                resolved = resolve_link(target, (*active, name))
+        return resolved
+
+    # Python 3.14's default data filter can rewrite the link text. Validate the
+    # original graph before extraction so sanitization cannot hide an escape.
+    for name, member in members.items():
+        if member.issym():
+            resolve_link(PurePosixPath(name).parts)
+
     for member in members.values():
         member.mode = (member.mode & 0o755) | 0o600
         member.uid = member.gid = 0

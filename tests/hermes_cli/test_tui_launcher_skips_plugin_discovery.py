@@ -20,7 +20,7 @@ from hermes_cli import mcp_startup
 def _install_discover_spy(monkeypatch):
     calls = []
 
-    def _discover():
+    def _discover(*a, **k):
         calls.append("discover")
 
     monkeypatch.setitem(

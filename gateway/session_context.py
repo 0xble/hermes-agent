@@ -37,6 +37,7 @@ _SESSION_VARS = (
     _SESSION_USER_NAME, _SESSION_SCOPE_ID, _SESSION_KEY, _SESSION_ID,
     _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _SESSION_PROFILE,
     _BROWSER_CONTROL_PRINCIPAL, _BROWSER_CONTROL_TRANSPORT_FAMILY, _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
+    _TURN_ORIGIN,
 ) = tuple(ContextVar(name, default=_UNSET) for name in (
     "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
     "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
@@ -44,7 +45,7 @@ _SESSION_VARS = (
     "HERMES_SESSION_SCOPE_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
     "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
     "HERMES_BROWSER_CONTROL_PRINCIPAL", "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
-    "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID",
+    "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID", "HERMES_TURN_ORIGIN",
 ))
 
 # Whether this channel can route an ASYNC completion back AFTER the turn ends (see
@@ -180,6 +181,9 @@ def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:
     return {**(metadata or {}), **anchors} if anchors else metadata
 
 
+_TURN_ORIGINS = frozenset({"user", "relay", "process", "goal_loop", "cron", "unknown"})
+
+
 def set_session_vars(
     platform: str = "", source: str = "", chat_id: str = "", chat_type: str = "",
     chat_name: str = "", thread_id: str = "", user_id: str = "", user_id_alt: str = "",
@@ -187,7 +191,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
-    session_history_delivery: str | None = None,
+    session_history_delivery: str | None = None, turn_origin: str = "unknown",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -204,12 +208,25 @@ def set_session_vars(
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
         browser_control_principal, browser_control_transport_family, cron_session, parent_chat_id,
+        turn_origin if turn_origin in _TURN_ORIGINS else "unknown",
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
+
+
+def set_turn_origin(turn_origin: str) -> None:
+    """Bind this task's turn provenance after ``set_session_vars``; unknown values default-deny."""
+    _TURN_ORIGIN.set(turn_origin if turn_origin in _TURN_ORIGINS else "unknown")
+
+
+def bound_turn_origin() -> str:
+    """This task's bound turn provenance, never ``os.environ``: an ambient or stale
+    ``HERMES_TURN_ORIGIN`` must not grant human-turn treatment. Unbound is ``unknown``."""
+    value = _TURN_ORIGIN.get()
+    return value if value is not _UNSET and value in _TURN_ORIGINS else "unknown"
 
 
 def clear_session_vars(tokens: list) -> None:
@@ -245,6 +262,17 @@ def get_session_env(name: str, default: str = "") -> str:
     if var is not None and (value := var.get()) is not _UNSET:
         return value
     return os.getenv(name, default)
+
+
+def bound_session_env(name: str, default: str = "") -> str:
+    """Like :func:`get_session_env`, but for identity that crosses a trust boundary: once any
+    session has been bound in this process the ContextVar is authoritative and an unbound var is
+    *default*, because ``os.environ`` then mirrors whichever concurrent turn wrote last. A process
+    that never bound one (plain CLI) has a single session, so its ``os.environ`` mirror is used."""
+    var = _VAR_MAP[name]
+    if (value := var.get()) is not _UNSET:
+        return value
+    return default if _session_context_engaged else os.getenv(name, default)
 
 
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/

@@ -12,12 +12,44 @@ def _flag(parser, *names, help, **kw):
     parser.add_argument(*names, action="store_true", help=help, **kw)
 
 
+def cmd_sessions_lazy(args, **kwargs):
+    """``hermes sessions`` handler; sessions_cmd imports only when the subcommand runs."""
+    from hermes_cli.sessions_cmd import cmd_sessions
+
+    return cmd_sessions(args, **kwargs)
+
+
 def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     """Attach the ``sessions`` subcommand to ``subparsers``."""
     sessions_parser = subparsers.add_parser(
         "sessions", help="Manage session history (list, rename, export, prune, delete)",
         description="View and manage the SQLite session store")
     sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
+
+    from hermes_cli.sessions_inspect import cmd_session_search, cmd_session_state
+
+    search_parser = sessions_subparsers.add_parser("search", help="Search session history and print JSON")
+    search_parser.add_argument("query", help="Session-search query")
+    search_parser.add_argument("--limit", type=int, default=3, help="Maximum sessions (clamped to 1-10)")
+    search_parser.add_argument("--after", help="Inclusive ISO-8601 or relative-duration lower bound")
+    search_parser.add_argument("--before", help="Exclusive ISO-8601 or relative-duration upper bound")
+    search_parser.set_defaults(func=cmd_session_search)
+
+    state_parser = sessions_subparsers.add_parser("state", help="Read bounded session/topic/delivery state as JSON")
+    state_subs = state_parser.add_subparsers(dest="state_action", required=True)
+    topic_parser = state_subs.add_parser("resolve-topic", help="Resolve a Telegram topic binding")
+    topic_parser.add_argument("--chat-id", required=True)
+    topic_parser.add_argument("--thread-id", required=True)
+    topic_parser.set_defaults(func=cmd_session_state, state_action="resolve_topic")
+    inspect_parser = state_subs.add_parser("inspect", help="Inspect session metadata without messages")
+    inspect_parser.add_argument("--session-id", required=True)
+    inspect_parser.set_defaults(func=cmd_session_state, state_action="inspect_session")
+    delivery_parser = state_subs.add_parser("delivery", help="Inspect delivery obligations")
+    delivery_selector = delivery_parser.add_mutually_exclusive_group(required=True)
+    for flag in ("--session-id", "--session-key", "--obligation-id"):
+        delivery_selector.add_argument(flag)
+    delivery_parser.add_argument("--include-content", action="store_true", help="Include bounded delivery text")
+    delivery_parser.set_defaults(func=cmd_session_state, state_action="inspect_delivery")
 
     sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions")
     sessions_list.add_argument("--source", help="Filter by source (cli, telegram, discord, etc.)")
@@ -89,7 +121,8 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     sessions_export.add_argument("--session-id", help="Session ID or unique prefix to export")
     _add_session_filter_args(
         sessions_export, "Only export sessions older than AGE (duration like '5h'/'2d', "
-        "bare number of days, or an ISO timestamp)")
+        "bare number of days, or an ISO timestamp). Filtered exports include pinned and archived "
+        "sessions, so they back up everything a matching prune could delete")
     _flag(sessions_export, "--redact",
         help="Redact secrets (API keys, tokens, credentials) from exported content")
     sessions_export.add_argument("--lineage", choices=["single", "logical"], default="single",
@@ -130,6 +163,11 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         "optimize", help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)")
     _flag(sessions_optimize, "--force",
         help="Run even while another Hermes process (gateway, Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped")
+    _flag(sessions_optimize, "--at-next-start",
+        help="Don't optimize now: record a one-shot request that the next gateway start honors before "
+             "it opens the store (safe while the gateway runs; deferred while other processes hold state.db)")
+    _flag(sessions_optimize, "--cancel-next-start",
+        help="Withdraw a pending --at-next-start request")
 
     sessions_clean_markers = sessions_subparsers.add_parser("clean-markers",
         help="Permanently clear stale tool-call marker content left by sessions from before #78148",

@@ -136,85 +136,51 @@ def test_timeout_fails_closed_instead_of_authorizing_an_unserialized_turn():
 
 
 @pytest.mark.asyncio
-async def test_agent_path_propagates_timed_out_lease_before_loading_transcript(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("full_dispatch", [False, True])
+async def test_lease_wait_preserves_input_without_loading_transcript_or_goal_hook(
+    monkeypatch, tmp_path, full_dispatch
 ):
-    """The agent path propagates timeout before transcript work can begin.
-
-    Outer dispatch owns the visible rejection/resend notice. Most importantly,
-    transcript loading and agent execution must not start: both would operate
-    without the per-session serialization guarantee.
-    """
-    from tests.gateway.test_duplicate_user_message import (
-        _bootstrap,
-        _event,
-        _source,
-    )
+    from tests.gateway.test_duplicate_user_message import _bootstrap, _event, _source
 
     runner = _bootstrap(monkeypatch, tmp_path)
     runner._turn_leases = SessionTurnLeaseRegistry()
-    holder = await runner._turn_leases.acquire(
-        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
-    )
-    assert holder is not None
+    holder = await runner._turn_leases.acquire("sess-dedup", owner_key="holder-key", generation=1)
     monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: tmp_path)
+    # The real preparation path must reach the lease; synchronize on its durable preservation.
+    from gateway.run_turn_lease_wait import preserve_lease_wait
+    spooled = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
-    runner.session_store.load_transcript.side_effect = AssertionError(
-        "transcript must not load after a turn-lease timeout"
-    )
-    runner._run_agent = pytest.fail
+    def preserve(*args):
+        preserve_lease_wait(*args)
+        loop.call_soon_threadsafe(spooled.set)
 
-    try:
-        with pytest.raises(TurnLeaseTimeoutError):
-            await runner._handle_message_with_agent(
-                _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
-            )
-    finally:
-        assert runner._turn_leases.release(holder) is True
-
-    runner.session_store.load_transcript.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
-    monkeypatch, tmp_path
-):
-    """A lease rejection is not a completed turn for `/goal` evaluation.
-
-    The lease wait also has its own clock: a short lease budget must reject
-    promptly even while the normal agent inactivity timeout remains long.
-    """
-    from tests.gateway.test_duplicate_user_message import _bootstrap, _event
-
-    runner = _bootstrap(monkeypatch, tmp_path)
-    runner._turn_leases = SessionTurnLeaseRegistry()
-    holder = await runner._turn_leases.acquire(
-        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
-    )
-    assert holder is not None
-    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "120")
-    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
-
-    runner.session_store.load_transcript.side_effect = AssertionError(
-        "transcript must not load after a turn-lease timeout"
-    )
-    session_env_tokens = object()
-    runner._set_session_env = MagicMock(return_value=session_env_tokens)
+    monkeypatch.setattr("gateway.run_turn_lease_wait.preserve_lease_wait", preserve)
+    runner.session_store.load_transcript.side_effect = AssertionError("lease is still held")
+    tokens = object()
+    runner._set_session_env = MagicMock(return_value=tokens)
     runner._clear_session_env = MagicMock()
     runner._run_agent = pytest.fail
     runner._post_turn_goal_continuation = AsyncMock()
-
+    event = _event()
+    operation = (runner._handle_message(event) if full_dispatch else
+                 runner._handle_message_with_agent(event, _source(), "agent:main:telegram:group:-1001:12345", 1))
+    task = asyncio.create_task(operation)
     try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=30)
+        await asyncio.wait_for(spooled.wait(), 5)
+        assert not task.done()
+        runner.session_store.load_transcript.assert_not_called()
     finally:
-        assert runner._turn_leases.release(holder) is True
-
-    assert isinstance(response, str)
-    assert "not processed" in response.lower()
-    assert "resend" in response.lower()
-    runner.session_store.load_transcript.assert_not_called()
-    runner._clear_session_env.assert_called_once_with(session_env_tokens)
+        # This probe models process shutdown. User cancellation deliberately retires
+        # the spool instead, exercised by the inbound exit-intent coverage.
+        runner._draining = True
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert runner._turn_leases.release(holder)
+    runner._clear_session_env.assert_called_once_with(tokens)
     runner._post_turn_goal_continuation.assert_not_awaited()
+    assert event._gateway_lease_wait_spool.exists()
 
 
 # ---------------------------------------------------------------------------

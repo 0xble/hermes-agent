@@ -15,14 +15,19 @@ from typing import Any, Dict, List, Optional
 
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
-    PRE_API_COMPRESSION_STATUS_TEMPLATE, _reset_read_dedup_caches, compression_blocked_transiently,
-    compression_skipped_due_to_lock, context_compression_timed_out,
+    PRE_API_COMPRESSION_STATUS_TEMPLATE, compression_blocked_transiently,
+    compression_pool_saturated, compression_skipped_due_to_lock, context_compression_timed_out,
     conversation_history_after_compression, ensure_compression_feasibility_checked,
 )
+from agent.conversation_compression_boundary import mark_context_loss_boundary
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
     _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
     _reanchor, _reset_retry_state_after_compaction,
+)
+from agent.compact_context import (
+    commit_compaction, mark_compaction_refused,
+    release_pending_compaction, mark_compaction_failure, take_pending_compaction,
 )
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -51,13 +56,15 @@ class PreflightGateVerdict:
     _preflight_compression_blocked: Any
     _provider_overflow_recovery_pending: Any
     _last_preflight_pressure: Any
-    result: Optional[Dict[str, Any]] = None
+    _preflight_api_call_refunded: bool = False
+    result: Optional[dict[str, Any]] = None
 
 
 def run_preflight_compression(
     agent: Any, v: PreflightGateVerdict, *, compressor: Any, request_pressure_tokens: int,
     provider_overflow_preflight: bool, defer_preflight: Any, moa_prepared_request: Any,
     system_message: Any, user_message: Any, max_compression_attempts: int, effective_task_id: Any,
+    hard_window_preflight: bool = False,
 ) -> PreflightGateVerdict:
     """Mirror of the turn-prologue guard chain (defer on noisy estimate → skip in failure
     cooldown → ``should_compress``), rebinding the loop locals on ``v`` and setting
@@ -68,15 +75,22 @@ def run_preflight_compression(
     closed (llama.cpp may silently truncate)."""
     from agent.conversation_loop import (
         _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _HANDOFF_SKIP_FINAL_RESPONSE,
-        _compression_deferred_result, _maybe_grow_local_window, _provider_overflow_exhausted_result,
-        _should_skip_model_call_for_reference_handoff,
+        _compression_deferred_result, _maybe_grow_local_window, _preflight_hard_window_result,
+        _provider_overflow_exhausted_result, _should_skip_model_call_for_reference_handoff,
     )
 
-    def _done(action: str, result: Optional[Dict[str, Any]] = None) -> PreflightGateVerdict:
+    def _done(action: str, result: Optional[dict[str, Any]] = None) -> PreflightGateVerdict:
         v.action, v.result = action, result
         return v
 
-    def _exhausted_result() -> Dict[str, Any]:
+    def _exhausted_result() -> dict[str, Any]:
+        if hard_window_preflight:
+            if not getattr(v, "_preflight_api_call_refunded", False):
+                v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                v._preflight_api_call_refunded = True
+            return _preflight_hard_window_result(
+                agent, v.messages, v.conversation_history, v.api_call_count,
+            )
         return _provider_overflow_exhausted_result(
             agent, v.messages, v.conversation_history, v.api_call_count, request_pressure_tokens,
             max_compression_attempts,
@@ -99,7 +113,7 @@ def run_preflight_compression(
         and (not v._preflight_compression_blocked or provider_overflow_preflight)
         and (not defer_preflight(request_pressure_tokens) or provider_overflow_preflight)
         and not _compression_cooldown
-        and compressor.should_compress(request_pressure_tokens)
+        and (compressor.should_compress(request_pressure_tokens) or hard_window_preflight)
     ):
         # Managed local runtime: grow the context window before compressing (last
         # resort). Only for a llamacpp provider at the supervised base_url.
@@ -146,12 +160,15 @@ def run_preflight_compression(
         _pre_api_input = v.messages
         v.messages, v.active_system_prompt = agent._compress_context(
             v.messages, system_message, approx_tokens=request_pressure_tokens,
-            task_id=effective_task_id,
+            task_id=effective_task_id, trigger="pre_api",
         )
         if context_compression_timed_out(agent):
             # Progress-aware timeout: never reached the provider — refund the
             # call/budget and stop; an overflow retry would only re-compress.
             v.api_call_count = _refund_api_call(agent, v.api_call_count)
+            v._preflight_api_call_refunded = True
+            if hard_window_preflight:
+                return _done("return", _exhausted_result())
             v.final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
             v.failed = True
             v._compression_timeout_exhausted = True
@@ -162,12 +179,25 @@ def run_preflight_compression(
         ):
             # Temporary DEFER (lock held / cooldown), not evidence about compressibility:
             # refund the attempt, leave the progress blocker unarmed and proceed.
+            _lock_skipped = compression_skipped_due_to_lock(agent)
             v.compression_attempts -= 1
             v._last_preflight_pressure = None
             if v.pending_moa_prepared_request is moa_prepared_request:
                 v.pending_moa_prepared_request = None
+            if hard_window_preflight:
+                v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                agent._persist_session(v.messages, v.conversation_history)
+                return _done("return", _compression_deferred_result(
+                    agent, v.messages, v.api_call_count,
+                    reason="lock" if _lock_skipped else "transient_block",
+                ))
         else:
             _reset_retry_state_after_compaction(agent)
+            # The old cap was sized for the pre-compaction request. Let the next
+            # preflight pass measure the freed room and arm a fresh ceiling.
+            agent._preflight_output_ceiling = None
+            if not getattr(agent, "_ephemeral_output_cap_is_retry_boost", False):
+                agent._ephemeral_max_output_tokens = None
             # Re-baseline the flush cursor: rotation returns None (child flushes
             # whole); in-place returns list(messages) — None would re-append
             # persisted rows. See conversation_history_after_compression().
@@ -189,9 +219,16 @@ def run_preflight_compression(
                 v._turn_exit_reason = "compaction_handoff_not_actionable"
                 return _done("break")
             return _done("continue")
+    elif hard_window_preflight and not _eligible:
+        # No legal guarded compression path exists (disabled, empty, or attempt cap);
+        # fail closed with the retained-input type, never timeout/exhaustion.
+        return _done("return", _exhausted_result())
     elif provider_overflow_preflight and _compression_cooldown:
         # Provider proved the request cannot fit and the compressor is unavailable:
         # don't resend; let the next user turn retry after cooldown.
+        if hard_window_preflight:
+            v.api_call_count = _refund_api_call(agent, v.api_call_count)
+            v._preflight_api_call_refunded = True
         agent._persist_session(v.messages, v.conversation_history)
         return _done("return", _compression_deferred_result(
             agent, v.messages, v.api_call_count, reason="transient_block"
@@ -232,7 +269,7 @@ class PostToolCompressionVerdict:
     ``turn_exit_reason`` set)."""
 
     end_turn: bool
-    messages: List[Dict[str, Any]]
+    messages: list[dict[str, Any]]
     active_system_prompt: Any
     conversation_history: Any
     compression_attempts: int
@@ -242,7 +279,7 @@ class PostToolCompressionVerdict:
 
 
 def compress_after_tool_results(
-    agent: Any, *, messages: List[Dict[str, Any]], system_message: Any, user_message: Any,
+    agent: Any, *, messages: list[dict[str, Any]], system_message: Any, user_message: Any,
     active_system_prompt: Any, conversation_history: Any, compression_attempts: int,
     max_compression_attempts: int, effective_task_id: Any, final_response: Any,
     turn_exit_reason: Any, current_turn_user_idx: int,
@@ -294,6 +331,54 @@ def compress_after_tool_results(
             estimate_request_tokens_rough(messages, tools=agent.tools or None),
         )
 
+    # Agent-requested compaction is a separate path: unlike automatic compaction it is
+    # intentionally allowed below the threshold. It still runs only at this post-tool
+    # boundary, under the same attempt budget and transient/lock refund rules.
+    _agent_pending = take_pending_compaction(agent)
+    if _agent_pending is not None:
+        if not agent.compression_enabled or compression_attempts >= max_compression_attempts:
+            mark_compaction_refused(agent)
+        else:
+            ensure_compression_feasibility_checked(agent, _real_tokens)
+            compression_attempts += 1
+            _clear_overflow_warn(agent)
+            _post_tool_input = messages
+            _safe_print = getattr(agent, "_safe_print", lambda _message: None)
+            _safe_print("  ⟳ compacting context…")
+            try:
+                messages, active_system_prompt = agent._compress_context(
+                    messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id,
+                    focus_topic=_agent_pending.get("focus") or None, trigger="agent_requested",
+                )
+            except Exception:
+                mark_compaction_failure(agent)
+                raise
+            if messages is _post_tool_input and (
+                compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
+            ):
+                # Keep the request pending for the next safe boundary in this turn.
+                compression_attempts -= 1
+                release_pending_compaction(agent)
+                return _verdict(False)
+            if messages is _post_tool_input:
+                # A hard failure/no-op consumes the request; do not retry repeatedly.
+                mark_compaction_failure(agent)
+                return _verdict(False)
+            commit_compaction(agent)
+            conversation_history = conversation_history_after_compression(
+                agent, messages, conversation_history
+            )
+            if _should_skip_model_call_for_reference_handoff(messages, user_message):
+                logger.info("Skipping agent-requested compaction model call: reference-only handoff (#80622)")
+                if not final_response:
+                    final_response = _HANDOFF_SKIP_FINAL_RESPONSE
+                turn_exit_reason = "compaction_handoff_not_actionable"
+                return _verdict(True)
+            current_turn_user_idx = _reanchor(agent, messages, user_message)
+            # One requested pass is the boundary for this invocation; do not also run
+            # automatic compaction on the same post-tool result.
+            return _verdict(False)
+
     if agent.compression_enabled and compression_attempts < max_compression_attempts:
         ensure_compression_feasibility_checked(agent, _real_tokens)
     if (
@@ -313,11 +398,13 @@ def compress_after_tool_results(
         # Pass overhead-aware _real_tokens, not last_prompt_tokens (0 in the
         # no-usage fallback), so the overflow guard sees the true size.
         messages, active_system_prompt = agent._compress_context(
-            messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id
+            messages, system_message, approx_tokens=_real_tokens, task_id=effective_task_id, trigger="post_tool",
         )
-        if messages is _post_tool_input and compression_skipped_due_to_lock(agent):
-            # Lock-skip no-op is a temporary defer, not evidence about compressibility:
-            # refund so a lock-loser loop doesn't burn the budget toward exhausted.
+        if messages is _post_tool_input and (
+            compression_skipped_due_to_lock(agent) or compression_pool_saturated(agent)
+        ):
+            # Lock or full-pool no-op is a temporary defer, not evidence about compressibility:
+            # refund so a contention loop doesn't burn the budget toward exhausted.
             # #69870 lock-skip / #97488 transient-block: this pass no-oped for a TEMPORARY reason (another
             # path holds the compression lock, or a timed cooldown/backoff guard is active). That is a
             # temporary DEFER, not evidence about compressibility — refund the attempt (it must not burn the
@@ -385,9 +472,12 @@ def compress_after_tool_results(
             # conversation_history: rows already carry _DB_PERSISTED_MARKER, and on a
             # stale in-place flag the helper could seed unpersisted rows.
             if _pruned_n and _pruned_msgs is not messages:
+                from agent.compaction_events import publish_prune
+
+                publish_prune(agent, messages, _pruned_msgs, _pruned_n)
                 messages = _pruned_msgs
                 # A committed prune is a content-loss boundary like compaction: demoted skill_view /
                 # read_file bodies survive only as one-line markers, so the repeat-read dedup must
                 # stop answering "unchanged" for them or the reload the marker asks for is refused.
-                _reset_read_dedup_caches(effective_task_id, session_id=agent.session_id or "")
+                mark_context_loss_boundary(agent, effective_task_id)
     return _verdict(False)

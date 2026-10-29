@@ -11,7 +11,7 @@ def test_socket_verified_outgoing_gateway_survives_cleanup_scan_exclusion(monkey
     parents = {gateway.os.getpid(): outgoing_pid, outgoing_pid: 1}
     monkeypatch.setattr(gateway, "_get_parent_pid", parents.get)
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
-    monkeypatch.setattr(gateway, "_get_service_pids", lambda **kwargs: [])
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda **kwargs: set())
     monkeypatch.setattr(gateway.os.path, "isdir", lambda path: False)
     monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda **kwargs: [])
     monkeypatch.setattr(

@@ -41,7 +41,7 @@ def test_text_password_candidate_never_outranks_real_password(monkeypatch, mixed
     secret_eval = Mock(return_value={'success': True, 'result': '{"filled":1}'})
     monkeypatch.setattr(vault, '_eval_js_secret', secret_eval)
     from tools.registry import registry
-    result = json.loads(registry.dispatch('browser_vault_fill', {'handle': 'op:test'}, task_id='synthetic'))
+    result = json.loads(registry.dispatch('browser_vault', {'action': 'fill', 'handle': 'op:test'}, task_id='synthetic'))
     if not mixed:
         assert result['success'] is False
         backend.resolve_password.assert_not_called()

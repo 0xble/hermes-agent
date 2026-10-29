@@ -18,23 +18,39 @@ import time
 import weakref as _weakref
 from agent.async_utils import consume_detached_task_result
 from contextvars import Context
-from datetime import datetime, timedelta, timezone
-from gateway.config import SHARED_LISTENER_MIRROR_PLATFORMS, Platform, platform_binds_port as _platform_binds_port
+from datetime import datetime, timedelta, timezone, UTC
+from gateway.config import (
+    ON_ALL_ADAPTERS_DOWN_POLICIES,
+    SHARED_LISTENER_MIRROR_PLATFORMS,
+    Platform,
+    platform_binds_port as _platform_binds_port,
+)
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.helpers import carry_inbound_dedup, inbound_dedup_caches
+from gateway.platforms.helpers import carry_inbound_dedup, hand_over_held_inbound
 from gateway.restart import is_global_startup_conflict
 from gateway.run_shutdown import _log_suppressed
 from gateway.session import SessionSource
+from hermes_cli.observability.shared_metrics_gateway import record_platform_connect, record_platform_disconnect
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
-    from gateway.run import GatewayRunner  # noqa: F401
-    from gateway.run_turn_runner import TurnRunner  # noqa: F401
+    from gateway.run import GatewayRunner
+    from gateway.run_turn_runner import TurnRunner
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 _UNSET = object()  # "no per-profile human_delay snapshot": fall back to the primary's value
+_MAX_PLUGIN_LOAD_REARMS = 3  # per queued platform: transient load failures heal, a broken plugin stops re-importing
+
+
+def _adapter_unavailable_message(platform: Platform, *, retrying: bool = True) -> str:
+    """Actionable ``adapter_unavailable`` status text, shared by startup and the reconnect watcher so
+    ``hermes status`` keeps the plugin/deps/credentials hint after the first retry."""
+    message = (
+        f"No adapter available for enabled {platform.value}; check the plugin, dependencies, and credentials."
+    )
+    return f"{message} Retrying in the background." if retrying else message
 
 
 class _UnresolvedProfileHome:
@@ -55,7 +71,7 @@ class GatewayAdapterLifecycleMixin:
     """Adapter lifecycle: connect/teardown, fatal recovery, reconnect watcher, multiplex profiles."""
 
     @staticmethod
-    async def _wait_or_detach(task: "asyncio.Future", timeout: float) -> bool:
+    async def _wait_or_detach(task: asyncio.Future, timeout: float) -> bool:
         """Wait up to ``timeout`` for ``task``; on deadline (or our own cancellation) detach it. Not
         ``asyncio.wait_for``: that WAITS for the cancelled child, so a connect()/close() swallowing
         ``CancelledError`` blocks recovery forever. True if it finished in time."""
@@ -68,9 +84,25 @@ class GatewayAdapterLifecycleMixin:
                 task.add_done_callback(consume_detached_task_result)
         return task in done
 
-    async def _await_adapter_cleanup_with_timeout(self, awaitable: Awaitable[Any], timeout: float) -> bool:
-        """Await adapter cleanup with a detach-on-deadline bound; True when it completed."""
-        if timeout <= 0:
+    async def _await_adapter_cleanup_with_timeout(
+        self, awaitable: Awaitable[Any], timeout: Optional[float], *, deadline_expired: bool = False,
+    ) -> bool:
+        """Await adapter cleanup with a detach-on-deadline bound; True when it completed.
+
+        ``timeout`` None or <= 0 means unbounded (``HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT=0``).
+        An already-expired shared shutdown deadline is a separate, explicit ``deadline_expired``
+        signal: the cleanup is still started (so disconnect and token-lock release are attempted)
+        and gets one loop turn, then anything still running is detached.
+        """
+        if deadline_expired:
+            task = asyncio.ensure_future(awaitable)
+            task.add_done_callback(consume_detached_task_result)
+            await asyncio.sleep(0)
+            if not task.done():
+                return False
+            await task
+            return True
+        if timeout is None or timeout <= 0:
             await awaitable
             return True
         task = asyncio.ensure_future(awaitable)
@@ -91,7 +123,10 @@ class GatewayAdapterLifecycleMixin:
                     timeout, label,
                 )
 
-    async def _bounded_adapter_teardown(self, adapter, platform, *, profile: Optional[str] = None) -> None:
+    async def _bounded_adapter_teardown(
+        self, adapter, platform, *, profile: Optional[str] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
         """Tear down one adapter on the shutdown path with bounded awaits (never raises). Unbounded,
         a half-dead transport stalls past systemd's ``TimeoutStopSec``; the SIGKILL skips ``atexit``
         PID-file cleanup and the next start dies with "PID file race lost".
@@ -99,29 +134,54 @@ class GatewayAdapterLifecycleMixin:
         Both ``cancel_background_tasks()`` and ``disconnect()`` can block indefinitely when a platform's
         network state is half-dead (e.g. a wedged Feishu/Lark WebSocket thread waiting on I/O). See #14128.
         """
-        timeout = self._adapter_disconnect_timeout_secs()
+        budget = self._adapter_disconnect_timeout_secs()
+        # HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT=0 keeps its documented "unbounded" meaning; only a
+        # shared shutdown ``deadline`` bounds it then.
+        teardown_deadline: Optional[float] = None if budget <= 0 else time.monotonic() + budget
+        if deadline is not None:
+            teardown_deadline = deadline if teardown_deadline is None else min(teardown_deadline, deadline)
+
+        def remaining() -> Optional[float]:
+            """Seconds left (None = unbounded); 0.0 means the shared deadline has expired."""
+            if teardown_deadline is None:
+                return None
+            return max(0.0, teardown_deadline - time.monotonic())
+
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
-        try:
-            if not await self._await_adapter_cleanup_with_timeout(adapter.cancel_background_tasks(), timeout):
-                logger.warning(
-                    "✗ %s background-task cancel timed out after %.1fs - forcing continue%s",
-                    platform.value, timeout, suffix,
-                )
-        except Exception as e:
-            logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
+        cancel_timeout = remaining()
+        if cancel_timeout is None or cancel_timeout > 0:
+            try:
+                if not await self._await_adapter_cleanup_with_timeout(
+                    adapter.cancel_background_tasks(), cancel_timeout,
+                ):
+                    logger.warning(
+                        "✗ %s background-task cancel timed out after %.1fs - forcing continue%s",
+                        platform.value, cancel_timeout or 0.0, suffix,
+                    )
+            except Exception as e:
+                logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
+        else:
+            logger.warning(
+                "✗ %s background-task cancel skipped after shutdown deadline%s",
+                platform.value, suffix,
+            )
+        disconnect_timeout = remaining()
         with _log_suppressed(
             logging.ERROR, "✗ %s disconnect error after %.2fs%s: %s",
             platform.value, time.monotonic() - started_at, suffix,
         ):
-            if await self._await_adapter_cleanup_with_timeout(adapter.disconnect(), timeout):
+            if await self._await_adapter_cleanup_with_timeout(
+                adapter.disconnect(), disconnect_timeout,
+                deadline_expired=disconnect_timeout is not None and disconnect_timeout <= 0,
+            ):
                 logger.info(
                     "✓ %s disconnected (%.2fs)%s", platform.value, time.monotonic() - started_at, suffix,
                 )
             else:
                 logger.warning(
                     "✗ %s disconnect timed out after %.1fs - forcing continue%s",
-                    platform.value, timeout, suffix,
+                    platform.value, disconnect_timeout or 0.0, suffix,
                 )
 
     @staticmethod
@@ -174,6 +234,15 @@ class GatewayAdapterLifecycleMixin:
         ``initial`` selects the capped cold-start budget for platforms whose full connect budget is too long
         to spend before the gateway reaches ``running`` (#85993 — Telegram's 180s).
         """
+        try:
+            ok = await self._connect_adapter_bounded(adapter, platform, is_reconnect=is_reconnect, initial=initial)
+        except Exception as exc:
+            record_platform_connect(adapter, platform, is_reconnect=is_reconnect, ok=False, exc=exc)
+            raise
+        record_platform_connect(adapter, platform, is_reconnect=is_reconnect, ok=bool(ok))
+        return ok
+
+    async def _connect_adapter_bounded(self, adapter, platform, *, is_reconnect: bool, initial: bool) -> bool:
         timeout = self._platform_connect_timeout_secs(platform, initial=initial)
         if timeout <= 0:
             return await adapter.connect(is_reconnect=is_reconnect)
@@ -191,7 +260,7 @@ class GatewayAdapterLifecycleMixin:
         finally:
             adapter._platform_lock_takeover_allowed = False
 
-    async def _handle_reaction_event(self, ctx: Dict[str, Any]) -> None:
+    async def _handle_reaction_event(self, ctx: dict[str, Any]) -> None:
         """Fan a normalised reaction event out to the HookRegistry; errors never block the adapter."""
         event_name = str(ctx.get("event_name") or "reaction:added")
         with _log_suppressed(logging.DEBUG, "[Gateway] reaction hook emit failed", exc_info=True):
@@ -220,7 +289,8 @@ class GatewayAdapterLifecycleMixin:
             **({"queued_at": now} if queued else {}),
             "credential_claim": self._adapter_credential_claim(platform, adapter),
             "listener_claim": self._adapter_listener_claim(platform, adapter),
-            "inbound_dedup": inbound_dedup_caches(adapter),
+            # The replaced instance: its dedup caches seed each candidate, its held inbound moves on publish.
+            "predecessor": adapter,
         }
 
     def _queue_retryable_fatal_platform(self, adapter: BasePlatformAdapter) -> bool:
@@ -258,6 +328,14 @@ class GatewayAdapterLifecycleMixin:
         # respawn it so queued platforms are not permanently stranded (#70344).
         self._ensure_reconnect_watcher_running()
         return True
+
+    def _on_all_adapters_down(self) -> str:
+        """Normalized ``GatewayConfig.on_all_adapters_down``: ``"exit"`` (default — a supervising
+        service manager restarts the process) or ``"stay_alive"`` (launchers with no supervisor,
+        e.g. the desktop app's direct ``hermes serve`` child, where a failure exit only severs the
+        UI's websockets and drops in-flight assistant messages; #118080)."""
+        value = getattr(getattr(self, "config", None), "on_all_adapters_down", None)
+        return value if value in ON_ALL_ADAPTERS_DOWN_POLICIES else "exit"
 
     async def _handle_adapter_fatal_error_detached(self, adapter: BasePlatformAdapter) -> None:
         """Run the fatal handler; a platform left stranded (not reconnected, not queued, not
@@ -301,13 +379,25 @@ class GatewayAdapterLifecycleMixin:
                 and platform not in getattr(self, "_failed_platforms", {})
                 and not (shutdown_event is not None and shutdown_event.is_set())
             ):
-                logger.error(
-                    "%s adapter was lost without entering the reconnection "
-                    "queue; exiting gateway so the service manager restarts it.", platform.value,
-                )
-                self._exit_reason = f"{platform.value} adapter lost without reconnection queue"
-                self._exit_with_failure = True
-                await self.stop()
+                if self._on_all_adapters_down() == "stay_alive":
+                    # No supervisor will revive this process, so exiting only severes the UI's
+                    # connections and drops in-flight assistant messages (#118080). Stay alive and
+                    # hand recovery to the reconnect watcher; the messaging platform stays down
+                    # either way, but cron / api_server / dashboard keep serving.
+                    logger.warning(
+                        "%s adapter was lost without entering the reconnection queue; "
+                        "on_all_adapters_down=stay_alive — gateway staying alive, reconnect "
+                        "watcher owns recovery.", platform.value,
+                    )
+                    self._ensure_reconnect_watcher_running()
+                else:
+                    logger.error(
+                        "%s adapter was lost without entering the reconnection "
+                        "queue; exiting gateway so the service manager restarts it.", platform.value,
+                    )
+                    self._exit_reason = f"{platform.value} adapter lost without reconnection queue"
+                    self._exit_with_failure = True
+                    await self.stop()
 
     def _queue_retryable_best_effort(self, adapter: BasePlatformAdapter, why: str) -> None:
         with _log_suppressed(
@@ -340,6 +430,7 @@ class GatewayAdapterLifecycleMixin:
             error_message=adapter.fatal_error_message,
         )
         if existing is adapter:
+            record_platform_disconnect(adapter)
             # Claim for teardown BEFORE awaiting disconnect(), else a second fatal disconnects it twice.
             self.adapters.pop(adapter.platform, None)
             self.delivery_router.adapters = self.adapters
@@ -354,6 +445,17 @@ class GatewayAdapterLifecycleMixin:
             # after.
             await self._safe_adapter_disconnect(adapter, adapter.platform)
         if not self.adapters and not self._failed_platforms:
+            if adapter.fatal_error_retryable and self._on_all_adapters_down() == "stay_alive":
+                # No supervising service manager to revive the process (#118080): stay alive and
+                # keep serving cron / api_server / dashboard while the reconnect watcher owns
+                # recovery of the lost platform.
+                logger.warning(
+                    "No connected messaging platforms remain; on_all_adapters_down=stay_alive — "
+                    "gateway staying alive, reconnect watcher owns recovery of %s.",
+                    adapter.platform.value,
+                )
+                self._ensure_reconnect_watcher_running()
+                return
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
             if adapter.fatal_error_retryable:
                 self._exit_with_failure = True
@@ -369,7 +471,7 @@ class GatewayAdapterLifecycleMixin:
                 "retry in background.", len(self._failed_platforms),
             )
 
-    def _retain_background_task(self, task: "asyncio.Task") -> "asyncio.Task":
+    def _retain_background_task(self, task: asyncio.Task) -> asyncio.Task:
         """Register ``task`` in ``_background_tasks`` (created lazily for bare test runners)."""
         tasks = getattr(self, "_background_tasks", None)
         if not isinstance(tasks, set):
@@ -379,7 +481,7 @@ class GatewayAdapterLifecycleMixin:
         return task
 
     @staticmethod
-    def _track_task_in(tasks: set, task: "asyncio.Task") -> "asyncio.Task":
+    def _track_task_in(tasks: set, task: asyncio.Task) -> asyncio.Task:
         """Register ``task`` in an arbitrary lifecycle set with self-removal on completion."""
         tasks.add(task)
         task.add_done_callback(tasks.discard)
@@ -473,7 +575,7 @@ class GatewayAdapterLifecycleMixin:
         """Process pending CLI→gateway session handoffs from ``state.db``: claim atomically (pending
         → running), re-bind the home channel to the CLI session_id, dispatch a synthetic event, mark
         ``completed``/``failed``."""
-        from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes, _reclaim_stale
+        from gateway.run import _async_profile_runtime_scope, _reclaim_stale, _resolve_handoff_watch_scopes
         from gateway.run_idle_gates import off_loop_gate, profile_has_pending_handoff
         await asyncio.sleep(5)  # let platforms connect before dispatching through them
         # Does _process_handoff accept the profile argument? Test stand-ins bind a one-arg callable.
@@ -483,7 +585,7 @@ class GatewayAdapterLifecycleMixin:
         except Exception:
             _process_takes_profile = False
         # In-flight dispatches by session id: a handoff is a FULL agent turn, so never process inline.
-        inflight: Dict[str, "asyncio.Task"] = {}
+        inflight: dict[str, asyncio.Task] = {}
 
         async def _dispatch(row, session_id, session_db, profile_name) -> None:
             """Run one claimed handoff to a terminal state, off the poll path."""
@@ -534,14 +636,16 @@ class GatewayAdapterLifecycleMixin:
         def _scope(profile_home):  # local: tests bind this watcher onto bare SimpleNamespace runners
             return GatewayAdapterLifecycleMixin._async_scope_or_null(_async_profile_runtime_scope, profile_home)
 
-        for _pname, _phome in _handoff_watch_scopes(self):
+        # Multiplex scope resolution walks the filesystem (profiles_to_serve) off the loop, so a
+        # stalled walk cannot trip the liveness probe — startup reclaim and every tick alike.
+        for _pname, _phome in await _resolve_handoff_watch_scopes(self):
             with _log_suppressed(logging.DEBUG, "Stale-handoff reclaim failed", exc_info=True):
                 async with _scope(_phome):
                     await _reclaim_stale(self)
         try:
             while self._running:
                 try:
-                    for profile_name, profile_home in _handoff_watch_scopes(self):
+                    for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
                         # Idle gate (run_idle_gates): skip the scope entry when the profile's store
                         # holds no pending handoff. The root poll (None) is unscoped and stays cheap.
                         if profile_home is not None and not await off_loop_gate(
@@ -693,7 +797,7 @@ class GatewayAdapterLifecycleMixin:
         )
         self._update_platform_runtime_status(
             status_key or platform.value, platform_state="retrying", needs_attention=True,
-            retrying_since=(datetime.now(timezone.utc) - timedelta(seconds=queued_for)).isoformat(),
+            retrying_since=(datetime.now(UTC) - timedelta(seconds=queued_for)).isoformat(),
         )
 
     def _mark_platform_fatal(self, status_key: str, adapter) -> None:
@@ -716,6 +820,21 @@ class GatewayAdapterLifecycleMixin:
         info["next_retry"] = time.monotonic() + backoff
         return backoff
 
+    def _adapter_may_heal(self, platform, platform_config) -> bool:
+        """Whether a platform whose ``_create_adapter`` returned None can heal without a config change.
+
+        Only an unregistered plugin can (a plugin load can fail transiently). A builtin whose probe fails
+        (missing deps/creds), a registered plugin returning None, or an empty bot credential needs a config
+        change: retrying it re-warns forever at the backoff cap (#5196 fleet nodes). Shared by startup and
+        the reconnect watcher so both classify the same platform the same way."""
+        from gateway.platform_registry import platform_registry
+        from gateway.run import _BUILTIN_ADAPTERS, _platform_has_bot_credential
+        return (
+            platform not in _BUILTIN_ADAPTERS
+            and not platform_registry.is_registered(platform.value)
+            and _platform_has_bot_credential(platform, platform_config)
+        )
+
     async def _reconnect_failed_platform(self, platform, now: float) -> None:
         """One watcher pass for a queued platform: gate, attempt, and record the outcome."""
         from gateway.run import _dispose_unused_adapter, _platform_has_bot_credential
@@ -728,20 +847,41 @@ class GatewayAdapterLifecycleMixin:
             return  # not time yet
         platform_config = info["config"]
         attempt = info["attempts"] + 1
-        # Empty-token primary configs can never reconnect; drop them so multiplex setups
-        # where a secondary profile owns the bot do not spin forever.
-        # See #64674.
+        # Empty-token primary configs can never reconnect; drop them so multiplex setups where a
+        # secondary profile owns the bot do not spin forever (#64674).
         if not _platform_has_bot_credential(platform, platform_config):
             self._drop_from_reconnect_queue(platform, "no bot credential on queued config")
             return
         logger.info("Reconnecting %s (attempt %d)...", platform.value, attempt)
         adapter = None
         try:
+            from gateway.platform_registry import platform_registry
+            # A re-armed plugin import + register() joins its load deadline: run it off the event loop.
+            await self._run_in_executor_with_context(platform_registry.get, platform.value)
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
-                self._drop_from_reconnect_queue(platform, "adapter creation returned None")
+                if not self._adapter_may_heal(platform, platform_config):
+                    # Became builtin/registered-but-None: a config change is needed, so stop retrying.
+                    self._update_platform_runtime_status(
+                        platform.value, platform_state="fatal", error_code="adapter_unavailable",
+                        error_message=_adapter_unavailable_message(platform, retrying=False),
+                        needs_attention=True,
+                    )
+                    self._drop_from_reconnect_queue(platform, "adapter creation returned None")
+                    return
+                # Unregistered plugin: keep it queued and re-arm a failed load (capped) for the next tick.
+                from hermes_cli.plugins import get_plugin_manager
+                rearms = info.get("load_rearms", 0)
+                # Off the loop: the re-arm takes the manager's discovery lock, which a sweep or deferred load holds.
+                if rearms < _MAX_PLUGIN_LOAD_REARMS and await self._run_in_executor_with_context(
+                        get_plugin_manager().rearm_failed_platform, platform.value):
+                    info["load_rearms"] = rearms + 1
+                backoff = self._bump_reconnect_backoff(
+                    platform, info, attempt, "adapter_unavailable", _adapter_unavailable_message(platform),
+                )
+                logger.info("Reconnect %s: no adapter yet, next retry in %ds", platform.value, backoff)
                 return
-            carry_inbound_dedup(info.get("inbound_dedup"), adapter)
+            carry_inbound_dedup(info.get("predecessor"), adapter)
             self._wire_adapter_handlers(adapter)
             # is_reconnect keeps the server-side update queue so offline-period messages are delivered.
             success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
@@ -773,6 +913,8 @@ class GatewayAdapterLifecycleMixin:
                 # __init__ stay open until the next GC pass — and aiohttp/SQLite handles don't get GC'd
                 # promptly, so 2 fds/retry leak at 300s backoff cap = ~12 fds/hour (#37011).
                 await _dispose_unused_adapter(adapter)
+                # Inbound it held during connect or salvaged in disconnect goes back to the predecessor.
+                hand_over_held_inbound(adapter, info.get("predecessor"))
         except Exception as e:
             if adapter is not None and self.adapters.get(platform) is adapter:
                 # Installation already transferred ownership to the gateway. A tail failure
@@ -781,6 +923,8 @@ class GatewayAdapterLifecycleMixin:
                 return
             if adapter is not None:
                 await _dispose_unused_adapter(adapter)
+                if self.adapters.get(platform) is not adapter:  # an installed adapter owns its queue
+                    hand_over_held_inbound(adapter, info.get("predecessor"))
             # A reconnect exception is transient; keep retrying at the cap rather than auto-pausing.
             backoff = self._bump_reconnect_backoff(platform, info, attempt, None, str(e))
             logger.warning("Reconnect %s error: %s, next retry in %ds", platform.value, e, backoff)
@@ -807,6 +951,11 @@ class GatewayAdapterLifecycleMixin:
 
     async def _recover_spool_after_reconnect(self, platform) -> None:
         """Claim owed follow-ups before resume and drain them as separate turns."""
+        completion = getattr(self, "_pending_recovery_complete", None)
+        if completion is not None and not completion.is_set():
+            # Boot recovery publishes claimed events on the loop after its worker scan. Wait at the
+            # asyncio level rather than taking a thread lock here, which would deadlock that publish.
+            await completion.wait()
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
         from gateway.run import _startup_restore_drain_timeout_secs
         candidates = self._resume_pending_candidates(record_boot=False)
@@ -818,23 +967,50 @@ class GatewayAdapterLifecycleMixin:
         except Exception:
             logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
                            exc_info=True)
-        try:
-            # Recovery scans all served homes, but only the newly available platform resumes.
-            self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
-                                                   restore_tasks=tasks, restore_keys=keys)
-        except Exception:
-            logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
-                           exc_info=True)
         keys.update(self._session_key_for_source(self._normalize_source_for_session_key(event.source))
                     for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
-        if not keys and not tasks:
-            return
+        reconnect_note_keys = []
+        for entry in candidates or ():
+            try:
+                if (platform is not None and getattr(entry.origin, "platform", None) != platform):
+                    continue
+                if not getattr(entry, "resume_turn_id", None):
+                    continue
+                if self._auto_resume_ready(entry) is not None:
+                    reconnect_note_keys.append(entry.session_key)
+            except Exception:
+                # A bad note candidate must not strand follow-ups already claimed above.
+                logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                               exc_info=True)
+        keys.update(reconnect_note_keys)
         counts = getattr(self, "_reconnect_restore_keys", None)
         if counts is None:
             counts = self._reconnect_restore_keys = {}
         for key in keys:
             counts[key] = counts.get(key, 0) + 1
+        counted_keys = set(keys)
         try:
+            try:
+                # A platform that was offline at boot could not receive its S2 note. Before reconnect
+                # resumes any durable interruption marker, claim and send that marker's note through the
+                # append-only sender; it is a no-op when restart_notes already has a visible/in-flight note.
+                if reconnect_note_keys:
+                    await self._send_interrupted_turn_notes(
+                        reconnect_note_keys, cancel_on_timeout=True,
+                        timeout=_startup_restore_drain_timeout_secs(),
+                    )
+                # Recovery scans all served homes, but only the newly available platform resumes.
+                self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
+                                                       restore_tasks=tasks, restore_keys=keys)
+            except Exception:
+                logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                               exc_info=True)
+            for key in keys:
+                if key not in counted_keys:
+                    counts[key] = counts.get(key, 0) + 1
+                    counted_keys.add(key)
+            if not keys and not tasks:
+                return
             if tasks:
                 await self._wait_bounded_or_release(
                     set(tasks), _startup_restore_drain_timeout_secs(),
@@ -847,17 +1023,18 @@ class GatewayAdapterLifecycleMixin:
         finally:
             # The timeout deliberately fails open after a bounded wait; unfinished resume turns
             # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
-            for key in keys:
+            for key in counted_keys:
                 counts[key] -= 1
                 if not counts[key]:
                     del counts[key]
+            self._schedule_startup_restore_drain()
 
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""
         self._publish_primary_adapter(platform, adapter)
         self.delivery_router.adapters = self.adapters
-        del self._failed_platforms[platform]
+        hand_over_held_inbound(self._failed_platforms.pop(platform).get("predecessor"), adapter)
         # connect() returning True does not mean the receive path is confirmed -- Telegram's degraded
         # reconnect returns True so the gateway stays up while its own ladder retries. Stamping "connected"
         # here would undo the adapter's accurate status.
@@ -945,7 +1122,12 @@ class GatewayAdapterLifecycleMixin:
             from hermes_cli.profiles import get_active_profile_name, profiles_to_serve, profile_is_parked
         except Exception:
             return 0
-        active = get_active_profile_name() or "default"  # launch profile, pre-identity (adapter boot)
+        if self._multiplex_on():
+            # Primary adapters belong to default. A named launcher is not skipped here —
+            # it still needs its own secondary adapter and credential ownership entry.
+            active = getattr(self, "_primary_profile_name", None) or "default"
+        else:
+            active = get_active_profile_name() or "default"  # launch profile, pre-identity (adapter boot)
         for name, home in profiles_to_serve(True, include_parked=True):
             if name != "default" and profile_is_parked(home):
                 logger.info("profile '%s' is parked (gateway.parked); not served by this gateway", name)
@@ -974,20 +1156,22 @@ class GatewayAdapterLifecycleMixin:
         # would park a transiently-failed profile before the first watcher tick can retry it.
         for profile_name in transient_failed:
             self._served_profile_signatures.pop(profile_name, None)
-        # Cached configs follow the served set: a profile that failed to start (or stopped being
-        # served) keeps no home channel in the host-wide notice fan-out, where it would be owed a
-        # notice no transport can deliver and ``.restart_pending.json`` would never be unlinked.
+        # Cached configs follow the served set: a failed/unserved profile keeps no home channel in the
+        # host-wide notice fan-out (it would be owed an undeliverable notice; .restart_pending.json stays).
         configs = getattr(self, "_profile_configs", None)
         if configs is not None:
             for profile_name in [p for p in configs if p not in self._served_profile_signatures]:
                 configs.pop(profile_name, None)
-        self._restore_secondary_completion_ledgers(profile_homes)
+        # Off the loop: each replay writes a profile's state.db; a standby leaves that to promotion.
+        from gateway.zero_cut_standby import is_standby
+        if not is_standby():
+            await asyncio.to_thread(self._restore_secondary_completion_ledgers, profile_homes)
         return connected
 
-    def _primary_resource_claims(self, active: str) -> Dict[tuple, str]:
+    def _primary_resource_claims(self, active: str) -> dict[tuple, str]:
         """Resource claim -> owning profile for every live or queued primary adapter (credential:
         one account polled once; listener: one bind+port). A queued retryable primary owns both."""
-        claimed: Dict[tuple, str] = {}
+        claimed: dict[tuple, str] = {}
         for _plat, _ad in self.adapters.items():
             fp = self._adapter_credential_fingerprint(_ad)
             for claim in ((_plat, fp) if fp is not None else None, self._adapter_listener_claim(_plat, _ad)):
@@ -1021,7 +1205,7 @@ class GatewayAdapterLifecycleMixin:
                 from hermes_constants import get_hermes_home
                 publish_record(ROLE_GATEWAY, profiles=tuple(served), home=str(get_hermes_home()))
 
-    async def _load_secondary_profile_config(self, profile_name: str, profile_home: "Path"):
+    async def _load_secondary_profile_config(self, profile_name: str, profile_home: Path):
         """Hydrate + enter ``profile_home``'s scope once; return its gateway config. Raises
         ``MultiplexConfigError`` (open dm/group policy). Port-binding platforms are NOT refused: the
         default profile owns the single shared listener and a secondary's port-binders are built in
@@ -1034,6 +1218,9 @@ class GatewayAdapterLifecycleMixin:
         from hermes_cli.env_loader import hydrate_profile_secret_sources
         # Hydrate external secret sources off-loop ONCE: sync hydration would stall every heartbeat.
         await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
+        # A platform that left core for a catalog plugin is installed before discovery below.
+        from gateway.run_startup import recover_left_core_in
+        await asyncio.to_thread(recover_left_core_in, profile_home, hydrate_secrets=False)
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
             profile_runtime_cfg = _load_gateway_config()
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
@@ -1046,6 +1233,8 @@ class GatewayAdapterLifecycleMixin:
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
+        # Assign (not setdefault) so a profile reload picks up a changed relay.fyi_passive rollback flag.
+        getattr(self, "_relay_fyi_passive_by_profile", {})[profile_name] = profile_runtime_cfg
         if violation:
             raise MultiplexConfigError(
                 f"Profile '{profile_name}' enables {violation}. "
@@ -1054,8 +1243,71 @@ class GatewayAdapterLifecycleMixin:
             )
         return profile_cfg
 
+    @staticmethod
+    def _credential_claim_origin(profile_name: str, profile_home, platform: Platform, token: str) -> Optional[str]:
+        """Where *token* was configured for *profile_name*: that profile's ``.env``, or ambient env.
+
+        ``None`` when the value is not in either place (yaml-only, or unknown). An env label
+        is only returned when the profile's own ``.env`` does not contain the value — a shell
+        export that merely echoes the file is the file.
+        """
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+        env_name = PLATFORM_TOKEN_ENV_NAMES.get(platform)
+        if not env_name or not isinstance(token, str) or not token.strip():
+            return None
+        token = token.strip()
+        in_dotenv = False
+        if profile_home:
+            try:
+                from agent.secret_scope import load_env_file
+                in_dotenv = (load_env_file(Path(profile_home) / ".env").get(env_name) or "").strip() == token
+            except Exception:
+                in_dotenv = False
+        if in_dotenv:
+            if profile_name and profile_name != "default":
+                return f"profiles/{profile_name}/.env"
+            return ".env"
+        if (os.environ.get(env_name) or "").strip() == token:
+            return f"env {env_name}"
+        return None
+
+    def _duplicate_credential_origins(
+        self, owner: str, profile_name: str, profile_home, platform: Platform, adapter: Any,
+    ) -> tuple:
+        """``(owner_origin, incoming_origin)`` for a same-credential refusal; either may be None."""
+        token = None
+        for obj, attr in (
+            (adapter, "token"), (adapter, "bot_token"),
+            (getattr(adapter, "config", None), "token"),
+        ):
+            val = getattr(obj, attr, None) if obj is not None else None
+            if isinstance(val, str) and val.strip():
+                token = val.strip()
+                break
+        if not token:
+            return None, None
+        incoming = self._credential_claim_origin(profile_name, profile_home, platform, token)
+        owner_home = None
+        if owner == "default":
+            try:
+                from hermes_constants import get_default_hermes_root
+                owner_home = get_default_hermes_root()
+            except Exception:
+                owner_home = None
+        else:
+            try:
+                from hermes_cli.profiles import get_profile_dir
+                owner_home = get_profile_dir(owner)
+            except Exception:
+                owner_home = None
+        owner_origin = (
+            self._credential_claim_origin(owner, owner_home, platform, token) if owner_home else None
+        )
+        return owner_origin, incoming
+
     def _refuse_duplicate_claim(
-        self, claim, claimed: Dict[tuple, str], profile_name: str, platform: Platform, kind: str
+        self, claim, claimed: dict[tuple, str], profile_name: str, platform: Platform, kind: str,
+        *, owner_origin: Optional[str] = None, incoming_origin: Optional[str] = None,
     ) -> bool:
         """Log + park a secondary adapter whose credential/listener another profile owns (True when
         refused). NOT disconnected: it never connected, and for a same-credential Photon adapter
@@ -1064,13 +1316,19 @@ class GatewayAdapterLifecycleMixin:
         if owner is None:
             return False
         pv = platform.value
-        head = f"Profile '{owner}' and '{profile_name}' both configure {pv} "
+        env_derived = any(
+            isinstance(origin, str) and origin.startswith("env ")
+            for origin in (owner_origin, incoming_origin)
+        )
+        def _who(name: str, origin: Optional[str]) -> str:
+            return f"{name} ({origin})" if env_derived and origin else name
+        head = f"Profile '{_who(owner, owner_origin)}' and '{_who(profile_name, incoming_origin)}' both configure {pv} "
         if kind == "credential":
             message = head + f"with the same credential. Give each profile its own {pv} credential."
             logger.error(
                 "Profile '%s' and '%s' both configure %s with the same credential — refusing to start the "
                 "duplicate (one credential cannot be consumed twice). Give each profile its own %s credential.",
-                owner, profile_name, pv, pv,
+                _who(owner, owner_origin), _who(profile_name, incoming_origin), pv, pv,
             )
         else:
             bind, port = claim[-2:]
@@ -1087,8 +1345,7 @@ class GatewayAdapterLifecycleMixin:
         return True
 
     def _note_unserved_secondary_platform(self, profile_name: str, platform: Platform) -> None:
-        """A secondary enabled a shared-ingress platform (Relay, WhatsApp) the multiplexer only runs on
-        the default profile. Log the reason + remedy once per (profile, platform) and stamp a
+        """Report unpaired WhatsApp or secondary-only Relay. Log the reason and remedy and stamp a
         ``<profile>:<platform>`` status entry so ``hermes gateway status --profile X`` and the
         dashboard show *why* the channel is dead instead of nothing at all."""
         noted = getattr(self, "_unserved_secondary_platforms", None)
@@ -1098,6 +1355,14 @@ class GatewayAdapterLifecycleMixin:
             return
         noted.add((profile_name, platform))
         pv = platform.value
+        if platform is Platform.WHATSAPP:
+            message = f"WhatsApp is not paired; pair it: hermes -p {profile_name} whatsapp"
+            logger.info("[MULTIPLEX] Profile '%s': %s", profile_name, message)
+            self._update_platform_runtime_status(
+                f"{profile_name}:{pv}", platform_state="disabled",
+                error_code="whatsapp_unpaired", error_message=message,
+            )
+            return
         logger.info(
             "[MULTIPLEX] Profile '%s': %s is enabled but not served — %s is process-level shared ingress "
             "owned by the default profile under multiplex. Enable and configure %s on the default profile "
@@ -1115,6 +1380,8 @@ class GatewayAdapterLifecycleMixin:
         noted = getattr(self, "_unserved_secondary_platforms", None) or ()
         lines = []
         for platform in sorted({p for _n, p in noted}, key=lambda p: p.value):
+            if platform is Platform.WHATSAPP:
+                continue  # unpaired sessions have their own per-profile remedy
             if platform in self.adapters or platform in (getattr(self, "_failed_platforms", None) or {}):
                 continue  # the default owns it: secondaries ARE served through the shared adapter
             profiles = sorted(n for n, p in noted if p is platform)
@@ -1126,7 +1393,7 @@ class GatewayAdapterLifecycleMixin:
         return lines
 
     async def _start_one_profile_adapters(
-        self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
+        self, profile_name: str, profile_home: Path, claimed: dict[tuple, str]
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
         from gateway.run import _platform_has_bot_credential, _profile_runtime_scope
@@ -1143,21 +1410,24 @@ class GatewayAdapterLifecycleMixin:
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # Runtime re-scan of a served profile (config/.env changed): only platforms that are not
-            # already live or queued for reconnect are built — never a second poller on the same bot.
             if platform in profile_map or platform in (
                     (getattr(self, "_profile_failed_platforms", None) or {}).get(profile_name) or {}):
                 continue
-            # No credential in THIS profile's scope: an adapter would fan inbound across every such profile.
-            if multiplex and not _platform_has_bot_credential(platform, platform_config):
+            with _profile_runtime_scope(profile_home, hydrate_secrets=False):
+                has_credential = _platform_has_bot_credential(platform, platform_config)
+            if multiplex and not has_credential:
+                if platform is Platform.WHATSAPP:
+                    self._note_unserved_secondary_platform(profile_name, platform)
                 logger.info(
                     "[MULTIPLEX] Profile '%s': skipping %s - no bot credential "
                     "in this profile's secrets", profile_name, platform.value,
                 )
                 continue
-            # Relay/WhatsApp are shared process-level ingress under multiplex; a secondary would retry-loop.
-            # Say so: four profiles with WHATSAPP_ENABLED=true and nothing in the log is a silent dead channel.
-            if multiplex and platform in (Platform.RELAY, Platform.WHATSAPP):
+            from gateway import zero_cut_standby as zcs  # after credential gating, like active startup
+            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config, profile=profile_name):
+                continue
+            # Relay still uses process-level shared ingress; WhatsApp owns a session per profile.
+            if multiplex and platform is Platform.RELAY:
                 self._note_unserved_secondary_platform(profile_name, platform)
                 continue
             # api_server / webhook: the default's listener already mirrors them at /p/<profile>/; a second
@@ -1185,8 +1455,15 @@ class GatewayAdapterLifecycleMixin:
             # Same-token / same-listener conflict detection — refuse a duplicate poll or bind.
             credential_claim = self._adapter_credential_claim(platform, adapter)
             listener_claim = self._adapter_listener_claim(platform, adapter)
+            owner_name = claimed.get(credential_claim) if credential_claim is not None else None
+            owner_origin, incoming_origin = (None, None)
+            if owner_name:
+                owner_origin, incoming_origin = self._duplicate_credential_origins(
+                    owner_name, profile_name, profile_home, platform, adapter,
+                )
             if self._refuse_duplicate_claim(
-                credential_claim, claimed, profile_name, platform, "credential"
+                credential_claim, claimed, profile_name, platform, "credential",
+                owner_origin=owner_origin, incoming_origin=incoming_origin,
             ) or self._refuse_duplicate_claim(listener_claim, claimed, profile_name, platform, "listener"):
                 continue
             self._configure_profile_adapter(adapter, profile_name, platform)
@@ -1282,7 +1559,7 @@ class GatewayAdapterLifecycleMixin:
                 and _platform_binds_port(platform.value, getattr(getattr(adapter, "config", None), "extra", None)):
             adapter._shared_listener_profile = profile_name
 
-    async def _secondary_reconnect_attempt(self, profile_name: str, platform: Platform, inbound_dedup=None):
+    async def _secondary_reconnect_attempt(self, profile_name: str, platform: Platform, predecessor=None):
         """One scoped attempt to rebuild+connect a secondary adapter → ``(adapter, success)``;
         ``(None, None)`` = give up for good (disabled, credential removed, adapter unavailable). Caller
         tears down a RETURNED adapter; one whose configure/connect raised is torn down here."""
@@ -1314,18 +1591,19 @@ class GatewayAdapterLifecycleMixin:
                     platform.value, profile_name,
                 )
                 return None, None
-            carry_inbound_dedup(inbound_dedup, adapter)
+            carry_inbound_dedup(predecessor, adapter)
             try:
                 self._configure_profile_adapter(adapter, profile_name, platform)
                 success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
             except BaseException:
-                # Caller never sees this adapter; release its partial resources here.
+                # Caller never sees this adapter; release its partial resources and return its held inbound.
                 await self._safe_adapter_disconnect(adapter, platform)
+                hand_over_held_inbound(adapter, predecessor)
                 raise
             return adapter, success
 
     async def _run_secondary_profile_reconnect(
-        self, profile_name: str, platform: Platform, inbound_dedup=None
+        self, profile_name: str, platform: Platform, predecessor=None
     ) -> None:
         """Reconnect a retryable secondary adapter under its own profile scope."""
         from gateway.run import _profile_runtime_scope, _reconnect_backoff
@@ -1338,7 +1616,7 @@ class GatewayAdapterLifecycleMixin:
                 adapter = None
                 try:
                     adapter, success = await self._secondary_reconnect_attempt(
-                        profile_name, platform, inbound_dedup
+                        profile_name, platform, predecessor
                     )
                     if adapter is None:
                         return
@@ -1346,6 +1624,7 @@ class GatewayAdapterLifecycleMixin:
                         profile_map = self._profile_adapters.setdefault(profile_name, {})
                         if platform not in profile_map:
                             profile_map[platform] = adapter
+                            hand_over_held_inbound(predecessor, adapter)
                             self._sync_voice_mode_state_to_adapter(adapter)
                             logger.info("✓ %s reconnected (profile: %s)", platform.value, profile_name)
                             await self._redeliver_failed_obligations_for_platform(
@@ -1357,8 +1636,9 @@ class GatewayAdapterLifecycleMixin:
                             await self._recover_spool_after_reconnect(platform)
                             return
                     # Not installed (newer reconnect won the slot, shutdown began, or connect failed):
-                    # release partial resources; stop only for a non-retryable fatal.
+                    # release partial resources and return its held inbound; stop only for a non-retryable fatal.
                     await self._safe_adapter_disconnect(adapter, platform)
+                    hand_over_held_inbound(adapter, predecessor)
                     if success or (
                         getattr(adapter, "has_fatal_error", False)
                         and not getattr(adapter, "fatal_error_retryable", True)
@@ -1367,6 +1647,8 @@ class GatewayAdapterLifecycleMixin:
                 except BaseException as exc:
                     if adapter is not None:
                         await self._safe_adapter_disconnect(adapter, platform)
+                        if self._profile_adapters.get(profile_name, {}).get(platform) is not adapter:
+                            hand_over_held_inbound(adapter, predecessor)  # an installed adapter owns its queue
                     if not isinstance(exc, Exception):
                         raise  # CancelledError (and other BaseExceptions) propagate after release
                     logger.debug(
@@ -1456,7 +1738,7 @@ class GatewayAdapterLifecycleMixin:
         if platform in profile_pending:
             return
         profile_pending[platform] = self._retain_background_task(asyncio.create_task(
-            self._run_secondary_profile_reconnect(profile_name, platform, inbound_dedup_caches(adapter)),
+            self._run_secondary_profile_reconnect(profile_name, platform, adapter),
             name=f"secondary-reconnect:{profile_name}:{platform.value}",
         ))
 
@@ -1478,6 +1760,9 @@ class GatewayAdapterLifecycleMixin:
             )
             return
         profile_map.pop(platform, None)
+        # The notification may arrive outside the profile's scope: the row is that profile's.
+        if (profile_home := self._routed_profile_home(profile_name)) is not UNRESOLVED_PROFILE_HOME:
+            record_platform_disconnect(adapter, hermes_home=profile_home)
         await self._safe_adapter_disconnect(adapter, platform)
         if not self._running:
             return
@@ -1658,8 +1943,8 @@ class GatewayAdapterLifecycleMixin:
         # Observer failures must never break the adapter's update loop.
         with _log_suppressed(logging.DEBUG, "gateway_platform_event hook dispatch failed", exc_info=True):
             from hermes_cli.lifecycle import has_hook, invoke_hook
-            if has_hook("gateway_platform_event") and self._is_user_authorized_for_source(source):
-                invoke_hook("gateway_platform_event", **event)
+            if await asyncio.to_thread(has_hook, "gateway_platform_event") and self._is_user_authorized_for_source(source):
+                await asyncio.to_thread(invoke_hook, "gateway_platform_event", **event)
 
     def _make_profile_platform_event_handler(self, profile_name: str):
         """Bind platform-event auth and hook dispatch to one multiplex profile."""
@@ -1769,10 +2054,17 @@ class GatewayAdapterLifecycleMixin:
         is consulted while allowlist reads stay under the transport home.
 
         Without this an inline-button caller approved only in the routed profile's pairing store was denied
-        (#86296), because the adapter's callback source was never route-stamped.
+        (#86296), because the adapter's callback source was never route-stamped. A secondary-owned bot's
+        callback fires outside the profile runtime scope (straight off the adapter's event loop), so the
+        check re-enters the owning profile's scope per call — the gate's scoped env read otherwise falls
+        back to os.environ (the default profile's env) and denies the secondary's own allowlisted
+        callers (#120639).
         """
         from gateway.run import get_hermes_home
         transport_home = Path(get_hermes_home()) if self._multiplex_on() and profile_name is None else None
+        # Resolved once; the scope is entered per call so an ``.env`` allowlist edit reaches the next
+        # tap, matching the message path's per-message re-read.
+        profile_home = self._routed_profile_home(profile_name) if profile_name else None
 
         def check(
             user_id: str, chat_type: Optional[str] = None, chat_id: Optional[str] = None, *,
@@ -1793,7 +2085,13 @@ class GatewayAdapterLifecycleMixin:
             if adapter is not None:
                 source._transport_adapter_ref = _weakref.ref(adapter)
             if transport_home is None:
-                return self._is_user_authorized(source)
+                # Sync, on the adapter's event loop (per tap, per inline-query keystroke): never
+                # hydrate external secret sources here — that takes the process-global source lock
+                # (#99519). Startup and the message path hydrate off-loop; this reads their cache.
+                from gateway.run import _profile_runtime_scope
+                with self._scope_or_null(
+                        functools.partial(_profile_runtime_scope, hydrate_secrets=False), profile_home):
+                    return self._is_user_authorized(source)
             # Canonicalize FIRST (callback sources never went through ``build_source``): the routed
             # profile's pairing store is consulted, allowlists read under the transport home.
             if self._canonicalize(source, primary_home=transport_home) is None:

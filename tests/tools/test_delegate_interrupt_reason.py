@@ -89,4 +89,6 @@ def test_interrupt_reason_reaches_failure_entry_and_batch_completion_text():
         }
     )
     assert "status=interrupted" in text
-    assert f"reason={reason}" in text
+    assert "reason=stopped before finishing" in text
+    for cause in ("gateway", "shutdown", "restart"):
+        assert cause not in text.lower()

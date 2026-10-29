@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli import goals
+
 
 @pytest.fixture()
 def hermes_home(tmp_path, monkeypatch):
@@ -135,7 +137,7 @@ def turn_env(server, monkeypatch, tmp_path):
         server, "_sync_session_key_after_compress", lambda *a, **k: None
     )
     monkeypatch.setattr(server, "_get_usage", lambda agent: {})
-    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_load_cfg", dict)
     return emitted
 
 
@@ -207,6 +209,8 @@ def _max_iterations_fallback(final_response="fallback summary"):
         (_max_iterations_fallback(), "error", "fallback summary", False),
         (_max_iterations_fallback(), "interrupted", "fallback summary", False),
         (_max_iterations_fallback(), "complete", "   ", False),
+        (_max_iterations_fallback("   "), "complete", "   ", False),
+        (_max_iterations_fallback(""), "complete", "", False),
     ],
 )
 def test_successful_goal_turn_accepts_only_valid_completion_outcomes(
@@ -216,6 +220,28 @@ def test_successful_goal_turn_accepts_only_valid_completion_outcomes(
 
 
 # ── command.dispatch /goal ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("configured,expected", [(0, 0), (7, 7), (-1, 20), ("invalid", 20), (None, 20)])
+def test_goal_budget_flows_through_command_and_prompt_manager(
+    server, session, hermes_home, configured, expected,
+):
+    import hermes_yaml as yaml
+    from hermes_cli import goals
+
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump({"goals": {"max_turns": configured}}))
+    sid, session_key, record = session
+    record["profile_home"] = str(hermes_home)
+    result = _call(server, "command.dispatch", name="goal", arg="ship it", session_id=sid)
+    assert result["result"]["type"] == "send"
+    with server._session_profile_runtime_scope(record):
+        assert goals.load_goal(session_key).max_turns == expected
+        mgr = server._active_goal_manager(record)
+        assert mgr.default_max_turns == expected
+        assert mgr.state.max_turns == expected
+    if expected == 0:
+        assert "∞" in result["result"]["notice"]
+
 
 
 
@@ -267,6 +293,33 @@ def test_goal_resume_without_goal_stays_exec(server, session):
     sid, _, _ = session
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
     assert r["result"]["type"] == "exec"
+
+
+def test_goal_replace_and_remove_commands_use_real_dispatch(server, session):
+    sid, session_key, record = session
+    _call(server, "command.dispatch", name="goal", arg="Ship X\nconstraints: No downtime.; No secrets.", session_id=sid)
+    replaced = _call(server, "command.dispatch", name="goal", arg="replace Ship Y", session_id=sid)
+    assert replaced["result"]["type"] == "send"
+    assert "Goal replaced" in replaced["result"]["notice"]
+    assert "Ship Y" in replaced["result"]["message"]
+    assert "Ship X" not in replaced["result"]["message"]
+    removed = _call(server, "command.dispatch", name="goal", arg="remove constraint 2", session_id=sid)
+    assert removed["result"]["type"] == "send"
+    assert "Removed constraint 2" in removed["result"]["notice"]
+    assert "No downtime." in removed["result"]["message"]
+    assert "No secrets." not in removed["result"]["message"]
+    with server._session_profile_runtime_scope(record):
+        state = goals.load_goal(session_key)
+        assert state.goal == "Ship Y" and state.contract.constraints == "No downtime."
+        assert state.status == "active"
+
+
+def test_goal_remove_out_of_range_uses_real_dispatch_error(server, session):
+    sid, _, _ = session
+    _call(server, "command.dispatch", name="goal", arg="Ship X\nconstraints: No downtime.", session_id=sid)
+    result = _call(server, "slash.exec", command="goal remove constraint 2", session_id=sid)
+    assert "error" in result
+    assert "out of range" in result["error"]["message"]
 
 
 # ── slash.exec /goal routing ──────────────────────────────────────────
@@ -536,7 +589,7 @@ def _blocked_goal(session_key: str):
     mgr.set("run both agent sessions end to end")
     with patch(
         "hermes_cli.goals.judge_goal",
-        return_value=("blocked", "needs the user to approve the login card", False, None, False),
+        return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False),
     ):
         decision = mgr.evaluate_after_turn("Can I use your login for the tests?")
     assert decision["status"] == "paused"
@@ -813,3 +866,25 @@ def test_isolated_submit_keeps_preview_separate_from_user_provenance(server, ses
     assert result["result"]["status"] == "streaming"
     assert seen[0]["user_turn"] is (not hidden)
     assert seen[0]["display_metadata"]["title_preview"] == "Useful title"
+
+
+def test_user_turn_completes_over_a_corrupt_goal_row(server, turn_env, monkeypatch):
+    """Regression for the PR #551 review: an unreadable goal row errored every TUI user turn."""
+    session_key = "goal-corrupt-row"
+    goals._get_session_db().set_meta(f"goal:{session_key}", "{corrupt")
+    seen = []
+
+    def run_conversation(message, **_kwargs):
+        seen.append(message)
+        return {"final_response": "Answered."}
+
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", lambda *a, **k: pytest.fail("never judged"))
+    agent = types.SimpleNamespace(
+        session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda: None)
+
+    server._run_prompt_submit("rid", "sid", _turn_session(agent, session_key), "hello", user_turn=True)
+
+    assert seen == ["hello"]
+    assert not [event for event, _sid, _payload in turn_env if event == "error"]
+    assert any(event == "message.complete" for event, _sid, _payload in turn_env)
+    assert goals._get_session_db().get_meta(f"goal:{session_key}") == "{corrupt"

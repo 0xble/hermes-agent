@@ -263,6 +263,7 @@ class TestPostStopInterruptSwallow:
         """The control-interrupt path must evict the session's cached agent
         so its ``_interrupt_requested`` flag cannot leak into the next turn."""
         import threading
+        from unittest.mock import MagicMock
 
         from gateway.run import GatewayRunner, _INTERRUPT_REASON_STOP
 
@@ -287,11 +288,17 @@ class TestPostStopInterruptSwallow:
         runner._agent_cache_lock = threading.Lock()
         runner.adapters = {}
         runner._pending_messages = {}
+        runner.session_store = MagicMock()
+        runner.session_store.get_resume_pending_marker.return_value = None
 
         invalidated = []
-        runner._invalidate_session_run_generation = (
-            lambda key, reason=None: invalidated.append((key, reason))
-        )
+        invalidate = runner._invalidate_session_run_generation
+
+        def _record_invalidation(session_key: str, *, reason: str = "") -> int:
+            invalidated.append((session_key, reason))
+            return invalidate(session_key, reason=reason)
+
+        runner._invalidate_session_run_generation = _record_invalidation
         released = []
         runner._release_running_agent_state = (
             lambda key, **kw: released.append(key)
@@ -315,6 +322,9 @@ class TestPostStopInterruptSwallow:
         )
 
         assert agent.interrupt_reasons == [_INTERRUPT_REASON_STOP]
+        assert invalidated == [(session_key, "stop_command")]
+        assert runner._current_session_run_generation(session_key) == 1
+        runner.session_store.get_resume_pending_marker.assert_called_once_with(session_key)
         assert released == [session_key]
         assert reaped_event.wait(1)
         assert reaped == [

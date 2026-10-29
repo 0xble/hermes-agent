@@ -41,7 +41,10 @@ def test_regex_matches_bridged_session_vars():
     from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
     from gateway.session_context import _VAR_MAP
 
-    for name in (*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER):
+    from agent.delegation_context import DELEGATED_PARENT_SESSION_ENV
+    from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV
+
+    for name in (*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER, DELEGATED_PARENT_SESSION_ENV, RELAY_PARENT_ADDRESS_ENV):
         line = f'declare -x {name}="whatever"'
         assert rx.search(line), f"{name} should be excluded from the snapshot"
 
@@ -52,7 +55,7 @@ def test_regex_matches_bridged_session_vars():
 # Integration: real LocalEnvironment, two sessions, no cross-contamination.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+@pytest.mark.platforms("posix")  # POSIX bash snapshot path
 def test_shared_snapshot_no_cross_session_leak(tmp_path):
     import threading
 
@@ -98,7 +101,7 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
 # persist into the snapshot either.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+@pytest.mark.platforms("posix")  # POSIX bash snapshot path
 def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
     """Run the real dump: nothing the gateway bridges per command, nor the
     delegate_task marker, may survive ``export -p``; ordinary exports must."""
@@ -116,7 +119,7 @@ def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
     assert 'declare -x MYVAR="keep"' in out
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+@pytest.mark.platforms("posix")  # POSIX bash snapshot path
 def test_snapshot_does_not_turn_later_commands_into_delegated_children(tmp_path):
     """A snapshot re-dumped during a delegated child's command must not re-export
     the marker into the parent's next ``source`` (#90782)."""

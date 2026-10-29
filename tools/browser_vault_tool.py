@@ -45,6 +45,42 @@ _PAYMENT_RETRY_TTL = 600
 _payment_retry_lock = threading.Lock()
 _payment_retry_until: dict[tuple[str, str, str], float] = {}
 
+# Alias-only login fills require an explicit one-time confirmation because the alias registry is
+# intentionally outside the password-manager item's own origin binding. Decisions are scoped to the
+# active profile and approval session, and refusals remain fail-closed for the process lifetime.
+_alias_fill_lock = threading.Lock()
+_alias_fill_decisions: dict[tuple[str, str, str, str], str] = {}
+_alias_fill_refused: set[tuple[str, str, str, str]] = set()
+_ALIAS_FILL_CACHE_CAP = 256
+
+
+def _alias_fill_key(task_id: str, handle: str, origin: str) -> tuple[str, str, str, str]:
+    from hermes_constants import hermes_home_key
+    from tools.approval_context import get_current_session_key
+
+    session = get_current_session_key()
+    return (hermes_home_key(), task_id if session == "default" else session, handle, origin)
+
+
+def _alias_fill_decision(key: tuple[str, str, str, str]) -> str | None:
+    with _alias_fill_lock:
+        if key in _alias_fill_refused:
+            return "refused"
+        return _alias_fill_decisions.get(key)
+
+
+def _record_alias_fill_decision(key: tuple[str, str, str, str], decision: str) -> None:
+    with _alias_fill_lock:
+        if decision == "refused":
+            _alias_fill_refused.add(key)
+            _alias_fill_decisions.pop(key, None)
+            return
+        if len(_alias_fill_decisions) >= _ALIAS_FILL_CACHE_CAP and key not in _alias_fill_decisions:
+            # Refusals live in the separate process-lifetime set above. Only approvals are bounded
+            # and eligible for eviction, so a declined origin can never become retryable by churn.
+            _alias_fill_decisions.pop(next(iter(_alias_fill_decisions)))
+        _alias_fill_decisions[key] = decision
+
 
 def _payment_retry_key(task_id: str, origin: str) -> tuple[str, str, str]:
     from hermes_constants import hermes_home_key
@@ -97,7 +133,7 @@ def _browser_key(task_id: str) -> str:
     return _last_session_key(task_id)
 
 
-def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
+def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
 
     Prefers the supervisor's persistent CDP WebSocket, falls back to the
@@ -163,7 +199,7 @@ def _ensure_supervisor(task_id: str):
         return None
 
 
-def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
+def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     """Evaluate a SECRET-BEARING JS expression. Supervisor CDP-WS only.
 
     Fails closed: there is deliberately NO fallback to the agent-browser CLI
@@ -295,7 +331,16 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     if supervisor is None:
         return None
     focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
-    return (origin or focused.get("url")) if focused.get("ok") else None
+    if not focused.get("ok"):
+        return None
+    # Adopted from upstream PR 128194: the requested origin is only a filter,
+    # never evidence about the attached page. Prefer its live post-focus URL.
+    from agent.vault_store import normalize_origin
+    try:
+        attached_origin = normalize_origin(str(focused.get("url") or ""))
+    except Exception:
+        attached_origin = None
+    return _current_page_origin(task_id) or attached_origin
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +389,18 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
                            "unlock": "browser_vault_unlock" if can_prompt_here() else "unavailable_in_this_session"})
             continue
         try:
-            metas = backend.list_items()
+            from agent.vault_origin_aliases import apply_origin_aliases
+            metas = apply_origin_aliases(backend.list_items())
+            # A cached 1Password display listing can hide an item added by the user moments ago.
+            # An origin-filtered miss is the one case where freshness is worth another op call;
+            # matching cached logins, other filters, and unfiltered listings keep the quota-saving path.
+            if (origin is not None and kind in (None, "login")
+                    and (backend.name == "onepassword" or backend.name.startswith("onepassword@"))
+                    and not any(meta.kind == "login" and origin in (meta.allowed_origins or (meta.origin,))
+                                for meta in metas)):
+                from agent.vault_backends.onepassword import OnePasswordLoginBackend
+                if isinstance(backend, OnePasswordLoginBackend):
+                    metas = apply_origin_aliases(backend.list_items(fresh=True))
         except Exception as exc:
             errors.append({"backend": backend.name, "error": str(exc)[:200]})
             continue
@@ -361,7 +417,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
-                entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
+                entry["two_factor"] = ("automatic" if meta.has_otp else
+                                        "automatic if the manager stores a TOTP seed, else fetch the newest matching code "
+                                        "from the intended 1Password item, mailbox, or phone; ask the user only when no "
+                                        "supported source exists")
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
@@ -371,13 +430,15 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
             if isinstance(pinned, str) and pinned:
                 entry["browser_account"] = pinned
             items.append(entry)
-    out: Dict[str, Any] = {"success": True, "items": items}
+    out: dict[str, Any] = {"success": True, "items": items}
     if not items:
         out["hint"] = ("No matching vault items for this filter. Try another kind or origin." if kind is not None or origin is not None else
                        "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
-                       "for that service (credential CLI, 1Password CLI), or call browser_vault_save_login to ask the "
-                       "user to save one. Never type a password shown on the page or given in chat, and never ask for "
-                       "one in chat.")
+                       "for that service (credential CLI or 1Password CLI), or call browser_vault_save_login to ask the "
+                       "user to save one. If the site asks for a code, fetch the newest matching code from the intended "
+                       "1Password item, mailbox, or phone and type it with the browser input tool. Never type a value "
+                       "shown on the page or supplied in chat, never ask for one in chat, and keep card numbers and CVCs "
+                       "in vault fills.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -457,11 +518,12 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
 
 def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
-    authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on
-    their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
-    socket and never enters the conversation."""
+    authenticator seed, the code is minted server-side and nobody is asked. Otherwise the caller should fetch the
+    newest matching code from the intended 1Password item, mailbox, or phone and type it with the browser input
+    tool first; this handler prompts the user only as the final fallback when no source can be read. The code goes
+    into the page over the supervisor socket and never enters the conversation."""
     from agent.redact import register_vault_redaction_value
-    from agent.vault_backends import backend_for_handle
+    from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_backends.base import MissingCredential
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
@@ -471,10 +533,62 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
         return refusal
     browser_key = _browser_key(effective_task_id)
-    _focus_bound_origin(browser_key, "", "otp")
+    raw_meta = None
+    allowed = None
+    saved_origins = ()
+    if handle:
+        try:
+            raw_meta = backend.get_meta(handle) if backend is not None else None
+        except MissingCredential as exc:
+            return json.dumps({"success": False, "error_type": "credential_missing", "error": str(exc)[:200]})
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} locked; call browser_vault_unlock."})
+        if raw_meta is None or raw_meta.kind != "login":
+            return json.dumps({"success": False, "error_type": "credential_missing",
+                               "error": f"No login with handle {handle!r}. Use browser_vault_list."})
+        saved_origins = tuple(raw_meta.allowed_origins) or ((str(raw_meta.origin),) if raw_meta.origin else ())
+        from agent.vault_origin_aliases import apply_origin_aliases
+        meta = apply_origin_aliases([raw_meta])[0]
+        allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+        if not allowed:
+            return json.dumps({"success": False, "error_type": "no_origin",
+                               "error": "The saved login has no bound origin; refusing to enter a code."})
+        for candidate in allowed:
+            if _focus_bound_origin(browser_key, candidate, "otp"):
+                break
+    else:
+        _focus_bound_origin(browser_key, "", "otp")
+    # Never trust the requested candidate or a stale focus result as authorization.
     origin = _current_page_origin(browser_key)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
+    if allowed is not None and origin not in allowed:
+        return json.dumps({"success": False, "error_type": "origin_mismatch",
+                           "error": (f"Refused: current page origin ({origin}) does not match "
+                                     f"the vault item's bound origin(s) ({', '.join(allowed)}).")})
+    from agent.vault_origin_aliases import alias_domain_warning, alias_fill_confirmation_enabled
+
+    alias_only = allowed is not None and origin not in saved_origins
+    if alias_only:
+        alias_key = _alias_fill_key(effective_task_id, handle, origin)
+        decision = _alias_fill_decision(alias_key)
+        if decision == "refused":
+            return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
+                               "error": "Alias-origin confirmation was declined or unanswered. Do not retry."})
+        if not alias_fill_confirmation_enabled():
+            if warning := alias_domain_warning(origin, saved_origins):
+                logger.info("%s", warning)
+        elif decision is None:
+            decision = _confirm_alias_fill(raw_meta.label, origin, saved_origins)
+            if decision != "accept":
+                _record_alias_fill_decision(alias_key, "refused")
+                return json.dumps({"success": False,
+                                   "error_type": "origin_alias_declined" if decision == "decline" else "origin_alias_prompt_unanswered",
+                                   "error": "Alias-origin confirmation was declined or unanswered. Nothing was written."})
+            if refusal := _alias_fill_revalidation_refusal(raw_meta, origin):
+                return refusal
+            _record_alias_fill_decision(alias_key, "accept")
     site = origin.split("://", 1)[-1]
 
     nonce = secrets.token_hex(8)
@@ -485,9 +599,20 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     otp_controls = classify_otp_controls([LoginControl.from_dict(r) for r in (raw_controls or []) if isinstance(r, dict)])
     if not otp_controls:
         return json.dumps({"success": False, "error_type": "no_code_field",
-                           "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
-                                     "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
+                           "error": ("No one-time-code field on the current page. If the site wants a passkey, use a "
+                                     "stored 1Password passkey through the canonical-origin browser/system prompt for the "
+                                     "intended identity. For an approval, try the issuer's web or desktop path, then an "
+                                     "email/SMS code or a 1Password TOTP or passkey. Never use iPhone Mirroring. A phone-only "
+                                     "approval, a passkey not in 1Password, a Touch ID or Face ID sensor read, or a hardware "
+                                     "security key remains a physical handoff.")})
 
+    # Inspection and alias consent can race navigation. Refuse before minting
+    # a code, and retain the checked origin in the atomic in-page write guard.
+    if _current_page_origin(browser_key) != origin:
+        return json.dumps({"success": False, "error_type": "origin_changed",
+                           "error": "The page navigated before the code could be resolved. Nothing was written."})
+    if raw_meta is not None and (refusal := _alias_fill_revalidation_refusal(raw_meta, origin)):
+        return refusal
     code: Optional[str] = None
     source = "user"
     if backend is not None:
@@ -511,6 +636,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                                "error": "The user did not enter a code. Do not ask again this turn."})
 
     register_vault_redaction_value(code)
+    if raw_meta is not None and (refusal := _alias_fill_revalidation_refusal(raw_meta, origin)):
+        return refusal  # a manual-code prompt can outlive alias authorization too
     if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
         return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     fills = build_otp_fills(otp_controls, code)
@@ -550,7 +677,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         select_protected_field_fills,
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
-    from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
+    from agent.vault_backends.base import FILL_METADATA_NOT_APPLICABLE, FILL_METADATA_TTL_SECONDS
+    from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, VaultItemMeta, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
     # Pin ONE browser for the whole fill: the privacy check, inspection, write and redaction must
@@ -566,7 +694,15 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             return json.dumps(unlocked)
 
     try:
-        meta = backend.get_meta(handle) if backend is not None else None
+        raw_meta = backend.get_meta(handle) if backend is not None else None
+        saved_origins = (
+            tuple(raw_meta.allowed_origins)
+            or ((str(raw_meta.origin),) if raw_meta is not None and raw_meta.origin else ())
+        ) if raw_meta is not None else ()
+        meta = raw_meta
+        if meta is not None:
+            from agent.vault_origin_aliases import apply_origin_aliases
+            meta = apply_origin_aliases([meta])[0]
     except UnlockRequired:
         return json.dumps({"success": False, "error_type": "unlock_required",
                            "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
@@ -581,10 +717,32 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+
+    def _discard_fill_metadata() -> None:
+        discard = getattr(backend, "discard_fill_metadata", None)
+        if callable(discard):
+            discard(handle)
+
+    def _refresh_fill_metadata_after_confirmation() -> object:
+        refresh = getattr(backend, "refresh_fill_metadata", None)
+        if not callable(refresh):
+            return FILL_METADATA_NOT_APPLICABLE
+        refreshed = refresh(handle)
+        if refreshed is FILL_METADATA_NOT_APPLICABLE:
+            return refreshed
+        if refreshed is None or not isinstance(refreshed, VaultItemMeta):
+            # A backend that owns per-fill metadata failed to revalidate it. Clear the
+            # authorization context and fail closed instead of reading a moved item.
+            _discard_fill_metadata()
+            return None
+        return refreshed
+
     if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
+        _discard_fill_metadata()
         return refusal
     if meta.kind != "login" and not meta.origin:
         if meta.kind != "payment" or not backend.binds_cards_to_page:
+            _discard_fill_metadata()
             return json.dumps({"success": False, "error_type": "no_origin",
                                "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
         # A password manager's card has no site of its own. Bind it to the checkout tab (the supervisor's
@@ -594,6 +752,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         _focus_bound_origin(browser_key, "", "payment")
         page_origin = _current_page_origin(browser_key)
         if not page_origin:
+            _discard_fill_metadata()
             return json.dumps({"success": False, "error": "Could not determine the current page origin. Navigate to the checkout page first."})
         meta = replace(meta, origin=page_origin, allowed_origins=(page_origin,))
 
@@ -610,10 +769,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             break
     page_origin = page_origin or _current_page_origin(browser_key)
     if not page_origin:
+        _discard_fill_metadata()
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
         )
     if page_origin not in allowed:
+        _discard_fill_metadata()
         return json.dumps(
             {
                 "success": False,
@@ -621,12 +782,27 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 "error": (
                     f"Refused: current page origin ({page_origin}) does not match "
                     f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
-                    "only run on the exact origin(s) the credential was saved for."
+                    "only run on the exact origin(s) the credential was saved for. Add the exact origin with `hermes config set "
+                    f"vault.origin_aliases.{handle} '[\"{page_origin}\"]'`, including any existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may write this config entry; alias-only fills ask the user to confirm the exact origin and item label unless `vault.confirm_alias_fills` is false. Never edit or rewrite the existing 1Password item to add a URL: template rewrites can delete passkeys."
                 ),
             }
         )
+    alias_only = meta.kind == "login" and page_origin not in saved_origins
+    if alias_only:
+        from tools.browser_vault_aliases import authorize_login_alias
+
+        assert raw_meta is not None
+
+        authorization = authorize_login_alias(
+            handle, raw_meta, meta, page_origin, effective_task_id, _refresh_fill_metadata_after_confirmation,
+        )
+        if isinstance(authorization, str):
+            _discard_fill_metadata()
+            return authorization
+        raw_meta, meta = authorization
     retry_key = _payment_retry_key(effective_task_id, page_origin) if meta.kind == "payment" else None
     if retry_key is not None and _payment_retry_blocked(retry_key):
+        _discard_fill_metadata()
         return json.dumps({"success": False, "error_type": "payment_retry_refused",
                            "error": "Card confirmation was declined or unanswered on this origin. Do not retry; hand card entry to the user."})
 
@@ -670,16 +846,27 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     inspected = _inspect_page()
     if isinstance(inspected, str):
+        _discard_fill_metadata()
         return inspected
     if meta.kind == "payment":
         # Ask only once the page is known to hold a card-number target on the bound origin: a prompt for a
         # fill that cannot succeed spends the user's attention for nothing. That inspection is advisory; the
         # prompt can wait minutes, so after consent the page is inspected again with a fresh nonce and only
         # that inspection's targets are written (the fill script also re-checks the origin at write time).
+        prompt_started = time.monotonic()
         decision = _confirm_payment_fill(meta.label, page_origin)
+        if decision == "accept" and time.monotonic() - prompt_started > FILL_METADATA_TTL_SECONDS:
+            refreshed = _refresh_fill_metadata_after_confirmation()
+            if refreshed is None:
+                return json.dumps({"success": False, "error_type": "metadata_changed",
+                                   "error": "The vault item changed while confirmation was pending. Nothing was written; retry the fill."})
+            if isinstance(refreshed, VaultItemMeta):
+                from dataclasses import replace
+                meta = replace(refreshed, origin=page_origin, allowed_origins=(page_origin,))
         if decision != "accept":
             assert retry_key is not None
             _payment_retry_blocked(retry_key, refuse=True)
+            _discard_fill_metadata()
             return json.dumps({"success": False,
                                "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
                                "error": ("The user declined this payment card." if decision == "decline" else
@@ -687,9 +874,13 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                                         " Do not retry; hand card entry to the user."})
         inspected = _inspect_page()
         if isinstance(inspected, str):
+            _discard_fill_metadata()
             return inspected
     nonce, classified = inspected
     # ── Resolve secret and fill (secret never enters any logged string) ─────
+    if alias_only and (refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin)):
+        _discard_fill_metadata()
+        return refusal
     try:
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
@@ -714,10 +905,17 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # human-readable card metadata uses the existing tab/origin component registry.
     from agent.redact import (
         mark_vault_protected_tab, register_vault_card_component,
-        register_vault_date_component, register_vault_redaction_value,
+        register_vault_date_component,
     )
     protected_tab = browser_key if meta.kind in ("payment", "protected_field") else effective_task_id
     if meta.kind == "payment":
+        # A manager can store a formatted PAN; register its canonical digits
+        # too, so the redactor handles whatever separator the page adds/removes.
+        number = secret.get("card_number", "")
+        canonical_number = "".join(ch for ch in number if ch.isascii() and ch.isdigit())
+        if (13 <= len(canonical_number) <= 19
+                and all((ch.isascii() and ch.isdigit()) or ch.isspace() or ch == "-" for ch in number)):
+            register_vault_redaction_value(canonical_number)
         for field in ("card_number", "cvc"):
             register_vault_redaction_value(secret.get(field, ""))
         for field in ("cardholder_name", "exp_month", "exp_year", "billing_postal_code"):
@@ -750,6 +948,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
         return refusal  # selection may have changed during inspection
+    if alias_only and (refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin)):
+        _discard_fill_metadata()
+        return refusal
     try:
         fill_result = _eval_js_secret(
             browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
@@ -812,8 +1013,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
     if meta.kind == "login":
-        out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault_enter_code with this handle"
-                       + (" (a code will be generated automatically)." if meta.has_otp else "."))
+        out["next"] = ("Submit. If the site then asks for a verification code, "
+                       + ("call browser_vault_enter_code with this handle (a code will be generated automatically)."
+                          if meta.has_otp else
+                          "fetch the newest matching code from the intended 1Password item, mailbox, or phone and "
+                          "type it with the browser input tool; call browser_vault_enter_code only when no such source "
+                          "exists."))
     if meta.kind != "login":
         out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
     return json.dumps(out)
@@ -832,124 +1037,97 @@ def _confirm_payment_fill(label: str, origin: str) -> str:
         surface="vault-payment", title="Confirm payment card fill?")
 
 
+def _alias_fill_revalidation_refusal(raw_meta: Any, page_origin: str) -> str | None:
+    """Re-authorize an alias-only fill after prompting, inspection, or secret resolution.
+
+    Re-read ``vault.origin_aliases`` through the same registry path used before the prompt
+    (it revalidates the config file signature), and refuse when the exact page origin is no
+    longer allowed. Navigation is refused by the fill script's ``expected_origin`` check.
+    """
+    from agent.vault_origin_aliases import apply_origin_aliases
+
+    fresh = apply_origin_aliases([raw_meta])[0]
+    allowed = list(fresh.allowed_origins) or ([str(fresh.origin)] if fresh.origin else [])
+    if page_origin not in allowed:
+        return json.dumps({"success": False, "error_type": "origin_alias_revoked",
+                           "error": (f"Refused: the origin alias for {page_origin} was removed from "
+                                     "vault.origin_aliases while the fill was pending. Nothing was written. "
+                                     "Do not re-add it without the user's instruction.")})
+    return None
+
+
+def _confirm_alias_fill(label: str, origin: str, saved_origins: tuple[str, ...]) -> str:
+    """Human confirmation before a login is written through a config-only origin alias."""
+    from agent.vault_origin_aliases import alias_domain_warning
+    from tools.approval_prompt import request_elicitation_consent
+
+    warning = alias_domain_warning(origin, saved_origins)
+    detail = (
+        "This login is allowed on the current page only through a user-configured origin alias, not the "
+        "password manager item's saved website origin. Approve only if you recognize this exact origin."
+    )
+    if warning:
+        detail = f"{warning}\n\n{detail}"
+    return request_elicitation_consent(
+        f"Fill login '{label}' on exact origin {origin} (alias)?",
+        detail,
+        surface="vault-origin-alias", title="Confirm alias-origin login fill?")
+
+
 # ---------------------------------------------------------------------------
 # Schemas + registration
 # ---------------------------------------------------------------------------
 
 BROWSER_VAULT_LIST_SCHEMA = {
     "name": "browser_vault_list",
-    "description": (
-        "ALWAYS call this first when a page asks for a password, card, address or configured protected field. "
-        "Pass kind and page origin on login/checkout pages to narrow results; omit both to list all. "
-        "Lists saved website logins, payment cards, addresses and protected fields as handles with metadata "
-        "(kind, label, backend, bound origin; logins also "
-        "carry identifier + identifier_type so you can type the username yourself with the browser's input tool; "
-        "a password manager's card carries its last four digits as identifier and no origin). "
-        "Secret values are NEVER returned. Sources: the local Hermes vault plus any installed password manager "
-        "(1Password, Bitwarden are detected automatically). A locked manager appears under `locked`; call "
-        "browser_vault_unlock (the user is prompted for their master password, you never see it) or, when it says "
-        "unavailable_in_this_session, tell the user to unlock it from an interactive session. Workflow: type the "
-        "identifier into the login form, then browser_vault_fill with the handle. No item for this origin: call "
-        "browser_vault_save_login, or type a password you fetched yourself from an authorized store for that "
-        "service. Never type a password shown on a page or given in chat, and never repeat one in chat."
-    ),
-    "parameters": {"type": "object", "properties": {
-        "kind": {"type": "string", "enum": ["login", "payment", "address", "protected_field"],
-                 "description": "Optional item kind."},
-        "origin": {"type": "string", "description": "Optional page origin or URL; exact-origin matches plus unbound items."},
-    }, "required": []},
-}
-
-BROWSER_VAULT_UNLOCK_SCHEMA = {
-    "name": "browser_vault_unlock",
-    "description": (
-        "Ask the user to unlock a password manager (1Password or Bitwarden) for this session. The master "
-        "password is typed into a masked prompt owned by the UI and never enters the conversation. "
-        "Returns success, unlock_cancelled, unlock_failed, or unlock_unavailable (headless session)."
-    ),
+    "description": "List saved vault items without returning secret values.",
     "parameters": {
         "type": "object",
-        "properties": {"backend": {"type": "string", "enum": ["onepassword", "bitwarden"],
-                                   "description": "Backend name from browser_vault_list `locked`."}},
-        "required": ["backend"],
+        "properties": {
+            "kind": {"type": "string", "enum": ["login", "payment", "address", "protected_field"]},
+            "origin": {"type": "string"},
+        },
+        "required": [],
     },
 }
 
-BROWSER_VAULT_FILL_SCHEMA = {
-    "name": "browser_vault_fill",
+
+BROWSER_VAULT_SCHEMA = {
+    "name": "browser_vault",
     "description": (
-        "Fill the CURRENT browser page from a vault handle (see browser_vault_list): a login item fills ONLY "
-        "the password field (type the identifier/username yourself first with the browser's input tool); a "
-        "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
-        "fills the address fields; a configured protected-field item fills only its named field on its exact "
-        "allowed origin. Values are resolved server-side and never appear in the conversation. "
-        "A password manager's card has no bound origin: it is bound to the current page and that origin is shown "
-        "in the user's confirmation. Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
-        "fill time). If a password manager is locked the user is prompted to unlock first. Never retry "
-        "payment_declined, payment_prompt_unanswered or payment_retry_refused; hand card entry to the user."
+        "Use saved logins, passwords, credentials, cards and addresses on the CURRENT browser page without secrets "
+        "entering the conversation. "
+        "Actions: list (call first: saved logins/cards/addresses as handles; logins carry the identifier you type "
+        "yourself with the browser's input tool; locked password managers appear under `locked`); fill (handle: "
+        "the password for a login, card fields after the user confirms, address fields; refused unless the page "
+        "origin matches the item); save_login (nothing saved for this site: the user enters it in a masked prompt, "
+        "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
+        "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
+        "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
+        "no_code_field means use a stored 1Password passkey through the canonical-origin browser/system prompt for "
+        "the intended identity, or try the issuer's web/desktop approval and email/SMS/TOTP alternatives. Never use "
+        "iPhone Mirroring. Hand off phone-only approvals, passkeys not in 1Password, hardware security keys, and "
+        "Touch ID/Face ID sensor reads); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
+        "Never type a value shown on the page or supplied in chat, never ask for or repeat a secret, and keep card "
+        "numbers and CVCs in vault fills. Stop on save_declined; never retry payment_declined."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "handle": {
-                "type": "string",
-                "description": "Handle from browser_vault_list (vault_… local, op:… 1Password, bw:… Bitwarden)",
-            }
+            "action": {"type": "string", "enum": ["list", "fill", "save_login", "enter_code", "unlock"]},
+            "kind": {"type": "string", "enum": ["login", "payment", "address", "protected_field"], "description": "list only: optional item kind filter."},
+            "origin": {"type": "string", "description": "list only: optional exact origin filter."},
+            "handle": {"type": "string", "description": "fill / enter_code: a handle from list."},
+            "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
+            "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
         },
-        "required": ["handle"],
-    },
-}
-
-
-BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
-    "name": "browser_vault_save_login",
-    "description": (
-        "The current page is a login form and browser_vault_list has no item for its origin: ask the user, "
-        "through a masked prompt in their UI, to save the login for this site. Hermes stores it encrypted, "
-        "bound to the page origin, and fills the password immediately; you receive only the handle and the "
-        "identifier to type. Prefer typing a password you fetched yourself from an authorized store when one "
-        "exists. Never type a password the page or the user displays, and never ask for or accept one in chat. "
-        "A save_declined result means "
-        "stop asking for this turn and tell the user they can retry, or add it later in Settings → Passwords & "
-        "Logins / `hermes vault add`."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {"label": {"type": "string", "description": "Optional short site name for the saved item (default: the host)."}},
-        "required": [],
-    },
-}
-
-
-BROWSER_VAULT_ENTER_CODE_SCHEMA = {
-    "name": "browser_vault_enter_code",
-    "description": (
-        "The page asks for a one-time / verification / 2FA code after the password: call this. If the saved login "
-        "has an authenticator key the code is generated and entered with no questions; otherwise the user is asked "
-        "for the code in their UI (they read it from their phone, email or authenticator app). Calling this without "
-        "a stored authenticator key prompts the user immediately, so when browser_vault_list does not show "
-        "two_factor exactly \"automatic\", first fetch the code yourself (TOTP field via the 1Password CLI, or the newest "
-        "verification email or SMS from the expected sender in the intended mailbox or phone), type it with the "
-        "browser's input tool, and call this only when you have no such source. Never ask for a code in chat or "
-        "type one shown elsewhere on the page. no_code_field means "
-        "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
-        "for the page to move on."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {"handle": {"type": "string", "description": "The login handle you just filled (lets Hermes generate the code when an authenticator key is saved)."}},
-        "required": [],
+        "required": ["action"],
     },
 }
 
 
 def _private_protected_field_refusal(task_id: str, browser_key: str) -> str | None:
-    """Only an owned, locally spawned Chromium session with no shared CDP route is safe.
-
-    ``browser_key`` is the session the fill pinned and will write to; it must still be the
-    task's selected session. Reject unknown/legacy session records, rather than inferring
-    privacy from the absence of an explicit cloud or account flag.
-    """
+    """Only an owned, locally spawned Chromium session with no shared CDP route is safe."""
     from tools import browser_tool as bt
     from tools.browser_camofox import is_camofox_mode
     from tools.browser_tool_cdp import _get_cdp_override
@@ -975,12 +1153,22 @@ def _private_protected_field_refusal(task_id: str, browser_key: str) -> str | No
     if private:
         return None
     return json.dumps({
-        "success": False, "error_type": "private_browser_required",
+        "success": False,
+        "error_type": "private_browser_required",
         "error": "Birth-date fills only run in a private per-task local browser. "
                  "This browser may be shared with another task or process (Camofox accounts, "
                  "attached/CDP, Bot Desktop, cloud and unverified sessions are refused). "
                  "Navigate in a fresh local browser session for this task first.",
     })
+
+
+def _handle_vault_list(args: dict[str, Any], **kwargs) -> str:
+    return browser_vault_list(kind=args.get("kind"), origin=args.get("origin"))
+
+
+def _handle_vault_fill(args: dict[str, Any], **kwargs) -> str:
+    tid = kwargs.get("task_id")
+    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
 
 
 def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
@@ -1001,30 +1189,26 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     return res["raw"] if "raw" in res else json.dumps(res)
 
 
-def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
+def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
-    return _fenced_page_op(tid, lambda: browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=tid))
+    action = str(args.get("action") or "")
+    handle, label = str(args.get("handle") or ""), str(args.get("label") or "")
+    if action == "list":
+        return browser_vault_list(kind=args.get("kind"), origin=args.get("origin"))
+    if action == "unlock":
+        return browser_vault_unlock(str(args.get("backend") or ""))
+    page_ops = {
+        "fill": lambda: browser_vault_fill(handle=handle, task_id=tid),
+        "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
+        "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid),
+    }
+    if action not in page_ops:
+        return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "
+                                                       "enter_code or unlock."})
+    return _fenced_page_op(tid, page_ops[action])
 
 
-def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
-    tid = kwargs.get("task_id")
-    return _fenced_page_op(tid, lambda: browser_vault_save_login(label=str(args.get("label") or ""), task_id=tid))
-
-
-def _handle_vault_list(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_list(kind=args.get("kind"), origin=args.get("origin"))
-
-
-def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_unlock(str(args.get("backend") or ""))
-
-
-def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
-    tid = kwargs.get("task_id")
-    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
-
-
-from tools.registry import registry  # noqa: E402
+from tools.registry import registry
 
 registry.register(
     name="browser_vault_list",
@@ -1035,38 +1219,12 @@ registry.register(
     emoji="🔐",
 )
 
-registry.register(
-    name="browser_vault_unlock",
-    toolset="browser",
-    schema=BROWSER_VAULT_UNLOCK_SCHEMA,
-    handler=_handle_vault_unlock,
-    check_fn=_check_vault_available,
-    emoji="🔐",
-)
 
 registry.register(
-    name="browser_vault_save_login",
+    name="browser_vault",
     toolset="browser",
-    schema=BROWSER_VAULT_SAVE_LOGIN_SCHEMA,
-    handler=_handle_vault_save_login,
-    check_fn=_check_vault_available,
-    emoji="🔐",
-)
-
-registry.register(
-    name="browser_vault_enter_code",
-    toolset="browser",
-    schema=BROWSER_VAULT_ENTER_CODE_SCHEMA,
-    handler=_handle_vault_enter_code,
-    check_fn=_check_vault_available,
-    emoji="🔐",
-)
-
-registry.register(
-    name="browser_vault_fill",
-    toolset="browser",
-    schema=BROWSER_VAULT_FILL_SCHEMA,
-    handler=_handle_vault_fill,
+    schema=BROWSER_VAULT_SCHEMA,
+    handler=_handle_vault,
     check_fn=_check_vault_available,
     emoji="🔐",
 )

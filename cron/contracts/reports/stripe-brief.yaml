@@ -1,0 +1,17 @@
+title: Stripe Priorities
+required_lines:
+  - "**Focus:**"
+required_sections:
+  - Priorities
+optional_sections:
+  - Upcoming
+  - Waiting / Blocked
+  - Changes
+  - Standup
+word_cap: 400
+silence_markers:
+  - "[SILENT]"
+  - SILENT
+  - NO_REPLY
+  - "NO REPLY"
+  - "[CRON_FAILURE]"

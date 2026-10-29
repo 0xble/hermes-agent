@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import time
 from typing import Any, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.stream_consumer_fences import ensure_closed_code_fences
+from gateway.stream_recovery import _REPLACEMENT_PREVIEW_PREFIX, _SPLIT_PREVIEW_PREFIX
+from hermes_cli.observability.shared_metrics_gateway import stops_reply_clock
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -20,6 +23,8 @@ logger = logging.getLogger("gateway.stream_consumer")
 # until the interval elapses, so honouring a 30s Telegram retry_after costs nothing but a
 # stale preview; anything longer is left to the strike counter and the fallback send path.
 _MAX_EDIT_BACKOFF_SECS = 30.0
+_JOURNAL_WARNING_INTERVAL_SECS = 60.0
+_last_journal_warning = float("-inf")
 
 
 class StreamTransportMixin:
@@ -279,25 +284,44 @@ class StreamTransportMixin:
         if self._turn_split_delivery:
             return False
         stale_ids = self._stale_preview_ids()
+        # The old row must stop naming the editable preview before a replacement
+        # send is issued.  If the process dies after the platform accepts the new
+        # message but before its ACK can be journaled, recovery treats this as an
+        # uncertain fresh send instead of editing the retired preview.
+        replacement_intent = _REPLACEMENT_PREVIEW_PREFIX + json.dumps({
+            "text": text,
+            "stale_ids": list(stale_ids),
+        })
+        await self._journal_preview(replacement_intent, self._message_id, force=True)
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
         except Exception as e:
+            await self._journal_preview(self._last_sent_text, self._message_id, force=True)
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
         if not getattr(result, "success", False):
+            await self._journal_preview(self._last_sent_text, self._message_id, force=True)
             return False
         new_message_id = getattr(result, "message_id", None)
+        # Journal the replacement before deleting what the old row points at.
+        await self._journal_preview(text, new_message_id, force=True)
         # Best-effort preview cleanup; never delete the message just sent.
         await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
         self._already_sent = True
+        self._adopted_unconfirmed = None
         self._last_sent_text = text
         if is_turn_final:
             self._final_response_sent = True
             self._record_turn_final_payload(text)
         return True
+
+    def _adoption_unconfirmed(self) -> bool:
+        """An adopted crash preview is still the edit target and no edit to it has landed."""
+        adopted = getattr(self, "_adopted_unconfirmed", None)
+        return bool(adopted) and getattr(self, "_message_id", None) == adopted
 
     def _adopt_message_id(self, message_id) -> None:
         """Retarget edits at ``message_id``; None → "__no_edit__" sentinel so we never edit it."""
@@ -308,6 +332,7 @@ class StreamTransportMixin:
             self._message_id = "__no_edit__"
             self._message_created_ts = None
 
+    @stops_reply_clock
     async def _send_or_edit(
         self, text: str, *, finalize: bool = False, is_turn_final: bool = True) -> bool:
         """Send or edit the streaming message; True if delivered.  ``finalize`` marks the
@@ -331,9 +356,16 @@ class StreamTransportMixin:
             return True  # cursor-only / whitespace-only update
         # Don't open a new message for 1-2 tokens + cursor (rapid tool-calling): if
         # the cursor-strip edit is then rate-limited, "X ▉" stays forever.
-        if (self._message_id is None and self.cfg.cursor and self.cfg.cursor in text
-                and len(visible_stripped) < self._MIN_NEW_MSG_CHARS):
-            return True  # too short for a standalone message — accumulate more
+        # A segment-break finalize never carries the cursor, so gate it too or a 1-2 token
+        # preamble lands durably at every tool boundary and resets the progress anchor
+        # (#99026).  Turn finals are exempt: a short complete answer must be delivered.
+        # Tradeoff: on non-cumulative transports the held preamble is DROPPED, not
+        # carried — _end_segment sees update_visible=True and resets the segment.
+        preamble_finalize = finalize and not is_turn_final
+        if (self._message_id is None and len(visible_stripped) < self._MIN_NEW_MSG_CHARS
+                and (preamble_finalize or (self.cfg.cursor and self.cfg.cursor in text))):
+            # Mid-stream: accumulate more.  Segment-break finalize: dropped (see above).
+            return True
 
         # A failed native/draft transport disables itself and falls through so the
         # accumulated text still reaches the user via edit/send.
@@ -390,6 +422,7 @@ class StreamTransportMixin:
         if await self._try_frame(self._send_frame(text, finalize=finalize),
                                  "send_stream_frame raised, disabling native streaming: %s"):
             self._already_sent = True
+            self._adopted_unconfirmed = None  # a landed frame supersedes any adopted text
             self._last_sent_text = text
             self._native_last_pushed_len = len(text)
             if finalize:
@@ -437,6 +470,40 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
+    async def _journal_preview(self, text: str, message_id=None, *, force: bool = False) -> None:
+        """Best-effort crash journal: a failure is logged and never changes delivery."""
+        global _last_journal_warning
+        on_preview = getattr(self, "_on_preview", None)
+        if on_preview is None or (getattr(self, "_turn_split_delivery", False) and not force):
+            return
+        if self.cfg.cursor:
+            text = text.removesuffix(self.cfg.cursor).rstrip()
+        try:
+            await on_preview(text, message_id)
+        except Exception as err:
+            # A locked state DB fails every edit of every stream: warn at most once a minute.
+            now = time.monotonic()
+            if now - _last_journal_warning >= _JOURNAL_WARNING_INTERVAL_SECS:
+                _last_journal_warning = now
+                logger.warning("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
+            else:
+                logger.debug("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
+
+    async def _journal_split_delivery(self, message_ids) -> None:
+        """Record accepted sealed heads while a split send is still in flight."""
+        await self._journal_preview(
+            _SPLIT_PREVIEW_PREFIX + json.dumps([str(mid) for mid in message_ids if mid]),
+            None,
+            force=True,
+        )
+
+    async def _enter_split_delivery(self) -> None:
+        """Mark the turn split and forget its preview row: the row names a now-sealed head,
+        which a crash recovery must never adopt and overwrite with the whole answer."""
+        self._turn_split_delivery = True
+        await self._journal_preview("", force=True)
+        self._split_delivery_journal_pending = False
+
     async def _first_send(self, text: str, *, finalize: bool) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
         if getattr(self, "_egress_declined", False):
@@ -448,12 +515,17 @@ class StreamTransportMixin:
                 "declined this destination for this run"
             )
             return False
+        await self._journal_preview(text)
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
             metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
         if not result.success:
+            await self._journal_preview("")
             self._edit_supported = False
             return False
+        if result.message_id:
+            # The write-ahead row already holds (text, None): only a new ID is worth a write.
+            await self._journal_preview(text, result.message_id)
         self._already_sent = True
         self._last_sent_text = text
         if result.message_id:
@@ -470,7 +542,10 @@ class StreamTransportMixin:
         """Edit the live preview (or replace it via fresh-final when finalizing)."""
         # REQUIRES_EDIT_FINALIZE adapters need the finalize=True edit even when
         # unchanged; everyone else short-circuits.
-        if text == self._last_sent_text and not (finalize and self._adapter_requires_finalize):
+        # An adopted crash preview's text is write-ahead: the platform may never have shown
+        # it, so the first edit after adoption always goes out, even byte-identical.
+        if (text == self._last_sent_text and not self._adoption_unconfirmed()
+                and not (finalize and self._adapter_requires_finalize)):
             return True
         # Fresh-final: replace a long-lived preview with a fresh message, or whenever
         # the adapter prefers it (Telegram's send path renders richer markdown).  An
@@ -485,18 +560,25 @@ class StreamTransportMixin:
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
+        if not getattr(self, "_split_delivery_journal_pending", False):
+            await self._journal_preview(text, self._message_id)
         result = await self._edit_message(message_id=self._message_id, content=text,
                                           finalize=finalize)
         if not result.success:
+            if not getattr(self, "_split_delivery_journal_pending", False):
+                await self._journal_preview(self._last_sent_text, self._message_id)
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
         raw_response = getattr(result, "raw_response", None)
         if isinstance(raw_response, dict) and raw_response.get("skipped"):
             # Adapter deferred the edit (Telegram's shared send+edit slot was busy): nothing
             # changed on screen, so the visible prefix and flood state stay as they were and the
-            # next tick retries with the newer text.
+            # next tick retries with the newer text. An in-flight split seal keeps its fence row.
+            if not getattr(self, "_split_delivery_journal_pending", False):
+                await self._journal_preview(self._last_sent_text, self._message_id)
             return True
         self._already_sent = True
+        self._adopted_unconfirmed = None
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
         # continuation, which holds only the final chunk — retarget edits and reset
@@ -504,7 +586,7 @@ class StreamTransportMixin:
         if ((getattr(result, "continuation_message_ids", ()) or ())
                 and result.message_id and result.message_id != self._message_id):
             self._last_edit_overflowed = True
-            self._turn_split_delivery = True
+            await self._enter_split_delivery()
             self._adopt_message_id(str(result.message_id))
             self._last_sent_text = ""
             self._notify_new_message()

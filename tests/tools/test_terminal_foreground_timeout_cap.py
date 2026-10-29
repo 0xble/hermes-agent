@@ -7,7 +7,6 @@ re-sent lower/split/background, 251 of them test suites).
 import json
 from unittest.mock import patch, MagicMock
 
-
 # ---------------------------------------------------------------------------
 # Shared test config dict — mirrors _get_env_config() return shape.
 # ---------------------------------------------------------------------------
@@ -26,7 +25,6 @@ def _make_env_config(**overrides):
     }
     config.update(overrides)
     return config
-
 
 class TestForegroundTimeoutCap:
     """FOREGROUND_MAX_TIMEOUT rejects foreground commands that exceed it."""
@@ -54,7 +52,6 @@ class TestForegroundTimeoutCap:
             time.sleep(0.05)
         assert marker.read_text().count("x") == 1  # ran exactly once, in the background
 
-
     def test_zero_timeout_rejected(self):
         """timeout=0 must be rejected, not silently coerced to the default."""
         from tools.terminal_tool import terminal_tool
@@ -77,7 +74,6 @@ class TestForegroundTimeoutCap:
         assert result.get("error")
         assert "positive" in result["error"]
 
-
     def test_foreground_allows_help_variant_for_server_command(self):
         """Informational variants like '--help' should not be blocked."""
         from tools.terminal_tool import terminal_tool
@@ -96,7 +92,6 @@ class TestForegroundTimeoutCap:
         assert result["error"] is None
         call_kwargs = mock_env.execute.call_args
         assert call_kwargs[0][0] == "pnpm dev --help"
-
 
     def test_config_default_above_cap_not_rejected(self):
         """When config default timeout > cap but model passes no timeout, execute normally.
@@ -124,7 +119,6 @@ class TestForegroundTimeoutCap:
         assert call_kwargs[1]["timeout"] == 900
         assert "error" not in result or result["error"] is None
 
-
     def test_exactly_at_max_not_rejected(self):
         """Timeout exactly at FOREGROUND_MAX_TIMEOUT should execute normally."""
         from tools.terminal_tool import terminal_tool, FOREGROUND_MAX_TIMEOUT
@@ -148,6 +142,38 @@ class TestForegroundTimeoutCap:
         assert "error" not in result or result["error"] is None
 
 
+class TestHeavySlotExpiryPromotion:
+    def test_single_heavy_command_is_resumed_in_background_without_retry(self):
+        """A bounded not-started result preserves the command instead of asking the model to re-run it."""
+        from tools.terminal_tool import terminal_tool
+
+        mock_env = MagicMock()
+        mock_env.execute.return_value = {"output": "not started", "returncode": 75}
+        wrapped = []
+        background = json.dumps({
+            "output": "Background process started", "exit_code": None, "error": None,
+            "session_id": "proc_heavy", "notify_on_complete": True,
+        })
+
+        def fake_wrap(command, **kwargs):
+            wrapped.append((command, kwargs.get("max_wait_seconds")))
+            return f"wrapped-{len(wrapped)}"
+
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"), \
+             patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+             patch("tools.terminal_tool._last_activity", {"default": 0}), \
+             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+             patch("tools.terminal_tool.can_promote_expired_wait", return_value=True), \
+             patch("tools.terminal_tool.wrap_heavy_command", side_effect=fake_wrap), \
+             patch("tools.terminal_tool.spawn_background_process", return_value=background) as spawn:
+            result = json.loads(terminal_tool(command="pytest -q tests", timeout=180))
+
+        assert result["error"] is None
+        assert result["promoted_from_heavy_slot"].startswith("The foreground heavy-slot wait expired")
+        assert wrapped == [("pytest -q tests", 60), ("pytest -q tests", None)]
+        assert spawn.call_args.kwargs["command"] == "wrapped-2"
+        assert spawn.call_args.kwargs["notify_on_complete"] is True
 
 
 class TestPromotionKeepsTheDetachmentGuard:
@@ -162,4 +188,3 @@ class TestPromotionKeepsTheDetachmentGuard:
             result2 = json.loads(terminal_tool(command="nohup make test", timeout=9999))
         assert "'&' backgrounding" in result["error"]
         assert "nohup" in result2["error"]
-

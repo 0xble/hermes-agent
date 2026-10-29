@@ -130,7 +130,7 @@ class TestMarkRunningJobsInterrupted:
         assert marked == ["job-2"]
 
     def test_stale_shutdown_cannot_clear_replacement_owner(self, tmp_path):
-        import cron.jobs as jobs
+        from cron import jobs
         import cron.scheduler as sched
 
         profile_home = tmp_path / "profile"
@@ -375,19 +375,19 @@ class TestExecutionScopedInterruption:
 
 class TestCombinedCancelEvent:
     def test_or_semantics(self):
-        import cron.scheduler as sched
+        from cron.scheduler_cancel import _CombinedCancelEvent
 
         a, b = threading.Event(), threading.Event()
-        combined = sched._CombinedCancelEvent(a, b)
+        combined = _CombinedCancelEvent(a, b)
         assert combined.is_set() is False
         b.set()
         assert combined.is_set() is True
 
     def test_set_propagates_to_all(self):
-        import cron.scheduler as sched
+        from cron.scheduler_cancel import _CombinedCancelEvent
 
         a, b = threading.Event(), threading.Event()
-        combined = sched._CombinedCancelEvent(a, b)
+        combined = _CombinedCancelEvent(a, b)
         combined.set()
         assert a.is_set() and b.is_set()
 
@@ -405,7 +405,11 @@ class TestCombinedCancelEvent:
             assert sched.run_one_job(job, cancel_event=external) is True
 
         kwargs = body.call_args.kwargs
-        assert kwargs["transport_cancel"] is external
+        combined = kwargs["transport_cancel"]
+        assert not combined.is_set()
+        external.set()
+        assert combined.is_set()
+        external.clear()
         # What run_job receives: the ownership handle built from the two forwarded sources.
         combined = sched._FireOwnership(job, kwargs["claim_lost"], kwargs["transport_cancel"]).cancel_event
         assert combined.is_set() is False
@@ -504,7 +508,7 @@ class TestCallerLossAfterClaimAcquisition:
     and block retries while that ownership is live."""
 
     def test_second_fire_cannot_claim_while_first_ownership_live(self, tmp_path):
-        import cron.jobs as jobs
+        from cron import jobs
 
         with jobs.use_cron_store(tmp_path):
             job = jobs.create_job(prompt="x", schedule="every 5m", name="owned")
@@ -591,14 +595,19 @@ class TestRunOneJobHonoursInterruptedFlag:
              ) as mock_summarize, \
              patch("cron.scheduler._is_cron_silence_response", return_value=False), \
              patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.finish_execution") as mock_finish:
             result = sched.run_one_job(job)
 
         assert result is True
         mock_summarize.assert_called_once()
         # The summarizer's error argument must mention the interruption,
         # not be silently None / the agent's own (possibly absent) error.
-        assert "interrupt" in mock_summarize.call_args.args[1].lower()
+        errors = [mock_summarize.call_args.args[1], mock_finish.call_args.kwargs["error"]]
+        for error in errors:
+            assert "stopped before finishing" in error
+            for cause in ("restart", "shutdown", "killed"):
+                assert cause not in error.lower()
         delivered_content = mock_deliver.call_args.args[1]
         assert delivered_content == "This run was interrupted."
         assert "plausible final response" not in delivered_content

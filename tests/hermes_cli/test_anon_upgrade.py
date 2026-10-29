@@ -99,7 +99,6 @@ def portal(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_PORTAL_BASE_URL", PORTAL)
     monkeypatch.setenv("HERMES_ANON_API_SECRET", "test-secret")
     monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared-store"))
-    monkeypatch.setenv("HERMES_GUEST_ONBOARDING", "1")
     for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NOUS_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     from hermes_cli import auth_nous
@@ -185,6 +184,7 @@ def free_account(monkeypatch):
     free list are the only network egress the default pick has, stubbed at their seams."""
     from hermes_cli import models as m
     from hermes_cli import models_pricing as mp
+    monkeypatch.setattr(m, "get_curated_nous_model_ids", lambda **kw: list(m._PROVIDER_MODELS["nous"]))
     monkeypatch.setattr(m, "check_nous_free_tier", lambda **kw: True)
     monkeypatch.setattr(m, "fetch_nous_recommended_models", lambda *a, **kw: {
         "freeRecommendedModels": [{"modelName": FREE_PICK}]})

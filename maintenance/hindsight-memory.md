@@ -1,5 +1,63 @@
 # Hindsight memory provider
 
+**Patch identity:** `hindsight-retain-visibility` and `evict-memory-shutdown`.
+
+Soft agent-cache eviction must drain and shut down the agent's memory manager
+(including Hindsight's writer and the mem-sync executor), then release clients
+off the gateway event loop. Eviction removes the cache entry first, so a refetched
+turn builds a fresh manager while retirement completes. Only idle-TTL, LRU-cap
+and memory-pressure evictions commit the transcript (`on_session_end`) first;
+same-session evictions (`/model`, fallback drift, config signature,
+cross-process) never do. Not covered yet: fallback drift and mid-turn `/model`
+evict while the agent is running, so they skip the soft release entirely.
+An agent whose `shutdown_memory_provider()` already ran
+(`_memory_provider_shutdown`, the `/new` and `/reset` cleanup) is detached without
+a second commit or shutdown: `shutdown_memory_provider()` sets that flag and
+captures the manager under a per-agent handoff lock (`memory_handoff_lock`) that
+eviction's detach also takes, so exactly one side owns `shutdown_all()`. The
+lock covers only those reads and writes. The captured local means a cleanup
+that outlived its 30s reset timeout still finishes with
+`shutdown_all()` after eviction nulls the attribute. `MemoryManager.shutdown_all()`
+is idempotent, so racing teardown paths retire providers once. A memory-pressure
+batch commits, detaches the manager, and calls `release_clients()` inline, then
+runs the deferred `shutdown_all()` on parallel daemon threads, so `malloc_trim` is
+not held behind their bounded joins. Releasing the agent's clients first is safe
+because no provider drain uses them: Hindsight's writer and shutdown use the
+provider's own `_client`, and query rewrite goes through the process-wide
+auxiliary client.
+Hindsight prefetch keeps one in-flight worker and one latest-wins pending query;
+discard and shutdown fence both the pending query and the worker's publication,
+and a `BaseException` leaving the worker clears its running flag.
+Proof: `scripts/run_tests.sh tests/gateway/test_agent_cache_memory_lifetime.py`
+and `scripts/run_tests.sh tests/plugins/memory/test_hindsight_prefetch_lifetime.py`.
+Retire when upstream soft eviction retires memory providers and Hindsight
+prefetch is single-flight. Roll back by reverting the commits carrying
+`Fork-Patch: evict-memory-shutdown`; evicted agents then keep their writer and
+mem-sync threads until process exit again.
+
+Follow up:
+- Fallback-drift and mid-turn `/model` eviction (`gateway/run_turn.py`
+  `_run_agent_evict_on_fallback`) reach `_evict_cached_agent` while the agent is
+  in `_running_agent_ids()`, which returns before the soft release, so that
+  agent's Hindsight writer and mem-sync executor still leak. Predates this patch.
+
+Accepted asynchronous retain operations remain tracked after the first prefetch
+visibility wait expires. Later prefetches do not repeat that wait. The existing
+writer also ages out initial waits while idle, covering tools-only, synchronous
+recall, disabled prefetch waits, and the final turn before idle. It polls late
+operations with a two-second pass budget and
+five-second cadence. A single operation map keeps each operation's bank, expiry
+and whether its initial wait is still due. Tracking is limited to 256 operations
+and one hour, with visible warnings on eviction, expiry and terminal failure.
+Idle polling cannot release an active prefetch barrier or a configured unlimited
+visibility wait. Capacity eviction uses expiry order independently of poll rotation.
+Completed and failed operations are removed. Slow status requests rotate to the
+back so they cannot starve later operations. Proof:
+`scripts/run_tests.sh tests/plugins/memory/test_hindsight_provider.py`.
+Retire when the selected upstream integration preserves late visibility without
+repeating per-turn waits. Revert the `hindsight-retain-visibility` commit to
+restore deadline eviction. No accepted server operation is cancelled on rollback.
+
 Load this unit when changing `plugins/memory/hindsight/`, the provider's lifecycle
 contract with `agent/memory_manager.py` and `agent/agent_init.py`, or the retain
 strategy and cron-exclusion behavior.
@@ -29,6 +87,75 @@ strategy and cron-exclusion behavior.
   `_session_turns` once queued), so the writer keeps a failed job in an ordered, bounded
   backlog and retries it instead of discarding it (`TestRetainRetry`). Tag settings
   (`retain_tags`, `recall_tags`) accept comma-separated strings and reach the SDK as lists.
+- Hermes-generated user turns (notices, goal continuations, heartbeat and `/loop` wakeups, every
+  turn of a cron run, recovery notes) neither key automatic recall nor enter retained transcripts. Both
+  gates call `agent.synthetic_prompt.human_prompt_text`. A runtime-owned `display_kind` or an
+  unattended platform is authoritative: the whole turn is generated and no text boundary overrides
+  it, so text the gateway merged into an internal notification is answered but not used for memory
+  (accepted cost of never letting a forged boundary in a payload win). Without that provenance (goal,
+  kanban and `/loop` prompts the gateway queues as ordinary events, legacy rows) each producer's own
+  formatter boundary decides, keeping any human text merged after it. Add a new generated prompt there, beside its producer constant,
+  rather than in a provider. `memory.recall_synthetic_turns` (default off) restores recall on
+  generated turns. Proof: `tests/agent/test_synthetic_prompt.py`.
+- A generated-only turn also excludes its assistant reply from automatic transcript retention.
+  Filtering only the user half creates an orphan assistant result that can turn test, relay or
+  recall feedback into apparent personal evidence. Reuse the shared human-part classifier, not
+  result-wording rules. Preserve assistant context when a real human suffix survives, and do not
+  drop ordinary assistant-only or recalled-context-only turns without generated provenance.
+  Proof: `tests/plugins/memory/test_hindsight_generated_turns.py` and the existing provider suite.
+  Retire when the selected upstream provider applies the same whole-turn exclusion. Revert only
+  that patch to restore user-side-only filtering.
+- First-person auto-recall (`recall_owner_subject`, default empty = off). "What car do I drive"
+  names no subject, so the owner's personal facts never enter Hindsight's candidate pool: the
+  controlled traces show the targets absent before fusion, and no budget, recency or reranker
+  setting reorders what was never retrieved. When the owner name is configured and the query has
+  I/me/my/mine/we/our/ours/us (case-sensitive `us`, so the country "US" does not count) and does
+  not already name the owner, recall runs the user's words and `<words> (<owner>)` and merges the
+  two lists round-robin with dedupe, capped at one `recall_max_tokens` budget. Merging, not
+  replacing, is required: on the optimization holdout (30 attributes x 2 rounds, 2 request shapes)
+  appending alone gained 13-14 personal hits but lost Toyota, birthday and anniversary and pushed
+  generic answers out of non-personal first-person queries. Round-robin kept every gain with 0
+  losses and 60-64% of the original top 5. Only automatic recall changes. The `hindsight_recall`
+  tool keeps the model's own query. Proof: `TestOwnerSubjectRecall` in
+  `tests/plugins/memory/test_hindsight_provider.py`. Retire when Hindsight resolves first-person
+  queries to the bank owner server-side.
+- Template boundary rule: when a template's closing paragraph appears more than once, the LAST
+  copy is the generated boundary. Every template is tried and the FURTHEST boundary wins, because
+  templates share openings and a payload can hold a complete sibling template (a goal quoting a
+  contract continuation) whose boundary ends inside the outer payload. Generated text is never classified as human, which is #320's
+  invariant. A revised goal continuation (with its "This goal has been revised" block) has no
+  provable end and is generated in full. Accepted limitation: a person's message that the gateway
+  text-merged into a pending goal, kanban, heartbeat or `/loop` prompt and that quotes that
+  prompt's exact closing paragraph keeps only the text after the quote for recall and retention,
+  and a message merged into a revised continuation keeps none. The message itself is still
+  delivered and answered. Text cannot tell such a quote from a payload copy, and carrying the human
+  part as structured metadata through every merge path was judged too wide for this patch.
+- Buffered recall across generated turns. Default (async) Hindsight injects the result the
+  post-turn `queue_prefetch` computed for the PREVIOUS turn. Generated turns neither consume nor
+  queue, so in human A -> generated S -> human B, B injects the recall keyed on A, the latest human
+  intent (before this gate it was keyed on S's generated text). Review raised that A's result can
+  be stale. Discarding it on every suppressed turn was rejected: B would get no automatic recall,
+  and goal-heavy sessions put many generated turns between human ones. Measured on 30 days of
+  state.db top-level sessions, 72% of human -> generated -> human gaps are within 30 minutes
+  (median 11 min), against 90% of direct human -> human gaps. The defect is unbounded age, so
+  `MemoryManager` records when it last queued (`queue_prefetch_all`) and, at the next
+  `prefetch_all`, calls every provider's `discard_prefetch()` once that is older than
+  `memory.prefetch_max_age_seconds` (default 1800, `0` = no limit). The clock is wall time because
+  macOS's monotonic clock stops during sleep. It is manager-level so every buffering provider is
+  covered. A discard must also stop a worker already in flight from republishing, so the manager,
+  Hindsight, RetainDB and Honcho share `agent.memory_provider.PrefetchGeneration`: each request
+  takes a token, a discard or newer request obsoletes it, and a worker publishes only while its
+  token is current, checked under the provider's existing state lock. Hindsight drops its buffered
+  recall, RetainDB its three caches, Honcho its pending dialectic plus any cadence or backoff update
+  from the obsolete run. Honcho's base context (representation and card) is outside this bound: it
+  is a per-session cache injected every turn by design, and a pending refresh only replaces it, so
+  dropping the refresh would keep an older copy rather than none. Mem0 keys its buffer on the query and OpenViking,
+  ByteRover, Holographic and Supermemory recall live, so they keep the no-op default. The buffer
+  lives on the provider instance owned by one agent's manager (each `load_memory_provider` call
+  builds a new instance), so it does not cross sessions, and Hindsight's `on_session_switch`
+  already drops it on /new, /resume, /branch and compression. In a shared chat it can carry one
+  participant's recall to another's next turn, which every async turn already did before this gate. Proof:
+  `tests/agent/test_synthetic_prompt.py` (`test_buffered_recall_*`).
 
 ## Proof surface
 
@@ -45,7 +172,9 @@ strategy and cron-exclusion behavior.
 
 - Fork patch identities: `HERMES-122`, `hindsight-retain-strategy`,
   `hindsight-cron-retention`, `hindsight-bundled-provider`,
-  `memory-note-not-authoritative`. Local narrow patches on the `v2026.9.14` baseline.
+  `memory-note-not-authoritative`, `synthetic-prompt-memory-gate`,
+  `hindsight-generated-turn-retention`, `hindsight-owner-subject-recall`. Local narrow patches
+  on the `v2026.9.14` baseline.
 - `HERMES-122` (`6878e95d58`, re-landed `65059fa22d`) defaults `_cron_skipped` in
   `__init__`. Its first landing was reverted hours later by `fc45821e1f`, a backup
   change authored in a worktree created before the fix, whose tree still held the
@@ -59,6 +188,20 @@ strategy and cron-exclusion behavior.
 - `hindsight-cron-retention` (`fdb3f2e49d`) withholds the retain tool on cron
   sessions. This is the commit that introduced the `_cron_skipped` read without the
   matching default.
+- `synthetic-prompt-memory-gate` moves the generated-prompt inventory to
+  `agent/synthetic_prompt.py` and gates the core turn-start and post-turn recall paths on
+  it, plus retention through `sync_all` provenance. It is core because the prefetch call
+  sites and turn provenance live in `agent/turn_context.py` and `run_agent.py`. Automatic
+  recall peels attachment and reply context before applying the provider's query cap.
+  The gateway JSON-quotes complete reply text so embedded quotes and paragraph breaks
+  cannot impersonate the wrapper boundary. Native image turns use stored caption-only
+  text instead of their vision-enriched API copy. Proof: the producer-composed cases in
+  `tests/agent/test_attachment_recall_query.py` and full-quote round trips in
+  `tests/gateway/test_reply_to_injection.py`. No
+  upstream issue or PR covered synthetic-turn recall as of 2026-10-05. Retire it when
+  upstream skips provider prefetch for runtime-generated turns. Roll back by reverting
+  its commit, which restores the `hindsight-session-lifecycle` retention-only filter in
+  `plugins/memory/hindsight/retention.py`.
 
 - `memory-note-not-authoritative` changes the note `build_memory_context_block()` puts
   before every provider recall. The upstream note called recalled memory
@@ -91,3 +234,8 @@ keeps that allowlist entry, mirroring the range in its `plugin.yaml`. Without it
 client build raises `FeatureUnavailable` and retain and recall stop.
 `tests/plugins/memory/test_memory_lazy_install.py` guards the entry. Drop this patch
 only together with the bundled provider.
+
+
+## Native Notification Footer
+
+Upstream appends `INTERNAL_NOTIFICATION_FOOTER` after a framed process result's end marker. Retention removes that exact defining formatter footer before retaining any real human suffix. The async batch delivery invariant exercises both notification-only and notification-plus-human-request turns in `tests/gateway/test_completion_delivery.py`.

@@ -193,14 +193,22 @@ def _coerce_int(value, *, default: int, minimum: int, maximum: int) -> int:
 
 
 def _extract_message_content(msg: dict) -> str:
-    """Extract text content from a message, handling multi-part content."""
+    """Extract text content from a message, handling multi-part content.
+
+    Assistant copy blocks render inline: MCP clients read one text per message.
+    """
     content = msg.get("content", "")
     if isinstance(content, list):
-        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
-    return str(content) if content else ""
+        text = "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    else:
+        text = str(content) if content else ""
+    if text and msg.get("role") == "assistant":
+        from gateway.copy_blocks import render_copy_blocks_inline
+        text = render_copy_blocks_inline(text)
+    return text
 
 
-def _extract_attachments(msg: dict) -> List[dict]:
+def _extract_attachments(msg: dict) -> list[dict]:
     """Non-text attachments: image/file content blocks plus MEDIA: tags in the text."""
     attachments = []
     content = msg.get("content", "")
@@ -218,7 +226,12 @@ def _extract_attachments(msg: dict) -> List[dict]:
             continue
         if url:
             attachments.append({"type": "image", "url": url})
-    for match in re.finditer(r'MEDIA:\s*(\S+)', _extract_message_content(msg)):
+    # Scan text outside copy blocks only: a MEDIA line inside a body is literal paste-ready text.
+    scan = _extract_message_content({"content": content})
+    if msg.get("role") == "assistant":
+        from gateway.copy_blocks import strip_copy_blocks
+        scan = strip_copy_blocks(scan)
+    for match in re.finditer(r'MEDIA:\s*(\S+)', scan):
         attachments.append({"type": "media", "path": match.group(1)})
     return attachments
 
@@ -267,14 +280,14 @@ class EventBridge:
     gateway bridge, polling SQLite instead)."""
 
     def __init__(self):
-        self._queue: List[QueueEvent] = []
+        self._queue: list[QueueEvent] = []
         self._cursor = 0
         self._lock = threading.Lock()
         self._new_event = threading.Event()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
-        self._pending_approvals: Dict[str, dict] = {}  # populated from events
+        self._last_poll_timestamps: dict[str, float] = {}  # session_key -> unix timestamp
+        self._pending_approvals: dict[str, dict] = {}  # populated from events
         self._state_db_mtime: float = 0.0  # skip polling work when state.db is unchanged
         self._cached_sessions_index: dict = {}
 
@@ -301,7 +314,7 @@ class EventBridge:
             self._thread.join(timeout=5)
         logger.debug("EventBridge stopped")
 
-    def _matching(self, after_cursor: int, session_key: Optional[str], limit: int) -> List[dict]:
+    def _matching(self, after_cursor: int, session_key: Optional[str], limit: int) -> list[dict]:
         with self._lock:
             return [e.as_dict() for e in self._queue
                     if e.cursor > after_cursor and (not session_key or e.session_key == session_key)][:limit]
@@ -325,7 +338,7 @@ class EventBridge:
             self._new_event.wait(timeout=min(remaining, POLL_INTERVAL))
         return None
 
-    def list_pending_approvals(self) -> List[dict]:
+    def list_pending_approvals(self) -> list[dict]:
         """List approval requests observed during this bridge session."""
         with self._lock:
             return sorted(self._pending_approvals.values(), key=lambda a: a.get("created_at", ""))
@@ -689,7 +702,7 @@ _TOOL_NAMES = (
 )
 
 
-def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "MCPServer":
+def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> MCPServer:
     """Create and return the Hermes MCP server with all tools registered."""
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(f"MCP server requires the 'mcp' package. Install with: {sys.executable} -m pip install 'mcp'")

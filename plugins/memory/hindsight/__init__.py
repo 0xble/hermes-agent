@@ -15,10 +15,12 @@ import atexit
 import collections
 import concurrent.futures
 import contextlib
+import itertools
 import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -26,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
+from agent.memory_provider import MemoryProvider, PrefetchGeneration, RecallStatus, spawn_context_thread
 from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import cfg_get
 from hermes_constants import get_hermes_home
@@ -48,7 +50,7 @@ from .settings import (
     _normalize_observation_scopes, _normalize_retain_tags, _parse_int_setting,
     _resolve_bank_id_template,
 )
-from .retention import filter_retain_messages
+from .retention import PendingRetainOperation, filter_retain_messages
 
 logger = logging.getLogger(__name__)
 
@@ -59,18 +61,22 @@ _RETAIN_MAX_ATTEMPTS = 5
 _RETAIN_BACKLOG_MAX = 50
 _RETAIN_RETRY_BASE_S = 5.0
 _RETAIN_RETRY_MAX_S = 300.0
+_RETAIN_OP_TRACKING_MAX = 256
+_RETAIN_OP_TRACKING_TTL_S = 3600.0
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
 def _ensure_client_dependency() -> None:
-    """Lazily install the Hindsight client (``tools.lazy_deps``) before importing it."""
+    """Validate the client declared by this plugin before creating any client."""
+    from importlib.metadata import PackageNotFoundError, version
+    from packaging.version import Version
     try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("memory.hindsight", prompt=False)
-    except ImportError:
-        pass
-    except Exception as exc:
-        raise ImportError(str(exc)) from exc
+        installed = version("hindsight-client")
+    except PackageNotFoundError as exc:
+        raise ImportError("Hindsight client is missing. Run `hermes pm install` to prepare plugin dependencies.") from exc
+    if Version(installed) < Version(_MIN_CLIENT_VERSION):
+        raise ImportError(f"Hindsight client {installed} needs >= {_MIN_CLIENT_VERSION}. "
+                          "Run `hermes pm install` to refresh plugin dependencies.")
 
 
 def _scoped_setting(name: str, default: str = "") -> str:
@@ -101,28 +107,6 @@ def _cloud_api_key(config: dict) -> str:
     return config.get("apiKey") or config.get("api_key") or get_secret("HINDSIGHT_API_KEY", "")
 
 
-def _maybe_upgrade_client() -> None:
-    """Auto-upgrade an outdated hindsight-client via the environment-aware lazy_deps
-    installer (sealed hosted venvs redirect to the durable target)."""
-    try:
-        from importlib.metadata import version as pkg_version
-        from packaging.version import Version
-        installed = pkg_version("hindsight-client")
-        if Version(installed) < Version(_MIN_CLIENT_VERSION):
-            logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
-                           installed, _MIN_CLIENT_VERSION)
-            from tools.lazy_deps import install_specs
-            outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
-            if outcome.ok:
-                logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-            elif outcome.blocked:
-                logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
-                               outcome.reason, _MIN_CLIENT_VERSION)
-            else:
-                logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                               (outcome.stderr or "").strip() or "install error", _MIN_CLIENT_VERSION)
-    except Exception:
-        pass  # packaging not available or other issue — proceed anyway
 
 
 # update_mode='append' capability (Hindsight >= 0.5.0), cached per (API URL, key fingerprint)
@@ -332,6 +316,10 @@ def _mint_document_id(session_id: str) -> str:
     return f"{session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
 
+# First-person words that leave a recall query without a subject entity (see _owner_subject_query).
+# "us" is case-sensitive so the country abbreviation "US" does not count as a pronoun.
+_FIRST_PERSON = re.compile(r"\b(?:(?i:i|me|my|mine|we|our|ours)|us|Us)\b")
+
 # initialize() kwargs copied verbatim (str, stripped) onto ``self._<name>``.
 _SESSION_KWARGS = (
     "platform", "user_id", "user_name", "chat_id", "chat_name", "chat_type",
@@ -357,6 +345,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # Each server-side op status poll is a round trip — coarser than the 0.05s queue poll.
     _RETAIN_OP_POLL_INTERVAL_S = 0.5
+    _RETAIN_LATE_POLL_INTERVAL_S = 5.0
 
     def backup_paths(self) -> List[str]:
         """Legacy shared config + embedded-mode profile env files live under ~/.hindsight."""
@@ -406,22 +395,25 @@ class HindsightMemoryProvider(MemoryProvider):
         # Server-side async retain ops still in flight: aretain_batch returns on
         # *acceptance*, not durability, so the prefetch gates on these via
         # get_operation_status (a drained local queue is not a read-after-write signal).
-        self._pending_retain_ops: set[str] = set()
-        # Bank each pending op was retained to: a session-scoped bank_id_template can leave
-        # old-session ops pending after a switch, and their status lives only in their own bank.
-        self._pending_retain_op_banks: dict[str, str] = {}
+        self._pending_retain_ops: dict[str, PendingRetainOperation] = {}
         self._pending_retain_ops_lock = threading.Lock()
+        self._retain_visibility_waiters = 0
+        self._retain_status_next_at = 0.0
         self._apply_retain_policy({})
 
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
         self._prefetch_result, self._prefetch_count = "", 0
         self._prefetch_lock = threading.Lock()
-        self._prefetch_generation = 0
+        # Each queued request is its own generation; a discard obsoletes the worker in flight.
+        self._prefetch_generation = PrefetchGeneration(self._prefetch_lock)
         # Per-bank mission application (once per bank per process). The event is set when the
         # attempt finishes (success or failure); other callers for that bank wait for it.
         self._mission_banks: dict[str, threading.Event] = {}
         self._mission_lock = threading.Lock()
         self._prefetch_thread = None
+        self._prefetch_worker_lock = threading.Lock()
+        self._prefetch_running = False
+        self._prefetch_pending = None
         self._last_recall_returned, self._last_recall_count = False, 0
         self._apply_recall_settings({})
 
@@ -509,6 +501,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "recall_owner_subject", "description": "Bank owner's name. When set, a first-person auto-recall query (I/my/we/our...) is also recalled with the name appended, and the two result lists are merged, so personal facts surface for \"my car\". Empty disables it."},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -619,6 +612,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     return
                 if self._retain_backlog and time.monotonic() >= self._retain_backlog_next_at:
                     self._drain_retain_backlog()
+                self._poll_late_retain_ops()
                 continue
             try:
                 if job is _WRITER_SENTINEL:
@@ -675,8 +669,59 @@ class HindsightMemoryProvider(MemoryProvider):
         raw_ids = [getattr(retain_response, "operation_id", None), *(getattr(retain_response, "operation_ids", None) or [])]
         if ids := [str(op) for op in raw_ids if op]:
             with self._pending_retain_ops_lock:
-                self._pending_retain_ops.update(ids)
-                self._pending_retain_op_banks.update(dict.fromkeys(ids, bank_id))
+                self._expire_retain_ops_locked()
+                for op_id in ids:
+                    self._pending_retain_ops.setdefault(op_id, PendingRetainOperation(
+                        bank_id, time.monotonic() + _RETAIN_OP_TRACKING_TTL_S))
+                dropped = max(0, len(self._pending_retain_ops) - _RETAIN_OP_TRACKING_MAX)
+                for _ in range(dropped):
+                    oldest = min(self._pending_retain_ops, key=lambda key: self._pending_retain_ops[key].expires_at)
+                    self._pending_retain_ops.pop(oldest)
+                if dropped:
+                    logger.warning("Hindsight retain visibility tracking full; expired %d oldest op(s)", dropped)
+
+    def _expire_retain_ops_locked(self) -> None:
+        expired = [op_id for op_id, op in self._pending_retain_ops.items()
+                   if op.expires_at <= time.monotonic()]
+        for op_id in expired:
+            self._pending_retain_ops.pop(op_id)
+        if expired:
+            logger.warning("Hindsight retain visibility expired for %d unresolved op(s)", len(expired))
+
+    def _poll_late_retain_ops(self) -> None:
+        """Bounded idle polling preserves accepted operations after their first wait."""
+        with self._pending_retain_ops_lock:
+            if time.monotonic() < self._retain_status_next_at:
+                return
+            self._retain_status_next_at = time.monotonic() + self._RETAIN_LATE_POLL_INTERVAL_S
+            self._expire_retain_ops_locked()
+            # Tools-only, synchronous recall, disabled prefetch waits, and the
+            # final turn before idle never reach the prefetch barrier.
+            timeout = self._prefetch_retain_drain_timeout
+            unbounded_wait = (timeout <= 0 and self._prefetch_waits_for_retain
+                              and not self._recall_sync and not self._recall_disabled())
+            if not self._retain_visibility_waiters and not unbounded_wait:
+                for op in self._pending_retain_ops.values():
+                    first_wait_deadline = op.expires_at - _RETAIN_OP_TRACKING_TTL_S + max(0.0, timeout)
+                    if time.monotonic() >= first_wait_deadline:
+                        op.wait_for_visibility = False
+            pending = [(op_id, op) for op_id, op in self._pending_retain_ops.items()
+                       if not op.wait_for_visibility]
+        deadline = time.monotonic() + 2.0
+        for op_id, op in pending:
+            left = deadline - time.monotonic()
+            if left <= 0 or self._shutting_down.is_set():
+                return
+            with self._pending_retain_ops_lock:
+                if self._pending_retain_ops.get(op_id) is not op:
+                    continue
+                # A slow status endpoint must not starve later operations.
+                self._pending_retain_ops.pop(op_id)
+                self._pending_retain_ops[op_id] = op
+            if self._is_retain_op_complete(op.bank_id, op_id, timeout=left):
+                with self._pending_retain_ops_lock:
+                    if self._pending_retain_ops.get(op_id) is op:
+                        self._pending_retain_ops.pop(op_id)
 
     def _is_retain_op_complete(self, bank_id: str, op_id: str, timeout: float | None = None) -> bool:
         """True when a server-side retain op is done or gone (completed ops are evicted,
@@ -694,7 +739,10 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
-        return str(getattr(resp, "status", "") or "").lower() in {"completed", "failed"}
+        status = str(getattr(resp, "status", "") or "").lower()
+        if status == "failed":
+            logger.warning("Hindsight retain operation failed: op=%s bank=%s", op_id, bank_id)
+        return status in {"completed", "failed"}
 
     def _wait_for_retains_drained(self, timeout: float) -> bool:
         """Block up to *timeout* s for the last retain to become recall-visible
@@ -721,41 +769,48 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _wait_for_server_retain_ops(self, _expired: Callable[[], bool], timeout: float,
                                     _remaining: Callable[[], float | None] = lambda: None) -> bool:
-        """Poll tracked async retain ops until complete or *_expired()* (deadline
-        predicate). Ops still pending at the deadline are DROPPED: keeping them
-        would let a permanently failing status endpoint burn the full timeout on
-        EVERY later prefetch (a per-turn latency penalty via prefetch()'s bounded
-        join). Trades a possibly-stale recall for liveness; WARNING once per prefetch."""
+        with self._pending_retain_ops_lock:
+            self._retain_visibility_waiters += 1
+        try:
+            return self._poll_server_retain_ops(_expired, timeout, _remaining)
+        finally:
+            with self._pending_retain_ops_lock:
+                self._retain_visibility_waiters -= 1
+
+    def _poll_server_retain_ops(self, _expired: Callable[[], bool], timeout: float,
+                               _remaining: Callable[[], float | None]) -> bool:
+        """Wait once per accepted op, then leave late completion to idle polling."""
         while True:
             with self._pending_retain_ops_lock:
-                pending = [(op_id, self._pending_retain_op_banks.get(op_id) or self._bank_id)
-                           for op_id in self._pending_retain_ops]
+                self._expire_retain_ops_locked()
+                pending = [(op_id, op) for op_id, op in self._pending_retain_ops.items()
+                           if op.wait_for_visibility]
             if not pending:
                 return True
             if self._shutting_down.is_set():
                 return False
             done: set[str] = set()
-            for op_id, bank_id in pending:
+            for op_id, op in pending:
                 if self._shutting_down.is_set():
                     return False
                 if _expired():
                     break
-                if self._is_retain_op_complete(bank_id, op_id, timeout=_remaining()):
+                if self._is_retain_op_complete(op.bank_id, op_id, timeout=_remaining()):
                     done.add(op_id)
             with self._pending_retain_ops_lock:
-                self._pending_retain_ops.difference_update(done)
                 for op_id in done:
-                    self._pending_retain_op_banks.pop(op_id, None)
-                if not self._pending_retain_ops:
+                    self._pending_retain_ops.pop(op_id, None)
+                unresolved = [op_id for op_id, _ in pending if op_id in self._pending_retain_ops]
+                if not any(op.wait_for_visibility for op in self._pending_retain_ops.values()):
                     return True
-                dropped = len(self._pending_retain_ops) if _expired() else 0
-                if dropped:
-                    self._pending_retain_ops.clear()
-                    self._pending_retain_op_banks.clear()
-            if dropped:
+                late = len(unresolved) if _expired() else 0
+                if late:
+                    for op_id in unresolved:
+                        self._pending_retain_ops[op_id].wait_for_visibility = False
+            if late:
                 logger.warning("Prefetch: server retain visibility timed out after %.1fs; "
-                               "dropping %d unresolved op(s) so later prefetches stay "
-                               "bounded (recall may miss the just-completed turn)", timeout, dropped)
+                               "tracking %d unresolved op(s) in background "
+                               "(recall may miss the just-completed turn)", timeout, late)
                 return False
             left = _remaining()
             time.sleep(self._RETAIN_OP_POLL_INTERVAL_S if left is None else min(self._RETAIN_OP_POLL_INTERVAL_S, left))
@@ -797,7 +852,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._platform = str(kwargs.get("platform") or "cli")
         # session_id stays in tags so processes for one session remain filterable together.
         self._document_id = _mint_document_id(self._session_id)
-        _maybe_upgrade_client()
 
         self._config = cfg = _load_config()
         for name in _SESSION_KWARGS:
@@ -910,6 +964,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
+        self._recall_owner_subject = str(cfg.get("recall_owner_subject") or "").strip()
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
         # recall_max_tokens budget); a comma-separated string is accepted for parity
@@ -1070,6 +1125,61 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return resp.text
 
+    def _owner_subject_query(self, query: str) -> str | None:
+        """The owner-anchored twin of a first-person query, or None when it doesn't apply.
+
+        "my car" carries no subject entity, so the owner's facts never enter Hindsight's
+        candidate pool; naming the owner does. The twin supplements the user's words, it
+        never replaces them (see ``_recall_with_owner_subject``).
+        """
+        owner = self._recall_owner_subject
+        if (not owner or not _FIRST_PERSON.search(query)
+                or re.search(rf"(?<!\w){re.escape(owner)}(?!\w)", query, re.IGNORECASE)):
+            return None
+        return f"{query} ({owner})"
+
+    def _recall_with_owner_subject(self, query: str, owner_query: str) -> list:
+        """Recall the user's words and the owner-anchored twin, merged round-robin.
+
+        Interleaving keeps the original ranking's head (generic first-person questions such
+        as "how do I fix this build" stay answered) while the twin adds the owner's personal
+        facts. The merge is capped at roughly one recall's token budget so auto-recall does
+        not double the injected context.
+        """
+        def kwargs(q: str) -> dict:
+            kw: dict = {"bank_id": self._bank_id, "query": q, "budget": self._budget,
+                        "max_tokens": self._recall_max_tokens}
+            if self._recall_tags:
+                kw.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
+            if self._recall_types:
+                kw["types"] = self._recall_types
+            return kw
+
+        async def _both(client):
+            responses = await asyncio.gather(client.arecall(**kwargs(query)), client.arecall(**kwargs(owner_query)),
+                                             return_exceptions=True)
+            # Raise inside the operation so _run_hindsight_operation's reconnect retry still sees
+            # a dead embedded daemon; one failed request alone must not discard the other's results.
+            if all(isinstance(resp, BaseException) for resp in responses):
+                raise responses[0]
+            return responses
+
+        original, owner = ([] if isinstance(resp, BaseException) else resp.results or []
+                           for resp in self._run_hindsight_operation(_both))
+        merged, seen, used = [], set(), 0
+        for pair in itertools.zip_longest(original, owner):
+            for result in pair:
+                key = getattr(result, "id", None) or getattr(result, "text", None)
+                if result is None or not getattr(result, "text", None) or key in seen:
+                    continue
+                cost = len(result.text) // 4 + 1
+                if merged and used + cost > self._recall_max_tokens:
+                    return merged
+                seen.add(key)
+                merged.append(result)
+                used += cost
+        return merged
+
     def _do_recall(self, query: str) -> tuple[str, int]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
         -> (text, memory count); the count is 0 for reflect (synthesis) and on error."""
@@ -1081,7 +1191,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 return self._reflect(query) or "", 0
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
-            results = self._recall(query)
+            owner_query = self._owner_subject_query(query)
+            results = self._recall_with_owner_subject(query, owner_query) if owner_query else self._recall(query)
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
@@ -1128,38 +1239,78 @@ class HindsightMemoryProvider(MemoryProvider):
             return None
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
+    def _reset_prefetch_result(self) -> None:
+        self._prefetch_result, self._prefetch_count = "", 0
+
+    def discard_prefetch(self) -> None:
+        """Drop the buffered result; a worker still in flight belongs to a superseded generation."""
+        with self._prefetch_worker_lock:
+            self._prefetch_pending = None
+            self._prefetch_generation.discard(self._reset_prefetch_result)
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
-        if self._recall_sync or self._recall_disabled():
+        if self._recall_sync or self._recall_disabled() or self._shutting_down.is_set():
             return
 
         # Each queued request is its own generation: a worker that outlived prefetch()'s capped
         # join must not publish over a newer request's result, not only across session switches.
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            generation = self._prefetch_generation
-            # An older worker's result that landed after prefetch()'s capped join belongs to a
-            # superseded query; it must not be injected for this one.
-            self._prefetch_result, self._prefetch_count = "", 0
+        # An older worker's result that landed after prefetch()'s capped join belongs to a
+        # superseded query; it must not be injected for this one.
+        with self._prefetch_worker_lock:
+            if self._shutting_down.is_set():
+                return
+            generation = self._prefetch_generation.begin(self._reset_prefetch_result)
+            self._prefetch_pending = (query, generation)
+            if self._prefetch_running:
+                return
+            self._prefetch_running = True
+            self._prefetch_thread = spawn_context_thread(self._run_prefetch, name="hindsight-prefetch")
+            try:
+                self._prefetch_thread.start()
+            except Exception:
+                self._prefetch_running = False
+                self._prefetch_thread = None
+                raise
 
-        def _run():
-            # Wait (bounded, off the reply path) for the just-completed turn's
-            # retain to be recall-visible so the warmed context includes it.
-            if self._prefetch_waits_for_retain:
-                self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            text, count = self._do_recall(query)
-            # Publish the current generation's result even when empty: an empty recall is an answer.
-            with self._prefetch_lock:
-                if generation == self._prefetch_generation:
-                    self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
-
-        self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
-        self._prefetch_thread.start()
+    def _run_prefetch(self) -> None:
+        """One in-flight recall plus one latest-wins slot, rather than a thread per turn."""
+        try:
+            while True:
+                with self._prefetch_worker_lock:
+                    pending, self._prefetch_pending = self._prefetch_pending, None
+                    if pending is None or self._shutting_down.is_set():
+                        self._prefetch_running = False
+                        return
+                query, generation = pending
+                try:
+                    if self._prefetch_waits_for_retain:
+                        self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
+                    # A newer query queued during the drain wait supersedes this one: skip its
+                    # recall so the latest query is not held behind a result nobody will read.
+                    with self._prefetch_generation.publishing(generation) as current:
+                        if not current:
+                            continue
+                    text, count = self._do_recall(query)
+                    with self._prefetch_generation.publishing(generation) as current:
+                        if current:
+                            self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
+                except Exception:
+                    logger.debug("Hindsight prefetch failed", exc_info=True)
+        except BaseException:
+            # A BaseException escaping the worker must not leave ``_prefetch_running`` stuck True,
+            # or every later queue_prefetch() would wait on a worker that no longer exists.
+            with self._prefetch_worker_lock:
+                if self._prefetch_thread is threading.current_thread():
+                    self._prefetch_running = False
+            raise
 
     # -- retain ------------------------------------------------------------------
 
-    def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        user_content, assistant_content = filter_retain_messages(user_content, assistant_content)
+    def _build_turn_messages(self, user_content: str, assistant_content: str, *,
+                             display_kind: Optional[str] = None, platform: Optional[str] = None) -> List[Dict[str, str]]:
+        user_content, assistant_content = filter_retain_messages(
+            user_content, assistant_content, display_kind=display_kind, platform=platform)
         if not user_content and not assistant_content:
             return []
         now = _event_timestamp()  # one turn -> both messages share the event timestamp
@@ -1275,7 +1426,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         return _job
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
+                  display_kind: Optional[str] = None, platform: Optional[str] = None) -> None:
         """Enqueue a retain for the current turn (non-blocking; writer thread). Dropped
         once shutdown() fired so post-exit retains never reach aiohttp during teardown."""
         if self._cron_skipped:
@@ -1289,7 +1441,8 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        messages = self._build_turn_messages(user_content, assistant_content)
+        messages = self._build_turn_messages(user_content, assistant_content,
+                                             display_kind=display_kind, platform=platform)
         if not messages:
             logger.debug("sync_turn: skipped (no durable messages after retain filtering)")
             return
@@ -1435,9 +1588,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # 2. Drain the old session's in-flight prefetch and drop its result.
         self._join_prefetch(3.0)
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            self._prefetch_result, self._prefetch_count = "", 0
+        self.discard_prefetch()
 
         # 3. Rotate to the new session.
         # An explicit empty parent on a real switch clears the old lineage (an unrelated resumed
@@ -1493,6 +1644,7 @@ class HindsightMemoryProvider(MemoryProvider):
             ))
         # Stop accepting retain jobs so late sync_turn() calls are dropped.
         self._shutting_down.set()
+        self.discard_prefetch()
         # The writer finishes in-flight work then exits on the sentinel; the
         # bounded join keeps shutdown predictable even if the daemon is wedged.
         if (writer := self._writer_thread) is not None and writer.is_alive():

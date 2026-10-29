@@ -66,13 +66,15 @@ def test_poller_resumes_a_lifted_goal_wait_once(server, session):
         dispatched.append(text)
         return True
 
-    with patch.object(server, "_run_prompt_submit", submit), patch.object(server, "_emit"):
+    with patch.object(server, "_run_prompt_submit", submit), patch.object(server, "_emit") as emit:
         server._maybe_resume_tui_parked_goal(sid, s)
         server._maybe_resume_tui_parked_goal(sid, s)  # barrier cleared: no second continuation
 
     from hermes_cli.goals import load_goal
 
     assert len(dispatched) == 1 and "finish the migration" in dispatched[0]
+    # Resuming is silent: no goal status line accompanies the continuation.
+    assert not [c for c in emit.call_args_list if c.args[:1] == ("status.update",)]
     assert load_goal(key).waiting_until == 0.0
 
 

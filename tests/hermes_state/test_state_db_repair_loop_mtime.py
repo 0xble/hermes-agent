@@ -28,9 +28,14 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import hermes_state
 import hermes_state_repair
 from hermes_state_repair import _MAX_MALFORMED_BACKUPS, _MAX_PERSISTENT_REPAIR_ATTEMPTS, _REPAIR_BACKUP_MIN_FREE_BYTES, _backup_content_identity, _backup_db_file, _db_fingerprint, _existing_malformed_backups, _persistent_repair_attempts_exhausted, _record_repair_outcome, _repair_backup_headroom_bytes
+
+
+pytestmark = pytest.mark.usefixtures("adequate_repair_capacity")
 
 
 def _damaged_db(tmp_path: Path, size: int = 200_000) -> Path:
@@ -347,6 +352,7 @@ def test_live_connection_keeps_its_write_lock_across_a_repair_pass(tmp_path):
             capture_output=True,
             text=True,
             timeout=60,
+            check=False,
         ).stdout.strip()
         assert out in {"WROTE", "BLOCKED"}, f"unexpected peer output: {out!r}"
         return out == "WROTE"

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Vault-value redaction registry (profile-scoped, bounded)
 # ---------------------------------------------------------------------------
-# Exact secret values that transited a server-side vault fill (browser_vault_fill). Generic
+# Exact secret values that transited a server-side vault fill (browser_vault). Generic
 # credential-shaped regexes cannot catch an arbitrary user password, so the fill path registers
 # the exact bytes and every browser_* tool result (including browser_cdp Runtime.evaluate
 # passthrough) is scrubbed against them before it can reach the model. Memory only: never
@@ -171,6 +171,11 @@ def redact_registered_vault_values(text: str, *,
         values = sorted(bucket, key=len, reverse=True) if bucket else ()
     parts = _date_parts(tab, origin)
     for value in values:
+        if value.isascii() and value.isdigit() and 13 <= len(value) <= 19:
+            # Checkout masks commonly insert spaces, NBSPs or dashes into a
+            # registered PAN. Match only this known number, not arbitrary PANs.
+            pattern = r"(?<!\d)" + r"[\s-]*".join(value) + r"(?!\d)"
+            text = re.sub(pattern, "«redacted-vault-secret»", text)
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
     for _, value in parts:
@@ -191,6 +196,7 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "access_token", "refresh_token", "id_token", "token", "api_key", "apikey",
     "client_secret", "password", "auth", "jwt", "session", "secret", "key",
     "code", "signature", "x-amz-signature",
+    "x-goog-signature", "sig",  # GCS V4 signed URLs, Azure SAS tokens
 })
 
 # Snapshot at import time so runtime env mutations (e.g. an LLM-generated
@@ -332,7 +338,7 @@ _ENV_ASSIGN_RE = re.compile(rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0
 # it re.sub retries the greedy prefix at every byte of a long opaque payload.
 # See #77484.
 _ENV_ASSIGN_LOWER_RE = re.compile(
-    rf"(?<![a-z0-9_])([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
+    r"(?<![a-z0-9_])([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
     re.IGNORECASE,
 )
 
@@ -470,7 +476,7 @@ def _is_word_end(s: str, j: int, *, allow_plural: bool = True) -> bool:
     return allow_plural and cur in "sS" and _is_word_end(s, j + 1, allow_plural=False)
 
 
-def _has_word_bounded_keyword(key: str, keyword_re: "re.Pattern[str]") -> bool:
+def _has_word_bounded_keyword(key: str, keyword_re: re.Pattern[str]) -> bool:
     """True if ``keyword_re`` matches ``key`` at a word boundary (see _KEY_KEYWORD_RE)."""
     return any(_is_word_start(key, m.start()) and _is_word_end(key, m.end()) for m in keyword_re.finditer(key))
 
@@ -529,6 +535,10 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORECASE)
+# The same field inside a JSON-encoded string (``{"output": "{\\"api_key\\": \\"…\\"}"}``): every tool result
+# that wraps a config dump in JSON escapes the quotes, so the rule above never saw the value (#115104).
+# The backreference keeps the key's and value's escape depth equal.
+_JSON_FIELD_ESCAPED_RE = re.compile(rf'((\\+)"{_JSON_KEY_NAMES}\2")\s*:\s*\2"([^"\\]+)\2"', re.IGNORECASE)
 
 # Python ``repr`` uses single-quoted mapping fields, so opaque credentials in
 # tracebacks and pytest failure introspection bypass the double-quoted JSON rule
@@ -604,7 +614,8 @@ _AUTH_HEADER_RE = re.compile(r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s
 
 # API-key style headers (single opaque value, no scheme word): non-vendor-prefix
 # values would otherwise leak when a curl command is echoed into tool output.
-_SECRET_HEADER_NAMES = r"(?:x-api-key|x-goog-api-key|api-key|apikey|x-api-token|x-auth-token|x-access-token)"
+SECRET_HEADER_NAME_LIST = ("x-api-key", "x-goog-api-key", "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token")
+_SECRET_HEADER_NAMES = rf"(?:{'|'.join(SECRET_HEADER_NAME_LIST)})"
 _SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
 
 # Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars. The lookbehind
@@ -667,7 +678,7 @@ _STRICT_URL_PARAM_RE = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]
 # authority stops at path/query/fragment delimiters. Anchored on the mandatory
 # ``//`` — an optional-scheme prefix backtracked O(n²) on long alphanumeric runs
 # (~55s per sub() on a 320KB compaction payload).
-_STRICT_URL_USERINFO_RE = re.compile(r"(//)([^/\s?#@]+)@")
+_STRICT_URL_USERINFO_RE = re.compile(r"//[^/\s?#@]+@")
 
 # Form-urlencoded body: only when the ENTIRE text is a k=v&k=v string.
 _FORM_BODY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$")
@@ -682,7 +693,7 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f\u200b-\u200f\u2028-\u202f\u2060\
 _TOKEN_BODY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.")
 
 
-def _compile_prefix_matcher(patterns: list) -> "re.Pattern[str]":
+def _compile_prefix_matcher(patterns: list) -> re.Pattern[str]:
     return re.compile(r"(?<![A-Za-z0-9_-])(" + "|".join(patterns) + r")(?![A-Za-z0-9_-])")
 
 
@@ -773,6 +784,12 @@ def _is_python_repr_secret_key(key: str) -> bool:
     return folded.endswith(_PYTHON_REPR_CREDENTIAL_SUFFIXES)
 
 
+def is_secret_field_name(key: object) -> bool:
+    """True when a mapping field named ``key`` holds a credential — the repr-field policy, for callers
+    that mask structured config by field instead of by text."""
+    return isinstance(key, str) and _is_python_repr_secret_key(key)
+
+
 def _redact_python_repr_fields(text: str) -> str:
     """Fully mask credential fields in Python mapping ``repr`` output."""
     def _sub(match: re.Match) -> str:
@@ -848,7 +865,10 @@ def _canonical_url_param_name(name: str) -> str:
         if next_value == decoded:
             break
         decoded = next_value
-    return decoded.casefold().replace("-", "_")
+    folded = decoded.casefold()
+    # Preserve policy names that are canonically hyphenated (for example
+    # x-amz-signature) before accepting underscore-normalized aliases.
+    return folded if folded in _SENSITIVE_QUERY_PARAMS else folded.replace("-", "_")
 
 
 def _redact_strict_url_credentials(text: str) -> str:
@@ -857,9 +877,7 @@ def _redact_strict_url_credentials(text: str) -> str:
     text = _STRICT_URL_PARAM_RE.sub(
         lambda m: f"{m.group(1)}{m.group(2)}=***"
         if _canonical_url_param_name(m.group(2)) in _SENSITIVE_QUERY_PARAMS else m.group(0), text)
-    return _STRICT_URL_USERINFO_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2).partition(':')[0]}:***@" if ":" in m.group(2) else f"{m.group(1)}***@",
-        text)
+    return _STRICT_URL_USERINFO_RE.sub("//***:***@", text)
 
 
 def redact_cdp_url(value: object) -> str:
@@ -944,6 +962,9 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     if ":" in text and '"' in text:
         text = _JSON_FIELD_RE.sub(
             _assignment_sub(lambda g: f'{g[0]}: "{mask(g[1])}"', check_keyword=False), text)
+        if '\\"' in text:
+            text = _JSON_FIELD_ESCAPED_RE.sub(
+                _assignment_sub(lambda g: f'{g[0]}: {g[1]}"{mask(g[2])}{g[1]}"', check_keyword=False), text)
 
     # Python mapping repr fields ({'API_KEY': '…'}): single-quoted, so the JSON rule
     # above never sees them — the traceback / pytest-introspection leak shape.
@@ -976,6 +997,46 @@ def _redact_phone(m):
     return phone[:keep] + "****" + phone[-keep:]
 
 
+_JSON_KEY_FULL_RE = re.compile(_JSON_KEY_NAMES, re.IGNORECASE)
+
+
+def redact_sensitive_json(value, **kwargs):
+    """Redact parsed JSON leaves and secret-named fields without touching JSON syntax.
+
+    Every string leaf goes through :func:`redact_sensitive_text` first, so the registered vault
+    boundary (and the redact_secrets preference, flags and vault tab/origin) apply exactly as
+    they do to serialized text; the secret-named field mask is applied only to that output.
+    """
+    if isinstance(value, str):
+        return redact_sensitive_text(value, **kwargs)
+    if isinstance(value, dict):
+        # Mirror redact_sensitive_text: effective (routed-profile) policy, and secret_file wins.
+        key_rule = ((kwargs.get("force") or _redact_enabled())
+                    and (kwargs.get("secret_file")
+                         or not (kwargs.get("code_file") or kwargs.get("file_read"))))
+        mask = _mask_token_nonreusable if kwargs.get("file_read") else _mask_token
+        out = {}
+        for key, leaf in value.items():
+            # Numeric keys serialize as text too, so they get the same registered-value scrub as leaves.
+            new_key = (redact_sensitive_text(key, **kwargs) if isinstance(key, str)
+                       else redact_sensitive_json(key, **kwargs))
+            new_leaf = redact_sensitive_json(leaf, **kwargs)
+            if (key_rule and isinstance(key, str) and isinstance(new_leaf, str) and new_leaf
+                    and _JSON_KEY_FULL_RE.fullmatch(key) and not _ENV_LOOKUP_VALUE_RE.match(new_leaf)):
+                new_leaf = mask(new_leaf)
+            out[new_key] = new_leaf
+        return out
+    if isinstance(value, (list, tuple)):
+        return [redact_sensitive_json(leaf, **kwargs) for leaf in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Serialized dumps scrubbed registered numeric values too; keep that boundary structurally.
+        text = str(value)
+        scrubbed = redact_registered_vault_values(
+            text, tab=kwargs.get("vault_tab", "default"), origin=kwargs.get("vault_origin", ""))
+        return value if scrubbed == text else scrubbed
+    return value
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
                           redact_url_credentials: bool = False,
@@ -987,7 +1048,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     raw secrets regardless.
 
     ``redact_url_credentials=True``: also redact credential-named query params
-    and ``user:pass@`` userinfo — off by default because OAuth-callback /
+    and the entire URL userinfo (``***:***@``) — off by default because OAuth-callback /
     magic-link / pre-signed URLs must survive ordinary tool flows unchanged.
     ``code_file=True``: skip the ENV/JSON assignment passes for known source
     code (``MAX_TOKENS=***``, ``"apiKey": "test"`` fixtures). ``file_read=True``

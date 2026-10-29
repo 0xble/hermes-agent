@@ -8,7 +8,7 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
-from hermes_state_common import _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _sql_session_last_active
+from hermes_state_common import _sql_preview_raw, _sql_session_last_active
 from hermes_state_errors import StateDbReplacedError
 
 # caplog tests pin the "hermes_state" logger name.
@@ -97,6 +97,17 @@ _TOPIC_TABLES = (
                 """,
     ),
     (
+        "telegram_dm_topic_owners",
+        "profile_name, chat_id, owner_key, thread_id, topic_name, status, canonical_owner_key, created_at, updated_at",
+        """
+                    profile_name TEXT NOT NULL DEFAULT 'default', chat_id TEXT NOT NULL,
+                    owner_key TEXT NOT NULL, thread_id TEXT, topic_name TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('creating','active','unresolved','retired','conflict')),
+                    canonical_owner_key TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                    PRIMARY KEY (profile_name, chat_id, owner_key)
+                """,
+    ),
+    (
         "telegram_topic_icon_state",
         "profile_name, chat_id, thread_id, custom_emoji_id, emoji, owner, updated_at",
         """
@@ -122,14 +133,7 @@ _UNLINKED_SELECT_HEAD = f"""
                     SELECT s.*,
                         COALESCE(sp.prompt, s.system_prompt)
                             AS _system_prompt_resolved,
-                        COALESCE(
-                            (SELECT {_PREVIEW_RAW_SELECT}
-                             FROM messages m
-                             WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                               AND {_PREVIEW_ELIGIBLE_SQL}
-                             ORDER BY m.timestamp, m.id LIMIT 1),
-                            ''
-                        ) AS _preview_raw,
+                        {_sql_preview_raw()},
                         {_sql_session_last_active("s")} AS last_active
                     FROM sessions s
                     LEFT JOIN system_prompts sp
@@ -183,6 +187,7 @@ class SessionTelegramTopicsMixin:
         pre-v3 table an upgrade left behind (#103363). Schema versions: v1 initial; v2 session_id FK
         ON DELETE CASCADE (pruning clears bindings); v3 ``profile_name`` on both tables so
         multiplexed gateways sharing one state.db isolate topic state per profile.
+        v4 adds a stable owner registry for recurring automation topic delivery.
 
         See #76423.
         """
@@ -216,9 +221,13 @@ class SessionTelegramTopicsMixin:
                 "ON telegram_dm_topic_bindings(profile_name, user_id, chat_id)"
             )
             conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_owners_thread "
+                "ON telegram_dm_topic_owners(profile_name, chat_id, thread_id)"
+            )
+            conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                ("telegram_dm_topic_schema_version", "3"),
+                ("telegram_dm_topic_schema_version", "4"),
             )
         self._execute_write(_do)
 
@@ -289,7 +298,7 @@ class SessionTelegramTopicsMixin:
 
     def get_telegram_topic_binding(
         self, *, chat_id: str, thread_id: str, profile_name: str = "default"
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Return the session binding for a Telegram DM topic, if present."""
         profile_name = _normalize_telegram_topic_profile_name(profile_name)
         row = self._topic_read_one("""
@@ -300,7 +309,7 @@ class SessionTelegramTopicsMixin:
 
     def list_telegram_topic_bindings_for_chat(
         self, *, chat_id: str, profile_name: str = "default"
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """All bindings for one chat, newest first ([] when the table is absent)."""
         profile_name = _normalize_telegram_topic_profile_name(profile_name)
         rows = self._topic_read_all(
@@ -309,7 +318,190 @@ class SessionTelegramTopicsMixin:
         )
         return [dict(row) for row in rows]
 
-    def get_telegram_topic_binding_by_session(self, *, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_telegram_topic_owner(
+        self, *, chat_id: str, owner_key: str, profile_name: str = "default",
+    ) -> Optional[dict[str, Any]]:
+        """Read one stable automation owner mapping."""
+        self.apply_telegram_topic_migration()
+        row = self._topic_read_one(
+            """SELECT * FROM telegram_dm_topic_owners
+               WHERE profile_name = ? AND chat_id = ? AND owner_key = ?""",
+            (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(owner_key)),
+        )
+        return dict(row) if row else None
+
+    def get_telegram_topic_owner_for_thread(
+        self, *, chat_id: str, thread_id: str, profile_name: str = "default",
+    ) -> Optional[dict[str, Any]]:
+        """Return the active automation owner for one numeric DM topic, if any."""
+        self.apply_telegram_topic_migration()
+        row = self._topic_read_one(
+            """SELECT * FROM telegram_dm_topic_owners
+               WHERE profile_name = ? AND chat_id = ? AND thread_id = ? AND status = 'active'""",
+            (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(thread_id)),
+        )
+        return dict(row) if row else None
+
+    def resolve_telegram_topic_owner(
+        self, *, chat_id: str, owner_key: str, profile_name: str = "default",
+    ) -> Optional[dict[str, Any]]:
+        """Follow explicit shared-owner redirects, including successive topic merges."""
+        seen = set()
+        while owner_key:
+            if owner_key in seen:
+                raise RuntimeError("Telegram topic owner redirect cycle")
+            seen.add(owner_key)
+            owner = self.get_telegram_topic_owner(
+                chat_id=chat_id, owner_key=owner_key, profile_name=profile_name)
+            if not owner or owner.get("status") != "active":
+                return None
+            if owner.get("thread_id"):
+                return owner
+            owner_key = str(owner.get("canonical_owner_key") or "")
+        return None
+
+    def reserve_telegram_topic_owner(
+        self, *, chat_id: str, owner_key: str, topic_name: str, profile_name: str = "default",
+    ) -> dict[str, Any]:
+        """Reserve an automation owner before remote topic creation.
+
+        The returned ``_reserved`` flag is process-local and tells the caller whether
+        it won the reservation. A competing caller must not create a topic.
+        """
+        self.apply_telegram_topic_migration()
+        now = time.time()
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
+        chat_id, owner_key, topic_name = map(str, (chat_id, owner_key, topic_name))
+
+        def _do(conn):
+            cur = conn.execute(
+                """INSERT INTO telegram_dm_topic_owners
+                   (profile_name, chat_id, owner_key, thread_id, topic_name, status, created_at, updated_at)
+                   VALUES (?, ?, ?, NULL, ?, 'creating', ?, ?)
+                   ON CONFLICT(profile_name, chat_id, owner_key) DO NOTHING""",
+                (profile_name, chat_id, owner_key, topic_name, now, now),
+            )
+            row = conn.execute(
+                """SELECT * FROM telegram_dm_topic_owners
+                   WHERE profile_name = ? AND chat_id = ? AND owner_key = ?""",
+                (profile_name, chat_id, owner_key),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Telegram topic owner reservation disappeared")
+            result = dict(row)
+            result["_reserved"] = bool(cur.rowcount)
+            return result
+
+        return self._execute_write(_do)
+
+    def set_telegram_topic_owner_active(
+        self, *, chat_id: str, owner_key: str, thread_id: str, topic_name: str,
+        profile_name: str = "default",
+    ) -> dict[str, Any]:
+        """Publish the exact remote thread after a successful create/readback."""
+        self.apply_telegram_topic_migration()
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
+        try:
+            self._write_sql(
+                """UPDATE telegram_dm_topic_owners
+                      SET thread_id = ?, topic_name = ?, status = 'active', updated_at = ?
+                    WHERE profile_name = ? AND chat_id = ? AND owner_key = ? AND status = 'creating'""",
+                (str(thread_id), str(topic_name), time.time(), profile_name, str(chat_id), str(owner_key)),
+            )
+        except sqlite3.IntegrityError as exc:
+            existing = self.get_telegram_topic_owner_for_thread(
+                chat_id=str(chat_id), thread_id=str(thread_id), profile_name=profile_name)
+            canonical = str(existing.get("owner_key")) if existing else None
+            self.set_telegram_topic_owner_state(
+                chat_id=str(chat_id), owner_key=str(owner_key), status="conflict",
+                canonical_owner_key=canonical, profile_name=profile_name)
+            detail = f" by {canonical}" if canonical else ""
+            raise RuntimeError(
+                f"Telegram topic thread {thread_id} is already owned{detail}; refusing duplicate owner"
+            ) from exc
+        return self.get_telegram_topic_owner(chat_id=str(chat_id), owner_key=str(owner_key), profile_name=profile_name) or {}
+
+    def set_telegram_topic_owner_shared(
+        self, *, chat_id: str, owner_key: str, canonical_owner_key: str, topic_name: str,
+        profile_name: str = "default",
+    ) -> dict[str, Any]:
+        """Record a second automation owner sharing an existing canonical owner."""
+        self.apply_telegram_topic_migration()
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
+        self._write_sql(
+            """UPDATE telegram_dm_topic_owners
+                  SET thread_id = NULL, topic_name = ?, status = 'active',
+                      canonical_owner_key = ?, updated_at = ?
+                WHERE profile_name = ? AND chat_id = ? AND owner_key = ?
+                  AND status IN ('creating', 'conflict', 'retired')""",
+            (str(topic_name), str(canonical_owner_key), time.time(), profile_name,
+             str(chat_id), str(owner_key)),
+        )
+        return self.get_telegram_topic_owner(
+            chat_id=str(chat_id), owner_key=str(owner_key), profile_name=profile_name) or {}
+
+    def set_telegram_topic_owner_state(
+        self, *, chat_id: str, owner_key: str, status: str,
+        canonical_owner_key: Optional[str] = None, profile_name: str = "default",
+    ) -> dict[str, Any]:
+        """Record conflict, unresolved, or retired routing state."""
+        if status not in {"unresolved", "retired", "conflict", "active"}:
+            raise ValueError("invalid Telegram topic owner state")
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
+        self._write_sql(
+            """UPDATE telegram_dm_topic_owners SET status = ?, canonical_owner_key = ?, updated_at = ?
+                WHERE profile_name = ? AND chat_id = ? AND owner_key = ?""",
+            (status, canonical_owner_key, time.time(), profile_name, str(chat_id), str(owner_key)),
+        )
+        return self.get_telegram_topic_owner(chat_id=str(chat_id), owner_key=str(owner_key), profile_name=profile_name) or {}
+
+    def list_live_telegram_topic_title_candidates(
+        self, *, chat_id: str, topic_name: str, profile_name: str = "default",
+    ) -> list[dict[str, Any]]:
+        """Find exact-title, bound sessions that are live, visible, and unarchived."""
+        rows = self._topic_read_all(
+            """SELECT b.*, s.title, s.ended_at, s.archived, s.hidden
+                 FROM telegram_dm_topic_bindings b
+                 JOIN sessions s ON s.id = b.session_id
+                WHERE b.profile_name = ? AND b.chat_id = ? AND s.title = ?
+                  AND COALESCE(NULLIF(TRIM(s.profile_name), ''), 'default') = b.profile_name
+                  AND s.ended_at IS NULL AND COALESCE(s.archived, 0) = 0
+                  AND COALESCE(s.hidden, 0) = 0
+                ORDER BY b.updated_at DESC""",
+            (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(topic_name)),
+        )
+        return [dict(row) for row in rows]
+
+    def list_telegram_topic_title_bindings(
+        self, *, chat_id: str, topic_name: str, profile_name: str = "default",
+    ) -> list[dict[str, Any]]:
+        """Find every exact-title binding, including stale, hidden, and archived rows."""
+        rows = self._topic_read_all(
+            """SELECT b.*, s.title, s.ended_at, s.archived, s.hidden,
+                         COALESCE(NULLIF(TRIM(s.profile_name), ''), 'default') AS session_profile_name
+                 FROM telegram_dm_topic_bindings b
+                 JOIN sessions s ON s.id = b.session_id
+                WHERE b.profile_name = ? AND b.chat_id = ? AND s.title = ?
+                ORDER BY b.updated_at DESC""",
+            (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(topic_name)),
+        )
+        return [dict(row) for row in rows]
+
+    def set_telegram_topic_binding_managed_mode(
+        self, *, chat_id: str, thread_id: str, managed_mode: str,
+        profile_name: str = "default",
+    ) -> int:
+        """Mark a bound topic's provenance without replacing its session binding."""
+        if managed_mode not in {"auto", "automation", "manual"}:
+            raise ValueError("invalid Telegram topic managed mode")
+        self.apply_telegram_topic_migration()
+        return self._write_sql(
+            """UPDATE telegram_dm_topic_bindings SET managed_mode = ?, updated_at = ?
+                WHERE profile_name = ? AND chat_id = ? AND thread_id = ?""",
+            (managed_mode, time.time(), _normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(thread_id)),
+        )
+
+    def get_telegram_topic_binding_by_session(self, *, session_id: str) -> Optional[dict[str, Any]]:
         """Reverse lookup via the UNIQUE INDEX on session_id; None when unbound."""
         row = self._topic_read_one("""
                     SELECT * FROM telegram_dm_topic_bindings
@@ -416,7 +608,7 @@ class SessionTelegramTopicsMixin:
 
     def list_unlinked_telegram_sessions_for_user(
         self, *, chat_id: str, user_id: str, profile_name: str = "default", limit: int = 10
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """This user's Telegram sessions not bound to a topic. Read-only: if the bindings table
         is absent, every session is unlinked and the profile-unscoped query is used.
         Scoped by ``profile_name`` so multiplexed profiles do not surface each other.

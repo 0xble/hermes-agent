@@ -183,14 +183,17 @@ def test_stop_interrupts_owned_child(monkeypatch):
     _register("sid-ctl-stop-1", child)
     interrupted = []
     monkeypatch.setattr(
-        dt, "request_hard_interrupt", lambda agent, reason: interrupted.append(agent) or True
+        dt, "request_hard_interrupt",
+        lambda agent, reason, *, delegation_reason=None:
+            interrupted.append((agent, reason, delegation_reason)) or True,
     )
     try:
         out = json.loads(
             _handle_control_action("stop", "sid-ctl-stop-1", None, parent)
         )
         assert out["status"] == "interrupt_requested"
-        assert interrupted == [child]
+        assert interrupted == [(child, "Interrupted via TUI (sid-ctl-stop-1)", "stop_command")]
+        assert child._delegation_interrupt_reason == "stop_command"
     finally:
         _unregister_subagent("sid-ctl-stop-1")
 
@@ -203,7 +206,9 @@ def test_stop_foreign_child_is_refused(monkeypatch):
     _register("sid-ctl-stop-2", foreign)
     interrupted = []
     monkeypatch.setattr(
-        dt, "request_hard_interrupt", lambda agent, reason: interrupted.append(agent) or True
+        dt, "request_hard_interrupt",
+        lambda agent, reason, *, delegation_reason=None:
+            interrupted.append((agent, reason, delegation_reason)) or True,
     )
     try:
         out = _handle_control_action("stop", "sid-ctl-stop-2", None, parent)

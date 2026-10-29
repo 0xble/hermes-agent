@@ -240,7 +240,7 @@ class TestCommandBypassActiveSession:
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = {
             "quick_commands": {
-                "s": {"type": "alias", "target": "/steer"},
+                "customsteer": {"type": "alias", "target": "/steer"},
             },
         }
         runner._quick_commands_by_profile = {"secondary": {}}
@@ -248,13 +248,13 @@ class TestCommandBypassActiveSession:
         runner.config = SimpleNamespace(**runner.config, multiplex_profiles=True)
         runner._profile_adapters = {"secondary": {Platform.TELEGRAM: adapter}}
         adapter.gateway_runner = runner
-        event = _make_event("/s stay isolated")
+        event = _make_event("/customsteer stay isolated")
         sk = build_session_key(event.source, profile=adapter._owner_profile)
         adapter._active_sessions[sk] = asyncio.Event()
 
         await adapter.handle_message(event)
 
-        assert adapter._pending_messages[sk].text == "/s stay isolated"
+        assert adapter._pending_messages[sk].text == "/customsteer stay isolated"
         assert adapter.sent_responses == []
 
     @pytest.mark.asyncio

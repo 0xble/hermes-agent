@@ -22,4 +22,8 @@ def interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
     flag can be set a hair before ``sys.is_finalizing()`` flips."""
     if sys.is_finalizing():
         return True
+    # CPython closes executor workers before sys.is_finalizing() turns true.
+    # Inspect only an already-loaded module, never import during teardown.
+    if getattr(sys.modules.get("concurrent.futures.thread"), "_shutdown", False):
+        return True
     return exc is not None and "cannot schedule new futures" in str(exc).lower()

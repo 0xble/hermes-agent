@@ -21,7 +21,6 @@ from gateway.agent_cache_pressure import (
     transcript_persistence_caught_up,
 )
 
-
 class TestBoundsResolution:
     """Absent config must stay absent so gateway/run.py keeps its defaults."""
 
@@ -66,7 +65,6 @@ class TestBoundsResolution:
         )
         assert bounds.protect_recent == 0
 
-
 class TestMemoryBudgetResolution:
     @pytest.mark.parametrize("setting", [0, False, None, "off", "none", ""])
     def test_falsy_settings_disable_the_pass(self, setting):
@@ -97,8 +95,7 @@ class TestMemoryBudgetResolution:
 
         assert resolve_memory_high_mb("auto") is None
 
-
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 class TestPressureSignalScope:
     """The budget is the unit's cgroup limit, so the signal must be the unit's anon charge:
     an execute_code kernel in the same cgroup counts even while the gateway itself is small (#110549)."""
@@ -134,7 +131,6 @@ class TestPressureSignalScope:
 
         assert acp.read_anon_rss_mb() == 1_600
 
-
 class TestPersistenceGuard:
     """Soft eviction drops the transcript, so it may only run once the
     transcript is durable. Exercised against the real AIAgent flush."""
@@ -160,7 +156,6 @@ class TestPersistenceGuard:
         agent._session_db_created = True
         return agent
 
-
     def test_unflushed_turn_blocks_eviction_then_flush_unblocks_it(self, tmp_path):
         agent = self._agent(tmp_path, "lagging")
         try:
@@ -183,7 +178,6 @@ class TestPersistenceGuard:
     def test_unknown_shapes_are_treated_as_unsafe(self):
         assert transcript_persistence_caught_up(object()) is False
         assert transcript_persistence_caught_up(None) is False
-
 
 class TestEvictionPlanner:
     def _entries(self, n):
@@ -238,7 +232,6 @@ class TestEvictionPlanner:
         )
         assert [key for key, _ in plan] == ["s1", "s2"]
 
-
 class TestGatewayPressureSweep:
     """End-to-end against the real GatewayRunner method."""
 
@@ -278,7 +271,7 @@ class TestGatewayPressureSweep:
         runner = self._runner()
         self._at_rss(monkeypatch, 4000)
         released: list = []
-        runner._commit_then_release_soft = lambda agent, key: (
+        runner._commit_then_release_soft = lambda agent, key, retired=None: (
             released.append(key),
             setattr(agent, "_session_messages", []),
         )
@@ -298,7 +291,7 @@ class TestGatewayPressureSweep:
     def test_mid_turn_session_is_never_evicted(self, monkeypatch):
         runner = self._runner()
         self._at_rss(monkeypatch, 4000)
-        runner._commit_then_release_soft = lambda agent, key: None
+        runner._commit_then_release_soft = lambda agent, key, retired=None: None
 
         active = self._cached_agent()
         runner._agent_cache["s-active"] = (active, "sig")
@@ -317,7 +310,7 @@ class TestGatewayPressureSweep:
     def test_lagging_persistence_blocks_eviction(self, monkeypatch):
         runner = self._runner()
         self._at_rss(monkeypatch, 4000)
-        runner._commit_then_release_soft = lambda agent, key: None
+        runner._commit_then_release_soft = lambda agent, key, retired=None: None
 
         runner._agent_cache["s-lagging"] = (
             self._cached_agent(persisted=False), "sig",
@@ -343,7 +336,7 @@ class TestGatewayPressureSweep:
     def test_all_candidates_skipped_reports_zero_without_raising(self, monkeypatch):
         runner = self._runner()
         self._at_rss(monkeypatch, 4000)
-        runner._commit_then_release_soft = lambda agent, key: None
+        runner._commit_then_release_soft = lambda agent, key, retired=None: None
         for i in range(3):
             runner._agent_cache[f"s{i}"] = (
                 self._cached_agent(persisted=False), "sig",
@@ -359,7 +352,6 @@ class TestGatewayPressureSweep:
 
         assert runner._sweep_agent_cache_under_pressure() == 0
         assert "s0" in runner._agent_cache
-
 
 class TestConfiguredBoundsReachTheCache:
     """The two existing bounds must be operator-tunable, and must keep their
@@ -385,8 +377,8 @@ class TestConfiguredBoundsReachTheCache:
         runner._agent_cache = OrderedDict()
         runner._agent_cache_lock = threading.Lock()
         runner._running_agents = {}
-        runner._release_evicted_agent_soft = lambda agent: None
-        runner._commit_then_release_soft = lambda agent, key: None
+        runner._release_evicted_agent_soft = lambda agent, retired=None, commit_key=None: None
+        runner._commit_then_release_soft = lambda agent, key, retired=None: None
 
         with runner._agent_cache_lock:
             for i in range(5):
@@ -403,7 +395,7 @@ class TestConfiguredBoundsReachTheCache:
         runner._agent_cache = OrderedDict()
         runner._agent_cache_lock = threading.Lock()
         runner._running_agents = {}
-        runner._release_evicted_agent_soft = lambda agent: None
+        runner._release_evicted_agent_soft = lambda agent, retired=None, commit_key=None: None
         runner.session_store = None
 
         stale = MagicMock()
@@ -412,7 +404,6 @@ class TestConfiguredBoundsReachTheCache:
 
         assert runner._sweep_idle_cached_agents() == 1
         assert "s-stale" not in runner._agent_cache
-
 
 def _wait_for(predicate, timeout: float = 3.0) -> None:
     """Wait for a background release thread to finish its work."""
@@ -424,7 +415,6 @@ def _wait_for(predicate, timeout: float = 3.0) -> None:
             return
         _t.sleep(0.02)
     assert predicate(), "background release did not complete in time"
-
 
 class TestSalvageFollowups:
     """Follow-up behaviors added while salvaging PR #80795."""
@@ -458,6 +448,3 @@ class TestSalvageFollowups:
             {"agent": {"agent_cache": {"protect_recent": False}}}
         )
         assert bounds.protect_recent > 0
-
-
-

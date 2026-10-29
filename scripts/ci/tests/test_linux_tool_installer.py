@@ -54,7 +54,7 @@ class LinuxToolInstallerTests(unittest.TestCase):
             self.assertEqual(executable.stat().st_mode & 0o7777, 0o755)
             self.assertEqual((destination / 'tool/run-link').read_bytes(), executable.read_bytes())
             self.assertTrue((destination / 'tool/run-hardlink').samefile(executable))
-            self.assertEqual(executable.read_text(encoding='utf-8'), '#!/bin/sh\necho installed\n')
+            self.assertEqual(executable.read_text(encoding='utf-8-sig'), '#!/bin/sh\necho installed\n')
 
     def test_rejects_unsafe_archives_before_writing_members(self):
         bad_archives = [

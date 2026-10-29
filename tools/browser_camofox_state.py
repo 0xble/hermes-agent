@@ -6,7 +6,7 @@ active profile so Camofox maps it to the same persistent browser profile across 
 
 from __future__ import annotations
 
-import hashlib
+import re
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
@@ -19,7 +19,7 @@ def get_camofox_state_dir() -> Path:
     return get_hermes_home() / "browser_auth" / "camofox"
 
 
-def get_camofox_identity(task_id: Optional[str] = None) -> Dict[str, str]:
+def get_camofox_identity(task_id: Optional[str] = None) -> dict[str, str]:
     """Stable Hermes-managed Camofox identity: userId is profile-scoped, session key is
     scoped to the logical browser task so new tabs in the same profile reuse it."""
     scope_root = str(get_camofox_state_dir())
@@ -66,27 +66,30 @@ def get_camofox_account_aliases() -> tuple:
 def get_camofox_account_identity(account: str, task_id: Optional[str] = None) -> Dict[str, str]:
     """Return a stable identity for one named operator account.
 
-    The alias is part of the profile-scoped derivation, so sibling accounts never
-    share a Camofox userId while tasks using the same account reuse its browser
+    The server's alias registry owns persistent userIds. Client-local paths must
+    not select browser profiles, but still scope task keys to the active Hermes
     profile. Raw Camofox IDs stay inside the client and are never model-facing.
     """
     allowed = get_camofox_account_aliases()
     if account not in allowed:
         raise ValueError(f"Unknown Camofox account {account!r}; choose one of: {', '.join(allowed)}")
+    from tools.browser_camofox import _get
+
+    try:
+        metadata = _get("/browser/identities")
+    except Exception as exc:
+        raise ValueError(f"Cannot verify Camofox account {account!r} persistent shared identity on the server") from exc
+    entries = metadata.get("identities") if isinstance(metadata, dict) else None
+    matches = [entry.get("userId") for entry in entries
+               if isinstance(entry, dict) and entry.get("alias") == account] if isinstance(entries, list) else []
+    # Camofox adds every alias-map target to its persistent shared-identity set.
+    # Absence from this endpoint is not permission to create an ephemeral userId.
+    if len(matches) != 1 or not isinstance(matches[0], str) or not re.fullmatch(r"hermes_camofox_[0-9a-f]{24}", matches[0]):
+        raise ValueError(f"Camofox account {account!r} has no configured persistent shared identity on the server")
     scope_root = str(get_camofox_state_dir())
-    user_digest = hashlib.sha256(f"camofox-account:{scope_root}:{account}".encode()).hexdigest()[:24]
     session_digest = uuid.uuid5(
         uuid.NAMESPACE_URL, f"camofox-account-session:{scope_root}:{account}:{task_id or 'default'}"
     ).hex[:16]
-    return {"user_id": f"hermes_camofox_{user_digest}", "session_key": f"{account}_{session_digest}"}
+    return {"user_id": matches[0], "session_key": f"{account}_{session_digest}"}
 
 
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-CAMOFOX_STATE_DIR_NAME = "browser_auth"
-
-CAMOFOX_STATE_SUBDIR = "camofox"
-# ---- END PLUGIN-COMPAT ----

@@ -190,6 +190,7 @@ class TestLockContended413Defer:
 
         mock_compress.assert_called_once()
         assert result.get("compression_deferred") is True
+        assert result["final_response"].startswith("⏳ Context compression is already running")
         assert not result.get("compression_exhausted")
         # Soft defer: transient, retry-next-message semantics — the gateway
         # persists the user turn (failed=False) and never auto-resets.

@@ -45,22 +45,25 @@ def build_gateway_parser(
     gateway_run.add_argument("-v", "--verbose", action="count", default=0,
         help="Increase stderr log verbosity (-v=INFO, -vv=DEBUG)")
     _flag(gateway_run, "-q", "--quiet", help="Suppress all stderr log output")
-    _flag(gateway_run, "--replace", help="Replace any existing gateway instance (useful for systemd)")
-    _flag(gateway_run, "--standby",
-        help="Register an overlap generation without polling or claiming the singleton gateway")
+    _flag(
+        gateway_run, "--replace", help="Replace any existing gateway instance (useful for systemd)")
     _flag(gateway_run, "--force",
         help="Start a foreground gateway even when a systemd/launchd/s6 service "
             "already supervises this profile. Without --force, the command "
             "refuses because a second dispatcher escapes the service and can "
             "corrupt shared gateway state.")
-    _flag(gateway_run, "--no-supervise",
-        help="Inside the s6-overlay Docker image, normally `gateway run` is "
+    gateway_run.add_argument(
+        "--no-supervise",
+        action="store_true",
+        help=(
+            "Inside the s6-overlay Docker image, normally `gateway run` is "
             "automatically redirected to the supervised s6 service (so the "
             "gateway gets auto-restart on crash, plus a supervised dashboard "
             "if HERMES_DASHBOARD is set). Pass --no-supervise to opt out and "
             "get the historical pre-s6 foreground behavior: the gateway is "
             "the container's main process and the container exits with the "
-            "gateway's exit code. No effect outside an s6 container.")
+            "gateway's exit code. No effect outside an s6 container."),
+    )
     _flag(gateway_run, "--external-supervisor",
         help="Declare that an external process manager owns this foreground "
             "gateway. In-chat restarts and updates exit back to that manager "
@@ -88,6 +91,9 @@ def build_gateway_parser(
     _flag(gateway_restart, "--force", help=_FORCE_SERVED_PROFILE_HELP)
     _add_compat_platform_flag(gateway_restart)
 
+    gateway_subparsers.add_parser(
+        "handover", help="Switch gateway service to the zero-cut standby slot")
+
     guardian = gateway_subparsers.add_parser(
         "guardian", help="Manage the opt-in macOS guardian (install, uninstall, status)",
         description="Manage the independent launchd guardian. Set gateway.guardian.enabled: true "
@@ -102,6 +108,7 @@ def build_gateway_parser(
     _add_system_flag(gateway_status)
     _add_compat_platform_flag(gateway_status)
 
+    # gateway install
     gateway_install = gateway_subparsers.add_parser(
         "install", help="Install gateway as a systemd/launchd background service")
     _flag(gateway_install, "--force",
@@ -118,6 +125,10 @@ def build_gateway_parser(
         help="Enable the service to start automatically on login/boot")
     gateway_install.add_argument("--no-start-on-login", dest="start_on_login", action="store_false",
         help="Do not enable the service to start on login/boot")
+    _flag(gateway_install, "--if-missing", dest="if_missing",
+        help="Do nothing when a gateway service is already installed")
+    _flag(gateway_install, "--force-unit-path", dest="force_unit_path",
+        help="Repoint a service definition that pins another HERMES_HOME at this one")
     _flag(gateway_install, "--elevated-handoff", dest="elevated_handoff", help=argparse.SUPPRESS)
 
     gateway_uninstall = gateway_subparsers.add_parser("uninstall", help="Uninstall gateway service")

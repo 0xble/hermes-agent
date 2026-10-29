@@ -235,11 +235,7 @@ class TestConfiguredCamofoxIdentity:
         assert session["session_key"] == "visible-tab"
         assert session["managed"] is True
         assert session["adopt_existing_tab"] is True
-        mock_get.assert_called_once_with(
-            "/tabs",
-            params={"userId": "shared-camofox"},
-            timeout=5,
-        )
+        mock_get.assert_not_called()  # adoption runs when a tab is needed, not on lookup
 
 
     def test_soft_cleanup_preserves_externally_managed_session(self, tmp_path, monkeypatch):
@@ -254,7 +250,7 @@ class TestConfiguredCamofoxIdentity:
         assert result is True
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert mod._sessions["task-1"]["user_id"] == "shared-camofox"
 
 
 class TestVncUrlDiscovery:
@@ -285,9 +281,9 @@ class TestVncUrlDiscovery:
 
 
 class TestCamofoxSoftCleanup:
-    """camofox_soft_cleanup drops local state only when managed persistence is on."""
+    """Managed soft cleanup keeps the task's binding for its next turn."""
 
-    def test_returns_true_and_drops_session_when_enabled(self, tmp_path, monkeypatch):
+    def test_returns_true_and_keeps_session_when_enabled(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
 
@@ -296,10 +292,10 @@ class TestCamofoxSoftCleanup:
             result = camofox_soft_cleanup("task-1")
 
         assert result is True
-        # Session should have been dropped from in-memory store
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert mod._sessions["task-1"]["managed"] is True
+            assert mod._sessions["task-1"]["carried"] is True
 
 
     def test_does_not_call_server_delete(self, tmp_path, monkeypatch):

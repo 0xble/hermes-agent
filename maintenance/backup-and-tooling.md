@@ -5,6 +5,15 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
 
 ## Required behavior
 
+- Fork patch identity: `slice-18-archive`. Legacy archive bundles include reflog-only
+  stash commits as well as every ref. Restore qualification verifies HEAD, each
+  original ref's exact SHA, and every stash commit. It fails closed if any are
+  missing, and the source checkout and stash list remain unchanged. Verify the
+  real three-stash restore and damaged-mirror invariant in
+  `tests/scripts/test_archive_legacy_fork.py`. Retire after the legacy migration's
+  recovery obligation ends. Rollback retains existing bundles but weakens future
+  archive verification.
+
 - New quick snapshots have version-2 manifests containing SHA-256 digests of captured
   payloads. Retention verifies digests before counting a recovery copy. Restore verifies
   every versioned payload before writing any destination. Legacy size-only manifests
@@ -14,18 +23,34 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   addition when a selected release preserves the same same-size-alteration and restore
   rejection behavior. Verify `tests/hermes_cli/test_quick_snapshot_digests.py` alongside
   the existing backup/retention suite. Rollback keeps the additive manifests readable.
+- Retention verifies one complete recovery anchor and one usable anchor per database
+  path, then seeks verified anchors for recorded omissions. It caches successful
+  and failed payload checks within each prune call, so generations being discarded do
+  not multiply full-file hashing under the shared backup lock. A size match alone never
+  qualifies a version-2 recovery payload. The lazy-verification invariants live in
+  `tests/hermes_cli/test_quick_snapshot_retention.py`.
 - Incomplete backup archives are reported as failures; complete archives survive
   retention; SQLite snapshot members are verified before a quick snapshot is trusted.
 - `scripts/schema_rehearsal.py` proves a copied legacy database opens, migrates, and keeps
   canonical row counts, metadata, and fork-only rows. Search changes from the upstream
   FTS v2-to-v3 migration require independent canonical-projection and rank-1 index
   integrity checks. Unexpected differences and query errors fail the rehearsal.
-  A successful open alone is insufficient.
+  A successful open alone is insufficient. Candidate homes must be fresh and resolve under
+  the temporary root or `$HERMES_HOME/cache/scratch`. When Hermes sets `TMPDIR` inside its
+  home, that resolved temporary subtree is allowed too. The live home, any ancestor, and
+  live-home descendants outside those scratch roots are refused before candidate startup.
+  Path resolution includes symlink aliases; an existing `state.db` is never unlinked.
 - `scripts/sync_fork_candidate.py` builds candidates only; `scripts/check_fork_patches.py`
   proves trailers, unit ownership, extension registration, config keys, and the native
   update receipt; with immutable releases, compare receipt and live gateway to the
   ready `current` release and check trailers through its commit, not the stale source
-  HEAD. Legacy homes still use checkout HEAD. Broken pointers and mismatched code fail.
+  HEAD. The release's recorded baseline helper is read from that exact commit, even
+  when the source checkout predates the helper. Generated scheduled shims execute the
+  active release interpreter and require the live SHA in the configured source checkout
+  (`HERMES_FORK_REPO`, default `~/Repos/hermes-agent`). Legacy homes still use checkout
+  HEAD when `scripts/check_fork_patches.py` is run directly, but generated scheduled shims
+  fail closed on legacy homes without a `current` release symlink. Broken pointers and
+  mismatched code fail.
   `scripts/rollback_fork_runtime.sh` reaches recovery when reinstall fails.
   Scheduled copies live under `$HERMES_HOME/scripts` per [runtime ownership](runtime-ownership.md).
 - Cron: per-job IANA `job_timezone` with civil-time scheduling and a migration dry-run
@@ -46,7 +71,8 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `cron-profile-timezone-reanchor`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
   `full-zip-failure-accounting`, `config-backup-content`, `sqlite-backup-wal-snapshot`,
-  `sqlite-close-guard-upstream`,
+  `sqlite-close-guard-upstream`, `update-backup-outcome`,
+  `cron-restore-respects-deletes`,
   `evidence` (records, not patches), `candidate-tooling` (candidate sync/check scripts and
   their review fallback), `slice-14-request-update` (the parent-only native update request).
   `maintenance-contract` is owned by the root contract.
@@ -73,6 +99,14 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
   setting) has its own message on the snapshot path. Retire it if the two stop sharing
   one cross-process slot, which is the fix the message exists to compensate for.
+- `update-backup-outcome`: `create_pre_update_backup(raise_errors=True)`, used only by
+  `_run_full_backup`, keeps `None` for "nothing to back up" and raises the held slot or the
+  archive failure, so the `HERMES-123` message and "Backup failed" are reachable and the
+  receipt records `pre_update_full_backup` as a step (created or failed) or a skip (empty
+  home). Other callers keep the swallowing default. Verify with
+  `scripts/run_tests.sh tests/hermes_cli/test_update_receipt_truthfulness.py -k FullBackup`.
+  Retire when upstream reports why there is no pre-update archive. Rollback restores the
+  generic "Backup skipped" for all three causes.
 - `sqlite-close-guard-upstream`: exact upstream commits `87bb0d3827a0` and
   `c451cd1bba80`, from merged
   [PR #121433](https://github.com/NousResearch/hermes-agent/pull/121433), preserve
@@ -155,6 +189,11 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   11-file home as a mass disappearance, which after (b) costs that install four of its five
   rollback points. A floor can only relax the verdict on churn, never on critical state, which
   `_is_critical_state` routes to `on_error` before the vanished branch is reached.
+  Criticality is relative to both the default home and each `profiles/<name>/` home.
+  A named-profile config/auth/cron or pairing file disappearing must not be
+  routine churn: it makes the archive incomplete and preserves prior complete ZIPs.
+  Nested plugin `.env` files remain churn. Proof: real scan-then-unlink cases in
+  `test_backup_all_profiles.py` cover manual, pre-update, and pre-migration retention.
   (e) `status=` and `coverage=` are separate fields on both log lines. One word carrying both
   facts made the log contradict the console twice, in opposite directions: first always
   `complete`, then `incomplete` while the console said complete on a vanished-only run.
@@ -226,6 +265,12 @@ desktop fixture portability fix and local CI declaration are owned by
 including after a release rebase. It does not advance the trailer floor.
 
 Fork-Patch-Backfill: f0a3bb8be8b611d30a990bb83db46aeaed37c39a; maintenance-tooling
+
+Published commit `a776676f5e12` (PR #285) also omitted its trailer during squash
+merge. Its PM and source-driver fixture portability fix for macOS is owned by
+`maintenance-tooling` on the same terms.
+
+Fork-Patch-Backfill: a18e5fe814c5f53d7ea1b79c1c99cbf6e1fd229d; maintenance-tooling
 
 `scripts/run_tests.sh` on `tests/hermes_cli/test_backup.py`,
 `tests/hermes_cli/test_backup_stability.py`, `tests/scripts/test_candidate_scripts.py`,

@@ -28,7 +28,7 @@ def selected_history(repo: Path, base: str, head: str) -> tuple[str, str]:
     if not shallow.is_absolute():
         shallow = repo / shallow
     if shallow.exists():
-        for boundary in shallow.read_text(encoding='utf-8').splitlines():
+        for boundary in shallow.read_text(encoding='utf-8-sig').splitlines():
             for commit in (base_sha, head_sha):
                 result = subprocess.run(
                     ['git', 'merge-base', '--is-ancestor', boundary, commit],

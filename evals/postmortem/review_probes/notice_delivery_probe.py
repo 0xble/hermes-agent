@@ -4,7 +4,7 @@ Independent-review probe (written by the /review subagent for tracking issue #10
 It reproduced a defect in the first version of the PR; the fixed head must pass it. Paths are taken
 from the command line / environment, never hard-coded. Usage: see the argument parsing at the top of the file.
 """
-import os, sys, tempfile, socket, json, time, threading, queue, asyncio
+import os, sys, tempfile, socket, json, time, threading, queue, asyncio, contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from collections import OrderedDict
@@ -30,14 +30,17 @@ class Sink(GatewayNotificationsMixin):
         self._completion_delivery_retention=100
         self.received=[]
     async def _classify_completion_target(self,sid): return 'deliver'
-    async def _inject_watch_notification(self,text,evt):
+    def _completion_event_scope(self,evt): return contextlib.nullcontext()
+    def _user_stop_latched(self,*_args): return False
+    async def _completion_delivery_ready(self,evt): return True
+    async def _inject_watch_notification(self,synth_text,evt,**kwargs):
         self.received.append(('notice' if evt.get('task_failure_notice') else 'final',evt.get('results')))
         return True
 
 def batch_run(did, gates):
     tasks=[{'goal':f'worker task {i}','group':'g'} for i in range(3)]  # grouped: one shared final, so the early notice matters
     children=[(i,t,SimpleNamespace()) for i,t in enumerate(tasks)]
-    b=dd._Batch(tasks,children,SimpleNamespace(quiet_mode=True),{'model':'offline'},None,'leaf',3,did,[],[], '', '',None,None,time.monotonic())
+    b=dd._Batch(tasks,children,SimpleNamespace(quiet_mode=True),{'model':'offline'},None,'leaf',3,did,[],[], '', '',None,None,False,time.monotonic())
     # Since the per-group split on main, a detached unit carries its registry id; the notice keys on it.
     if hasattr(b,'unit_id'): b.unit_id=did; b.group='g'
     def child(i,t,c):
@@ -76,7 +79,7 @@ else:
     assert [kind for kind,_ in sink.received]==['notice','notice','final'], 'fixed head must deliver both notices AND the final'
     # Parent busy: the queued first notice gets accepted only after final persisted.
     g=start('busy-parent');g[0].set();notice=get();g[1].set();second=get();g[2].set();final=get()
-    claim=ad.claim_event_delivery(notice,'tui-poller');assert claim=='', 'an interim notice must be NON-durable (empty claim token)'
+    claim=ad.claim_event_delivery(notice,'tui-poller'); assert claim and claim.startswith('outbox:'), 'durable notice must claim its outbox row'
     ad.complete_event_delivery(notice,claim)
     final_claim=ad.claim_event_delivery(final,'tui-poller')
     results['busy_parent']={'notice_claimed':bool(claim),'final_claim':final_claim,'row':ad.get_durable_delegation('busy-parent')}

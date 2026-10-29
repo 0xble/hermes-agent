@@ -14,8 +14,10 @@ from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from tools.arg_coercion import coerce_tool_args
 
-def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) -> Dict[str, str]:
+
+def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) -> dict[str, str]:
     """Identity kwargs every tool hook/middleware call carries (all coerced to ``""``)."""
     return {
         "task_id": effective_task_id or "",
@@ -27,22 +29,24 @@ def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) ->
 
 
 GOAL_RECEIPT_NOTICE_KEY = "goal.receipt"
+_TOOL_RECEIPTS = {
+    "goal_set": {"config_section": "goals", "config_key": "auto_notices", "notice_key": GOAL_RECEIPT_NOTICE_KEY},
+    "loop_set": {"config_section": "loops", "config_key": "auto_notices", "notice_key": "loop.receipt"},
+}
 
 
 def _goal_receipt_text(function_name: str, result: Any) -> str:
-    """The user-facing receipt carried by a committed ``goal_set`` mutation, else ``""``.
-
-    Fork patch: the goal-lifecycle plugin has no send path of its own, so the receipt rides on the
-    tool result and is surfaced here at the moment the change commits. Gated on the persisted
-    read-back (``success`` and ``persisted``) so a failed or read-only call never announces."""
-    if function_name != "goal_set":
+    """Return a committed mutation receipt for a registered state-changing tool."""
+    receipt_spec = _TOOL_RECEIPTS.get(function_name)
+    if receipt_spec is None:
         return ""
     try:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.goal_notices import goal_notices_enabled
-        if not goal_notices_enabled():
+        if function_name == "goal_set" and not goal_notices_enabled():
             return ""
-        if not (load_config_readonly().get("goals") or {}).get("auto_notices", True):
+        config = load_config_readonly()
+        if not (config.get(receipt_spec["config_section"]) or {}).get(receipt_spec["config_key"], True):
             return ""
         receipt = json.loads(result) if isinstance(result, str) else result
     except Exception:
@@ -58,6 +62,8 @@ def _emit_goal_receipt(agent, function_name: str, result: Any) -> None:
     if not text:
         return
     try:
+        receipt_spec = _TOOL_RECEIPTS[function_name]
+        notice_key = receipt_spec["notice_key"]
         from agent.credits_tracker import AgentNotice, CREDITS_RESTORED_TTL_MS
         if getattr(agent, "notice_callback", None):
             # Finite TTL plus a stable key so the receipt expires and is clearable instead of sitting
@@ -67,7 +73,7 @@ def _emit_goal_receipt(agent, function_name: str, result: Any) -> None:
             # goal and contract); single-line drivers show only the headline.
             agent._emit_notice(AgentNotice(
                 text=text, level="info", kind="ttl", ttl_ms=CREDITS_RESTORED_TTL_MS,
-                key=GOAL_RECEIPT_NOTICE_KEY, id=GOAL_RECEIPT_NOTICE_KEY,
+                key=notice_key, id=notice_key,
             ))
         else:
             agent._vprint(text, force=True)
@@ -149,10 +155,10 @@ class InlineToolContext:
 InlineToolExecutor = Callable[[Any, dict, InlineToolContext], Any]
 
 # ``(kwarg, args_key)`` → ``args.get(key)``; ``(kwarg, args_key, default)`` → ``args.get(key, default)``.
-_ArgSpec = Tuple[Any, ...]
+_ArgSpec = tuple[Any, ...]
 
 
-def _call_tool(module: str, func: str, args: dict, arg_specs: Tuple[_ArgSpec, ...], **fixed: Any) -> Any:
+def _call_tool(module: str, func: str, args: dict, arg_specs: tuple[_ArgSpec, ...], **fixed: Any) -> Any:
     """Import ``module.func`` lazily and call it with args mapped per ``arg_specs`` plus ``fixed``."""
     fn = getattr(import_module(module), func)
     return fn(**{spec[0]: args.get(*spec[1:]) for spec in arg_specs}, **fixed)
@@ -196,7 +202,7 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
     result = _call_tool(
         "tools.memory_tool", "memory_tool", args,
         (
-            ("action", "action"), ("target", "target", "memory"), ("content", "content"),
+            ("action", "action"), ("target", "target"), ("content", "content"),
             ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
         ),
         store=agent._memory_store,
@@ -238,8 +244,10 @@ def _manage_connections(agent, args: dict, ctx: InlineToolContext) -> Any:
 
     result = manage_connections(
         args, session_id=getattr(agent, "session_id", None), tool_call_id=ctx.tool_call_id,
+        turn_id=getattr(agent, "_current_turn_id", None) or None,
         connection_callback=getattr(agent, "connection_callback", None),
         connectors_available=gateway_config.connectors_available,
+        card_surface=getattr(agent, "platform", None) == "desktop",
     )
     _scope_in_connected_mcp_servers(agent, result)
     return result
@@ -277,6 +285,20 @@ def _manage_catalog(agent, args: dict, ctx: InlineToolContext) -> Any:
     )
 
 
+def _setup_beat(agent, args: dict, ctx: InlineToolContext) -> Any:
+    # The run record lives on the session row and the card callback on the agent. A card the user wrote
+    # past ends the turn as a new message does: setup_beat runs inline (never parallel), so its result is
+    # kept and the loop stops before the next model call.
+    from agent.interrupt_control import _REASON_NEW_MESSAGE
+    from tools.setup_beat_tool import setup_beat_tool
+
+    return setup_beat_tool(
+        args, db=getattr(agent, "_session_db", None), session_id=getattr(agent, "session_id", None) or "",
+        tool_call_id=ctx.tool_call_id or "", callback=getattr(agent, "setup_beat_callback", None),
+        end_turn=lambda: agent.interrupt(tool_reason=_REASON_NEW_MESSAGE),
+    )
+
+
 def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     # Replay shim for conversations whose cached prompt still names setup_mcp.
     # Not in _LEGACY_TOOL_ALIASES: inline tools bypass handle_function_call.
@@ -286,8 +308,15 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     }, ctx)
 
 
+def _compact_context(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from agent.compact_context import request_compaction
+
+    return request_compaction(agent, args, messages=getattr(agent, "_session_messages", None))
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
-INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
+_RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
+    "compact_context": _compact_context,
     "todo_list": _tool(
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,
@@ -301,9 +330,7 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     "session_search": _session_search,
     "memory": _memory,
     "clarify": _tool(
-        "tools.clarify_tool", "clarify_tool",
-        ("question", "question", ""), ("choices", "choices"), ("multi_select", "multi_select", False),
-        ("questions", "questions"),
+        "tools.clarify_tool", "clarify_tool", ("questions", "questions"),
         callback=lambda agent, ctx: agent.clarify_callback,
     ),
     "read_terminal": _callback_tool(
@@ -327,11 +354,28 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
         "tools.tour_tool", "tour_tool", "tour_callback",
         ("action", "action", ""), ("surface", "surface"), ("selector", "selector"), ("title", "title"),
         ("text", "text"), ("side", "side"), ("steps", "steps"), ("step_index", "step_index"),
+        ("preset", "preset"),
     ),
+    "set_theme": _callback_tool(
+        "tools.set_theme_tool", "set_theme_tool", "theme_callback",
+        ("accent", "accent"), ("mode", "mode"), ("layout", "layout"), ("picker", "picker"),
+    ),
+    "setup_beat": _setup_beat,
     "manage_connections": _manage_connections,
     "manage_catalog": _manage_catalog,
     "setup_mcp": _setup_mcp_shim,
     "delegate_task": lambda agent, args, ctx: agent._dispatch_delegate_task(args),
+}
+
+
+def _coerced(name: str, executor: InlineToolExecutor) -> InlineToolExecutor:
+    def _exec(agent, args: dict, ctx: InlineToolContext) -> Any:
+        return executor(agent, coerce_tool_args(name, args), ctx)
+    return _exec
+
+
+INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
+    name: _coerced(name, executor) for name, executor in _RAW_INLINE_TOOL_EXECUTORS.items()
 }
 
 # ``invoke_tool`` (concurrent path) consults the memory manager right after these three

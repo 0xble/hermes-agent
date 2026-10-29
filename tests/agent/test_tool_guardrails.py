@@ -182,6 +182,58 @@ def test_skill_read_tools_are_idempotent_and_block_repeated_identical_success_ou
         assert blocked.code == "idempotent_no_progress_block"
 
 
+def test_context_loss_reanchors_reads_without_erasing_failure_protection():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=5,
+        )
+    )
+    skill_args = {"name": "demo-skill"}
+    skill_result = '{"success":true,"content":"same"}'
+
+    for _ in range(5):
+        assert controller.before_call("skill_view", skill_args).action == "allow"
+        controller.after_call("skill_view", skill_args, skill_result, failed=False)
+    assert controller.before_call("skill_view", skill_args).code == "idempotent_no_progress_block"
+
+    failing_args = {"path": "/missing"}
+    for _ in range(4):
+        controller.after_call("read_file", failing_args, '{"error":"missing"}', failed=True)
+
+    controller.reset_idempotent_read_progress()
+    assert controller.before_call("skill_view", skill_args).action == "allow"
+    reanchor = controller.after_call("skill_view", skill_args, skill_result, failed=False)
+    assert reanchor.action == "allow"
+    for _ in range(4):
+        assert controller.before_call("skill_view", skill_args).action == "allow"
+        controller.after_call("skill_view", skill_args, skill_result, failed=False)
+    assert controller.before_call("skill_view", skill_args).code == "idempotent_no_progress_block"
+
+    controller.after_call("read_file", failing_args, '{"error":"missing"}', failed=True)
+    assert controller.before_call("read_file", failing_args).code == "repeated_exact_failure_block"
+
+
+def test_context_loss_clears_success_read_observation_state_and_stale_halt():
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    args = {"path": "/tmp/demo.txt"}
+    result = "content " * 100
+
+    for call_id in ("a", "b"):
+        controller.after_call("read_file", args, result, failed=False)
+        controller.observe_call("read_file", args, result, tool_call_id=call_id)
+    assert controller._call_history
+
+    controller.reset_idempotent_read_progress()
+
+    assert controller.halt_decision is None
+    assert not controller._call_history
+    observation = controller.observe_call("read_file", args, result, tool_call_id="c")
+    assert observation.notice is None
+    assert observation.stub is None
+
+
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
@@ -243,7 +295,7 @@ def test_identical_call_streak_never_halts_when_hard_stop_disabled_or_for_poller
 
 # ── Per-turn runaway-loop caps (Claude Code v2.1.212, Week 29) ──────────────
 
-from agent.tool_guardrails import LoopCapConfig  # noqa: E402
+from agent.tool_guardrails import LoopCapConfig
 
 
 
@@ -291,7 +343,7 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
 # distinct red commands, and browser retry-after-action — while the pure
 # replay (same call, nothing changed between attempts) is still stopped.
 
-_HARD = lambda: ToolCallGuardrailController(  # noqa: E731
+_HARD = lambda: ToolCallGuardrailController(
     ToolCallGuardrailConfig(hard_stop_enabled=True)
 )
 _PYTEST = {"command": "pytest tests/test_x.py -q"}
@@ -405,3 +457,81 @@ def test_a_real_tool_error_is_still_a_failure():
     assert _detect_tool_failure("read_file", real)[0] is True
     # The marker is only honoured as the literal boolean, never as truthy prose.
     assert classify_tool_failure("read_file", '{"error": "x", "guardrail_refusal": "yes"}')[0] is True
+
+
+def test_identical_streak_ignores_volatile_execution_metadata():
+    # execute_code results carry per-call metadata (execution_count, duration_seconds) that
+    # changes on every run. Hashing it made each empty replay look "new", so a model re-ran
+    # the same empty probe 147 times without the identical-call halt ever firing.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=5)
+    )
+    args = {"code": "import subprocess\nprint(subprocess.run(['true']).returncode) if False else None"}
+
+    def result(n):
+        return json.dumps({
+            "status": "success", "output": "", "exit_code": 0, "tool_calls_made": 0,
+            "duration_seconds": 1.0 + n / 100,
+            "kernel": {"mode": "session", "reused": True, "execution_count": 100 + n, "state_reset": False},
+            "stdout_truncated": False, "stdout_bytes_captured": 0,
+        })
+
+    for i in range(4):
+        controller.observe_call("execute_code", args, result(i), failed=False)
+        assert controller.halt_decision is None, f"halted early at {i}"
+    controller.observe_call("execute_code", args, result(4), failed=False)
+    halt = controller.halt_decision
+    assert halt is not None, "volatile metadata defeated the identical-call streak"
+    assert halt.code == "identical_call_streak_halt"
+
+
+def test_identical_streak_still_resets_when_real_output_changes():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=3)
+    )
+    args = {"code": "print(1)"}
+    for i in range(6):
+        out = json.dumps({"status": "success", "output": f"line {i}", "duration_seconds": 1.0,
+                          "kernel": {"execution_count": i}})
+        controller.observe_call("execute_code", args, out, failed=False)
+    assert controller.halt_decision is None, "different real output must not count as a replay"
+
+
+def test_other_tools_keep_duration_and_execution_count_as_real_output():
+    # Only execute_code's known metadata locations are volatile. For any other tool these keys
+    # can be the actual answer (e.g. a job-status tool reporting how long a job ran), so results
+    # that differ only there are different results and must not form an identical streak.
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=3)
+    )
+    args = {"job": "build-42"}
+    for i in range(6):
+        out = json.dumps({"status": "done", "duration_seconds": 10 + i,
+                          "stats": {"execution_count": 100 + i}})
+        controller.observe_call("mcp_ci_job_status", args, out, failed=False)
+    assert controller.halt_decision is None, "a real change in duration_seconds/execution_count was treated as a replay"
+
+
+def test_execute_code_replay_streak_notice_fires_on_warn_only_desktop_config():
+    # #124072: on an interactive surface hard stops are off, so the appended notice is
+    # the only signal the model gets. 186 no-op print("...") cells whose results differed
+    # only in kernel.execution_count / duration_seconds produced zero notices.
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig.from_mapping({}, platform="desktop"))
+    args = {"code": 'print("...")'}
+
+    def result(n):
+        return json.dumps({
+            "status": "success", "output": "...\n", "exit_code": 0, "tool_calls_made": 0,
+            "duration_seconds": 0.001 * n,
+            "kernel": {"mode": "session", "reused": True, "execution_count": n, "state_reset": False},
+            "stdout_truncated": False, "stdout_bytes_captured": 4, "stdout_bytes_total": 4,
+            "stdout_bytes_omitted": 0,
+        })
+
+    notices = [
+        controller.observe_call("execute_code", args, result(i), tool_call_id=f"c{i}").notice
+        for i in range(1, 7)
+    ]
+    assert notices[:2] == [None, None]
+    assert all(n is not None and "consecutive identical call to execute_code" in n for n in notices[2:]), notices
+    assert controller.halt_decision is None, "warn-only surfaces must not halt"
