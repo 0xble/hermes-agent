@@ -456,7 +456,8 @@ platforms:
       # {title: "Start here", prompts: [{title: "Plan", message: "..."}]}
       suggested_prompts: []
 
-      # Title Agent/Assistant DM threads from the first user message.
+      # Title Agent/Assistant DM threads from the first user message, and put
+      # the generated title on channel thread roots Hermes may edit.
       # Default: true. Set false to leave Slack's default thread titles.
       assistant_thread_titles: true
 
@@ -486,7 +487,7 @@ platforms:
 | `platforms.slack.extra.feedback_buttons` | `false` | When `true` with `rich_blocks`, appends Slack-native feedback controls to final replies. |
 | `platforms.slack.extra.native_task_cards` | `false` | When `true`, renders live tool calls as Slack-native plan/task cards. Cards work with Slack's built-in default `tool_progress: off`; an explicitly configured `display.tool_progress: off` (global or `display.platforms.slack`; `/verbose` writes the same key) disables cards too. Cards need a thread: when the card lane is active and the chat has no thread to anchor on (a top-level DM with `reply_in_thread: false`), Hermes shows no tool progress instead of text bubbles, unless you explicitly set `tool_progress: new`/`all`, which falls back to editable text progress there. Recoverable native API failures fall back to one continuously edited text update. |
 | `platforms.slack.extra.suggested_prompts` | `[]` | Up to four `{title, message}` prompts for Agent/Assistant DM entry points; accepts either a list or `{title, prompts}`. |
-| `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message. |
+| `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message, then upgrades them once to a generated task title. Channel threads get the same generated title as their session title, shown as the bold first line of the thread root when Hermes posted the root. See [Channel Thread Titles](#channel-thread-titles). |
 | `platforms.slack.extra.allow_bots` | `"none"` | Controls messages from other Slack bots: `"none"` ignores them, `"mentions"` accepts a bot message only when **that message itself** @mentions Hermes, and `"all"` accepts all of them. Use `"mentions"` for the safest bot-to-bot collaboration mode. See [Accepting messages from other bots](#accepting-messages-from-other-bots-allow_bots). |
 | `platforms.slack.extra.api_human_users` | `[]` | Slack user IDs whose **Web-API (user-token) posts count as human**. Such posts carry the posting `app_id` and no `client_msg_id`, so by default they are dropped as app traffic; allowlist your own front-end's users here instead of `allow_bots: all`. See [Treating your own app's user-token posts as human](#treating-your-own-apps-user-token-posts-as-human-api_human_users). |
 | `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |
@@ -521,6 +522,21 @@ Hermes verifies the current parent is still a tombstone before deleting any
 replies. A cleanup failure produces 1 notice in the DM naming the failed
 operation or reply. Cleanup is not retried, and deleting messages while Hermes
 is offline is not caught up later.
+
+### Channel Thread Titles
+
+Channel threads have no native Slack title, so Hermes shows the generated
+session title on the thread root, once per thread:
+
+- A root Hermes posted gains a bold first line with the title, unless it
+  already starts with a bold line or a header block.
+- A root posted as an `api_human_users` user through a user token in the
+  migrated-opener shape (a bold first line, then `Moved from Telegram...`) has
+  only that bold line replaced. This needs `SLACK_USER_TOKEN` for the same
+  user and workspace, with `chat:write`, as for
+  [deleted threads](#deleted-threads-in-the-owner-dm). Without it the root is
+  left as it is.
+- Hermes never edits any other human-written root.
 
 ### Working-State Status Line
 

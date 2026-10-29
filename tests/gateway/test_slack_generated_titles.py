@@ -241,3 +241,116 @@ async def test_other_rename_errors_do_not_fall_back(adapter, source, monkeypatch
     adapter._app.client.assistant_threads_setTitle = AsyncMock()
     await adapter._set_assistant_thread_title("D123", source.thread_id, "Draft reply", team_id="T123")
     adapter._app.client.assistant_threads_setTitle.assert_not_awaited()
+
+
+SEEDED = "*Hindsight Maintenance*\nMoved from Telegram. Hermes continues here with the same history."
+SEEDED_BLOCKS = [{"type": "rich_text", "block_id": "b1", "elements": [{"type": "rich_text_section", "elements": [
+    {"type": "text", "text": "Hindsight Maintenance", "style": {"bold": True}},
+    {"type": "text", "text": "\nMoved from Telegram. Hermes continues here with the same history."}]}]}]
+
+
+@pytest.fixture
+def channel(adapter):
+    adapter._team_bot_user_ids = {"T123": "UBOT"}
+    adapter.config.extra["api_human_users"] = ["UOWNER"]
+    adapter._app.client.chat_update = AsyncMock()
+    user_client = AsyncMock()
+    user_client.auth_test = AsyncMock(return_value={"ok": True, "team_id": "T123", "user_id": "UOWNER"})
+    adapter._new_web_client = MagicMock(return_value=user_client)
+    return SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="group",
+                         thread_id="171234.0001", scope_id="T123", user_id="UOWNER"), user_client
+
+
+def with_root(adapter, **root):
+    adapter._app.client.conversations_replies = AsyncMock(
+        return_value={"messages": [{"ts": "171234.0001", **root}]})
+
+
+@pytest.mark.asyncio
+async def test_channel_thread_gets_verb_first_title_on_its_root(adapter, channel, monkeypatch):
+    from plugins.platforms.slack import adapter as module
+    source, _ = channel
+    rename = AsyncMock()
+    monkeypatch.setattr(module, "_session_title_method", lambda client: rename)
+    with_root(adapter, user="UBOT", text="Daily brief is ready")
+    done = asyncio.Event()
+    adapter._app.client.chat_update.side_effect = lambda **kwargs: done.set()
+    agent = attach(adapter, source)
+    assert agent._title_style == "verb_first"
+    agent._on_session_title("Review daily brief", "llm")
+    await asyncio.wait_for(done.wait(), timeout=5)
+    adapter._app.client.chat_update.assert_awaited_once_with(
+        channel="C123", ts="171234.0001", text="*Review daily brief*\nDaily brief is ready")
+    await adapter._title_channel_thread_root(source, "Clobber the title", lambda: True)
+    assert adapter._app.client.chat_update.await_count == 1
+    rename.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root,token,edited_by", [
+    ({"user": "UBOT", "text": "*Hermes updates*\nAll green"}, "xoxp-owner", None),
+    ({"user": "UBOT", "text": "Brief", "blocks": [{"type": "header", "text": {"type": "plain_text", "text": "Brief"}}]},
+     "xoxp-owner", None),
+    ({"user": "UOWNER", "text": "can you fix the *backup* job?"}, "xoxp-owner", None),
+    ({"user": "UOWNER", "text": "*Plan*\nmy own notes"}, "xoxp-owner", None),
+    ({"user": "UOTHER", "text": SEEDED, "blocks": SEEDED_BLOCKS}, "xoxp-owner", None),
+    ({"user": "UOWNER", "text": SEEDED, "blocks": SEEDED_BLOCKS}, None, None),
+    ({"user": "UOWNER", "text": SEEDED, "blocks": SEEDED_BLOCKS}, "xoxp-other", None),
+    ({"user": "UOWNER", "text": SEEDED, "blocks": SEEDED_BLOCKS}, "xoxp-owner", "owner"),
+])
+async def test_channel_root_rewrite_never_touches_free_human_text(adapter, channel, monkeypatch, root, token, edited_by):
+    from plugins.platforms.slack import adapter as module
+    source, user_client = channel
+    monkeypatch.setattr(module, "_get_scoped_secret", lambda name, default=None: token)
+    if token == "xoxp-other":
+        user_client.auth_test.return_value = {"ok": True, "team_id": "T123", "user_id": "UOTHER"}
+    with_root(adapter, **root)
+    await adapter._title_channel_thread_root(source, "Check Hindsight backlog", lambda: True)
+    adapter._app.client.chat_update.assert_not_awaited()
+    if edited_by is None:
+        user_client.chat_update.assert_not_awaited()
+        return
+    blocks = user_client.chat_update.await_args.kwargs.pop("blocks")
+    user_client.chat_update.assert_awaited_once_with(
+        channel="C123", ts="171234.0001",
+        text="*Check Hindsight backlog*\nMoved from Telegram. Hermes continues here with the same history.")
+    runs = blocks[0]["elements"][0]["elements"]
+    assert runs[0] == {"type": "text", "text": "Check Hindsight backlog", "style": {"bold": True}}
+    assert runs[1:] == SEEDED_BLOCKS[0]["elements"][0]["elements"][1:]
+
+
+@pytest.mark.asyncio
+async def test_seeded_opener_keeps_matching_title(adapter, channel, monkeypatch):
+    from plugins.platforms.slack import adapter as module
+    source, user_client = channel
+    monkeypatch.setattr(module, "_get_scoped_secret", lambda name, default=None: "xoxp-owner")
+    with_root(adapter, user="UOWNER", text=SEEDED, blocks=SEEDED_BLOCKS)
+    await adapter._title_channel_thread_root(source, "Hindsight Maintenance", lambda: True)
+    user_client.auth_test.assert_not_awaited()
+    user_client.chat_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bot_root_with_blocks_gains_title_through_slack_http(adapter, channel):
+    from slack_sdk.web.async_client import AsyncWebClient
+    from tests.fakes.platforms.slack_standin import SlackStandin, BOT_USER_ID
+
+    source, _ = channel
+    server = SlackStandin()
+    server.start()
+    try:
+        client = AsyncWebClient(token=server.bot_token, base_url=server.api_base)
+        adapter._get_client = lambda *args, **kwargs: client
+        adapter._team_bot_user_ids = {"T123": BOT_USER_ID}
+        body = [{"type": "section", "text": {"type": "mrkdwn", "text": "Backups finished & verified"}}]
+        posted = await client.chat_postMessage(channel="C123", text="Backups finished & verified", blocks=body)
+        source.thread_id = posted["ts"]
+        await adapter._title_channel_thread_root(source, "Verify <nightly> backups", lambda: True)
+        await adapter._title_channel_thread_root(source, "Verify backups again", lambda: True)
+        [update] = server.calls_of("chat.update")
+        assert update.params["text"] == "*Verify &lt;nightly&gt; backups*\nBackups finished & verified"
+        assert update.params["blocks"] == [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*Verify &lt;nightly&gt; backups*"}}, *body]
+        assert update.response["ok"] is True
+    finally:
+        server.stop()
