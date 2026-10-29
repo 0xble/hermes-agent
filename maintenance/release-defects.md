@@ -884,6 +884,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   release uses the canonical source module, not the removed status export.
   Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
 - Fork patch identity: `v0225-merge-integration`.
+- Gateway reservation retries when a browse holder releases between the failed
+  all-home reservation and the per-home conflict probes. The original deadline
+  still applies, and each retry must acquire the actual ownership locks.
+  Guard: `tests/gateway/test_browse_reservation_release_race.py` and browse schema drift.
 - Integrating fork main through #818 keeps atomic fanout prepare/stamp/admission alongside
   overflow resume notices and their physical-drain barrier. Routing replacement performs its
   diff and retirement-fence check in SQLite and returns only rejected route keys, without
