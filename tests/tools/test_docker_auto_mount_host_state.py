@@ -36,6 +36,8 @@ def daemon(monkeypatch, tmp_path):
                              if all(labels.get(k) == v for k, v in filters))
         elif cmd[1] == "inspect" and ".Config.Image" in cmd[3]:
             output = "python:3.14\n"
+        elif cmd[1] == "inspect" and "hermes-auto-mount-host-state" in cmd[3]:
+            output = containers[cmd[-1]].get("hermes-auto-mount-host-state", "") + "\n"
         return subprocess.CompletedProcess(cmd, 0, stdout=output, stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", run)
@@ -110,6 +112,21 @@ def test_reuse_never_crosses_mount_policy(monkeypatch, daemon, shared_key, old_p
     assert len([cmd for cmd in commands if cmd[1] == "run"]) == 2
     assert third._recreate_container()
     assert third._container_id == second._container_id
+
+
+@pytest.mark.parametrize("shared_key", ["", "trusted-shared"])
+@pytest.mark.parametrize("kwargs", [{}, {"auto_mount_host_state": True}])
+def test_default_policy_reuses_legacy_container(monkeypatch, daemon, shared_key, kwargs):
+    _getters(monkeypatch, mounts={name: [] for name, _, _ in docker_env._RO_MOUNT_SOURCES})
+    containers, commands, _ = daemon
+    first = _environment(shared_container_key=shared_key)
+    containers[first._container_id].pop("hermes-auto-mount-host-state")
+
+    second = _environment(shared_container_key=shared_key, **kwargs)
+    assert second._container_id == first._container_id
+    assert len([cmd for cmd in commands if cmd[1] == "run"]) == 1
+    assert second._recreate_container()
+    assert second._container_id == first._container_id
 
 
 @pytest.mark.parametrize("legacy", [False, True])

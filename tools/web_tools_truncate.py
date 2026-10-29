@@ -103,7 +103,7 @@ def _truncate_with_footer(content: str, url: str, char_limit: int) -> tuple[str,
         # The footer is read by the AGENT, whose read_file runs inside the active backend: render the
         # path where docker/modal/ssh/... see the mounted cache, not the host path (#72389, #81984).
         from tools.credential_files import to_agent_visible_cache_path
-        stored_path = to_agent_visible_cache_path(stored_path)
+        stored_path = to_agent_visible_cache_path(stored_path, fallback_to_host=False)
     footer_lines = [
         "", "─" * 8 + " [TRUNCATED] " + "─" * 8,
         f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "

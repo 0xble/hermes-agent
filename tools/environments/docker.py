@@ -1252,7 +1252,8 @@ class DockerEnvironment(BaseEnvironment):
         """``(container_id, state)`` of an existing container labeled for this task/profile/
         egress posture and immutable environment, or ``None`` on miss or any failure.
         Explicit shared keys opt out of the environment filter, never the host-state policy:
-        that policy must match even when collectors return no mounts or a legacy container exists.
+        disabled policy requires an explicit false label, while enabled policy accepts legacy
+        containers without the label to preserve their writable layers.
         The egress posture is a label
         FILTER for every posture, "off" included: a container built with egress on must not be
         reused after ``hermes egress disable`` (baked-in proxy env and CA mounts), and every
@@ -1262,8 +1263,9 @@ class DockerEnvironment(BaseEnvironment):
             "--filter", "label=hermes-agent=1",
             "--filter", f"label=hermes-task-id={task_label}",
             "--filter", f"label=hermes-profile={profile_label}",
-            "--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}",
-            "--filter", f"label={_HOST_STATE_LABEL_KEY}={self._labels[_HOST_STATE_LABEL_KEY]}"]
+            "--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"]
+        if self._labels[_HOST_STATE_LABEL_KEY] == "false":
+            filters.extend(["--filter", f"label={_HOST_STATE_LABEL_KEY}=false"])
         if environment_label := self._labels.get(_ENVIRONMENT_LABEL_KEY):
             filters.extend(["--filter", f"label={_ENVIRONMENT_LABEL_KEY}={environment_label}"])
         result = _docker_query(
@@ -1280,6 +1282,14 @@ class DockerEnvironment(BaseEnvironment):
             if len(parts) != 2:
                 continue
             cid, state = parts[0], parts[1].strip().lower()
+            if self._labels[_HOST_STATE_LABEL_KEY] == "true":
+                policy = _docker_query(
+                    [self._docker_exe, "inspect", "--format",
+                     f'{{{{index .Config.Labels "{_HOST_STATE_LABEL_KEY}"}}}}', cid], timeout=10,
+                    fail="docker inspect host-state policy failed: %s",
+                    nonzero="docker inspect host-state policy returned %d: %s")
+                if policy is None or policy.stdout.strip() == "false":
+                    continue
             if first is None:
                 first = (cid, state)
             if state == "running" and running is None:
