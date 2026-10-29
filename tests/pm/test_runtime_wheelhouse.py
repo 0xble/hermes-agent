@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import sys
 import tomllib
-import urllib.request
 
 from packaging.tags import sys_tags
 from packaging.utils import parse_wheel_filename
@@ -19,8 +18,9 @@ from tests.pm._fixtures import stage_host_python
 
 @pytest.fixture(scope="module")
 def locked_wheelhouse(tmp_path_factory):
-    """Download host wheels first; only the subsequent stage runs offline."""
+    """Copy hash-locked universal wheels without relying on a populated host cache."""
     wheelhouse = tmp_path_factory.mktemp("pm-wheelhouse")
+    source = Path(__file__).with_name("fixtures") / "runtime-wheelhouse"
     project = Path(__file__).resolve().parents[2] / "pm"
     lock = tomllib.loads((project / "uv.lock").read_text(encoding="utf-8-sig"))
     tags = set(sys_tags())
@@ -32,10 +32,10 @@ def locked_wheelhouse(tmp_path_factory):
                    if parse_wheel_filename(wheel["url"].rsplit("/", 1)[1])[3] & tags]
         assert choices, f"no host wheel for {package['name']}"
         wheel = choices[0]
-        with urllib.request.urlopen(wheel["url"], timeout=60) as response:
-            data = response.read()
+        filename = wheel["url"].rsplit("/", 1)[1]
+        data = (source / filename).read_bytes()
         assert "sha256:" + hashlib.sha256(data).hexdigest() == wheel["hash"]
-        (wheelhouse / wheel["url"].rsplit("/", 1)[1]).write_bytes(data)
+        (wheelhouse / filename).write_bytes(data)
         versions[package["name"]] = package["version"]
     return wheelhouse, versions
 

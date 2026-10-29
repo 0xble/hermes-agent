@@ -481,6 +481,14 @@ prompt assertions remain. Each parallel scenario owns its provider and barrier.
 Retire this synchronization when upstream supplies equivalent observation-driven
 fault injection.
 
+The PM wheelhouse fixture uses the four unmodified universal wheels vendored in
+`tests/pm/fixtures/runtime-wheelhouse`, not live PyPI or a host cache. It checks
+their hashes against the current `pm/uv.lock` before copying them into the
+isolated wheelhouse. Keep the fixtures and lock together when updating PM. The
+offline sealing, relocation and missing-locked-wheel rejection checks are
+unchanged. Retire the vendored source if upstream provides an equally hermetic
+real-wheel fixture.
+
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
 complete-suite gap or proves an installed runtime.
