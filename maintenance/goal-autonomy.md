@@ -80,6 +80,30 @@ prompt rebuild. It calls for another route or timed sleep instead of stopping
 for input. The generated wording registry includes it and preserves all earlier
 shipped entries, including wordings whose source branches have been retired.
 
+## Notice Visibility
+
+`goals.notices` defaults to `true`. When false, the shared profile-scoped helper
+suppresses routine gateway lifecycle output, automatic CLI/TUI revival, barrier
+and judge output, and every persisted `goal_set` receipt, including completion.
+The legacy `goals.auto_notices` preference still independently controls inline
+receipts. Loop receipts and loop completion output retain their existing policy.
+Explicit `/goal status`, `/goal show`, command errors and approval requests remain
+visible. Structured tool results and TUI control snapshots remain available.
+
+Terminal session-control records with `authority.via=autonomy` settle their
+cosmetic target and requester flags as `target_notice_skipped` and
+`requester_notification_skipped`, including when adapters are offline. They still
+perform normal cleanup, continuation admission, supersession checks and expiry.
+Reconnect does not replay the skipped notices. Quote, button and session
+authorities retain their outcome replies. Visibility never authorizes a mutation
+or bypasses evidence, inherited requirements or wake fences.
+
+The correction reuses the already-shipped profile-scoped helper and surface
+guards, and adds deferred-delivery profile re-entry plus quiet settlement of
+autonomous control receipts. Local event-stream verdicts are not a separate path
+on this runtime: the local adapter send is a no-op and viewers read the stream.
+No upstream contribution or moving-main synchronization is included.
+
 ## Verification And Activation Boundary
 
 Run the complete goal and session-control test inventory with the canonical
@@ -88,6 +112,10 @@ Run the complete goal and session-control test inventory with the canonical
 requirements, removal quotes, blocker and gate/budget waits, external rechecks,
 legacy migration, profile selection, and default-off behavior. Historical prompt
 classification runs in `tests/agent/test_synthetic_prompt_legacy_goals.py`.
+Notice visibility runs in `tests/agent/test_quiet_goal_receipts.py`,
+`tests/gateway/test_goal_notices_config.py`,
+`tests/gateway/test_quiet_goal_control_recovery.py` and both
+`test_goal_notice_surfaces.py` files under `tests/hermes_cli` and `tests/tui_gateway`.
 The companion plugin tests drive the registered goal_set handler through the
 native managers and durable readbacks.
 

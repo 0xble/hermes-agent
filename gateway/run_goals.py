@@ -334,7 +334,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _retry_goal_status_notice(
         self, source: Any, message: str, metadata: Any, wait: float, already_waited: float,
-        attempts: int, notice_kind: Optional[str] = None,
+        attempts: int, notice_kind: Optional[str] = None, *, goal_notice: bool = True,
     ) -> None:
         from gateway.delivery_ledger import short_flood_wait
 
@@ -348,6 +348,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                     notice_kind or _goal_notice_kind(message), attempts,
                 )
                 raise
+            # The wait can outlive the turn scope, and a profile can change policy while it sleeps.
+            if goal_notice and not goal_notices_enabled():
+                return
             adapter = self._goal_notice_adapter(source)
             if not adapter:
                 self._log_goal_status_notice_failure(
@@ -413,6 +416,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         task = asyncio.create_task(
             self._retry_goal_status_notice(
                 source, message, metadata, wait, wait, attempts=1, notice_kind=notice_kind,
+                goal_notice=goal_notice,
             ),
             name=f"goal-status-retry:{notice_kind or _goal_notice_kind(message)}",
         )
@@ -434,7 +438,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message, goal_notice=goal_notice)
+                # Adapters invoke post-delivery callbacks after the turn's profile scope exits.
+                with self._profile_scope_for_source(source):
+                    await self._send_goal_status_notice(source, message, goal_notice=goal_notice)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 

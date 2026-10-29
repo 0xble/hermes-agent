@@ -59,6 +59,8 @@ arbitrary queue depth is not an enqueue receipt: the outbox retries until its ow
 accepted or superseded. Queue cleanup runs synchronously on the event loop and removes the adapter
 slot only while it still holds the inspected continuation. A persisted gateway origin with an
 unavailable adapter retains its unsettled outcome flags for retry, including cleanup and notices;
+`goals.notices: false` settles only autonomous goal outcome notices as skipped, not
+continuation admission or cleanup (see [notice visibility](goal-autonomy.md#notice-visibility));
 only a missing origin is permanently skipped. Offline continuations still record supersession,
 and the existing 24-hour outcome expiry bounds retries.
 
