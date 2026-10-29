@@ -1,3 +1,5 @@
+
+
 """Advisory memory health must stay bounded and preserve actionable diagnostics.
 
 Regression tests for #910's standalone named-profile memory notice routing.
@@ -6,6 +8,29 @@ import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+from gateway import runtime_health as health
+
+
+@pytest.mark.parametrize("metadata", ["missing", "invalid-requirement"])
+def test_optional_metadata_cannot_hide_provider_reason(tmp_path, monkeypatch, caplog, metadata):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("memory: {provider: fixture}\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda *args, **kwargs: SimpleNamespace(
+        is_available=lambda: False, unavailable_reason=lambda: "SDK client is missing"))
+    inputs = Mock(side_effect=ValueError("bad optional manifest")) if metadata == "missing" else Mock(
+        return_value=({"python_dependencies": ["not a requirement !!!"]}, {}))
+    monkeypatch.setattr("hermes_cli.memory_setup.memory_provider_dependency_inputs", inputs)
+    assert "SDK client is missing" in health._readiness_issue()
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+"""Advisory health must not hold gateway startup or lose provider diagnostics."""
+import logging
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -39,7 +64,7 @@ async def test_scope_discovery_is_off_loop_and_uses_served_primary_home(tmp_path
         checked.append((profile, home))
 
     monkeypatch.setattr("gateway.run._handoff_watch_scopes", Mock(side_effect=AssertionError("sync resolver used")))
-    monkeypatch.setattr("gateway.run._resolve_handoff_watch_scopes", AsyncMock(return_value=[(None, None), ("launch", launch)]))
+    monkeypatch.setattr("gateway.runtime_health._health_scopes", AsyncMock(return_value=[(None, None), ("launch", launch)]))
     monkeypatch.setattr(health, "_check_profile_health", check)
     monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: primary)
     gateway = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True),
@@ -108,7 +133,7 @@ async def test_startup_does_not_await_blocked_advisory_health(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_failing_profile_tracebacks_are_deduped_per_release(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr("gateway.run._resolve_handoff_watch_scopes", AsyncMock(return_value=[("broken", tmp_path)]))
+    monkeypatch.setattr("gateway.runtime_health._health_scopes", AsyncMock(return_value=[("broken", tmp_path)]))
     monkeypatch.setattr(health, "_check_profile_health", AsyncMock(side_effect=ValueError("bad config")))
     monkeypatch.setattr("hermes_cli.version_info.get_code_identity", lambda: {"sha": "A"})
     gateway = SimpleNamespace()

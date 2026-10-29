@@ -56,16 +56,20 @@ def _failure_key(home: Path) -> str:
         return str(_marker(home))
     except Exception:  # health: allow BLE001 -- marker identity fallback must never break readiness checks
         return f"{__file__}:{home}"
+def _health_scopes(runner) -> list[tuple[str | None, Path]]:
+    from gateway.run import _multiplex_profile_homes
+    from hermes_constants import get_hermes_home
+
+    config = getattr(runner, "config", None)
+    if config is not None and getattr(config, "multiplex_profiles", False):
+        # Adapter ownership uses None for the served default home, not the launch home.
+        return [(None if name == "default" else name, Path(home))
+                for name, home in _multiplex_profile_homes(config)]
+    return [(None, get_hermes_home())]
 
 
 async def check_memory_health(runner) -> None:
-    from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
-    from hermes_constants import get_default_hermes_root, get_hermes_home
-
-    # Multiplexing serves every profile from the default root. A standalone gateway, including a named
-    # profile launched on its own, serves only its launch home, so the unscoped primary must stay there.
-    multiplexed = bool(getattr(getattr(runner, "config", None), "multiplex_profiles", False))
-    primary_home = get_default_hermes_root if multiplexed else get_hermes_home
+    from gateway.run import _async_profile_runtime_scope
 
     lock = getattr(runner, "_memory_health_lock", None)
     if lock is None:
@@ -73,9 +77,9 @@ async def check_memory_health(runner) -> None:
     if lock.locked():
         return
     async with lock:
-        for profile, home in await _resolve_handoff_watch_scopes(runner):
+        for profile, home in await asyncio.to_thread(_health_scopes, runner):
             try:
-                home = Path(home or primary_home())
+                home = Path(home)
                 async with _async_profile_runtime_scope(home):
                     await _check_profile_health(runner, profile, home)
             except Exception:  # health: allow BLE001 -- advisory profile probes must isolate failures
