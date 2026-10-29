@@ -319,6 +319,13 @@ async def test_channel_root_rewrite_never_touches_free_human_text(adapter, chann
     runs = blocks[0]["elements"][0]["elements"]
     assert runs[0] == {"type": "text", "text": "Check Hindsight backlog", "style": {"bold": True}}
     assert runs[1:] == SEEDED_BLOCKS[0]["elements"][0]["elements"][1:]
+    # The edit echoes back as message_changed from an api_human_users author; it must not start a turn.
+    from plugins.platforms.slack.message_changes import normalize_changed_message
+    echo = {"subtype": "message_changed", "channel": "C123", "ts": "171234.0009", "event_ts": "171234.0009",
+            "previous_message": {"ts": "171234.0001", "user": "UOWNER", "text": SEEDED},
+            "message": {"ts": "171234.0001", "user": "UOWNER", "text": "*Check Hindsight backlog*\nMoved from Telegram.",
+                        "edited": {"user": "UOWNER", "ts": "171234.0009"}}}
+    assert normalize_changed_message(adapter, echo) is None
 
 
 @pytest.mark.asyncio

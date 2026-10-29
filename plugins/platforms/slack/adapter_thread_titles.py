@@ -97,6 +97,7 @@ class SlackThreadTitlesMixin:
     _proxy_url: Any
     _new_web_client: Any
     _slack_api_human_users: Any
+    _remember_processed_message_ts: Any
 
     def _assistant_thread_title_enabled(self) -> bool:
         raw = self.config.extra.get("assistant_thread_titles", True)
@@ -226,6 +227,9 @@ class SlackThreadTitlesMixin:
                 client = await self._opener_author_client(team_id, root.get("user") or "")
                 if client is None:
                     return
+            # Our edit echoes back as message_changed. Claim the root so the inbound guard treats
+            # it as seen; an unseen root's text edit would otherwise start a turn as its author.
+            self._remember_processed_message_ts(source.thread_id)
             await client.chat_update(channel=source.chat_id, ts=source.thread_id, **kwargs)
         except SlackApiError as e:
             logger.info("[Slack] channel thread root title rejected: %s",
