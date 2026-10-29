@@ -283,6 +283,105 @@ async def test_requester_outcome_stays_in_its_recorded_session(state, rebind, ti
     assert admitted == ([] if rebind else ["requester"])
 
 
+def _local_requester_runner(state, *, live: bool):
+    """A watcher runner whose requester is a local (CLI/TUI) session, delivered through the real
+    injector into a session authority that holds the session only when *live*."""
+    from types import MethodType
+    from gateway.run_plugin_injection import GatewayPluginInjectionMixin
+    from gateway.session import Platform, SessionEntry, SessionSource
+    from hermes_constants import get_hermes_home
+
+    runner = _runner(state)
+    now = datetime.now(UTC)
+    key = "agent:main:local:dm:requester"
+    local = SessionSource(platform=Platform.LOCAL, chat_id="requester", chat_type="dm")
+    requester = SessionEntry(key, "requester", now, now, origin=local)
+    entries = {"target": runner.target, "requester": requester}
+    runner.session_store = SimpleNamespace(lookup_by_session_id=entries.get)
+    runner.async_session_store = SimpleNamespace(
+        lookup_by_session_key=AsyncMock(side_effect=lambda k: requester if k == key else None))
+    runner._adapter_for_source = lambda source: runner.adapter
+    runner.session_authority = SimpleNamespace(
+        db=SimpleNamespace(db_path=str(get_hermes_home() / "state.db")),
+        sessions={"requester": SimpleNamespace(route=key, source=local)} if live else {},
+        admit_automation=AsyncMock(),
+    )
+    runner._dispatch_plugin_message_injection = MethodType(
+        GatewayPluginInjectionMixin._dispatch_plugin_message_injection, runner,
+    )
+    return runner
+
+
+def _apply_clear(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    state.append_message("requester", "user", "Please clear the target goal immediately")
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           user_quote="clear the target goal immediately")
+    assert result["status"] == "applied"
+    return result["record"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_live_local_requester_receives_its_outcome(state):
+    """The drain names its own profile home, so a live local requester is resolved through that
+    profile's session authority instead of being refused for a missing plugin home every pass."""
+    from hermes_cli.session_controls import _load_record, pending_outbox
+
+    runner = _local_requester_runner(state, live=True)
+    request_id = _apply_clear(state)
+
+    await runner._drain_session_controls()
+
+    record = _load_record(request_id)
+    assert record["requester_notified"] is True
+    assert record["outbox_done"] is True
+    runner.session_authority.admit_automation.assert_awaited_once()
+    event = runner.session_authority.admit_automation.await_args.args[1]
+    assert event.metadata["gateway_session_id"] == "requester"
+    assert "cleared" in event.text or "applied" in event.text
+    assert pending_outbox() == []
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_requester_outcome_settles_after_retry_window(state, caplog):
+    """A requester the authority no longer holds keeps being retried inside the notice window,
+    then settles as skipped with a logged reason instead of re-running every pass for 24 hours."""
+    import json
+    import logging
+    from gateway.run_session_controls import GatewaySessionControlsMixin
+    from hermes_cli import session_controls
+    from hermes_cli.session_controls import _load_record, pending_outbox
+
+    runner = _local_requester_runner(state, live=False)
+    request_id = _apply_clear(state)
+
+    await runner._drain_session_controls()
+    await runner._drain_session_controls()
+    record = _load_record(request_id)
+    assert record["target_notice_sent"] is True
+    assert record["requester_notified"] is False
+    assert record["requester_notification_skipped"] is False
+    assert [item["id"] for item in pending_outbox()] == [request_id]
+
+    key = session_controls._record_key(request_id)
+    raw = json.loads(state.get_meta(key))
+    raw["resolved_at"] = float(raw["resolved_at"]) - GatewaySessionControlsMixin._NOTICE_RETRY_SECONDS - 1
+    state.set_meta(key, json.dumps(raw))
+    with caplog.at_level(logging.WARNING, logger="gateway.run_session_controls"):
+        await runner._drain_session_controls()
+
+    record = _load_record(request_id)
+    assert record["requester_notified"] is False
+    assert record["requester_notification_skipped"] is True
+    assert record["outbox_done"] is True
+    assert pending_outbox() == []
+    assert any("undeliverable" in r.getMessage() and request_id in r.getMessage() for r in caplog.records)
+    runner.session_authority.admit_automation.assert_not_awaited()
+
+
 
 @pytest.mark.asyncio
 async def test_watcher_denied_control_leaves_goal_and_notifies_requester(state):
