@@ -236,6 +236,15 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Unicode TAG character stripping | Strip invisible plane-14 TAG characters from model-facing skill, web, browser, MCP, and read_file results | Tool-result construction, Unicode tag stripping, or those tool output paths | [Unicode TAG character stripping](maintenance/unicode-tag-strip.md) |
 | Go write lint scope | Post-write lint for `.go` files checks syntax with `gofmt -e`, leaving type, vet and lint checks to package-level gates and the Go LSP | Post-write shell linters, Go lint commands, or LSP redundancy rules in `tools/file_operations_lint.py` | [Go write lint scope](maintenance/go-write-lint.md) |
 
+## Active Patch Record: Exa Lite Routing
+
+- **Patch identity:** `exa-lite-routing`.
+- **Behavior:** Exa defaults to Auto. An agent's explicit `stakes="standard"` selects Lite unless the existing protected-topic or non-ASCII guard forces Auto. No commodity or site allowlist is required. Request-local preparation keeps concurrent hints isolated, cache keys separate tiers, and result metadata reports the current request's reason, including on cache hits, plus the served tier when the paid Exa SDK served the request. Keyless and rescued responses report `served_by` or `rescued_from` instead. Other providers are unchanged. Known keyword gaps rely on agent judgment by design, with protected-topic pilot spot-checks.
+- **Source surfaces:** `plugins/web/exa/policy.py`, `plugins/web/exa/provider.py`, `agent/web_search_provider.py`, `tools/web_tools.py`, `tools/code_execution_tool.py`, and the web-search provider developer guide.
+- **Focused regression:** `tests/tools/test_web_exa_lite_routing.py` and `tests/tools/test_code_execution_file_rpc.py`, plus the existing web-provider, cache, routing, configuration, rescue, and code-execution suites.
+- **Retirement:** Remove when upstream provides equivalent agent-judged tier routing, protected-query overrides, request isolation, and cache-hit tier metadata.
+- **Rollback:** Revert the commit carrying `Fork-Patch: exa-lite-routing`.
+
 ## Active patch record: state.db prune lock batching
 
 - **Patch identity:** `state-prune-lock-batching`.
@@ -476,6 +485,18 @@ Fork-Patch: web-search-cost-controls.
 - **Focused regression:** `scripts/run_tests.sh tests/tools/test_web_result_cache.py tests/tools/test_web_keyless_rescue.py tests/tools/test_web_providers.py`.
 - **Retirement:** Remove when released upstream provides equivalent cross-process paid-search deduplication, route-aware cache identity, and visible warning behavior.
 - **Rollback:** Revert the commit carrying `Fork-Patch: web-search-cost-controls`.
+
+## Active patch record: Exa direct extraction
+
+Fork-Patch: exa-direct-extract.
+
+- **Patch identity:** `exa-direct-extract`.
+- **Behavior:** For paid Exa extraction of known HTML URLs, try bounded direct HTTP and readable-text cleanup before paid contents. Reject thin, access-gated, challenge or unsupported responses, preserve visible fallback/rescue attribution and batch order, and do not cache direct results or newly fetched fallback contents. Existing keyless, non-Exa, non-Markdown, PDF and disabled-direct routes remain unchanged. Search behavior and schemas are untouched.
+- **Source surfaces:** `tools/web_extract_direct.py`, `tools/web_extract_html.py`, `tools/web_tools_extract.py`, `tools/web_tools_truncate.py`, and focused extraction tests. Builds on [direct web extraction](maintenance/web-extract-direct.md).
+- **Provenance:** Split from reviewed `4e42e464c6c228e975c2a87352fc5ab1a51e6bee`, without its Lite/Auto search policy. Paid-route eligibility lives in the extraction dispatcher to leave `plugins/web/exa/` unchanged.
+- **Focused regression:** `tests/tools/test_web_extract_direct_policy.py`, `tests/tools/test_web_extract_direct.py`, and web extraction/cache/provider regressions.
+- **Retirement:** Remove when a released upstream provides equivalent bounded direct HTML extraction with conservative content acceptance and truthful fallback attribution.
+- **Rollback:** Revert the commit carrying `Fork-Patch: exa-direct-extract`, preserving the pre-existing plain-file and local-docs route.
 
 ## Update
 
