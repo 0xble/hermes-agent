@@ -228,10 +228,10 @@ def notify_other_tool_call(task_id: str = "default"):
                     task_data[key].clear()
 
 
-def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
+def _invalidate_dedup_for_path(filepath: str, task_id: str, *, resolved: str | None = None) -> None:
     """Evict every dedup entry (all offset/limit ranges) and not-found entry for *filepath*
     after a write, so the next read returns fresh content. Acquires the lock itself."""
-    resolved = _resolved_or_none(filepath, task_id)
+    resolved = resolved if resolved is not None else _resolved_or_none(filepath, task_id)
     if resolved is None:
         return
     with _read_tracker_lock:
@@ -253,17 +253,17 @@ def _backend_mtime(path: str):
     return os.path.getmtime(path)
 
 
-def _update_read_timestamp(filepath: str, task_id: str) -> None:
+def _update_read_timestamp(filepath: str, task_id: str, *, resolved: str | None = None) -> None:
     """After a successful write: invalidate dedup and refresh the stored mtime so
     consecutive edits by the same task don't trigger false staleness warnings.
 
     Also invalidates the dedup cache for the written path so that subsequent reads return fresh content
-    (fixes #13144).
+    (fixes #13144). A committed edit supplies its already-resolved identity.
     """
-    _invalidate_dedup_for_path(filepath, task_id)
-    resolved = _resolved_or_none(filepath, task_id)
+    resolved = resolved if resolved is not None else _resolved_or_none(filepath, task_id)
     if resolved is None:
         return
+    _invalidate_dedup_for_path(filepath, task_id, resolved=resolved)
     try:
         current_mtime = _backend_mtime(resolved)
     except OSError:

@@ -148,7 +148,7 @@ if request["action"] == "stop":
     if result["state"] == "running":
         # The token-scoped request is consumed by the original supervisor. A stale
         # receipt can never authorize a PID signal from a new SSH connection.
-        temporary = run / "stop.tmp"
+        temporary = run / ("stop." + str(os.getpid()) + ".tmp")
         temporary.write_text(json.dumps({"token": token, "source": request.get("source", "process.kill")}), encoding="utf-8")
         os.replace(temporary, run / "stop.json")
         deadline = time.monotonic() + request.get("wait", 3)
@@ -197,6 +197,9 @@ class SSHProcessMixin:
             from tools.environments.ssh import SSHEnvironment
             # Never consult nodes.default or a mutable named-node registry here.
             session.env_ref = SSHEnvironment(host=session.ssh_binding.ssh, user="", sync_files=False)
+            from tools.nodes import Node
+            binding = session.ssh_binding
+            session.env_ref._hermes_node = Node(binding.node_name, binding.ssh, binding.platform)
         if getattr(session.env_ref, "host", session.ssh_binding.ssh) != session.ssh_binding.ssh:
             raise RuntimeError("SSH environment target changed since this process was launched")
         return session.env_ref
@@ -278,10 +281,33 @@ class SSHProcessMixin:
     def _refresh_ssh(self, session, *, action="inspect", timeout=10):
         if session.exited:
             return True
-        if not session._ssh_lock.acquire(blocking=False):
+        if action == "stop":
+            # Stop is an idempotent token-scoped control request, independent of
+            # the output decoder/offset lock held by an in-flight long poll.
+            deadline = time.monotonic() + timeout
+            try:
+                record = self._ssh_request(session, "stop", timeout=timeout,
+                                           wait=max(0, min(3, timeout - 0.5)), max_output=0,
+                                           source=session._ssh_kill_source)
+                if record.get("state") not in {"running", "exited"}:
+                    raise RuntimeError("Remote supervisor/receipt unavailable; stop is unconfirmed")
+            except Exception as exc:
+                session.remote_error = str(exc)
+                return False
+            remaining = max(0.0, deadline - time.monotonic())
+            if not session._ssh_lock.acquire(timeout=remaining):
+                session.remote_error = "Remote stop sent but refresh is still in flight; retry the same handle"
+                return False
+            timeout = max(0.0, deadline - time.monotonic())
+        elif not session._ssh_lock.acquire(blocking=False):
             return False
         try:
-            return self._refresh_ssh_locked(session, action=action, timeout=timeout)
+            if session.exited:
+                return True
+            if action == "stop" and timeout <= 0:
+                session.remote_error = "Remote stop sent but confirmation timed out; retry the same handle"
+                return False
+            return self._refresh_ssh_locked(session, action="inspect", timeout=timeout)
         finally:
             session._ssh_lock.release()
 
@@ -384,6 +410,9 @@ def handle_process(args, **kw):
             binding = session.ssh_binding
             if binding is None or (binding.node_name, binding.ssh, binding.platform) != (node.name, node.ssh, node.platform):
                 raise NodeError("Explicit node conflicts with the process handle's original node/SSH identity")
+        if session is not None and session.ssh_binding is not None:
+            from tools.node_execution import record_result_environment
+            record_result_environment(source.process_registry._ssh_environment(session))
         if action == "handoff":
             result = source._handoff_process(session_id, args, kw.get("task_id"))
         elif action in source._SESSION_ACTIONS:

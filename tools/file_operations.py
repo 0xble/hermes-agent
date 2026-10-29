@@ -1505,6 +1505,18 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             hash_result = None if disk_sha else self._exec(f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null")
             if hash_result is not None and hash_result.exit_code == 0 and hash_result.stdout.strip():
                 disk_sha = hash_result.stdout.strip().split()[0]
+            if not disk_sha:
+                # Minimal macOS peers have Python but no GNU coreutils. Hash on
+                # the same backend without depending on a platform-specific CLI.
+                hash_result = self._exec_python_snippet(
+                    "import hashlib\n"
+                    "digest=hashlib.sha256()\n"
+                    f"with open({path!r},'rb') as stream:\n"
+                    "    for block in iter(lambda:stream.read(1048576),b''):\n"
+                    "        digest.update(block)\n"
+                    "print(digest.hexdigest())\n")
+                if hash_result.exit_code == 0:
+                    disk_sha = hash_result.stdout.strip()
             if disk_sha:
                 if disk_sha != hashlib.sha256(content_bytes).hexdigest():
                     return False, WriteResult(error=(

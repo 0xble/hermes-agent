@@ -857,12 +857,31 @@ def _edit_warnings(paths: list[str], path_to_resolved: dict, task_id: str) -> li
     return warnings
 
 
+@contextmanager
+def _post_edit_bookkeeping(result_dict: dict, task_id: str):
+    """Keep a committed backend result when optional metadata refresh fails.
+
+    Discard the caller's read authority and caches rather than letting partially
+    refreshed bookkeeping authorize another overwrite or hide the new bytes.
+    """
+    try:
+        yield
+    except Exception as exc:
+        from tools.node_execution import tracking_key
+        with _read_tracker_lock:
+            _read_tracker.pop(tracking_key(task_id), None)
+        result_dict["bookkeeping_warning"] = (
+            f"Post-edit bookkeeping failed: {exc}. Read tracking was cleared; "
+            "re-read the affected paths before another whole-file overwrite.")
+        logger.warning("Post-edit bookkeeping failed for task %s: %s", task_id, exc)
+
+
 def _note_edited(task_id: str, paths: list[str], path_to_resolved: dict, session_id: str | None) -> None:
     """Post-success bookkeeping: verification-stale marker, then per path refresh
     the read stamp (no false staleness on the next edit) and record the write."""
     _mark_verification_stale(task_id, [path_to_resolved.get(p) or p for p in paths], session_id=session_id)
     for p in paths:
-        _update_read_timestamp(p, task_id)
+        _update_read_timestamp(p, task_id, resolved=path_to_resolved.get(p))
         if path_to_resolved.get(p):
             file_state.note_write(task_id, path_to_resolved[p])
 
@@ -962,15 +981,19 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 # Always report the ABSOLUTE path written so a wrong-cwd mismatch
                 # is visible in the response instead of silently landing elsewhere.
                 result_dict["resolved_path"] = _resolved
-            if result_dict.get("error"):
-                _update_read_timestamp(path, task_id)
-            else:
-                if _resolved:
-                    result_dict["files_modified"] = [_resolved]
-                    # Own write = current whole-file content: consecutive
-                    # same-task writes stay unblocked (patch_tool carries it).
-                    _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
-                _note_edited(task_id, [path], path_to_resolved, session_id)
+            # The backend result is authoritative. Metadata failures after
+            # this point cannot turn a committed write into a generic error.
+            if not result_dict.get("error") and _resolved:
+                result_dict["files_modified"] = [_resolved]
+            with _post_edit_bookkeeping(result_dict, task_id):
+                if result_dict.get("error"):
+                    _update_read_timestamp(path, task_id)
+                else:
+                    if _resolved:
+                        # Own write = current whole-file content: consecutive
+                        # same-task writes stay unblocked (patch_tool carries it).
+                        _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
+                    _note_edited(task_id, [path], path_to_resolved, session_id)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
@@ -1076,10 +1099,11 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
                 result_dict["files_modified"] = _resolved_modified
                 if len(_resolved_modified) == 1:
                     result_dict["resolved_path"] = _resolved_modified[0]
-                _note_edited(task_id, _paths_to_check, _path_to_resolved, session_id)
-                _carry_full_write_baselines(task_id, _known, getattr(result, "_writes", ()), _path_to_resolved)
-                # Clear failure counters so a future miss starts a fresh count.
-                _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
+                with _post_edit_bookkeeping(result_dict, task_id):
+                    _note_edited(task_id, _paths_to_check, _path_to_resolved, session_id)
+                    _carry_full_write_baselines(task_id, _known, getattr(result, "_writes", ()), _path_to_resolved)
+                    # Clear failure counters so a future miss starts a fresh count.
+                    _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
         # old_string-not-found hint. Failure escalation is tracked for replace
         # mode only (V4A misses are rare); the generic hint is suppressed when
         # patch_replace already attached a richer "Did you mean?" snippet.
