@@ -741,7 +741,8 @@ class CLILoopsMixin:
             return
         mgr = self._get_goal_manager()
         if mgr is not None and mgr.resume_for_user_input():
-            _cprint(f"  ▶ Goal resumed: {mgr.state.goal}")
+            if goal_notices_enabled():
+                _cprint(f"  ▶ Goal resumed: {mgr.state.goal}")
 
     def _post_turn_response(self) -> tuple[str, bool]:
         """Read only the current turn result; a started turn without one is unsuccessful."""

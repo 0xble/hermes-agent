@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from hermes_cli.session_controls import REPLACEMENT_MAX_CHARS
+from hermes_cli.goal_notices import goal_notices_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +280,8 @@ class GatewaySessionControlsMixin:
         if status not in {"applied", "denied", "failed", "expired"}:
             return
 
+        record = await self._settle_quiet_autonomy_notices(session_controls, record)
+
         # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
         source, adapter = await self._session_control_route(target_entry)
         # Any outcome whose gateway origin persists but whose adapter is offline is retryable:
@@ -385,6 +388,22 @@ class GatewaySessionControlsMixin:
 
         if self._outbox_complete(record) and not record.get("outbox_done"):
             await self._mark_control(session_controls, request_id, "outbox_done")
+
+    async def _settle_quiet_autonomy_notices(self, session_controls, record):
+        """Settle only cosmetic delivery of autonomous goal outcomes when goal notices are off.
+
+        Runs even offline. Continuation admission and cleanup still own progress, supersession
+        and recovery, and explicit authorities (quote, button, session) keep their replies.
+        """
+        if (record.get("kind") != "goal"
+                or (record.get("authority") or {}).get("via") != "autonomy"
+                or goal_notices_enabled()):
+            return record
+        for sent, skipped in (("target_notice_sent", "target_notice_skipped"),
+                              ("requester_notified", "requester_notification_skipped")):
+            if not record.get(sent) and not record.get(skipped):
+                record = await self._mark_and_finish(session_controls, record, skipped)
+        return record
 
     async def _admit_control_continuation(self, record, session_controls, source, adapter, key, prompt):
         from gateway.wake import WakeNotAccepted, WakeSuperseded, admit_internal_event

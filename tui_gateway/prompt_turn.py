@@ -103,7 +103,9 @@ def _revive_blocked_goal_for_user_turn(sid: str, session: dict, user_turn: bool)
     from hermes_cli.goals import GoalManager
     goal_mgr = GoalManager(session_id=str(session["session_key"]))
     if goal_mgr.resume_for_user_input():
-        _emit("status.update", sid, {"kind": "goal", "text": f"▶ Goal resumed: {goal_mgr.state.goal}"})
+        from hermes_cli.goal_notices import goal_notices_enabled
+        if goal_notices_enabled():
+            _emit("status.update", sid, {"kind": "goal", "text": f"▶ Goal resumed: {goal_mgr.state.goal}"})
         _publish_session_control_snapshot(sid, session, only_if_present=True)
 
 
