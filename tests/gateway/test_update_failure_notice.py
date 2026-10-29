@@ -442,7 +442,7 @@ def test_immutable_build_failure_has_untouched_source_proof(update_tree, tmp_pat
 
 
 @pytest.mark.parametrize("case", [
-    "no_record", "activation_started", "activation_unknown", "after_missing", "after_differs",
+    "no_record", "activation_started", "activation_unknown", "staging_unknown", "staging_not_boolean", "after_missing", "after_differs",
     "pointer_moved_since", "marker_rewritten", "candidate_is_active",
 ])
 def test_immutable_unchanged_claim_needs_every_part_of_the_pointer_proof(
@@ -462,6 +462,10 @@ def test_immutable_unchanged_claim_needs_every_part_of_the_pointer_proof(
         proof["activation_started"] = True
     elif case == "activation_unknown":
         del proof["activation_started"]
+    elif case == "staging_unknown":
+        del receipt["staging_runtime_mutation_started"]
+    elif case == "staging_not_boolean":
+        receipt["staging_runtime_mutation_started"] = 0
     elif case == "after_missing":
         proof["after"] = None
     elif case == "after_differs":
@@ -488,7 +492,7 @@ def test_immutable_unchanged_claim_needs_every_part_of_the_pointer_proof(
     assert "Cause: candidate build failed" in detail
 
 
-def test_activation_start_is_recorded_before_the_first_runtime_mutation(update_tree, tmp_path, monkeypatch):
+def test_activation_start_is_recorded_before_the_pending_marker(update_tree, tmp_path, monkeypatch):
     """A failure at the pending-marker write follows staging, so it cannot read as unchanged."""
     from hermes_cli import main, update_cmd, update_receipt
     from tests.hermes_cli.test_update_target_identity import git

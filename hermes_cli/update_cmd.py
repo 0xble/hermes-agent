@@ -2243,12 +2243,14 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
     immutable_proof = {"before": release_identity(home), "candidate": str(paths.release(fetched)),
                        "source": str(source), "activation_started": False}
     record_fact("immutable_update", immutable_proof)
+    record_fact("staging_runtime_mutation_started", False)
     # stage_release archives the selected target (FETCH_HEAD or a local carry-forward merge),
     # builds web and its own locked environment in a build-aside directory, then publishes it.
     candidate, _ = stage_release(source, home, sha=fetched, branch=selected_branch)
     if candidate != paths.release(fetched) or not _release_is_ready(candidate, fetched):
         raise RuntimeError("staged release does not match fetched commit")
-    # Everything below this line can change the runtime: the pending marker, then the hand-off.
+    # Activation can change runtime state from the pending marker onward. Staging's PM sync
+    # separately records staging_runtime_mutation_started before it can edit shared profiles.
     record_fact("immutable_update", {**immutable_proof, "activation_started": True})
     _write_fleet_restart_pending_marker(
         expected_sha=fetched,

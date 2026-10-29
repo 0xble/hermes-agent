@@ -474,7 +474,11 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
                      if extra in leaves and not leaves[extra] <= installed)
     if missing:
         import pm
-        from hermes_cli.update_receipt import record_step
+        from hermes_cli.update_receipt import record_fact, record_step
+        # This sync can publish profile config edits (plugin eviction/memory.provider) and
+        # recover earlier publications outside the candidate. Mark the boundary before entering
+        # PM, even if it fails or its worker never returns mutation evidence.
+        record_fact("staging_runtime_mutation_started", True)
         # An update never fails because of a plugin: evict one that keeps the candidate's
         # environment from building, as every other update-path sync does.
         pm.sync_venv(missing, explicit=True, project_root=candidate, evict_incompatible_plugins=True)
