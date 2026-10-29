@@ -1455,6 +1455,30 @@ def resolved_release(home: Path) -> Path | None:
     return release if _release_is_ready(release, release.name) else None
 
 
+def release_identity(home: Path) -> dict[str, Any] | None:
+    """Pointer and readiness-marker fingerprint of the active release; None when unreadable.
+
+    Releases are never edited in place, so an identical fingerprint before and after a
+    failed candidate build is the evidence that the active release was left alone. It
+    identifies the release (link, resolved path, build sha, marker inodes and mtimes) and
+    does not hash the release tree.
+    """
+    paths = ReleasePaths.for_home(home)
+    try:
+        link = os.readlink(paths.current)
+        release = resolved_release(paths.home)
+        if release is None:
+            return None
+        markers = {}
+        for name in (".release-ready", ".hermes_build_sha"):
+            stat = (release / name).stat()
+            markers[name] = [stat.st_ino, stat.st_mtime_ns, stat.st_size]
+    except OSError:
+        return None
+    return {"home": str(paths.home), "link": link, "path": str(release),
+            "sha": release.name, "markers": markers}
+
+
 def update_source_checkout(home: Path, running_root: Path) -> Path | None:
     """Resolve the only authorized git checkout for an update from a release.
 

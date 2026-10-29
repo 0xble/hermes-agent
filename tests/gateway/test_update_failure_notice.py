@@ -418,6 +418,13 @@ def test_immutable_build_failure_has_untouched_source_proof(update_tree, tmp_pat
     monkeypatch.setattr("gateway.update_notifications.__file__", str(release / "gateway/update_notifications.py"))
     path = fail_immutable_update(home, source)
     receipt = json.loads(path.read_text())
+    proof = receipt["immutable_update"]
+    assert proof["before"] == proof["after"]
+    assert proof["before"]["path"] == str(release)
+    assert proof["before"]["sha"] == release.name
+    assert proof["activation_started"] is False
+    assert proof["candidate"] != str(release)
+    assert proof["source"] == str(source)
     assert not any(step["name"] == "local_changes_stash" for step in receipt["steps"])
     assert git(source, "status", "--porcelain") == before
     assert git(source, "rev-parse", "HEAD") == update_tree.base
@@ -432,6 +439,98 @@ def test_immutable_build_failure_has_untouched_source_proof(update_tree, tmp_pat
     receipt["steps"] = []
     latest.write_text(json.dumps(receipt))
     assert "Runtime state is unverified" in final_outcome(home, request)[1]
+
+
+@pytest.mark.parametrize("case", [
+    "no_record", "activation_started", "activation_unknown", "after_missing", "after_differs",
+    "pointer_moved_since", "marker_rewritten", "candidate_is_active",
+])
+def test_immutable_unchanged_claim_needs_every_part_of_the_pointer_proof(
+    update_tree, tmp_path, monkeypatch, case,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    release = _release(home, sha=update_tree.base)
+    request = pending(home, reason=False)
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(release / "gateway/update_notifications.py"))
+    path = fail_immutable_update(home, update_tree.clone)
+    receipt = json.loads(path.read_text())
+    proof = receipt["immutable_update"]
+    if case == "no_record":
+        del receipt["immutable_update"]
+    elif case == "activation_started":
+        proof["activation_started"] = True
+    elif case == "activation_unknown":
+        del proof["activation_started"]
+    elif case == "after_missing":
+        proof["after"] = None
+    elif case == "after_differs":
+        proof["after"] = {**proof["after"], "sha": "d" * 40}
+    elif case == "pointer_moved_since":
+        other = home / "releases" / ("d" * 40)
+        other.mkdir()
+        for name in (".release-ready", ".hermes_build_sha"):
+            (other / name).write_text("d" * 40)
+        (home / "current").unlink()
+        (home / "current").symlink_to(other)
+    elif case == "marker_rewritten":
+        (release / ".release-ready").write_text(update_tree.base + "\n")
+    elif case == "candidate_is_active":
+        proof["candidate"] = str(release)
+    for target in (path, home / "logs/update_receipts/latest.json"):
+        target.write_text(json.dumps(receipt))
+
+    success, detail = final_outcome(home, request)
+
+    assert success is False
+    assert "Runtime state is unverified" in detail
+    assert "Nothing changed" not in detail and "Still on" not in detail
+    assert "Cause: candidate build failed" in detail
+
+
+def test_activation_start_is_recorded_before_the_first_runtime_mutation(update_tree, tmp_path, monkeypatch):
+    """A failure at the pending-marker write follows staging, so it cannot read as unchanged."""
+    from hermes_cli import main, update_cmd, update_receipt
+    from tests.hermes_cli.test_update_target_identity import git
+
+    home = tmp_path / "home"
+    home.mkdir()
+    release = _release(home, sha=update_tree.base)
+    source = update_tree.clone
+    request = pending(home, reason=False)
+    monkeypatch.setattr("gateway.update_notifications.__file__", str(release / "gateway/update_notifications.py"))
+    target = git(source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "downloaded update")
+    git(source, "fetch", "--no-tags", ".", target)
+    (home / "release-layout.json").write_text(json.dumps({"source": str(source)}))
+    staged = home / "releases" / target
+    staged.mkdir()
+    for name in (".release-ready", ".hermes_build_sha"):
+        (staged / name).write_text(target)
+
+    def fail_marker(**_kw):
+        raise RuntimeError("marker write failed")
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(main, "PROJECT_ROOT", source)
+    monkeypatch.setattr(update_receipt, "_receipt_dir", lambda: home / "logs/update_receipts")
+    monkeypatch.setattr(update_receipt, "_code_identity", lambda **_: {"sha": git(source, "rev-parse", "HEAD")})
+    monkeypatch.setattr("hermes_cli.immutable_releases.stage_release", lambda *a, **k: (staged, "built"))
+    monkeypatch.setattr(update_cmd, "_write_fleet_restart_pending_marker", fail_marker)
+    update_receipt.begin_update_receipt()
+    try:
+        with pytest.raises(RuntimeError, match="marker write failed"):
+            update_cmd._apply_fetched_immutable_update(
+                ["git"], "main", SimpleNamespace(no_gateway_restart=True), None,
+                gateway_mode=True, had_desktop_app_before_update=False,
+                pre_update_snapshot_id=None, _pre_update_plan=None, _windows_gateway_resume=None)
+    finally:
+        path = update_receipt.finalize_update_receipt("failed", stop_reason="marker write failed")
+    assert json.loads(path.read_text())["immutable_update"]["activation_started"] is True
+    (home / ".update_process_exit_code").write_text("1")
+    success, detail = final_outcome(home, request)
+    assert success is False
+    assert "Nothing changed" not in detail and "Runtime state is unverified" in detail
 
 
 @pytest.mark.parametrize("case", [
