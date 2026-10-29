@@ -26,7 +26,8 @@ def config_error_reason(exc: BaseException) -> str | None:
 
 
 def config_error_notice(reason: str) -> str:
-    return f"Hermes config is invalid: {reason}; fix config.yaml"
+    """Transport-safe notice. Arbitrary authored values belong only in operator logs."""
+    return "Hermes config is invalid; fix config.yaml"
 
 
 def log_config_error_once(logger, reason: str, *, context: str = "config") -> None:
@@ -44,4 +45,4 @@ def log_config_error_once(logger, reason: str, *, context: str = "config") -> No
         if key in _logged and _logged[key] == signature:
             return
         _logged[key] = signature
-    logger.error("%s (%s)", config_error_notice(reason), context)
+    logger.error("Hermes config is invalid: %s; fix config.yaml (%s)", reason, context)

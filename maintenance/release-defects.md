@@ -34,8 +34,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 ## Distinct Config Error Notice
 
 - Fork patch identity: `config-error-notice`.
-- Typed config/preset validation failures produce `Hermes config is invalid:
-  <reason>; fix config.yaml`, not a provider sign-in notice. Pre-turn and in-turn
+- Typed config/preset validation failures produce `Hermes config is invalid;
+  fix config.yaml`, not a provider sign-in notice. Arbitrary validation details
+  stay in the operator log, never in the transport reply. Pre-turn and in-turn
   handlers log once per profile config revision. Unrelated failures retain
   existing classification, failed-turn bookkeeping and sanitized messages.
 - Owner: `hermes_cli/config_errors.py`, `gateway/run_turn_runner.py`,
