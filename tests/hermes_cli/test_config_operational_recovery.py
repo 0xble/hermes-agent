@@ -31,8 +31,14 @@ def test_show_reports_invalid_document_without_stale_values_or_crash(broken_conf
 
 def test_health_names_the_repairable_validation_error(broken_config):
     issues = config.validate_config_structure()
-    assert any(i.severity == "error" and "NOT/A_ZONE" in i.message for i in issues)
+    assert any(i.severity == "error" and "NOT/A_ZONE" in i.local_detail for i in issues)
+    assert all("NOT/A_ZONE" not in i.message for i in issues)
     assert any("hermes config edit" in i.hint for i in issues)
+
+
+def test_local_warning_retains_validation_detail(broken_config, capsys):
+    config.print_config_warnings()
+    assert "NOT/A_ZONE" in capsys.readouterr().err
 
 
 def test_recovery_only_allows_a_fully_valid_repaired_write(broken_config):

@@ -603,7 +603,7 @@ def run_setup_wizard(args):
         try:
             return _run_setup_wizard_impl(args)
         except _SetupCancelled:
-            _info(None, "Setup cancelled. Remaining sections were not changed.")
+            _info(None, "Setup cancelled. Settings saved at earlier checkpoints are kept.")
             return None
 
 

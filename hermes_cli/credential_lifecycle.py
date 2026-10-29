@@ -93,7 +93,21 @@ def _scrub_config_yaml_mirrors(old_value: str, new_value: str | None) -> list[st
     config_path = get_config_path()
     if not config_path.exists():
         return []
-    user_config = require_readable_config_before_write(config_path)
+    try:
+        user_config = require_readable_config_before_write(config_path)
+    except RuntimeError as exc:
+        # No mirror write is needed if the old credential is absent from the broken text.
+        # If even that read fails, absence cannot be established, so keep every store intact.
+        try:
+            text = config_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            text = None
+        if text is not None and old_value not in text:
+            return []
+        raise ValueError(
+            "Cannot reconcile credential mirrors in unreadable config.yaml. "
+            "Run 'hermes config edit' to repair it, then retry. No credential stores were changed."
+        ) from exc
     if not user_config:
         return []
 

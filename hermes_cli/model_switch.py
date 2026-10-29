@@ -1073,7 +1073,8 @@ def _unknown_provider_message(explicit_provider: str) -> str:
         from hermes_cli.config import validate_config_structure
         issues = validate_config_structure()
         if issues:
-            msg += "\n\nRun 'hermes doctor' — config issues detected:" + "".join(f"\n  • {ci.message}" for ci in issues[:3])
+            # Structural issues can contain authored values too, not just load failures.
+            msg += "\n\nConfig issues detected. Run 'hermes doctor' for local diagnostics."
     except Exception:
         pass
     return msg

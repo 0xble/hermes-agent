@@ -53,7 +53,11 @@ acceptance of the design. Reassess this divergence before adopting upstream work
   Generic atomic I/O applies admission only to owned home/profile configs or explicit config
   transactions, never to an unrelated application/template file by basename alone.
 - Credential mirror admission precedes environment and pool changes. A rejected mirror
-  candidate leaves those stores unchanged, rather than splitting a rotation/removal.
+  candidate leaves those stores unchanged, rather than splitting a rotation/removal. Broken YAML
+  without the old credential text requires no mirror write and must not block env-only changes.
+  An unreadable possible mirror refuses with a generic repair-hint `ValueError` (dashboard 400),
+  never parser detail or a 500. `tests/hermes_cli/test_credential_broken_config.py` covers both
+  outcomes for rotation and removal through the real dashboard routes.
 - Strict runtime reads never serve stale semantic values. Local config display and structure
   diagnostics retain repair details without admitting invalid runtime data. Guardian canary
   reads validate their own policy independently of unrelated runtime fields, retaining managed

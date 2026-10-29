@@ -1406,12 +1406,8 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
         issues = validate_config_structure()
         if not issues:
             return ""
-        lines = ["Config issue detected — run 'hermes doctor' for full diagnostics:"]
-        for ci in issues:
-            lines.append(f"  [{'ERROR' if ci.severity == 'error' else 'WARNING'}] {ci.message}")
-            if ci.hint and ci.hint.splitlines()[0]:
-                lines.append(f"    → {ci.hint.splitlines()[0]}")
-        return "\n".join(lines)
+        # This hint can reach chat through AuthError. Keep authored diagnostics local.
+        return "Config issues detected. Run 'hermes doctor' for local diagnostics."
     except Exception:
         return ""
 
