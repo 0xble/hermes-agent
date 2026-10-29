@@ -43,7 +43,7 @@ its metrics. Memory-provider background threads therefore cannot retain and
 mutate a completed attempt's metrics. Compression lease timestamps must be
 calculated after the wait, inside the write callback. Atomic publication, lease
 ownership, covered row checks, FTS triggers, display reconciliation, and rewind
-flags stay intact.
+flags stay intact. Shared compaction inserts keep all FTS triggers in that same transaction even when rows are grouped into bounded multi-row statements. A failed page rolls back both the visible transcript and its indexes, and the transcript-write wrapper restores caller row markers before retry or final failure.
 
 The publication scope accumulates total SQLite changes, including trigger work
 and rolled-back attempts, across retries. Attempt-local write diagnostics use a

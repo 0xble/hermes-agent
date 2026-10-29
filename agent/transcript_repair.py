@@ -62,7 +62,11 @@ def transcript_row_snapshot(row: Mapping[str, Any]) -> str:
             tag, data = b"S", value.encode("utf-8", "surrogatepass")
         else:
             tag, data = (b"F" if isinstance(value, float) else b"I"), repr(value).encode("ascii")
-        digest.update(tag + len(data).to_bytes(8, "big") + data)
+        framed = tag + len(data).to_bytes(8, "big") + data
+        # hashlib releases the GIL at 2,048 bytes. Gateway CPU threads turn each
+        # reacquisition into a switch-interval wait while this writer is held.
+        for start in range(0, len(framed), 2047):
+            digest.update(framed[start:start + 2047])
     return digest.hexdigest()
 
 

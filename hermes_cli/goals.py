@@ -2728,18 +2728,21 @@ from hermes_cli.goals_authority import (
 
 
 # One notice per judge outage for the whole process, not one per goal: a provider outage
-# hits every active goal at once. Any successful judge response ends the outage.
+# hits every active goal at once. Require a later failed attempt; any success resets both flags.
 _JUDGE_OUTAGE_LOCK = threading.Lock()
-_JUDGE_OUTAGE_ACTIVE = False
+_JUDGE_OUTAGE_PENDING = _JUDGE_OUTAGE_ACTIVE = False
 JUDGE_OUTAGE_NOTICE = "⚠ Goal judge unavailable; goals stay active and back off until it recovers."
 
 
 def _judge_outage_notice(*, failed: bool) -> str:
-    """Return the outage notice exactly once per outage; ``failed=False`` ends the outage."""
-    global _JUDGE_OUTAGE_ACTIVE
+    """Announce only consecutive failed attempts; ``failed=False`` ends the outage."""
+    global _JUDGE_OUTAGE_PENDING, _JUDGE_OUTAGE_ACTIVE
     with _JUDGE_OUTAGE_LOCK:
         if not failed:
-            _JUDGE_OUTAGE_ACTIVE = False
+            _JUDGE_OUTAGE_PENDING = _JUDGE_OUTAGE_ACTIVE = False
+            return ""
+        if not _JUDGE_OUTAGE_PENDING:
+            _JUDGE_OUTAGE_PENDING = True
             return ""
         if _JUDGE_OUTAGE_ACTIVE:
             return ""
@@ -3652,6 +3655,9 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             resume_override=state.resume_override_reasons(),
             user_messages_block=_render_user_messages_block(self.session_id, state.created_at),
         )
+        # Track attempts before early returns so successes reset the outage; parse failures stay silent.
+        outage_notice = "" if parse_failed else _judge_outage_notice(failed=bool(transport_failed))
+
         verdict, reason, wait_directive = autonomous_verdict(state, verdict, reason, wait_directive)
         state.last_verdict = verdict
         state.last_reason = reason
@@ -3703,12 +3709,6 @@ class GoalManager(GoalAutonomyMixin, GoalStatusMixin, GoalRevisionsMixin, GoalCo
             state.status = "done"
             self._save()
             return _decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
-
-        # Judge outages fail open as CONTINUE (judge_goal already maps them) and take the normal
-        # continue/ladder path below, so a persistent outage backs off instead of pausing. One
-        # process-wide notice per outage, not one per goal.
-        # Unparseable output is a model-quality problem, not an outage: it continues silently.
-        outage_notice = "" if parse_failed else _judge_outage_notice(failed=bool(transport_failed))
 
         def _with_outage(decision: Dict[str, Any]) -> Dict[str, Any]:
             if outage_notice and decision.get("status") == "active":

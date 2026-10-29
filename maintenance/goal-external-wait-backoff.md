@@ -16,6 +16,11 @@ rather than busy-polling. A pid/session barrier whose target is still running
 re-arms after its bounded probe window instead of lifting and waking the agent;
 target exit or the process session's watch trigger remains the wake condition.
 
+A process-wide judge outage is pending after the first failed attempt and emits
+one notice only if a later judge attempt also fails, even on another goal. Any
+successful judgment clears the pending flag and notice latch. Transport failures
+still leave goals active on their existing backoff ladder.
+
 ## Quiet unchanged-wait notice policy
 
 A recheck deadline or backoff change is not a user-visible outcome. Both idle

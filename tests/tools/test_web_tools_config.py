@@ -505,7 +505,8 @@ class TestExaClientConfig:
                 self.api_key = api_key
                 self.headers = {}
 
-            def search(self, query, num_results, contents):
+            def search(self, query, num_results, contents, type="auto"):
+                assert type in {"auto", "lite"}
                 hit = types.SimpleNamespace(url="https://example.com", title="t", highlights=[self.api_key])
                 return types.SimpleNamespace(results=[hit])
 

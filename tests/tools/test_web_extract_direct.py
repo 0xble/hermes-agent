@@ -25,7 +25,7 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.website_policy.check_website_access", lambda url: None)
     monkeypatch.setattr("tools.web_result_cache.extract_cache_get", lambda *a, **k: None)
     monkeypatch.setattr("tools.web_result_cache.extract_cache_put", lambda *a, **k: None)
-    monkeypatch.setattr(wt, "_load_web_config", lambda: {})
+    monkeypatch.setattr(wt, "_load_web_config", dict)
     return provider
 
 
@@ -37,6 +37,18 @@ def _transport(monkeypatch, handler, *, safe=None):
 
 def _run(urls):
     return json.loads(asyncio.run(wt.web_extract_tool(urls, char_limit=10000)))["results"]
+
+
+def test_tavily_xhtml_plain_url_preserves_raw_base_behavior(harness, monkeypatch):
+    monkeypatch.setattr(wt, "_get_extract_backend", lambda: "tavily")
+    document = '<html xmlns="http://www.w3.org/1999/xhtml"><body><main><p>Raw XML document</p></main></body></html>'
+    _transport(monkeypatch, lambda request: httpx.Response(
+        200, headers={"content-type": "application/xhtml+xml"}, text=document,
+    ))
+    result = _run(["https://site.test/document.xml"])[0]
+    assert result["content"] == document
+    assert result["title"] == "document.xml"
+    harness.extract.assert_not_awaited()
 
 
 def test_plain_files_download_without_provider_and_preserve_mixed_order(harness, monkeypatch):
@@ -105,7 +117,6 @@ def test_redirect_policy_error_fails_closed(harness, monkeypatch):
     def policy(url):
         if "other.test" in url:
             raise RuntimeError("policy unreadable")
-        return None
 
     def respond(request):
         seen.append(str(request.url))
@@ -195,3 +206,28 @@ def test_secret_gate_refuses_before_direct_route(harness, monkeypatch):
     outcome = json.loads(asyncio.run(wt.web_extract_tool(["https://site.test/file.md?api_key=sk-test-abc123"])))
     assert outcome["success"] is False
     harness.extract.assert_not_awaited()
+
+
+def test_html_parser_worker_does_not_block_download_deadline(harness, monkeypatch):
+    from threading import Event
+    from time import perf_counter
+
+    release = Event()
+
+    def stalled_parser(*args):
+        release.wait(timeout=5)
+
+    monkeypatch.setattr("tools.web_extract_html.readable_html", stalled_parser)
+    monkeypatch.setattr(direct, "_TIMEOUT_SECONDS", 0.05)
+    _transport(monkeypatch, lambda request: httpx.Response(200, headers={"content-type": "text/html"}, text="<main>page</main>"))
+
+    async def run():
+        started = perf_counter()
+        try:
+            result = await asyncio.wait_for(direct.extract_direct("https://site.test/article", allow_html=True), timeout=2)
+            assert result is None
+            assert perf_counter() - started < 2
+        finally:
+            release.set()
+
+    asyncio.run(run())

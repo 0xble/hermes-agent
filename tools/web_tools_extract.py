@@ -146,7 +146,7 @@ def _extract_timeout_seconds() -> float:
         return _DEFAULT_EXTRACT_TIMEOUT_S
 
 
-async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[str]) -> list[dict]:
+async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[str], *, direct_fallbacks: Optional[set[str]] = None) -> list[dict]:
     """Call ``provider.extract`` (async or sync-in-thread), with one-shot keyless rescue.
 
     Rescue fires on a raised exception — including a dispatch timeout — or when the WHOLE batch
@@ -191,8 +191,58 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
         source = meta.get("sourceURL") if isinstance(meta, dict) else None
         url = next((u for u in (fetched.get("url"), source) if u in requested), None)
         _content = fetched.get("raw_content", "") or fetched.get("content", "")
-        if url and _content and not fetched.get("error"):
+        if url and _content and not fetched.get("error") and url not in (direct_fallbacks or set()):
             extract_cache_put(url, _content, fetched.get("title", ""), format=format, provider=provider.name)
+    return results
+
+
+def _direct_html_enabled(provider) -> bool:
+    # Resolve the paid route here without changing Exa's search plugin or schema.
+    from plugins.web.exa.provider import ExaWebSearchProvider, provider_env, use_keyless
+
+    return isinstance(provider, ExaWebSearchProvider) and not use_keyless("exa", provider_env("EXA_API_KEY"))
+
+
+async def _try_direct(url: str, allow_html: bool) -> Optional[dict]:
+    from tools.web_extract_direct import extract_direct
+    from tools.web_extract_html import MIN_DIRECT_CHARS
+    try:
+        direct = await extract_direct(url, allow_html=True) if allow_html else await extract_direct(url)
+    except Exception as exc:  # health: allow BLE001 -- direct extraction is optional; any failure uses the configured provider
+        logger.debug("Direct extract miss for %s: %s", url, exc)
+        return None
+    if direct is None or direct.get("error"):
+        return None
+    if allow_html and len(direct.get("content", "").strip()) < MIN_DIRECT_CHARS:
+        return None
+    if allow_html:
+        direct["extract_backend"] = "direct_http"
+    return direct
+
+
+def _attribute_direct_fallbacks(results: list[dict], provider_name: str) -> None:
+    for result in results:
+        metadata = result.get("metadata")
+        rescued = isinstance(metadata, dict) and metadata.get("rescued_from")
+        result.update(
+            fallback_from="direct_http",
+            extract_backend="keyless_rescue" if rescued else provider_name,
+            direct_fetch_error="Direct fetch failed, was blocked, unsupported, or returned thin/JS-only content. Used the configured extract backend.",
+        )
+
+
+async def _dispatch_extract_groups(provider, fetch_urls: list[str], format: Optional[str], fallbacks: set[str]) -> list[dict]:
+    from itertools import groupby
+
+    results = []
+    # Keep fallback provenance attached to the dispatch, not guessed from result
+    # positions: providers may omit failures and canonicalize every returned URL.
+    for is_fallback, group in groupby(fetch_urls, key=fallbacks.__contains__):
+        urls = list(group)
+        fetched = await _dispatch_extract(provider, urls, format, direct_fallbacks=fallbacks)
+        if is_fallback:
+            _attribute_direct_fallbacks(fetched, provider.name)
+        results.extend(fetched)
     return results
 
 
@@ -204,29 +254,32 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
     control; policy-blocked URLs are cache misses. Keys include provider and format, so switching either
     within the TTL never serves the other's content."""
     from tools.web_result_cache import extract_cache_get
-    from tools.web_extract_direct import extract_direct
+    from tools.web_extract_direct import is_html_candidate
     from tools.website_policy import check_website_access as _check_site
     from tools.web_tools import _load_web_config
     from utils import is_truthy_value
 
     direct_enabled = is_truthy_value(_load_web_config().get("extract_direct"), default=True)
+    html_enabled = direct_enabled and _direct_html_enabled(provider) and format in (None, "markdown")
+    direct_fallbacks: set[str] = set()
     fixed, fetch_urls, fetch_positions = {}, [], []
     for position, url in enumerate(safe_urls):
         try:
             policy_block = _check_site(url)
         except Exception:
             policy_block = None
+        allow_html = html_enabled and is_html_candidate(url)
         if policy_block is None and direct_enabled:
-            try:
-                direct = await extract_direct(url)
-            except Exception as exc:  # noqa: BLE001 — the direct route is an optimization; any failure is a miss
-                logger.debug("Direct extract miss for %s: %s", url, exc)
-                direct = None
+            direct = await _try_direct(url, allow_html)
             if direct is not None:
                 fixed[position] = direct
                 continue
+            if allow_html:
+                direct_fallbacks.add(url)
         hit = extract_cache_get(url, format=format, provider=provider.name) if policy_block is None else None
         if hit is not None:
+            if url in direct_fallbacks:
+                _attribute_direct_fallbacks([hit], provider.name + "_cache")
             fixed[position] = hit
         else:
             fetch_urls.append(url)
@@ -235,7 +288,10 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
     if not fetch_urls:
         return [fixed[i] for i in range(len(safe_urls))]
     logger.info("Web extract via %s: %d URL(s)", provider.name, len(fetch_urls))
-    results = await _dispatch_extract(provider, fetch_urls, format)
+    if direct_fallbacks:
+        results = await _dispatch_extract_groups(provider, fetch_urls, format, direct_fallbacks)
+    else:
+        results = await _dispatch_extract(provider, fetch_urls, format)
     if not fixed:
         return results
     return _merge_in_order(len(safe_urls), fixed, fetch_positions, fetch_urls, results)

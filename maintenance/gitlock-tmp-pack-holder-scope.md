@@ -6,9 +6,13 @@ recovery tests.
 
 ## Preserve
 
-- Keep stale lock cleanup conservative: the existing system-wide Git-process
-  guard remains authoritative for lock files because a lock holder can close its
-  descriptor while still waiting in an editor.
+- On Linux, stale lock cleanup excludes only provably foreign Git owners.
+  Target/shared metadata, redirected indexes, launch-relative commands, and
+  unreadable live ownership retain the veto. Do not apply the pack-only
+  unplaced-owner exception: a lock holder can close its fd while in an editor.
+  Non-Linux lock cleanup keeps the global guard. Age and inode/mtime checks apply.
+  The minimal lock-scope port reuses the existing metadata parser from #479/#502;
+  #527's separate dead-lock holder-scan retry remains unchanged.
 - On Linux, an aged `tmp_pack_*`, `tmp_idx_*`, `tmp_rev_*`, `tmp_mtimes_*`, or
   `.tmp-*` candidate is checked against the target/shared repository metadata and
   every visible process's file descriptors, directory handles, and mappings.
@@ -48,5 +52,5 @@ executed rather than treating a local skip as Linux proof. Roll back by revertin
 this unit and the focused holder-scope commit together.
 
 Retire when released upstream or the maintained fork provides equivalent
-repository-scoped tmp-pack liveness with the same conservative lock behavior and
+repository-scoped tmp-pack and stale-lock liveness with conservative unknown-owner vetoes and
 regression coverage.

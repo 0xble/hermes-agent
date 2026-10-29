@@ -18,6 +18,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.notice_style import ContextNotice
 from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import AwakeIdleMeter, format_iteration_progress
 from agent.turn_failure_copy import (
@@ -791,7 +792,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     model = attended_model
                 except Exception as exc:
                     logger.warning("Attended route %s unavailable: %s", attended_provider, exc)
-                    notice = f"⚠️ Attended model unavailable; staying on {model}."
+                    notice = ContextNotice(f"⚠️ Attended model unavailable; staying on {model}.")
             else:
                 model = attended_model
 

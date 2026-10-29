@@ -71,7 +71,7 @@ def test_non_file_tool_error_envelope_is_returned(transport):
 
 
 CALLS = {
-    "web_search": {"query": "fixture", "limit": 3},
+    "web_search": {"query": "fixture", "limit": 3, "stakes": "standard"},
     "web_extract": {"urls": ["https://example.test"], "char_limit": 3000},
     "read_file": {"path": "reference", "offset": 2, "limit": 4},
     "write_file": {"path": "output", "content": "café", "cross_profile": False},

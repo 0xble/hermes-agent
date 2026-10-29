@@ -36,7 +36,7 @@ mcp_servers:
     args: ["mcp-server-time"]
 ```
 
-Restart Hermes Agent. On startup it will:
+A running gateway applies this within about a minute without a restart: it watches `config.yaml`, connects new entries, and tears down removed or `enabled: false` ones. An already-open session keeps its tool list until `/reload-mcp`, `/new`, or context compaction. A new CLI session picks it up at startup. On connect Hermes will:
 1. Connect to the server
 2. Discover available tools
 3. Register them with the prefix `mcp_time_*`
@@ -340,4 +340,4 @@ Disable sampling for untrusted servers with `sampling: { enabled: false }`.
 - Tool results are returned as JSON with either `{"result": "..."}` or `{"error": "..."}`
 - The native MCP client is independent of `mcporter` -- you can use both simultaneously
 - Server connections are persistent and shared across all conversations in the same agent process
-- Adding or removing servers requires restarting the agent (no hot-reload currently)
+- Adding, removing or disabling servers needs no restart: a running gateway reconciles `mcp_servers` edits in `config.yaml` within about a minute, and a failed first connect retries on its cooldown (30 s, doubling up to 10 min). A session's tool set refreshes only on `/reload-mcp`, `/new`, or context compaction

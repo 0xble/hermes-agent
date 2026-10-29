@@ -4,9 +4,10 @@ from __future__ import annotations
 import contextlib
 import os
 from pathlib import Path
-import shutil
 import stat
 import time
+
+from hermes_cli.fs_utils import rmtree_with_handler
 
 # A multiplexer answers a delete's rescan ``pending`` after 5 s and keeps tearing the profile down;
 # its gateway.lock reservation is released last, once the profile's writers are gone.
@@ -78,10 +79,7 @@ def _rmtree_with_retry(profile_dir: Path, onexc_handler) -> None:
     last_exc: OSError | None = None
     for attempt in range(attempts):
         try:
-            try:
-                shutil.rmtree(profile_dir, onexc=onexc_handler)
-            except TypeError:  # ``onexc`` is 3.12+; 3.11 has ``onerror``
-                shutil.rmtree(profile_dir, onerror=onexc_handler)
+            rmtree_with_handler(profile_dir, onexc_handler)
             return
         except OSError as e:
             last_exc = e

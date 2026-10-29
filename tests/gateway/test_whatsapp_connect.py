@@ -475,6 +475,7 @@ class TestHttpSessionLifecycle:
             encoding="utf-8",
             errors="replace",
             timeout=10,
+            check=False,
         )
         # subprocess.run is patched on the shared module, so runtime-status/provenance `git`
         # probes from elsewhere in the process land here too. Everything else must be exactly

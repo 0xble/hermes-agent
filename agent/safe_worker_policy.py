@@ -78,3 +78,9 @@ def worker_config_snapshot() -> dict | None:
     """Return detached explicit config; None means the ordinary loader owns it."""
     policy = _current_policy()
     return json.loads(policy.config_json) if policy is not None else None
+
+
+def worker_ignores_user_config() -> bool:
+    """True for a bypass worker: its snapshot is not an authored profile config."""
+    policy = _current_policy()
+    return policy is not None and policy.ignore_user_config

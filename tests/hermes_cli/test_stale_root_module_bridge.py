@@ -40,7 +40,7 @@ def pre_handoff_purge():
             sys.modules[name] = module
 
 
-@pytest.mark.parametrize("consumer", ["hermes_cli.config", "hermes_cli.managed_scope"])
+@pytest.mark.parametrize("consumer", ["hermes_cli.config", "hermes_cli.managed_scope", "hermes_cli.backup"])
 def test_fresh_hermes_cli_import_heals_stale_utils_missing_file_signature(
     monkeypatch, pre_handoff_purge, consumer
 ):
@@ -52,7 +52,10 @@ def test_fresh_hermes_cli_import_heals_stale_utils_missing_file_signature(
     assert consumer not in sys.modules
 
     module = importlib.import_module(consumer)
-    assert callable(module.file_signature)
+    if consumer != "hermes_cli.backup":
+        assert callable(module.file_signature)
+    else:
+        assert callable(module.create_quick_snapshot)
     assert hasattr(sys.modules["utils"], "file_signature")
 
 
@@ -64,3 +67,25 @@ def test_drop_stale_root_modules_leaves_complete_utils_alone():
     before = sys.modules["utils"]
     assert drop_stale_root_modules() == []
     assert sys.modules["utils"] is before
+
+
+def test_backup_first_after_historical_purge_heals_utils_in_fresh_process(tmp_path):
+    import os
+    from pathlib import Path
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[2]
+    code = f"""
+import sys
+sys.path.insert(0, {str(repo)!r})
+import utils
+del utils.file_signature
+from hermes_cli import backup
+assert callable(backup.create_quick_snapshot)
+assert callable(sys.modules['utils'].file_signature)
+"""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
+    env.update(HOME=str(tmp_path), HERMES_HOME=str(tmp_path / ".hermes"))
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", code], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr

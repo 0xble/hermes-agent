@@ -8,7 +8,6 @@ import logging
 import time
 from typing import Iterable, Optional
 from tools.mcp_tool_errors import _is_method_not_found_error, _unwrap_exception_group
-from tools.mcp_tool_schema import mcp_prefixed_tool_name
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_registration as _registration
 
@@ -129,6 +128,22 @@ class MCPServerHealthMixin:
             if registry.get_toolset_for_tool(tool_name) == f"mcp-{self.name}":
                 _registration._deregister_mcp_tool_all_scopes(self, tool_name)
 
+    def _publish_discovered_tools(self, new_mcp_tools) -> None:
+        """Reconcile an already-fetched manifest without removing retained handlers first."""
+        if getattr(self, '_editor_frozen_manifest', None) is not None:
+            return  # Reconnects must preserve the canonical editor session's selected schemas too.
+        old_tool_names = set(self._registered_tool_names)
+        old_tools = self._tools
+        self._tools = new_mcp_tools
+        try:
+            registered_names = _registration._register_server_tools(self.name, self, self._config)
+        except Exception:
+            self._tools = old_tools
+            raise
+        # Only prune after registration succeeds, including names made ambiguous by normalization.
+        self._deregister_owned(old_tool_names - set(registered_names))
+        self._registered_tool_names = registered_names
+
     async def _refresh_tools(self):
         """Re-fetch tools on ``tools/list_changed`` and update the registry. The lock serializes rapid-fire
         notifications; after the list_tools ``await`` all mutations are synchronous — atomic on the event loop."""
@@ -149,16 +164,8 @@ class MCPServerHealthMixin:
                     logger.debug("MCP server '%s': skipping dynamic tool refresh; session not connected", self.name)
                     return
                 new_mcp_tools = await _core._paginate_full_list(session.list_tools, "tools", self.name)
-            # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
-            # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
-            self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
-            # Re-register; a raw name can become ambiguous after normalization without changing
-            # its normalized name, so also drop old entries the final registration no longer owns.
-            self._tools = new_mcp_tools
-            registered_names = _registration._register_server_tools(self.name, self, self._config)
-            self._deregister_owned(old_tool_names - set(registered_names))
-            self._registered_tool_names = registered_names
-            new_tool_names = set(registered_names)
+            self._publish_discovered_tools(new_mcp_tools)
+            new_tool_names = set(self._registered_tool_names)
             changes = [f"{label}: {', '.join(sorted(names))}" for label, names in
                        (("added", new_tool_names - old_tool_names), ("removed", old_tool_names - new_tool_names)) if names]
             if changes:

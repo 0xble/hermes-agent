@@ -12,4 +12,13 @@ The scratch pruner treats idle as not unused. Before reaping processes and again
 
 Guard tests: `tests/pm/test_install_gc.py` covers orphan, live, leased, locked, and legacy installs, the per-pass limit, and finishing an interrupted removal. `tests/gateway/test_install_orphan_housekeeping.py` covers the housekeeping chore collecting an orphan idle past a day while keeping a younger orphan and a live checkout's install. `tests/test_scratch_dir.py::test_user_tmpdir_does_not_disable_scratch_pruning` covers the macOS boot path, and the `test_prune_*` retention tests in the same file cover pinned, transitive, unreadable, `.keep` and re-read cases.
 
+PM runtime preparation builds the dependency graph under `pm/`, but its stable
+install lock and owner metadata must use `pm.paths.repo_root()` (the checkout),
+like startup recovery, permission classification, and orphan collection. Using
+the dependency project's key can misclassify a read-only install as repairable
+and record the wrong collector owner. `tests/pm/test_runtime.py` guards both
+the denied-lock classification and the successful preparation owner while
+preserving the PM project's dependency inputs. Related historical upgrade
+seams are owned by [historical upgrade compatibility](nightly-upgrade-e2e.md).
+
 Retire when equivalent upstream behavior is present and the guard tests pass without this fork patch.
