@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator, List, Optional
@@ -121,6 +121,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_terminal_age "
         "ON executions(COALESCE(julianday(finished_at), julianday(claimed_at)), id) "
         "WHERE status IN ('completed','failed','unknown')"
+    )
+    # Retention must preserve the same latest attempt the history/list readers select,
+    # including when a profile's UTC offset has changed.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_job_instant "
+        "ON executions(job_id, julianday(claimed_at) DESC, claimed_at DESC, id DESC)"
     )
 
 
@@ -257,25 +263,67 @@ def touch_execution_progress(execution_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def _prune_unlocked(conn: sqlite3.Connection) -> None:
+def _delete_prunable(
+    conn: sqlite3.Connection, limit: int, *, keep_ids: set[str], cutoff: Optional[str] = None,
+) -> int:
+    from cron.scheduler_authority import journal_path
+
+    age_clause = (
+        " AND COALESCE(julianday(e.finished_at), julianday(e.claimed_at)) < julianday(?)"
+        if cutoff is not None else ""
+    )
+    ids = []
+    with closing(conn.execute(
+        """SELECT e.id, e.job_id FROM executions AS e INDEXED BY idx_executions_terminal_age
+           WHERE e.status IN ('completed','failed','unknown')
+             AND COALESCE(e.delivery_outcome, '') != 'queued'
+             AND COALESCE(e.delivery_status, '') NOT IN ('pending','delivering')
+             AND e.delivery_status_provisional=0
+             AND e.id != (
+                 SELECT newest.id FROM executions AS newest
+                 WHERE newest.job_id=e.job_id
+                 ORDER BY julianday(newest.claimed_at) DESC, newest.claimed_at DESC,
+                          newest.id DESC LIMIT 1
+             )""" + age_clause + """
+           ORDER BY COALESCE(julianday(e.finished_at), julianday(e.claimed_at)), e.id""",
+        (cutoff,) if cutoff is not None else (),
+    )) as rows:
+        for row in rows:
+            if row["id"] in keep_ids:
+                continue
+            # A terminal worker can still owe canonical admission settlement. Keep
+            # its recovery link until the journal's owner removes it, even if old.
+            if journal_path(row["job_id"], row["id"]).exists():
+                continue
+            ids.append((row["id"],))
+            if len(ids) == limit:
+                break
+    return conn.executemany("DELETE FROM executions WHERE id=?", ids).rowcount
+
+
+def _prune_unlocked(conn: sqlite3.Connection, *, keep_ids: Iterable[str] = ()) -> None:
     """Age out terminal history, with a bounded runaway-write backstop.
 
     Share one deletion budget between both policies so an upgrade or recovery
     backlog cannot monopolize the caller's write transaction. Later transitions
     drain any remaining excess. In-flight attempts never enter either policy.
     """
-    cutoff = (_hermes_now().astimezone(UTC) - timedelta(days=TERMINAL_RETENTION_DAYS)).isoformat()
+    from hermes_cli.config import load_config_readonly
+
+    value = (load_config_readonly().get("cron") or {}).get(
+        "execution_retention_days", TERMINAL_RETENTION_DAYS)
+    try:
+        days = float(value)
+        if not math.isfinite(days) or days < 0:
+            raise ValueError("expected a non-negative finite duration")
+    except (TypeError, ValueError):
+        logger.warning("Invalid cron.execution_retention_days=%r, using %s", value, TERMINAL_RETENTION_DAYS)
+        days = TERMINAL_RETENTION_DAYS
     budget = TERMINAL_PRUNE_BATCH_SIZE
-    expired = conn.execute(
-        """DELETE FROM executions WHERE id IN (
-             SELECT id FROM executions INDEXED BY idx_executions_terminal_age
-             WHERE status IN ('completed','failed','unknown')
-               AND COALESCE(julianday(finished_at), julianday(claimed_at)) < julianday(?)
-             ORDER BY COALESCE(julianday(finished_at), julianday(claimed_at)), id LIMIT ?
-           )""",
-        (cutoff, budget),
-    ).rowcount
-    budget -= expired
+    keep_ids = set(keep_ids)
+    if days > 0:
+        cutoff = (_hermes_now().astimezone(UTC) - timedelta(days=days)).isoformat()
+        budget -= _delete_prunable(conn, budget, keep_ids=keep_ids, cutoff=cutoff)
     if budget <= 0:
         return
     cap = max(0, int(MAX_TERMINAL_EXECUTIONS))
@@ -290,14 +338,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     ).fetchone()[0]
     excess = min(budget, remaining - cap)
     if excess > 0:
-        conn.execute(
-            """DELETE FROM executions WHERE id IN (
-                 SELECT id FROM executions INDEXED BY idx_executions_terminal_age
-                 WHERE status IN ('completed','failed','unknown')
-                 ORDER BY COALESCE(julianday(finished_at), julianday(claimed_at)), id LIMIT ?
-               )""",
-            (excess,),
-        )
+        _delete_prunable(conn, excess, keep_ids=keep_ids)
 
 
 def create_execution(
@@ -435,7 +476,7 @@ def finish_execution(
         )
         if cur.rowcount != 1:
             return None
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
@@ -458,7 +499,7 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
                handoff_started_at=NULL, delivery_outcome=? WHERE id=?""",
             ('completed' if success else 'failed', now, None if success else (str(error) if error else 'unknown failure'),
              delivery_outcome, execution_id))
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
@@ -605,7 +646,7 @@ def recover_interrupted_executions() -> int:
                 if record is not None:
                     recovered.append(record)
         if changed:
-            _prune_unlocked(conn)
+            _prune_unlocked(conn, keep_ids=(record["id"] for record in recovered))
     for record in recovered:
         _emit_execution_state(record)
     return changed
@@ -661,7 +702,7 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
         if cur.rowcount != 1:
             return False
         record = _fetch(conn, execution_id)
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
     _emit_execution_state(record)
     return True
 
@@ -681,7 +722,7 @@ def give_up_execution(execution_id: str, *, reason: str) -> bool:
         if cur.rowcount != 1:
             return False
         record = _fetch(conn, str(execution_id))
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
     _emit_execution_state(record)
     return True
 
