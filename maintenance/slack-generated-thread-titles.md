@@ -2,11 +2,11 @@
 
 ## Contract
 
-Slack DM and Assistant threads keep their instant first-message placeholder, then receive at most one best-effort generated upgrade per cached thread. Channel threads use the same verb-first session title and show it at most once per cached thread on the root's first line, only where the text is ours to edit: a root our bot posted gains a bold first line unless it already leads with one, and the migrated Telegram opener (`*<title>*\nMoved from Telegram...`, posted by an `api_human_users` user through a user token) has only its bold line swapped, through the author's own `SLACK_USER_TOKEN`. Any other human root is never edited. The existing shared session-title worker performs generation off the turn path, preserving endpoint serialization, link context, held-title retries, profile context, and user-title authority. Slack opts into verb-first, sentence-case task titles. Telegram, Discord, and ordinary sessions retain the unchanged noun prompt and echo guard.
+Slack DM and Assistant threads keep their instant first-message placeholder, then receive at most one best-effort generated upgrade per cached thread. With `slack.channel_thread_titles` enabled (off by default), channel threads use the same verb-first session title and show it at most once per cached thread on the root's first line, only where the text is ours to edit: a root our bot posted gains a bold first line unless it already leads with one, and the migrated Telegram opener (`*<title>*\nMoved from Telegram...`, posted by an `api_human_users` user through a user token) has only its bold line swapped, through the author's own `SLACK_USER_TOKEN`. Any other human root is never edited. The existing shared session-title worker performs generation off the turn path, preserving endpoint serialization, link context, held-title retries, profile context, and user-title authority. Slack opts into verb-first, sentence-case task titles. Telegram, Discord, and ordinary sessions retain the unchanged noun prompt and echo guard.
 
 Patch identity: `slack-generated-thread-titles`.
 
-`slack.assistant_thread_titles` remains the opt-out for both Slack renames. No new configuration is required. Global `auxiliary.title_generation.enabled` and `model_upgrade_enabled` continue controlling the shared worker.
+`slack.assistant_thread_titles` remains the opt-out for both DM renames. `slack.channel_thread_titles` (default false) opts channel threads in, because their root edit is visible to other members. Global `auxiliary.title_generation.enabled` and `model_upgrade_enabled` continue controlling the shared worker.
 
 ## Preserve
 

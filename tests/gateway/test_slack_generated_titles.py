@@ -252,7 +252,7 @@ SEEDED_BLOCKS = [{"type": "rich_text", "block_id": "b1", "elements": [{"type": "
 @pytest.fixture
 def channel(adapter):
     adapter._team_bot_user_ids = {"T123": "UBOT"}
-    adapter.config.extra["api_human_users"] = ["UOWNER"]
+    adapter.config.extra.update(api_human_users=["UOWNER"], channel_thread_titles=True)
     adapter._app.client.chat_update = AsyncMock()
     user_client = AsyncMock()
     user_client.auth_test = AsyncMock(return_value={"ok": True, "team_id": "T123", "user_id": "UOWNER"})
@@ -319,13 +319,45 @@ async def test_channel_root_rewrite_never_touches_free_human_text(adapter, chann
     runs = blocks[0]["elements"][0]["elements"]
     assert runs[0] == {"type": "text", "text": "Check Hindsight backlog", "style": {"bold": True}}
     assert runs[1:] == SEEDED_BLOCKS[0]["elements"][0]["elements"][1:]
-    # The edit echoes back as message_changed from an api_human_users author; it must not start a turn.
-    from plugins.platforms.slack.message_changes import normalize_changed_message
-    echo = {"subtype": "message_changed", "channel": "C123", "ts": "171234.0009", "event_ts": "171234.0009",
-            "previous_message": {"ts": "171234.0001", "user": "UOWNER", "text": SEEDED},
-            "message": {"ts": "171234.0001", "user": "UOWNER", "text": "*Check Hindsight backlog*\nMoved from Telegram.",
-                        "edited": {"user": "UOWNER", "ts": "171234.0009"}}}
-    assert normalize_changed_message(adapter, echo) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("author", ["owner", "bot"])
+async def test_root_edit_echo_never_starts_a_turn(adapter, channel, monkeypatch, author):
+    """Slack echoes the edit as message_changed; an unseen root's text edit is otherwise new input."""
+    from plugins.platforms.slack import adapter as module
+    source, user_client = channel
+    monkeypatch.setattr(module, "_get_scoped_secret", lambda name, default=None: "xoxp-owner")
+    adapter.config.extra.update(allow_bots="all", free_response_channels=["C123"])
+    adapter._bot_user_id = "UBOT"
+    root = ({"user": "UOWNER", "bot_id": "B07K85WLG9K", "app_id": "A07KPKY7Q1F", "text": SEEDED,
+             "blocks": SEEDED_BLOCKS} if author == "owner"
+            else {"user": "UBOT", "bot_id": "BBOT", "app_id": "AHERMES", "text": "Daily brief is ready"})
+    with_root(adapter, **root)
+    await adapter._title_channel_thread_root(source, "Check Hindsight backlog", lambda: True)
+    writer = user_client if author == "owner" else adapter._app.client
+    edit = writer.chat_update.await_args.kwargs
+    adapter.handle_message = AsyncMock()
+    adapter._resolve_user_name = AsyncMock(return_value="Brian")
+    echo = {"type": "message", "subtype": "message_changed", "channel": "C123", "channel_type": "channel",
+            "team": "T123", "ts": "171234.0009", "event_ts": "171234.0009",
+            "previous_message": {**root, "ts": "171234.0001"},
+            "message": {**root, "ts": "171234.0001", "text": edit["text"], "blocks": edit.get("blocks"),
+                        "edited": {"user": root["user"], "ts": "171234.0009"}}}
+    await adapter._handle_slack_message(echo, {"team_id": "T123", "event_id": "Ev0ECHO"})
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_titles_are_off_unless_enabled(adapter, monkeypatch):
+    source = SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="group",
+                           thread_id="171234.0001", scope_id="T123", user_id="UOWNER")
+    agent = attach(adapter, source)
+    assert agent._title_style == "noun"
+    assert not hasattr(agent, "_on_session_title")
+    adapter.config.extra["channel_thread_titles"] = True
+    adapter.config.extra["assistant_thread_titles"] = False
+    assert attach(adapter, source)._title_style == "verb_first"
 
 
 @pytest.mark.asyncio

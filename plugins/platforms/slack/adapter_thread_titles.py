@@ -99,11 +99,23 @@ class SlackThreadTitlesMixin:
     _slack_api_human_users: Any
     _remember_processed_message_ts: Any
 
-    def _assistant_thread_title_enabled(self) -> bool:
-        raw = self.config.extra.get("assistant_thread_titles", True)
+    def _title_flag(self, key: str, default: bool) -> bool:
+        raw = self.config.extra.get(key, default)
         if isinstance(raw, str):
             return raw.strip().lower() not in {"0", "false", "no", "off"}
         return bool(raw)
+
+    def _assistant_thread_title_enabled(self) -> bool:
+        return self._title_flag("assistant_thread_titles", True)
+
+    def _channel_thread_titles_enabled(self) -> bool:
+        """Off by default: titling a channel thread edits a message other members can see."""
+        return self._title_flag("channel_thread_titles", False)
+
+    def _thread_titles_enabled(self, source) -> bool:
+        if source.chat_type == "group":
+            return self._channel_thread_titles_enabled()
+        return self._assistant_thread_title_enabled()
 
     async def _set_assistant_thread_title(
         self, channel_id: str, thread_ts: str, title_source: str, *, team_id: str = "",
@@ -159,7 +171,7 @@ class SlackThreadTitlesMixin:
         """Opt this thread into the shared titler without running a model on Slack's intake path."""
         source = ctx.source
         if (source.chat_type not in {"dm", "group"} or not source.thread_id
-                or not self._assistant_thread_title_enabled()):
+                or not self._thread_titles_enabled(source)):
             return False
         agent._title_style = "verb_first"
         loop = ctx._loop_for_step
@@ -180,7 +192,7 @@ class SlackThreadTitlesMixin:
 
     def _reserve_title_upgrade(self, source, title: str, current) -> Optional[str]:
         """Reserve before I/O: an ambiguous API failure must not retry over a manual rename."""
-        if not self._app or not self._assistant_thread_title_enabled() or not current():
+        if not self._app or not self._thread_titles_enabled(source) or not current():
             return None
         key = self._workspace_thread_key(source.scope_id or "", source.chat_id, source.thread_id)
         if not key or key in self._upgraded_assistant_threads:
@@ -207,8 +219,8 @@ class SlackThreadTitlesMixin:
         agents.sessions.rename covers channel threads only when Slack holds an agent session for
         them (else session_not_found); Hermes never opens one there, so channels do not use it.
         """
-        from slack_sdk.errors import SlackApiError
         try:
+            from slack_sdk.errors import SlackApiError
             title = self._reserve_title_upgrade(source, title, current)
             if not title:
                 return
@@ -230,10 +242,11 @@ class SlackThreadTitlesMixin:
             # Our edit echoes back as message_changed. Claim the root so the inbound guard treats
             # it as seen; an unseen root's text edit would otherwise start a turn as its author.
             self._remember_processed_message_ts(source.thread_id)
-            await client.chat_update(channel=source.chat_id, ts=source.thread_id, **kwargs)
-        except SlackApiError as e:
-            logger.info("[Slack] channel thread root title rejected: %s",
-                        (getattr(e, "response", None) or {}).get("error") or e)
+            try:
+                await client.chat_update(channel=source.chat_id, ts=source.thread_id, **kwargs)
+            except SlackApiError as e:
+                logger.info("[Slack] channel thread root title rejected: %s",
+                            (getattr(e, "response", None) or {}).get("error") or e)
         except Exception:
             logger.debug("[Slack] channel thread root title failed", exc_info=True)
 
