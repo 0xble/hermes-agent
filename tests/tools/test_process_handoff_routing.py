@@ -124,6 +124,11 @@ def test_handoff_survives_child_cleanup_and_transfers_completion(
     assert proc is not None
     assert child.closed and not proc.exited
     assert entry["handed_off_processes"][0]["session_id"] == proc.id
+    from tools.process_registry_notifications import _process_accounting_lines
+    from gateway.run import _parse_session_key
+    assert "Handed off to you:" in "\n".join(_process_accounting_lines(entry))
+    parsed_route = _parse_session_key(proc.session_key)
+    assert parsed_route is not None and parsed_route["chat_type"] == "group"
     assert reg.running_owned_by(child._subagent_id) == []
     assert proc.owner_task_id == parent._current_task_id
     assert proc.parent_session_id == parent.session_id

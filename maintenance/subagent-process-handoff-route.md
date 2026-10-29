@@ -27,6 +27,14 @@ checkpointed route of a background process.
   restart-recovered watcher addresses the parent, not the child.
 - Watcher and queue completion events carry `handoff_note` and `parent_session_id`, so
   the parent's notice names the purpose the child gave.
+- Legacy checkpoints with a bare session id resolve their persisted session-store
+  origin before parsing route metadata. If that origin is unavailable, the store may
+  supply an unambiguous chat type for the watcher's exact platform, chat and profile.
+  A sibling session never supplies a missing thread. Unknown or ambiguous chats remain
+  unroutable rather than being guessed. No checkpoint migration is required.
+- An unresolvable process source warns once per process per gateway lifetime. Later
+  watcher ticks and the terminal event log at DEBUG. Async-delegation diagnostic
+  sources retain their existing DEBUG-only behavior.
 
 ## Entry Points
 
@@ -35,6 +43,8 @@ performs the transfer. `tools/process_registry.py::_handoff_process` is the disp
 shim. `ProcessRegistry.transfer_ownership` owns the locked field moves, pending-watcher
 updates and the checkpoint write. `gateway/run_notifications_ownership.py::_follow_process_route`
 is the watcher's route adoption.
+`gateway/run_notifications_sources.py` owns synthetic source reconstruction and
+per-process unresolvable-source warning suppression.
 
 ## Provenance
 
@@ -51,12 +61,17 @@ describe the same gap. Recovered from uncommitted work by the 2026-10-26 lost-wo
 ```bash
 scripts/run_tests.sh tests/tools/test_process_handoff_routing.py \
   tests/tools/test_subagent_process_handoff.py tests/gateway/test_telegram_retire_work.py \
-  tests/gateway/test_background_process_notifications.py
+  tests/gateway/test_background_process_notifications.py \
+  tests/gateway/test_process_event_source_recovery.py
 ```
 
 `test_process_handoff_routing.py` drives a real process through real tool dispatch,
 child teardown, checkpoint I/O and gateway admission. Against the unpatched code 11 of
 its 12 cases fail: the completion keeps the child's session id.
+`test_process_event_source_recovery.py` loads a real legacy process checkpoint and a
+reloaded routing store, then drives its completion to gateway admission. It also
+covers exact-chat fallback, explicit-thread preservation, fail-closed unknown chats,
+and warning deduplication across watcher ticks and a fresh completion event.
 
 ## Retirement And Rollback
 
