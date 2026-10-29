@@ -160,10 +160,22 @@ Timer and remote-kernel concurrency fixtures use bounded Events to establish the
 intended owner before asserting behavior; real worker threads and watchdogs remain
 in place. Updater tests isolate all launchd inventory and profile-plist probes so fake
 updates cannot discover the host gateway. No runtime safety guard is disabled.
-The desktop installer-ownership fixture waits for a readiness message from its real
-Python child before checking process arguments. Full platform concurrency left the
-shell wrapper running beyond its former 40 x 25ms polling window. A bounded child
-handshake preserves the real process-identity assertions and reports startup failures.
+The desktop installer-ownership fixtures wait for a readiness message from their real
+Python children before checking process arguments or native update ownership. Full
+platform concurrency left a shell wrapper running beyond its former 40 x 25ms
+polling window. The managed-launcher fixture subscribes before launch to the atomic
+terminal-status publication rather than assuming completion within 100 x 25ms.
+The existing finite Vitest budgets and all argv, log, status, mode and native-ownership
+assertions remain intact. Three-second startup/update injection reproduces both
+former failures and passes with event-based synchronization, without retries.
+The bundled gateway-ticket fixture links the selected Python's base interpreter,
+not its venv executable. A copied venv binary depends on its adjacent `pyvenv.cfg`
+to find the standard library, which is absent in the fake payload. With a copied
+venv first on `PATH`, the unchanged test fails at gateway-ticket bootstrap, while
+linking `sys._base_executable` passes through the real payload interpreter and
+socket. The rejecting CLI shim, exact ticket assertion and existing timeout and
+platform selection remain unchanged. No production resolver changes are needed.
+Retire when upstream's fixture preserves an equivalent standalone Python layout.
 
 The portable Linux sandbox exposed a browser port-allocation bug when IPv6 is
 unavailable. Upstream [PR #91455](https://github.com/NousResearch/hermes-agent/pull/91455),

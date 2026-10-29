@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, watch } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -367,6 +367,19 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
     const shell: string = (await exec('command -v bash', { shell: 'bash' })).stdout.trim()
     const launcher: string = path.join(home, 'hermes launcher')
 
+    // Subscribe before launching: the detached child can publish before exec returns.
+    const statusPath: string = path.join(home, `.update_exit_code.${CORRELATION}`)
+    const publication = watch(home)
+
+    const published = new Promise<void>((resolve, reject) => {
+      publication.on('error', reject)
+      publication.on('change', (_event, filename) => {
+        if (String(filename) === path.basename(statusPath) && existsSync(statusPath)) {
+          resolve()
+        }
+      })
+    })
+
     try {
       await writeFile(
         launcher,
@@ -384,24 +397,13 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
         CORRELATION
       )
 
-      const { stdout, stderr } = await exec(command, { shell, env: { ...process.env, HOME: home, HERMES_HOME: home } })
-      const statusPath: string = path.join(home, `.update_exit_code.${CORRELATION}`)
+      const [{ stdout, stderr }] = await Promise.all([
+        exec(command, { shell, env: { ...process.env, HOME: home, HERMES_HOME: home } }),
+        published
+      ])
+
       const logPath: string = path.join(home, 'logs', `desktop-update-${CORRELATION}.log`)
-      let status: string | undefined
-
-      for (let attempt: number = 0; attempt < 100; attempt += 1) {
-        try {
-          status = await readFile(statusPath, 'utf8')
-
-          break
-        } catch (error: unknown) {
-          if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
-            throw error
-          }
-
-          await new Promise<void>(resolve => setTimeout(resolve, 25))
-        }
-      }
+      const status: string = await readFile(statusPath, 'utf8')
       const log: string = await readFile(logPath, 'utf8')
       assert.match(stdout, /MANAGED_UPDATE_STARTED/)
       assert.match(log, /managed-update start pid=/)
@@ -417,6 +419,7 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
         false
       )
     } finally {
+      publication.close()
       await rm(home, { force: true, recursive: true })
     }
   }
