@@ -6,7 +6,6 @@ path on the controller, including realpath, hashes and negative-cache checks.
 from __future__ import annotations
 
 import json
-import posixpath
 
 from tools.node_execution import current_execution
 
@@ -22,7 +21,9 @@ def file_ops():
 def remote_home() -> str:
     env = file_ops().env
     if not getattr(env, "_remote_home_detected", False):
-        raise RuntimeError("Selected node's home is unavailable, refusing controller path expansion")
+        env._remote_home = env._detect_remote_home()
+        if not getattr(env, "_remote_home_detected", False):
+            raise RuntimeError("Selected node home is unavailable; refusing an unscoped file operation")
     return env._remote_home
 
 
@@ -87,5 +88,15 @@ def mtime(path: str) -> float | None:
 
 
 def policy_realpath(path: str) -> str:
-    """Policy candidates are already in target coordinates, not controller symlinks."""
-    return posixpath.normpath(str(path))
+    """Resolve policy anchors on the target, just like the path being checked.
+
+    Cache only inside this tool invocation. A later call must observe changed
+    target symlinks, and a failed resolution must never become a lexical anchor.
+    """
+    execution = current_execution()
+    if execution is None:
+        raise RuntimeError("Remote policy resolution requires a bound node")
+    text = str(path)
+    if text not in execution.policy_paths:
+        execution.policy_paths[text] = remote_path(text)
+    return execution.policy_paths[text]

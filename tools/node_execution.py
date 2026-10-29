@@ -5,8 +5,9 @@ mutable terminal/file state uses the profile/session/connection-qualified key.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import hashlib
 import json
@@ -21,6 +22,7 @@ class Execution:
     node: Node
     key: str
     task_id: str
+    policy_paths: dict[str, str] = field(default_factory=dict, compare=False, repr=False)
 
 
 _execution: ContextVar[Execution | None] = ContextVar("node_execution", default=None)
@@ -40,6 +42,43 @@ def tracking_key(task_id: str) -> str:
 def path_key(path: str) -> str:
     execution = current_execution()
     return json.dumps([execution.key, path]) if execution else path
+
+
+def physical_path_key(path: str) -> str:
+    """Serialize mutations by filesystem, not by the caller's read authority."""
+    execution = current_execution()
+    if execution is None:
+        return path
+    node = execution.node
+    return json.dumps(["ssh", node.ssh, node.platform, path])
+
+
+_result_environment: ContextVar[list | None] = ContextVar("node_result_environment", default=None)
+
+
+@contextmanager
+def collect_result_environment():
+    destination = [None]
+    token = _result_environment.set(destination)
+    try:
+        yield destination
+    finally:
+        _result_environment.reset(token)
+
+
+class UnavailableResultEnvironment:
+    """A selected destination without a live environment must not mean controller."""
+    def __init__(self, node):
+        self._hermes_node = node
+
+    def execute(self, *args, **kwargs):
+        raise RuntimeError("Producing node environment is unavailable; archive was not saved")
+
+
+def record_result_environment(env):
+    destination = _result_environment.get()
+    if destination is not None:
+        destination[0] = env
 
 
 def node_schema() -> dict:
@@ -85,7 +124,11 @@ def node_handler(handler):
                     try:
                         result = handler(args, **kw)
                     finally:
-                        _execution.reset(token)
+                        try:
+                            from tools.terminal_tool_lifecycle import get_active_env
+                            record_result_environment(get_active_env(execution.key) or UnavailableResultEnvironment(selected))
+                        finally:
+                            _execution.reset(token)
             finally:
                 with _lock:
                     mutex, users = _locks[key]

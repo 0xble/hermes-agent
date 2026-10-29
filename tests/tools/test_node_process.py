@@ -25,6 +25,9 @@ class RecordedSSH:
         self.host = node.ssh
         self.calls = []
         self.state = "running"
+        self.exit_code = 0
+        self.reason = "exited"
+        self.source = ""
         self.output = b""
         self.error = None
         self.wrong_token = False
@@ -39,9 +42,13 @@ class RecordedSSH:
                   "state": self.state, "pid": 43123, "offset": offset,
                   "size": len(self.output), "output": base64.b64encode(self.output[offset:]).decode()}
         if request["action"] == "stop":
-            result.update(state="exited", exit_code=-9, reason="killed", source=request.get("source"))
+            self.state = "exited"
+            self.exit_code = -9
+            self.reason = "killed"
+            self.source = request.get("source")
+            result.update(state=self.state, exit_code=self.exit_code, reason=self.reason, source=self.source)
         elif self.state == "exited":
-            result.update(exit_code=0, reason="exited")
+            result.update(exit_code=self.exit_code, reason=self.reason, source=self.source)
         return subprocess.CompletedProcess([], 0, json.dumps(result), "")
 
 

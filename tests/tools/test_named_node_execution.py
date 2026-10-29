@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -65,7 +66,10 @@ def peers(monkeypatch, tmp_path):
         # Keep target-side snapshots and receipts in owned fixture directories.
         for prefix in ("hermes-snap-", "hermes-cwd-"):
             command = command.replace("/tmp/" + prefix, str(root / "tmp" / prefix))
-        return command, {**os.environ, "HOME": str(root / "home"), "TMPDIR": str(root / "tmp")}
+        # A synthetic target owns a supported Python, not the controller's user
+        # shims. Recovered handles invoke helpers before a terminal snapshot.
+        return command, {**os.environ, "HOME": str(root / "home"), "TMPDIR": str(root / "tmp"),
+                         "PATH": str(Path(sys.executable).parent) + os.pathsep + os.defpath}
 
     def run_ssh(env, remote_cmd, timeout):
         command, variables = prepare(env, remote_cmd)

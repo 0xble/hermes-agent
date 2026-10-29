@@ -258,7 +258,8 @@ def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
 
 
 def lock_path(resolved_or_path: str | Path):
-    return _registry.lock_path(path_key(str(resolved_or_path)))
+    from tools.node_execution import physical_path_key
+    return _registry.lock_path(physical_path_key(str(resolved_or_path)))
 
 
 def writes_since(exclude_task_id: str, since_ts: float, paths: Iterable[str | Path]) -> dict[str, list[str]]:
