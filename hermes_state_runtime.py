@@ -64,8 +64,11 @@ def _epoch(conn, epoch):
 
 
 def _session(conn, session_id):
+    from hermes_state_mutation_retirement import retired_in
     row = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
-    if row is None:
+    # Reclamation may lag the retirement commit. Resolve visibility on this
+    # transaction, not a separate preflight read or the physical row alone.
+    if row is None or retired_in(conn, session_id):
         raise RuntimeStoreError('not_found')
     return row
 
@@ -512,6 +515,10 @@ def mutate_runtime_session(db, *, epoch: int, principal_id: str, session_id: str
         if replay is not None:
             return replay, None
         session = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+        from hermes_state_mutation_retirement import retired_in
+        # Import validates every payload id and reports the named conflict itself.
+        if operation != 'import' and retired_in(conn, session_id):
+            raise RuntimeStoreError('not_found')
         if session is None and operation != 'import':
             raise RuntimeStoreError('not_found')
         revision = session['runtime_revision'] if session else 0
@@ -552,6 +559,9 @@ def mutate_runtime_session(db, *, epoch: int, principal_id: str, session_id: str
     if event is not None:
         from hermes_state_common import emit_session_deleted
         emit_session_deleted(db, event.session_ids, reason=event.reason, primary=session_id)
+    if operation == 'delete':
+        from hermes_state_deletion import finish_pending_deletes
+        finish_pending_deletes(db, required_ids=result['deleted_ids'])
     return result
 
 

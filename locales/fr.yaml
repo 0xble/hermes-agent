@@ -3883,6 +3883,7 @@ explainer:
     error_near_max_iterations: "une erreur s'est produite près de la limite d'itérations avant d'obtenir une réponse finale. Vérifiez la sortie de l'outil ci-dessus, puis envoyez `continue`."
     repeated_outer_errors: "le tour échouait sans cesse avec des erreurs répétées et a été arrêté prématurément au lieu de réessayer indéfiniment. Vérifiez les erreurs ci-dessus, puis envoyez `continue` pour réessayer."
   persistence:
+    owner_restart: "la passerelle Hermes a redémarré ou est devenue indisponible pendant ce tour et n’est pas revenue avant la fin du délai de nouvelle tentative. Les écritures en attente du worker restent dans le journal local pour une nouvelle tentative explicite ou une reprise authentifiée. Ne renvoyez pas le tour."
     compression: "le tour a été arrêté car un autre processus compressait cette session. Votre message devrait déjà être enregistré — renvoyez-le une fois la compression terminée."
     compression_closed: "le tour a été arrêté car cette session a été renouvelée par la compression du contexte et sa continuation en cours n'a pas pu être reprise. Le stockage lui-même est sain — actualisez le client (ou démarrez un nouveau tour) pour qu'il récupère le nouvel identifiant de session, puis renvoyez votre message."
     turn_lease: "le tour a été arrêté car un autre processus Hermes a pris le contrôle de cette session. Votre réponse n'a pas été enregistrée — attendez que l'autre processus termine, puis renvoyez votre message."

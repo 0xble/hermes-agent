@@ -313,16 +313,24 @@ class DeliveryRouter:
         elif send_metadata.get("job_id"):
             topic_owner_key = f"cron:{send_metadata['job_id']}"
         thread_id = target.thread_id
+        # A configured numeric destination borrows that live session's topic. Its
+        # historical cron owner may name a retired lane, so it must not override
+        # the delivery target. Explicit owner keys and named topics still pin lanes.
         if (
             thread_id and _looks_like_int(thread_id)
             and target.platform == Platform.TELEGRAM
             and looks_like_telegram_private_chat_id(target.chat_id)
             and topic_owner_key and not topic_allow_parallel
         ):
-            validate_owner = getattr(adapter, "ensure_existing_telegram_topic_owner", None)
-            if callable(validate_owner):
-                # The owner registry lives in state.db (claims are writes): keep it off the loop.
-                await asyncio.to_thread(validate_owner, target.chat_id, str(thread_id), topic_owner_key)
+            if send_metadata.get("job_id") and not send_metadata.get("telegram_topic_owner_key"):
+                validate_target = getattr(adapter, "validate_existing_telegram_topic", None)
+                if callable(validate_target):
+                    await asyncio.to_thread(validate_target, target.chat_id, str(thread_id))
+            else:
+                validate_owner = getattr(adapter, "ensure_existing_telegram_topic_owner", None)
+                if callable(validate_owner):
+                    # Registry claims write state.db: keep them off the loop.
+                    await asyncio.to_thread(validate_owner, target.chat_id, str(thread_id), topic_owner_key)
         if thread_id and not any(key in send_metadata for key in _THREAD_ROUTING_KEYS):
             send_metadata["thread_id"] = thread_id
             if target.platform == Platform.TELEGRAM and looks_like_telegram_private_chat_id(target.chat_id):
