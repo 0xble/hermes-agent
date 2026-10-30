@@ -65,6 +65,23 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `tests/gateway/test_legacy_delegation_refusal.py`,
   `tests/hermes_cli/test_rollback_diagnostics.py`, and existing guardian/release tests.
 
+## Automation Wakes After a Route Rebind
+
+- Fork patch identity: `automation-rebound-route`.
+- Producer wakes (`/loop` ticks, delegation completions, process notices) borrow the
+  route's last committed envelope. A session rebound to another route after its last
+  human turn (`switch_session`, as the 2026-10-30 Slack cutover moves 142 Telegram topic
+  owners to Slack threads) kept a committed envelope from the old route. Its provenance
+  names a connector that no longer serves the session, so every wake was refused
+  (`not_found` from provenance restore). A refused completion is permanent and reaches the
+  drop cap. A refused `/loop` tick is skipped.
+- `route_rebound(entry, envelope)` is true when the committed envelope's `route` is not
+  the entry's current `session_key`. Then `snapshot_automation` and `admit_route_wake`
+  use the current origin, revalidated by `revalidate_legacy_route` against the live
+  adapter like native ingress. That path mints no proof, refuses relay, role and
+  upstream-authorized origins, and keeps the sender and route comparison.
+- Guard: `tests/gateway/test_automation_rebound_route.py`.
+
 ## Billing outage persistence and provider-wide classification
 
 - Fork patch identity: `billing-outage-recovery`.
