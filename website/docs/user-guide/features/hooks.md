@@ -454,6 +454,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
+| [`post_steer_delivered`](#post_steer_delivered) | Observer | After a mid-turn steer row is inserted into the running turn, at either drain site; return ignored, timeout fails open. | `session_id`, `turn_id`, `platform`, `text`, `delivery_id`, `ordinal` | `text` is the user's raw steer text and is not redacted. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform`, `side_question_token` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
 | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
@@ -672,6 +673,39 @@ def track_metrics(tool_name, result, duration_ms=0, **kwargs):
 def register(ctx):
     ctx.register_hook("post_tool_call", track_metrics)
 ```
+
+---
+
+### `post_steer_delivered`
+
+Fires once **after** a mid-turn steer (`/steer`, or a busy-input message delivered as a steer) is inserted into the running turn as its own user row, at either drain site: after a tool batch, or just before the next API call.
+
+**Callback signature:**
+
+```python
+def my_callback(session_id, turn_id: str, platform: str, text: str,
+                delivery_id: str, ordinal: int, **kwargs):
+    ...
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | `str \| None` | Current session ID; it can change during compression. |
+| `turn_id` | `str` | The turn's ID, the same one `pre_llm_call` and `pre_api_request` receive; empty string if absent. |
+| `platform` | `str` | Current surface, such as `cli` or `telegram`; empty string if absent. |
+| `text` | `str` | The drained steer text, without the out-of-band marker frame. |
+| `delivery_id` | `str` | A UUID4 minted for this insertion. |
+| `ordinal` | `int` | 1-based insertion counter, reset each turn and shared by both drain sites. |
+
+`steer()` strips each input and joins several pending inputs with `\n`, so one drain of several steers is one delivery, not one event per original message. Nothing fires for an empty drain or a requeue. A steer that falls back to the next turn arrives as that turn's ordinary `user_message` instead.
+
+**Return value:** Ignored. A callback cannot rewrite or veto the inserted row. Python callbacks are bounded by `plugins.hook_callback_timeout`; a timed-out callback is abandoned without joining it and the turn continues. Exceptions also fail open.
+
+**Use cases:** Capturing mid-turn user input when it reaches the model, for task trackers and audit logs, without inferring it from transcript rows.
+
+**Privacy:** `text` is the user's raw input and may contain secrets. It is not redacted.
+
+This is an insertion receipt, not proof that the provider accepted the request, and not an exactly-once guarantee across process death.
 
 ---
 

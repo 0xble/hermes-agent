@@ -116,7 +116,7 @@ VALID_HOOKS: set[str] = {
     # pre_verify: once per turn when the agent edited code and is about to verify/finish. Return
     # {"action": "continue", "message"} (or Claude-Code Stop {"decision": "block", "reason"}) to keep
     # going; anything else finishes. Bounded by agent.max_verify_nudges.
-    "pre_verify", "pre_api_request", "post_api_request", "api_request_error",
+    "pre_verify", "pre_api_request", "post_api_request", "api_request_error", "post_steer_delivered",  # hooks.md
     # pre/post_auxiliary_call: once per physical provider attempt of an auxiliary LLM call
     # (agent/auxiliary_hooks.py — titling, compression, MoA, vision, approval, ...). Same payload
     # shape as pre/post_api_request plus ``aux_task``; distinct events so turn-scoped
