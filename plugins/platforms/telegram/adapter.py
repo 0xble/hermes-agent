@@ -3405,22 +3405,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     return
             raise RuntimeError(
                 f"Telegram topic owner {owner_key} does not own thread {thread_id}; refusing reroute")
-        binding = db.get_telegram_topic_binding(
-            chat_id=str(chat_id), thread_id=str(thread_id), profile_name=profile_name)
-        if not binding:
-            raise RuntimeError(
-                f"Telegram topic thread {thread_id} has no live Hermes binding; refusing duplicate fallback")
-        session = db.get_session(str(binding.get("session_id")))
-        session_profile = str((session or {}).get("profile_name") or "default")
-        if (
-            not session
-            or session_profile != profile_name
-            or session.get("ended_at") is not None
-            or session.get("archived")
-            or session.get("hidden")
-        ):
-            raise RuntimeError(
-                f"Telegram topic thread {thread_id} has no live Hermes owner; refusing duplicate fallback")
+        session = self.validate_existing_telegram_topic(chat_id, thread_id)
         mark_automation = getattr(db, "set_telegram_topic_binding_managed_mode", None)
         if callable(mark_automation):
             mark_automation(

@@ -46,6 +46,18 @@ class _SendResult:
 
 
 class TestConfirmAdapterDelivery:
+    def test_configured_target_wins_over_pinned_origin(self):
+        job = _job("101")
+        job.update(deliver=f"telegram:{CHAT_ID}:202", keep_pinned_lane=True, no_agent=True)
+        error, calls, standalone_calls = _run(job, "**report**", _SendResult(message_id=42))
+        assert error is None
+        assert len(calls) == 1
+        assert calls[0]["target"].thread_id == "202"
+        assert calls[0]["metadata"]["thread_id"] == "202"
+        assert calls[0]["metadata"]["job_id"] == job["id"]
+        assert "telegram_topic_owner_key" not in calls[0]["metadata"]
+        assert standalone_calls == []
+
     def test_none_is_not_delivered(self):
         assert _confirm_adapter_delivery(None, "j1") is False
 
