@@ -247,18 +247,23 @@ async def test_native_retry_retains_original_receipt_but_changed_content_still_c
 
 
 @pytest.mark.asyncio
-async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_busy, monkeypatch):
+async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_busy, monkeypatch, tmp_path):
     import threading
     import gateway.run as gateway_run
     from hermes_constants import get_hermes_home_override
+    from tests.waiting import async_wait_until
 
     env = shared_busy
     home = env.runner._resolve_profile_home_for_source(env.source)
+    # A routed identity: the admitting bot's transport profile differs from the runtime profile.
+    transport = tmp_path / 'transport'
+    transport.mkdir()
+    (transport / '.env').write_text(f'SIGNAL_ALLOWED_USERS={env.source.user_id}\n')
     loads, marks = [], []
     real_load, real_mark = gateway_run._load_profile_secret_scope, env.runner._mark_attended_user_activity
 
     def load(profile_home):
-        loads.append(threading.get_ident())
+        loads.append((str(profile_home), threading.get_ident()))
         return real_load(profile_home)
 
     async def mark(*args, **kwargs):
@@ -266,14 +271,19 @@ async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_bu
         return await real_mark(*args, **kwargs)
     monkeypatch.setattr(gateway_run, '_load_profile_secret_scope', load)
     monkeypatch.setattr(env.runner, '_mark_attended_user_activity', mark)
-    # A multiplexed identity authorizes under its transport profile: its gates must find that
-    # scope already hydrated, rather than load secrets inline before the reader can continue.
-    monkeypatch.setattr(env.runner, '_authorization_home_for_source', lambda source: home)
+    monkeypatch.setattr(env.runner, '_authorization_home_for_source', lambda source: transport)
+    # Commit from the burst's own timer, as production does, rather than the test's flush helper.
+    monkeypatch.setattr(env.adapter, '_busy_text_debounce_seconds', 0.01)
+    monkeypatch.setattr(env.adapter, '_busy_text_hard_cap_seconds', 0.01)
     event = MessageEvent(text='scoped follow-up', source=env.source, message_id='scoped')
     await env.adapter.handle_message(event)
     await event._attended_activity_task
-    # 1 off-loop load for the authorization gates, 1 inside the stamp task. None on the loop.
-    assert len(loads) == 2 and threading.get_ident() not in loads
+    await async_wait_until(lambda: any(row['request_id'] == 'scoped' for row in _rows(env.owner.authority)),
+                           timeout=10, what='the follow-up to commit')
+    loop_thread = threading.get_ident()
+    # Ingress gates (burst lane and the handler's re-check) and the stamp all load off the loop.
+    assert loads and all(thread != loop_thread for _, thread in loads), loads
+    assert [path for path, _ in loads].count(str(transport)) == 1
     assert marks == [str(home)]
     assert event._attended_activity_marked
 

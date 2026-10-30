@@ -25,7 +25,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextvars import Context, copy_context
+from contextvars import Context, ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Tuple, cast
@@ -1913,6 +1913,36 @@ async def _async_profile_runtime_scope(profile_home: Path):
     secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(profile_home))
     with _profile_runtime_scope(Path(profile_home), secrets):
         yield
+
+
+# One authorization home's secrets, loaded off the loop for the synchronous gates awaited inside
+# ``prepared_authorization_scope`` (``GatewayRunner._under_authorization_profile`` reads it).
+_PREPARED_AUTHORIZATION_SCOPE: ContextVar[Optional[tuple[str, dict]]] = ContextVar(
+    "_PREPARED_AUTHORIZATION_SCOPE", default=None)
+
+
+@_asynccontextmanager
+async def prepared_authorization_scope(runner, source):
+    """Hydrate *source*'s authorization-profile secrets off the event loop for the auth and bot
+    budget checks awaited inside, so a receive path never loads them inline. The checks still
+    enter that profile's scope; they only skip the load."""
+    home = runner._authorization_home_for_source(source)
+    if home is None:
+        yield
+        return
+    from hermes_constants import hermes_home_key
+    secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(home))
+    token = _PREPARED_AUTHORIZATION_SCOPE.set((hermes_home_key(home), secrets))
+    try:
+        yield
+    finally:
+        _PREPARED_AUTHORIZATION_SCOPE.reset(token)
+
+
+def release_prepared_authorization_scope() -> None:
+    """End reuse in this task once its ingress gates passed. A turn that outlives admission must
+    load the authorization profile afresh, so a failed secret source is retried as before."""
+    _PREPARED_AUTHORIZATION_SCOPE.set(None)
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -4133,14 +4163,11 @@ class GatewayRunner(
         authorization_home = self._authorization_home_for_source(source)
         if authorization_home is None:
             return check()
-        from agent.secret_scope import current_secret_scope_home
         from hermes_constants import hermes_home_key
-        key = hermes_home_key(authorization_home)
-        bound = current_secret_scope_home()
-        if (bound is not None and hermes_home_key(bound) == key
-                and (override := get_hermes_home_override()) is not None and hermes_home_key(override) == key):
-            return check()  # the caller already entered this profile's scope, hydrated off-loop
-        with _profile_runtime_scope(Path(authorization_home)):
+        prepared = _PREPARED_AUTHORIZATION_SCOPE.get()
+        secrets = (prepared[1] if prepared is not None and prepared[0] == hermes_home_key(authorization_home)
+                   else None)
+        with _profile_runtime_scope(Path(authorization_home), secrets):
             return check()
 
     def _cache_session_source(self, session_key: str, source) -> None:

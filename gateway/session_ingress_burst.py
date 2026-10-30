@@ -48,20 +48,8 @@ def _serial(adapter):
     return getattr(adapter, 'serial_receive_loop', False)
 
 
-async def _authorize(runner, event, session_key):
-    """User and bot-budget gates for one external busy input, under its authorization profile.
-
-    The profile's secrets hydrate off the event loop first, as the runner's own message handlers
-    do, so the synchronous checks find the scope already bound instead of hydrating inline."""
-    home = runner._authorization_home_for_source(event.source)
-    if home is None:
-        return _authorized(runner, event, session_key)
-    from gateway.run import _async_profile_runtime_scope
-    async with _async_profile_runtime_scope(home):
-        return _authorized(runner, event, session_key)
-
-
 def _authorized(runner, event, session_key):
+    """User and bot-budget gates for one external busy input, under its authorization profile."""
     if not runner._is_user_authorized_for_source(event.source):
         logger.warning(
             "Dropping message from unauthorized user in active session: "
@@ -105,16 +93,27 @@ async def burst_gate(adapter, event, session_key):
 async def dispatch_busy_burst(adapter, event, session_key):
     """``dispatch_shared_busy`` for one busy input, merging a same-sender PHOTO+PHOTO or
     queue-mode TEXT+TEXT burst first."""
+    runner = getattr(adapter._message_handler, '__self__', None) or adapter.gateway_runner
+    if event.internal or not callable(getattr(runner, '_schedule_attended_user_activity', None)):
+        return await _dispatch_busy_burst(adapter, runner, event, session_key)
+    # The authorization profile's secrets load off the event loop once, here. Every gate this input
+    # reaches, including the handler's re-check in the commit and observer tasks that copy this
+    # context, reuses them, so a serial reader never waits on an inline load.
+    from gateway.run import prepared_authorization_scope
+    async with prepared_authorization_scope(runner, event.source):
+        return await _dispatch_busy_burst(adapter, runner, event, session_key)
+
+
+async def _dispatch_busy_burst(adapter, runner, event, session_key):
     from gateway.platforms.base import merge_pending_message_event
     from gateway.session_ingress import dispatch_shared_busy
     # This lane returns before the runner's busy handler. Authorize each original input before
     # it can merge into an authorized head, and stamp before any burst/backpressure wait.
-    runner = getattr(adapter._message_handler, '__self__', None) or adapter.gateway_runner
     schedule = getattr(runner, '_schedule_attended_user_activity', None)
     if callable(schedule) and not event.internal:
         # Keep internal work on the handler's existing automation admission. An external input's
         # allow_gateway_control flag alone never bypasses the scoped user/bot gates.
-        if not await _authorize(runner, event, session_key):
+        if not _authorized(runner, event, session_key):
             return
         from gateway.run import _async_profile_runtime_scope
 
@@ -135,7 +134,7 @@ async def dispatch_busy_burst(adapter, event, session_key):
     previous = _state(adapter, '_shared_burst_commits').get(session_key)
     if kind is not None and previous is not None and not previous.done() and _serial(adapter):
         await asyncio.wait({previous})  # one uncommitted burst per chat: the reader waits, as on main
-        return await dispatch_busy_burst(adapter, event, session_key)  # a burst may have started meanwhile
+        return await _dispatch_busy_burst(adapter, runner, event, session_key)  # a burst may have started
     if kind is None:
         if previous is not None:
             await asyncio.wait({previous})
