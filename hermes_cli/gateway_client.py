@@ -222,7 +222,7 @@ class GatewayClient:
             self.pending.pop(rid, None)
 
 
-def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, subject=None) -> str:
+def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, subject=None, timeout=5) -> str:
     from hermes_cli.gateway_runtime import control_home_for
     from hermes_cli.gateway_runtime_discovery import connect_private, _identify_response
     # A served secondary's ticket is minted by the multiplexer's socket, bound to the secondary.
@@ -235,10 +235,10 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
     }}).encode() + b"\n"
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
-        data = query_runtime_control(home, request, 5)
+        data = query_runtime_control(home, request, timeout)
     else:
-        deadline = time.monotonic() + 5
-        with connect_private(home, 5) as peer:
+        deadline = time.monotonic() + timeout
+        with connect_private(home, timeout) as peer:
             peer.sendall(request)
             data = bytearray()
             while b"\n" not in data:
