@@ -211,6 +211,52 @@ class SessionLifecycleMixin:
             self._set_turn_marker_locked(session_key, entry, None, None)
         return True
 
+    def record_progress_card(self, session_key: str, chat_id: str, message_id: str) -> bool:
+        """Durably note a temporary progress card as sent, owned by this process."""
+        card = {"chat_id": str(chat_id), "message_id": str(message_id), "pid": os.getpid()}
+        return self._replace_progress_cards(session_key, lambda cards: cards + [card])
+
+    def forget_progress_cards(self, session_key: str, chat_id: str, message_ids) -> bool:
+        """Drop the record of cards whose cleanup has run (or that a failed run keeps on purpose)."""
+        gone = {(str(chat_id), str(mid)) for mid in message_ids}
+        return self._replace_progress_cards(
+            session_key, lambda cards: [c for c in cards if (c["chat_id"], c["message_id"]) not in gone])
+
+    def _replace_progress_cards(self, session_key: str, change) -> bool:
+        """Persist ``change(cards)`` before publishing it, through the single-entry fast save."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            cards = change(list(entry.progress_cards))
+            if cards == entry.progress_cards:
+                return False
+            self._save_entry(session_key, entry_data={**entry.to_dict(), "progress_cards": cards}, lock_held=True)
+            entry.progress_cards = cards
+        return True
+
+    def orphan_progress_cards(self) -> list[tuple[str, "SessionSource", str, list[str]]]:
+        """``(session_key, origin, chat_id, message_ids)`` for recorded cards whose owning process
+        is gone. A live owner (this process, or a zero-cut predecessor still finishing its turns)
+        still holds the cleanup callback, so its cards are left to it."""
+        from gateway.status import _pid_exists
+        with self._lock:
+            self._ensure_loaded_locked()
+            recorded = [(key, e.origin, list(e.progress_cards)) for key, e in self._entries.items()
+                        if e.progress_cards and e.origin is not None]
+        live: dict = {}
+        orphans: dict = {}
+        for key, origin, cards in recorded:
+            for card in cards:
+                pid = card.get("pid")
+                if isinstance(pid, int) and pid > 0:
+                    if pid not in live:
+                        live[pid] = _pid_exists(pid)
+                    if live[pid]:
+                        continue
+                orphans.setdefault((key, card["chat_id"]), (origin, []))[1].append(card["message_id"])
+        return [(key, origin, chat_id, mids) for (key, chat_id), (origin, mids) in orphans.items()]
+
     def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
         """Promote crash-left turn markers into ``resume_pending`` (unclean startup only).
         Old/invalid markers are cleared without resuming; suspended sessions are never re-armed.

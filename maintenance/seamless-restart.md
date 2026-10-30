@@ -156,6 +156,29 @@ for its own receipts and cancelling its own queued rows (`authorize(superseded_o
 those rows can never run, and cancelling them is what lets the session be deleted.
 Proof: `tests/gateway/test_superseded_queued_rows.py`.
 
+## Progress cards survive a restart only as a record
+
+Patch identity: `seamless-restart; boot deletes progress cards a restart stranded`.
+End-of-turn deletion of temporary progress cards is a post-delivery callback held
+in process memory, so a restart mid-turn, or between the final send and the
+callback, stranded every card the turn posted (about 215 deleted by hand on
+2026-10-29).
+
+- `TurnContext.track_cleanup_id` is the one tracking site. With
+  `cleanup_progress` on it also records `{chat_id, message_id, pid}` on the
+  session's routing entry (`SessionEntry.progress_cards`, single-entry fast save,
+  off the loop). Only ids the in-memory cleanup would delete are recorded, so the
+  final reply never is.
+- The cleanup callback forgets its ids after one attempt; a cancelled cleanup
+  keeps them. A failed run forgets them too, because failed runs keep their cards.
+- Boot (`_start_finish_wiring`, after adapters connect) deletes, in the
+  background, every recorded card whose recording pid is dead, one
+  `delete_messages` batch per chat, then forgets them whatever the outcome:
+  Telegram reports a card already gone or past its 48h window as a plain False.
+  A live pid (a zero-cut predecessor finishing its turn) keeps its own cards.
+
+Proof: `tests/gateway/test_progress_card_restart_cleanup.py`.
+
 ## Bounded terminal shutdown
 
 Patch identity: `seamless-restart; bounded restart shutdown` (the same lineage as

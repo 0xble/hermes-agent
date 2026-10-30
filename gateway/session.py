@@ -593,6 +593,10 @@ class SessionEntry:
     model_role: Optional[str] = None
     attended_pinned: bool = False
     attended_pin_until: Optional[float] = None
+    # Temporary progress cards still on the platform: ``{"chat_id", "message_id", "pid"}``. Their
+    # deletion is an in-memory post-delivery callback a restart drops, so boot deletes the cards a
+    # dead process recorded. Omitted from JSON when empty.
+    progress_cards: list[Dict[str, Any]] = field(default_factory=list)
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -644,6 +648,8 @@ class SessionEntry:
             result["attended_pinned"] = True
             if self.attended_pin_until is not None:
                 result["attended_pin_until"] = self.attended_pin_until
+        if self.progress_cards:
+            result["progress_cards"] = [dict(card) for card in self.progress_cards]
         if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
             result["active_turn_owner_pid"] = self.active_turn_owner_pid
             result["active_turn_owner_slot"] = self.active_turn_owner_slot
@@ -750,6 +756,11 @@ class SessionEntry:
             if data.get("reasoning_override_scope") in ("session", "temporary") else "session",
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
+            progress_cards=[
+                {"chat_id": str(card["chat_id"]), "message_id": str(card["message_id"]), "pid": card.get("pid")}
+                for card in data.get("progress_cards") or []
+                if isinstance(card, dict) and card.get("chat_id") and card.get("message_id")
+            ],
             **plain,
         )
 
