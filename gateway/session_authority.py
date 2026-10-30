@@ -80,6 +80,10 @@ class LiveSession:
     # Mounted by that cold path (not published by its lane): the lane publishing ANOTHER conversation
     # on the same route later supersedes it too.
     history_mount: bool = False
+    # The route the claimed turn was admitted on, while it runs. A session served on several routes
+    # (one conversation reached from Slack and Telegram) runs each turn under its own route key, so
+    # its agent, Stop and deferred reset live there, not under ``route`` (the first route admitted).
+    claim_route: str | None = None
     # The background-review guard of a cold ``/refine`` (gateway/session_refine.py): its side agent is
     # per call, so the run token lives here; a second /refine joins it and the next turn cancels it.
     review: SimpleNamespace = field(default_factory=SimpleNamespace)
@@ -281,7 +285,28 @@ class SessionAuthority:
         if live.superseded:
             return None  # the route's agent is the newer conversation's
         lookup = getattr(self.runner, '_resident_agent_for', None) or self.runner._cached_agent_for
-        return lookup(live.route)
+        return lookup(live.claim_route or live.route)
+
+    @staticmethod
+    def _row_route(live, row):
+        """The route a row was admitted on: its envelope's route, else the session's live route."""
+        envelope = (row or {}).get('payload', {}).get('native_text_v1') or {}
+        return envelope.get('route') or live.route
+
+    def _route_binding(self, sid, live, route):
+        """``(source, adapter)`` a queued row admitted on *route* is checked against.
+
+        A session can be bound to several routes (one conversation reached from Slack and
+        Telegram). Each row is checked against its own route while that route's entry still names
+        this logical owner, never against whichever route admitted first, which would refuse every
+        row from the other platform and pause the whole FIFO. Any other route keeps the live route,
+        which refuses it as before."""
+        if route != live.route:
+            entry = self.runner.session_store.lookup_by_session_key(route)
+            if entry is not None and entry.origin is not None and self.logical_owner(entry.session_id) == sid:
+                source = self.runner._restored_source(entry)
+                return source, self.runner._adapter_for_source(source)
+        return live.source, self.runner._adapter_for_source(live.source)
 
     def _pending_rows(self, ref):
         """Pending admissions as the event stream presents them: a settlement committed but not yet
@@ -597,29 +622,51 @@ class SessionAuthority:
         # tracked_write's ``after``: in the admitting caller's own step (see tracked_write).
         self._schedule(ref)
 
+    def _recovery_routes(self, sid, group):
+        """``{route: (source, adapter)}`` for one owner's recovery bindings. One binding keeps its
+        historic single-route check. Several bindings are one conversation served on several routes
+        only when they are distinct routes whose entries all still name this logical owner;
+        anything else (two bindings of one route, a route moved to another session) is ambiguous."""
+        if len(group) == 1:
+            return {None: group[0]}
+        store = self.runner.session_store
+        routes = {store._generate_session_key(source): (source, adapter) for source, adapter in group}
+        if len(routes) != len(group):
+            raise RuntimeStoreError('admission_conflict')
+        for key in routes:
+            entry = store.lookup_by_session_key(key)
+            if entry is None or self.logical_owner(entry.session_id) != sid:
+                raise RuntimeStoreError('admission_conflict')
+        return routes
+
     async def recover_native_sessions(self, bindings):
         """Bind only server-observed native routes; unknown work stays paused."""
-        from collections import Counter
         from gateway.session_envelope import check_native_route
-        bindings = list(bindings)
-        counts = Counter(sid for sid, _, _ in bindings)
-        results = {}
+        grouped = {}
         for sid, available_source, adapter in bindings:
+            grouped.setdefault(sid, []).append((available_source, adapter))
+        results = {}
+        for sid, group in grouped.items():
             try:
-                if counts[sid] != 1:
-                    raise RuntimeStoreError('admission_conflict')
+                routes = self._recovery_routes(sid, group)
                 rows = list_session_admissions(self.db, session_id=sid, pending_only=False)
                 native = [row for row in rows if 'native_text_v1' in row['payload']]
                 if not native:
                     raise RuntimeStoreError('not_found')
                 target = self.physical_target(SessionRef(self.profile_id, sid))
+
+                def binding(row, routes=routes):
+                    # A row checks against its own route's binding; the latest human route otherwise.
+                    route = row['payload']['native_text_v1'].get('route')
+                    return (routes.get(route) or routes.get(native[-1]['payload']['native_text_v1'].get('route'))
+                            or next(iter(routes.values())))
                 source, route = await check_native_route(self.runner, native[-1]['payload'], target,
-                                                    available_source, adapter)
+                                                         *binding(native[-1]))
                 for row in rows:
                     if row['status'] != 'queued':
                         continue
                     if 'native_text_v1' in row['payload']:
-                        await check_native_route(self.runner, row['payload'], target, available_source, adapter)
+                        await check_native_route(self.runner, row['payload'], target, *binding(row))
                     elif 'local_automation_v1' in row['payload']:
                         await self._check_local_automation(
                             SessionRef(self.profile_id, sid), row, route=route)
@@ -896,7 +943,8 @@ class SessionAuthority:
         if agent is not None:
             request_hard_interrupt(agent)
         for parent in dict.fromkeys((ref.session_id, self.physical_target(ref))):
-            interrupt_for_session(session_key=live.route, parent_session_id=parent, reason='user_stop')
+            for route in dict.fromkeys((live.claim_route or live.route, live.route)):
+                interrupt_for_session(session_key=route, parent_session_id=parent, reason='user_stop')
         return self._handle(ref)
 
     def _classic_turn_holds(self, route):
@@ -924,7 +972,7 @@ class SessionAuthority:
         if live.superseded:
             return False
         running = getattr(self.runner, '_running_agents', None) or {}
-        agent = running.get(live.route)
+        agent = running.get(live.claim_route or live.route)
         return agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
     def steer_agent(self, ref, generation, text):
@@ -1074,8 +1122,8 @@ class SessionAuthority:
                     await tracked_write(self, partial(reopen_local_session, self, ref))
             if first is not None and 'native_text_v1' in first['payload']:
                 from gateway.session_envelope import check_native_route
-                await check_native_route(self.runner, first['payload'], self.physical_target(ref), live.source,
-                                   self.runner._adapter_for_source(live.source))
+                source, adapter = self._route_binding(ref.session_id, live, self._row_route(live, first))
+                await check_native_route(self.runner, first['payload'], self.physical_target(ref), source, adapter)
                 # Cancellation may advance FIFO while the connector is awaited.
                 # Never let the successor inherit this row's fresh verdict.
                 current = get_session_admission(self.db, admission_id=first['admission_id'])
@@ -1084,7 +1132,8 @@ class SessionAuthority:
             if first is not None and live.source.platform == Platform.API_SERVER:
                 from gateway.session_api_turn import check_api_turn
                 check_api_turn(self, ref, first['payload'])
-            if first is not None and self._classic_turn_holds(live.route):
+            if first is not None and any(self._classic_turn_holds(route) for route in
+                                         dict.fromkeys((self._row_route(live, first), live.route))):
                 # A classic turn (fallback wake, CLI handoff, legacy resume) holds the route's slot:
                 # a claim now would hand this row to its busy path and settle it unrun. The head
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
@@ -1231,16 +1280,20 @@ class SessionAuthority:
                     continue
                 return
             admission_id = row['admission_id']
+            # The turn runs under the route it was admitted on (see ``LiveSession.claim_route``).
+            turn_route = live.claim_route = self._row_route(live, row)
             try:
                 response, outcome = await self._execute_claimed(ref, live, row)
                 if outcome == 'settled_unknown':
-                    self.deferred_resets.pop(live.route, None)  # no settlement follows, as below
+                    live.claim_route = None
+                    self.deferred_resets.pop(turn_route, None)  # no settlement follows, as below
                     continue
             except BaseException as exc:
                 # No settlement follows (a lost managed worker, a cancelled drain): the turn is never
                 # replayed, so its deferred reset is dropped (the next turn re-detects the overflow),
                 # never left to fire after a later settled turn with a stale entry.
-                self.deferred_resets.pop(live.route, None)
+                live.claim_route = None
+                self.deferred_resets.pop(turn_route, None)
                 if isinstance(exc, ManagedExecutionUnknown):
                     return
                 raise
@@ -1321,11 +1374,12 @@ class SessionAuthority:
                 from gateway.session_ingress import waiter_replies
                 waiter_replies(self).pop(admission_id, None)
                 # Taken on every exit, so a turn that never settled leaves no reset for a later one.
-                reset = self.deferred_resets.pop(live.route, None)
+                reset = self.deferred_resets.pop(turn_route, None)
+                live.claim_route = None
             if settled is not None:
                 from gateway.run_checkins import record_local_settlement
                 await record_local_settlement(self.runner, live.source, settled, response, captured)
-            await self._run_deferred_reset(live.route, reset)
+            await self._run_deferred_reset(turn_route, reset)
             from gateway.session_ingress import deliver_settled
             await deliver_settled(self, admission_id)
             await self._resolve_settled_waiter(admission_id, response)
