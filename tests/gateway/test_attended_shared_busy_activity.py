@@ -266,10 +266,14 @@ async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_bu
         return await real_mark(*args, **kwargs)
     monkeypatch.setattr(gateway_run, '_load_profile_secret_scope', load)
     monkeypatch.setattr(env.runner, '_mark_attended_user_activity', mark)
+    # A multiplexed identity authorizes under its transport profile: its gates must find that
+    # scope already hydrated, rather than load secrets inline before the reader can continue.
+    monkeypatch.setattr(env.runner, '_authorization_home_for_source', lambda source: home)
     event = MessageEvent(text='scoped follow-up', source=env.source, message_id='scoped')
     await env.adapter.handle_message(event)
     await event._attended_activity_task
-    assert loads and threading.get_ident() not in loads
+    # 1 off-loop load for the authorization gates, 1 inside the stamp task. None on the loop.
+    assert len(loads) == 2 and threading.get_ident() not in loads
     assert marks == [str(home)]
     assert event._attended_activity_marked
 
