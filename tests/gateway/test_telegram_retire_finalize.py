@@ -1,5 +1,6 @@
 """Already-absent topics finish native retirement without deleting transcript history."""
 import json
+import time
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -34,7 +35,7 @@ def runtime(tmp_path, monkeypatch, request):
                              _async_profile_scope_for_source=lambda _: nullcontext())
     state = {"phase": "failed", "generation": "gen", "session_id": entry.session_id,
              "session_key": entry.session_key, "source": source.to_dict(), "handoffs": {},
-             "error": "closing failed", "reason": "", "target": ""}
+             "error": "closing failed", "reason": "", "target": "", "failed_at": time.time()}
     monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[]))
     monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
     monkeypatch.setattr(work, "cli", AsyncMock(return_value=[]))
@@ -163,3 +164,16 @@ def test_partial_unbind_refuses_rebound_persistent_route(runtime):
     assert r.db.get_session(r.entry.session_id)["session_key"] == r.entry.session_key
     assert r.db.load_gateway_routing_entry(r.entry.session_key, scope="other-scope") is not None
     assert r.db.get_messages(r.entry.session_id)
+
+
+@pytest.mark.asyncio
+async def test_failed_retirement_of_a_replaced_conversation_is_not_retried(runtime, monkeypatch):
+    """Auto-retry retires only the conversation the user asked to retire, never a /new successor."""
+    r = runtime
+    r.state["failed_at"] = 1.0
+    monkeypatch.setattr(work, "cli", AsyncMock(return_value=[{"id": "17"}]))
+    r.runner.session_store.get_or_create_session(r.source, force_new=True)
+    await retire.save(r.runner, r.source, r.state)
+    await retire.resume_all(r.runner)
+    state = await retire.load(r.runner, r.source)
+    assert state["phase"] == "failed" and state["generation"] == "gen" and not state.get("auto_retries")
