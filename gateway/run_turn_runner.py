@@ -1081,12 +1081,14 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             agent._gateway_attended_decision_key = desired_key
             if ctx.session_key:
                 _handoff(conversation={"last_resolved_model": model})
-            if decision.switched_back and not unavailable_emitted:
+            notices = parse_attended_config(ctx.user_config or {}).notices
+            if decision.switched_back and not unavailable_emitted and notices:
                 self._emit_persistent_attended_notice(format_attended_switch_back_notice(
                     model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
                 ))
             elif (
-                decision.reason == "attended"
+                notices
+                and decision.reason == "attended"
                 and not decision.new_session
                 and not unavailable_emitted
                 # Turn-start resolution may already have selected and announced this route.
