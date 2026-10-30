@@ -74,9 +74,7 @@ replaces the role, while `--once` leaves it available after that turn. `/model
 reset`, `/model reset --all` and `/new` clear role state. Role picks cannot be
 combined with model-selection flags.
 
-The `telegram_topic` tool accepts the same `@NAME` values for create and edit.
-It reads route and reasoning from the routed profile, not the gateway's launch
-profile. `/status` shows the held role. The admin command `/model --all attended`
+`/status` shows the held role. The admin command `/model --all attended`
 converts existing concrete Telegram topic picks to `@attended` under the session
 store lock, writes one routing snapshot, and returns the converted session keys.
 It skips sessions already following a role and does not interrupt active agents.

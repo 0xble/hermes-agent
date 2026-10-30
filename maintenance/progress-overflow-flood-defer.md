@@ -45,7 +45,7 @@ Proof surface: `tests/gateway/test_run_progress_topics.py`
 **Rate boundary:** adds no request type. During a flood window a turn's progress
 makes zero requests, where before it made one edit or send per incoming line. A
 permanent failure sends one fresh bubble as before. Edits stay on the existing 1.5-second progress throttle behind the adapter's
-shared per-chat slot and flood window (see [Telegram delivery](telegram-delivery.md)).
+shared per-chat slot and flood window (see [Telegram delivery remnants](telegram-delivery.md)).
 
 **Retire** when an upstream release passes all three regressions without this patch.
 **Roll back** by reverting the logical patch. No configuration or persistent state.

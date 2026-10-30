@@ -380,14 +380,6 @@ Registered on the `hermes-discord` platform toolset. Moderation actions require 
 |------|-------------|----------------------|
 | `discord_admin` | Manage a Discord server via the REST API: list guilds/channels/roles, create/edit/delete channels, manage role grants, timeouts, kicks, and bans. | `DISCORD_BOT_TOKEN` + bot permissions |
 
-## `telegram_topic` toolset
-
-Registered on the `hermes-telegram` platform toolset (gateway only). Topic creation needs the bot's Threaded Mode enabled in BotFather.
-
-| Tool | Description | Requires environment |
-|------|-------------|----------------------|
-| `telegram_topic` | `create` opens a topic in the user's Telegram DM as its own Hermes session, with a name, a required native icon when Telegram provides its icon set, model, provider and reasoning effort, and an optional opening brief the session receives as its first message. A missing or unsupported icon is rejected with the available choices before creation. If the icon set is unavailable, creation proceeds without an icon and returns a warning. Returns the `thread_id`, `session_id`, relay address and icon actually applied. `edit` changes a topic's name or icon and its session's model or reasoning. Settings persist across gateway restarts. | Telegram adapter |
-
 ## `hermes-yuanbao` toolset
 
 Registered only on the `hermes-yuanbao` platform toolset. Yuanbao is Tencent's chat app; these tools drive its DM/group/sticker APIs.

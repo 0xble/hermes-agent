@@ -9,6 +9,13 @@ from hermes_cli import session_controls as sc
 from hermes_cli.goals import GoalContract, GoalManager
 
 
+@pytest.fixture(autouse=True)
+def _telegram_approval_surface(monkeypatch):
+    """No shipped adapter renders Approve/Deny cards; these tests drive the retained request
+    machinery as if the Telegram source still had one."""
+    monkeypatch.setattr("hermes_cli.session_controls._APPROVABLE_SOURCES", frozenset({"telegram"}))
+
+
 @pytest.fixture
 def goal_session(tmp_path, monkeypatch):
     from hermes_cli import goals

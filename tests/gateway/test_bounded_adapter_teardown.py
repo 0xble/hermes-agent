@@ -23,7 +23,6 @@ import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
 from gateway.run_shutdown import GatewayShutdownMixin
-from plugins.platforms.telegram.disconnect_handover import run_disconnect
 
 
 @pytest.fixture
@@ -32,32 +31,6 @@ def bare_runner():
     return object.__new__(GatewayRunner)
 
 
-@pytest.mark.asyncio
-async def test_zero_cut_teardown_does_not_cancel_disconnect_before_updater_stop(bare_runner, monkeypatch):
-    """The outer teardown budget may detach zero-cut disconnect, but cannot release its lock early."""
-    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
-    release = asyncio.Event()
-    lock_released = []
-    released = asyncio.Event()
-    adapter = MagicMock()
-    adapter.platform = Platform.TELEGRAM
-    adapter.gateway_runner.config = GatewayConfig(zero_cut_handover_enabled=True)
-    adapter.cancel_background_tasks = AsyncMock()
-    adapter._platform_lock_identity = None
-    adapter._platform_lock_nonce = None
-    adapter._platform_lock_retirement_task = None
-    adapter._handover_polling_stop_task = None
-    adapter._release_platform_lock = lambda: (lock_released.append(True), released.set())
-
-    async def disconnect(**_kwargs):
-        await release.wait()
-
-    adapter.disconnect = lambda: run_disconnect(adapter, disconnect)
-    await bare_runner._bounded_adapter_teardown(adapter, Platform.TELEGRAM)
-    assert lock_released == []
-    release.set()
-    await asyncio.wait_for(released.wait(), timeout=1)
-    assert lock_released == [True]
 
 
 @pytest.mark.asyncio

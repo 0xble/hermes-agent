@@ -169,10 +169,6 @@ TOOLSETS = {
     ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),
-    "telegram_topic": _ts(
-        "Create and edit Telegram DM topics as Hermes sessions (name, icon, model, reasoning, opening brief)",
-        ["telegram_topic"],
-    ),
     "session_state": _ts(
         "Read-only typed inspection of Hermes topic, session, and delivery state",
         ["session_state"],
@@ -216,7 +212,7 @@ TOOLSETS = {
     "hermes-cron": _bundle("Default cron toolset - same core tools as hermes-cli; gated by `hermes tools`"),
     "hermes-telegram": _bundle(
         "Telegram bot toolset - full access for personal use (terminal has safety checks)",
-        ["telegram_topic", "session_state"],
+        ["session_state"],
     ),
     "hermes-discord": _bundle(
         "Discord bot toolset - full access (terminal has safety checks via dangerous "

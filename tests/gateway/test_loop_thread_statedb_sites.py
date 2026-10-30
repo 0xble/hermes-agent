@@ -42,35 +42,6 @@ def _source() -> SessionSource:
                          user_name="tester", thread_id="42")
 
 
-@pytest.mark.asyncio
-async def test_stale_topic_binding_prune_runs_off_the_loop(tmp_path):
-    from telegram.error import BadRequest
-
-    from hermes_state import SessionDB
-    from plugins.platforms.telegram.adapter import TelegramAdapter
-
-    db = SessionDB(db_path=tmp_path / "state.db")
-    try:
-        db.create_session(session_id="sess", source="telegram", user_id="2027045491")
-        db.bind_telegram_topic(chat_id="2027045491", thread_id="150565", user_id="2027045491",
-                               session_key="agent:main:telegram:dm:2027045491:150565", session_id="sess")
-        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
-        adapter._session_store = SimpleNamespace(_db=db)
-        adapter._bot = SimpleNamespace(send_message=AsyncMock(side_effect=[
-            BadRequest("Message thread not found"), SimpleNamespace(message_id=120)]))
-        _arm()
-        result = await adapter._send_with_retry(
-            chat_id="2027045491", content="Completed response", reply_to="150565",
-            metadata={"notify": True, "thread_id": "150565", "telegram_reply_to_message_id": "150565",
-                      "telegram_dm_topic_reply_fallback": True},
-        )
-        hermes_loop_guard.set_loop_thread(None)
-        assert result.success is True
-        # On the loop the guarded delete raised inside the best-effort prune and the row survived.
-        assert db.get_telegram_topic_binding(chat_id="2027045491", thread_id="150565") is None
-    finally:
-        hermes_loop_guard.set_loop_thread(None)
-        db.close()
 
 
 @pytest.mark.asyncio
@@ -140,16 +111,6 @@ async def test_typed_reasoning_pick_persists_off_the_loop(tmp_path, monkeypatch)
     assert runner.session_store.threads and loop_thread not in runner.session_store.threads
 
 
-@pytest.mark.asyncio
-async def test_topic_session_reasoning_pick_persists_off_the_loop(tmp_path, monkeypatch):
-    from gateway.telegram_topic_sessions import _apply_session_settings
-
-    runner = _reasoning_runner(tmp_path, monkeypatch)
-    entry = SimpleNamespace(session_key="agent:main:telegram:dm:67890:42", was_auto_reset=True)
-    loop_thread = _arm()
-    await _apply_session_settings(runner, _source(), entry, None, {"enabled": True, "effort": "high"},
-                                  announce=False)
-    assert runner.session_store.threads and loop_thread not in runner.session_store.threads
 
 
 @pytest.mark.asyncio

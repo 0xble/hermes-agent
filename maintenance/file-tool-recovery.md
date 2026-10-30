@@ -17,8 +17,8 @@ covers that direction without interpreting a content query as a filename glob.
 [Upstream PR #82800](https://github.com/NousResearch/hermes-agent/pull/82800)
 is merged: retain its unicode-equivalent filename repair and near-miss ranking;
 this patch only stabilizes the missing-path diagnostics around that owner.
-The Telegram variation-selector change belongs to
-[the native topic tool](telegram-topic-tool.md), not this unit.
+The Telegram variation-selector change belonged to the native topic tool, retired with
+the [Telegram stack](telegram-stack-retirement.md), not this unit.
 
 Delivery route: owned-fork PR only; no upstream publication or runtime promotion
 is authorized by this change. The scoped source and dispatch proof lives in

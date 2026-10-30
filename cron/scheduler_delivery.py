@@ -1275,11 +1275,6 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
             "direct_messages_topic_id": str(thread_id), "job_id": job["id"],
             "notify": t.notify_delivery,
         }
-        if job.get("telegram_topic_owner_key") or job.get("topic_owner_key"):
-            route_metadata["telegram_topic_owner_key"] = str(
-                job.get("telegram_topic_owner_key") or job.get("topic_owner_key"))
-        if job.get("telegram_topic_allow_parallel") or job.get("allow_parallel_topic"):
-            route_metadata["telegram_topic_allow_parallel"] = True
         media_metadata = {"direct_messages_topic_id": str(thread_id), "notify": t.notify_delivery}
     else:
         # Forum-style topic or non-topic target: message_thread_id.
@@ -1289,11 +1284,6 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         # key bypasses that check and lets the adapter route via a plain message_thread_id. See #52060.
         route_thread_id = str(thread_id) if thread_id is not None else None
         route_metadata = {"job_id": job["id"], "notify": t.notify_delivery}
-        if job.get("telegram_topic_owner_key") or job.get("topic_owner_key"):
-            route_metadata["telegram_topic_owner_key"] = str(
-                job.get("telegram_topic_owner_key") or job.get("topic_owner_key"))
-        if job.get("telegram_topic_allow_parallel") or job.get("allow_parallel_topic"):
-            route_metadata["telegram_topic_allow_parallel"] = True
         if route_thread_id:
             route_metadata["thread_id"] = route_thread_id
         media_metadata = {"notify": t.notify_delivery}

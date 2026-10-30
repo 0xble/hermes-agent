@@ -205,11 +205,3 @@ def test_yaml_startup_honours_auto_resume_on_boot(tmp_path, monkeypatch, yaml_te
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(yaml_text)
     assert load_gateway_config().auto_resume_on_boot is expected
-
-
-def test_telegram_trigger_classifier_matches_the_resume_note_prefix():
-    """The classifier copies the prefix as a literal; keep it in lockstep with the builder."""
-    from gateway.run import RESUME_NOTE_PREFIX
-    from plugins.platforms.telegram.chat_budget import _TRIGGER_PREFIXES
-
-    assert (RESUME_NOTE_PREFIX, "restart") in _TRIGGER_PREFIXES

@@ -8,9 +8,6 @@ PLATFORM_HINT = (
     "*italic*, ~~strikethrough~~, ||spoiler||, `code`, ```blocks```, "
     "[links](url), ## headers. Prefer bullets or labeled lines for structured data (no tables). "
     "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
-    # Telegram is in gateway.copy_blocks.PLAIN_COPY_PLATFORMS, so only its hint promises separate sends.
-    "For text the user should copy exactly, wrap it in [[copy]] and [[/copy]] on separate lines; "
-    "each copy block is sent as its own plain-text message. "
     "Images (.png, .jpg, .webp) send as photos, videos (.mp4) play inline; image URLs via ![alt](url) send as "
     "photos. Audio: add [[audio_as_voice]] on its own line to send ANY audio file as a native voice bubble "
     "(non-Opus transcodes automatically); without it, .mp3/.m4a arrive as audio files, other formats as documents."

@@ -186,41 +186,6 @@ class SessionTitlesMixin:
             return conflict_id
         raise ValueError(f"Title '{title}' is already in use by session {conflict_id}")
 
-    def set_session_title_in_lineage(self, session_id: str, title: str) -> str:
-        """Store the user's exact title, or the next free ``<title> #N`` alias when that exact text
-        is held by another session. Returns the stored text. Each attempt goes through
-        ``_set_session_title`` so the canonical Bot Chat guard, compression-ancestor transfer and
-        compare-and-swap all apply; only a uniqueness collision advances to the next alias."""
-        clean = self.sanitize_title(title)
-        if not clean:
-            raise ValueError("title cannot be empty")
-        from hermes_state import SessionDB
-        max_length = SessionDB.MAX_TITLE_LENGTH
-        candidate = clean
-        for _attempt in range(50):
-            try:
-                if not self._set_session_title(session_id, candidate, source=self.TITLE_SOURCE_USER):
-                    raise ValueError(f"session not found: {session_id}")
-                return candidate
-            except ValueError as exc:
-                if "already in use" not in str(exc):
-                    raise
-            # Collision: strip any existing " #N" from the requested text, then pick the next number.
-            match = _NUMBERED_TITLE_RE.match(candidate)
-            base = match.group(1) if match else candidate
-            n = int(match.group(2)) + 1 if match else 2
-            rows = self._read_all(
-                "SELECT title FROM sessions WHERE id != ? AND (title = ? OR title LIKE ? ESCAPE '\\')",
-                (session_id, base, f"{_escape_like(base)} #%"))
-            numbers = [int(m.group(2)) for m in (_NUMBERED_TITLE_RE.match(str(r["title"])) for r in rows) if m]
-            n = max([n, *[k + 1 for k in numbers]])
-            suffix = f" #{n}"
-            alias_base = base[:max_length - len(suffix)].rstrip()
-            if not alias_base:
-                raise ValueError("title is too long to reserve a unique lineage alias")
-            candidate = f"{alias_base}{suffix}"
-        raise ValueError(f"could not reserve a unique lineage alias for {clean!r}")
-
     def set_session_title(self, session_id: str, title: str) -> bool:
         """Set a title on the user's behalf (``user`` provenance). Empty clears it. Raises
         ValueError on conflict or validation failure."""

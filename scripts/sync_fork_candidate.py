@@ -30,9 +30,6 @@ from pathlib import Path
 
 TAG_RE = re.compile(r"^v(\d{4})\.(\d{1,2})\.(\d{1,2})$")
 FORK_TESTS = [
-    "tests/gateway/test_telegram_flood_coherence.py",
-    "tests/gateway/test_telegram_split_send_flood.py",
-    "tests/gateway/test_telegram_emphasis.py",
     "tests/gateway/test_delivery_ledger.py",
     "tests/cron/test_per_job_timezone.py",
     "tests/cron/test_contention_skip_observability.py",

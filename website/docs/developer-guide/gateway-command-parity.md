@@ -102,7 +102,6 @@ handler does; `client-local (cli_only)` commands are terminal/UI features of a c
 | `/reload-skills` (/reload_skills) | refused | HermesCLI._cmd_reload_skills | commands.catalog, skills.reload | unavailable: advanced | slash.exec: refused |  |
 | `/restart` | refused | messaging-only: unknown command | slash.exec: refused | unavailable: terminal | slash.exec: refused | messaging-only |
 | `/resume` | refused | HermesCLI._handle_resume_command | local | picker: session | slash.exec: refused | switches the messaging chat's session; local clients resume by id |
-| `/retire` | refused | messaging-only: unknown command | slash.exec: refused | unavailable: messaging | slash.exec: refused | messaging-only |
 | `/retry` | refused | HermesCLI._cmd_retry | canonical route | action: retry | session.mutate rewind + resubmit |  |
 | `/review` | control | HermesCLI._handle_review_command | slash.exec | slash.exec | slash.exec |  |
 | `/rollback` | refused | HermesCLI._handle_rollback_command | rollback.diff, rollback.list, rollback.restore | action: rollback | slash.exec: refused | restores filesystem checkpoints |

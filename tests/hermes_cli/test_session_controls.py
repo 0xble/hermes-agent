@@ -3,6 +3,15 @@ from __future__ import annotations
 
 import pytest
 
+from hermes_cli.session_controls import _APPROVABLE_SOURCES as _SHIPPED_APPROVABLE_SOURCES
+
+
+@pytest.fixture(autouse=True)
+def _telegram_approval_surface(monkeypatch):
+    """No shipped adapter renders Approve/Deny cards; these tests drive the retained request
+    machinery as if the Telegram source still had one."""
+    monkeypatch.setattr("hermes_cli.session_controls._APPROVABLE_SOURCES", frozenset({"telegram"}))
+
 
 @pytest.fixture
 def state(tmp_path, monkeypatch):
@@ -615,6 +624,20 @@ def test_paused_goal_resumes(state):
                            user_quote="resume the target goal now please")
     assert result["status"] == "applied"
     assert load_goal("target").status == "active"
+
+
+def test_no_platform_has_an_approval_surface_by_default(state, monkeypatch):
+    """With the Telegram cards removed, a Telegram target is as unapprovable as any other."""
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+
+    assert _SHIPPED_APPROVABLE_SOURCES == frozenset()
+    monkeypatch.setattr(session_controls, "_APPROVABLE_SOURCES", _SHIPPED_APPROVABLE_SOURCES)
+    state.create_session("tg-target", "telegram", profile_name="default", chat_id="1",
+                         chat_type="dm", session_key="agent:main:telegram:dm:1")
+    GoalManager("tg-target").set("watch the build")
+    result = session_controls.request_control("goal", "clear", "tg-target", requester_sid="requester")
+    assert result["error_code"] == "target_unapprovable"
 
 
 def test_request_control_refuses_target_without_approval_surface(state):

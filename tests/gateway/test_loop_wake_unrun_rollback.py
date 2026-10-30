@@ -203,5 +203,5 @@ def test_control_request_text_fallback_says_buttons_are_required():
     asyncio.run(adapter.send_control_request("c1", "Pause the loop in session X?", "req-123"))
     (text,) = adapter.sent
     assert "req-123" in text
-    assert "Telegram" in text and "button" in text.lower()
+    assert "button" in text.lower()
     assert "unavailable on this platform" not in text

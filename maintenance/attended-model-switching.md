@@ -195,11 +195,11 @@ A topic role edit reads reasoning from the same routed profile as the route.
 
 Fork-Patch-Backfill: cd3d18e27b6e7bf54a5f3bb22d81c571e3e2e95d; live-model-preset-roles
 
-The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and route re-evaluation at the real API-request boundary. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly. The topic tool commits through the gateway's existing model and reasoning persistence paths rather than adding a second store.
+The attended feature adds per-topic attended routing, idle expiry, persisted activity timestamps, and route re-evaluation at the real API-request boundary. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
 
 The combined resolution is implemented in `gateway/run_turn.py` and
-`gateway/run_config_loaders.py`; the topic commit path is
-`gateway/telegram_topic_sessions.py` and `gateway/slash_commands_model.py`.
+`gateway/run_config_loaders.py`; the session commit path is
+`gateway/slash_commands_model.py`.
 `@role` holds persist on `SessionEntry.model_role` and resolve through the shared
 config route resolver in `hermes_cli/model_preset_runtime.py`. `/model --all attended` converts concrete Telegram
 overrides to that role and returns the converted session keys, skipping keys
@@ -208,12 +208,6 @@ This is a fork-only gateway feature that adds per-topic attended routing, idle
 expiry, persisted activity timestamps, and boundary-only idle expiry. A new genuine user message switches in at the next API call; idle expiry switches back to the default only when the session is quiet and the request fits the default route. A long autonomous turn that continues making API calls stays on the attended route. An active fallback is never undone. The deprecated `compact_before_switch_tokens` key remains accepted but is ignored; normal per-model preflight compression remains the only compaction path. Keep its disabled path inert so users without the new keys receive the pre-feature behavior exactly.
 
 ## Verification
-
-Run `tests/gateway/test_attended_session_opening.py` for new user-opened text
-and photo topics, `telegram_topic`-created topics, preparatory route probes,
-first-request silence, later switch-in notices, and genuine-activity provenance.
-The tests enter through `_handle_message` and assert marker cleanup after success,
-exceptions, and task cancellation, including recovery from a lobby key to a topic.
 
 Run `tests/gateway/test_model_pick_expiry.py` for disabled-by-default policy,
 positive TTLs with attended routing on and off, command confirmation, unchanged
@@ -247,7 +241,7 @@ The lifecycle suite builds turns through the gateway assembly boundary. Run it
 with `test_cached_agent_history_guard.py`, `test_local_model_connection_reply.py`,
 `test_multiplex_session_db_profile_scope.py`, `test_native_stream_warning_composition.py`,
 `test_slack.py`, `test_streaming_tts_consumer.py`, `test_subagent_failure_notice.py`,
-`test_task_card_destination_preflight.py`, `test_telegram_progress_literals.py`,
+`test_task_card_destination_preflight.py`,
 `test_turn_context.py` and `test_context_ref_expansion_runtime.py` under
 `tests/gateway/`. These cover callback-only construction and inbound reference
 expansion through real persisted routing. Also run

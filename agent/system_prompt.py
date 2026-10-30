@@ -489,8 +489,7 @@ def _telegram_rich_messages_enabled() -> bool:
         _gw = (((_cfg.get("gateway") or {}).get("platforms") or {}).get("telegram") or {}).get("extra")
         _top = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra")
         merged = {**(_gw if isinstance(_gw, dict) else {}), **(_top if isinstance(_top, dict) else {})}
-        from gateway.config import normalize_telegram_rich_messages
-        return normalize_telegram_rich_messages(merged.get("rich_messages")) != "never"
+        return bool(merged.get("rich_messages"))
     except Exception:
         return False
 

@@ -25,14 +25,6 @@ def test_auto_title_collision_lookup(tmp_path, existing, candidate, expected):
         assert db.has_auto_title_collision(candidate, exclude_session_id="taken") is False
 
 
-def test_manual_titles_can_still_share_a_subject(tmp_path):
-    with SessionDB(tmp_path / "state.db") as db:
-        for session_id in ("first", "second"):
-            db.create_session(session_id=session_id, source="telegram")
-            db.set_session_title_in_lineage(session_id, "Shared Manual Subject")
-        assert db.get_session_title("first") == "Shared Manual Subject"
-        assert db.get_session_title("second") == "Shared Manual Subject #2"
-        assert db.get_session_title_source("second") == "user"
 
 
 @pytest.mark.parametrize("first, second, first_writer, expected", [

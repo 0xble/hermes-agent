@@ -276,14 +276,6 @@ class TelegramApplication(Application):
         return stopped or (claim is not None and not claim.accepted)
 
     async def process_update(self, update):
-        from gateway.platforms.base import ingress_consumer_scope, leave_ingress_consumer
-        consumer = ingress_consumer_scope()
-        try:
-            return await self._process_update_on_consumer(update)
-        finally:
-            leave_ingress_consumer(consumer)
-
-    async def _process_update_on_consumer(self, update):
         if not isinstance(update, Update):
             return await super().process_update(update)
         bot_id = self.bot.id
@@ -291,7 +283,6 @@ class TelegramApplication(Application):
         _load_receipts(self.adapter, bot_id)
         # Dispatch happened even when preparation fails before the group-99 observer.
         self.adapter._updates_dispatched_total += 1
-        self.adapter._last_ingress_dispatch_monotonic = time.monotonic()
         seen = self.adapter._seen_update_ids
         pending = self.adapter._inflight_update_ids
         if key in seen or key in pending:
