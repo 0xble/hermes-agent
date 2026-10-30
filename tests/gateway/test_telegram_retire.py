@@ -469,3 +469,43 @@ async def test_passive_reconciliation_does_not_unbind_superseded_generation(runt
     runtime.bot.delete_forum_topic.assert_not_awaited()
     runtime._session_db.delete_telegram_topic_binding.assert_not_awaited()
     runtime.session_store.unbind_session.assert_not_called()
+
+
+_FLOOD = ('relay failed: {"error":{"code":"telegram","message":"telegram: exit status 6: {\\"error\\":{\\"code\\":'
+          '\\"rate_limited\\",\\"message\\":\\"rpc error code 420: FLOOD_WAIT (13)\\",\\"exit_code\\":6,'
+          '\\"retryable\\":true,\\"retry_after_seconds\\":13}}\\n","exit_code":1}}')
+
+
+def test_transient_delay_reads_flood_wait_and_ignores_permanent_errors():
+    assert retire._transient_delay(RuntimeError(_FLOOD)) == 18
+    assert retire._transient_delay(asyncio.TimeoutError()) == 30
+    assert retire._transient_delay(RuntimeError("Missing exact-topic confirmed closing receipt")) is None
+
+
+@pytest.mark.asyncio
+async def test_flood_wait_during_preparation_retries_instead_of_failing(runtime, monkeypatch):
+    prepare = AsyncMock(side_effect=[RuntimeError(_FLOOD), True])
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", prepare)
+    retries = []
+    monkeypatch.setattr(retire, "_schedule_retry", lambda runner, source, delay: retries.append(delay))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state["phase"] == "pending" and state["transient_retries"] == 1
+    assert retries == [18]
+    runtime.adapter.send.assert_not_awaited()  # no failure notice, no closing note yet
+    await retire.advance(runtime, runtime.source)
+    assert (await retire.load(runtime, runtime.source))["phase"] == "done"
+    runtime.bot.delete_forum_topic.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_transient_errors_stop_retrying_after_the_limit(runtime, monkeypatch):
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError(_FLOOD)))
+    monkeypatch.setattr(retire, "_schedule_retry", lambda runner, source, delay: None)
+    await retire.request(runtime, runtime.source)
+    for _ in range(retire._TRANSIENT_RETRY_LIMIT + 1):
+        await retire.advance(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state["phase"] == "failed" and state["transient_retries"] == retire._TRANSIENT_RETRY_LIMIT
+    assert "Topic retirement failed" in runtime.adapter.send.await_args.args[1]
