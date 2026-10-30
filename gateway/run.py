@@ -1939,10 +1939,13 @@ async def prepared_authorization_scope(runner, source):
         _PREPARED_AUTHORIZATION_SCOPE.reset(token)
 
 
-def release_prepared_authorization_scope() -> None:
-    """End reuse in this task once its ingress gates passed. A turn that outlives admission must
-    load the authorization profile afresh, so a failed secret source is retried as before."""
-    _PREPARED_AUTHORIZATION_SCOPE.set(None)
+def without_prepared_authorization_scope():
+    """A copy of the current context with no prepared authorization secrets, for a task that
+    outlives ingress (a session drain): its turns load the profile afresh, so a failed secret
+    source is still retried."""
+    context = copy_context()
+    context.run(_PREPARED_AUTHORIZATION_SCOPE.set, None)
+    return context
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
