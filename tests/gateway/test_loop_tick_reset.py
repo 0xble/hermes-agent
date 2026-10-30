@@ -11,10 +11,13 @@ import pytest
 from tests.waiting import async_wait_until
 
 
-async def _drains_idle(authority):
+async def _drains_idle(authority, adapter=None):
+    # Native ingress and /new guard cleanup run in adapter tasks too. The authority
+    # alone can look idle before a buffered follower has even reached admission.
     await async_wait_until(
-        lambda: all(live.task is None or live.task.done() for live in authority.sessions.values()),
-        timeout=15, what="authority drains to finish or pause at their real claim boundary")
+        lambda: all(live.task is None or live.task.done() for live in authority.sessions.values())
+        and (adapter is None or not adapter._background_tasks),
+        timeout=15, what="authority drains and native delivery tasks to settle")
 
 
 def _tick(runner, source, key, sid):
@@ -110,11 +113,11 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
         if reset == "new":
             await adapter.handle_message(MessageEvent(text="/new", source=source, message_id="new"))
         finish.set()
-        await _drains_idle(authority)
+        await _drains_idle(authority, adapter)
         new = runner.session_store.peek_session_id(key)
         assert new != old
         await adapter.handle_message(MessageEvent(text="B", source=source, message_id="B"))
-        await _drains_idle(authority)
+        await _drains_idle(authority, adapter)
         rows = [row for sid in (old, new) for row in list_session_admissions(
             authority.db, session_id=sid, pending_only=False)]
         actual = next(row for row in rows if row["admission_id"] == wake["admission_id"])
@@ -123,6 +126,7 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
         assert state is not None
         observed = dict(reset=reset, executed=executed, resolved=resolved,
                         wake=(actual["status"], actual["outcome"]),
+                        admissions=[(row["payload"].get("text"), row["status"], row["outcome"]) for row in rows],
                         awaiting=state.awaiting_response, log=caplog.text)
         print("RESET_OBSERVED", observed)
         assert ("B", new) in executed, observed
@@ -139,7 +143,7 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
         assert after is not None and after.to_json() == snapshot
     finally:
         finish.set()
-        await _drains_idle(authority)
+        await _drains_idle(authority, adapter)
         await asyncio.gather(*mutation_tasks(authority))
         authority.db.close()
         runner.session_store.close_all_db_handles()
