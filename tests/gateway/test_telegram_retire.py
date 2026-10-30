@@ -642,3 +642,43 @@ async def test_unresolved_closing_note_is_never_retried_automatically(runtime, m
     clock[0] += retire._AUTO_RETRY_MAX_SECONDS
     await retire.advance(runtime, runtime.source)
     assert (await retire.load(runtime, runtime.source))["generation"] == failed["generation"]
+
+
+@pytest.mark.asyncio
+async def test_user_message_during_an_automatic_retry_wins(runtime, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    failed = await retire.load(runtime, runtime.source)
+    meta_key = retire.state_key(runtime.source)
+    calls = {"n": 0}
+
+    def peek(_key):
+        calls["n"] += 1
+        if calls["n"] == 2:  # inside request(): the user's message is recorded meanwhile
+            raw = runtime._session_db.get_meta.side_effect(meta_key)
+            runtime._session_db.set_meta.side_effect(meta_key, json.dumps({**json.loads(raw), "user_active_at": clock[0]}))
+        return "session-1"
+    runtime.session_store.peek_session_id = MagicMock(side_effect=peek)
+    clock[0] += retire._AUTO_RETRY_BASE_SECONDS
+    await retire.advance(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state["phase"] == "failed" and state["generation"] == failed["generation"]
+
+
+@pytest.mark.asyncio
+async def test_a_retry_refused_before_it_starts_still_spends_an_attempt(runtime, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    monkeypatch.setattr(retire, "request", AsyncMock(side_effect=RuntimeError("no unambiguous destination")))
+    clock[0] += retire._AUTO_RETRY_BASE_SECONDS
+    await retire.advance(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state["auto_retries"] == 1 and state["failed_at"] == clock[0]
+    await retire.advance(runtime, runtime.source)  # inside the new backoff: no second attempt
+    assert retire.request.await_count == 1

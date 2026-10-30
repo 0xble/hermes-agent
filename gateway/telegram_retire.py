@@ -87,7 +87,8 @@ async def save(runner, source, state, *, force=False, expected_generation="", re
             raise RetirementSuperseded
         # An automatic retry replaces only the failed generation it read, never a cancel or a
         # user retry that landed while it was being requested.
-        if retry_of and (not current or current["generation"] != retry_of or current["phase"] != "failed"):
+        if retry_of and (not current or current["generation"] != retry_of or current["phase"] != "failed"
+                         or current.get("user_active_at")):
             raise RetirementSuperseded
         await runner._session_db.set_meta(state_key(source), json.dumps(state))
 
@@ -198,7 +199,7 @@ async def intercept(runner, event):
         try:
             await save(runner, event.source, state)
         except RetirementSuperseded:
-            pass
+            state = await load(runner, event.source)  # an automatic retry won: judge this input against it
     # A stalled retirement admits the user so the agent's telegram_topic tool can retry or cancel it.
     if not state or state["phase"] in {"cancelled", "done", "failed", "delete_unresolved"}:
         return None
@@ -442,7 +443,8 @@ async def advance(runner, source):
                 current["failed_at"] = time.time()
                 await save(runner, source, current)
                 retries = int(current.get("auto_retries") or 0)
-                retryable = current["phase"] == "failed" and _retryable(current)
+                retryable = current["phase"] == "failed" and _retryable(current) and await asyncio.to_thread(
+                    runner.session_store.peek_session_id, current["session_key"]) == current["session_id"]
                 if retryable and 0 < retries < _AUTO_RETRY_LIMIT:
                     return  # An automatic retry failing again stays quiet until the retries run out.
                 if retryable and retries < _AUTO_RETRY_LIMIT:
@@ -483,7 +485,15 @@ async def _auto_retry(runner, source, generation):
                       reason=state.get("reason") or "", context=state.get("context") or "",
                       retry_of=generation, auto_retries=attempts + 1)
     except RetirementSuperseded:
-        return  # A cancel or a user retry won.
+        return  # A cancel, a user retry or the user's own message won.
+    except Exception:
+        # A retry refused before it could start still spends an attempt and waits out the backoff.
+        state.update(auto_retries=attempts + 1, failed_at=time.time())
+        try:
+            await save(runner, source, state)
+        except RetirementSuperseded:
+            pass
+        raise
     logger.info("Topic retirement for %s retried automatically (%d of %d)",
                 state_key(source), attempts + 1, _AUTO_RETRY_LIMIT)
 
