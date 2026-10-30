@@ -395,16 +395,33 @@ async def transfer_control(runner, source, state, item, dest):
         accepted_task_id = handoff.get("accepted_task_id")
         if proof:
             expected = {"source": old, "session_id": dest["session_id"]}
-            if accepted_task_id:
+            if proof.get("ended"):
+                expected["ended"] = True
+            elif accepted_task_id:
                 expected["accepted_task_id"] = accepted_task_id
             else:
                 expected["destination"] = new
             if proof == expected:
                 return proof
             raise RuntimeError(f"Transferred {kind} changed before retirement recovery")
-        if (not old or json.loads(old) != item["record"]
-                or (not accepted_task_id and open_control(new))):
-            raise RuntimeError(f"Cannot transfer {kind}: destination already owns one or the source changed")
+        if not old:
+            raise RuntimeError(f"Cannot transfer {kind}: the source control disappeared")
+        if not open_control(old):
+            # It finished or was cleared after the handoff was recorded. The handoff task already
+            # carries its definition; there is no live control left to move or clear.
+            proof = {"source": old, "session_id": dest["session_id"], "ended": True}
+            handoff["control_receipt"] = proof
+            db.set_meta(state_key(source), json.dumps(stored), cursor=conn)
+            return proof
+        # A running loop or goal advances its counters every tick. Only its authored definition
+        # and status say whether it is still the work that was handed off (2026-10-30: two
+        # retirements failed forever because a loop ticked after its handoff was recorded).
+        current = json.loads(old)
+        if (authored_definition(current) != authored_definition(item["record"])
+                or current.get("status") != item["record"].get("status")):
+            raise RuntimeError(f"Cannot transfer {kind}: the source changed after its handoff was recorded")
+        if not accepted_task_id and open_control(new):
+            raise RuntimeError(f"Cannot transfer {kind}: destination already owns one")
         if kind == "loop":
             current_loop, retired_loop = LoopState.from_json(old), LoopState.from_json(old)
             retired_loop.status = "cleared"

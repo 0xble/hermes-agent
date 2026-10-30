@@ -1000,3 +1000,51 @@ def test_durable_delegation_handoff_and_queued_snapshot_refresh(tmp_path, monkey
     assert "thread_id" not in event
     with pytest.raises(RuntimeError, match="ownership changed"):
         delegation.transfer_retirement_owner("retirement-test", "wrong-key", "old", "elsewhere", "another")
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+async def test_control_that_ticked_after_its_handoff_still_transfers(runtime, monkeypatch, kind):
+    """Run counters advance every tick; they never make the handed-off work a different control."""
+    from hermes_cli import goals, loops
+    r = runtime
+    monkeypatch.setattr(goals, "_get_session_db", lambda: r.db)
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    if kind == "goal":
+        goals.save_goal("old", goals.GoalState(goal="Maintain Service"))
+    else:
+        loops.save_loop("old", loops.LoopState(prompt="Watch Service", interval_seconds=60))
+    item = (await work.inventory(r.runner, r.source, r.state))[0]
+    ticked = {**item["record"], "mutation_id": "m-later", "ticks_fired": 7, "turns_used": 3,
+              "last_fired_at": 123.0, "next_due_at": 456.0}
+    r.db.set_meta(f"{kind}:old", json.dumps(ticked))
+    await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+    assert json.loads(r.db.get_meta(f"{kind}:old"))["status"] == "cleared"
+    assert json.loads(r.db.get_meta(f"{kind}:next"))["status"] == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("ended", ["done", "cleared"])
+async def test_control_that_ended_after_its_handoff_settles_without_moving(runtime, monkeypatch, kind, ended):
+    from hermes_cli import goals, loops
+    r = runtime
+    monkeypatch.setattr(goals, "_get_session_db", lambda: r.db)
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    if kind == "goal":
+        goals.save_goal("old", goals.GoalState(goal="Maintain Service"))
+    else:
+        loops.save_loop("old", loops.LoopState(prompt="Watch Service", interval_seconds=60))
+    item = (await work.inventory(r.runner, r.source, r.state))[0]
+    finished = json.dumps({**item["record"], "status": ended, "ticks_fired": 9})
+    r.db.set_meta(f"{kind}:old", finished)
+    destination = json.dumps({"status": "active", "prompt": "Its own work", "goal": "Its own work"})
+    r.db.set_meta(f"{kind}:next", destination)
+    dest = {"session_id": "next", "thread_id": "18"}
+    await work.transfer(r.runner, r.source, r.state, item, dest)
+    await work.transfer(r.runner, r.source, r.state, item, dest)  # recovery replays the same proof
+    assert r.db.get_meta(f"{kind}:old") == finished and r.db.get_meta(f"{kind}:next") == destination
+    assert r.state["handoffs"][item["id"]]["control_receipt"]["ended"] is True
