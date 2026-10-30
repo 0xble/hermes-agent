@@ -37,15 +37,16 @@ class GatewaySessionControlsMixin:
         text = str(text or "")
         return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
-    # A resolved notice is cosmetic. Keep it retryable briefly, then settle it so an
-    # unavailable target route cannot keep waking the gateway forever.
-    _TARGET_NOTICE_RETRY_SECONDS = 15 * 60
+    # A resolved notice is informational. Keep it retryable briefly, then settle it so an
+    # unavailable target or requester route cannot keep waking the gateway until the record's
+    # 24h outbox TTL. Busy sessions are not affected: the session authority queues the notice.
+    _NOTICE_RETRY_SECONDS = 15 * 60
 
     @classmethod
-    def _target_notice_is_stale(cls, record: dict) -> bool:
+    def _notice_is_stale(cls, record: dict) -> bool:
         resolved_at = record.get("resolved_at") or record.get("created_at")
         try:
-            return bool(resolved_at and time.time() - float(resolved_at) >= cls._TARGET_NOTICE_RETRY_SECONDS)
+            return bool(resolved_at and time.time() - float(resolved_at) >= cls._NOTICE_RETRY_SECONDS)
         except (TypeError, ValueError):
             return False
 
@@ -199,7 +200,7 @@ class GatewaySessionControlsMixin:
         if record.get("target_notice_sent") or record.get("target_notice_skipped"):
             return record
         request_id = record["id"]
-        if self._target_notice_is_stale(record):
+        if self._notice_is_stale(record):
             logger.warning("session-control target notice stale for %s; settling as skipped", request_id)
             return await self._mark_and_finish(
                 session_controls, record, "target_notice_skipped"
@@ -369,6 +370,7 @@ class GatewaySessionControlsMixin:
                     session_controls, record, "requester_notification_skipped"
                 )
             else:
+                from hermes_constants import get_hermes_home
                 content = self._requester_notice(record)
                 try:
                     accepted = await self._dispatch_plugin_message_injection(
@@ -376,16 +378,31 @@ class GatewaySessionControlsMixin:
                         expected_session_id=record["requester_session_id"],
                         content=content,
                         plugin_id="session-controls",
+                        # The drain runs in the scope of the profile whose store holds this record,
+                        # and the requester is that profile's session. Without an explicit home a
+                        # local (CLI/TUI/Desktop) requester is always refused, never resolved.
+                        plugin_home=get_hermes_home(),
                     )
                 except Exception:
                     logger.warning("requester outcome injection failed for %s", request_id, exc_info=True)
-                else:
-                    if not accepted:
-                        logger.info("requester outcome injection not accepted for %s; retrying", request_id)
-                        return
+                    accepted = False
+                if accepted:
                     record = await self._mark_and_finish(
                         session_controls, record, "requester_notified"
                     )
+                elif self._notice_is_stale(record):
+                    # Delivery is always attempted first, so a requester that comes back is still
+                    # told; one that never does (a retired or rebound session) settles here.
+                    logger.warning(
+                        "session-control requester notice for %s undeliverable for %d min; settling as skipped",
+                        request_id, self._NOTICE_RETRY_SECONDS // 60,
+                    )
+                    record = await self._mark_and_finish(
+                        session_controls, record, "requester_notification_skipped"
+                    )
+                else:
+                    logger.info("requester outcome injection not accepted for %s; retrying", request_id)
+                    return
 
         if self._outbox_complete(record) and not record.get("outbox_done"):
             await self._mark_control(session_controls, request_id, "outbox_done")
@@ -458,6 +475,8 @@ class GatewaySessionControlsMixin:
             return f"⌛ Request to {action} this {kind} expired"
         if status == "failed":
             return f"✗ Request to {action} this {kind} failed: {record.get('error') or 'unknown error'}"
+        if status == "applied" and record.get("outcome") == "timed_wait":
+            return f"◷ {record['notice']}. Requested by {requester}."
         verb = {
             "pause": "paused", "resume": "resumed", "clear": "cleared", "stop": "stopped",
             "replace": "replaced",
@@ -493,6 +512,8 @@ class GatewaySessionControlsMixin:
         target = f"{target_title} ({target_id})"
         action = f"{record.get('kind', '')} {record.get('action', '')}"
         if record.get("status") == "applied":
+            if record.get("outcome") == "timed_wait":
+                return f"✓ {record['notice']} in {target}."
             authority = record.get("authority") or {}
             if authority.get("via") == "quote":
                 how = "using your quoted words"

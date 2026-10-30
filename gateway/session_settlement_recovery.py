@@ -154,15 +154,6 @@ def gateway_refusal_boundary(captured, outcome):
     return error, {'error': error, 'error_surface': dict(surface)}
 
 
-def _release_media(authority, row):
-    """Terminal media cleanup: its own write txn after publication, never under the stream lock."""
-    try:
-        from gateway.session_ingress_media import release_admission_media
-        release_admission_media(authority.db, row['admission_id'])
-    except Exception:
-        logger.exception('Terminal media cleanup failed for admission %s', row['admission_id'])
-
-
 def commit_and_publish(authority, live, ref, row, response, outcome, captured, settlement):
     """Worker-thread settlement: redaction, encoding and the SQLite write never stall the owner loop.
 
@@ -173,6 +164,7 @@ def commit_and_publish(authority, live, ref, row, response, outcome, captured, s
     so none sees the terminal row without its completion. ``settlement`` receives the committed
     ``(settled, response)`` before publication, so a publish failure is not a lost commit.
     The caller publishes idle ``session.info`` on the loop afterwards (bot receipt wakeups are tasks).
+    Terminal media cleanup is not part of it: ``settle_with_retry`` queues it once this returns.
     """
     from gateway.session_results import finish_result, prepare_result
     # Compaction, redaction and outcome flags are CPU-only.
@@ -193,7 +185,6 @@ def commit_and_publish(authority, live, ref, row, response, outcome, captured, s
     finally:
         with live.event_stream.lock:
             live.settling.pop(admission_id, None)
-    _release_media(authority, row)
 
 
 # Pauses between settlement attempts after a transient storage error (held writer past its
@@ -208,11 +199,15 @@ async def settle_with_retry(authority, live, ref, row, response, outcome, captur
     lives only in memory. Retrying is exact: a write that committed before reporting failure is
     read back by ``finish_result``, and a failure after the commit (``settled`` set) never retries.
     A fence refusal (``RuntimeStoreError``) is not transient and is raised at once."""
+    from gateway.session_ingress_media import release_admission_media_later
     from gateway.session_runtime_workers import track_mutation
     for delay in (*_SETTLE_RETRY_DELAYS_S, None):
         try:
-            return await asyncio.shield(track_mutation(authority, asyncio.to_thread(
+            await asyncio.shield(track_mutation(authority, asyncio.to_thread(
                 commit_and_publish, authority, live, ref, row, response, outcome, captured, settlement)))
+            # Queued, never awaited: the next FIFO row and this turn's delivery do not wait on it.
+            release_admission_media_later(authority, row['admission_id'])
+            return
         except (OSError, sqlite3.Error) as exc:
             if delay is None or 'settled' in settlement:
                 raise
@@ -226,6 +221,7 @@ def publish_terminal(authority, ref, row, settled, response, captured):
     live = authority.sessions[ref.session_id]
     with live.event_stream.lock:
         _publish_completion(authority, live, ref, row, settled, response, captured)
-    _release_media(authority, row)
+    from gateway.session_ingress_media import release_admission_media_later
+    release_admission_media_later(authority, row['admission_id'])
     # Idle follows the completion so a viewer cannot mistake a settled turn for a lost frame.
     authority._publish_pending(ref)

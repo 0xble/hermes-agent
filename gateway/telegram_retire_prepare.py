@@ -73,8 +73,8 @@ async def queue_preparation(runner, source, state: dict, items: list[dict], *, b
     event = MessageEvent(
         text=text, message_type=MessageType.TEXT,
         source=dataclasses.replace(source, message_id=None), internal=True, reply_expected=False,
-        metadata={"gateway_session_id": state["session_id"], "gateway_session_strict": True,
-                  "retirement_generation": state["generation"]},
+        metadata={"gateway_session_id": state["session_id"], "gateway_session_key": state["session_key"],
+                  "gateway_session_strict": True, "retirement_generation": state["generation"]},
     )
     adapter = runner._delivery_adapter_for(source)
     await admit_internal_event(adapter, event)

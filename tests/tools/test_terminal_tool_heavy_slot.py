@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from tools import terminal_tool_heavy_slot as heavy
-from tools.terminal_tool_heavy_slot import can_promote_expired_wait, classify_command, wrap_heavy_command
+from tools.terminal_tool_heavy_slot import classify_command, wrap_heavy_command
 
 HELPER = "/opt/heavy/bin/heavy-slot"
 
@@ -172,17 +172,6 @@ def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
     wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=None)
     dispatcher, _body = wrapped.split("\n", 1)
     assert "HEAVY_SLOT_MAX_WAIT" not in dispatcher
-
-
-@pytest.mark.parametrize(("command", "env_type", "expected"), [
-    ("pytest -q tests", "local", True),
-    ("cd repo && pytest -q tests", "local", False),
-    ("pytest -q tests && echo done", "local", False),
-    ("pytest -q tests", "docker", False),
-    ("echo pytest -q tests", "local", False),
-])
-def test_only_single_simple_heavy_commands_are_promotable(command, env_type, expected):
-    assert can_promote_expired_wait(command, env_type=env_type, environment={}) is expected
 
 
 @pytest.mark.parametrize(("background", "env_type", "timeout", "expected"), [

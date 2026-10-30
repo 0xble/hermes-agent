@@ -123,6 +123,35 @@ def register(ctx) -> None:
     ctx.register_web_search_provider(MyBackendWebSearchProvider())
 ```
 
+## Request-Local Search Quality
+
+`web_search` accepts an optional `stakes` hint (`standard` or `high`). Exa defaults
+to Auto. The agent marks a search `standard` when a somewhat wrong or incomplete
+answer costs little, such as software docs and APIs, product specs and reviews,
+how-tos, recipes, entertainment, navigation, general background, or early broad
+discovery. These searches use Lite unless the protected-topic keyword guard fires.
+There is no commodity-term or `site:` domain allowlist.
+
+Use `high` or omit the hint for legal, financial, tax, medical or health,
+compliance, official or government sources, news or current events, prices or
+rates, safety, time-sensitive work, or anything costly to get wrong. When unsure,
+omit it. Missing or unknown hints retain Auto. Protected and non-ASCII queries
+override `standard`. The guard is a backstop, not a complete topic classifier:
+known gaps rely on the agent's judgment, and occasional sensitive Lite searches
+are an accepted trade-off. The pilot spot-checks protected topics.
+
+Responses report the request-local `data.search_type_reason`: `default`,
+`hint_standard`, `hint_high`, or `protected_guard`, including cache hits.
+Responses served by the paid Exa SDK also report `data.search_type`. Keyless or
+rescued responses identify their route with `served_by` or `rescued_from`
+instead. Cache identity separates Lite from Auto.
+Other providers keep their existing behavior.
+
+Providers can override the optional `prepare_search(query, *, stakes=None)`
+method to return a request-local provider with `SEARCH_TYPE` selected before the
+shared cache lookup. The default returns `self`. Never mutate a shared provider
+instance to select request options.
+
 ## plugin.yaml
 
 ```yaml

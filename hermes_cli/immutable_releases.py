@@ -474,7 +474,11 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
                      if extra in leaves and not leaves[extra] <= installed)
     if missing:
         import pm
-        from hermes_cli.update_receipt import record_step
+        from hermes_cli.update_receipt import record_fact, record_step
+        # This sync can publish profile config edits (plugin eviction/memory.provider) and
+        # recover earlier publications outside the candidate. Mark the boundary before entering
+        # PM, even if it fails or its worker never returns mutation evidence.
+        record_fact("staging_runtime_mutation_started", True)
         # An update never fails because of a plugin: evict one that keeps the candidate's
         # environment from building, as every other update-path sync does.
         pm.sync_venv(missing, explicit=True, project_root=candidate, evict_incompatible_plugins=True)
@@ -1453,6 +1457,30 @@ def resolved_release(home: Path) -> Path | None:
     if release is None or release.parent != paths.releases.resolve():
         return None
     return release if _release_is_ready(release, release.name) else None
+
+
+def release_identity(home: Path) -> dict[str, Any] | None:
+    """Pointer and readiness-marker fingerprint of the active release; None when unreadable.
+
+    Releases are never edited in place, so an identical fingerprint before and after a
+    failed candidate build is the evidence that the active release was left alone. It
+    identifies the release (link, resolved path, build sha, marker inodes and mtimes) and
+    does not hash the release tree.
+    """
+    paths = ReleasePaths.for_home(home)
+    try:
+        link = os.readlink(paths.current)
+        release = resolved_release(paths.home)
+        if release is None:
+            return None
+        markers = {}
+        for name in (".release-ready", ".hermes_build_sha"):
+            stat = (release / name).stat()
+            markers[name] = [stat.st_ino, stat.st_mtime_ns, stat.st_size]
+    except OSError:
+        return None
+    return {"home": str(paths.home), "link": link, "path": str(release),
+            "sha": release.name, "markers": markers}
 
 
 def update_source_checkout(home: Path, running_root: Path) -> Path | None:

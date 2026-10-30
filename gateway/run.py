@@ -429,7 +429,7 @@ def _ensure_windows_gateway_venv_imports() -> None:
         return
 
     project_root = Path(__file__).resolve().parent.parent
-    from pm.environments import committed_venv
+    from pm.environments import committed_venv, venv_python_version
 
     # A PM install's store Python was already activated onto the committed generation by
     # hermes_bootstrap; overlaying the leftover pre-PM venv loads a foreign ABI (#122183).
@@ -453,6 +453,10 @@ def _ensure_windows_gateway_venv_imports() -> None:
 
         site_packages = resolved_venv / "Lib" / "site-packages"
         if not site_packages.exists():
+            continue
+        # A legacy venv must match this interpreter before any .pth or native module is loaded.
+        if (found := venv_python_version(resolved_venv)) != sys.version_info[:2]:
+            logger.debug("Skipping venv overlay %s: Python %s, gateway %s", resolved_venv, found or "unknown", sys.version_info[:2])
             continue
 
         project_entry = str(project_root)
@@ -2088,6 +2092,7 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
         "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
         "docker_env": "TERMINAL_DOCKER_ENV",
+        "docker_auto_mount_host_state": "TERMINAL_DOCKER_AUTO_MOUNT_HOST_STATE",
         "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
         "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
         "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",

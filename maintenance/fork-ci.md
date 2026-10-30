@@ -160,10 +160,22 @@ Timer and remote-kernel concurrency fixtures use bounded Events to establish the
 intended owner before asserting behavior; real worker threads and watchdogs remain
 in place. Updater tests isolate all launchd inventory and profile-plist probes so fake
 updates cannot discover the host gateway. No runtime safety guard is disabled.
-The desktop installer-ownership fixture waits for a readiness message from its real
-Python child before checking process arguments. Full platform concurrency left the
-shell wrapper running beyond its former 40 x 25ms polling window. A bounded child
-handshake preserves the real process-identity assertions and reports startup failures.
+The desktop installer-ownership fixtures wait for a readiness message from their real
+Python children before checking process arguments or native update ownership. Full
+platform concurrency left a shell wrapper running beyond its former 40 x 25ms
+polling window. The managed-launcher fixture subscribes before launch to the atomic
+terminal-status publication rather than assuming completion within 100 x 25ms.
+The existing finite Vitest budgets and all argv, log, status, mode and native-ownership
+assertions remain intact. Three-second startup/update injection reproduces both
+former failures and passes with event-based synchronization, without retries.
+The bundled gateway-ticket fixture links the selected Python's base interpreter,
+not its venv executable. A copied venv binary depends on its adjacent `pyvenv.cfg`
+to find the standard library, which is absent in the fake payload. With a copied
+venv first on `PATH`, the unchanged test fails at gateway-ticket bootstrap, while
+linking `sys._base_executable` passes through the real payload interpreter and
+socket. The rejecting CLI shim, exact ticket assertion and existing timeout and
+platform selection remain unchanged. No production resolver changes are needed.
+Retire when upstream's fixture preserves an equivalent standalone Python layout.
 
 The portable Linux sandbox exposed a browser port-allocation bug when IPv6 is
 unavailable. Upstream [PR #91455](https://github.com/NousResearch/hermes-agent/pull/91455),
@@ -271,6 +283,20 @@ The adaptation keeps the fork's portable `TestPlayBeep` and Linux-only WSL2
 class, and omits upstream opt-out tests the fork already removed. A logging
 `afplay` shim on `PATH` recorded one call on the base and none with the patch.
 Retire when a released upstream revision carries equivalent guard coverage.
+
+## Desktop handoff fixture teardown
+
+The `fork-ci-reliability` identity covers the sidecar-publication timeout cell in
+`tests/scripts/desktop_update/test_handoff_delegate_publication.py`. Releasing
+A7 lets the real handoff finish naturally. A later `os.killpg` races that exit:
+surviving, reparented helpers cannot prove test ancestry after their leader has
+exited, so the live-system guard correctly refuses the group signal. Release A7
+and join the handoff under the existing 10-second teardown bound instead. Require
+exit code 3 and marker removal as well as the original parked-update and
+no-delegate assertions. Product code, the real 10-second lock deadline, and the
+live-system guard are unchanged. A Linux probe that lets the leader exit before
+group inspection reproduces the old guard refusal. Retire when upstream adopts
+cooperative teardown for this cell.
 
 ## Linked worktree test venv
 

@@ -18,6 +18,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.notice_style import ContextNotice
 from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import AwakeIdleMeter, format_iteration_progress
 from agent.turn_failure_copy import (
@@ -791,7 +792,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     model = attended_model
                 except Exception as exc:
                     logger.warning("Attended route %s unavailable: %s", attended_provider, exc)
-                    notice = f"⚠️ Attended model unavailable; staying on {model}."
+                    notice = ContextNotice(f"⚠️ Attended model unavailable; staying on {model}.")
             else:
                 model = attended_model
 
@@ -2389,7 +2390,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
         from gateway.response_filters import reaction_answered
-        if _intentional_silence and not (reaction_answered(agent_result) or silence_allowed(_silence_kind, _silence_reply_expected)):
+        if _intentional_silence and not ((reaction_answered(agent_result) and _silence_kind != "supervisor_checkin")
+                                        or silence_allowed(_silence_kind, _silence_reply_expected)):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -3260,6 +3262,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         if not await self._prepare_loop_wake_execution(event, source):
             self._log_loop_wake_suppressed(event, "superseded before turn preparation")
             return
+        from gateway.run_checkins import prepare_checkin
+        if not await prepare_checkin(self, event, session_entry):
+            return
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -3322,6 +3327,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 if message_text is None:
                     logger.info("Discarding wake superseded during turn preparation for %s", session_key)
                     return None
+            if not await prepare_checkin(self, event, session_entry, start=True):
+                return
+            if (event.metadata or {}).get("checkin"):
+                message_text = event.text
             started, agent_result = await self._invoke_loop_wake_effect(
                 event, self._run_agent,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
@@ -3346,6 +3355,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             if not started:
                 self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
                 return
+            from gateway.run_checkins import silence_fallback
+            agent_result = await silence_fallback(self, event, session_entry, agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -3430,6 +3441,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         except Exception as e:
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
+            try:
+                from gateway.run_checkins import reconcile_turn
+                await reconcile_turn(self, source, session_key)
+            except Exception:
+                logger.warning("Could not reconcile supervisor check-in", exc_info=True)
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -4993,7 +5009,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # contract. A queued successor must not make the retry's second marker silently legal.
             silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
             from gateway.response_filters import reaction_answered
-            if reaction_answered(_delivery_result) or silence_allowed(silence_kind, turn_ctx.reply_expected):
+            if ((reaction_answered(_delivery_result) and silence_kind != "supervisor_checkin")
+                    or silence_allowed(silence_kind, turn_ctx.reply_expected)):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -5524,6 +5541,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         owner.register_post_delivery_callback(key, cleanup, generation=turn_ctx.run_generation)
         turn_ctx._post_delivery_adapter = owner
         turn_ctx._bubble_cleanup_registered = True
+        # A FIFO drain turn has no adapter handler whose unwind fires this; the drain fires it.
+        from gateway.session_results import execution_result
+        captured = execution_result.get()
+        if captured is not None:
+            captured['post_delivery'] = (owner, key, turn_ctx.run_generation)
 
     def _run_agent_bind_turn_wiring(
         self, turn_ctx: TurnContext, turn_runner: TurnRunner, source: SessionSource,

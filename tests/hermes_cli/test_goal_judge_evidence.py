@@ -125,6 +125,8 @@ def test_evidence_keeps_output_tail_bounded_and_redacted(hermes_home):
 
 
 def test_prompt_without_evidence_is_unchanged(monkeypatch):
+    # Prompt equality must not depend on both calls landing in the same second.
+    monkeypatch.setattr(goals, "safe_strftime", lambda *_args: "fixed current time")
     prompts = _capture_prompts(monkeypatch, ['{"verdict":"continue","reason":"r"}'] * 2)
     goals.judge_goal("Finish the work", "did a thing", timeout=1)
     goals.judge_goal("Finish the work", "did a thing", evidence=[], timeout=1)

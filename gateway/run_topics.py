@@ -947,23 +947,6 @@ class GatewayTopicThreadsMixin:
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 
-    async def _handle_retire_command(self, event):
-        from gateway.telegram_retire import request
-        from gateway.telegram_topic_sessions import TopicRequestError
-        args = (event.get_command_args() or "").strip()
-        try:
-            result = await request(self, event.source, target=None if args in {"", "now", "cancel"} else args,
-                                   now=args == "now", cancel=args == "cancel")
-        except TopicRequestError as exc:
-            return str(exc)
-        if result["status"] == "cancelled":
-            return "Topic retirement cancelled."
-        if args == "now":
-            from gateway.telegram_retire import advance
-            await advance(self, event.source)
-            return None
-        return "This topic is retiring after the current turn."
-
     # ── /topic command bodies ───────────────────────────────────────────────────────────────
 
     async def _disable_telegram_topic_mode_for_chat(self, source: SessionSource) -> str:
