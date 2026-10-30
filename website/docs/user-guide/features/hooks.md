@@ -477,6 +477,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_skill_lifecycle` | Observer | After an authoritative skill-usage state change; return ignored. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Exposes the local skill name and provenance. |
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
+| [`subagent_failure_notice`](#subagent_failure_notice) | Directive | A child ended `failed`, `error` or `timeout`, once, before the user-facing failure notice (gateway chat notice, CLI tree line). `{"action": "suppress"}` hides that notice; anything else, or an error, keeps it. The child result and `subagent_stop` are unchanged. | `child_session_id`, `child_goal`, `child_status`, `error`, `failure_reason` | Error text may contain provider details. |
 | `pre_gateway_dispatch` | Directive/control | Once per incoming non-internal message, at ingress: platform-adapter messages before auth/pairing/dispatch; webhook and relay deliveries after their authorization, before the admission commits; never for local CLI/TUI/Desktop or API turns, a retry of a committed delivery, or a queued admission when it executes. First valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
 | `post_gateway_admission` | Directive/control (fail-open) | Admitted non-internal message after auth, pause/drain, pending-reply, running-session and slash-command lanes, inside the claimed session slot and the routed profile's scope; first `handled` result skips the agent turn, anything else (including a raise or timeout) runs it. | `session_key`, `platform`, `source` (dict snapshot), `message_id`, `text` | Inbound text is untrusted user data; no runner or session-store handles are passed. |
 | `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
@@ -1284,6 +1285,47 @@ def register(ctx):
 
 :::info
 With heavy delegation (e.g. orchestrator roles × 5 leaves × nested depth), `subagent_stop` fires many times per turn. Keep your callback fast; push expensive work to a background queue.
+:::
+
+---
+
+### `subagent_failure_notice`
+
+Fires **once per failed child**, when a `delegate_task` child ends with status `failed`, `error` or `timeout`, before Hermes tells the user (the gateway's "Subagent failed" chat notice and the CLI's tree line). It lets a plugin that recovers the failure itself, for example by re-running the same work on another provider from `subagent_stop`, keep the user from being told the work failed while the retry is still running.
+
+**Callback signature:**
+
+```python
+def my_callback(child_session_id: str | None, child_goal: str, child_status: str,
+                error: str | None, failure_reason: str | None, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `child_session_id` | `str \| None` | Session ID of the failed child, the same ID `subagent_start` reported |
+| `child_goal` | `str` | The goal the child was given |
+| `child_status` | `str` | `"failed"`, `"error"`, or `"timeout"` |
+| `error` | `str \| None` | The child's error summary |
+| `failure_reason` | `str \| None` | The classified failure reason, when the child loop classified it |
+
+**Fires:** In the child progress relay (`tools/delegate_tool_progress.py`), on the child's completion event. The first relay to see the failure asks the hook and records the answer on the event, so nested relays and the gateway reuse that decision and the hook never runs twice for one failure. The gateway asks the hook itself only for a failure event that did not pass through the relay.
+
+**Return value:** Return `{"action": "suppress"}` to hide the user-facing notice. Any other return, no plugin, or a callback error keeps the notice. Only presentation changes: the child's result, the parent's consolidated result and `subagent_stop` are unaffected.
+
+**Example — hide the notice while a fallback retry runs:**
+
+```python
+def on_failure_notice(child_session_id, child_status, error, **kwargs):
+    if my_retry_is_pending(child_session_id):
+        return {"action": "suppress"}
+    return None
+
+def register(ctx):
+    ctx.register_hook("subagent_failure_notice", on_failure_notice)
+```
+
+:::info
+The callback runs synchronously on the child's progress path. Keep it fast, and start recovery work from `subagent_stop` rather than from this hook.
 :::
 
 ---
