@@ -13,7 +13,7 @@ def writable_fds(home):
         try:
             target = path.resolve()
             flags = next(line.split(':')[1].strip() for line in
-                         (Path('/proc/self/fdinfo') / path.name).read_text().splitlines()
+                         (Path('/proc/self/fdinfo') / path.name).read_text(encoding='utf-8').splitlines()
                          if line.startswith('flags:'))
             if target.name in ('state.db', 'state.db-wal', 'state.db-shm') and int(flags, 8) & 3:
                 result.append(str(target))
@@ -52,7 +52,7 @@ for line in sys.stdin:
             store = module.RuntimeSessionStore(transport, scope, home / 'worker-outboxes' / 'owned-worker', max_bytes=20000)
             sid = scope['session_id']
             store.try_acquire_session_turn_lease(sid, 'owned-worker-lease')
-            (home / 'tool-marker').write_text('once')
+            (home / 'tool-marker').write_text('once', encoding='utf-8')
             messages = [{'role': 'user', 'content': 'start'},
                         {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'call', 'type': 'function',
                          'function': {'name': 'inert', 'arguments': '{}'}}]},
@@ -81,8 +81,16 @@ for line in sys.stdin:
                 'outbox_full': reason(lambda: store.append_messages_batch(sid, [{'role': 'user', 'content': 'x' * 30000}])),
                 'writable_canonical_fds': writable_fds(home), 'canonical_opens': list(canonical_opens)}
         elif command['op'] == 'outage':
+            from agent import runtime_session_store as module
             store.retry_pending()  # clear the deliberate full-entry rejection
-            failure = reason(lambda: store.record_auxiliary_usage(sid, 'compression', input_tokens=5, model='aux'))
+            # This command deliberately exhausts patience before the parent starts a successor.
+            patience = module.OWNER_RESTART_TIMEOUT
+            module.OWNER_RESTART_TIMEOUT = 2.0
+            try:
+                failure = reason(lambda: store.record_auxiliary_usage(sid, 'compression', input_tokens=5, model='aux'))
+            finally:
+                module.OWNER_RESTART_TIMEOUT = patience
+            assert failure.startswith('owner_restart:'), failure
             assert store.failure and store.journal['pending']
             output = {'pending': len(store.journal['pending']), 'failure': failure,
                       'canonical_opens': list(canonical_opens)}
