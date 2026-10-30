@@ -175,10 +175,11 @@ def _record_rate_limit_cooldown(key: str, home_path: Optional[Path]) -> None:
         pass  # best-effort: without the marker the next start just probes once and stops
 
 
-def find_op(binary_path: str = "") -> Optional[Path]:
+def find_op(binary_path: str = "", *, search_path: Optional[str] = None) -> Optional[Path]:
     """Resolve a usable ``op`` binary, or None. A pinned ``binary_path`` is used
-    verbatim — pinned-but-missing returns None rather than falling back to PATH."""
-    found = binary_path or shutil.which("op")
+    verbatim — pinned-but-missing returns None rather than falling back to PATH.
+    ``search_path`` resolves against another process's PATH (a service definition)."""
+    found = binary_path or shutil.which("op", path=search_path)
     if not found or (binary_path and not os.access(binary_path, os.X_OK)):
         return None
     return Path(found)

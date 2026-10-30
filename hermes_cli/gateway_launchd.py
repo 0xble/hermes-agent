@@ -413,6 +413,27 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
+def _installed_service_path_entries(home: Path) -> list[str]:
+    """User PATH entries of the installed service definition, minus release-owned dirs.
+
+    A release render runs from ``hermes update`` in a login shell and from the
+    guardian under launchd's bare PATH. Deriving the user tail from the caller made
+    a guardian rollback drop ``~/.local/bin`` (the 1Password ``op`` CLI), so the
+    rolled-back gateway started without its secrets and exited (2026-10-29).
+    """
+    import plistlib
+    from xml.parsers.expat import ExpatError
+    try:
+        installed = plistlib.loads(_gw().get_launchd_plist_path().read_bytes())
+        entries = str(installed["EnvironmentVariables"]["PATH"]).split(":")
+    except (OSError, ValueError, KeyError, TypeError, plistlib.InvalidFileException, ExpatError):
+        # An unreadable installed definition (e.g. truncated XML) is rewritten, not fatal.
+        return []
+    owned = (home / "releases", home / "current")
+    return [entry for entry in entries
+            if entry and not any(Path(entry).is_relative_to(root) for root in owned)]
+
+
 def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a") -> str:
     """Render a candidate definition without moving ``current`` first.
 
@@ -431,14 +452,20 @@ def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a
     # launchd's default PATH misses Homebrew, nvm, cargo…; prepend venv/bin + node dirs (as in the
     # systemd unit) so node stays resolvable even if the shell PATH changes, then the shell PATH.
     priority_dirs = _gw()._build_service_path_dirs()
+    user_dirs = [p for p in os.environ.get("PATH", "").split(":") if p]
     if release_target:
         root = Path(release_target)
         if not (root / ".venv" / "bin" / "python").is_file():
             raise RuntimeError(f"candidate launchd interpreter unavailable: {root}")
+        # Release-owned dirs follow the target, not the release this code was imported from.
         priority_dirs = [str(_gw().get_hermes_home() / "current" / ".venv" / "bin"),
-                         *[entry for entry in priority_dirs if entry != str(root / ".venv" / "bin")]]
+                         *[entry for entry in _gw()._build_service_path_dirs(project_root=root)
+                           if entry != str(root / ".venv" / "bin")]]
+        # The installed service's user PATH leads, so every renderer of the same target
+        # (shell update, launchd guardian rollback) emits it; the caller only adds new dirs.
+        user_dirs = _installed_service_path_entries(_gw().get_hermes_home()) + user_dirs
     _gw()._append_node_dir_for_service(priority_dirs)
-    sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
+    sane_path = ":".join(dict.fromkeys(priority_dirs + user_dirs))
 
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).

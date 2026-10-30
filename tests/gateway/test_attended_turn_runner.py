@@ -451,3 +451,76 @@ def test_effort_log_label(config, label):
     from agent.reasoning_effort import effort_log_label
 
     assert effort_log_label(config) == label
+
+
+_SILENT = {"model": {"default": "default", "attended": {"model": "opus", "provider": "anthropic", "notices": False}}}
+
+
+def test_notices_false_switches_mid_turn_without_a_card():
+    decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
+    turn, _, state = _runner(decision)
+    turn._ctx = _ctx(_SILENT)
+    agent = SimpleNamespace(
+        model="default", provider="nous", api_mode="codex_responses",
+        _gateway_attended_decision_key=("default", "nous", "xhigh", "default", False),
+        _fallback_activated=False, _provider_fallback_active=False,
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+        _emit_diagnostic_status=lambda _m: None,
+        context_compressor=None,
+    )
+
+    with patch("agent.agent_runtime_helpers.switch_model") as switch:
+        turn._apply_attended_before_api_call(agent)
+
+    switch.assert_called_once()
+    assert turn.attended_notices == []
+    assert state.conversation.last_resolved_model == "opus"
+
+
+def test_notices_false_switches_back_without_a_card():
+    previous = AttendedResolution(
+        "claude-opus-5-5", "anthropic", "medium", "attended", True, idle_model="gpt-6.1-sol",
+    )
+    decision = AttendedResolution("gpt-6.1-sol", "nous", "xhigh", "default", False, switched_back=True)
+    turn, _, _ = _runner(decision, runtime=("gpt-6.1-sol", {"provider": "nous", "api_mode": "codex_responses"}))
+    turn._ctx = _ctx(_SILENT)
+    agent = SimpleNamespace(
+        model="claude-opus-5-5", provider="anthropic", api_mode="anthropic_messages",
+        _gateway_attended_decision=previous, _gateway_attended_decision_key=previous.decision_key,
+        _fallback_activated=False, _provider_fallback_active=False,
+        reasoning_config={"enabled": True, "effort": "medium"},
+        _emit_diagnostic_status=lambda _m: None,
+        context_compressor=None,
+    )
+
+    with patch("agent.agent_runtime_helpers.switch_model") as switch:
+        turn._apply_attended_before_api_call(agent)
+
+    switch.assert_called_once()
+    assert turn.attended_notices == []
+
+
+def test_notices_false_stages_no_queued_turn_card():
+    from gateway.run_turn import GatewayTurnMixin
+
+    decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
+    _, runner, state = _runner(decision)
+    state.conversation.pending_attended_notice = None
+    runner._load_attended_route_active = lambda _key: False
+    runner._handoff_attended_state = lambda _key, conversation: vars(state.conversation).update(conversation)
+
+    route = GatewayTurnMixin._attended_route_for_session(
+        runner, source=None, session_key="session-1", user_config=_SILENT,
+        override=None, last_model="default",
+    )
+
+    assert route is not None
+    assert state.conversation.pending_attended_notice is None
+
+
+def test_notices_must_be_a_boolean():
+    from gateway.attended_model import parse_attended_config
+
+    assert parse_attended_config(_SILENT).notices is False
+    assert parse_attended_config({"model": {"attended": {"model": "opus"}}}).notices is True
+    assert parse_attended_config({"model": {"attended": {"model": "opus", "notices": "no"}}}).notices is True

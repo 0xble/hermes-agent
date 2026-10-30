@@ -462,7 +462,7 @@ class SessionAuthority:
     async def admit_automation(self, adapter, event, identity, replaces=None):
         from gateway.admission_canary import refusal_evidence
         from gateway.session_automation import admit_automation
-        with refusal_evidence('automation'):
+        with refusal_evidence('automation', identity):
             return await admit_automation(self, adapter, event, identity, replaces)
 
     async def admit_native(self, event):
