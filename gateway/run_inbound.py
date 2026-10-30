@@ -1729,17 +1729,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
-    def _schedule_attended_user_activity(self, event, source, session_key: str):
-        """Keep receipt-time bookkeeping alive without delaying busy input or commands."""
+    def _schedule_attended_user_activity(self, event, source, session_key: str, *, profile_scope=None):
+        """Keep receipt-time bookkeeping alive without delaying busy input or commands.
+
+        ``profile_scope`` is a zero-argument factory for an async profile scope, entered inside
+        the background task. Callers on a receive loop that hold no scope use it, so secret
+        hydration never runs before the input returns."""
         if not is_genuine_user_message(event) or getattr(event, "_attended_activity_marked", False):
             return
         if getattr(event, "_attended_activity_task", None) is not None:
             return
         from gateway.reply_latency import record_received
         record_received(event)
-        task = asyncio.create_task(self._mark_attended_user_activity(
-            event, source, session_key, retry_on_failure=True,
-        ))
+        mark = self._mark_attended_user_activity
+        if profile_scope is None:
+            work = mark(event, source, session_key, retry_on_failure=True)
+        else:
+            async def scoped():
+                async with profile_scope():
+                    return await mark(event, source, session_key, retry_on_failure=True)
+            work = scoped()
+        task = asyncio.create_task(work)
         event._attended_activity_task = task
         self._retain_background_task(task)
 
