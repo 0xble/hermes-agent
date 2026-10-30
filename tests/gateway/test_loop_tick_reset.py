@@ -30,7 +30,10 @@ def _tick(runner, source, key, sid):
     event.metadata.update(loop_wake_metadata(sid, state))
     event.metadata.update(gateway_session_key=key, gateway_session_id=sid,
                           gateway_session_strict=True)
-    runner._stamp_post_turn_goal_identity(event, runner._session_state(key).turn.run_generation)
+    tick = (state.created_at, state.ticks_fired)
+    generation = runner._session_state(key).turn.run_generation
+    event.metadata.update(hermes_loop_wakeup=True, gateway_loop_tick=list(tick))
+    event._gateway_loop_execution_fence = (sid, tick, generation, state.control_generation)
     return manager, event
 
 
@@ -140,16 +143,18 @@ async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatc
     from gateway.session_results import execution_result
     from gateway.session_runtime_workers import mutation_tasks
     from hermes_constants import get_hermes_home
+    from gateway import run
     from hermes_state_runtime import list_session_admissions
 
     (get_hermes_home() / "config.yaml").write_text(
         'platform_toolsets: {cli: []}\nmodel: {provider: custom, default: m, base_url: "http://127.0.0.1:9/v1"}\n',
         encoding="utf-8")
+    monkeypatch.setattr(run, "_hermes_home", get_hermes_home())
     runner = GatewayRunner(GatewayConfig())
     authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
     connection = AuthorityConnection(authority, object(), {"user_id": "owner"})
     ref = create_local_session(authority, connection.actor, dict(
-        request_id="loop-reset", source="cli", cwd=str(tmp_path), toolsets=[]))
+        request_id="loop-reset", source="cli", cwd=str(tmp_path), toolsets=[], model="m"))
     live = authority.sessions[ref.session_id]
     source, key = live.source, live.route
     adapter = runner.adapters[source.platform]
@@ -180,8 +185,8 @@ async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatc
     try:
         await authority.submit(connection.actor, Submission("A", ref, {"text": "A"}, "queue"))
         await asyncio.wait_for(running.wait(), 10)
-        receipt = await authority.admit_automation(adapter, tick, "loop-tick")
-        assert receipt is not None
+        from gateway.session_automation import admit_route_wake
+        assert await admit_route_wake(runner, adapter, source, "WAKE", "loop-tick", event=tick)
         rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
         wake = next(row for row in rows if "local_automation_v1" in row["payload"])
         assert wake["status"] == "queued"
