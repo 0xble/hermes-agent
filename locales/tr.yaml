@@ -3566,6 +3566,7 @@ explainer:
     error_near_max_iterations: "nihai bir yanıt üretilmeden, yineleme sınırına yakın bir noktada hata oluştu. Yukarıdaki araç çıktısını kontrol edin, ardından `continue` gönderin."
     repeated_outer_errors: "tur tekrarlanan hatalarla sürekli başarısız olduğu için sonsuza dek yeniden denemek yerine erken durduruldu. Yukarıdaki hataları kontrol edin, ardından yeniden denemek için `continue` gönderin."
   persistence:
+    owner_restart: "Hermes ağ geçidi bu tur sırasında yeniden başlatıldı veya kullanılamaz hale geldi ve yeniden deneme süresi dolmadan geri dönmedi. Bekleyen işçi yazmaları, açıkça yeniden denemek veya kimliği doğrulanmış devralma için yerel günlükte tutulur. Turu yeniden göndermeyin."
     compression: "tur durduruldu çünkü başka bir süreç bu oturumu sıkıştırıyordu. Mesajınız zaten kaydedilmiş olmalı — sıkıştırma tamamlandıktan sonra lütfen yeniden gönderin."
     compression_closed: "tur durduruldu çünkü bu oturum bağlam sıkıştırmasıyla döndürüldü ve canlı devamı devralınamadı. Depolamanın kendisi sağlam — yeni oturum kimliğini alması için istemciyi yenileyin (veya yeni bir tur başlatın), sonra mesajınızı yeniden gönderin."
     turn_lease: "tur durduruldu çünkü başka bir Hermes süreci bu oturumu devraldı. Yanıtınız kaydedilmedi — diğer sürecin bitmesini bekleyin, sonra mesajınızı yeniden gönderin."

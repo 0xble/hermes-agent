@@ -3566,6 +3566,7 @@ explainer:
     error_near_max_iterations: "ocorreu um erro perto do limite de iterações, antes de uma resposta final. Verifique a saída da ferramenta acima e então envie `continue`."
     repeated_outer_errors: "o turno continuou falhando com erros repetidos e foi encerrado antecipadamente em vez de tentar novamente para sempre. Verifique os erros acima e então envie `continue` para tentar de novo."
   persistence:
+    owner_restart: "o gateway Hermes reiniciou ou ficou indisponível durante este turno e não voltou antes do prazo de nova tentativa. As gravações pendentes do worker permanecem no diário local para uma nova tentativa explícita ou adoção autenticada. Não reenvie o turno."
     compression: "o turno foi encerrado porque outro processo estava comprimindo esta sessão. Sua mensagem já deve estar salva — envie-a novamente quando a compressão terminar."
     compression_closed: "o turno foi encerrado porque esta sessão foi rotacionada pela compressão de contexto e sua continuação ativa não pôde ser adotada. O armazenamento em si está íntegro — atualize o cliente (ou inicie um novo turno) para que ele use o novo id de sessão e então envie sua mensagem novamente."
     turn_lease: "o turno foi encerrado porque outro processo do Hermes assumiu esta sessão. Sua resposta não foi salva — aguarde o outro processo terminar e então envie sua mensagem novamente."

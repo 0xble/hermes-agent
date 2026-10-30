@@ -317,6 +317,10 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
         return GatewayDiscovery(state)
     except TimeoutError:
         return GatewayDiscovery("inaccessible", reason_code="control_timeout")
+    except (ConnectionResetError, BrokenPipeError):
+        # An exiting owner can break identify before a response, just like EOF.
+        # Keep this distinct from malformed or unauthorized control peers.
+        return GatewayDiscovery("inaccessible", reason_code="incomplete_control_response")
     except DiscoveryError as exc:
         # The code stays bounded; the detail names the local node, its owner or mode, and the fix.
         return GatewayDiscovery("inaccessible", reason_code=exc.reason, detail=exc.bounded_detail(500))
