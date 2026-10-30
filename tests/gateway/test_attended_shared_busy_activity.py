@@ -118,8 +118,10 @@ async def test_nonhuman_or_refused_shared_input_never_persists_activity(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('user_id', [None, 'unauthorized-user'])
 @pytest.mark.parametrize('allow_gateway_control', [False, True])
+@pytest.mark.parametrize('busy_input_mode', ['interrupt', 'steer', 'queue'])
+@pytest.mark.parametrize('draining', [False, True])
 async def test_internal_busy_input_keeps_existing_admission_without_user_auth(
-        shared_busy, caplog, user_id, allow_gateway_control):
+        shared_busy, caplog, user_id, allow_gateway_control, busy_input_mode, draining):
     env = shared_busy
     source = replace(env.source, user_id=user_id)
     assert not env.runner._is_user_authorized_for_source(source)
@@ -127,6 +129,9 @@ async def test_internal_busy_input_keeps_existing_admission_without_user_auth(
     assert env.runner._session_key_for_source(source) == env.owner.key
     # _busy_owner holds the real FIFO turn before model construction. Exercise the running-agent
     # branch a completion actually encounters, rather than the pre-model merge-only sentinel.
+    env.runner._busy_input_mode = busy_input_mode
+    assert env.runner._effective_busy_input_mode(source) == busy_input_mode
+    env.runner._draining = draining
     agent = Mock()
     agent.get_activity_summary.return_value = {'idle_seconds': 0}
     env.runner._session_state(env.owner.key).turn.agent = agent
@@ -138,11 +143,18 @@ async def test_internal_busy_input_keeps_existing_admission_without_user_auth(
     await admit_internal_event(env.adapter, event)
     assert event._gateway_accepted
     assert env.adapter._pending_messages[env.owner.key] is event
+    assert not env.runner._overflow_queue(env.owner.key)
+    assert env.runner._session_state(env.owner.key).turn.agent is agent
+    agent.interrupt.assert_not_called()
+    agent.steer.assert_not_called()
+    agent.redirect.assert_not_called()
+    assert bool(getattr(event, '_drain_deferred', False)) is draining
     assert getattr(event, '_attended_activity_received_at', None) is None
     env.persist.assert_not_awaited()
     assert 'Dropping message from unauthorized user' not in caplog.text
     # This is the existing internal adapter FIFO, not a forged external native admission.
     env.adapter._pending_messages.pop(env.owner.key)
+    env.runner._draining = False
 
 
 @pytest.mark.asyncio
