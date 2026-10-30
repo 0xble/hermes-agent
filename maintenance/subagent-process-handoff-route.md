@@ -27,13 +27,16 @@ checkpointed route of a background process.
   restart-recovered watcher addresses the parent, not the child.
 - Watcher and queue completion events carry `handoff_note` and `parent_session_id`, so
   the parent's notice names the purpose the child gave.
-- Legacy checkpoints with a bare session id resolve their persisted session-store
-  origin before parsing route metadata. If that origin is unavailable, the store may
-  supply an unambiguous chat type for the watcher's exact platform, chat and profile.
+- Legacy messaging checkpoints with a bare session id resolve their persisted session-store
+  origin before parsing route metadata. Raw API routes are excluded from this bare-id
+  fallback, and stored API-server origins are ignored during origin recovery. If the
+  messaging origin is unavailable, the store may supply an unambiguous chat type for
+  the watcher's exact platform, chat and profile.
   A sibling session never supplies a missing thread. Unknown or ambiguous chats remain
   unroutable rather than being guessed. No checkpoint migration is required.
-- An unresolvable process source warns once per process per gateway lifetime. Failed
-  recovery work has a 30-second cooldown, invalidated by route changes, store replacement
+- An unresolvable process source warns once per process while retained in a 512-entry
+  cache that evicts the oldest entry first. Failed recovery work has a 30-second
+  cooldown, invalidated by route changes, store replacement
   or routing-generation advancement. The retry cache is capped at 512 entries. No
   checkpoint, output or completion is discarded. Async-delegation diagnostic sources
   retain their existing DEBUG-only behavior.

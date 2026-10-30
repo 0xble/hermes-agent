@@ -63,9 +63,10 @@ class GatewayProcessEventSourcesMixin:
         if session_key:
             try:
                 self.session_store._ensure_loaded()
-                entry = (self.session_store.lookup_by_session_key(session_key)
-                         or self.session_store.lookup_by_session_id(session_key))
-                if entry and getattr(entry, "origin", None):
+                entry = self.session_store.lookup_by_session_key(session_key)
+                if entry is None and not _raw_process_event_session_id(evt):
+                    entry = self.session_store.lookup_by_session_id(session_key)
+                if entry and getattr(entry, "origin", None) and entry.origin.platform != Platform.API_SERVER:
                     return self._restored_source(entry)
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
@@ -80,8 +81,7 @@ class GatewayProcessEventSourcesMixin:
         if platform_name and chat_id and not chat_type:
             chat_type = self._stored_process_chat_type(platform_name, chat_id, profile)
         if not platform_name or not chat_type or not chat_id:
-            # Raw API keys legitimately have no messaging source. Resolve persisted
-            # origins first, then leave this recognized route to the API dispatcher.
+            # Raw API keys have no messaging source, even when the store has an API origin.
             if _raw_process_event_session_id(evt):
                 return None
             log = self._unresolvable_process_source_log(evt)
@@ -144,7 +144,9 @@ class GatewayProcessEventSourcesMixin:
         identity = evt.get("session_id") or (evt.get("profile"), evt.get("session_key"))
         lock = self.__dict__.setdefault("_unresolvable_process_source_lock", threading.Lock())
         with lock:
-            seen = self.__dict__.setdefault("_unresolvable_process_sources", set())
+            seen = self.__dict__.setdefault("_unresolvable_process_sources", {})
             repeated = identity in seen
-            seen.add(identity)
+            seen[identity] = None
+            while len(seen) > 512:
+                seen.pop(next(iter(seen)))
         return logger.debug if repeated else logger.warning
