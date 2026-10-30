@@ -69,6 +69,7 @@ def test_large_delete_bounds_each_transaction(tmp_path, operation):
 @pytest.mark.parametrize("phase", ["retirement", "batch"])
 def test_interrupted_delete_is_invisible_and_next_prune_resumes(tmp_path, monkeypatch, phase):
     from hermes_state_deletion import finish_pending_deletes
+    from hermes_state_runtime import RuntimeStoreError
     from hermes_state_timeline import get_session_timeline
 
     path = tmp_path / "state.db"
@@ -125,9 +126,9 @@ def test_interrupted_delete_is_invisible_and_next_prune_resumes(tmp_path, monkey
         db.append_message("doomed", "user", "must not resurrect")
     survivor = db._read_one("SELECT id FROM messages WHERE session_id='doomed' LIMIT 1")[0]
     assert db.set_user_message_content("doomed", survivor, "changed after retirement") == 0
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(RuntimeStoreError, match="not_found"):
         db.create_session("doomed", source="cli")
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(RuntimeStoreError, match="not_found"):
         db.create_session("late-child", source="cli", parent_session_id="doomed")
     from hermes_state_mutation_retirement import RETIRED_PREFIX, prune_retired_tombstones
     execute_write(lambda conn: conn.execute(
