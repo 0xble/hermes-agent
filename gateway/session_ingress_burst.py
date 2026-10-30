@@ -79,6 +79,20 @@ async def dispatch_busy_burst(adapter, event, session_key):
     queue-mode TEXT+TEXT burst first."""
     from gateway.platforms.base import merge_pending_message_event
     from gateway.session_ingress import dispatch_shared_busy
+    # This lane returns before the runner's busy handler. Authorize each original input before
+    # it can merge into an authorized head, and stamp before any burst/backpressure wait.
+    runner = getattr(adapter._message_handler, '__self__', None) or adapter.gateway_runner
+    schedule = getattr(runner, '_schedule_attended_user_activity', None)
+    if callable(schedule):
+        if not runner._is_user_authorized_for_source(event.source):
+            return
+        if not getattr(event, '_bot_loop_admitted', False):
+            if not runner._admit_bot_message_for_source(event.source):
+                return
+            event._bot_loop_admitted = True
+        from gateway.run import _profile_runtime_scope
+        with runner._scope_or_null(_profile_runtime_scope, runner._resolve_profile_home_for_source(event.source)):
+            schedule(event, event.source, session_key)
     kind, bursts = _kind(adapter, event), _state(adapter, '_shared_bursts')
     while (burst := bursts.get(session_key)) is not None:
         if kind is not None and kind == _kind(adapter, burst.head) and adapter._can_merge_text_debounce_events(
