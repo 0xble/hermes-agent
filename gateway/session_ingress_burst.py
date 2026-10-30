@@ -48,6 +48,34 @@ def _serial(adapter):
     return getattr(adapter, 'serial_receive_loop', False)
 
 
+async def _authorize(runner, event, session_key):
+    """User and bot-budget gates for one external busy input, under its authorization profile.
+
+    The profile's secrets hydrate off the event loop first, as the runner's own message handlers
+    do, so the synchronous checks find the scope already bound instead of hydrating inline."""
+    home = runner._authorization_home_for_source(event.source)
+    if home is None:
+        return _authorized(runner, event, session_key)
+    from gateway.run import _async_profile_runtime_scope
+    async with _async_profile_runtime_scope(home):
+        return _authorized(runner, event, session_key)
+
+
+def _authorized(runner, event, session_key):
+    if not runner._is_user_authorized_for_source(event.source):
+        logger.warning(
+            "Dropping message from unauthorized user in active session: "
+            "user=%s (%s), platform=%s, session=%s", event.source.user_id, event.source.user_name,
+            event.source.platform.value if event.source.platform else "unknown", session_key,
+        )
+        return False
+    if not getattr(event, '_bot_loop_admitted', False):
+        if not runner._admit_bot_message_for_source(event.source):
+            return False
+        event._bot_loop_admitted = True
+    return True
+
+
 def holds_busy_burst(adapter, session_key):
     """A burst is held or committing: later input for the route must queue behind it."""
     return any(session_key in adapter.__dict__.get(name, ()) for name in ('_shared_bursts', '_shared_burst_commits'))
@@ -86,17 +114,8 @@ async def dispatch_busy_burst(adapter, event, session_key):
     if callable(schedule) and not event.internal:
         # Keep internal work on the handler's existing automation admission. An external input's
         # allow_gateway_control flag alone never bypasses the scoped user/bot gates.
-        if not runner._is_user_authorized_for_source(event.source):
-            logger.warning(
-                "Dropping message from unauthorized user in active session: "
-                "user=%s (%s), platform=%s, session=%s", event.source.user_id, event.source.user_name,
-                event.source.platform.value if event.source.platform else "unknown", session_key,
-            )
+        if not await _authorize(runner, event, session_key):
             return
-        if not getattr(event, '_bot_loop_admitted', False):
-            if not runner._admit_bot_message_for_source(event.source):
-                return
-            event._bot_loop_admitted = True
         from gateway.run import _async_profile_runtime_scope
 
         def profile_scope():  # resolved and hydrated in the stamp task, off this receive path

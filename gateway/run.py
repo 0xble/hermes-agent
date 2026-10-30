@@ -4141,6 +4141,13 @@ class GatewayRunner(
         authorization_home = self._authorization_home_for_source(source)
         if authorization_home is None:
             return check()
+        from agent.secret_scope import current_secret_scope_home
+        from hermes_constants import hermes_home_key
+        key = hermes_home_key(authorization_home)
+        bound = current_secret_scope_home()
+        if (bound is not None and hermes_home_key(bound) == key
+                and (override := get_hermes_home_override()) is not None and hermes_home_key(override) == key):
+            return check()  # the caller already entered this profile's scope, hydrated off-loop
         with _profile_runtime_scope(Path(authorization_home)):
             return check()
 
