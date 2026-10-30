@@ -214,8 +214,8 @@ tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, 
 `hermes_state_messages.py` (off-lock historical display fold),
 `cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound), and the 2026-10-25 sweep
 in `gateway/run_turn.py`, `gateway/run_config_loaders.py`, `gateway/slash_commands_status.py`,
-`gateway/delivery.py`, `gateway/telegram_retire*.py`, `gateway/telegram_topic_sessions.py` and
-the Telegram and Slack adapters. Proof surface:
+`gateway/delivery.py` and the Slack adapter. The Telegram retire, topic-session and adapter
+sites were retired with the [Telegram stack](telegram-stack-retirement.md). Proof surface:
 `tests/gateway/test_startup_resume_admission.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and

@@ -30,28 +30,7 @@ def test_metadata_forwarding_preserves_legacy_and_scoped_signatures(args, scoped
     assert calls == [(args, metadata if scoped else None)]
 
 
-@pytest.mark.asyncio
-async def test_telegram_approval_button_resumes_its_topic(monkeypatch):
-    """The real callback must undo the topic pause installed by the turn runner."""
-    a = _make_adapter()
-    md = {"thread_id": "11"}
-    a.pause_typing_for_chat("123", metadata=md)
-    a._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7))
-    result = await a.send_exec_approval("123", "pwd", "telegram:123:11", metadata=md)
-    assert result.success
-    approval_id = next(iter(a._approval_state))
-    a.pause_typing_for_chat("123", metadata={"thread_id": "22"})
-    a._callback_authorized = AsyncMock(return_value=True)
-    a._edit_md_quiet = AsyncMock()
-    monkeypatch.setattr("tools.approval.resolve_gateway_approval", lambda *args: 1)
-    query = SimpleNamespace(from_user=SimpleNamespace(first_name="Tester", id=1),
-                            answer=AsyncMock(),
-                            message=SimpleNamespace(chat_id=123, message_thread_id=11,
-                                                    chat=SimpleNamespace(type="supergroup")))
-    cb = a._callback_ctx(query)
-    await a._handle_exec_approval_callback(query, f"ea:once:{approval_id}", cb)
-    assert not a._typing_is_paused("123", md), a._typing_paused
-    assert a._typing_is_paused("123", {"thread_id": "22"})
+
 
 @pytest.mark.parametrize("platform,chat_type,thread_id", [
     (Platform.SLACK, "dm", "171.1"),
@@ -105,24 +84,7 @@ async def test_top_level_slack_typing_scope_is_independent_of_send_routing(reply
     a.pause_typing_for_chat(source.chat_id, metadata=prompt_typing)
     assert a._typing_is_paused(source.chat_id, initial), (initial, prompt_typing, a._typing_paused)
 
-@pytest.mark.asyncio
-async def test_scoped_telegram_pause_cancels_own_rearm_only():
-    a = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
-    a.send_typing = AsyncMock()
-    a._telegram_typing_retrigger_interval = 0.02
-    first, second = {"thread_id": "11"}, {"thread_id": "22"}
-    await a._retrigger_typing("123", first)
-    await a._retrigger_typing("123", second)
-    await asyncio.sleep(0)
-    await a._retrigger_typing("123", first)
-    await a._retrigger_typing("123", second)
-    a.pause_typing_for_chat("123", metadata=first)
-    # Wait for every re-arm still scheduled after the pause, not a wall-clock window.
-    pending = [task for task_map in a._typing_retrigger_task_maps() for task in task_map.values()]
-    await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 2)
-    calls = [c.kwargs["metadata"]["thread_id"] for c in a.send_typing.await_args_list]
-    assert calls == ["11", "22", "22"]
-    a._cancel_typing_retrigger("123")
+
 
 @pytest.mark.asyncio
 async def test_late_interim_reassert_cannot_restore_status_after_final(monkeypatch):

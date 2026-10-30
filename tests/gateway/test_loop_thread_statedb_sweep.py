@@ -130,52 +130,6 @@ async def test_hygiene_activity_stamp_persists_off_the_loop():
     assert touch.off_loop(loop_thread)
 
 
-@pytest.mark.asyncio
-async def test_telegram_control_send_prunes_stale_topic_off_the_loop(monkeypatch):
-    from telegram.error import BadRequest
-
-    from plugins.platforms.telegram.adapter import TelegramAdapter
-
-    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
-    adapter._bot = SimpleNamespace(send_message=AsyncMock(side_effect=[
-        BadRequest("Message thread not found"), SimpleNamespace(message_id=7)]))
-    prune = _Probe()
-    monkeypatch.setattr(adapter, "_prune_stale_dm_topic_binding", prune)
-    loop_thread = _arm()
-    sent = await adapter._send_message_with_thread_fallback(chat_id="123", text="x", message_thread_id=9)
-    assert sent.message_id == 7
-    assert prune.off_loop(loop_thread)
-
-
-@pytest.mark.asyncio
-async def test_topic_retire_request_reads_binding_off_the_loop():
-    from gateway.telegram_retire import request
-    from gateway.telegram_topic_sessions import TopicRequestError
-
-    peek = _Probe(None)
-    runner = SimpleNamespace(
-        _session_db=SimpleNamespace(get_meta=AsyncMock(return_value=None)),
-        session_store=SimpleNamespace(peek_session_id=peek),
-        _session_key_for_source=lambda source: "agent:main:telegram:dm:123:9",
-    )
-    loop_thread = _arm()
-    with pytest.raises(TopicRequestError):
-        await request(runner, _source(thread_id="9"))
-    assert peek.off_loop(loop_thread)
-
-
-@pytest.mark.asyncio
-async def test_topic_existence_check_reads_routing_off_the_loop():
-    from gateway.telegram_topic_sessions import _topic_exists
-
-    peek = _Probe("sess")
-    runner = SimpleNamespace(
-        _session_db=None, session_store=SimpleNamespace(peek_session_id=peek),
-        _session_key_for_source=lambda source: "k",
-    )
-    loop_thread = _arm()
-    assert await _topic_exists(runner, _source(thread_id="9"), "9") is True
-    assert peek.off_loop(loop_thread)
 
 
 @pytest.mark.asyncio
@@ -199,25 +153,6 @@ async def test_slack_thread_hydration_reads_and_advances_watermark_off_the_loop(
     assert set_mark.off_loop(loop_thread)
 
 
-@pytest.mark.asyncio
-async def test_delivery_validates_automation_topic_owner_off_the_loop(tmp_path):
-    from gateway.delivery import DeliveryRouter, DeliveryTarget
-
-    owner = _Probe()
-
-    async def send(*_args, **_kwargs):
-        return SimpleNamespace(success=True, message_id="1", error=None)
-
-    adapter = SimpleNamespace(ensure_existing_telegram_topic_owner=owner, send=send)
-    router = DeliveryRouter(GatewayConfig(sessions_dir=tmp_path), adapters={Platform.TELEGRAM: adapter})
-    target = DeliveryTarget(platform=Platform.TELEGRAM, chat_id="2027045491", thread_id="150")
-    loop_thread = _arm()
-    with pytest.raises(RuntimeError, match="telegram_reply_to_message_id"):
-        # The numeric private-topic send then refuses for want of a reply anchor; the owner
-        # check before it is the step under test.
-        await router._deliver_to_platform(target, "body", metadata={"job_id": "j1"})
-    assert owner.off_loop(loop_thread)
-    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

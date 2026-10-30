@@ -287,13 +287,6 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   open macOS installer/product-app ownership issue tracked in #125245; that
   runtime packaging change is separate from this proof-boundary repair.
 
-## Media send checks flood cooldown after chat lock acquisition
-
-- Fork patch identity: `telegram-media-flood-under-lock`.
-- A media send checked the shared flood cooldown before entering the per-chat send lock. When it queued behind a text send that armed a 120-second window, it later acquired the lock and uploaded anyway. Media sends now recheck the cooldown inside the serialization boundary before the API call and before the topic-anchor retry.
-- Guard: `tests/gateway/test_telegram_flood_coherence.py`
-  (`test_media_queued_behind_send_lock_rechecks_flood_cooldown`).
-
 ## Hindsight session lifecycle loses bank isolation, buffered turns, and recall scope
 
 - Fork patch identity: `hindsight-session-lifecycle`.
@@ -342,25 +335,6 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Guard: `tests/plugins/memory/test_hindsight_provider.py`
   (`test_capability_cache_does_not_leak_between_tests_first`/`_second`; `_stop_retain_writers` fails
   a test whose writer does not stop).
-
-## Telegram album flood refusal read as a permanent failure
-
-- Fork patch identity: `telegram-album-flood-contract`.
-- `send_multiple_images()` caught a media-group flood refusal (local or platform) in its generic
-  handler, fell back to per-image sends that were refused again, and returned
-  `all images failed to send` with no `retry_after`, so the caller saw a permanent failure. The album
-  path now arms the per-chat window, skips the futile fallback, and answers a wholly undelivered album
-  with `flood_control:<s>`, using the longer of the window and the platform's own remaining deadline
-  (the window caps at 300s, so a multi-hour penalty still reaches the ledger intact). Every refusal
-  records that deadline per chat, so per-image fallback and animation refusals report it too. `_telegram_retry_after()` also honours a
-  `timedelta` `retry_after` (PTB_TIMEDELTA) instead of shrinking it to one second.
-- Guard: `tests/gateway/test_telegram_flood_coherence.py`
-  (`test_album_inside_an_armed_window_returns_the_flood_contract`,
-  `test_album_refused_by_the_platform_returns_the_flood_contract`,
-  `test_timedelta_retry_after_keeps_the_full_penalty`,
-  `test_album_reports_the_platform_penalty_beyond_the_local_window_cap`,
-  `test_album_fallback_route_reports_the_platform_penalty`,
-  `test_animation_only_album_reports_the_platform_penalty`).
 
 ## Update notice held or mislabelled at completion
 
@@ -416,20 +390,6 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `TestRetainRetry`, including `test_queued_jobs_do_not_bypass_the_retry_delay` and
   `test_prefetch_barrier_waits_for_a_pending_retry`).
 
-## Telegram legacy links lost titled or angle-bracket destinations
-
-- Fork patch identity: `telegram-link-targets`.
-- The unsupported-link scrubber parses CommonMark destinations (`[t](url "Title")`, `[t](<url>)`) with
-  `_markdown_link_target()` and keeps such links, but the legacy MarkdownV2 converters in
-  `format_message()` re-validated the raw group: an ordinary link with a title or angle brackets lost
-  its URL and became plain text, and an explicit numeric citation shipped the title inside the Telegram
-  URL. Both converters now validate and emit the parsed destination, and a citation with an unsupported
-  target degrades to its number.
-- Guard: `tests/gateway/test_telegram_unsupported_link_targets.py`
-  (`test_link_with_title_keeps_its_url`, `test_angle_bracket_destination_keeps_its_url`,
-  `test_citation_with_title_does_not_put_the_title_in_the_url`,
-  `test_citation_with_unsupported_target_degrades_to_its_number`).
-
 ## Hindsight timed-out retains resent and empty recall_types overridden
 
 - Fork patch identity: `hindsight-session-lifecycle`.
@@ -470,16 +430,6 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   parent equal to the session itself is now treated as no parent, in `initialize()` and on switch.
 - Regression coverage: `test_hindsight_provider.py`
   (`test_in_place_compaction_keeps_lineage_tags_stable`).
-
-## Telegram short media flood retry let other traffic into the penalty
-
-- Fork patch identity: `telegram-media-flood-under-lock`.
-- A media upload refused with a short `retry_after` (within the 5s inline cap) slept and retried in place,
-  but the sleep ran after the per-chat send lock was released and armed no shared window, so a concurrent
-  text send, edit or typing request could reach Telegram inside the penalty and lengthen it. The retry now
-  holds the chat's send lock across its wait and arms the shared window for it, releasing only its own
-  window before the retry.
-- Regression coverage: `test_telegram_flood_coherence.py::test_short_media_flood_wait_holds_other_outbound_traffic`.
 
 ## Desktop orphan reap crosses isolated gateway homes
 

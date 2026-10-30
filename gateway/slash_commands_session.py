@@ -873,9 +873,6 @@ class GatewaySessionCommandsMixin:
         args = event.get_command_args().strip()
         if args.lower() in {"help", "?", "-h", "--help"}:
             return self._telegram_topic_help_text()
-        command, _, command_args = args.partition(" ")
-        if command.lower() == "edit":
-            return await self._edit_telegram_topic_metadata(event, command_args.strip())
         if args.lower() in {"off", "disable", "stop"}:
             return await self._disable_telegram_topic_mode_for_chat(source)
         if args:
@@ -925,54 +922,7 @@ class GatewaySessionCommandsMixin:
         return t("gateway.topic.bound_status", label=title or t("gateway.topic.untitled_session"),
                  session_id=session_id)
 
-    async def _edit_telegram_topic_metadata(self, event: MessageEvent, raw_args: str) -> str:
-        """Explicitly edit the current Telegram topic's visible name and/or native icon."""
-        source = event.source
-        if not source.thread_id:
-            return "Run /topic edit inside a Telegram topic, not the root chat."
-        try:
-            parts = shlex.split(raw_args)
-        except ValueError as exc:
-            return f"Invalid /topic edit syntax: {exc}"
-        title = None
-        icon = None
-        i = 0
-        while i < len(parts):
-            flag = parts[i]
-            if flag in {"--title", "-t"}:
-                if i + 1 >= len(parts):
-                    return "Usage: /topic edit [--title \"Name\"] [--icon EMOJI]"
-                title = parts[i + 1].strip()
-                i += 2
-            elif flag in {"--icon", "-i"}:
-                if i + 1 >= len(parts):
-                    return "Usage: /topic edit [--title \"Name\"] [--icon EMOJI]"
-                icon = parts[i + 1].strip()
-                i += 2
-            else:
-                return "Usage: /topic edit [--title \"Name\"] [--icon EMOJI]"
-        if not title and not icon:
-            return "Usage: /topic edit [--title \"Name\"] [--icon EMOJI]"
-        from gateway.telegram_topic_sessions import TopicRequestError, set_topic_appearance, topic_icon_id
-        adapter = self._delivery_adapter_for(source)
-        if adapter is None or not callable(getattr(adapter, "rename_dm_topic", None)):
-            return "Telegram topic editing is unavailable right now."
-        # An icon-only edit omits the name, so Telegram keeps the visible one: the saved session
-        # title can be stale after an earlier `--title` edit, and resending it reverted that rename.
-        if title:
-            title = self._sanitize_telegram_topic_title(title)
-        try:
-            icon_id = await topic_icon_id(adapter, icon) if icon else None
-            await set_topic_appearance(self, source, str(source.thread_id), name=title, icon_emoji=icon or "", icon_id=icon_id)
-        except TopicRequestError as exc:
-            return str(exc)
-        except Exception as exc:
-            logger.warning("Telegram topic edit failed: %s", exc)
-            return "Telegram rejected the topic edit."
-        if not title:
-            return f"Topic icon updated: {icon}"
-        return f"Topic updated: {title}" + (f" {icon}" if icon else "")
-
+    # ------------------------------------------------------------------ /save, /title
 
     async def _handle_save_command(self, event: MessageEvent) -> str:
         """Handle /save — export the current session and send it as a document."""
@@ -1066,34 +1016,17 @@ class GatewaySessionCommandsMixin:
             return t("gateway.shared.warn_passthrough", error=e)
         if not sanitized:
             return t("gateway.title.empty_after_clean")
-        topic_lane = await asyncio.to_thread(self._is_telegram_topic_lane, source)
         try:
-            if topic_lane and hasattr(self._session_db, "set_session_title_in_lineage"):
-                stored_title = await self._session_db.set_session_title_in_lineage(session_id, sanitized)
-                if stored_title != sanitized:
-                    logger.info("Telegram topic title %r reserved internal lineage alias %r", sanitized, stored_title)
-            elif not await self._session_db.set_session_title(session_id, sanitized):
+            if not await self._session_db.set_session_title(session_id, sanitized):
                 return t("gateway.title.not_found")
-            else:
-                stored_title = sanitized
         except ValueError as e:
             return t("gateway.shared.warn_passthrough", error=e)
-        reply = t("gateway.title.set_to", title=stored_title)
-        if topic_lane:
-            # An explicit request needs the Bot API result before we claim the visible name changed.
-            renamed = await self._rename_telegram_topic_explicit(
-                source, session_id, sanitized, session_key=session_entry.session_key)
-            if not renamed:
-                return reply + "\nTelegram topic rename failed; the session title was stored."
-            if stored_title != sanitized:
-                return reply + f"\nTelegram topic name: **{sanitized}**."
-            return reply
-        # Other paths keep their existing best-effort scheduling behavior.
+        # Mirror the title onto the Telegram forum topic name (auto titles already do this).
         try:
             await asyncio.to_thread(self._schedule_telegram_topic_title_rename, source, session_id, sanitized)
         except Exception:
             logger.debug("Failed to rename Telegram topic from /title", exc_info=True)
-        return reply
+        return t("gateway.title.set_to", title=sanitized)
 
     # -------------------------------------------------------------- /resume, /sessions
 

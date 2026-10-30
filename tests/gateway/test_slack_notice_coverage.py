@@ -17,6 +17,13 @@ from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource, SessionStore, build_session_key
 
 
+@pytest.fixture(autouse=True)
+def _telegram_approval_surface(monkeypatch):
+    """No shipped adapter renders Approve/Deny cards; these tests drive the retained request
+    machinery as if the Telegram source still had one."""
+    monkeypatch.setattr("hermes_cli.session_controls._APPROVABLE_SOURCES", frozenset({"telegram"}))
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override

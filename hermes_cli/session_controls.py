@@ -964,8 +964,9 @@ def _approved_authority(authority: Optional[Dict[str, Any]]):
         _CURRENT_AUTHORITY.reset(token)
 
 
-# Platforms whose adapter renders Approve/Deny buttons for ``send_control_request``.
-_APPROVABLE_SOURCES = frozenset({"telegram"})
+# Platforms whose adapter renders Approve/Deny buttons for ``send_control_request``. No adapter
+# does, so a request that needs approval fails as ``target_unapprovable``.
+_APPROVABLE_SOURCES: frozenset[str] = frozenset()
 
 
 def _session_source(session_id: str) -> str:

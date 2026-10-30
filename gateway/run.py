@@ -1083,8 +1083,7 @@ def resolve_restart_resume_policy(config: Any, adapter: Any) -> str:
     return str(configured) if configured is not None else "ask"
 
 
-# Opening of every resume note. Classifiers (Telegram trigger budget, e2e fakes) import this rather
-# than copying the wording.
+# Opening of every resume note. Classifiers (e2e fakes) import this rather than copying the wording.
 RESUME_NOTE_PREFIX = "[System note: Resume the pending turn."
 
 

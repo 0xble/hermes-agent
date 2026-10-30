@@ -49,8 +49,6 @@ class GatewaySessionWatchersMixin:
 
     async def _session_housekeeping(self) -> None:
         """Idle/pressure agent-cache sweeps plus the hourly SessionStore prune."""
-        from gateway.telegram_retire import resume_all
-        await resume_all(self)
         try:
             if evicted := self._sweep_idle_cached_agents():
                 logger.info("Agent cache idle sweep: evicted %d agent(s)", evicted)

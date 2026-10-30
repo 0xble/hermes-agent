@@ -618,15 +618,7 @@ class GatewayBusySessionMixin:
                                              platform=event.source.platform, style=getattr(content, "notice_style", None)),
                 )
 
-        send = labelled_send()
-        # On the platform's update consumer, never wait out the chat's outbound budget: every later
-        # update (and the next poll) would queue behind this acknowledgement.
-        from gateway.platforms.base import in_ingress_consumer
-        spawn = getattr(adapter, "spawn_ingress_reply", None)
-        if in_ingress_consumer() and callable(spawn):
-            spawn(send, label="busy reply")
-            return
-        await send
+        await labelled_send()
 
     def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> bool:
         """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing.
@@ -1275,7 +1267,7 @@ class GatewayBusySessionMixin:
         "status", "context", "restart", "approve", "deny", "pause", "discard", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
-        "title", "retire", "attend", "fast", "reasoning", "usage", "whoami",
+        "title", "attend", "fast", "reasoning", "usage", "whoami",
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (

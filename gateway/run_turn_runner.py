@@ -289,9 +289,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         tool_progress_sent: bool = False
 
     # Default minimum seconds between progress edits. An adapter may raise it with
-    # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
-    # plugins/platforms/telegram/chat_budget.EDIT_FLOOR_SECS): a producer faster than the
-    # transport delivers no extra updates, it only parks edits inside the chat's send lock.
+    # ``PROGRESS_EDIT_INTERVAL``: a producer faster than the transport delivers no extra
+    # updates, it only parks edits inside the chat's send lock.
     _PROGRESS_EDIT_INTERVAL = 3.0
 
     @classmethod

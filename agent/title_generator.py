@@ -134,7 +134,6 @@ _TITLE_PROMPT_TEMPLATE = (
     "__LINK_RULE__\n"
     "__INSTRUCTIONS__\n"
     "__AVOID_TITLES__\n"
-    "__ICON_RULE__\n"
     "__EXAMPLES__"
     f'Too vague: {{"title": "{_PROMPT_VAGUE_EXAMPLE}"}}\n'
     'Too long: {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}\n\n'
@@ -167,11 +166,10 @@ _TASK_TITLE_PROMPT_TEMPLATE = (
     "Drop qualifiers before the verb or main object, and never cut a word short.\n"
     "- No emoji, trailing punctuation, quotes, tool names, or Title: prefix.\n"
     "- Never answer the message. Name it. If the task or subject is unclear, set abstain to true and title empty.\n"
-    "__LANGUAGE_RULE__\n__LINK_RULE__\n__INSTRUCTIONS__\n__AVOID_TITLES__\n__ICON_RULE__\n__EXAMPLES__"
+    "__LANGUAGE_RULE__\n__LINK_RULE__\n__INSTRUCTIONS__\n__AVOID_TITLES__\n__EXAMPLES__"
     "__REPLY_RULE__"
 )
 _REPLY_TITLE_ONLY = 'Reply with JSON only: {"title": "...", "abstain": false}'
-_REPLY_TITLE_AND_ICON = 'Reply with JSON only: {"title": "...", "abstain": false, "icons": ["...", "..."]}'
 
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
@@ -186,16 +184,6 @@ _TITLE_RESPONSE_FORMAT = {
         "properties": {"title": {"type": "string"}, "abstain": {"type": "boolean"}},
         "required": ["title", "abstain"], "additionalProperties": False}},
 }
-# With icons requested, a strict title-only schema would make enforcing providers drop the icons field.
-_TITLE_AND_ICONS_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {"name": "session_title_and_icons", "strict": True, "schema": {
-        "type": "object",
-        "properties": {"title": {"type": "string"}, "abstain": {"type": "boolean"},
-                       "icons": {"type": "array", "items": {"type": "string"}}},
-        "required": ["title", "abstain", "icons"], "additionalProperties": False}},
-}
-
 # Control-tag wrappers around machine-authored content inside a nominal "user" message (Codex CLI's
 # RECOGNIZED_CONTROL_WRAPPERS): stripped, titling continues on what remains.
 _CONTROL_WRAPPERS = tuple(
@@ -255,7 +243,7 @@ def _title_preferences() -> dict:
             "instructions": instructions, "name_aliases": aliases}
 
 
-def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = None, icon_rule: str = "",
+def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = None,
                   link_rule: str = "", title_style: str = "noun") -> str:
     prefs = prefs or _title_preferences()
     case_rule = ("Title case: capitalize the principal words; this is the only capitalization rule."
@@ -278,9 +266,8 @@ def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = 
         .replace("__LINK_RULE__", link_rule) \
         .replace("__INSTRUCTIONS__", instruction_block) \
         .replace("__AVOID_TITLES__", avoid_block) \
-        .replace("__ICON_RULE__", icon_rule) \
         .replace("__EXAMPLES__", examples) \
-        .replace("__REPLY_RULE__", _REPLY_TITLE_AND_ICON if icon_rule else _REPLY_TITLE_ONLY)
+        .replace("__REPLY_RULE__", _REPLY_TITLE_ONLY)
 
 
 def _restore_name_aliases(title: str, aliases: dict) -> str:
@@ -695,14 +682,13 @@ def _notify_title(
     label: str,
     *,
     display_title: Optional[str] = None,
-    icon: Optional[str] = None,
 ) -> None:
-    """Notify title consumers, preserving compatibility with two-argument callbacks. Keyword
-    extras (``display_title``, ``icon``) are passed only when the callback's signature binds them."""
+    """Notify title consumers, preserving compatibility with two-argument callbacks. The keyword
+    extra ``display_title`` is passed only when the callback's signature binds it."""
     if title_callback is None:
         return
     try:
-        extras = {k: v for k, v in (("display_title", display_title), ("icon", icon)) if v is not None}
+        extras = {"display_title": display_title} if display_title is not None else {}
         if not extras:
             title_callback(title, source)
             return
@@ -789,10 +775,6 @@ def generate_title(
     runtime_validator: Optional[RuntimeValidator] = None,
     avoid_titles=None,
     recent_titles=None,
-    icon_options=None,
-    recent_icons=None,
-    icon_instructions: str = "",
-    icon_callback: Optional[Callable[[Optional[str], str], None]] = None,
     title_preview: str | None = None,
     link_context: str | None = None,
     reply_excerpt: str | None = None,
@@ -824,22 +806,10 @@ def generate_title(
         return None
     language = _title_language()
     prefs = _title_preferences()
-    icon_allowed = list(icon_options or [])
-    icon_rule = ""
-    if icon_allowed:
-        from agent.topic_icons import DEFAULT_ICON_GUIDANCE, allowed_icon_list
-        # The whole catalog every time: withholding recently used icons made the best match
-        # unavailable and forced unrelated picks. Ranked alternatives let code skip recently used
-        # icons without ever landing on one the model did not judge relevant.
-        icon_rule = ("- Also pick icons for the topic from exactly this list: "
-                     f"{' '.join(allowed_icon_list(icon_allowed))}")
-        icon_rule += f" Icon guidance: {(str(icon_instructions or '').strip() or DEFAULT_ICON_GUIDANCE)[:1000]}"
-        icon_rule += (" Return up to 3 icons ranked best fit first; after the best one, add the next icons that"
-                      " also depict this topic's subject, skipping any that would not. The icons must not change the title.")
     has_link_context = bool(isinstance(link_context, str) and link_context.strip()
                             and not (isinstance(title_preview, str) and title_preview.strip()))
     prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs,
-                           icon_rule=icon_rule, link_rule=_LINK_CONTEXT_RULE if has_link_context else "",
+                           link_rule=_LINK_CONTEXT_RULE if has_link_context else "",
                            title_style=title_style)
     try:
         # Use the provider's default temperature instead of forcing 0.3.
@@ -856,7 +826,7 @@ def generate_title(
             # replies that would have been garbage anyway. temperature=None: omitted from the wire so
             # default-only reasoning models accept the first request (#72351).
             max_tokens=TITLE_MAX_TOKENS, temperature=None, timeout=timeout, main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_AND_ICONS_RESPONSE_FORMAT if icon_allowed else _TITLE_RESPONSE_FORMAT},
+            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
             # The module contract above promises thinking-disabled operation,
             # but nothing enforced it: with the aux default reasoning_effort
             # "" (provider default), Gemini enables internal thinking and
@@ -872,35 +842,12 @@ def generate_title(
             return None
         raw_content = getattr(getattr(choice, "message", None), "content", "") or ""
         # Normalize the visible answer before any structured extraction,
-        # including the abstention and combined title/icon paths.
+        # including the abstention path.
         from agent.agent_runtime_helpers import strip_think_blocks
         raw_content = strip_think_blocks(None, str(raw_content)).strip()
-        payload = None
-        if icon_allowed:
-            with suppress(Exception):
-                candidate = str(raw_content).strip()
-                fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
-                payload = json.loads(fence.group(1) if fence else candidate)
-
         if _extract_json_title(str(raw_content)) == "":
             return ""
-        title_value = payload.get("title") if isinstance(payload, dict) else None
-        title = _clean_title(_extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message))
-        if icon_allowed and icon_callback is not None:
-            from agent.topic_icons import choose_topic_icon_deterministic, pick_ranked_icon, validate_ranked_icons
-            proposed = None
-            if isinstance(payload, dict):
-                # "icon" is the pre-ranking single-pick shape; a model may still answer that way.
-                proposed = payload.get("icons") if payload.get("icons") else payload.get("icon")
-            ranked = validate_ranked_icons(proposed, icon_allowed)
-            icon = pick_ranked_icon(ranked, recent_icons)
-            icon_source = "model" if icon == (ranked[0] if ranked else None) else "model-alternate"
-            if icon is None:
-                icon = choose_topic_icon_deterministic(title or "", user_snippet, icon_allowed, recent_icons)
-                icon_source = "keyword" if icon else "none"
-            logger.info("Topic icon %s via %s (model proposed %r)", icon, icon_source, proposed)
-            with suppress(Exception):
-                icon_callback(icon, "llm" if title else "fallback")
+        title = _clean_title(_extract_title_text(raw_content) or _title_from_reasoning(choice.message))
         if title is None or not any(char.isalnum() for char in title):
             return None
         title = _restore_name_aliases(title, prefs["name_aliases"])
@@ -924,52 +871,6 @@ def generate_title(
         logger.warning("Title generation failed: %s", e)
         logger.debug("Title generation traceback", exc_info=True)
         _report_failure(failure_callback, e, "Title generation")
-        return None
-
-
-_ICON_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {"name": "topic_icon", "strict": True, "schema": {
-        "type": "object", "properties": {"icon": {"type": "string"}}, "required": ["icon"], "additionalProperties": False}},
-}
-
-
-def pick_topic_icon(title: str, icon_options, *, instructions: str = "", timeout: Optional[float] = None) -> Optional[str]:
-    """Model-chosen icon for a title the user supplied (explicit ``/title``), or None; never raises.
-
-    Same aux task and guidance as the combined title+icon call, minus the title: the user already named it.
-    """
-    allowed = list(icon_options or [])
-    title = str(title or "").strip()
-    if not allowed or not title:
-        return None
-    from agent.topic_icons import DEFAULT_ICON_GUIDANCE, allowed_icon_list, validate_model_icon
-    guidance = (str(instructions or "").strip() or DEFAULT_ICON_GUIDANCE)[:1000]
-    prompt = (
-        "You pick the icon for a chat topic from its title.\n"
-        f"Choose exactly one icon from this list: {' '.join(allowed_icon_list(allowed))}\n"
-        f"Icon guidance: {guidance}\n"
-        'Reply with JSON only: {"icon": "..."}'
-    )
-    try:
-        response = call_llm(
-            task="title_generation",
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": title[:MAX_TITLE_INPUT_CHARS]}],
-            max_tokens=TITLE_MAX_TOKENS, temperature=None, timeout=timeout,
-            extra_body={"response_format": _ICON_RESPONSE_FORMAT}, reasoning_config={"enabled": False},
-        )
-        raw = str(getattr(response.choices[0].message, "content", "") or "").strip()
-        fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
-        raw = fence.group(1).strip() if fence else raw
-        proposed: Any = raw
-        with suppress(ValueError, TypeError):
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                proposed = parsed.get("icon")
-        return validate_model_icon(proposed, allowed)
-    except Exception as e:
-        logger.warning("Topic icon selection failed: %s", e)
-        logger.debug("Topic icon selection traceback", exc_info=True)
         return None
 
 
@@ -1064,7 +965,6 @@ def auto_title_session(
     main_runtime: dict | None = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
-    icon_context: Optional[dict] = None,
     title_preview: str | None = None,
     reply_excerpt: str | None = None,
     conversation_history: Optional[list] = None,
@@ -1093,14 +993,6 @@ def auto_title_session(
             list_recent = getattr(session_db, "list_recent_session_titles", None)
             if callable(list_recent):
                 recent_titles = list_recent(exclude_session_id=session_id, limit=20)
-        chosen_icon: list = []
-        icon_kwargs: dict = {}
-        if isinstance(icon_context, dict) and icon_context.get("options"):
-            icon_kwargs = dict(
-                icon_options=icon_context.get("options"), recent_icons=icon_context.get("recent"),
-                icon_instructions=str(icon_context.get("instructions") or ""),
-                icon_callback=lambda icon, _how: chosen_icon.append(icon),
-            )
         # The three-turn model budget does not make a rejected placeholder final.
         # Later user turns can still supply a usable literal subject without more I/O.
         hold_until_reply = _hold_until_reply_enabled()
@@ -1112,12 +1004,10 @@ def auto_title_session(
             if reply_excerpt is None and hold_until_reply:
                 reply_excerpt = _latest_assistant_excerpt(conversation_history)
             link_context = _title_link_context(user_message, title_preview)
-            if title_style != "noun":
-                icon_kwargs["title_style"] = title_style
             title = generate_title(
                 user_message, failure_callback=failure_callback, main_runtime=main_runtime,
                 runtime_validator=runtime_validator, recent_titles=recent_titles, title_preview=title_preview,
-                link_context=link_context, reply_excerpt=reply_excerpt, **icon_kwargs,
+                link_context=link_context, reply_excerpt=reply_excerpt, title_style=title_style,
             )
         source = "llm"
         # The prompt's recent-name sample is not a uniqueness check: older topics still exist.
@@ -1137,7 +1027,6 @@ def auto_title_session(
             # The final decision must outrank the instant derived placeholder
             # and stop later upgrades. Existing CAS still gives /title priority.
             source = "llm" if terminal_fallback else "derived"
-            chosen_icon.clear()
         if title and not terminal_fallback and _is_provisional_greeting_title(title):
             source = "derived"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
@@ -1160,7 +1049,6 @@ def auto_title_session(
             logger.debug("Auto-generated session title: %s", persisted)
             _notify_title(
                 title_callback, persisted, source, "Auto-title", display_title=persisted,
-                icon=(chosen_icon[0] if chosen_icon and source == "llm" else None),
             )
     except Exception as e:
         # WARNING so operators see it in agent.log; names the likely cause.
@@ -1276,7 +1164,6 @@ def maybe_auto_title(
     main_runtime: dict | None = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
-    icon_context: dict | None = None,
     title_preview: str | None = None,
     title_style: str = "noun",
 ) -> Optional[threading.Thread]:
@@ -1331,7 +1218,7 @@ def maybe_auto_title(
     upgrade = spawn_context_thread(
         auto_title_session, name="auto-title",
         args=(session_db, session_id, user_message),
-        kwargs={**upgrade_kwargs, "icon_context": icon_context},
+        kwargs=upgrade_kwargs,
     )
     # A self-hosted endpoint still waits for the turn. Otherwise only an opener that names no
     # subject waits, so a clear request is titled immediately and a link or image can use the reply.

@@ -151,20 +151,14 @@ class DeliveryTarget:
         return ":".join(p for p in parts if p)
 
 
-async def _ensure_named_dm_topic(
-    adapter: Any, chat_id: str, name: str, *, refresh: bool,
-    owner_key: Optional[str] = None, allow_parallel: bool = False,
-) -> str:
-    """Resolve a named Telegram private DM topic through its stable owner."""
+async def _ensure_named_dm_topic(adapter: Any, chat_id: str, name: str, *, refresh: bool) -> str:
+    """Create (or force-recreate) a named Telegram private DM topic; return its thread id."""
     verb, ensure_dm_topic = "refresh" if refresh else "create", getattr(adapter, "ensure_dm_topic", None)
     if ensure_dm_topic is None:
         raise RuntimeError(f"Telegram adapter cannot {verb} named private DM topics")
-    kwargs = {"force_create": True} if refresh else {}
-    if owner_key:
-        kwargs.update({"owner_key": owner_key, "allow_parallel": allow_parallel})
-    thread_id = await ensure_dm_topic(chat_id, name, **kwargs)
+    thread_id = await ensure_dm_topic(chat_id, name, **({"force_create": True} if refresh else {}))
     if not thread_id:
-        raise RuntimeError(f"Telegram adapter returned no thread for named topic {name!r}")
+        raise RuntimeError(f"Failed to {verb} Telegram private DM topic '{name}'")
     return str(thread_id)
 
 
@@ -305,33 +299,15 @@ class DeliveryRouter:
             send_metadata.update({k: v for k, v in (("user_id", home.user_id), ("scope_id", home.scope_id)) if v})
 
         # Caller-supplied thread routing always wins over target.thread_id.
-        named_topic: Optional[str] = None  # named topic requested for this send
-        topic_owner_key: Optional[str] = None
-        topic_allow_parallel = bool(send_metadata.get("telegram_topic_allow_parallel"))
-        if send_metadata.get("telegram_topic_owner_key"):
-            topic_owner_key = str(send_metadata["telegram_topic_owner_key"])
-        elif send_metadata.get("job_id"):
-            topic_owner_key = f"cron:{send_metadata['job_id']}"
+        named_topic: Optional[str] = None  # named Telegram private topic created for this send
         thread_id = target.thread_id
-        if (
-            thread_id and _looks_like_int(thread_id)
-            and target.platform == Platform.TELEGRAM
-            and looks_like_telegram_private_chat_id(target.chat_id)
-            and topic_owner_key and not topic_allow_parallel
-        ):
-            validate_owner = getattr(adapter, "ensure_existing_telegram_topic_owner", None)
-            if callable(validate_owner):
-                # The owner registry lives in state.db (claims are writes): keep it off the loop.
-                await asyncio.to_thread(validate_owner, target.chat_id, str(thread_id), topic_owner_key)
         if thread_id and not any(key in send_metadata for key in _THREAD_ROUTING_KEYS):
             send_metadata["thread_id"] = thread_id
             if target.platform == Platform.TELEGRAM and looks_like_telegram_private_chat_id(target.chat_id):
                 if not _looks_like_int(thread_id):
                     # Named topic: create via createForumTopic, use message_thread_id directly.
                     named_topic = thread_id
-                    send_metadata["thread_id"] = await _ensure_named_dm_topic(
-                        adapter, target.chat_id, thread_id, refresh=False,
-                        owner_key=topic_owner_key, allow_parallel=topic_allow_parallel)
+                    send_metadata["thread_id"] = await _ensure_named_dm_topic(adapter, target.chat_id, thread_id, refresh=False)
                     send_metadata["telegram_dm_topic_created_for_send"] = True
                 elif send_metadata.get("telegram_reply_to_message_id") is None:
                     # Legacy numeric private topic ids not created by this send path need a reply
@@ -348,15 +324,8 @@ class DeliveryRouter:
             error = _send_result_error(result)
             if retry or error is None or not named_topic or "thread not found" not in error.lower():
                 break
-            if topic_owner_key and not topic_allow_parallel:
-                mark_unresolved = getattr(adapter, "mark_telegram_topic_owner_unresolved", None)
-                if callable(mark_unresolved):
-                    mark_unresolved(target.chat_id, topic_owner_key, reason="remote_topic_unavailable")
-                break
-            # Legacy, unowned named topics may be recreated once; owned automation topics fail closed above.
-            send_metadata["thread_id"] = await _ensure_named_dm_topic(
-                adapter, target.chat_id, named_topic, refresh=True,
-                owner_key=topic_owner_key, allow_parallel=topic_allow_parallel)
+            # The named topic vanished under us: recreate it once and resend.
+            send_metadata["thread_id"] = await _ensure_named_dm_topic(adapter, target.chat_id, named_topic, refresh=True)
             send_metadata["telegram_dm_topic_created_for_send"] = True
         if error is not None:
             from gateway.platforms.base import BasePlatformAdapter

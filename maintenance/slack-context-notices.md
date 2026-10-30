@@ -73,10 +73,6 @@ working-default notice. Tests preserve diagnostic suppression, session isolation
 repeat-boundary deduplication, unchanged Telegram text, and full-size unmarked
 credentials, login, and model-access prompts.
 
-`tests/gateway/test_telegram_ingress_nonblocking.py` drives busy acknowledgements
-through the native ingress-consumer boundary with a real `MessageEvent` and
-`SessionSource`. Both unmarked and context-marked Telegram acknowledgements return
-before the outbound budget opens and retain the same text and metadata.
 `tests/gateway/test_restart_resume_admission_identity.py` uses native session states
 and the replay scheduler to verify each interrupted resume marker is admitted
 exactly once and reaches a successful terminal outcome. Do not replace the

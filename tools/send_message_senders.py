@@ -3,7 +3,6 @@
 from pm import install_hint
 import asyncio
 import contextlib
-import inspect
 import logging
 import os
 import re
@@ -69,17 +68,14 @@ _TELEGRAM_TRANSIENT_MARKERS = ("bad gateway", "502", "too many requests", "429",
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
-    """Retry delay in seconds, or None when final: honours a short ``retry_after`` (a long one is a
-    server penalty the durable flood store enforces, never slept off inline); timeouts are never
-    retried (the send may have gone through); 5xx/429 back off exponentially."""
+    """Retry delay in seconds, or None when final: honours ``retry_after``; timeouts are
+    never retried (the send may have gone through); 5xx/429 back off exponentially."""
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
         try:
-            wait = retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else float(retry_after)
+            return max(float(retry_after), 0.0)
         except (TypeError, ValueError):
             return 1.0
-        from plugins.platforms.telegram.adapter import _FLOOD_INLINE_WAIT_CAP_SECS
-        return max(wait, 0.0) if wait <= _FLOOD_INLINE_WAIT_CAP_SECS else None
     text = str(exc).lower()
     if "timed out" in text or "timeout" in text:
         return None
@@ -109,52 +105,21 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-def _standalone_telegram_rate_limiter():
-    """Per-chat budget for the standalone lane, tied to the profile's durable flood store: a chat
-    under a known server penalty is refused locally and a new ``retry_after`` is persisted, so this
-    lane (cron fallback, out-of-gateway sends) cannot extend a ban the gateway is waiting out."""
-    from hermes_constants import get_hermes_home
-    from plugins.platforms.telegram import flood_state
-    from plugins.platforms.telegram.chat_budget import ChatBudgetRateLimiter, ChatOutboundBudget
-    profile_dir = get_hermes_home()
-
-    def penalty_remaining(key: str) -> float | None:
-        try:
-            remaining = max(flood_state.remaining_seconds(profile_dir, key),
-                            flood_state.fallback_remaining_seconds(profile_dir, key))
-        except Exception:
-            logger.warning("send_message: could not read Telegram flood deadline for chat %s", key, exc_info=True)
-            return 60.0  # an unreadable deadline is not evidence the penalty expired
-        return remaining if remaining > 0 else None
-
-    def on_retry_after(key: str, wait: float) -> None:
-        flood_state.record_deadline(profile_dir, key, wait)
-
-    from plugins.platforms.telegram.daily_quota import DailyQuota
-    # One-shot lane: persist every call so the gateway's daily ledger sees this lane's volume.
-    daily = DailyQuota(soft_ceiling=None, call_soft_ceiling=None, profile_dir=profile_dir, flush_interval=0.0)
-    return ChatBudgetRateLimiter(ChatOutboundBudget(), penalty_remaining=penalty_remaining,
-                                 on_retry_after=on_retry_after, daily=daily)
-
-
 def _telegram_bot(token):
-    """Metered bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
+    """Bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
     blocked); falls back to a direct connection."""
     from telegram import Bot
-    from plugins.platforms.telegram.chat_budget import MeteredBot
-    limiter = _standalone_telegram_rate_limiter()
     try:
         from gateway.platforms.base import resolve_proxy_url
         proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         if not proxy:
-            return MeteredBot(Bot(token=token), limiter)
+            return Bot(token=token)
         from telegram.request import HTTPXRequest
         logger.info("send_message: standalone Telegram send routed through proxy %s", proxy)
-        return MeteredBot(Bot(token=token, request=HTTPXRequest(proxy=proxy),
-                              get_updates_request=HTTPXRequest(proxy=proxy)), limiter)
+        return Bot(token=token, request=HTTPXRequest(proxy=proxy), get_updates_request=HTTPXRequest(proxy=proxy))
     except Exception as proxy_err:
         logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", proxy_err)
-    return MeteredBot(Bot(token=token), limiter)
+    return Bot(token=token)
 
 
 def _telegram_thread_kwargs(thread_id):
@@ -291,122 +256,18 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
-async def _send_telegram_copy_document(token, chat_id, message, thread_id=None):
-    """Send an oversized copy block as one UTF-8 ``copy.txt`` document."""
-    import io
-    from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
-    bot = _telegram_bot(token)
-    doc = io.BytesIO(message.encode("utf-8"))
-    doc.name = "copy.txt"
-    msg = await bot.send_document(
-        chat_id=normalize_telegram_chat_id(chat_id), document=doc, filename="copy.txt",
-        **_telegram_thread_kwargs(thread_id))
-    return _success("telegram", chat_id, [], message_id=str(getattr(msg, "message_id", "")))
-
-
-def _telegram_rich_adapter(message, bot, rich_messages, allow_cjk_rich_messages=False):
-    """Return a lightweight adapter carrying the live rich eligibility rules."""
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+    """One-shot Telegram Bot API send; parse failures fall back to plain text."""
     try:
-        from gateway.config import _coerce_bool, normalize_telegram_rich_messages
-        mode = normalize_telegram_rich_messages(rich_messages)
-        if mode == "never" or not inspect.iscoroutinefunction(getattr(bot, "do_api_request", None)):
-            return None
-        from plugins.platforms.telegram.adapter import TelegramAdapter, _normalize_dollar_entities
-        adapter = TelegramAdapter.__new__(TelegramAdapter)
-        adapter._rich_message_mode = mode
-        adapter._rich_messages_enabled = True
-        adapter._allow_cjk_rich_messages = _coerce_bool(allow_cjk_rich_messages, default=False)
-        adapter._rich_send_disabled = False
-        adapter._bot = bot
-        return adapter if adapter._should_attempt_rich(_normalize_dollar_entities(message)) else None
-    except Exception as error:  # health: allow BLE001 -- Optional rich setup has not sent anything; legacy delivery remains safe.
-        logger.warning("Telegram rich adapter unavailable, falling back to legacy: %s", _sanitize_error_text(error))
-        return None
-
-
-async def _send_telegram_rich(bot, chat_id, message, thread_kwargs, *, disable_link_previews, adapter):
-    """Send one Rich Message, or return ``None`` for a safe legacy fallback.
-
-    A thread-not-found response is a permanent routing failure, so it mirrors
-    the legacy sender by retrying once without ``message_thread_id``. Unknown or
-    transient failures return an error without a second legacy send: the rich
-    request may already have reached Telegram.
-    """
-    adapter._disable_link_previews = disable_link_previews
-    payload = {**adapter._rich_payload_base(chat_id, message), **thread_kwargs}
-    flood_retried = False
-
-    while True:
-        try:
-            response = await bot.do_api_request("sendRichMessage", api_kwargs=dict(payload))
-            break
-        except Exception as error:  # health: allow BLE001 -- Bot API boundary returns sanitized errors; only definite rejection permits resend.
-            if not flood_retried and getattr(error, "retry_after", None) is not None:
-                delay = _telegram_retry_delay(error, 0)
-                if delay is not None:
-                    flood_retried = True
-                    logger.warning("Telegram rich send rate-limited, retrying once in %.1fs: %s",
-                                   delay, _sanitize_error_text(error))
-                    await asyncio.sleep(delay)
-                    continue
-            if _is_telegram_thread_not_found(error) and payload.get("message_thread_id") is not None:
-                logger.warning("Thread %s not found in rich Telegram send, retrying without message_thread_id",
-                               payload.pop("message_thread_id"))
-                thread_kwargs.pop("message_thread_id", None)
-                continue
-            if adapter._is_rich_fallback_error(error):
-                logger.warning("Telegram rich send rejected, falling back to legacy: %s", _sanitize_error_text(error))
-                return None
-            logger.warning("Telegram rich send failed (no legacy resend): %s", _sanitize_error_text(error))
-            return _error(f"Telegram rich send failed: {error}")
-
-    if isinstance(response, dict):
-        message_id = response.get("message_id")
-        if message_id is None:
-            message_id = (response.get("result") or {}).get("message_id")
-    else:
-        message_id = getattr(response, "message_id", None)
-    return _success("telegram", chat_id, [], message_id=str(message_id) if message_id is not None else None)
-
-
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False,
-                   copy_block=False, rich_messages=None, allow_cjk_rich_messages=False):
-    """One-shot Telegram Bot API send; Rich Messages precede the legacy text path."""
-    try:
-        media_files = media_files or []
-        if copy_block:
-            from gateway.platforms.base import utf16_len
-            if utf16_len(message) > 4096 and not media_files:
-                # One paste-ready body never splits: send it intact as a .txt document,
-                # matching the live adapter.
-                return await _send_telegram_copy_document(token, chat_id, message, thread_id)
+        formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
         from gateway.platforms.base import BasePlatformAdapter, utf16_len
         # Telegram accepts a numeric chat_id OR an @username string; never force-int.
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
+        media_files = media_files or []
         thread_kwargs = _telegram_thread_kwargs(thread_id)
-
-        # Rich Messages are text-only. Eligibility, normalization, and the 32,768-character
-        # cap intentionally mirror TelegramAdapter._should_attempt_rich().
-        if not media_files and not copy_block:
-            rich_adapter = _telegram_rich_adapter(
-                message, bot, rich_messages, allow_cjk_rich_messages=allow_cjk_rich_messages)
-            if rich_adapter is not None:
-                from plugins.platforms.telegram.adapter import _normalize_dollar_entities
-                rich_content = _normalize_dollar_entities(message)
-                rich_result = await _send_telegram_rich(
-                    bot, chat_id, rich_content, thread_kwargs,
-                    disable_link_previews=disable_link_previews, adapter=rich_adapter)
-                if rich_result is not None:
-                    return rich_result
-                # Permanent/capability rejection leaves the existing MarkdownV2 path in charge.
-
-        if copy_block:
-            formatted, send_parse_mode, _has_html = message, None, False
-        else:
-            formatted, send_parse_mode, _has_html = _telegram_format(message)
         # disable_web_page_preview is only valid for send_message, not media sends.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
         last_msg, warnings, _tg_caption = None, [], None
@@ -416,19 +277,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
-        # HTML keeps raw suffixes; MarkdownV2 adds 2 escapes and a possible fence-lift newline.
-        chunks = BasePlatformAdapter.truncate_message(
-            formatted, 4096, len_fn=utf16_len,
-            indicator_overhead=0 if _has_html else 3) if formatted.strip() else []
-        if len(chunks) > 1 and not _has_html:
-            # truncate_message appends a raw " (1/2)" suffix after format_message escaped the text;
-            # escape the MarkdownV2-special parentheses, as the live adapter does (#74004).
-            from plugins.platforms.telegram.adapter import _separate_chunk_indicator_from_fence
-            chunks = [
-                _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
-                for chunk in chunks
-            ]
-        for chunk in chunks:
+        for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
             last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):

@@ -1694,33 +1694,11 @@ class ExecApprovalPrompt:
         return [choice for _, choice, _ in self.actions]
 
 
-# The task currently running a platform's serial update consumer (PTB's update fetcher awaits each
-# handler before taking the next update, and Telegram's controlled poller does not poll again until
-# that batch drains). Ingress handlers check it so they never await outbound pacing on that task.
-_INGRESS_CONSUMER: "_contextvars.ContextVar[Optional[asyncio.Task]]" = _contextvars.ContextVar(
-    "gateway_ingress_consumer", default=None)
-
-
 # (obligation id, event, adapter) while send_final_ledgered awaits the send. Task-local, because
 # one adapter serves many sessions at once: the send's finally reads only its own turn's entry if
 # a cancel is delivered at the return, before the ledger write.
 _PENDING_LEDGER_SETTLEMENT: "_contextvars.ContextVar[Optional[tuple]]" = _contextvars.ContextVar(
     "gateway_pending_ledger_settlement", default=None)
-
-
-def ingress_consumer_scope() -> "_contextvars.Token":
-    """Mark the current task as the update consumer; reset with :func:`leave_ingress_consumer`."""
-    return _INGRESS_CONSUMER.set(asyncio.current_task())
-
-
-def leave_ingress_consumer(token: "_contextvars.Token") -> None:
-    _INGRESS_CONSUMER.reset(token)
-
-
-def in_ingress_consumer() -> bool:
-    """True only on the consumer task itself; tasks spawned from it inherit the variable, not the role."""
-    consumer = _INGRESS_CONSUMER.get()
-    return consumer is not None and consumer is asyncio.current_task()
 
 
 # Outbound class of the sends made in the current context. Unlabelled sends are finals, which a
@@ -3170,7 +3148,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """Send a session-control approval request; non-button adapters use text fallback."""
         return await self.send(
             chat_id=chat_id,
-            content=f"{text}\n\nRequest: {request_id} (approval requires the Telegram buttons; this adapter cannot render them.)",
+            content=f"{text}\n\nRequest: {request_id} (approval requires buttons this adapter cannot render.)",
             metadata=metadata,
         )
 
@@ -3925,18 +3903,14 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
-        ephemeral deletion — no session lifecycle (active-session bypass paths).
-
-        Called from a platform's update consumer, the command runs here but its reply is handed
-        to a background task: the send waits for the chat's outbound budget, and a serial consumer
-        awaiting it holds every later update (and the next poll) behind that wait."""
+        ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
         # The handler ran the command: that is this event's admission, whatever the reply's fate.
         # Scheduled command wakes (a /loop tick of /status) count their tick on this receipt.
         event._gateway_inline_command_handled = True
         event._gateway_accepted = True
-        from gateway.outbox import active_turn, bind_event_turn, restore_turn, run_turn_child
+        from gateway.outbox import bind_event_turn, restore_turn
         token = bind_event_turn(event)
         try:
             text, eph_ttl = self._unwrap_ephemeral(response)
@@ -3945,18 +3919,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             if log_cmd is not None:
                 logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
                             len(text), event.source.chat_id)
-
-            async def deliver() -> None:
-                result = await self._send_with_retry(
-                    chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta))
-                if eph_ttl > 0 and result.success and result.message_id:
-                    self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
-
-            if in_ingress_consumer():
-                self.spawn_ingress_reply(run_turn_child(deliver(), active_turn()), label="command reply")
-            else:
-                await deliver()
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(thread_meta))
+            if eph_ttl > 0 and result.success and result.message_id:
+                self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
         finally:
             restore_turn(token)
 
@@ -4134,48 +4101,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
-        # A completed reply to a deleted private Telegram topic cannot be repaired by
-        # formatting fallback: that keeps both the dead thread and its reply anchor.
-        # Never move interim output (or an ambiguous timeout) into the parent DM.
-        topic_meta = metadata if isinstance(metadata, dict) else {}
-        if (
-            self.platform == Platform.TELEGRAM
-            and topic_meta.get("notify") and not topic_meta.get("_interim_send")
-            and topic_meta.get("telegram_dm_topic_reply_fallback")
-            and not topic_meta.get("telegram_stale_topic_recovery")
-            and (topic_meta.get("thread_id") or topic_meta.get("message_thread_id"))
-            and not self._is_timeout_error(error_str)
-            and any(marker in " ".join(error_str.lower().split()) for marker in (
-                "thread not found", "topic deleted", "topic closed", "topic not found"))
-        ):
-            thread_id = topic_meta.get("thread_id") or topic_meta.get("message_thread_id")
-            mark_stale = getattr(self, "_mark_dm_topic_stale", None)
-            if callable(mark_stale):
-                mark_stale(chat_id, thread_id)
-            prune = getattr(self, "_prune_stale_dm_topic_binding", None)
-            if callable(prune):
-                # A state.db write: run it off the loop, still before the root-chat fallback send.
-                await asyncio.to_thread(prune, chat_id, thread_id, metadata=topic_meta)
-            root_meta = {key: value for key, value in topic_meta.items() if key not in {
-                "thread_id", "message_thread_id", "direct_messages_topic_id",
-                "telegram_direct_messages_topic_id", "telegram_reply_to_message_id",
-                "reply_to_message_id", "telegram_dm_topic_reply_fallback",
-                "telegram_dm_topic_created_for_send",
-            }}
-            root_meta["telegram_stale_topic_recovery"] = True
-            partial = self._is_partial_delivery(result)
-            if partial:
-                root_content = ("A response was partially delivered before its Telegram topic was deleted. "
-                                "The complete response remains in Hermes session history.")
-            elif topic_meta.get("copy_block"):
-                # A copy block moves to the root unchanged: a banner would break the exact text.
-                root_content = content
-            else:
-                root_content = "Recovered response from a deleted Telegram topic:\n\n" + content
-            logger.warning("[%s] Recovering completed reply from deleted Telegram topic chat=%s thread=%s",
-                           self.name, chat_id, thread_id)
-            return await self.send(chat_id=chat_id, content=root_content, reply_to=None, metadata=root_meta)
-
         # Non-network / post-retry formatting failure: try plain text as fallback. A
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
@@ -4536,21 +4461,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
-        # Retirement admission precedes busy/debounce queues. The runner repeats
-        # this check when draining prompts queued before retirement was requested.
-        runner = self.gateway_runner
-        if runner is not None and self.platform == Platform.TELEGRAM:
-            from gateway.telegram_retire import intercept
-            if self._is_sender_authorized(event.source.user_id, event.source.chat_type,
-                                          event.source.chat_id, thread_id=event.source.thread_id) is True:
-                notice = await intercept(runner, event)
-                if notice is not None:
-                    if notice:
-                        await self.send(str(event.source.chat_id), notice, metadata=_thread_metadata_for_event(event))
-                    event._gateway_accepted = True
-                    from gateway.telegram_retire import advance
-                    await advance(runner, event.source)
-                    return
         from gateway.session_ingress_burst import burst_gate
         behind_burst = await burst_gate(self, event, session_key)  # a serial reader's command waits too
         # On-entry self-heal: clear a guard whose owner task already exited.
@@ -5532,9 +5442,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
-            if self.gateway_runner is not None and self.platform == Platform.TELEGRAM:
-                from gateway.telegram_retire import advance
-                await advance(self.gateway_runner, event.source)
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot
@@ -5741,17 +5648,15 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
 
     @staticmethod
     def truncate_message(content: str, max_length: int = 4096,
-                         len_fn: Optional[Callable[[str], int]] = None, *,
-                         indicator_overhead: int = 0) -> list[str]:
+                         len_fn: Optional[Callable[[str], int]] = None) -> list[str]:
         """Split a long message into chunks preserving code blocks: a split inside a fence closes it
         at the chunk end and reopens it (same language tag) in the next; multi-chunk output gets
-        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram).
-        ``indicator_overhead`` reserves additional length units for caller-side suffix encoding."""
+        ``(1/3)`` indicators. ``len_fn`` overrides ``len`` (``utf16_len`` for Telegram)."""
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]
         # Every split consumes a source codepoint, so len(content) bounds both indicator numbers.
-        INDICATOR_RESERVE = _len(f" ({len(content)}/{len(content)})") + indicator_overhead
+        INDICATOR_RESERVE = _len(f" ({len(content)}/{len(content)})")
         FENCE_CLOSE = "\n```"
         chunks: list[str] = []
         remaining = content

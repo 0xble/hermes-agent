@@ -7,6 +7,13 @@ import pytest
 from tests.gateway.test_session_control_watcher import _runner, state as state
 
 
+@pytest.fixture(autouse=True)
+def _telegram_approval_surface(monkeypatch):
+    """No shipped adapter renders Approve/Deny cards; these tests drive the retained request
+    machinery as if the Telegram source still had one."""
+    monkeypatch.setattr("hermes_cli.session_controls._APPROVABLE_SOURCES", frozenset({"telegram"}))
+
+
 async def _accept(_adapter, event):
     event._gateway_accepted = True
 

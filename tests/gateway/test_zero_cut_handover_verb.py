@@ -7,27 +7,6 @@ from types import SimpleNamespace
 
 from gateway.config import GatewayConfig
 from gateway.zero_cut_handover_drain import request_handover
-from plugins.platforms.telegram.disconnect_handover import handover_stop_polling
-
-
-class _Queue:
-    def __init__(self, values):
-        self.values = list(values)
-
-    def empty(self):
-        return not self.values
-
-
-class _Updater:
-    running = True
-
-    async def stop(self):
-        self.running = False
-        while self.app.update_queue.values:
-            value = self.app.update_queue.values.pop(0)
-            self.app.processed.append(value)
-            self.app.adapter._inflight_update_ids.pop(str(value), None)
-            await asyncio.sleep(0)
 
 
 class _Runner:
@@ -56,23 +35,6 @@ class _Runner:
         self.exited = reason
 
 
-def test_handover_stops_polling_and_settles_queued_updates_without_destroying_bot():
-    async def scenario():
-        adapter = SimpleNamespace(_inflight_update_ids={"1": 1, "2": 1})
-        bot = object()
-        updater = _Updater()
-        app = SimpleNamespace(
-            updater=updater, update_queue=_Queue([1, 2]), processed=[], bot=bot,
-            adapter=adapter,
-        )
-        updater.app = app
-        adapter._app = app
-        result = await handover_stop_polling(adapter)
-        assert result == {"settled": True}
-        assert app.processed == [1, 2]
-        assert app.bot is bot
-
-    asyncio.run(scenario())
 
 
 def test_handover_verb_accepts_once_and_reports_status(monkeypatch):
@@ -91,23 +53,6 @@ def test_handover_verb_accepts_once_and_reports_status(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_handover_waits_for_buffered_text_batches_before_settling():
-    async def scenario():
-        adapter = SimpleNamespace(_inflight_update_ids={}, _pending_text_batches={"chat": object()})
-        app = SimpleNamespace(updater=None, update_queue=_Queue([]), bot=object())
-        adapter._app = app
-
-        async def flush_later():
-            await asyncio.sleep(0.05)
-            adapter._pending_text_batches.clear()
-
-        flusher = asyncio.create_task(flush_later())
-        result = await handover_stop_polling(adapter)
-        await flusher
-        assert result == {"settled": True}
-        assert adapter._pending_text_batches == {}
-
-    asyncio.run(scenario())
 
 
 def test_idle_handover_stops_outside_background_tasks_and_exits_cleanly(monkeypatch):
@@ -155,6 +100,20 @@ def test_handover_verb_refuses_disabled_standby_and_existing_drain(monkeypatch):
             setattr(draining, attr, True)
             assert request_handover(draining, loop) == {"accepted": False, "refused": "draining"}
             assert getattr(draining, "_zero_cut_handover_state", None) is None
+    finally:
+        loop.close()
+
+
+def test_handover_verb_refuses_while_serving_telegram(monkeypatch):
+    """Nothing transfers Telegram polling, so a second poller on the token would conflict."""
+    monkeypatch.setattr("gateway.zero_cut_standby.is_standby", lambda: False)
+    loop = asyncio.new_event_loop()
+    try:
+        runner = _Runner()
+        runner.adapters = {"telegram": SimpleNamespace(platform=SimpleNamespace(value="telegram"))}
+        assert request_handover(runner, loop) == {"accepted": False, "refused": "telegram"}
+        assert getattr(runner, "_zero_cut_handover_state", None) is None
+        assert runner._external_drain_active is False
     finally:
         loop.close()
 

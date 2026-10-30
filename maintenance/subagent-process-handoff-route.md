@@ -50,7 +50,7 @@ describe the same gap. Recovered from uncommitted work by the 2026-10-26 lost-wo
 
 ```bash
 scripts/run_tests.sh tests/tools/test_process_handoff_routing.py \
-  tests/tools/test_subagent_process_handoff.py tests/gateway/test_telegram_retire_work.py \
+  tests/tools/test_subagent_process_handoff.py \
   tests/gateway/test_background_process_notifications.py
 ```
 

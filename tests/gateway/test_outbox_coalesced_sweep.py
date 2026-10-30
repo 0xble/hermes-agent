@@ -25,7 +25,6 @@ from gateway.platforms.base import (
     current_outbound_class,
     outbound_class,
 )
-from plugins.platforms.telegram.daily_quota import DailyQuota
 
 
 @pytest.fixture(autouse=True)
@@ -93,21 +92,17 @@ async def test_deferred_sweep_replays_final_under_a_clean_outbound_class(tmp_pat
     assert store.receipt(row, message_id=None, success=False, uncertain=False, retry_after=0.0)
 
     class BudgetAdapter(_Adapter):
+        """Sheds every non-final send, like a platform at its daily volume ceiling."""
         platform = "telegram"
 
         def __init__(self):
             super().__init__()
             self.labels: list[str | None] = []
-            quota_dir = tmp_path / "quota"
-            quota_dir.mkdir()
-            self.daily = DailyQuota(soft_ceiling=10, profile_dir=quota_dir)
-            for _ in range(10):
-                self.daily.record("c", "sendMessage")
 
         async def send(self, chat_id, content, **kwargs):
             label = current_outbound_class()
             self.labels.append(label)
-            if self.daily.sheds(chat_id, label):
+            if label not in (None, OUTBOUND_FINAL):
                 return SendResult(success=False, error="daily_budget_shed")
             return await super().send(chat_id, content, **kwargs)
 

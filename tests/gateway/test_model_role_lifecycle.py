@@ -17,9 +17,6 @@ from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.turn_context import TurnContext
 from gateway.session import SessionSource
-from gateway.telegram_topic_sessions import (
-    TopicRequestError, TopicSpec, _apply_session_settings, _resolve_model,
-)
 
 
 @pytest.fixture
@@ -141,42 +138,6 @@ async def test_cold_selection_reaches_first_real_request(lane, monkeypatch, sele
                 agent.close()
 
 
-@pytest.mark.asyncio
-async def test_queued_role_edit_does_not_change_worker_startup(lane, monkeypatch):
-    from tests.fakes.fake_llm_provider import FakeLLMServer
-
-    with FakeLLMServer(default_text="QUEUED-ROUTE") as server:
-        built = _wire_role_provider(lane, monkeypatch, server)
-        assembled, release = asyncio.Event(), threading.Event()
-        start = lane.runner._run_agent_start_turn_worker
-
-        def delayed_start(ctx, work):
-            def paused():
-                assert release.wait(10), "worker release missing"
-                return work()
-            assembled.set()
-            return start(ctx, paused)
-
-        monkeypatch.setattr(lane.runner, "_run_agent_start_turn_worker", delayed_start)
-        lane.runner._running_agents[lane.key] = SimpleNamespace()
-        task = asyncio.create_task(_run_role_message(lane))
-        try:
-            await asyncio.wait_for(assembled.wait(), 5)
-            status = await _apply_session_settings(lane.runner, lane.source, lane.entry, ("role", "fast"), None)
-            assert status["model_status"] == "queued"
-            assert status["model_effective_when"] == "next_turn"
-            release.set()
-            first = await task
-            second = await _run_role_message(lane)
-            assert first["final_response"] == second["final_response"] == "QUEUED-ROUTE"
-            assert [kwargs["model"] for _, kwargs in built] == ["base", "first"]
-            assert [request["model"] for request in server.main_requests()] == ["base", "first"]
-        finally:
-            release.set()
-            if not task.done():
-                await task
-            for agent, _ in built:
-                agent.close()
 
 
 def _switch(agent, model, provider, *_args):
@@ -299,38 +260,6 @@ async def test_temporary_concrete_pick_expires_back_to_named_hold(lane, monkeypa
     assert (model, runtime["provider"]) == ("first", "provider-a")
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("bulk", [False, True], ids=["topic-edit", "bulk-conversion"])
-async def test_busy_role_assignment_waits_for_next_turn_but_config_stays_live(lane, monkeypatch, bulk):
-    runner = lane.runner
-    if bulk:
-        runner.session_store.set_model_override(lane.key, {"model": "picked", "provider": "provider-a"})
-        runner._session_model_overrides[lane.key] = {"model": "picked", "provider": "provider-a", "api_key": "fixture"}
-    else:
-        await runner._set_session_model_role(lane.key, "fast")
-    turn, agent = _turn(lane)
-    monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", _switch)
-    initial = await _boundary(turn, agent)
-    # Assemble another turn, then edit while it is busy but before its first API call.
-    turn, agent = _turn(lane)
-    runner._running_agents[lane.key] = agent
-    status = {}
-    if bulk:
-        assert await runner._migrate_telegram_model_overrides_to_role("other") == ([lane.key], [])
-    else:
-        status = await _apply_session_settings(runner, lane.source, lane.entry, ("role", "other"), None)
-    assert await _boundary(turn, agent) == initial
-    if not bulk:
-        assert status["model_status"] == "queued"
-        assert status["model_effective_when"] == "next_turn"
-    if not bulk:
-        lane.cfg["model_presets"]["fast"]["model"] = "edited-first"
-        lane.path.write_text(yaml.safe_dump(lane.cfg))
-        assert (await _boundary(turn, agent))[:2] == ("edited-first", "provider-a")
-    runner._running_agents.pop(lane.key)
-    model, runtime = await runner._resolve_session_agent_runtime_async(
-        source=lane.source, session_key=lane.key, user_config=lane.cfg)
-    assert (model, runtime["provider"]) == ("second", "provider-b")
 
 
 @pytest.mark.asyncio
@@ -413,14 +342,6 @@ async def test_slash_role_uses_shared_guard_and_confirmation_keeps_name(lane, mo
     runner._perform_model_switch.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("guard", ["cost", "data_policy", "context_cache"])
-async def test_topic_role_uses_shared_selection_guard(lane, monkeypatch, guard):
-    runner = _guard_selection(lane, monkeypatch, guard)
-    with pytest.raises(TopicRequestError, match="confirmation"):
-        await _resolve_model(runner, lane.source, TopicSpec(model="@fast"), lane.key)
-    assert runner.session_store.get_model_role(lane.key) is None
-    runner._perform_model_switch.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -563,75 +484,6 @@ async def test_bulk_rechecks_role_eligibility_after_waiting_for_route_lock(lane,
     assert runner._session_state(lane.key).conversation.model_role == "fast"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("global_pick", [False, True], ids=["session", "global"])
-async def test_concrete_role_clear_settles_before_newer_topic_role_edit(lane, monkeypatch, global_pick):
-    from hermes_cli.model_switch import ModelSwitchResult
-
-    runner = lane.runner
-    await runner._set_session_model_role(lane.key, "fast")
-    ctx = SimpleNamespace(session_key=lane.key, persist_global=global_pick, current_model="first",
-                          config_path=lane.path, restore_snapshot=None, model_override_scope="session",
-                          pick_ttl_hours=0.0)
-    result = ModelSwitchResult(success=True, new_model="concrete", target_provider="provider-c",
-                               api_key="fixture", base_url="", api_mode="chat_completions")
-    clearing, waiting = asyncio.Event(), asyncio.Event()
-    release = threading.Event()
-    loop = asyncio.get_running_loop()
-    writes = []
-    original = runner.session_store.set_model_role
-
-    def blocked_clear(key, role, **kwargs):
-        writes.append(role)
-        if role is None:
-            loop.call_soon_threadsafe(clearing.set)
-            assert release.wait(10)
-        return original(key, role, **kwargs)
-
-    monkeypatch.setattr(runner.session_store, "set_model_role", blocked_clear)
-    lock = runner._session_model_override_lock(lane.key)
-
-    def route_lock(key):
-        assert key == lane.key
-        task = asyncio.current_task()
-        if task is not None and task.get_name() == "newer-topic-role":
-            waiting.set()
-        return lock
-
-    monkeypatch.setattr(runner, "_session_model_override_lock", route_lock)
-    older = asyncio.create_task(runner._record_model_switch(
-        result, ctx, source=lane.source, one_turn=False, picker=False))
-    newer = None
-    try:
-        await asyncio.wait_for(clearing.wait(), 2)
-        assert lock.locked()
-        newer = asyncio.create_task(_apply_session_settings(
-            runner, lane.source, lane.entry, ("role", "other"), None), name="newer-topic-role")
-        await asyncio.wait_for(waiting.wait(), 2)
-        assert not newer.done()
-        assert writes == [None]
-        assert runner.session_store.get_model_role(lane.key) == "fast"
-        assert runner._session_state(lane.key).conversation.model_role == "fast"
-    finally:
-        release.set()
-        await asyncio.wait_for(older, 2)
-        if newer is not None:
-            await asyncio.wait_for(newer, 2)
-    assert writes == [None, "other"]
-    assert not lock.locked()
-    assert runner.session_store.get_model_role(lane.key) == "other"
-    assert runner._session_state(lane.key).conversation.model_role == "other"
-    assert runner.session_store.get_model_override(lane.key) is None
-    assert runner._session_model_override(lane.key) is None
-    durable = runner.session_store._db.load_gateway_routing_entries(scope=runner.session_store._routing_scope())
-    assert json.loads(durable[lane.key])["model_role"] == "other"
-    mirror = json.loads((runner.session_store.sessions_dir / "sessions.json").read_text())
-    assert mirror[lane.key]["model_role"] == "other"
-    model, runtime = await runner._resolve_session_agent_runtime_async(
-        source=lane.source, session_key=lane.key, user_config=lane.cfg)
-    assert (model, runtime["provider"]) == ("second", "provider-b")
-    if global_pick:
-        assert yaml.safe_load(lane.path.read_text())["model"]["default"] == "concrete"
 
 
 @pytest.mark.asyncio
