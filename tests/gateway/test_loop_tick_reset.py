@@ -38,8 +38,8 @@ def _tick(runner, source, key, sid):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reset", ["new", "exhaustion"])
-async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, reset, caplog):
+@pytest.mark.parametrize("reset,superseded", [("new", False), ("exhaustion", False), ("exhaustion", True)])
+async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, reset, superseded, caplog):
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
@@ -67,7 +67,7 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
     key = runner.session_store._generate_session_key(source)
     old = runner.session_store.get_or_create_session(source).session_id
     await runner._warm_goals_session_db("loop reset fixture")
-    _manager, tick = _tick(runner, source, key, old)
+    manager, tick = _tick(runner, source, key, old)
     running, finish = asyncio.Event(), asyncio.Event()
     executed, resolved = [], []
 
@@ -103,6 +103,10 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
         queued = list_session_admissions(authority.db, session_id=old, pending_only=False)
         wake = next(row for row in queued if row["payload"].get("native_text_v1", {}).get("synthetic"))
         assert wake["status"] == "queued"
+        if superseded:
+            # Cancelling an old descriptor must not release a newer definition's claim.
+            manager.set("REPLACEMENT", interval_seconds=300, times=3)
+            assert manager.fire_tick(runner._current_session_run_generation(key)) is not None
         if reset == "new":
             await adapter.handle_message(MessageEvent(text="/new", source=source, message_id="new"))
         finish.set()
@@ -116,6 +120,7 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
         actual = next(row for row in rows if row["admission_id"] == wake["admission_id"])
         from hermes_cli.loops import load_loop
         state = load_loop(old)
+        assert state is not None
         observed = dict(reset=reset, executed=executed, resolved=resolved,
                         wake=(actual["status"], actual["outcome"]),
                         awaiting=state.awaiting_response, log=caplog.text)
@@ -123,17 +128,26 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
         assert ("B", new) in executed, observed
         assert not any(text == "WAKE" for text, _ in executed), observed
         assert (actual["status"], actual["outcome"]) == ("terminal", "cancelled"), observed
-        assert not state.awaiting_response, observed
+        assert state.awaiting_response is superseded, observed
+        assert len([row for row in rows if row["request_id"] == wake["request_id"]]) == 1, rows
         assert "admission_conflict" not in caplog.text, observed
+        # A repeated reset-move observation is idempotent and cannot settle a replacement tick.
+        from gateway.session_automation import move_route_wakes
+        snapshot = state.to_json()
+        await move_route_wakes(runner, key, old)
+        after = load_loop(old)
+        assert after is not None and after.to_json() == snapshot
     finally:
         finish.set()
         await _drains_idle(authority)
         await asyncio.gather(*mutation_tasks(authority))
         authority.db.close()
+        runner.session_store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
-async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatch, tmp_path, caplog, superseded):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
@@ -159,7 +173,7 @@ async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatc
     source, key = live.source, live.route
     adapter = runner.adapters[source.platform]
     await runner._warm_goals_session_db("local loop reset fixture")
-    _manager, tick = _tick(runner, source, key, ref.session_id)
+    manager, tick = _tick(runner, source, key, ref.session_id)
     running, finish = asyncio.Event(), asyncio.Event()
     executed, resolved = [], []
 
@@ -190,6 +204,9 @@ async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatc
         rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
         wake = next(row for row in rows if "local_automation_v1" in row["payload"])
         assert wake["status"] == "queued"
+        if superseded:
+            manager.set("REPLACEMENT", interval_seconds=300, times=3)
+            assert manager.fire_tick(runner._current_session_run_generation(key)) is not None
         finish.set()
         await _drains_idle(authority)
         new = runner.session_store.peek_session_id(key)
@@ -200,6 +217,7 @@ async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatc
         actual = next(row for row in rows if row["admission_id"] == wake["admission_id"])
         from hermes_cli.loops import load_loop
         state = load_loop(ref.session_id)
+        assert state is not None
         observed = dict(executed=executed, resolved=resolved,
                         wake=(actual["status"], actual["outcome"]),
                         awaiting=state.awaiting_response, log=caplog.text)
@@ -207,10 +225,12 @@ async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatc
         assert ("B", new) in executed, observed
         assert not any(text == "WAKE" for text, _ in executed), observed
         assert (actual["status"], actual["outcome"]) == ("terminal", "cancelled"), observed
-        assert not state.awaiting_response, observed
+        assert state.awaiting_response is superseded, observed
+        assert "admission_conflict" not in caplog.text, observed
     finally:
         finish.set()
         await _drains_idle(authority)
         await asyncio.gather(*mutation_tasks(authority))
         await connection.close()
         authority.db.close()
+        runner.session_store.close_all_db_handles()

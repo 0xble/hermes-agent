@@ -405,6 +405,8 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
         raise RuntimeStoreError('invalid_params', field='automation_event')
     from gateway.session_synthetic import project_synthetic
     synthetic = project_synthetic(event)
+    # Only the private producer token permits this projection, never inbound metadata.
+    # Its routing/tick fences live outside the ordinary adapter metadata allowlist.
     if synthetic is None and set(event.metadata) - _AUTOMATION_METADATA:
         raise RuntimeStoreError('invalid_params', field='automation_metadata')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
@@ -591,6 +593,31 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})
 
 
+async def _cancel_reset_pinned_wake(authority, row, new_session_id):
+    """A fresh transcript cannot inherit a strict producer pin. Cancel, never rewrite it.
+
+    Native and LOCAL descriptors carry the same private projection. Settle a cancelled
+    loop's exact tick too, without touching a replacement definition or replaying it.
+    """
+    payload = row['payload']
+    descriptor = payload.get('local_automation_v1') or payload.get('native_text_v1', {})
+    metadata = descriptor.get('synthetic', {}).get('metadata', {})
+    if not metadata.get('gateway_session_strict') or metadata.get('gateway_session_id') == new_session_id:
+        return False
+    import asyncio
+    from gateway.session_runtime_workers import track_mutation
+
+    async def cancel_and_settle():
+        if await _withdraw(authority, row):
+            event = MessageEvent(text=payload['text'], internal=True, metadata=deepcopy(metadata),
+                                 source=authority.sessions[row['target_session_id']].source)
+            await authority.runner._release_unsettled_loop_tick(event, ran=False)
+
+    # Once cancellation commits, even an interrupted reset owes the tick its settlement.
+    await asyncio.shield(track_mutation(authority, cancel_and_settle()))
+    return True
+
+
 async def move_route_wakes(runner, session_key, old_session_id):
     """After the route rotated (/new, /reset, compression-exhaustion reset), carry the old owner's
     still-queued route wakes to the fresh session, as main's #114456 kept a parked internal wake
@@ -621,6 +648,8 @@ async def move_route_wakes(runner, session_key, old_session_id):
         identity = json.loads(row['request_id']) if automation and row['request_id'].startswith('[') else None
         if (row['status'] != 'queued' or row['principal_id'] != 'automation:' + session_key
                 or not isinstance(identity, list) or identity[:1] not in ([p] for p in _ROUTE_WAKE_PRODUCERS)):
+            continue
+        if await _cancel_reset_pinned_wake(authority, row, entry.session_id):
             continue
         try:
             await authority.cancel_queued(actor, old, row['admission_id'])
@@ -665,6 +694,12 @@ async def _reset_and_retarget_local(authority, runner, session_key, old_session_
 
     async with live.mutation_lock:
         entry, moved = await tracked_write(authority, rotate_and_retarget, ordered=True)
+        if moved:
+            import asyncio
+            rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=owner.session_id)
+            for row in rows:
+                if row['admission_id'] in moved:
+                    await _cancel_reset_pinned_wake(authority, row, entry.session_id)
     if moved:
         authority._publish_pending(owner)
     return entry
