@@ -14,6 +14,16 @@ Fork-Patch-Backfill: dd8b51a7f52d926fc084cd7e84bc8b72a651ff0f; state-prune-lock-
 - `_execute_write_marked` emits a warning when one acquired transaction holds the lock for several seconds, including the originating callback, process id, bounded transcript target and input-row count when known. Acquisition time is separate from the lock-hold threshold. Callback wall/thread-CPU time, commit/rollback time and settlement outcome distinguish expensive work from a failed or slow commit without logging transcript payloads or SQL.
 - The same attempt-local `WriteMetrics` context retains archive/mark-inactive, insert (including inline FTS), clone (including inline FTS), display-reconcile, callback-total and commit/rollback timings, with affected message-row counts. Callback-total includes the named callback phases, so those durations must not be summed. Failed transactions report attempted row writes, not committed totals. Fast transactions add no log lines or diagnostic SQL. On macOS, the lock-owner diagnostic says `/proc/locks` is unavailable rather than claiming that a holder released just before the deadline.
 
+## Bounded Deletion
+
+Session-count pruning batches alone do not bound a large transcript's FTS-trigger work. Explicit single, bulk/chain and runtime deletes, and retention pruning, now publish the existing durable retirement fence before reclaiming messages. Guard, expected-id and expected-display checks remain inside that retirement transaction. Public session, transcript, timeline and search reads exclude the retired ids, including hidden/archive and LIKE fallback routes. Late transcript appends and child creation reject a retired id or parent.
+
+`hermes_state_deletion.py` extends the same retirement marker with pending cleanup, rather than adding a schema or independent deletion identity. Each message transaction removes at most 64 rows and 256 KiB of payload, admitting an oversized row alone. Length enumeration uses a reader outside the writer lock. Deletion executes in steps of at most 8 rows, stops after the 100 ms work target, commits, and yields before reacquiring the writer. All existing FTS delete triggers remain enabled. A single SQLite statement, oversized row, commit or fsync cannot be preempted, so this is a work bound rather than a hard wall-clock deadline.
+
+The next explicit delete or retention prune resumes pending work. Spillover pointers are retired per page before their rows disappear. Session rows are removed only after their messages, and pending markers cannot expire or be replaced by another sweep. Each page rechecks its original marker so a delayed cleaner cannot delete a later generation. System-prompt cleanup remains separately bounded.
+
+`tests/hermes_state/test_session_delete_batches.py` covers a 1,025-message single/chain/prune regression, another SQLite writer committing between pages, interruption immediately after retirement and after a committed page, restart/next-prune recovery, invisibility through FTS and LIKE, propagated database errors, pending-marker expiry, snapshot fences, and message-byte bounds. Existing guard, cascade, compression, retirement, media and prune tests remain authoritative.
+
 ## Compaction Attribution
 
 The existing slow-write warning also brackets in-lock compaction preparation

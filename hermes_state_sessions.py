@@ -24,6 +24,7 @@ from hermes_state_common import (
     _source_match_clause, emit_session_deleted, launch_stub_filter_sql,
 )
 from hermes_state_compression import _CHAIN_CAP, _UNSET_CREATED_SQL
+from hermes_state_deletion import finish_pending_deletes, stage_delete, visible_session_sql
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -119,7 +120,7 @@ def _session_filter_where(
     hides sub-agent runs and compression continuations but keeps branch/reset children
     (``_LISTABLE_CHILD_SQL``); ``include_subagents`` re-admits the sub-agent runs only
     (``sessions.show_subagents``). Clause order is part of the SQL text contract."""
-    where: list[str] = []
+    where: list[str] = [visible_session_sql("s.id")]
     params: list[Any] = []
     if exclude_children and include_subagents:
         where.append(f"({_LISTABLE_CHILD_SQL} OR {_delegate_from_json('s.model_config')} IS NOT NULL)")
@@ -440,9 +441,9 @@ class SessionSessionsMixin:
         matches win; several distinct users and no match → None (never another participant's session)."""
         if not platform or chat_id in (None, ""):
             return None
-        query = """
+        query = f"""
             SELECT id, user_id, started_at FROM sessions
-            WHERE LOWER(source) = LOWER(?)
+            WHERE {visible_session_sql('sessions.id')} AND LOWER(source) = LOWER(?)
               AND session_key IS NOT NULL
               AND chat_id = ?
               AND ended_at IS NULL
@@ -708,7 +709,7 @@ class SessionSessionsMixin:
             row = conn.execute(
                 "SELECT COALESCE(sp.prompt, s.system_prompt), COALESCE(tp.prompt, s.tool_names) "
                 "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "LEFT JOIN system_prompts tp ON tp.hash = s.tool_names WHERE s.id = ?",
+                f"LEFT JOIN system_prompts tp ON tp.hash = s.tool_names WHERE s.id = ? AND {visible_session_sql('s.id')}",
                 (session_id,),
             ).fetchone()
             if row is None or tuple(row) != (expected_prompt, expected_tool_names):
@@ -862,7 +863,7 @@ class SessionSessionsMixin:
             "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
             "COALESCE(tp.prompt, s.tool_names) AS _tool_names_resolved "
             "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-            "LEFT JOIN system_prompts tp ON tp.hash = s.tool_names WHERE s.id = ?",
+            f"LEFT JOIN system_prompts tp ON tp.hash = s.tool_names WHERE s.id = ? AND {visible_session_sql('s.id')}",
             (session_id,),
         )
         return self._session_row_dict(row) if row else None
@@ -871,7 +872,7 @@ class SessionSessionsMixin:
         """Picker columns only: the live listing skips ``get_session``'s prompt/tool JOIN and flush."""
         row = self._read_one(
             "SELECT id, source, title, started_at, ended_at, message_count, model, hidden, archived "
-            "FROM sessions WHERE id = ?",
+            f"FROM sessions WHERE id = ? AND {visible_session_sql('sessions.id')}",
             (session_id,),
         )
         return dict(row) if row else None
@@ -904,7 +905,7 @@ class SessionSessionsMixin:
         if exact:
             return exact["id"]
         matches = self._read_all(
-            "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
+            f"SELECT id FROM sessions WHERE {visible_session_sql('sessions.id')} AND id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
             (f"{_escape_like(session_id_or_prefix)}%",),
         )
         return matches[0]["id"] if len(matches) == 1 else None
@@ -1211,6 +1212,7 @@ class SessionSessionsMixin:
         lineage_limit = max(candidate_limit, min(int(lineage_limit), 8192))
 
         candidate_clauses = [
+            visible_session_sql("s.id"),
             "s.archived = 0",
             "s.hidden = 0",
             f"{_delegate_from_json('s.model_config')} IS NULL",
@@ -1580,7 +1582,9 @@ class SessionSessionsMixin:
         so ``hermes -c``/``--resume`` picks its last session. ``source`` may be one label or several.
         ``local_created_sources`` restricts ``source='local'`` rows before LIMIT/OFFSET, and
         ``skip_launch_stubs`` drops empty launch stubs (launch_stub_filter_sql) before it too."""
-        where_clauses = [launch_stub_filter_sql(self)] if skip_launch_stubs else []
+        where_clauses = [visible_session_sql("s.id")]
+        if skip_launch_stubs:
+            where_clauses.append(launch_stub_filter_sql(self))
         params: list = []
         if source:
             sources = [source] if isinstance(source, str) else list(source)
@@ -1620,7 +1624,7 @@ class SessionSessionsMixin:
 
     def session_count_ge(self, n: int = 1) -> bool:
         """At least N sessions exist (archived included); LIMIT short-circuits session_count()'s scan."""
-        return len(self._read_all("SELECT 1 FROM sessions LIMIT ?", (n,))) >= n
+        return len(self._read_all(f"SELECT 1 FROM sessions WHERE {visible_session_sql('sessions.id')} LIMIT ?", (n,))) >= n
 
     def session_count_by_source(
         self, *, include_archived: bool = False, archived_only: bool = False,
@@ -1684,7 +1688,7 @@ class SessionSessionsMixin:
         """Rows :meth:`delete_session` would remove: the session, then its recursive delegate children
         (branch/compression children are orphaned, not deleted)."""
         with self._read_ctx() as conn:
-            if not conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone():
+            if not conn.execute(f"SELECT 1 FROM sessions WHERE {visible_session_sql('sessions.id')} AND id = ? LIMIT 1", (session_id,)).fetchone():
                 return []
             # Use the borrowed read connection, never self._conn: handing the shared writer connection to a
             # helper here executes on it without self._lock — the same unsynchronized-read class as
@@ -1752,21 +1756,25 @@ class SessionSessionsMixin:
         through :meth:`delete_sessions` keeps the chain-aware guard/counting semantics in one
         place; its return value counts the *requested* ids that existed, so ``> 0`` is exactly
         "the session was found"."""
-        if include_compression_chain:
+        if include_compression_chain and expected_delete_ids is None and expected_display_messages is None:
             return self.delete_sessions(
                 [session_id], sessions_dir=sessions_dir,
                 exclude_active_write_guards=exclude_active_write_guards,
                 include_compression_chain=True,
             ) > 0
+        finish_pending_deletes(self)
         removed_ids: list[str] = []
         expected_ids = set(expected_delete_ids) if expected_delete_ids is not None else None
         def _do(conn):
-            if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone() is None:
+            if conn.execute(f"SELECT 1 FROM sessions WHERE id = ? AND {visible_session_sql('sessions.id')} LIMIT 1", (session_id,)).fetchone() is None:
                 return False
             # A local reset/compression conversation deletes whole from any segment: the listed row
             # is its latest segment, and a lone segment delete strands the owner's policy and FIFO.
             from hermes_state_local import owned_lineage_ids
             scope = owned_lineage_ids(conn, session_id)
+            if include_compression_chain:
+                scope = list(dict.fromkeys(sid for root in self._expand_compression_lineage(conn, [session_id])
+                                           for sid in owned_lineage_ids(conn, root)))
             target_ids = (
                 [*scope, *_collect_delegate_child_ids(conn, scope)]
                 if exclude_active_write_guards or expected_ids is not None else None
@@ -1784,18 +1792,15 @@ class SessionSessionsMixin:
             ):
                 return False
             from hermes_state_mutation_retirement import retire_sessions
-            retire_sessions(conn, scope)
-            removed_ids.extend(_delete_delegate_children(conn, scope))
-            for sid in scope:  # orphan remaining children (branches) so FK is satisfied
-                conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (sid,))
-                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-            conn.executemany("DELETE FROM sessions WHERE id = ?", [(sid,) for sid in scope])
-            self._delete_unreferenced_system_prompts(conn)
-            removed_ids.extend(scope)
+            targets = [*scope, *_collect_delegate_child_ids(conn, scope)]
+            retire_sessions(conn, targets, defer_messages=True)
+            stage_delete(conn, targets, sessions_dir)
+            removed_ids[:] = targets
             return True
         deleted = self._execute_write(_do)
         if deleted:
             emit_session_deleted(self, removed_ids, reason="delete", primary=session_id, sessions_dir=sessions_dir)
+        finish_pending_deletes(self)
         from hermes_state_media import collect_retired_media
         collect_retired_media(self)
         for sid in removed_ids:
@@ -1869,7 +1874,7 @@ class SessionSessionsMixin:
         exclude_active_write_guards: bool = False, skipped_ids: Optional[list[str]] = None,
         include_compression_chain: bool = False,
     ) -> int:
-        """Bulk delete with :meth:`delete_session` semantics per row, in ONE transaction. Unknown ids
+        """Bulk retire atomically, then reclaim messages in bounded transactions. Unknown ids
         are skipped (UI selection can race another tab's delete). With ``exclude_active_write_guards``, rows
         protected by an active turn lease or compression lock are skipped and, when given, appended
         to ``skipped_ids`` so callers can tell the user. Returns the number deleted.
@@ -1881,12 +1886,13 @@ class SessionSessionsMixin:
         the next list reload (#57543). The returned count still reflects the *requested* rows,
         not the expanded chain links, so the caller's toast matches the user's selection."""
         unique_ids = list({sid for sid in session_ids or () if isinstance(sid, str) and sid})
+        finish_pending_deletes(self)
         if not unique_ids:
             return 0
         removed_ids: list[str] = []
         def _do(conn):
             existing = [row["id"] for chunk in _id_chunks(unique_ids) for row in conn.execute(
-                f"SELECT id FROM sessions WHERE id IN ({_session_ids_placeholders(chunk)})", chunk,
+                f"SELECT id FROM sessions WHERE {visible_session_sql('sessions.id')} AND id IN ({_session_ids_placeholders(chunk)})", chunk,
             ).fetchall()]
             if not existing:
                 return 0
@@ -1929,17 +1935,10 @@ class SessionSessionsMixin:
                     return 0
                 expanded = expand(existing)
             from hermes_state_mutation_retirement import retire_sessions
-            retire_sessions(conn, expanded)
-            removed_ids.extend(_delete_delegate_children(conn, expanded))
-            for chunk in _id_chunks(expanded):
-                ph = _session_ids_placeholders(chunk)
-                conn.execute(  # orphan children whose parent is in the kill list (FK)
-                    f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk,
-                )
-                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
-            self._delete_unreferenced_system_prompts(conn)
-            removed_ids.extend(expanded)
+            targets = [*expanded, *_collect_delegate_child_ids(conn, expanded)]
+            retire_sessions(conn, targets, defer_messages=True)
+            stage_delete(conn, targets, sessions_dir)
+            removed_ids[:] = targets
             # Count the ids the CALLER asked for, not the expanded chain links —
             # the dashboard toast should say "3 deleted" when the user selected
             # 3 rows, however many physical links those rows had.
@@ -1948,6 +1947,7 @@ class SessionSessionsMixin:
         if count:
             emit_session_deleted(self, removed_ids, reason="delete", primary=unique_ids[0] if len(unique_ids) == 1 else None,
                                  sessions_dir=sessions_dir)
+        finish_pending_deletes(self)
         from hermes_state_media import collect_retired_media
         collect_retired_media(self)
         for sid in removed_ids:
