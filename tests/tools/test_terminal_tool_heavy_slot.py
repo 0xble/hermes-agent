@@ -205,6 +205,7 @@ def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
     assert "HEAVY_SLOT_MAX_WAIT" not in dispatcher
 
 
+@pytest.mark.parametrize("origin", ["user", "cron", "unknown"])
 @pytest.mark.parametrize(("background", "env_type", "timeout", "expected"), [
     (False, "local", 180, 60),
     (False, "local", 600, 120),
@@ -212,12 +213,15 @@ def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
     (True, "local", 180, None),
     (False, "docker", 180, None),
 ])
-def test_terminal_tool_bounds_only_foreground_local_waits(background, env_type, timeout, expected):
+def test_terminal_tool_bounds_only_foreground_local_waits(background, env_type, timeout, expected, origin):
+    from gateway.session_context import preserved_session_context, set_turn_origin
     from tools.terminal_tool import _heavy_slot_max_wait_for
 
-    assert _heavy_slot_max_wait_for(
-        background=background, env_type=env_type, effective_timeout=timeout,
-    ) == expected
+    with preserved_session_context():
+        set_turn_origin(origin)
+        assert _heavy_slot_max_wait_for(
+            background=background, env_type=env_type, effective_timeout=timeout,
+        ) == (None if origin == "cron" else expected)
 
 
 @pytest.mark.parametrize(("command", "expected"), [
@@ -301,7 +305,7 @@ def test_dispatcher_leaves_shell_functions_and_aliases_to_the_shell(tmp_path, mo
              "tox() { echo \"tox-fn FOO=$FOO\"; }\n")
     if shell == "bash":
         setup = "shopt -s expand_aliases\n" + setup
-    out = subprocess.run([shell, "-c", setup + command], capture_output=True, text=True, cwd=tmp_path)
+    out = subprocess.run([shell, "-c", setup + command], capture_output=True, text=True, cwd=tmp_path, check=False)
     assert out.returncode == 0, out.stderr
     assert out.stdout.splitlines() == [
         "function -q a b FOO=", "tox-fn FOO=1", "external run c d held=1", "external --all held=1"]
@@ -372,10 +376,10 @@ def test_background_wrapped_run_is_killable_and_releases_its_slot(tmp_path, monk
         subprocess.run(["pkill", "-f", str(runner)], check=False)
 
     deadline = time.monotonic() + 10
-    while subprocess.run(["pgrep", "-f", str(runner)], capture_output=True).returncode == 0 \
+    while subprocess.run(["pgrep", "-f", str(runner)], capture_output=True, check=False).returncode == 0 \
             and time.monotonic() < deadline:
         time.sleep(0.2)
-    assert subprocess.run(["pgrep", "-f", str(runner)], capture_output=True).returncode != 0
+    assert subprocess.run(["pgrep", "-f", str(runner)], capture_output=True, check=False).returncode != 0
     deadline = time.monotonic() + 10
     while any(p.stat().st_size for p in slots.glob("slot-*.lock")) and time.monotonic() < deadline:
         time.sleep(0.2)

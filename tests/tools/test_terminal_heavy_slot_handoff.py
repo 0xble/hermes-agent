@@ -154,3 +154,81 @@ print("completed")
     finally:
         os.close(fd)
         env.cleanup()
+
+
+@pytest.mark.parametrize("via_code", [False, True])
+@pytest.mark.parametrize("admit", [False, True])
+def test_cron_waits_inline_until_admission_or_its_own_timeout(tmp_path, monkeypatch, via_code, admit):
+    from gateway.session_context import preserved_session_context, set_turn_origin
+    from tools.code_execution_tool import execute_code
+    from tools.code_kernel import shutdown_all_kernels
+
+    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
+    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    monkeypatch.setenv("HERMES_TURN_ORIGIN", "user")  # task-local provenance wins
+    ticket, started, release = (tmp_path / name for name in ("ticket", "started", "release"))
+    os.mkfifo(release)
+    fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+    helper = _executable(tmp_path / "heavy-slot", f'''#!{sys.executable}
+import os, sys
+from pathlib import Path
+assert not os.environ.get("HEAVY_SLOT_MAX_WAIT")
+Path({str(ticket)!r}).touch()
+with open({str(release)!r}, "rb", buffering=0) as stream:
+    stream.read(1)
+args = sys.argv[sys.argv.index("--") + 1:]
+os.execvp(args[0], args)
+''')
+    runner = _executable(tmp_path / "pytest", f"#!/bin/sh\ntouch {shlex.quote(str(started))}\nprintf 'completed\\n'\n")
+    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _: str(helper))
+    # Exercise both automatic promotion paths without a multi-minute test.
+    monkeypatch.setattr(terminal_tool, "_FOREGROUND_HEAVY_SLOT_WAIT_CAP", 0)
+    monkeypatch.setattr(terminal_tool, "FOREGROUND_MAX_TIMEOUT", 1)
+    monkeypatch.setattr(terminal_tool, "spawn_background_process", lambda **_: pytest.fail("cron must stay inline"))
+    monkeypatch.setattr(terminal_tool, "yield_to_background_handler", lambda **_: pytest.fail("cron must not adopt"))
+    env = LocalEnvironment(cwd=str(tmp_path))
+    wait_for_process = env._wait_for_process
+
+    def wait_for_ticket(*args, **kwargs):
+        assert kwargs.get("yield_after_seconds") is None
+        assert "yield_handler" not in kwargs
+        assert wait_until(ticket.exists, timeout=5)
+        if admit:
+            os.write(fd, b"x")
+        return wait_for_process(*args, **kwargs)
+
+    monkeypatch.setattr(env, "_wait_for_process", wait_for_ticket)
+    monkeypatch.setattr(terminal_tool, "_acquire_env", lambda *_: env)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "local", "cwd": str(tmp_path), "timeout": 2, "host_cwd": None,
+    })
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *_, **__: {"approved": True})
+    monkeypatch.setattr("tools.code_execution_tool._load_config", lambda: {"mode": "strict", "timeout": 30})
+    command = f"{shlex.quote(str(runner))} -q tests"
+    try:
+        with preserved_session_context():
+            set_turn_origin("cron")
+            if via_code:
+                from model_tools import discover_builtin_tools
+                discover_builtin_tools()
+                cell = f"from hermes_tools import terminal\nimport json\nprint(json.dumps(terminal({command!r}, timeout=2)))"
+                response = json.loads(execute_code(cell, task_id="cron-admission"))
+                assert response["status"] == "success", response
+                result = json.loads(response["output"])
+            else:
+                result = json.loads(terminal_tool.terminal_tool(command, timeout=2, task_id="cron-admission", force=True))
+        assert "session_id" not in result, result
+        assert "promoted_from_foreground" not in result, result
+        if admit:
+            assert result["exit_code"] == 0, result
+            assert started.exists()
+            assert "completed" in result["output"]
+        else:
+            assert result["exit_code"] == 124, result
+            assert "not started" in result["output"]
+            assert "waiting for heavy-slot admission" in result["output"]
+            assert not started.exists()
+    finally:
+        shutdown_all_kernels()
+        os.close(fd)
+        env.cleanup()
