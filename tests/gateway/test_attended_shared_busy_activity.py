@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -64,7 +64,7 @@ async def test_active_shared_input_stamps_before_burst_commit(shared_busy):
     event = MessageEvent(text='human follow-up', source=env.source, message_id='busy')
     assert env.adapter._shared_runtime_owns_input(event)
     await env.adapter.handle_message(event)
-    env.schedule.assert_called_once_with(event, event.source, env.owner.key)
+    env.schedule.assert_called_once_with(event, event.source, env.owner.key, profile_scope=ANY)
     assert event._attended_activity_received_at == env.clock[0]
     assert holds_busy_burst(env.adapter, env.owner.key)
     await event._attended_activity_task
@@ -198,7 +198,7 @@ async def test_unauthorized_followup_cannot_merge_into_authorized_head(shared_bu
     assert head.text == 'allowed'
     assert not refused._gateway_accepted
     assert getattr(refused, '_attended_activity_task', None) is None
-    env.schedule.assert_called_once_with(head, head.source, env.owner.key)
+    env.schedule.assert_called_once_with(head, head.source, env.owner.key, profile_scope=ANY)
     monkeypatch.setattr(env.runner, '_is_user_authorized_for_source', lambda source: True)
 
 
@@ -244,6 +244,34 @@ async def test_native_retry_retains_original_receipt_but_changed_content_still_c
     retry['text'] = 'changed'
     with pytest.raises(RuntimeStoreError, match='admission_conflict'):
         await asyncio.to_thread(admit, retry)
+
+
+@pytest.mark.asyncio
+async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_busy, monkeypatch):
+    import threading
+    import gateway.run as gateway_run
+    from hermes_constants import get_hermes_home_override
+
+    env = shared_busy
+    home = env.runner._resolve_profile_home_for_source(env.source)
+    loads, marks = [], []
+    real_load, real_mark = gateway_run._load_profile_secret_scope, env.runner._mark_attended_user_activity
+
+    def load(profile_home):
+        loads.append(threading.get_ident())
+        return real_load(profile_home)
+
+    async def mark(*args, **kwargs):
+        marks.append(get_hermes_home_override())
+        return await real_mark(*args, **kwargs)
+    monkeypatch.setattr(gateway_run, '_load_profile_secret_scope', load)
+    monkeypatch.setattr(env.runner, '_mark_attended_user_activity', mark)
+    event = MessageEvent(text='scoped follow-up', source=env.source, message_id='scoped')
+    await env.adapter.handle_message(event)
+    await event._attended_activity_task
+    assert loads and threading.get_ident() not in loads
+    assert marks == [str(home)]
+    assert event._attended_activity_marked
 
 
 @pytest.mark.asyncio
