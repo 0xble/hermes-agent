@@ -26,25 +26,19 @@ _EVENT_FIELDS = (
 # ``reply_anchor_override`` = '' is Telegram topic transfer's "do not quote the root DM" (#139136).
 _CONTEXT_FIELDS = ('auto_skill', 'channel_prompt', 'channel_context', 'reply_expected', 'reply_anchor_override',
                    'edit_revision')
-# Closed metadata contract: only the keys the Baileys adapter stamps on ordinary inbound
-# (``WhatsAppAdapter._build_message_event``) cross native admission; any other key refuses.
+# Closed metadata contracts for ordinary adapter inputs. Unknown keys refuse admission.
 _WHATSAPP_METADATA = frozenset({'whatsapp_native_type', 'whatsapp_native', 'whatsapp_from_owner'})
 # Top-level ``nativeMetadata`` keys the bridge emits (scripts/whatsapp-bridge/bridge_helpers.js).
 _WHATSAPP_NATIVE_KEYS = frozenset({'video', 'audio', 'sticker', 'location', 'contact', 'contacts',
                                    'reaction', 'poll', 'pollUpdate'})
 _WHATSAPP_NATIVE_MAX_BYTES = 16 * 1024
+_TELEGRAM_RICH_FIELDS = ('block_count', 'block_types', 'source', 'truncated')
 _MEDIA_FIELDS = ('media_urls', 'media_types', 'media_text_inlined')
 
 
-def _native_metadata(event):
-    """JSON projection of the adapter metadata a native replay keeps; ``None`` refuses the event.
+def _whatsapp_metadata(metadata):
+    """Keep the bridge's native projection and size policy unchanged.
     An oversized ``whatsapp_native`` (vCards with photos) is dropped, never refused."""
-    metadata = event.metadata
-    if not metadata:
-        return {}
-    if (not isinstance(metadata, dict) or event.source.platform.value != 'whatsapp'
-            or not set(metadata) <= _WHATSAPP_METADATA):
-        return None
     kind, native = metadata.get('whatsapp_native_type'), metadata.get('whatsapp_native')
     if (kind is not None and not (isinstance(kind, str) and 0 < len(kind) <= 64)
             or metadata.get('whatsapp_from_owner') not in (None, True)
@@ -59,6 +53,44 @@ def _native_metadata(event):
         if len(encoded.encode()) <= _WHATSAPP_NATIVE_MAX_BYTES:
             projected['whatsapp_native'] = json.loads(encoded)
     return projected
+
+
+def _telegram_metadata(metadata):
+    rich = metadata['telegram_rich_message']
+    if not isinstance(rich, dict) or set(rich) != set(_TELEGRAM_RICH_FIELDS):
+        return None
+    count, types, source, truncated = (rich[key] for key in _TELEGRAM_RICH_FIELDS)
+    if (type(count) is not int or count < 0
+            or not isinstance(types, list) or len(types) > 256
+            or not all(isinstance(item, str) and 0 < len(item) <= 64 for item in types)
+            # _inbound_rich_message_payload emits a location label (attribute/api_kwargs), not content.
+            or source is not None and not (isinstance(source, str) and 0 < len(source) <= 64)
+            or type(truncated) is not bool):
+        return None
+    return {'telegram_rich_message': {
+        'block_count': count, 'block_types': list(types), 'source': source, 'truncated': truncated}}
+
+
+_NATIVE_METADATA = {
+    'whatsapp': (_WHATSAPP_METADATA, _whatsapp_metadata),
+    'telegram': (frozenset({'telegram_rich_message'}), _telegram_metadata),
+}
+
+
+def _native_metadata(event):
+    """JSON projection of the adapter metadata a native replay keeps; ``None`` refuses the event."""
+    metadata = event.metadata
+    if not metadata:
+        return {}
+    if not isinstance(metadata, dict):
+        return None
+    contract = _NATIVE_METADATA.get(event.source.platform.value)
+    if contract is None:
+        return None
+    allowed, project = contract
+    if not set(metadata) <= allowed:
+        return None
+    return project(metadata)
 
 
 def _adapter_event(event, **changes):
