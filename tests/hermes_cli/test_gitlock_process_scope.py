@@ -1,4 +1,4 @@
-"""Holder-scoped Linux tmp-pack cleanup with conservative global lock cleanup."""
+"""Holder-scoped packs and conservative repository-scoped Linux lock cleanup."""
 from __future__ import annotations
 
 import os
@@ -98,9 +98,43 @@ def test_transient_proc_inspection_is_retried_before_veto(scope, monkeypatch):
     assert scopeprobe.tmp_pack_in_use(ours, pack, lambda: True, retry_until=1.0) is False
 
 def test_stale_locks_keep_the_global_process_guard(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(scopeprobe, "_linux_process_scope", False)
     repo = _repo(tmp_path / "repo")
     lock = _aged(repo / ".git" / "index.lock")
     monkeypatch.setattr(gitlock, "_git_proc_running", lambda: True)
 
     assert gitlock.clear_stale_git_locks(repo) == []
     assert lock.exists()
+
+
+@pytest.mark.parametrize("owner", ["foreign", "target", "linked", "unknown", "redirected", "unplaced"])
+def test_index_lock_scope_preserves_possible_owners(scope, owner):
+    table, ours, other = scope
+    cwd = other if owner in ("foreign", "redirected", "unplaced") else ours
+    if owner == "linked":
+        cwd = ours.parent / "linked"
+        cwd.mkdir()
+        metadata = ours / ".git" / "worktrees" / "linked"
+        metadata.mkdir(parents=True)
+        (metadata / "commondir").write_text("../..")
+        (cwd / ".git").write_text(f"gitdir: {metadata}\n")
+    env = (f"GIT_INDEX_FILE={ours / '.git' / 'index'}",) if owner == "redirected" else ()
+    argv = ("git", "-C", str(other), "fetch") if owner == "unplaced" else ("git", "fetch")
+    proc = _process(table, 123, cwd, argv=argv, env=env)
+    if owner == "unknown":
+        (proc / "environ").unlink()
+    lock = _aged(ours / ".git" / "index.lock")
+
+    removed = gitlock.clear_stale_git_locks(ours)
+    assert removed == ([str(lock)] if owner == "foreign" else [])
+    assert lock.exists() is (owner != "foreign")
+
+
+def test_fresh_index_lock_is_never_swept(scope):
+    table, ours, other = scope
+    _process(table, 123, other)
+    lock = ours / ".git" / "index.lock"
+    lock.write_bytes(b"active")
+
+    assert gitlock.clear_stale_git_locks(ours) == []
+    assert lock.read_bytes() == b"active"

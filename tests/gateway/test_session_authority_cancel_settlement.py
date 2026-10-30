@@ -338,9 +338,10 @@ async def test_storage_lock_during_claim_retries_in_place_and_keeps_waiters(tmp_
 
 
 @pytest.mark.asyncio
-async def test_cancel_committed_before_a_failed_media_cleanup_still_settles_observers_once(tmp_path, monkeypatch):
-    """Media collection is a separate write after the cancellation commits. Its failure must not
-    withhold observer settlement, and an exact retry (which collects again) must neither leave the
+async def test_cancel_committed_before_a_failed_media_cleanup_still_settles_observers_once(tmp_path, monkeypatch, caplog):
+    """Media collection is a separate write after the cancellation commits, queued rather than
+    awaited (a /stop must not wait one transcript scan per queued row). Its failure is logged, never
+    withholds observer settlement, and an exact retry (which queues it again) must neither leave the
     waiter parked nor publish a second completion."""
     from gateway import session_ingress_media
 
@@ -358,10 +359,13 @@ async def test_cancel_committed_before_a_failed_media_cleanup_still_settles_obse
         waiter = authority.waiters.setdefault(receipt.admission_id, asyncio.get_running_loop().create_future())
         authority.sessions['s'].event_stream.observers.add(frames.append)
         monkeypatch.setattr(session_ingress_media, 'release_admission_media', fail_once)
-        with pytest.raises(OSError, match='media cleanup'):
-            await authority.cancel_queued(ACTOR, REF, receipt.admission_id)
+        first = await authority.cancel_queued(ACTOR, REF, receipt.admission_id)
+        assert (first.status, first.outcome) == ('terminal', 'cancelled')
+        await session_ingress_media.media_releases_idle(authority)
+        assert 'Terminal media cleanup failed' in caplog.text
         retried = await authority.cancel_queued(ACTOR, REF, receipt.admission_id)
         await authority.cancel_queued(ACTOR, REF, receipt.admission_id)
+        await session_ingress_media.media_releases_idle(authority)
 
     assert (retried.status, retried.outcome) == ('terminal', 'cancelled')
     assert waiter.done() and receipt.admission_id not in authority.native_waiters

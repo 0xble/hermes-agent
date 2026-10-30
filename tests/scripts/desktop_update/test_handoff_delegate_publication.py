@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shlex
-import signal
 import subprocess
 import time
 
@@ -70,6 +69,9 @@ def test_sidecar_timeout_never_releases_the_parked_update(tmp_path):
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
-        if script.poll() is None:
-            os.killpg(script.pid, signal.SIGKILL)  # windows-footgun: ok — Linux process-group fixture
+        # Releasing A7 lets finish() release the marker and reap its custodian.
+        # Killing the group here races that teardown and may instead target
+        # reparented helpers after the session leader has already exited.
         script.wait(timeout=10)
+    assert script.returncode == 3
+    assert not marker.exists()

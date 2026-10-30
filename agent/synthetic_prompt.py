@@ -52,6 +52,7 @@ RUNTIME_PROMPT_DISPLAY_KINDS = frozenset({
     "internal_notification",     # gateway MessageEvent(internal=True), including heartbeats
     "process_complete",          # bot-mode process completion rows
     "async_delegation_complete",  # TUI/desktop delegation results
+    "supervisor_checkin",         # generated wakeup with a required written status
     "auto_continue",             # TUI crash-recovery continuation
 })
 # Unattended platforms: every turn is a scheduled run with no person present. A cron run's prompt
@@ -120,7 +121,10 @@ _GOAL_PROMPT_PATTERNS = tuple(
     for row in GOAL_PROMPT_REGISTRY
     if row["formatter"] in {"autonomy", "plain", "contract", "subgoals", "gate_failed"}
 )
+from hermes_cli.checkins import CHECKIN_PROMPT_TEMPLATE
+
 _INJECTED_TURN_PATTERNS = (
+    ("checkin", CHECKIN_PROMPT_TEMPLATE, _TemplateMatcher(CHECKIN_PROMPT_TEMPLATE)),
     *_GOAL_PROMPT_PATTERNS,
     ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE, _TemplateMatcher(KANBAN_GOAL_CONTINUATION_TEMPLATE)),
     ("kanban", KANBAN_GOAL_FINALIZE_TEMPLATE, _TemplateMatcher(KANBAN_GOAL_FINALIZE_TEMPLATE)),

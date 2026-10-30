@@ -135,8 +135,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         claimed generation: a turn still constructing its agent latches the Stop for adopt_agent."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key)) if authority else None
-        if not sid or sid not in authority.sessions:
+        sid = self._hm_mounted_owner(authority, _quick_key) if authority else None
+        if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
                 authority.fence_route(_quick_key)
@@ -166,6 +166,20 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # Settled meanwhile (stale_generation): there is no claimed turn left to stop.
             with suppress(RuntimeStoreError):
                 await authority.interrupt(actor, ref, handle.execution_generation)
+
+    def _hm_mounted_owner(self, authority, _quick_key: str) -> Optional[str]:
+        """The route's durable FIFO owner for /stop and /new, mounted. Right after a restart the
+        startup recovery may not have mounted it yet, but its committed rows are still this chat's:
+        skipping them left them queued forever once /new moved the lane to a fresh session. None
+        when the chat has no durable session here."""
+        sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key))
+        if sid and sid not in authority.sessions:
+            from gateway.session_route_recovery import restore_routed_session
+            try:
+                restore_routed_session(authority, sid)
+            except Exception:
+                logger.debug("Could not mount %s for %s before stopping it", sid, _quick_key, exc_info=True)
+        return sid if sid and sid in authority.sessions else None
 
     async def _hm_pre_gateway_dispatch_hook(
         self, event: MessageEvent, source: SessionSource
@@ -895,8 +909,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         LOCAL/API input and ``unknown`` rows are untouched. Settled silently (no pause notice)."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key)) if authority else None
-        if not sid or sid not in authority.sessions:
+        sid = self._hm_mounted_owner(authority, _quick_key) if authority else None
+        if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
                 authority.fence_route(_quick_key)

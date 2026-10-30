@@ -214,6 +214,38 @@ def _process_repository_dirs(proc: Path) -> set[Path]:
     return _repository_dirs(cwd, git_dir)
 
 
+def git_process_running_for(repo_root: Path, fallback: Callable[[], bool]) -> bool:
+    """Retain target/shared/unknown Linux Git owners, not provably foreign ones.
+
+    Locks cannot use the pack-only unplaced-owner exception. Other hosts keep
+    the global guard. A redirected index also retains the veto even when the
+    object-store owner is elsewhere.
+    """
+    if not _linux_process_scope:
+        return fallback()
+    try:
+        target = _repository_dirs(Path(repo_root).resolve())
+        processes = list(_PROC_ROOT.iterdir())
+    except (OSError, RuntimeError, ValueError):
+        return True
+    for proc in processes:
+        if not proc.name.isdecimal():
+            continue
+        try:
+            name = proc.joinpath("comm").read_text(encoding="utf-8-sig").strip()
+            if name != "git" and not name.startswith("git-"):
+                continue
+            env = proc.joinpath("environ").read_bytes().split(b"\0")
+            if any(item.startswith(b"GIT_INDEX_FILE=") and item != b"GIT_INDEX_FILE=" for item in env):
+                return True
+            if target & _process_repository_dirs(proc):
+                return True
+        except (OSError, RuntimeError, ValueError, StopIteration, IndexError):
+            if not _exited(proc):
+                return True
+    return False
+
+
 def _unplaced_pack_owner(proc: Path, target: set[Path], repo_root: Path) -> bool:
     # Do not replay -C or a server operand against post-enter_repo cwd. Retain a
     # visible local/shared owner and explicit paths; the holder scan covers the
@@ -336,8 +368,8 @@ def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool], *
     A veto that rests only on a failed inspection is re-scanned until ``retry_until``
     (a ``time.monotonic()`` deadline), so a transient process state on a busy host does
     not strand the candidate; the answer is still a complete scan with no veto.
-    Non-Linux retains the existing repository/global probe; stale locks remain on
-    the separate global process guard in gitlock.py.
+    Non-Linux retains the existing global probe. Locks use the stricter
+    git_process_running_for guard without the pack-only unplaced-owner exception.
     """
     if not _linux_process_scope:
         return fallback()

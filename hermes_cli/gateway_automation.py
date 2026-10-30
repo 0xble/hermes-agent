@@ -179,6 +179,12 @@ class GatewayGoalManager(_Remote):
     def clear_gates(self):
         return self._rpc("clear_gates")
 
+    def wait_on_peer(self, peer, ref, requested_result, *, expected_instance):
+        return self._rpc("wait_on_peer", peer, ref, requested_result, expected_instance=expected_instance)
+
+    def resolve_peer(self, peer, ref, evidence, *, expected_instance):
+        return self._rpc("resolve_peer", peer, ref, evidence, expected_instance=expected_instance)
+
     def wait_on(self, pid, reason=""):
         return self._rpc("wait_on", int(pid), reason=reason)
 

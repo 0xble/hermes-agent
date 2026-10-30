@@ -1,15 +1,15 @@
 """Tests for the Slack ``api_human_users`` allowlist.
 
 A message posted through the Web API with a *user* token (``xoxp-``) is
-authored by a real person, but it arrives with the posting ``app_id`` and no
-``client_msg_id`` — the #35777 app/bot signature — so
-``_event_declares_bot_sender`` drops it. ``platforms.slack.extra.api_human_users``
-allowlists those *users* (never apps: an app's own ``xoxb`` bot posts carry
-the same user+app_id shape).
+authored by a real person, but Slack stamps it with the posting app's
+``app_id`` (often ``bot_id``/``bot_profile`` too) and no ``client_msg_id`` — the
+#35777 app/bot signature — so ``_event_declares_bot_sender`` drops it.
+``platforms.slack.extra.api_human_users`` allowlists those *users* (never apps:
+an app's own ``xoxb`` bot posts carry the same stamps under the bot's user id).
 """
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -52,12 +52,14 @@ from gateway.config import Platform, PlatformConfig
 
 
 HUMAN_ID = "U_human"
+BOT_ID = "U_hermes_bot"
 
 
 def _make_adapter(extra=None):
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
     adapter.config = PlatformConfig(enabled=True, extra=dict(extra or {}))
+    adapter._bot_user_id, adapter._team_bot_user_ids = None, {}
     return adapter
 
 
@@ -86,9 +88,60 @@ def test_allowlisted_user_api_post_is_human():
     assert adapter._event_declares_bot_sender({"app_id": "A_frontend", "text": "hi"}) is True
 
 
-def test_bot_markers_win_over_allowlist():
-    """Allowlisting a user never admits genuine bot posts, so the app's own
-    ``xoxb`` traffic (bot_id / subtype=bot_message) cannot loop back in."""
+def test_bot_message_subtype_wins_over_allowlist():
+    """``subtype: bot_message`` (or a bot user profile) is bot-authored no matter what — allowlisting a user
+    never admits classic bot posts, so ``xoxb`` traffic cannot loop back in."""
     adapter = _make_adapter({"api_human_users": HUMAN_ID})
     assert adapter._event_declares_bot_sender(_api_post(subtype="bot_message")) is True
-    assert adapter._event_declares_bot_sender(_api_post(bot_id="B_stamp")) is True
+    assert adapter._event_declares_bot_sender(_api_post(user_profile={"is_bot": True})) is True
+
+
+def test_bot_profile_stamped_user_token_post_is_human():
+    """Slack also stamps ``bot_id``/``bot_profile`` (not just ``app_id``) on some
+    user-token posts — observed live: ``chat.postMessage`` with ``xoxp-`` delivered as
+    ``{user: U_human, bot_id: B..., bot_profile: {...}, app_id: A..., no client_msg_id}``.
+    The allowlist must be consulted before the bot short-circuit or those human posts
+    are silently dropped. Loop safety holds: an app's own ``xoxb`` posts carry the
+    *bot's* user id, which is never in a human allowlist."""
+    adapter = _make_adapter({"api_human_users": HUMAN_ID})
+    stamped = _api_post(bot_id="B_stamp", bot_profile={"id": "B_stamp", "name": "Front-end"})
+    assert adapter._event_declares_bot_sender(stamped) is False
+    # A non-allowlisted user with the same stamps stays bot-classified.
+    assert adapter._event_declares_bot_sender(
+        _api_post(user="U_stranger", bot_id="B_stamp")) is True
+    # The bot's own posts (bot user id, or no user at all) stay bot-classified.
+    assert adapter._event_declares_bot_sender(
+        {"type": "message", "bot_id": "B_stamp", "app_id": "A_frontend", "text": "hi"}) is True
+
+
+def test_own_bot_never_rides_allowlist():
+    """Our own bot user stays a bot even if listed, so its posts cannot loop back in."""
+    adapter = _make_adapter({"api_human_users": [HUMAN_ID, BOT_ID]})
+    adapter._team_bot_user_ids = {"T1": BOT_ID}
+    assert adapter._event_declares_bot_sender(_api_post(user=BOT_ID)) is True
+    assert adapter._event_declares_bot_sender(_api_post(user=BOT_ID, bot_id="B_own")) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowlisted", [True, False])
+async def test_bot_id_stamped_user_token_post_reaches_handler_as_human(allowlisted):
+    """End to end through the inbound handler under the default ``allow_bots: none``:
+    allowlisted, the stamped post reaches ``handle_message`` as a human (``is_bot`` False,
+    which gateway authorization and turn origin rely on); otherwise it is dropped."""
+    extra = {"api_human_users": [HUMAN_ID]} if allowlisted else {}
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake", extra=extra))
+    adapter._app = MagicMock()
+    adapter._app.client = AsyncMock()
+    adapter._bot_user_id, adapter._team_bot_user_ids = BOT_ID, {"T1": BOT_ID}
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+    adapter._resolve_user_name = AsyncMock(return_value="Human")
+    adapter._resolve_user_is_bot = AsyncMock(return_value=False)
+    await adapter._handle_slack_message(_api_post(
+        bot_id="B_frontend", text=f"<@{BOT_ID}> what is 6+6?", channel="C1",
+        channel_type="channel", team="T1", ts="1700000000.000100"))
+    if not allowlisted:
+        adapter.handle_message.assert_not_awaited()
+        return
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].source.is_bot is False

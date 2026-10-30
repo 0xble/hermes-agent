@@ -299,7 +299,7 @@ def _finish_debug(call_name: str, debug_call_data: dict, error_msg: Optional[str
     return None if error_msg is None else tool_error(error_msg)
 
 
-def web_search_tool(query: str, limit: int = 5, session_id: Optional[str] = None) -> str:
+def web_search_tool(query: str, limit: int = 5, session_id: Optional[str] = None, *, stakes: str | None = None) -> str:
     """Search the web via the configured backend.
 
     Returns a JSON string ``{"success": bool, "data": {"web": [{"title", "url", "description", "position"},
@@ -336,7 +336,7 @@ def web_search_tool(query: str, limit: int = 5, session_id: Optional[str] = None
             response_data = {"success": False, "error": _no_provider_error("search", fallback)}
         else:
             logger.info("Web search via %s: '%s' (limit: %d)", provider.name, query, limit)
-            response_data = _memoized_search(provider, query, limit, session_id=session_id)
+            response_data = _memoized_search(provider, query, limit, session_id=session_id, stakes=stakes)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -484,21 +484,28 @@ def _search_with_cache(
             return response_data, budget_warning
 
 
-def _memoized_search(provider, query: str, limit: int, session_id: Optional[str] = None) -> dict:
+def _memoized_search(provider, query: str, limit: int, session_id: Optional[str] = None, *, stakes: str | None = None) -> dict:
     """TTL memo + cross-process coalescing around the remote vendor call.
 
     The cache is after provider/safety resolution and stores only successful,
     non-rescued responses. Search identity includes endpoint, backend, search
-    type, and freshness class even though the current public tool exposes only
-    the default values for the latter two.
+    type, and freshness class. Quality selection happens before every lookup.
     """
     from tools.web_result_cache import slice_search_response
 
+    # Older duck-typed plugins need not implement the additive preparation API.
+    if callable(getattr(type(provider), "prepare_search", None)):
+        provider = provider.prepare_search(query, stakes=stakes)
     cache_provider, cache_identity = _search_cache_identity(provider)
     response_data, budget_warning = _search_with_cache(
         provider, query, limit, session_id, cache_provider, cache_identity
     )
 
+    reason = getattr(provider, "SEARCH_TYPE_REASON", None)
+    if isinstance(reason, str) and response_data.get("success"):
+        # Auto cache entries can be shared by default, high, and protected calls.
+        # The reason describes this request, not the request that populated it.
+        response_data = {**response_data, "data": {**response_data["data"], "search_type_reason": reason}}
     if budget_warning:
         response_data = json.loads(json.dumps(response_data))
         warnings = response_data.setdefault("warnings", [])
@@ -641,6 +648,11 @@ WEB_SEARCH_SCHEMA = {
                 "type": "string",
                 "description": "The search query to look up on the web. You may include backend-supported operators such as site:example.com, filetype:pdf, intitle:word, -term, or \"exact phrase\"."
             },
+            "stakes": {
+                "type": "string",
+                "enum": ["standard", "high"],
+                "description": "Optional. standard: low-stakes lookups where some error is cheap (docs, APIs, product specs, how-tos, recipes, navigation, background); may use a cheaper search tier. Omit or pass high for legal, financial, tax, medical, compliance, official sources, news, prices, safety, time-sensitive or costly-if-wrong work. When unsure, omit."
+            },
             "limit": {
                 "type": "integer",
                 "description": "Maximum number of results to return. Defaults to 5.",
@@ -678,7 +690,8 @@ WEB_EXTRACT_SCHEMA = {
 registry.register(
     name="web_search", toolset="web", schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(
-        args.get("query", ""), limit=args.get("limit", 5), session_id=kw.get("session_id")
+        args.get("query", ""), limit=args.get("limit", 5), session_id=kw.get("session_id"),
+        stakes=args.get("stakes"),
     ),
     check_fn=check_web_api_key, requires_env=_web_requires_env(), emoji="🔍",
     max_result_size_chars=100_000,

@@ -178,6 +178,9 @@ async def test_submit_claim_and_discard_behind_a_held_writer_leave_the_loop_free
             tmp_path, lambda: authority.resolve_unknown(ACTOR, REF, receipt.admission_id, row['generation']))
         assert (resolved.status, resolved.outcome) == ('terminal', 'interrupted')
         assert get_session_admission(db, admission_id=receipt.admission_id)['status'] == 'terminal'
+        # Discard queues the terminal media cleanup as its own tracked task, never awaited inline.
+        from gateway.session_ingress_media import media_releases_idle
+        await asyncio.wait_for(media_releases_idle(authority), 10)
         assert not mutation_tasks(authority)
 
 

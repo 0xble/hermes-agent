@@ -10,8 +10,8 @@ a shallow clone:
    cherry-picks on top of the remote tip look like "update available" even
    though HEAD already contains the remote tip.
 
-The module's safety rules are also pinned: a *young* lock or a *running git
-process* must never be cleared.
+The module's safety rules are also pinned: a *young* lock or a *running target
+Git owner* must never be cleared.
 """
 
 from __future__ import annotations
@@ -69,17 +69,14 @@ def _touch(path: Path, age_seconds: float) -> None:
 def no_git_running(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the process guard: pretend no git process is running.
 
-    The removal tests exercise the sweep itself, not the guard.  Without
-    this pin they are flaky on CI: the parallel per-file test runner is
-    almost always running a real ``git`` subprocess somewhere, the
-    ``pgrep -x git`` probe hits, and the sweep (correctly) refuses to
-    remove anything — failing the assertion for reasons unrelated to the
-    code under test.  The guard's own behavior is pinned separately in
-    :func:`test_clear_skips_sweep_while_git_running`.
+    Removal tests exercise the sweep, not process inspection. Concurrent
+    subprocess inspection can conservatively veto the sweep on a busy host.
+    Owner classification is covered in test_gitlock_process_scope.py.
     """
-    from hermes_cli import gitlock
+    from hermes_cli import _git_process_scope, gitlock
 
     monkeypatch.setattr(gitlock, "_git_proc_running", lambda: False)
+    monkeypatch.setattr(_git_process_scope, "git_process_running_for", lambda _root, _fallback: False)
 
 
 def test_clear_removes_stale_shallow_lock(repo: Path, no_git_running: None) -> None:
@@ -99,10 +96,10 @@ def test_clear_removes_all_stale_lock_kinds(repo: Path, no_git_running: None) ->
 
 
 def test_clear_skips_sweep_while_git_running(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A running git process must block the sweep even for stale locks."""
-    from hermes_cli import gitlock
+    """A possible target Git owner must block the sweep even for stale locks."""
+    from hermes_cli import _git_process_scope
 
-    monkeypatch.setattr(gitlock, "_git_proc_running", lambda: True)
+    monkeypatch.setattr(_git_process_scope, "git_process_running_for", lambda _root, _fallback: True)
     _touch(repo / ".git" / "shallow.lock", STALE_LOCK_MIN_AGE_SECONDS + 60)
     removed = clear_stale_git_locks(repo)
     assert removed == []

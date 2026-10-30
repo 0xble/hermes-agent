@@ -375,6 +375,8 @@ DEFAULT_CONFIG = {
         # ["/home/user/.hermes/cache/documents:/output"]. For gateway MEDIA delivery, write to
         # /output/... inside Docker and emit the host-visible path in MEDIA:, not the container one.
         "docker_volumes": [],
+        # Read-only credential, skills and cache mounts. Disable to skip automatic collection.
+        "docker_auto_mount_host_state": True,
         "docker_mount_cwd_to_workspace": False,  # mount host cwd at /workspace (weakens isolation)
         "docker_network": True,  # false = --network=none, no network access from commands
         "docker_extra_args": [],        # Extra flags passed verbatim to docker run
@@ -1479,6 +1481,12 @@ DEFAULT_CONFIG = {
         "min_continuation_gap_seconds": 900,
         # Fork patch: committed agent goal_set receipts surface as notices; /goal replies don't.
         "auto_notices": True,
+    },
+    # Supervisor check-ins, automatic reassurance while gateway-owned work remains.
+    "checkins": {
+        "enabled": True,
+        "first_after_seconds": 1200,  # Both durations have a 300-second floor.
+        "interval_seconds": 1800,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially

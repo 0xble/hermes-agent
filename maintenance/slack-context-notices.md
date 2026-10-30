@@ -31,7 +31,7 @@ agent producers never load the gateway package
 | Loop manager and command output, `hermes_cli/loops.py` | Set/revise/replace/clear/stop/resume, done, count cap completion | Safety cap pauses and failures |
 | Agent lifecycle producers, `agent/status_output.py` | Explicitly marked fallback/recovery/compaction/lease/memory/review progress | Unmarked diagnostics and action-needed errors |
 | Credit producers, `agent/credits_tracker.py` | Usage, grant spent, restored | Depleted credits and payment action. Unmarked credit notices stay full, even at info/success severity |
-| Attended routing, `gateway/run_turn_runner.py` | Switch to/from attended, successful automatic retries | Failure prompts and dead subagents |
+| Attended routing, `gateway/run_turn.py`, `gateway/run_turn_runner.py` | Switch to/from attended, successful automatic retries, attended unavailable while a working default continues | Failure prompts and dead subagents |
 | Busy/delegation acknowledgement producer, `gateway/run_busy.py` | Queued, steered, redirected, interrupting, subagent-working and compressing acknowledgements, including optional onboarding hints | Unmarked busy replies, escalation, failures and requests for user action |
 | Display/busy settings, `gateway/slash_commands.py` | Saved verbose, busy and footer receipts, retaining busy's `EphemeralReply` contract | Status, usage, unknown values, disabled controls and failed saves |
 | Command producers, `gateway/slash_commands_model.py` | Model/reasoning/fast/personality/runtime setting confirmations | Invalid selections, failed saves, guard/approval prompts |
@@ -66,7 +66,12 @@ cron-health, heartbeat and busy-routing suites. Coverage drives actual settings
 and autonomy handlers through command delivery, persisted control outcomes
 through the outbox drain, scoped cron home-channel delivery, busy composition
 and sent metadata, and real credit producers through the threaded callback.
-Transport clients are faked, not formatters.
+Transport clients are faked, not formatters. Cached attended-unavailable coverage
+drives runtime resolution, one-shot session consumption, the request-boundary
+callback, and actual Slack payloads. The producer marks only the recoverable
+working-default notice. Tests preserve diagnostic suppression, session isolation,
+repeat-boundary deduplication, unchanged Telegram text, and full-size unmarked
+credentials, login, and model-access prompts.
 
 `tests/gateway/test_telegram_ingress_nonblocking.py` drives busy acknowledgements
 through the native ingress-consumer boundary with a real `MessageEvent` and

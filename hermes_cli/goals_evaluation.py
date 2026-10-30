@@ -61,6 +61,8 @@ def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: S
             raise GoalEvaluationConflict
         if precondition is not None:
             precondition(cursor)
+        from hermes_cli.goals_peers import validate_peer_completion
+        validate_peer_completion(state)
         if state.to_json() != expected:
             state.mutation_id = uuid.uuid4().hex
             db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)

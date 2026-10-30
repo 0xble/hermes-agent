@@ -1,6 +1,7 @@
 """A settled native input stays on disk while the transcript still tells a follow-up turn where it
 is saved (dokterdok N28), in whichever spelling the note used, and is bounded by main's 24 h media
 age once settled, as main's document cache cleanup bounded the staging copy the note used to name."""
+from contextlib import contextmanager
 import os
 import time
 
@@ -48,5 +49,36 @@ def test_settled_native_document_named_by_the_transcript_survives_settlement(tmp
         monkeypatch.setattr(media_module, '_last_sweep', {}, raising=False)
         release_admission_media(db, row['admission_id'])
         assert not os.path.exists(retained) and list(_media_root().iterdir()) == []
+    finally:
+        db.close()
+
+
+def test_the_history_owner_check_reads_only_the_admitting_conversations(tmp_path, monkeypatch):
+    """The settled bytes stay while their own conversation's family (here a compression or branch
+    child) names them, and the check reads those sessions through the session index: never every
+    transcript row, which took 13 minutes on an 86 GB store and stalled the chat's FIFO."""
+    import gateway.session_ingress_media as media_module
+    monkeypatch.setattr(media_module, '_last_sweep', {}, raising=False)
+    db, row, retained = _settled_native_document(tmp_path, monkeypatch, lambda path: 'page 3?')
+    try:
+        db.create_session('child', source='telegram', parent_session_id='s')
+        db.create_session('elsewhere', source='telegram')
+        db.append_message('child', 'user', f'It is saved at: {retained}')
+        statements = []
+        original_read_ctx = db._read_ctx
+
+        @contextmanager
+        def traced_read_ctx(*args, **kwargs):
+            with original_read_ctx(*args, **kwargs) as read:
+                read.set_trace_callback(statements.append)
+                try:
+                    yield read
+                finally:
+                    read.set_trace_callback(None)
+        monkeypatch.setattr(db, '_read_ctx', traced_read_ctx)
+        release_admission_media(db, row['admission_id'])
+        assert os.path.exists(retained), 'its own conversation family still names the bytes'
+        scans = [sql for sql in statements if 'FROM messages' in sql and 'instr(content' in sql]
+        assert scans and all('INDEXED BY idx_messages_session_id' in sql for sql in scans), scans
     finally:
         db.close()
