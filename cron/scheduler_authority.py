@@ -159,6 +159,24 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         error = f'{type(exc).__name__}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
 
+def _settled_now(journal):
+    """Recovery stamps canonical_settled after import; re-read rather than trust the pre-recover copy."""
+    try:
+        return bool(json.loads(journal.read_text(encoding='utf-8-sig')).get('canonical_settled'))
+    except (OSError, ValueError):
+        return False
+
+
+def _set_aside_unsettled(journal):
+    """Move an unimported capture out of the replay glob, keeping its bytes."""
+    import logging
+    target = journal.with_name(journal.name + '.unsettled')
+    journal.replace(target)
+    logging.getLogger(__name__).warning(
+        'cron journal %s kept as %s: terminal admission did not import its captured result',
+        journal.name, target.name)
+
+
 def reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
 
@@ -218,7 +236,12 @@ def reconcile_pending(*, allow_connect=True):
                 # A terminal admission is final even if its immutable result differs
                 # from the capture and recover could not stamp canonical_settled.
                 if state['status'] == 'terminal':
-                    journal.unlink(missing_ok=True)
+                    if pending_canonical and not _settled_now(journal):
+                        # The capture was never imported, so this journal holds its only
+                        # copy. Retire it from replay without destroying that evidence.
+                        _set_aside_unsettled(journal)
+                    else:
+                        journal.unlink(missing_ok=True)
                     journal.with_suffix('.cancel').unlink(missing_ok=True)
                 continue
             if state['status'] == 'missing':

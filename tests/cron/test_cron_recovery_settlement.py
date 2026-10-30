@@ -51,6 +51,12 @@ def test_captured_terminal_execution_retires_without_rebooking(tmp_path, monkeyp
                             assert journal.read_bytes() == saved_journal
                         else:
                             assert not journal.exists()
+                    kept = journal.with_name(journal.name + '.unsettled')
+                    if admission in ('different', 'no-result'):
+                        # The capture was never imported: its only copy is kept out of replay.
+                        assert kept.read_bytes() == saved_journal
+                    else:
+                        assert not kept.exists()
                     if admission == 'started':
                         assert admission_result(db, row['admission_id'])['result']['cron_result'] == captured
                     assert jobs.get_job(job['id']) == before
