@@ -224,13 +224,14 @@ def _positive_int(name: str, value: Any) -> None:
 
 def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_by: str, limit_sql: str) -> str:
     """Result-row SELECT shared by the FTS and LIKE routes (SQL text is pinned)."""
+    from hermes_state_deletion import visible_session_sql
     return f"""
             SELECT m.id, m.session_id, m.role,
                    {snippet_sql},
                    {_SEARCH_SELECT_TAIL}
             FROM {from_sql}
             JOIN sessions s ON s.id = m.session_id
-            WHERE {' AND '.join(where)}
+            WHERE {visible_session_sql('s.id')} AND {' AND '.join(where)}
             {order_by}
             {limit_sql}
         """
