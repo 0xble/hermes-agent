@@ -18,12 +18,10 @@ commands already inside a slot (``HEAVY_SLOT_HELD``), the opt-out
 ``HERMES_HEAVY_SLOT=off``, hosts without the helper, text that only mentions a
 runner (``grep pytest``, quoted strings, comments, heredoc bodies), and
 targeted runs of 1-10 explicit test files with only single-run options.
-Foreground local commands pass ``HEAVY_SLOT_MAX_WAIT`` derived from their
-terminal timeout, so a busy queue fails before the terminal deadline; background
-commands omit it and retain the helper's unbounded wait. A single simple heavy
-command that reaches this bound can be promoted to a tracked background process
-without re-running a compound shell command. The environment-variable transport
-is backwards-compatible with helpers that predate ``--max-wait``.
+Foreground terminal commands leave admission unbounded and hand the live shell
+to the background registry at their foreground budget only while waiting for a
+slot. Already-admitted work keeps its foreground deadline. Queue age survives and
+compound shells never replay earlier side effects. Gate routing remains unchanged.
 """
 
 from __future__ import annotations
@@ -32,6 +30,8 @@ import logging
 import os
 import re
 import shlex
+import tempfile
+from contextlib import contextmanager
 from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Optional
@@ -350,24 +350,6 @@ def _heavy_positions(command: str) -> list[tuple[int, str]]:
     return found
 
 
-def can_promote_expired_wait(
-    command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None,
-) -> bool:
-    """Whether an expired foreground wait can be safely resumed in the background.
-
-    Re-running a compound shell command could repeat earlier side effects. Restrict
-    promotion to one top-level simple command with one recognized heavy process;
-    callers with chains keep the existing not-started result and explicit retry
-    guidance instead.
-    """
-    if env_type != "local" or not command:
-        return False
-    effective = dict(os.environ)
-    if environment:
-        effective.update(environment)
-    return heavy_slot_enabled(effective) and len(_simple_commands(command)) == 1 and len(_heavy_positions(command)) == 1
-
-
 def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
     """The host helper: the terminal's PATH first, then ``~/.local/bin`` (absent from minimal service PATHs)."""
     from hermes_platform.resolver.core import LookupContext, locate_command
@@ -379,13 +361,13 @@ def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
 
 def wrap_heavy_command(
     command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None,
-    max_wait_seconds: Optional[int] = None,
+    max_wait_seconds: Optional[int] = None, admission_dir: Optional[str] = None,
 ) -> str:
     """Prefix heavy local commands with ``heavy-slot`` and optionally bound its queue wait."""
     if env_type != "local" or not command:
         return command
     try:
-        return _wrap_local(command, environment, max_wait_seconds=max_wait_seconds)
+        return _wrap_local(command, environment, max_wait_seconds=max_wait_seconds, admission_dir=admission_dir)
     except Exception:  # throttling is best-effort and must never break the terminal
         logger.debug("heavy-slot wrapping failed; running the command unwrapped", exc_info=True)
         return command
@@ -393,6 +375,7 @@ def wrap_heavy_command(
 
 def _wrap_local(
     command: str, environment: Optional[Mapping[str, str]], *, max_wait_seconds: Optional[int],
+    admission_dir: Optional[str] = None,
 ) -> str:
     effective = dict(os.environ)
     if environment:
@@ -408,10 +391,28 @@ def _wrap_local(
     rewritten = command
     for offset, label in reversed(positions):
         rewritten = rewritten[:offset] + f"{_DISPATCH} {shlex.quote('hermes ' + label)} " + rewritten[offset:]
-    return _dispatcher(executable, max_wait_seconds=max_wait_seconds) + rewritten
+    return _dispatcher(executable, max_wait_seconds=max_wait_seconds, admission_dir=admission_dir) + rewritten
 
 
-def _dispatcher(executable: str, *, max_wait_seconds: Optional[int] = None) -> str:
+@contextmanager
+def foreground_heavy_command(command: str, *, env_type: str, environment=None):
+    """Track only pending helper admission, not elapsed payload execution.
+
+    The admitted payload removes its marker before exec. The directory lives
+    only until the foreground wait returns, including adoption, so background
+    commands need no cleanup callback and later dispatches skip tracking.
+    """
+    if env_type != "local":
+        yield command, None
+        return
+    with tempfile.TemporaryDirectory(prefix="hermes-admission-") as directory:
+        rewritten = wrap_heavy_command(command, env_type=env_type, environment=environment,
+                                       admission_dir=directory)
+        yield rewritten, lambda: any(Path(directory).iterdir())
+
+
+def _dispatcher(executable: str, *, max_wait_seconds: Optional[int] = None,
+                admission_dir: Optional[str] = None) -> str:
     """Shell function the rewritten commands call.
 
     A name the session shell resolves itself (alias, function, builtin) runs exactly as
@@ -425,6 +426,33 @@ def _dispatcher(executable: str, *, max_wait_seconds: Optional[int] = None) -> s
     wait_env = ""
     if max_wait_seconds is not None:
         wait_env = f"HEAVY_SLOT_MAX_WAIT={shlex.quote(str(max_wait_seconds))} "
-    run_in_slot = f'{wait_env}{shlex.quote(executable)} --label "$_hermes_hs_label (in $PWD)" -- "$@"'
+    payload = '"$@"'
+    track = ""
+    if admission_dir is not None:
+        # Per-invocation files also cover pipelines and repeated heavy commands.
+        # mktemp may fail after adoption removed the directory. In that case the
+        # payload still runs normally and does not recreate tracking state.
+        template = shlex.quote(str(Path(admission_dir) / "wait.XXXXXXXX"))
+        # The admission trampoline hides argv from the helper's classifier.
+        # Preserve its exact-head bin/ci eligibility via its existing label form.
+        # Prefix utilities remain ordinary work, just as without the trampoline.
+        gate_label = (
+            '_hermes_hs_gate=$1; _hermes_hs_profile=${2-}; _hermes_hs_sha=${3-${CI_EXPECTED_SHA-}}; '
+            'case "${1##*/}" in bash|sh|zsh) _hermes_hs_gate=${2-}; '
+            '_hermes_hs_profile=${3-}; _hermes_hs_sha=${4-${CI_EXPECTED_SHA-}} ;; esac; '
+            'case "$_hermes_hs_gate" in bin/ci|*/bin/ci) '
+            'case "$_hermes_hs_profile" in gate|ready) '
+            'if [ "${#_hermes_hs_sha}" -eq 40 ]; then '
+            'case "$_hermes_hs_sha" in *[!0-9a-f]*) ;; *) '
+            '_hermes_hs_label="bin/ci $_hermes_hs_profile $_hermes_hs_sha" ;; esac; fi ;; esac ;; esac; '
+        )
+        track = gate_label + f'_hermes_hs_wait=$(mktemp {template} 2>/dev/null) || _hermes_hs_wait=; '
+        admitted = shlex.quote('rm -f -- "$1"; shift; exec "$@"')
+        payload = f'sh -c {admitted} hermes-admitted "$_hermes_hs_wait" "$@"'
+    run_in_slot = f'{wait_env}{shlex.quote(executable)} --label "$_hermes_hs_label (in $PWD)" -- {payload}'
+    if admission_dir is not None:
+        # A helper failing before admission must not leave a pending marker.
+        run_in_slot = (f'{track}if {run_in_slot}; then _hermes_hs_rc=0; else _hermes_hs_rc=$?; fi; '
+                       'rm -f -- "$_hermes_hs_wait"; return "$_hermes_hs_rc"')
     return (f'{_DISPATCH}() {{ _hermes_hs_label=$1; shift; case "{resolve}" in '
             f'{shell_owned}) {run_in_shell} ;; *) {run_in_slot} ;; esac; }}\n')
