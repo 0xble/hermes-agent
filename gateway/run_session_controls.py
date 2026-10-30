@@ -475,6 +475,8 @@ class GatewaySessionControlsMixin:
             return f"⌛ Request to {action} this {kind} expired"
         if status == "failed":
             return f"✗ Request to {action} this {kind} failed: {record.get('error') or 'unknown error'}"
+        if status == "applied" and record.get("outcome") == "timed_wait":
+            return f"◷ {record['notice']}. Requested by {requester}."
         verb = {
             "pause": "paused", "resume": "resumed", "clear": "cleared", "stop": "stopped",
             "replace": "replaced",
@@ -510,6 +512,8 @@ class GatewaySessionControlsMixin:
         target = f"{target_title} ({target_id})"
         action = f"{record.get('kind', '')} {record.get('action', '')}"
         if record.get("status") == "applied":
+            if record.get("outcome") == "timed_wait":
+                return f"✓ {record['notice']} in {target}."
             authority = record.get("authority") or {}
             if authority.get("via") == "quote":
                 how = "using your quoted words"

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import asdict
@@ -20,6 +21,33 @@ from gateway.telegram_topic_sessions import TopicRequestError
 logger = logging.getLogger(__name__)
 PREFIX = "telegram_retire:"
 NOTICE = "This topic is retiring. Use /retire cancel to keep it."
+# Telegram flood waits and timeouts clear on their own. Retry those automatically instead of
+# failing the retirement (2026-10-29: a FLOOD_WAIT during a handoff relay left a topic "failed").
+_TRANSIENT_MARKERS = ("rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror")
+_TRANSIENT_RETRY_LIMIT = 6
+
+
+def _transient_delay(exc) -> float | None:
+    """Seconds to wait before retrying a transient failure, or None when it is not transient."""
+    text = str(exc).lower().replace("\\", "").replace(" ", "")
+    if not (isinstance(exc, asyncio.TimeoutError) or any(marker in text for marker in _TRANSIENT_MARKERS)):
+        return None
+    match = re.search(r'retry_after_seconds":(\d+)', text)
+    return float(min(max(int(match.group(1)) + 5 if match else 30, 10), 600))
+
+
+def _schedule_retry(runner, source, delay: float) -> None:
+    async def retry():
+        await asyncio.sleep(delay)
+        async with runner._async_profile_scope_for_source(source):
+            await advance(runner, source)
+
+    tasks = getattr(runner, "_telegram_retire_retries", None)
+    if tasks is None:
+        tasks = runner._telegram_retire_retries = set()
+    task = asyncio.get_running_loop().create_task(retry())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
 
 
 def state_key(source):
@@ -373,8 +401,19 @@ async def advance(runner, source):
                 # reconcile read-only evidence without replaying sends/deletes.
                 logger.debug("Topic retirement reconciliation deferred for %s: %s", key, exc)
                 return
-            logger.warning("Topic retirement failed for %s: %s", key, exc, exc_info=True)
             current = await _current(runner, source, generation)
+            delay = _transient_delay(exc)
+            if (current and delay is not None and current["phase"] not in {"deleting", "delete_unresolved"}
+                    and not current.get("closing_attempt")
+                    and int(current.get("transient_retries") or 0) < _TRANSIENT_RETRY_LIMIT):
+                # Nothing destructive has been attempted yet, so the same phase can simply run again.
+                current["transient_retries"] = int(current.get("transient_retries") or 0) + 1
+                await save(runner, source, current)
+                logger.info("Topic retirement for %s hit a transient error; retry %d in %.0fs: %s",
+                            key, current["transient_retries"], delay, exc)
+                _schedule_retry(runner, source, delay)
+                return
+            logger.warning("Topic retirement failed for %s: %s", key, exc, exc_info=True)
             if current:
                 current["phase"] = "delete_unresolved" if current["phase"] in {"deleting", "delete_unresolved"} else "failed"
                 current["error"] = str(exc)

@@ -543,7 +543,15 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     if result is False or (result is None and not cleared_goal):
         code = f"nothing_to_{action}"
         return {"result": {"ok": False, "error_code": code, "error": code}, "state": state}
-    return {"result": result, "state": state}
+    receipt = {"result": result, "state": state}
+    if (kind, action) == ("goal", "pause") and (authority or {}).get("via") == "autonomy":
+        seconds = state.waiting_seconds
+        duration = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} sec"
+        receipt.update(
+            outcome="timed_wait", wait_seconds=seconds, waiting_until=state.waiting_until,
+            notice=f"Goal waiting {duration} (autonomous timed wait, no approval); still active",
+        )
+    return receipt
 
 
 def _session_title(session_id: str, *, cursor=None) -> str:
@@ -917,7 +925,10 @@ def _definition_key(kind: str, session_id: str) -> str:
     return f"{'goal' if kind == 'goal' else 'loop'}:{session_id}"
 
 
-def _bind_continuation(record: Dict[str, Any], result: Dict[str, Any], cursor) -> None:
+def _bind_control_result(record: Dict[str, Any], result: Dict[str, Any], cursor) -> None:
+    for key in ("outcome", "wait_seconds", "waiting_until", "notice"):
+        if key in result:
+            record[key] = result[key]
     if result.get("continuation_prompt"):
         record["continuation_prompt"] = result["continuation_prompt"]
         raw = _meta_value(cursor, _definition_key(record["kind"], record["target_session_id"]))
@@ -1106,7 +1117,7 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                              expires_at=None, affected_text=affected_before, cursor=conn)
         record["resolved_at"], record["error"] = now, code or None
         record["current_max_turns"] = _current_max_turns(kind, raw)
-        _bind_continuation(record, result, conn)
+        _bind_control_result(record, result, conn)
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,
                 **({"error_code": code, "error": code} if code else {}), **result}
@@ -1244,7 +1255,7 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
             manager_result = result.get("result")
             if isinstance(manager_result, dict) and not manager_result.get("ok", True):
                 raise ValueError(manager_result.get("error_code") or manager_result.get("error") or "apply_failed")
-            _bind_continuation(record, result, conn)
+            _bind_control_result(record, result, conn)
             record["status"], record["error"] = "applied", None
         except Exception as exc:
             conn.execute("ROLLBACK TO session_control_apply")
