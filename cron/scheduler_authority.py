@@ -167,6 +167,14 @@ def _settled_now(journal):
         return False
 
 
+def _capture_unsettled(journal, record, pending, received):
+    """True when the journal holds a capture that neither recovery nor the booked receipt imported."""
+    if not pending or _settled_now(journal):
+        return False
+    captured = (record.get('worker_result') or {}).get('result')
+    return json.dumps(captured) != json.dumps(received)
+
+
 def _set_aside_unsettled(journal):
     """Move an unimported capture out of the replay glob, keeping its bytes."""
     import logging
@@ -236,7 +244,7 @@ def reconcile_pending(*, allow_connect=True):
                 # A terminal admission is final even if its immutable result differs
                 # from the capture and recover could not stamp canonical_settled.
                 if state['status'] == 'terminal':
-                    if pending_canonical and not _settled_now(journal):
+                    if _capture_unsettled(journal, record, pending_canonical, state.get('result')):
                         # The capture was never imported, so this journal holds its only
                         # copy. Retire it from replay without destroying that evidence.
                         _set_aside_unsettled(journal)
@@ -277,9 +285,7 @@ def reconcile_pending(*, allow_connect=True):
             if finish_completed_run(delivery, None, params['request_id'], recovered=True):
                 # No execution row may remain to fence the next tick (legacy or
                 # pruned runs). Successful recovery is itself terminal bookkeeping.
-                captured = (record.get('worker_result') or {}).get('result')
-                if (pending_canonical and not _settled_now(journal)
-                        and json.dumps(captured) != json.dumps(received)):
+                if _capture_unsettled(journal, record, pending_canonical, received):
                     # Booked from a receipt that is not the capture: keep the capture's only copy.
                     _set_aside_unsettled(journal)
                 else:
