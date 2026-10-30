@@ -577,7 +577,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             loop_tick = [metadata.get("loop_wakeup_instance"), metadata.get("loop_wakeup_tick")]
         else:
             # Older in-process callers stamped the same exact identity under this name. Keep the
-            # compatibility path strict to a two-part tick; no text-only completion is accepted.
+            # compatibility path strict to a two-part tick; tick settlement still requires its identity.
             legacy_tick = metadata.get("gateway_loop_tick")
             if isinstance(legacy_tick, (list, tuple)) and len(legacy_tick) == 2:
                 loop_tick = list(legacy_tick)
@@ -744,7 +744,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not loop_tick and event is not None:
             loop_tick = self._post_turn_goal_identity(event).get("loop_tick")
         hooks = [("loop completion", self._post_turn_loop_completion,
-                  {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None})]
+                  {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None,
+                   "loop_identity": getattr(event, "_loop_completion_identity", None)})]
         if successful:
             # Any delivery into the session is fresh evidence and pierces a goal wait: process or
             # delegation results, watcher/cron/kanban wakes, plugin injections. Only the goal's own
@@ -885,16 +886,23 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _post_turn_loop_completion(
         self, *, session_entry: Any, source: Any, final_response: str,
-        loop_tick: Optional[tuple] = None,
+        loop_tick: Optional[tuple] = None, loop_identity: Optional[tuple] = None,
     ) -> None:
-        """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
-        (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
-        / --until judge / caps and schedules the next tick for the idle wakeup watcher.
+        """Honor explicit completion from the observed loop, or settle an exact wake tick.
 
-        A normal user turn has no loop-tick identity. It must not settle a claimed wakeup merely
-        because the session currently has one awaiting response; only the synthetic event carrying
-        the exact ``gateway_loop_tick`` may do that.
+        A successful final marker from any turn may finish its captured loop definition.
+        Other replies only settle the exact tick they answered. Older unstamped callers
+        retain tick-only settlement and cannot stop a replacement loop by accident.
         """
+        if loop_identity is not None and loop_tick is None:
+            from gateway.loop_completion import complete_loop_response
+            message = await self._run_in_executor_with_context(
+                complete_loop_response, session_entry.session_id, loop_identity, final_response,
+            )
+            if message:
+                if source is not None:
+                    await self._defer_goal_status_notice_after_delivery(source, message, goal_notice=False)
+                return
         def _load():
             from hermes_cli.loops import LoopManager
             return lambda sid: LoopManager(session_id=sid)

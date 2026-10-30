@@ -66,7 +66,21 @@ cadence/quote-authority policy.
 
 The gateway admits a wake with 1 stored-row compare-and-swap that both claims the tick and marks it `started`. The transaction checks the stored loop instance, active/idle state, tick count, control generation and schedule, and records the wake's run-generation token. Loop discovery binds only the existing home context, so admission runs before turn preparation, profile hydration, `agent:start`, command hooks, command dispatch or model work. A failed admission CAS starts no work. An admitted tick is never refundable, even if adapter admission fails or a producer is cancelled after an effect.
 
-On startup or a later scan, recovery first proves that no live, admitted, queued or restart-recovering turn owns the tick, and repeats that check at the stored-row settlement boundary. It consumes an interrupted tick as skipped with an unknown outcome and schedules the next tick on the stored cadence. It never replays the interrupted tick or pauses the loop awaiting inspection. Legacy `claimed`, `executing` and unmarked rows also have unknown outcomes and follow the same recovery rule. Post-turn settlement requires the synthetic wake's exact `gateway_loop_tick` identity. Unrelated human/internal turns, missing or malformed identities, and stale loop-instance/tick identities leave the claim untouched, even when their response contains `LOOP_COMPLETE`.
+On startup or a later scan, recovery first proves that no live, admitted, queued or restart-recovering turn owns the tick, and repeats that check at the stored-row settlement boundary. It consumes an interrupted tick as skipped with an unknown outcome and schedules the next tick on the stored cadence. It never replays the interrupted tick or pauses the loop awaiting inspection. Legacy `claimed`, `executing` and unmarked rows also have unknown outcomes and follow the same recovery rule. Tick settlement requires the synthetic wake's exact `gateway_loop_tick` identity. Missing or malformed identities and stale loop-instance/tick identities cannot settle a claim.
+
+Explicit final `LOOP_COMPLETE` is separate from tick settlement. Before each gateway model turn,
+including a queued follow-up, the gateway captures the active loop's session, instance, definition
+version and control generation off the event loop. A successful final marker from a user, goal,
+relay or loop turn atomically finishes that captured definition, whether idle, started or already
+recovered as skipped. Completion clears `awaiting_response` and advances the existing control
+fence, so a claimed wake cannot start afterward and an old settlement cannot revive it. A revision,
+replacement, pause/resume, another session or failed turn cannot inherit the completion. Queued
+chains carry the terminal turn's captured identity, including absence. Older callers without a
+capture retain exact-tick behavior. No marker changes a loop created during the answering turn.
+
+The model-facing loop tool's existing `LOOP_COMPLETE` route now works from ordinary gateway
+turns too. User `/loop stop` remains the unconditional explicit stop route. The marker remains
+present in raw final output for control processing before display filtering.
 
 A due wake defers before claiming whenever another live, admitted, queued or restart-recovering turn owns the conversation. The admission CAS repeats the local ownership check. An owner appearing after successful admission leaves a consumed tick for recovery, never a refunded tick or wake text offered as a human reply. Gateway-authored synthetic events (`internal`) never answer pending clarify, `/update` or slash-confirm prompts, including the adapter's inline clarify bypass. Explicit `/new` retires the old conversation's loop and goal. Compression follows the existing lineage tip and preserves responsibility. `/resume` and topic rebinds are reversible, so a loop whose route resolves to another, non-tip session defers untouched until the route returns; the scanner never retires a loop. A restart marker counts as an owner only inside the auto-resume freshness window. The loop and goal scanners share one stale-marker rule: a stale marker is compare-and-swap cleared before the scan acts, and a refreshed marker wins.
 
