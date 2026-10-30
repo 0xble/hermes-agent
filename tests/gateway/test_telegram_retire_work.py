@@ -458,7 +458,8 @@ async def test_control_transfer_refuses_conflicts_and_rolls_back_without_proof(r
         # Identical text is not evidence that an unrelated goal was moved.
         r.db.set_meta(f"{kind}:next", r.db.get_meta(f"{kind}:old"))
     elif failure == "source":
-        changed = {**item["record"], "status": "paused"}
+        # A changed definition is different work. A pause alone is not (it moves paused).
+        changed = {**item["record"], ("goal" if kind == "goal" else "prompt"): "Different work"}
         r.db.set_meta(f"{kind}:old", json.dumps(changed))
     before = (r.db.get_meta(f"{kind}:old"), r.db.get_meta(f"{kind}:next"))
     if failure == "receipt_write":
@@ -1018,11 +1019,14 @@ async def test_control_that_ticked_after_its_handoff_still_transfers(runtime, mo
         loops.save_loop("old", loops.LoopState(prompt="Watch Service", interval_seconds=60))
     item = (await work.inventory(r.runner, r.source, r.state))[0]
     ticked = {**item["record"], "mutation_id": "m-later", "ticks_fired": 7, "turns_used": 3,
-              "last_fired_at": 123.0, "next_due_at": 456.0}
+              "last_fired_at": 123.0, "next_due_at": 456.0, "status": "paused"}
+    if kind == "goal":
+        ticked["gates"] = [{"name": "tests pass", "attempts": 4}]
+        item["record"] = {**item["record"], "gates": [{"name": "tests pass", "attempts": 1}]}
     r.db.set_meta(f"{kind}:old", json.dumps(ticked))
     await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
     assert json.loads(r.db.get_meta(f"{kind}:old"))["status"] == "cleared"
-    assert json.loads(r.db.get_meta(f"{kind}:next"))["status"] == "active"
+    assert json.loads(r.db.get_meta(f"{kind}:next"))["status"] == "paused"  # moved as the judge left it
 
 
 @pytest.mark.asyncio

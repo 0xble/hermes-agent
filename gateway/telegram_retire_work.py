@@ -365,6 +365,16 @@ async def confirm_receipt(runner, source, handoff, dest):
     return {"receipt_id": receipt_id, "address": target, "destination": dest}
 
 
+def _handoff_definition(record):
+    """The authored definition without gate attempt counters, which every failing gate turn advances.
+    Comparison only: definition_digest keeps its fields so in-flight handoff digests still match."""
+    definition = authored_definition(record)
+    if isinstance(definition.get("gates"), list):
+        definition["gates"] = [{key: value for key, value in gate.items() if key != "attempts"}
+                               if isinstance(gate, dict) else gate for gate in definition["gates"]]
+    return definition
+
+
 async def transfer_control(runner, source, state, item, dest):
     """Settle source control and replay proof in one store transaction.
 
@@ -413,12 +423,11 @@ async def transfer_control(runner, source, state, item, dest):
             handoff["control_receipt"] = proof
             db.set_meta(state_key(source), json.dumps(stored), cursor=conn)
             return proof
-        # A running loop or goal advances its counters every tick. Only its authored definition
-        # and status say whether it is still the work that was handed off (2026-10-30: two
-        # retirements failed forever because a loop ticked after its handoff was recorded).
-        current = json.loads(old)
-        if (authored_definition(current) != authored_definition(item["record"])
-                or current.get("status") != item["record"].get("status")):
+        # A running loop or goal advances its counters every tick, and the judge or budget may pause
+        # it. Only its authored definition says whether it is still the work that was handed off
+        # (2026-10-30: two retirements failed forever because a loop ticked after its handoff was
+        # recorded). A paused control moves paused.
+        if _handoff_definition(json.loads(old)) != _handoff_definition(item["record"]):
             raise RuntimeError(f"Cannot transfer {kind}: the source changed after its handoff was recorded")
         if not accepted_task_id and open_control(new):
             raise RuntimeError(f"Cannot transfer {kind}: destination already owns one")
