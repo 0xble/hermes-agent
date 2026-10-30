@@ -146,6 +146,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # retargets ``_message_id`` (fallback resend, split) ends it implicitly.
         self._adopted_unconfirmed: Optional[str] = None
         self._initial_reply_to_id = initial_reply_to_id
+        from gateway.reply_latency import current_receipt
+        self._reply_latency_receipt = current_receipt()
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
         self._run_still_current = run_still_current or (lambda: True)

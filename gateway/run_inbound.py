@@ -310,8 +310,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
         # Capture before any admission buffer can park input for shutdown spooling,
         # including restore gates, compression deferral, and orphan FIFO rescue.
-        if is_genuine_user_message(event) and getattr(event, "_attended_activity_received_at", None) is None:
-            setattr(event, "_attended_activity_received_at", time.time())
+        from gateway.reply_latency import record_received, stamp_received
+        stamp_received(event)
 
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
         startup_restore_keys = getattr(self, "_startup_restore_keys", None)
@@ -347,6 +347,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             await _admit_outbox_event(self, event, source)
             return event, source, True
         if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress
+            record_received(event)
             return event, source, False
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
@@ -395,6 +396,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if not self._admit_bot_message_for_source(source):
                 return None
             event._bot_loop_admitted = True
+        record_received(event)
         await _admit_outbox_event(self, event, source)
         return event, source, False
 
@@ -1728,8 +1730,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return
         if getattr(event, "_attended_activity_task", None) is not None:
             return
-        if getattr(event, "_attended_activity_received_at", None) is None:
-            event._attended_activity_received_at = time.time()
+        from gateway.reply_latency import record_received
+        record_received(event)
         task = asyncio.create_task(self._mark_attended_user_activity(
             event, source, session_key, retry_on_failure=True,
         ))
@@ -1755,9 +1757,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 logger.debug("attended-model receipt task failed", exc_info=True)
             if getattr(event, "_attended_activity_marked", False):
                 return True
-        stamp = getattr(event, "_attended_activity_received_at", None)
-        if stamp is None:
-            stamp = event._attended_activity_received_at = time.time()
+        from gateway.reply_latency import record_received
+        record_received(event)
+        stamp = event._attended_activity_received_at
         try:
             from datetime import datetime
             from gateway.run import _load_gateway_config
@@ -2014,6 +2016,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         _claim_state.turn.started_ts = _claim_state.conversation.last_turn_started_at = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
+        from gateway.reply_latency import bind_agent_start
+        bind_agent_start(event)
         self._persist_active_agents()
         # The admission context is set by the durable executor, not by direct legacy dispatch.
         from gateway.session_ingress import executing_admission
