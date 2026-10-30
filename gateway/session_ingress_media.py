@@ -190,6 +190,7 @@ def ingress_fingerprint(payload, raw=None):
     re-captures them under a fresh staging name (``reconcile_native_retry``)."""
     envelope = {**payload['native_text_v1']}
     envelope.pop('ingress_sha256', None)
+    envelope.pop('attended_activity', None)
     if 'media' in envelope:
         envelope['media'] = [[media['sha256'], media['size']] for media in envelope['media']]
     received = {**payload, 'native_text_v1': envelope}
@@ -214,6 +215,15 @@ def reconcile_native_retry(db, *, principal_id, session_id, request_id, payload,
         row = conn.execute('SELECT status, payload_json FROM session_admissions WHERE principal_id=? AND '
                            'target_session_id=? AND request_id=?', (principal_id, session_id, request_id)).fetchone()
     retained = json.loads(row[1]) if row is not None else {}
+    if row is not None:
+        # Re-delivery's local receipt clock/status cannot change the original admission digest.
+        envelope = {**payload['native_text_v1']}
+        activity = retained.get('native_text_v1', {}).get('attended_activity')
+        if activity is not None:
+            envelope['attended_activity'] = activity
+        else:
+            envelope.pop('attended_activity', None)
+        payload = {**payload, 'native_text_v1': envelope}
     recorded = retained.get('native_text_v1', {}).get('ingress_sha256')
     if recorded is not None and recorded == ingress_fingerprint(payload, raw):
         resolved = retained
