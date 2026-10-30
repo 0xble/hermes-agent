@@ -64,10 +64,12 @@ def host_obligation_path(install_root: Path | None = None) -> Path:
     if install_root is None:
         try:
             # Lazy: historical takeover interpreters may lack release dependencies.
-            from hermes_constants import get_hermes_home
+            from hermes_constants import get_default_hermes_root, get_hermes_home
             from hermes_cli.immutable_releases import update_source_checkout
 
-            root = update_source_checkout(get_hermes_home(), root) or root
+            # A named profile's home holds no release layout; the installation root does.
+            installation = get_default_hermes_root(home=get_hermes_home())
+            root = update_source_checkout(installation, root) or root
         except ImportError:
             logger.debug("Immutable release resolver unavailable; using the running tree's obligation key")
     install = os.path.normcase(str(root))

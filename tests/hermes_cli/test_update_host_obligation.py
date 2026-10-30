@@ -29,54 +29,87 @@ SHA = "a" * 40
 
 
 @pytest.mark.parametrize("immutable", [False, True])
-def test_default_obligation_identity_agrees_with_gateway(tmp_path, monkeypatch, immutable):
-    """Source and release callers arm, observe and discharge one installation's debt."""
+@pytest.mark.parametrize("binding", ["environment", "context"])
+def test_default_obligation_identity_agrees_with_gateway(tmp_path, monkeypatch, immutable, binding):
+    """Default and named profiles share the journal-bound debt through real root resolution."""
+    import subprocess
+    from contextlib import contextmanager
+    from pathlib import Path
+
     from gateway import update_notifications
-    from hermes_cli import immutable_releases
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    home = tmp_path / "home"
-    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home = tmp_path / ".hermes"
+    homes = {"default": home, "coder": home / "profiles/coder", "writer": home / "profiles/writer"}
+    for profile_home in homes.values():
+        profile_home.mkdir(parents=True, exist_ok=True)
+        (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     source = tmp_path / "source"
-    running = home / "releases" / SHA if immutable else source
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "commit", "--allow-empty", "-qm", "fixture"], check=True)
+    release = home / "releases" / SHA
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(SHA + "\n", encoding="utf-8")
+    (home / "current").symlink_to(release, target_is_directory=True)
+    (home / "release-layout.json").write_text(json.dumps({"source": str(source)}), encoding="utf-8")
+    running = release if immutable else source
+    # A multiplex activity must use its bound installation, not the process's launch home.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-install"))
     monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "host-state"))
-
-    def source_checkout(actual_home, root):
-        assert actual_home == home
-        assert root in (source, running)
-        return source
-
-    monkeypatch.setattr(immutable_releases, "update_source_checkout", source_checkout)
     monkeypatch.setattr(host_obligation, "__file__", str(source / "hermes_cli/update_host_obligation.py"))
-    source_path = host_obligation.host_obligation_path(source)
-    assert host_obligation.write_host_obligation(expected_sha=SHA)
-    assert source_path.is_file()
-
-    monkeypatch.setattr(host_obligation, "__file__", str(running / "hermes_cli/update_host_obligation.py"))
     monkeypatch.setattr(update_notifications, "__file__", str(running / "gateway/update_notifications.py"))
-    assert update_notifications._update_recovery_pending(home)
-    assert host_obligation.host_obligation_present()
-    assert host_obligation.read_host_obligation()["expected_sha"] == SHA
-    assert host_obligation.host_obligation_path() == source_path
+    source_path = host_obligation.host_obligation_path(source)
 
-    host_obligation.clear_host_obligation()
-    assert not source_path.exists()
-    assert not host_obligation.host_obligation_present()
-    assert host_obligation.read_host_obligation() is None
-    assert not update_notifications._update_recovery_pending(home)
+    @contextmanager
+    def enter(profile):
+        with monkeypatch.context() as scope:
+            token = set_hermes_home_override(homes[profile] if binding == "context" else None)
+            if binding == "environment":
+                scope.setenv("HERMES_HOME", str(homes[profile]))
+            try:
+                yield
+            finally:
+                reset_hermes_home_override(token)
 
-    assert host_obligation.write_host_obligation(expected_sha=SHA, owner="update")
+    with enter("default"):
+        assert host_obligation.write_host_obligation(expected_sha=SHA)
     assert source_path.is_file()
-    host_obligation.release_host_obligation("update")
+    monkeypatch.setattr(host_obligation, "__file__", str(running / "hermes_cli/update_host_obligation.py"))
+    if immutable:
+        assert host_obligation.host_obligation_path(running) != source_path  # explicit roots override resolution
+
+    for profile in ("default", "coder", "writer", "coder", "default"):
+        with enter(profile):
+            assert host_obligation.host_obligation_path() == source_path
+            assert host_obligation.host_obligation_present()
+            record = host_obligation.read_host_obligation()
+            assert record is not None and record["expected_sha"] == SHA
+            assert update_notifications._update_recovery_pending(home)
+    with enter("writer"):
+        host_obligation.clear_host_obligation()
     assert not source_path.exists()
+
+    with enter("coder"):
+        assert host_obligation.write_host_obligation(expected_sha=SHA, owner="update")
+    with enter("writer"):
+        record = host_obligation.read_host_obligation()
+        assert record is not None and record["owners"] == ["update"]
+        host_obligation.release_host_obligation("update")
+    assert not source_path.exists()
+    for profile in homes:
+        with enter(profile):
+            assert not host_obligation.host_obligation_present()
+            assert host_obligation.read_host_obligation() is None
+            assert not update_notifications._update_recovery_pending(home)
 
 
 @pytest.mark.parametrize("unavailable", [False, True])
 def test_default_obligation_identity_falls_back_to_running_tree(tmp_path, monkeypatch, unavailable):
     """Unknown layouts and historical interpreters retain the checkout-keyed fallback."""
     import sys
-
-    from hermes_cli import immutable_releases
 
     home = tmp_path / "home"
     running = tmp_path / "checkout"
@@ -85,8 +118,6 @@ def test_default_obligation_identity_falls_back_to_running_tree(tmp_path, monkey
     monkeypatch.setattr(host_obligation, "__file__", str(running / "hermes_cli/update_host_obligation.py"))
     if unavailable:
         monkeypatch.setitem(sys.modules, "hermes_cli.immutable_releases", None)
-    else:
-        monkeypatch.setattr(immutable_releases, "update_source_checkout", lambda *_: None)
 
     assert host_obligation.host_obligation_path() == host_obligation.host_obligation_path(running)
     assert host_obligation.write_host_obligation(expected_sha=SHA)
