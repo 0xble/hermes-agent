@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn } from 'node:child_process'
-import { existsSync, watch } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
   buildPosixManagedUpdateLaunch,
@@ -367,18 +367,7 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
     const shell: string = (await exec('command -v bash', { shell: 'bash' })).stdout.trim()
     const launcher: string = path.join(home, 'hermes launcher')
 
-    // Subscribe before launching: the detached child can publish before exec returns.
     const statusPath: string = path.join(home, `.update_exit_code.${CORRELATION}`)
-    const publication = watch(home)
-
-    const published = new Promise<void>((resolve, reject) => {
-      publication.on('error', reject)
-      publication.on('change', (_event, filename) => {
-        if (String(filename) === path.basename(statusPath) && existsSync(statusPath)) {
-          resolve()
-        }
-      })
-    })
 
     try {
       await writeFile(
@@ -397,10 +386,11 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
         CORRELATION
       )
 
-      const [{ stdout, stderr }] = await Promise.all([
-        exec(command, { shell, env: { ...process.env, HOME: home, HERMES_HOME: home } }),
-        published
-      ])
+      const { stdout, stderr } = await exec(command, { shell, env: { ...process.env, HOME: home, HERMES_HOME: home } })
+
+      // Directory events can omit the status filename. The detached child may
+      // publish on either side of exec returning, so observe its terminal file.
+      await vi.waitUntil(() => existsSync(statusPath), { interval: 25, timeout: 30_000 })
 
       const logPath: string = path.join(home, 'logs', `desktop-update-${CORRELATION}.log`)
       const status: string = await readFile(statusPath, 'utf8')
@@ -419,7 +409,6 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
         false
       )
     } finally {
-      publication.close()
       await rm(home, { force: true, recursive: true })
     }
   }

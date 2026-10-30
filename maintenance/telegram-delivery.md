@@ -22,6 +22,29 @@ are owned by [Telegram rendering](telegram-rendering.md).
 - Synthetic gateway event IDs may identify notifications but never become Telegram reply
   anchors. Numeric Telegram message IDs still anchor ordinary DM-topic replies.
 
+## Copy Block Delivery
+
+Canonical FIFO replies (`gateway/session_ingress.py::deliver_response`) send extracted
+copy bodies through the same `_send_copy_blocks` entry point as ordinary and streamed
+finals. Text delivery must keep the crash marker while copy bodies or attachments remain
+owed. Pass thread routing, ephemeral TTL, and delivery accounting through that handoff.
+The shared implementation lives in `gateway/platforms/base_copy_delivery.py` so the
+already oversized adapter base does not grow.
+
+In the 2026-10-29 incident a reply of prose plus 1 top-level copy body opening with an
+@mention lost its copy body: FIFO delivery omitted the block sender entirely, so neither an
+attempted send nor a failed delivery existed to log or recover. `tests/gateway/test_copy_blocks.py::test_fifo_delivery_sends_exact_incident_copy_block`
+reproduces that omission through real extraction and delivery with a fake transport.
+The returned-failure and raised-exception cases of
+`test_copy_send_failure_logs_session_count_and_notifies` require an ERROR containing
+the session and unsent/total count plus a visible incomplete-reply notice. Notice
+failures also log at ERROR. Existing ledger ordering and ambiguity rules still own
+recovery, so the notice never resends the failed body under a different payload.
+
+This repair belongs to `telegram-delivery`. Retire it when released upstream provides
+the same FIFO copy handoff and shared failure visibility. Roll back the commit carrying
+that repair without changing persisted replies or delivery rows.
+
 ## Cancelled Final Settlement
 
 A captured successful final stays delivered when its turn is cancelled. A cancelled
