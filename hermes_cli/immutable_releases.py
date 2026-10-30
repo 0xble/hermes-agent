@@ -742,7 +742,7 @@ def _read_txn(paths: ReleasePaths) -> dict[str, Any] | None:
     try:
         record = json.loads(path.read_text(encoding="utf-8-sig"))
         if record["version"] != 1 or record["operation"] not in {
-            "promote", "rollback", "first-migration", "first-migration-rollback"
+            "promote", "rollback", "restore", "first-migration", "first-migration-rollback"
         }:
             raise ValueError("unsupported release transaction")
         return record
@@ -1125,7 +1125,9 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
     candidate = Path(candidate).resolve()
     if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
         raise ValueError(f"candidate is not a complete release under {paths.releases}: {candidate}")
-    if operation not in {"promote", "rollback"}:
+    # ``restore`` re-activates the release a failed guardian rollback replaced. It is not a
+    # completed rollback, so an operator's later ``rollback()`` still goes back.
+    if operation not in {"promote", "rollback", "restore"}:
         raise ValueError(f"unsupported activation operation: {operation}")
     pending = _read_txn(paths)
     if pending is not None:
