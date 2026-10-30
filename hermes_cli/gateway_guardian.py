@@ -237,28 +237,62 @@ def _reap_rollback_owners(owners, deadline, *, home: Path | None = None):
             pass
 
 
+def secret_preflight(home: Path, body: bytes) -> str | None:
+    """Why a rendered gateway definition cannot load its configured secrets, else None.
+
+    Checked before the running gateway is touched: a rollback plist whose PATH lacks
+    the 1Password CLI starts a gateway with no platform tokens, which exits cleanly.
+    """
+    from agent.secret_sources.onepassword import find_op
+    from hermes_cli.config_effective import load_user_config_effective
+    config = load_user_config_effective(home / "config.yaml", fail_closed=True)
+    onepassword = (config.get("secrets") or {}).get("onepassword") or {}
+    if not isinstance(onepassword, dict) or onepassword.get("enabled") is not True:
+        return None
+    path = plistlib.loads(body).get("EnvironmentVariables", {}).get("PATH", "")
+    if find_op(str(onepassword.get("binary_path") or ""), search_path=path) is None:
+        return "rollback definition cannot resolve the 1Password op CLI on its PATH"
+    return None
+
+
 def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
                     deadline: float | None = None) -> bool:
-    """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
+    """Use S2 rollback with a targeted reload, never the ambient live gateway label.
+
+    When the rolled-back release is proven down after it was started (parked, unloaded or
+    no supervised PID), restore the release that was serving, with the exact definition it
+    ran under, rather than leave the gateway down. Only a serving release that was proven
+    to run (acknowledged switch or health proof) is restored. Returns True only for a
+    healthy rollback.
+    """
+    import psutil
     from hermes_cli import gateway
     from hermes_cli.immutable_releases import wait_for_release_acknowledgement
     deadline = deadline or time.monotonic() + ROLLBACK_SECONDS
     paths = ReleasePaths.for_home(home)
+    running = paths.current.resolve()
+    running_body = plist.read_bytes()
+    serving_proven = _serving_proven(home, label, running, deadline)
     pending = home / "release-txn.json"
     if pending.exists():
         from hermes_cli.immutable_releases import abandon_failed_switch
-        abandon_failed_switch(home, candidate=paths.current.resolve(), previous=old)
-        receipt(home, "abandon_switch", "recorded", candidate=str(paths.current.resolve()), previous=str(old))
-    definition = plistlib.loads(plist.read_bytes())
+        abandon_failed_switch(home, candidate=running, previous=old)
+        receipt(home, "abandon_switch", "recorded", candidate=str(running), previous=str(old))
+    definition = plistlib.loads(running_body)
     if label == gateway.get_launchd_label() and home.resolve() == get_hermes_home().resolve():
         body = gateway.generate_launchd_plist(release_target=old).encode("utf-8")
     else:
         # A disposable label uses its own plist; never regenerate the real service.
         definition["WorkingDirectory"] = str(old)
         body = plistlib.dumps(definition)
+    if (reason := secret_preflight(home, body)) is not None:
+        raise RuntimeError(reason)
     domain = domain or _domain(label, deadline=deadline)
+    budget, touched = [deadline], []
+
     def reload_target():
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
+        deadline = budget[0]
         old_pid = _launchctl_supervised_pid(label, timeout=_bounded_timeout(10, deadline), strict=True)
         target_pid, owners = _rollback_owners(home, old_pid)
         if target_pid is not None:
@@ -266,6 +300,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
             from gateway.status import write_planned_restart_marker
             if not write_planned_restart_marker(target_pid, hermes_home=home):
                 raise RuntimeError('cannot mark the rollback gateway for planned restart')
+        touched.append(True)
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
                        timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         _reap_rollback_owners(owners, deadline, home=home)
@@ -273,17 +308,100 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         # second past the rollback deadline.
         _launchctl_bootstrap(domain, plist, label, timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         return True
-    result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
-    if result.get("reload_pending"):
-        # The S2 acknowledgement may arrive after this one-shot invocation; live
-        # process identity below is the independent health proof for this action.
-        wait_for_release_acknowledgement(home, timeout_seconds=_bounded_timeout(5, deadline))
-    deadline = deadline or time.monotonic() + 12
+    try:
+        result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
+        if result.get("reload_pending"):
+            # The S2 acknowledgement may arrive after this one-shot invocation; live
+            # process identity below is the independent health proof for this action.
+            wait_for_release_acknowledgement(home, timeout_seconds=_bounded_timeout(5, deadline))
+        if _await_healthy(home, label, old, deadline):
+            return True
+    except (OSError, ValueError, RuntimeError, AttributeError, subprocess.SubprocessError, psutil.Error):
+        if not touched:
+            raise  # The serving gateway was never stopped: fail closed, as before.
+        logging.getLogger(__name__).exception("Rollback to %s failed after the gateway stopped", old)
+    if not serving_proven:
+        # An expired, never-acknowledged switch: its release may never have started, so
+        # reinstating it could only trade one down gateway for another.
+        receipt(home, "restore", "skipped", release=str(running), reason="serving release never proven")
+        return False
+    if not _target_down(label, domain):
+        # Still starting, not failed: give it its own startup window before judging it.
+        if _await_healthy(home, label, old, time.monotonic() + STARTUP_SECONDS):
+            return True
+        if not _target_down(label, domain):
+            receipt(home, "restore", "skipped", release=str(running), reason="rollback target still running")
+            return False
+    _restore_running(home, plist, label, running, running_body, budget, reload_target)
+    return False
+
+
+def _serving_proven(home: Path, label: str, running: Path, deadline: float) -> bool:
+    """The release being rolled back from is known to have run: its switch was acknowledged by
+    its own gateway, or it passes the running-release health proof now."""
+    for name in ("release-txn.json", "release-last-txn.json"):
+        try:
+            record = json.loads((home / name).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        ack = record.get("reload_ack")
+        if record.get("candidate") == str(running) and isinstance(ack, dict) and ack.get("at"):
+            return True
+    try:
+        return healthy(home, label, running, deadline)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
+def _target_down(label: str, domain: str) -> bool:
+    """Proof the rollback target is not running: parked, unloaded, or no supervised PID.
+    A probe that cannot answer is not proof."""
+    from hermes_cli.gateway_launchd import _launchctl_supervised_pid
+    try:
+        if _launch_state(domain, label, deadline=time.monotonic() + 10) in {"parked", "unloaded"}:
+            return True
+        return _launchctl_supervised_pid(label, timeout=10, strict=True) is None
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
+def _await_healthy(home: Path, label: str, release: Path, deadline: float) -> bool:
     while time.monotonic() < deadline:
-        if healthy(home, label, old, deadline):
+        if healthy(home, label, release, deadline):
             return True
         _sleep_within(.25, deadline)
     return False
+
+
+def _restore_running(home: Path, plist: Path, label: str, running: Path, running_body: bytes,
+                     budget: list[float], reload_target) -> None:
+    """Re-activate the release that was serving before a rollback that did not come up.
+
+    A ``restore`` activation: the admission canary does not watch it again, and a later
+    ``hermes update --rollback`` still rolls back (it is not a completed rollback). The
+    previous definition's bytes are the ones that release last started with.
+    """
+    import psutil
+    from hermes_cli.immutable_releases import activate_release, wait_for_release_acknowledgement
+    budget[0] = time.monotonic() + ROLLBACK_SECONDS
+    receipt(home, "restore", "attempt", release=str(running))
+    try:
+        pending = home / "release-txn.json"
+        if pending.exists():
+            # The unacknowledged rollback is evidence, not work to finish: recovery would
+            # reload the release that just failed to start.
+            pending.rename(home / f"release-abandoned-{uuid.uuid4().hex}.json")
+        result = activate_release(home, running, plist_path=plist, plist_body=running_body,
+                                  reload_callback=reload_target, operation="restore", force_reload=True)
+        if result.get("reload_pending"):
+            wait_for_release_acknowledgement(home, timeout_seconds=_bounded_timeout(5, budget[0]))
+        ok = _await_healthy(home, label, running, budget[0])
+    except (OSError, ValueError, RuntimeError, AttributeError, subprocess.SubprocessError, psutil.Error) as exc:
+        receipt(home, "restore", "failed", release=str(running), reason=str(exc))
+        return
+    receipt(home, "restore", "restored" if ok else "failed", release=str(running))
 
 
 def _refuse_leftovers_before_launch(home: Path, deadline: float | None = None) -> None:
@@ -368,7 +486,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         pending = home / "release-txn.json"
         if pending.exists():
             record = json.loads(pending.read_text(encoding="utf-8-sig"))
-            if record.get("operation") in {"rollback", "first-migration-rollback"}:
+            if record.get("operation") in {"rollback", "restore", "first-migration-rollback"}:
                 from hermes_cli.immutable_releases import acknowledge_running_release
                 acknowledge_running_release(home, probe_timeout=_bounded_timeout(10, deadline))
         previous_canary = admission_canary.read_state(home)

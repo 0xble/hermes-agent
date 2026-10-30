@@ -8,6 +8,10 @@ The legacy `model.compact_before_switch_tokens` key is still accepted for compat
 
 When the attended configuration is unset or disabled, all attended activity tracking, route resolution, notices, compaction, and model-switch hooks are no-ops. Existing gateway call shapes and default model behavior remain unchanged.
 
+## Switch Cards
+
+`model.attended.notices` (boolean, default true) controls the persistent "⇄ Switched to {model} while you're active." and "⇄ Back to {model} after Nm idle." cards. When it is false, attended switching and switch-back still happen at the same boundaries, but no card is staged for a queued turn or posted mid-turn. A non-boolean value logs a warning and keeps the cards. The model-pick expiry notice is not a switch card and is unaffected.
+
 ## Attended Session Pin
 
 `/attend` pins this session to the live attended configuration permanently,

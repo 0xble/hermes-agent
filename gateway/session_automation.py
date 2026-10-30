@@ -373,8 +373,15 @@ def admission_display(payload):
     return card
 
 
+# Telegram omits a forum topic's name on ordinary messages inside the topic, so a route origin
+# that recorded ``chat_topic`` never matched its committed envelope, and every completion
+# borrowing that envelope was refused (``admission_conflict``) and retried forever. The topic
+# name labels a thread, never selects one; other labels (``user_name``) stay part of the check.
+_UNCOMPARED_FIELDS = frozenset({'message_id', 'chat_topic'})
+
+
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    return {key: value for key, value in source.to_dict().items() if key not in _UNCOMPARED_FIELDS}
 
 
 def route_rebound(entry, envelope):

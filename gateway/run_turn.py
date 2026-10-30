@@ -490,7 +490,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             return None
         conversation = self._session_state(session_key).conversation
         cfg = parse_attended_config(user_config or {})
-        if decision.switched_back:
+        if decision.switched_back and cfg.notices:
             self._handoff_attended_state(
                 session_key,
                 conversation={
@@ -509,7 +509,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             load_route_active = getattr(self, "_load_attended_route_active", None)
             route_active = load_route_active(session_key) if callable(load_route_active) else None
         if (
-            decision.reason != "role"
+            cfg.notices
+            and decision.reason != "role"
             and not decision.new_session
             # Resolution probes can carry a stale model snapshot across worker handoffs.
             # A committed attended API route is not another idle-to-attended switch.
