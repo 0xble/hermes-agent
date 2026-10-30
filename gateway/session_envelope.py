@@ -344,9 +344,6 @@ def restore_native(payload, runner=None):
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),
                         **deepcopy(envelope['event']))
-    if 'synthetic' in envelope:
-        from gateway.session_synthetic import restore_synthetic
-        restore_synthetic(event, envelope['synthetic'])
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):
@@ -360,6 +357,9 @@ def restore_native(payload, runner=None):
         event.metadata.update(automation_checkin_metadata(envelope['automation']))
         from gateway.session_automation import automation_retry_metadata
         event.metadata.update(automation_retry_metadata(envelope['automation']))
+    if 'synthetic' in envelope:
+        from gateway.session_synthetic import restore_synthetic
+        restore_synthetic(event, envelope['synthetic'])
     return event
 
 
