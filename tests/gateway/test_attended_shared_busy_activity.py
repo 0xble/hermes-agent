@@ -74,9 +74,11 @@ async def test_active_shared_input_stamps_before_burst_commit(shared_busy):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', [
-    'internal', 'relay', 'goal_wakeup', 'process_notification', 'bot', 'bot_refused', 'unauthorized',
+    'internal', 'relay', 'goal_wakeup', 'process_notification', 'bot', 'bot_refused',
+    'unauthorized', 'unauthorized_no_control',
 ])
-async def test_nonhuman_or_refused_shared_input_never_persists_activity(shared_busy, monkeypatch, kind):
+async def test_nonhuman_or_refused_shared_input_never_persists_activity(
+        shared_busy, monkeypatch, caplog, kind):
     env = shared_busy
     source = replace(env.source)
     event = MessageEvent(text='follow-up', source=source, message_id=kind)
@@ -90,15 +92,57 @@ async def test_nonhuman_or_refused_shared_input_never_persists_activity(shared_b
         source.is_bot = True
         monkeypatch.setattr(env.runner, '_is_user_authorized_for_source', lambda source: True)
         monkeypatch.setattr(env.runner, '_admit_bot_message_for_source', lambda source: kind != 'bot_refused')
-    elif kind == 'unauthorized':
+    elif kind.startswith('unauthorized'):
         source.user_id = 'unauthorized-user'
+        source.user_name = 'Unauthorized'
+        event.allow_gateway_control = kind != 'unauthorized_no_control'
     await env.adapter.handle_message(event)
     assert getattr(event, '_attended_activity_task', None) is None
     assert getattr(event, '_attended_activity_received_at', None) is None
     await flush_busy_burst(env.adapter, env.owner.key)
     env.persist.assert_not_awaited()
-    if kind in {'unauthorized', 'bot_refused'}:
+    if kind.startswith('unauthorized') or kind == 'bot_refused':
         env.schedule.assert_not_called()
+        assert not getattr(event, '_gateway_accepted', False)
+        assert not any(row['status'] == 'queued' for row in _rows(env.owner.authority))
+    if kind.startswith('unauthorized'):
+        assert (
+            'Dropping message from unauthorized user in active session: '
+            f'user=unauthorized-user (Unauthorized), platform=signal, session={env.owner.key}'
+        ) in caplog.text
+        assert event.text not in caplog.text
+    else:
+        assert 'Dropping message from unauthorized user' not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('user_id', [None, 'unauthorized-user'])
+@pytest.mark.parametrize('allow_gateway_control', [False, True])
+async def test_internal_busy_input_keeps_existing_admission_without_user_auth(
+        shared_busy, caplog, user_id, allow_gateway_control):
+    env = shared_busy
+    source = replace(env.source, user_id=user_id)
+    assert not env.runner._is_user_authorized_for_source(source)
+    assert env.runner._is_session_running(env.owner.key)
+    assert env.runner._session_key_for_source(source) == env.owner.key
+    # _busy_owner holds the real FIFO turn before model construction. Exercise the running-agent
+    # branch a completion actually encounters, rather than the pre-model merge-only sentinel.
+    agent = Mock()
+    agent.get_activity_summary.return_value = {'idle_seconds': 0}
+    env.runner._session_state(env.owner.key).turn.agent = agent
+    event = MessageEvent(text='internal wake', source=source,
+                         message_id='internal-wake', internal=True,
+                         allow_gateway_control=allow_gateway_control)
+    from gateway.wake import admit_internal_event
+
+    await admit_internal_event(env.adapter, event)
+    assert event._gateway_accepted
+    assert env.adapter._pending_messages[env.owner.key] is event
+    assert getattr(event, '_attended_activity_received_at', None) is None
+    env.persist.assert_not_awaited()
+    assert 'Dropping message from unauthorized user' not in caplog.text
+    # This is the existing internal adapter FIFO, not a forged external native admission.
+    env.adapter._pending_messages.pop(env.owner.key)
 
 
 @pytest.mark.asyncio
@@ -183,7 +227,8 @@ async def test_native_retry_retains_original_receipt_but_changed_content_still_c
 
     receipt, resolved = await asyncio.to_thread(admit, retry)
     assert receipt['admission_id'] == row['admission_id']
-    assert resolved == original
+    assert resolved == retry  # reconciliation only owns media, not local receipt identity
+    assert receipt['payload'] == original
     retry['text'] = 'changed'
     with pytest.raises(RuntimeStoreError, match='admission_conflict'):
         await asyncio.to_thread(admit, retry)

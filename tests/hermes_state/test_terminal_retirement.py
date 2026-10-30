@@ -73,6 +73,50 @@ def test_used_history_retirement_is_atomic_and_exact(tmp_path, monkeypatch):
                 generation=row['generation'], sequence=2, operation='transcript.append', payload=worker_append)
 
 
+def test_native_receipt_clock_does_not_change_retired_retry_identity(tmp_path):
+    from copy import deepcopy
+    from gateway.session_ingress_media import reconcile_native_retry
+
+    with SessionDB(tmp_path / 'state.db') as db:
+        db.create_session('native', source='signal')
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        payload = {'text': 'repeatable', 'native_text_v1': {
+            'attended_activity': {'received_at': 1800000000.0, 'marked': True},
+            'event': {'message_id': 'retry'}, 'context': {'channel_prompt': 'semantic'},
+        }}
+        args = dict(principal_id='native', session_id='native', request_id='retry')
+        original = rt.admit_session_input(db, epoch=epoch, payload=payload, **args)
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id='native')
+        assert isinstance(claimed, dict)
+        rt.settle_session_input(db, epoch=epoch, admission_id=claimed['admission_id'],
+                               generation=claimed['generation'], outcome='completed')
+        snap = db.get_session('native')
+        assert snap is not None
+        rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='native',
+            request_id='delete', operation='delete', payload={},
+            expected_revision=snap['runtime_revision'], expected_generation=snap['runtime_generation'])
+        assert db.get_session('native') is None
+        assert rt.find_session_admission(db, principal_id='native', session_id='native', request_id='retry') is None
+        terminal = rt.get_session_admission(db, admission_id=original['admission_id'])
+        assert terminal is not None
+        assert terminal['payload'] == {}
+        assert terminal['admission_id'] == original['admission_id']
+        assert terminal['status'] == 'terminal' and terminal['outcome'] == 'completed'
+        retry = deepcopy(payload)
+        retry['native_text_v1']['attended_activity'] = {'received_at': 1800003600.0, 'marked': False}
+        resolved = reconcile_native_retry(db, principal_id='native', session_id='native',
+                                         request_id='retry', payload=retry)
+        assert rt.admit_session_input(db, epoch=epoch, payload=resolved, **args) == terminal
+        for change in ('text', 'context', 'intent'):
+            changed = deepcopy(retry)
+            if change == 'text':
+                changed['text'] = 'changed'
+            elif change == 'context':
+                changed['native_text_v1']['context']['channel_prompt'] = 'changed'
+            with pytest.raises(rt.RuntimeStoreError, match='admission_conflict'):
+                rt.admit_session_input(db, epoch=epoch, payload=changed, intent='steer' if change == 'intent' else 'queue', **args)
+
+
 def test_nonterminal_obligations_prevent_any_retirement(tmp_path):
     import hermes_state_mutation_retirement as retirement
     import hermes_state_mutations
