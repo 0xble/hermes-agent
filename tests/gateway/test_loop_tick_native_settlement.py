@@ -82,6 +82,8 @@ async def test_stamped_loop_reply_settles_through_native_admission(tmp_path, mon
         print(f'HOOK reply={reply!r} observed={hooks[-1]!r} expected_tick={tick!r}')
         assert len(turns) == 2
         assert hooks[-1] == (tick, reply)
+        assert turns[-1].reply_expected is False
+        assert turns[-1].inherit_channel_pin is True
         assert not state.awaiting_response, 'completed turn was left for recover_tick'
         assert state.ticks_fired == 1
         assert state.status == ('done' if reply in ('LOOP_COMPLETE', 'condition met') else 'active')
