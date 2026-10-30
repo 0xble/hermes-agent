@@ -101,7 +101,7 @@ async def test_failed_retirement_releases_admission_and_explains_recovery(runtim
     # Failure stops automatic deletion, but cannot consume later human messages.
     assert await retire.intercept(runtime, MessageEvent(text="keep working here", source=runtime.source)) is None
     notice = runtime.adapter.send.await_args.args[1]
-    assert "Use /retire to retry" in notice and "/retire cancel" in notice
+    assert "Ask here to retry or cancel it." in notice and "/retire" not in notice
     count = runtime.adapter.send.await_count
     await retire.advance(runtime, runtime.source)
     assert runtime.adapter.send.await_count == count
@@ -202,8 +202,9 @@ async def test_owner_question_replies_do_not_bypass_retirement_and_preparation_i
     assert await retire.intercept(runner, event) == retire.NOTICE
     event.text = "start a new project"
     assert await retire.intercept(runner, event) == retire.NOTICE
+    # Core owns no /retire command, so a plugin's /retire is new work like any other.
     event.get_command = lambda: "retire"
-    assert await retire.intercept(runner, event) is None
+    assert await retire.intercept(runner, event) == retire.NOTICE
     wake = MessageEvent(text="prepare", source=source, internal=True,
                         metadata={"retirement_generation": state["generation"]})
     assert await retire.intercept(runner, wake) is None
@@ -240,12 +241,12 @@ async def test_cancel_generation_prevents_stale_save(runtime):
 
 
 @pytest.mark.asyncio
-async def test_internal_completion_can_settle_and_addressed_cancel_is_admitted(runtime):
+async def test_internal_completion_can_settle_and_slash_retire_is_fenced(runtime):
     await retire.request(runtime, runtime.source)
     completion = MessageEvent(text="owned completion", source=runtime.source, internal=True)
     assert await retire.intercept(runtime, completion) is None
     command = MessageEvent(text="/retire@HermesBot cancel", source=runtime.source)
-    assert await retire.intercept(runtime, command) is None
+    assert await retire.intercept(runtime, command) == retire.NOTICE
 
 
 @pytest.mark.asyncio
@@ -292,7 +293,9 @@ async def test_unresolved_delete_can_recover_without_housekeeping_spam(runtime, 
     await retire.advance(runtime, runtime.source)
     failed = await retire.load(runtime, runtime.source)
     assert failed["phase"] == "delete_unresolved"
-    assert "/retire cancel" in runtime.adapter.send.await_args.args[1]
+    assert "Ask here to retry or cancel it." in runtime.adapter.send.await_args.args[1]
+    # Only an explicit request recovers it, so the user can reach the agent's retire tool again.
+    assert await retire.intercept(runtime, MessageEvent(text="cancel the retirement", source=runtime.source)) is None
     counts = (runtime.bot.send_message.await_count, runtime.adapter.send.await_count)
     await retire.resume_all(runtime)
     await retire.advance(runtime, runtime.source)

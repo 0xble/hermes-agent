@@ -20,7 +20,7 @@ from gateway.telegram_topic_sessions import TopicRequestError
 
 logger = logging.getLogger(__name__)
 PREFIX = "telegram_retire:"
-NOTICE = "This topic is retiring. Use /retire cancel to keep it."
+NOTICE = "This topic is retiring and no longer accepts new work."
 # Telegram flood waits and timeouts clear on their own. Retry those automatically instead of
 # failing the retirement (2026-10-29: a FLOOD_WAIT during a handoff relay left a topic "failed").
 _TRANSIENT_MARKERS = ("rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror")
@@ -93,7 +93,7 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
     target = target.strip() if target is not None else None
     reason, context = reason.strip(), context.strip()
     if existing and existing["phase"] == "delete_unresolved":
-        # Only an explicit command retries recovery after a failed dispatch.
+        # Only an explicit request retries recovery after a failed dispatch.
         # Serialize the existence check against an executor already in flight.
         locks = getattr(runner, "_telegram_retire_locks", None)
         if locks is None:
@@ -179,15 +179,13 @@ async def intercept(runner, event):
     if event.internal and preparation and (not state or state["generation"] != preparation
                                            or state["phase"] not in {"pending", "waiting"}):
         return ""
-    if not state or state["phase"] in {"cancelled", "done", "failed"}:
+    # A stalled retirement admits the user so the agent's telegram_topic tool can retry or cancel it.
+    if not state or state["phase"] in {"cancelled", "done", "failed", "delete_unresolved"}:
         return None
     if event.internal:
         # Already-owned completion work may settle while retirement waits. The
         # admission fence is for new user work, not a way to discard results.
         return None
-    if event.allow_gateway_control and not event.internal:
-        if event.get_command() == "retire":
-            return None
     return NOTICE
 
 
@@ -339,9 +337,9 @@ async def advance(runner, source):
                     return
                 if passive:
                     return
-                raise RuntimeError("The previous delete was not confirmed. Use /retire to retry or /retire cancel to keep this topic.")
+                raise RuntimeError("The previous delete was not confirmed.")
             from gateway.telegram_retire_work import prepare
-            # Inventory happens here, after the turn, not when /retire was typed.
+            # Inventory happens here, after the turn, not when retirement was requested.
             if await asyncio.to_thread(runner.session_store.peek_session_id, key) != state["session_id"]:
                 raise RuntimeError("The bound session changed during retirement. Cancel and retry from its current session.")
             if not await prepare(runner, source, state):
@@ -389,7 +387,7 @@ async def advance(runner, source):
         except RetirementSuperseded:
             return
         except HandoffPending:
-            # The receipt is durable. Housekeeping or /retire rechecks it without
+            # The receipt is durable. Housekeeping rechecks it without
             # repeating the handoff or treating a busy destination as failure.
             current = await _current(runner, source, generation)
             if current:
@@ -418,7 +416,7 @@ async def advance(runner, source):
                 current["phase"] = "delete_unresolved" if current["phase"] in {"deleting", "delete_unresolved"} else "failed"
                 current["error"] = str(exc)
                 await save(runner, source, current)
-                recovery = " Use /retire to retry or /retire cancel to drop the request."
+                recovery = " Ask here to retry or cancel it."
                 await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc}{recovery}",
                                    metadata={"thread_id": str(source.thread_id)})
 

@@ -1275,7 +1275,7 @@ class GatewayBusySessionMixin:
         "status", "context", "restart", "approve", "deny", "pause", "discard", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
-        "title", "retire", "attend", "fast", "reasoning", "usage", "whoami",
+        "title", "attend", "fast", "reasoning", "usage", "whoami",
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (

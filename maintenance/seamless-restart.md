@@ -17,6 +17,19 @@ bots. Shared groups receive one notice, and private-topic parent suppression
 remains bound to the actual adapter. Native routing invariants live in
 `tests/gateway/test_multiplex_notice_egress_profile_adapter.py`.
 
+## FIFO Execution Outbox Identity
+
+A claimed session FIFO row uses `admission:<admission_id>` as its durable outbox
+identity. Its transport envelope was already admitted before the FIFO snapshot,
+and restoring that snapshot creates a new event without the process-local
+admission scope. Reusing the provider update ID would suppress the claimed turn
+as a redelivery of its own ingress. Keep transport redelivery dedup unchanged,
+and never let caller metadata select or bypass the claimed identity.
+
+Verify `tests/gateway/test_native_fifo_outbox_identity.py` alongside the durable
+outbox and native messaging FIFO suites. Distinct maintenance wakes sharing a
+task must execute once each, while a repeated provider update remains suppressed.
+
 ## Resume Marker Freshness
 
 Startup resume admission and pending follow-up recovery use upstream's
