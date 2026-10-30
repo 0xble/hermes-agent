@@ -187,8 +187,12 @@ class WorkerRPC:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
             reason = getattr(discovery, 'reason_code', None)
-            if discovery.state in ('inaccessible', 'incompatible') and reason not in (
-                    'control_timeout', 'incomplete_control_response'):
+            # Lock/descriptor uncertainty can span owner replacement. Explicit
+            # protocol, authorization and malformed-peer verdicts cannot heal here.
+            transient = discovery.state == 'inaccessible' and reason in (
+                None, 'control_timeout', 'incomplete_control_response',
+                'invalid_runtime_state', 'foreign_stale_lock')
+            if discovery.state in ('inaccessible', 'incompatible') and not transient:
                 raise WorkerPersistenceError(reason or 'owner_inaccessible')
             raise WorkerPersistenceError('owner_unavailable')
         from hermes_cli.gateway_runtime import control_home_for

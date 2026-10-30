@@ -233,6 +233,7 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     from hermes_cli.process_identity import process_birth
     from hermes_constants import get_hermes_home
     from hermes_state_errors import GatewayOwnerRestartError
+    from websockets.exceptions import ConnectionClosed
     import psutil
 
     if not owns_detached_execution(job['id'], execution_id):
@@ -253,19 +254,20 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
         while True:
             try:
                 return rpc(method, **params)
-            except (WorkerPersistenceError, GatewayOwnerRestartError, OSError, TimeoutError) as exc:
+            except (WorkerPersistenceError, GatewayOwnerRestartError, ConnectionClosed, OSError, TimeoutError) as exc:
                 # A returned authorization/assignment refusal is terminal. Only
                 # owner absence and the released epoch are lifecycle events.
                 # Detached executions outlive each bounded pre-send retry window.
-                # WorkerRPC already retries safe closes; any ConnectionClosed
-                # reaching this wrapper has an unknown outcome and must escape.
+                # WorkerRPC never blindly resends an ambiguous send. After
+                # authenticated adoption, this wrapper replays the identical
+                # journal entry, deduplicated by the owner's stored receipt.
                 if isinstance(exc, WorkerPersistenceError) and str(exc) not in (
                         'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
                     raise
                 try:
                     current = store.scope if store is not None else scope
                     next_owner = rpc('worker.adopt', **{k: v for k, v in current.items() if k != 'epoch'})
-                except (WorkerPersistenceError, GatewayOwnerRestartError, OSError, TimeoutError) as adoption:
+                except (WorkerPersistenceError, GatewayOwnerRestartError, ConnectionClosed, OSError, TimeoutError) as adoption:
                     if isinstance(adoption, WorkerPersistenceError) and str(adoption) not in (
                             'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
                         raise

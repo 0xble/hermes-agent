@@ -41,15 +41,23 @@ leaves pending writes in the existing journal for explicit retry or verified
 adoption. This does not claim that a queued operation is canonically committed.
 The detached executor retains its existing pause-until-adoption contract across
 multiple bounded connection windows, including exhaustion while adopting. Its
-outer reconnect wrapper never retries a ConnectionClosed that escapes WorkerRPC:
-that call may have reached the owner. Discovery resets and broken pipes retain
-the interrupted-control-response cause instead of becoming invalid-control-peer
-refusals. Malformed peers, authorization failures and explicit assignment
-refusals remain terminal.
+outer reconnect wrapper handles escaped ConnectionClosed and receipt timeouts by
+authenticating `worker.adopt`, then replaying only the identical journal entry.
+The owner returns the stored receipt for a matching execution, sequence and
+payload digest, so even a committed write with a lost reply produces only 1
+canonical row and 1 receipt. This does not relax WorkerRPC's inner no-resend guard
+or replay inference or tools. Discovery resets and broken pipes retain the
+interrupted-control-response cause instead of becoming invalid-control-peer
+refusals. Unclassified inaccessible lock state, invalid runtime state and stale
+foreign locks remain retriable while replacement settles. Explicit protocol
+mismatches, malformed peers, authorization failures and assignment refusals remain
+terminal.
 Regression coverage is `tests/agent/test_worker_owner_restart.py`, alongside the
 connection-reuse, outbox-adoption and persistence-explainer suites. Detached
-multi-window and no-replay coverage is `tests/cron/test_detached_owner_restart.py`.
-Discovery transport and terminal-peer coverage is
+multi-window and real-owner exactly-once receipt replay coverage is
+`tests/cron/test_detached_owner_restart.py`, including lost replies, double
+closed-on-entry, chained writes and receipt timeouts. Discovery transport,
+transient lock/state and terminal protocol/peer coverage is
 `tests/agent/test_worker_discovery_recovery.py`.
 
 The 2026-10-30 detached `maintain-filesystems` execution failed while its owner
