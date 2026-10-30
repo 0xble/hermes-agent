@@ -68,11 +68,27 @@ The gateway admits a wake with 1 stored-row compare-and-swap that both claims th
 
 On startup or a later scan, recovery first proves that no live, admitted, queued or restart-recovering turn owns the tick, and repeats that check at the stored-row settlement boundary. It consumes an interrupted tick as skipped with an unknown outcome and schedules the next tick on the stored cadence. It never replays the interrupted tick or pauses the loop awaiting inspection. Legacy `claimed`, `executing` and unmarked rows also have unknown outcomes and follow the same recovery rule. Post-turn settlement requires the synthetic wake's exact `gateway_loop_tick` identity. Unrelated human/internal turns, missing or malformed identities, and stale loop-instance/tick identities leave the claim untouched, even when their response contains `LOOP_COMPLETE`.
 
+Authority admission retains the private producer projection and quiet reply context, so a
+native or LOCAL wake's own reply can settle its stamped tick. Only the process-private
+synthetic token bypasses the ordinary metadata allowlist. A fresh-session reset cannot
+rewrite a strict synthetic transcript pin: native route-wake movement and LOCAL descriptor
+retargeting share cancellation and exact-tick abandonment instead. The cancellation and
+claim release remain tracked through an interrupted reset. Unpinned Kanban wakes still
+move, other completions keep their existing routing, and an unknown FIFO head still bars
+movement. A cancelled old descriptor never releases a newer loop instance's claim.
+
 A due wake defers before claiming whenever another live, admitted, queued or restart-recovering turn owns the conversation. The admission CAS repeats the local ownership check. An owner appearing after successful admission leaves a consumed tick for recovery, never a refunded tick or wake text offered as a human reply. Gateway-authored synthetic events (`internal`) never answer pending clarify, `/update` or slash-confirm prompts, including the adapter's inline clarify bypass. Explicit `/new` retires the old conversation's loop and goal. Compression follows the existing lineage tip and preserves responsibility. `/resume` and topic rebinds are reversible, so a loop whose route resolves to another, non-tip session defers untouched until the route returns; the scanner never retires a loop. A restart marker counts as an owner only inside the auto-resume freshness window. The loop and goal scanners share one stale-marker rule: a stale marker is compare-and-swap cleared before the scan acts, and a refreshed marker wins.
 
 ## Proof Surface
 
 Focused tests cover LoopState compatibility and versioning, authority branches, cadence re-anchoring, preservation of ticks/route/created_at, replacement, status and wakeup text, receipt registry behavior, and stale-manager survival through CLI/TUI completion paths. `tests/hermes_cli/test_loop_settlement.py` covers continue/done/blocked races, stale revisions, legacy entry checks, no-op and commit-edge conflicts, pause/resume ABA, claim cleanup races, same-manager commands after a revision, settlement or claim commit, persistence failures, and ephemeral operation with the real SessionDB. `tests/hermes_cli/test_loop_control_atomic.py` covers stale user controls and revisions against every newer lifecycle, write failures, and cursor-owned claims, settlements and revisions. Run the affected tests through `scripts/run_tests.sh`; run the repository's canonical gate before publication.
+
+`tests/gateway/test_loop_tick_native_settlement.py` exercises real scheduler admission and
+post-turn settlement for `LOOP_COMPLETE`, `NO_REPLY`, `[SILENT]`, and an `--until` verdict.
+`tests/gateway/test_loop_tick_reset.py` admits a producer-stamped tick behind a blocked
+human turn, invokes real `/new` and exhaustion reset callers, and checks that later human
+input runs on the fresh transcript without executing or cloning the stale wake. It covers
+LOCAL exhaustion, exact claim release, replacement-loop preservation, and idempotent movement.
 
 ### Execution-Entry Fence
 

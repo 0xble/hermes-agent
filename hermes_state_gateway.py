@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+from hermes_state_deletion import visible_session_sql
 import sys
 import time
 from pathlib import Path
@@ -63,6 +64,7 @@ _PEER_SELECT_HEAD = """
 # is strictly "ownership was transferred", never "a handoff was attempted".
 _HANDOFF_OWNED_ROW_SQL = "(s.handoff_state = 'completed')"
 _PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.session_key = ?
+                  AND {visible_session_sql('s.id')}
                   AND s.source = ?
                   AND (s.ended_at IS NULL OR s.end_reason IN ({_RECOVERABLE_END_REASONS_SQL})
                        OR {_HANDOFF_OWNED_ROW_SQL})
@@ -80,6 +82,7 @@ _PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.session_key = 
                 LIMIT 1
                 """
 _PEER_BY_TUPLE_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.source = ?
+                  AND {visible_session_sql('s.id')}
                   AND COALESCE(s.user_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_type, '') = COALESCE(?, '')
@@ -556,9 +559,10 @@ class SessionGatewayMixin:
             LEFT JOIN system_prompts sp
               ON sp.hash = sessions.system_prompt_hash
             WHERE session_key IS NOT NULL
+              AND {visible_session_sql('sessions.id')}
               AND started_at = (
                   SELECT MAX(s2.started_at) FROM sessions s2
-                  WHERE s2.session_key = sessions.session_key
+                  WHERE s2.session_key = sessions.session_key AND {visible_session_sql('s2.id')}
               )
         """
         params: list = [platform] if platform else []

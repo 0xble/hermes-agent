@@ -410,7 +410,11 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
             or not isinstance(event.text, str) or not identity
             or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER):
         raise RuntimeStoreError('invalid_params', field='automation_event')
-    if set(event.metadata) - _AUTOMATION_METADATA:
+    from gateway.session_synthetic import project_synthetic
+    synthetic = project_synthetic(event)
+    # Only the private producer token permits this projection, never inbound metadata.
+    # Its routing/tick fences live outside the ordinary adapter metadata allowlist.
+    if synthetic is None and set(event.metadata) - _AUTOMATION_METADATA:
         raise RuntimeStoreError('invalid_params', field='automation_metadata')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
                     | automation_checkin_metadata(event.metadata)
@@ -449,6 +453,10 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
         'event': {'message_id': identity}, 'provenance': provenance,
         'automation': {'identity': identity, 'owner': owner}}
     envelope['automation'].update(notification)
+    if synthetic is not None:
+        envelope['synthetic'] = synthetic
+        envelope['event'].update(reply_expected=event.reply_expected,
+                                 inherit_channel_pin=event.inherit_channel_pin)
     if getattr(event, '_heartbeat_session_id', None):
         envelope['automation']['heartbeat'] = event._heartbeat_session_id
     identities = event.metadata.get('automation_identities')
@@ -489,6 +497,11 @@ def snapshot_local_automation(authority, adapter, event, identity, entry, *, ref
     descriptor.update(automation_checkin_metadata(event.metadata))
     descriptor.update(automation_retry_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
+    from gateway.session_synthetic import project_synthetic
+    if synthetic := project_synthetic(event):
+        descriptor['synthetic'] = synthetic
+        descriptor['reply_expected'] = event.reply_expected
+        descriptor['inherit_channel_pin'] = event.inherit_channel_pin
     if event.metadata.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
         descriptor['turn_author'] = parse_turn_author(event.metadata['turn_author'])
@@ -523,6 +536,8 @@ def restore_local_automation(authority, ref, row):
     descriptor = row['payload']['local_automation_v1']
     entry = authority.runner.session_store.lookup_by_session_key(live.route)
     event = MessageEvent(text=row['payload']['text'], source=live.source, internal=True,
+        reply_expected=descriptor.get('reply_expected'),
+        inherit_channel_pin=descriptor.get('inherit_channel_pin', False),
         message_id=descriptor['identity'], metadata={'gateway_session_key': live.route,
             'gateway_session_id': entry.session_id})
     event.metadata.update(automation_notification_metadata(descriptor))
@@ -533,6 +548,9 @@ def restore_local_automation(authority, ref, row):
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
     if descriptor.get('heartbeat'):
         event._heartbeat_session_id = descriptor['heartbeat']
+    if 'synthetic' in descriptor:
+        from gateway.session_synthetic import restore_synthetic
+        restore_synthetic(event, descriptor['synthetic'])
     return event
 
 
@@ -562,7 +580,7 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
         # Provenance/adapter identity and all live publication remain on the owner loop.
         payload, entry = snapshot_automation(authority, adapter, event, identity, (entry, captured, owner))
         sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
-        ref = prepared['ref'] = SessionRef(authority.profile_id, sid)
+        prepared['ref'] = SessionRef(authority.profile_id, sid)
         authority.sessions.setdefault(sid, LiveSession(event.source, entry.session_key))
         return partial(admit_session_input, authority.db, epoch=authority.epoch,
             principal_id='automation:' + entry.session_key, session_id=sid, request_id=identity,
@@ -580,6 +598,31 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
 
 
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})
+
+
+async def _cancel_reset_pinned_wake(authority, row, new_session_id):
+    """A fresh transcript cannot inherit a strict producer pin. Cancel, never rewrite it.
+
+    Native and LOCAL descriptors carry the same private projection. Settle a cancelled
+    loop's exact tick too, without touching a replacement definition or replaying it.
+    """
+    payload = row['payload']
+    descriptor = payload.get('local_automation_v1') or payload.get('native_text_v1', {})
+    metadata = descriptor.get('synthetic', {}).get('metadata', {})
+    if not metadata.get('gateway_session_strict') or metadata.get('gateway_session_id') == new_session_id:
+        return False
+    import asyncio
+    from gateway.session_runtime_workers import track_mutation
+
+    async def cancel_and_settle():
+        if await _withdraw(authority, row):
+            event = MessageEvent(text=payload['text'], internal=True, metadata=deepcopy(metadata),
+                                 source=authority.sessions[row['target_session_id']].source)
+            await authority.runner._release_unsettled_loop_tick(event, ran=False)
+
+    # Once cancellation commits, even an interrupted reset owes the tick its settlement.
+    await asyncio.shield(track_mutation(authority, cancel_and_settle()))
+    return True
 
 
 async def move_route_wakes(runner, session_key, old_session_id):
@@ -612,6 +655,8 @@ async def move_route_wakes(runner, session_key, old_session_id):
         identity = json.loads(row['request_id']) if automation and row['request_id'].startswith('[') else None
         if (row['status'] != 'queued' or row['principal_id'] != 'automation:' + session_key
                 or not isinstance(identity, list) or identity[:1] not in ([p] for p in _ROUTE_WAKE_PRODUCERS)):
+            continue
+        if await _cancel_reset_pinned_wake(authority, row, entry.session_id):
             continue
         try:
             await authority.cancel_queued(actor, old, row['admission_id'])
@@ -656,6 +701,12 @@ async def _reset_and_retarget_local(authority, runner, session_key, old_session_
 
     async with live.mutation_lock:
         entry, moved = await tracked_write(authority, rotate_and_retarget, ordered=True)
+        if moved:
+            import asyncio
+            rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=owner.session_id)
+            for row in rows:
+                if row['admission_id'] in moved:
+                    await _cancel_reset_pinned_wake(authority, row, entry.session_id)
     if moved:
         authority._publish_pending(owner)
     return entry
@@ -744,7 +795,7 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     return entry, release
 
 
-async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):
+async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, *, event=None):
     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
     authority FIFO, like heartbeats and process completions, instead of a classic turn that
     interrupts or races the admitted one. ``False`` when no authority serves the scope or the
@@ -764,27 +815,28 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
         live = authority.sessions.get(source.chat_id)
         if live is None or live.route != key:
             return False
-        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=live.source, internal=True,
-                             message_id=identity, metadata={'gateway_session_key': key,
-                                                            'gateway_session_id': entry.session_id,
-                                                            **(metadata or {})})
-        await authority.admit_automation(adapter, event, identity)
-        return True
-    from gateway.session_envelope import restore_native
-    envelope = committed_route_envelope(authority, entry)
-    if envelope is None:
-        return False
-    if route_rebound(entry, envelope):
-        # The session moved after its last human turn: the wake rides the route it serves now,
-        # which ``snapshot_automation`` revalidates against the live adapter.
-        source = runner._restored_source(entry)
+        source = live.source
     else:
-        # The route's committed source, which ``snapshot_automation`` re-derives and compares.
-        source = restore_native({'text': text, 'native_text_v1': {
-            k: v for k, v in envelope.items() if k != 'media'}}, runner).source
-    event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
-                         message_id=identity, metadata={'gateway_session_key': key,
-                                                        'gateway_session_id': entry.session_id,
-                                                        **(metadata or {})})
-    await authority.admit_automation(adapter, event, identity)
+        from gateway.session_envelope import restore_native
+        envelope = committed_route_envelope(authority, entry)
+        if envelope is None:
+            return False
+        if route_rebound(entry, envelope):
+            # The session moved after its last human turn: the wake rides the route it serves now,
+            # which ``snapshot_automation`` revalidates against the live adapter.
+            source = runner._restored_source(entry)
+        else:
+            # The route's committed source, which ``snapshot_automation`` re-derives and compares.
+            source = restore_native({'text': text, 'native_text_v1': {
+                k: v for k, v in envelope.items() if k != 'media'}}, runner).source
+    wake = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
+                        message_id=identity, metadata=dict(metadata or {}))
+    from gateway.session_synthetic import project_synthetic, restore_synthetic
+    if event is not None and (synthetic := project_synthetic(event)) is not None:
+        # Borrow only the producer's private projection, never inbound metadata as a capability.
+        restore_synthetic(wake, synthetic)
+        wake.reply_expected = event.reply_expected
+        wake.inherit_channel_pin = event.inherit_channel_pin
+    wake.metadata.update(gateway_session_key=key, gateway_session_id=entry.session_id)
+    await authority.admit_automation(adapter, wake, identity)
     return True

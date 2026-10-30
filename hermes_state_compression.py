@@ -327,6 +327,10 @@ class SessionCompressionMixin:
         """INSERT the compression child's ``sessions`` row copied from *parent*. Same contract as
         _insert_session_row's compression-fork backfill: the child stays on the parent's profile and keeps
         gateway routing/origin columns; no owner on either side -> this store's profile."""
+        from hermes_state_runtime import _session
+        # Compression, branch and reset all publish here. A retained physical
+        # parent is not authority to publish after its retirement commit.
+        parent = _session(conn, parent_session_id)
         from hermes_state_sessions import _parse_model_config
         carried = {key: value for key, value in _parse_model_config(parent["model_config"]).items()
                    if key in _CONVERSATION_MODEL_CONFIG_KEYS}
