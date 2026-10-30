@@ -54,7 +54,8 @@ async def test_each_refused_admission_counts_once_before_notice_dedup(
     try:
         for index in range(5):
             if producer == "automation" or closed:
-                admit = (authority.admit_automation(adapter, event, "notice") if producer == "automation"
+                # Distinct producer identities: each is its own refused admission.
+                admit = (authority.admit_automation(adapter, event, f"notice-{index}") if producer == "automation"
                          else authority.admit_native(event))
                 with pytest.raises(RuntimeStoreError) as refused:
                     await admit
@@ -71,6 +72,36 @@ async def test_each_refused_admission_counts_once_before_notice_dedup(
         assert sent == before and len(turns) == 1
     finally:
         authority.retiring = False
+
+
+@pytest.mark.asyncio
+async def test_retries_of_one_refused_producer_identity_count_once_per_window(
+        refusal_evidence, native_chat, monkeypatch):
+    """A requeued notice retried on backoff is one failed admission, not one per retry."""
+    from hermes_state_runtime import RuntimeStoreError
+
+    runner, adapter, authority, source, sent, turns = native_chat
+    entry = runner.session_store.lookup_by_session_key(runner._session_key_for_source(source))
+    clock = [1000.0]
+    monkeypatch.setattr(admission_canary.time, "time", lambda: clock[0])
+
+    async def refuse(identity):
+        from gateway.platforms.event import MessageEvent
+        event = MessageEvent(text="notice", source=source, internal=True)
+        event.metadata = {"gateway_session_key": entry.session_key,
+                          "gateway_session_id": entry.session_id, "foreign": True}
+        with pytest.raises(RuntimeStoreError):
+            await authority.admit_automation(adapter, event, identity)
+
+    for _ in range(11):
+        await refuse("stuck-completion")
+        clock[0] += 15
+    assert len(admission_canary.snapshot()["refusals"]) == 1
+    await refuse("other-completion")
+    assert len(admission_canary.snapshot()["refusals"]) == 2
+    clock[0] += 601
+    await refuse("stuck-completion")  # a new window counts the still-failing producer again
+    assert [at for at, _ in admission_canary.snapshot()["refusals"]] == [clock[0]]
 
 
 @pytest.mark.asyncio
@@ -169,7 +200,7 @@ def test_refusals_publish_timestamped_runtime_evidence(tmp_path, monkeypatch):
 
 
 def test_evidence_is_bounded_and_does_not_mask_refusal(monkeypatch):
-    monkeypatch.setattr(admission_canary, "_events", deque([(0, "old"), (999, "metadata")], maxlen=4096))
+    monkeypatch.setattr(admission_canary, "_events", deque([(0, "old", None), (999, "metadata", None)], maxlen=4096))
     monkeypatch.setattr(admission_canary.time, "time", lambda: 1000)
     def failed_publish():
         raise OSError("status disk unavailable")

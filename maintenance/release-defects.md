@@ -34,7 +34,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - `gateway.admission_canary.record_refusal` owns bounded, timestamped, content-free
   runtime-status evidence. The authority's `admit_native` and `admit_automation`
   boundaries count each refused attempt once with its source, reason and clause,
-  including internal wakes and suppressed user notices. Receipt-only producer
+  including internal wakes and suppressed user notices. An automation refusal
+  carries its producer identity, and retries of one identity (a watch notice
+  requeued on backoff after a non-permanent refusal) count once per 600-second
+  retention window: on 2026-10-29 one stuck pair of delegation-completion batches
+  retried after a restart reset their backoff and tripped bff96cdf's canary.
+  Regression: `tests/gateway/test_admission_canary.py::test_retries_of_one_refused_producer_identity_count_once_per_window`. Receipt-only producer
   scope also covers pre-admission authorization, codec preparation and retry
   conflicts. Nested scopes count once per task without suppressing later tasks.
   Codec, gate and ledger refusals share this hook, not the deduplicated

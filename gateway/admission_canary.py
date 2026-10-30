@@ -12,22 +12,30 @@ from collections import deque
 
 # Retain longer than the maximum 5-minute observation window. The canary trips
 # at 10 events by default, well below the 4096 retained observations.
-_events: deque[tuple[float, str]] = deque(maxlen=4096)
+_RETAIN_SECONDS = 600
+# (at, clause, producer identity or None). A producer that requeues one refused
+# input on backoff (a watch notice whose route check keeps failing) retries the
+# same admission, not a new one: counting every retry let a single stuck notice
+# from before a promotion trip its canary.
+_events: deque[tuple[float, str, str | None]] = deque(maxlen=4096)
 _admitting: ContextVar[Task | None] = ContextVar("admission_canary_admitting", default=None)
 _lock = threading.Lock()
 
 
 def snapshot() -> dict:
     with _lock:
-        cutoff = time.time() - 600
+        cutoff = time.time() - _RETAIN_SECONDS
         while _events and _events[0][0] < cutoff:
             _events.popleft()
-        return {"pid": os.getpid(), "refusals": list(_events)}
+        return {"pid": os.getpid(), "refusals": [(at, clause) for at, clause, _ in _events]}
 
 
 @contextmanager
-def refusal_evidence(source: str) -> Iterator[None]:
+def refusal_evidence(source: str, identity: str | None = None) -> Iterator[None]:
     """Count a failed authority admission once, before any logging or notice dedup.
+
+    ``identity`` is the producer's stable admission identity. Its retries count
+    once per retention window; inputs without one count on every attempt.
 
     The codec is also reused by automation, so counting at its individual raise
     sites either misses ledger/gate refusals or double-counts producer failures.
@@ -53,16 +61,21 @@ def refusal_evidence(source: str) -> Iterator[None]:
         }
         if not settled:
             clause = f"{source}: {exc.reason}" + (f" ({exc.field})" if exc.field else "")
-            record_refusal(clause)
+            record_refusal(clause, identity=f"{source}:{identity}" if identity else None)
         raise
     finally:
         _admitting.reset(token)
 
 
-def record_refusal(clause: str) -> None:
-    """Record one refused admission attempt, not its logs or transport notices."""
+def record_refusal(clause: str, *, identity: str | None = None) -> None:
+    """Record one refused admission, not its logs, transport notices or retries."""
     with _lock:
-        _events.append((time.time(), str(clause)[:128]))
+        now = time.time()
+        cutoff = now - _RETAIN_SECONDS
+        if identity is not None and any(
+                counted == identity and at >= cutoff for at, _, counted in _events):
+            return
+        _events.append((now, str(clause)[:128], identity))
     # Use the existing coalescing background writer, never synchronous disk I/O
     # or user-facing notices on the admission path.
     from gateway.status import publish_runtime_status
