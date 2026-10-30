@@ -163,11 +163,13 @@ updates cannot discover the host gateway. No runtime safety guard is disabled.
 The desktop installer-ownership fixtures wait for a readiness message from their real
 Python children before checking process arguments or native update ownership. Full
 platform concurrency left a shell wrapper running beyond its former 40 x 25ms
-polling window. The managed-launcher fixture subscribes before launch to the atomic
-terminal-status publication rather than assuming completion within 100 x 25ms.
+polling window. The managed-launcher fixture polls the atomic terminal-status file
+within the existing test budget. macOS directory watches can coalesce changes
+without naming that file, even after it exists, so events alone cannot prove
+publication. Waiting on the file also covers publication before exec returns.
 The existing finite Vitest budgets and all argv, log, status, mode and native-ownership
 assertions remain intact. Three-second startup/update injection reproduces both
-former failures and passes with event-based synchronization, without retries.
+former failures and passes with condition-based synchronization, without retries.
 The bundled gateway-ticket fixture links the selected Python's base interpreter,
 not its venv executable. A copied venv binary depends on its adjacent `pyvenv.cfg`
 to find the standard library, which is absent in the fake payload. With a copied

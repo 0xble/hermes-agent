@@ -3220,7 +3220,7 @@ def _run_delivery_outcome(d: _RunDelivery) -> str:
 
 
 def _save_compose_deliver(
-    d: _RunDelivery, fence: _FireOwnership, final_response: str, output: str, *,
+    d: _RunDelivery, fence: _FireOwnership, final_response: str, output: Optional[str], *,
     adapters, loop, verbose: bool, execution_token, commit_result=None,
 ) -> None:
     """Save output, compose the notice and deliver it (both side effects run under the fire-claim
@@ -3231,7 +3231,7 @@ def _save_compose_deliver(
             raise _FireClaimLostDuringSideEffect
         # remove_job() already deleted this job's output dir; saving would re-create an orphan.
         output_file = (
-            None if self_removal_delivery_allowed(job["id"])
+            None if output is None or self_removal_delivery_allowed(job["id"])
             else save_job_output(job["id"], output))
     if verbose and output_file is not None:
         logger.info("Output saved to: %s", output_file)

@@ -4985,6 +4985,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         try:
             result = await delivery_adapter._send_with_retry(
                 chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+            from gateway.reply_latency import record_first_reply
+            record_first_reply(getattr(event, "_terminal_reply_latency_receipt",
+                                       getattr(event, "_reply_latency_receipt", None)), text_content, result)
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
         # Let records_delivery count the captured result before cancellation propagates,
@@ -5063,51 +5066,15 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
     async def _send_copy_blocks(
-        self, event: MessageEvent, session_key: str, copy_blocks: list[str], metadata: Dict[str, Any],
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], metadata: dict[str, Any],
         record_delivery: Callable, *, attachments_pending: bool = False,
         is_ephemeral_response: bool = False, ephemeral_ttl: int = 0,
     ) -> None:
-        """Deliver copy blocks in source order through the final delivery ledger, without pacing."""
-        previous_send_started = None
-        for index, block in enumerate(copy_blocks):
-            send_started = time.monotonic()
-            if previous_send_started is not None:
-                logger.debug(
-                    "[%s] Copy block %d/%d inter-message start gap: %.3fs",
-                    self.name, index, len(copy_blocks), send_started - previous_send_started)
-            previous_send_started = send_started
-            copy_metadata = dict(metadata)
-            copy_metadata["copy_block"] = True
-            copy_metadata["copy_block_index"] = index
-            copy_metadata["plain"] = True
-            deferred: list = []
-
-            async def _defer_rest(refused, refusing_adapter, _index=index, _metadata=copy_metadata):
-                # A later block must never overtake an undelivered earlier one: the rest wait
-                # in the ledger behind the refused block, and redelivery keeps their order.
-                deferred.extend(await self._defer_copy_blocks(
-                    event, session_key, copy_blocks, _index + 1, _metadata, refusing_adapter,
-                    str(refused.error or "send failed"), is_ephemeral_response=is_ephemeral_response))
-
-            result, delivery_adapter = await self.send_final_ledgered(
-                event, session_key, block, copy_metadata,
-                reply_to=_reply_anchor_for_event(event),
-                is_ephemeral_response=is_ephemeral_response,
-                release_marker=(index == len(copy_blocks) - 1 and not attachments_pending),
-                on_refused=_defer_rest,
-            )
-            record_delivery(result)
-            if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
-                delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
-            if not getattr(result, "success", False):
-                logger.error(
-                    "[%s] Copy block %d/%d failed for %s: %s",
-                    self.name, index + 1, len(copy_blocks), event.source.chat_id,
-                    result.error or "unknown delivery error",
-                )
-                for held in deferred:
-                    record_delivery(held)
-                return
+        from gateway.platforms.base_copy_delivery import _send_copy_blocks
+        await _send_copy_blocks(
+            self, event, session_key, copy_blocks, metadata, record_delivery,
+            attachments_pending=attachments_pending,
+            is_ephemeral_response=is_ephemeral_response, ephemeral_ttl=ephemeral_ttl)
 
     async def _defer_copy_blocks(
         self, event: MessageEvent, session_key: str, copy_blocks: list[str], start: int,

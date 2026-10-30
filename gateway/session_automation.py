@@ -373,8 +373,23 @@ def admission_display(payload):
     return card
 
 
+# Telegram omits a forum topic's name on ordinary messages inside the topic, so a route origin
+# that recorded ``chat_topic`` never matched its committed envelope, and every completion
+# borrowing that envelope was refused (``admission_conflict``) and retried forever. The topic
+# name labels a thread, never selects one; other labels (``user_name``) stay part of the check.
+_UNCOMPARED_FIELDS = frozenset({'message_id', 'chat_topic'})
+
+
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    return {key: value for key, value in source.to_dict().items() if key not in _UNCOMPARED_FIELDS}
+
+
+def route_rebound(entry, envelope):
+    """Whether the route's last committed envelope was admitted under a route key this session no
+    longer serves: the session was rebound (``switch_session``, e.g. moved to another platform's
+    thread) after its last human admission. That envelope's provenance names a connector the
+    session does not use now, so it is never lent; the current origin is revalidated instead."""
+    return envelope is not None and envelope.get('route') != entry.session_key
 
 
 def committed_route_envelope(authority, entry):
@@ -407,7 +422,9 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     from gateway.session_envelope import restore_native
     owner = captured[2] if captured is not None else authority.logical_owner(entry.session_id)
     envelope = captured[1] if captured is not None else committed_route_envelope(authority, entry)
-    if envelope is None:
+    if envelope is None or route_rebound(entry, envelope):
+        # No committed human source on this route yet: revalidate the current origin against the
+        # live adapter like native ingress. It mints no proof and refuses relay/role origins.
         from gateway.session_automation_legacy import revalidate_legacy_route
         restored, envelope = revalidate_legacy_route(authority, entry, adapter)
     else:
@@ -757,10 +774,15 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
     envelope = committed_route_envelope(authority, entry)
     if envelope is None:
         return False
-    # The route's committed source, which ``snapshot_automation`` re-derives and compares.
-    restored = restore_native({'text': text, 'native_text_v1': {
-        k: v for k, v in envelope.items() if k != 'media'}}, runner)
-    event = MessageEvent(text=text, message_type=MessageType.TEXT, source=restored.source, internal=True,
+    if route_rebound(entry, envelope):
+        # The session moved after its last human turn: the wake rides the route it serves now,
+        # which ``snapshot_automation`` revalidates against the live adapter.
+        source = runner._restored_source(entry)
+    else:
+        # The route's committed source, which ``snapshot_automation`` re-derives and compares.
+        source = restore_native({'text': text, 'native_text_v1': {
+            k: v for k, v in envelope.items() if k != 'media'}}, runner).source
+    event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
                          message_id=identity, metadata={'gateway_session_key': key,
                                                         'gateway_session_id': entry.session_id,
                                                         **(metadata or {})})
