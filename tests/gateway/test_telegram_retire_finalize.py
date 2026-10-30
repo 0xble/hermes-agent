@@ -94,6 +94,13 @@ async def test_absent_recovery_preserves_ambiguous_or_unsettled_topics(runtime, 
         r.runner.session_store.get_or_create_session(r.source, force_new=True)
     await retire.save(r.runner, r.source, r.state)
     await retire.resume_all(r.runner)
+    if block == "active_successor":
+        # The delivered handoff task carries the loop to its busy destination, whose own loop is
+        # never overwritten, so the absent topic now finalizes.
+        assert (await retire.load(r.runner, r.source))["phase"] == "done"
+        assert json.loads(r.db.get_meta("loop:next"))["prompt"] == "Independent successor work"
+        assert json.loads(r.db.get_meta(f"loop:{r.entry.session_id}"))["status"] == "cleared"
+        return
     assert (await retire.load(r.runner, r.source))["phase"] == "failed"
     assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
     assert r.db.get_session(r.entry.session_id)["session_key"] == r.entry.session_key

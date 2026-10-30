@@ -435,7 +435,9 @@ async def transfer_control(runner, source, state, item, dest):
         if _handoff_definition(json.loads(old)) != _handoff_definition(item["record"]):
             raise RuntimeError(f"Cannot transfer {kind}: the source changed after its handoff was recorded")
         if not accepted_task_id and not task_only and open_control(new):
-            raise RuntimeError(f"Cannot transfer {kind}: destination already owns one")
+            # The destination started its own control after preparation chose a move: decide here, in
+            # the transaction, and hand this one over as its task like any occupied destination.
+            task_only = handoff["task_only"] = True
         moves = not accepted_task_id and not task_only
         if kind == "loop":
             current_loop, retired_loop = LoopState.from_json(old), LoopState.from_json(old)

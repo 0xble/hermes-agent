@@ -479,6 +479,13 @@ async def test_control_transfer_refuses_conflicts_and_rolls_back_without_proof(r
                 raise RuntimeError("proof write failed")
             return original(key, value, **kwargs)
         monkeypatch.setattr(r.db, "set_meta", fail)
+    if failure == "destination":
+        # An occupied destination is never overwritten: the control arrives there as its handoff task.
+        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+        assert r.db.get_meta(f"{kind}:next") == before[1]
+        assert json.loads(r.db.get_meta(f"{kind}:old"))["status"] == "cleared"
+        assert r.state["handoffs"][item["id"]]["control_receipt"]["task_only"] is True
+        return
     with pytest.raises(RuntimeError, match="Cannot transfer|proof write failed"):
         await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
     assert (r.db.get_meta(f"{kind}:old"), r.db.get_meta(f"{kind}:next")) == before
