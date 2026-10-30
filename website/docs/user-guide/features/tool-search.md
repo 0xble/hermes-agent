@@ -22,7 +22,8 @@ Hermes keeps its working-set core tools (`terminal`, `read_file`, `write_file`,
 `_HERMES_CORE_TOOLS`) loaded directly by default. Cold, event-triggered built-ins
 may be deferred when they are named in `tools.tool_search.defer`; the shipped
 curated list covers tools such as `computer_use`, `session_search`, and selected
-desktop helpers. MCP and non-core plugin tools remain eligible automatically.
+desktop helpers. MCP and non-core plugin tools remain eligible automatically,
+except plugin tools their plugin registered with `eager=True`.
 An explicit `defer` list replaces the curated list, and `defer: []` keeps every
 tool eager.
 :::
@@ -132,7 +133,7 @@ shipped curated set; the runtime fallback uses the same value.
 | `max_search_limit` | `25` | Hard upper bound the model can request via `limit` (per query). Range 1–50. |
 | `listing` | `auto` | Embed a skills-style manifest of every deferred tool (name + first sentence of its description, ≤60 chars, grouped by MCP server) in the `tool_search` bridge description. `auto` includes it when it fits the budget (falling back to names-only, then to the tier-2 server summary); `on`/`off` force either way. |
 | `listing_max_tokens` | `4000` | Absolute cap on the embedded listing, regardless of context size. Range 200–60000. Large catalogs degrade to names-only or per-server summaries, keeping full schemas available through search. |
-| `defer` | Curated list | Tool names replaced by the bridge by default. The list may include cold built-in tools as well as MCP/plugin tools; an explicit list replaces it, and `[]` disables deferral for every tool. |
+| `defer` | Curated list | Tool names replaced by the bridge by default. The list may include cold built-in tools as well as MCP/plugin tools, including plugin tools registered with `eager=True`; an explicit list replaces it, and `[]` disables deferral for every tool. |
 
 Per-call array caps are internal safety bounds, not configuration. Over-cap
 calls return an error so the model can retry with a smaller batch.

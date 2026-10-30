@@ -1443,6 +1443,29 @@ ctx.register_tool(
 )
 ```
 
+### Keeping a tool out of Tool Search
+
+When [Tool Search](../../user-guide/features/tool-search.md) is active, plugin
+tools are deferred behind the search bridge by default: the model sees only a
+catalog line and loads the schema on demand. For a tool the model should be
+able to reach without searching first, such as one it is expected to call
+unprompted on most turns, pass `eager=True`:
+
+```python
+def register(ctx):
+    ctx.register_tool(
+        name="my_status",
+        toolset="my_plugin",
+        schema={...},
+        handler=report_status,
+        eager=True,   # full schema stays in the model-visible tools array
+    )
+```
+
+Eager tools pay their full schema on every request, so reserve the flag for a
+few small tools. The user stays in control: a tool named in
+`tools.tool_search.defer` is deferred even when it was registered eager.
+
 ### Overriding a built-in tool
 
 To replace a built-in tool with your own implementation (e.g. replace
