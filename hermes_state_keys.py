@@ -61,6 +61,15 @@ def legacy_cron_run_job(session_id):
 
 def admission_fingerprint(*, canonical_target: str, payload: dict) -> str:
     """Canonical payload identity after authorization and immutable media capture."""
+    native_input = payload.get('input')
+    if isinstance(native_input, dict):
+        envelope = native_input.get('native_text_v1')
+        if isinstance(envelope, dict) and 'attended_activity' in envelope:
+            # The native admission envelope retains local receipt time/marking for restore,
+            # not delivery identity. Normalize here for both live and retired exact retries.
+            # Other metadata and similarly named fields outside this path remain semantic.
+            payload = {**payload, 'input': {**native_input, 'native_text_v1': {
+                key: value for key, value in envelope.items() if key != 'attended_activity'}}}
     encoded = json.dumps(
         {'target': canonical_target, 'payload': payload}, ensure_ascii=False,
         sort_keys=True, separators=(',', ':'), allow_nan=False,

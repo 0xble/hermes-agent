@@ -64,6 +64,40 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         db.close()
 
 
+def test_native_activity_is_local_only_at_the_admission_envelope_boundary(tmp_path):
+    from copy import deepcopy
+    import hermes_state_runtime as rt
+
+    payload = {'text': 'hello', 'attended_activity': 'semantic top-level input',
+        'native_text_v1': {'attended_activity': {'received_at': 1800000000.0, 'marked': False},
+            'metadata': {'attended_activity': 'semantic metadata'}}}
+    untouched = deepcopy(payload)
+    with store(tmp_path) as db:
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        args = dict(principal_id='human', session_id='s', request_id='native')
+        first = rt.admit_session_input(db, epoch=epoch, payload=payload, **args)
+        retry = deepcopy(payload)
+        retry['native_text_v1']['attended_activity'] = {'received_at': 1800003600.0, 'marked': True}
+        assert rt.admit_session_input(db, epoch=epoch, payload=retry, **args) == first
+        del retry['native_text_v1']['attended_activity']
+        assert rt.admit_session_input(db, epoch=epoch, payload=retry, **args) == first
+        assert first['payload'] == untouched
+        assert payload == untouched, 'fingerprinting must not discard durable receipt data'
+        for change in ('top-level', 'metadata', 'native-field', 'intent'):
+            changed = deepcopy(retry)
+            if change == 'top-level':
+                changed['attended_activity'] = 'changed'
+            elif change == 'metadata':
+                changed['native_text_v1']['metadata']['attended_activity'] = 'changed'
+            elif change == 'native-field':
+                changed['native_text_v1']['semantic'] = 'changed'
+            with pytest.raises(rt.RuntimeStoreError, match='admission_conflict'):
+                rt.admit_session_input(db, epoch=epoch, payload=changed, intent='steer' if change == 'intent' else 'queue', **args)
+    # The helper also identifies non-admission operations. A similarly named field there is semantic.
+    fingerprint = rt.admission_fingerprint
+    assert fingerprint(canonical_target='s', payload=payload) != fingerprint(canonical_target='s', payload=retry)
+
+
 def test_sqlite_failure_never_acknowledges_or_partially_claims(tmp_path):
     db = store(tmp_path)
     import hermes_state_runtime as rt
