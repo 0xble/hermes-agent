@@ -5267,13 +5267,21 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     async def _fire_post_delivery_callback(
         self, session_key: str, generation: int | None,
     ) -> None:
-        """Run the one-shot callback for the generation captured after this handler returned."""
-        _post_cb = self.pop_post_delivery_callback(session_key, generation=generation)
-        if callable(_post_cb):
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                _post_result = _post_cb()
-                if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        """Run the one-shot callback for the generation captured after this handler returned, after
+        any older generation's callback for the session that nothing fired: that turn is over, and its
+        callback (temporary progress cleanup above all) would otherwise be held forever."""
+        callbacks = []
+        if generation is not None:
+            owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
+            stale = sorted(k for k in owned if k[0] == session_key and k[1] < int(generation))
+            callbacks.extend(owned.pop(k) for k in stale)
+        callbacks.append(self.pop_post_delivery_callback(session_key, generation=generation))
+        for _post_cb in callbacks:
+            if callable(_post_cb):
+                with contextlib.suppress(asyncio.TimeoutError, Exception):
+                    _post_result = _post_cb()
+                    if inspect.isawaitable(_post_result):
+                        await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
