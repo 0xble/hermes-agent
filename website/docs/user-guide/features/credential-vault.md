@@ -65,6 +65,28 @@ A manager item that lists several websites (say `amazon.co.uk`,
 `www.amazon.co.uk` and `eu.account.amazon.com`) fills on each of those exact
 origins; nothing is inferred beyond the URLs saved on the item.
 
+### Signing in on another site
+
+Some accounts sign in on a different host than the one the login is saved for
+(`example.com` saved, the form lives on `signin.example.net`). Rather than
+editing the item, name the extra origin in `config.yaml` under the login's
+handle from `browser_vault list`:
+
+```yaml
+vault:
+  origin_aliases:
+    op:abcdefghijklmnopqrstuvwxyz: [https://signin.example.net]
+```
+
+Each entry is one exact `https://` origin: an `http` origin, a path, a query or
+a wildcard is ignored with a warning, and nothing is inferred from it (a
+subdomain of the alias is not an alias). Aliases apply to logins only, so the
+password and the automatic one-time code. The first fill on an alias origin
+asks you to approve it, naming the login and the site it is saved for, because
+the agent can edit `config.yaml` too; answer for the session or always to stop
+being asked for that login on that origin. The config is read on every fill,
+so removing an entry stops the next fill, even one waiting on that prompt.
+
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
 

@@ -34,7 +34,13 @@ import secrets
 import logging
 from typing import Any, Dict, Optional
 
-from tools.browser_vault_context import plugin_errors_as_refusal, saved_origins, snapshot_refusal, write_backend_code
+from tools.browser_vault_context import (
+    origin_aliases,
+    plugin_errors_as_refusal,
+    saved_origins,
+    snapshot_refusal,
+    write_backend_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,17 +252,44 @@ def _bound_page_origin(task_id: str, meta: Any, probe_kind: str) -> str | dict[s
         return {"success": False, "error_type": "no_origin",
                 "error": f"Vault item {meta.id!r} has no bound origin; {meta.kind} items are filled only on "
                          "the site they were saved for."}
-    page_origin = next((o for o in (_focus_bound_origin(task_id, c, probe_kind) for c in allowed) if o), None)
+    aliases = [o for o in origin_aliases(meta) if o not in allowed]
+    candidates = allowed + aliases
+    page_origin = next((o for o in (_focus_bound_origin(task_id, c, probe_kind) for c in candidates) if o), None)
     page_origin = page_origin or _current_page_origin(task_id)
     if not page_origin:
         return {"success": False,
                 "error": "Could not determine the current page origin. Navigate to the login page first."}
-    if page_origin not in allowed:
+    if page_origin not in candidates:
         return {"success": False, "error_type": "origin_mismatch",
                 "error": (f"Refused: current page origin ({page_origin}) does not match the vault item's bound "
-                          f"origin(s) ({', '.join(allowed)}). Vault fills only run on the exact origin(s) the "
+                          f"origin(s) ({', '.join(candidates)}). Vault fills only run on the exact origin(s) the "
                           "credential was saved for.")}
+    if page_origin in aliases:
+        return _alias_origin_refusal(meta, page_origin) or page_origin
     return page_origin
+
+
+def _alias_origin_refusal(meta: Any, origin: str) -> dict[str, Any] | None:
+    """A login reaches an origin it was not saved for only through ``vault.origin_aliases``, and only after
+    the user approves that origin: config.yaml is writable by the agent, so the entry alone is not the
+    owner's consent. A session/always answer is remembered for this (handle, origin) pair. None when the
+    fill may go ahead; the alias is re-read after the prompt, so one removed meanwhile refuses."""
+    from tools.approval import is_approved
+    from tools.approval_context import get_current_session_key
+    from tools.approval_prompt import request_elicitation_consent
+
+    key = f"vault-alias:{meta.id}@{origin}"
+    if not is_approved(get_current_session_key(), key) and request_elicitation_consent(
+            f"Fill login '{meta.label}' on {origin}",
+            f"This login is saved for {', '.join(saved_origins(meta))}. {origin} reaches it only through "
+            "vault.origin_aliases in config.yaml. Approve only if this page signs in to the same account.",
+            surface="vault-alias", title="Use a saved login on another site?", remember_key=key) != "accept":
+        return {"success": False, "error_type": "origin_alias_declined",
+                "error": f"The user did not approve filling this login on {origin}. Do not retry; ask them instead."}
+    if origin not in origin_aliases(meta):
+        return {"success": False, "error_type": "origin_mismatch",
+                "error": f"Refused: {origin} was removed from vault.origin_aliases. Nothing was resolved or written."}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +321,8 @@ def browser_vault_list() -> str:
                      "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
             if len(meta.allowed_origins) > 1:
                 entry["allowed_origins"] = list(meta.allowed_origins)
+            if aliases := origin_aliases(meta):
+                entry["origin_aliases"] = aliases
             if meta.has_otp or backend.needs_unlock:
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
             if meta.identifier:
