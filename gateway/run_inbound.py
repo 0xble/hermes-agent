@@ -1028,6 +1028,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 return None
             self._preserve_drain_event(_quick_key, event)
             return None
+        if event.internal and not event.get_command():
+            # Shared busy dispatch skips the adapter's internal FIFO guard. Completions must
+            # never interrupt or steer a running turn, regardless of human busy policy.
+            self._queue_or_replace_pending_event(_quick_key, event)
+            return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if not _handled:
             _handled, _result = await self._busy_skill_turn(event, source, _quick_key)
