@@ -5541,6 +5541,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         owner.register_post_delivery_callback(key, cleanup, generation=turn_ctx.run_generation)
         turn_ctx._post_delivery_adapter = owner
         turn_ctx._bubble_cleanup_registered = True
+        # A FIFO drain turn has no adapter handler whose unwind fires this; the drain fires it.
+        from gateway.session_results import execution_result
+        captured = execution_result.get()
+        if captured is not None:
+            captured['post_delivery'] = (owner, key, turn_ctx.run_generation)
 
     def _run_agent_bind_turn_wiring(
         self, turn_ctx: TurnContext, turn_runner: TurnRunner, source: SessionSource,
