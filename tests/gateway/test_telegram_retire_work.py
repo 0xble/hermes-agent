@@ -1088,3 +1088,16 @@ async def test_running_process_owned_elsewhere_still_refuses(runtime, monkeypatc
             "record": {"session_id": "proc-x", "owner_task_id": "old", "status": "running"}}
     with pytest.raises(RuntimeError, match="Process ownership changed"):
         await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+
+
+
+@pytest.mark.asyncio
+async def test_cron_deleted_after_its_handoff_settles(runtime, monkeypatch):
+    from cron import jobs
+    r = runtime
+    monkeypatch.setattr(jobs, "get_job", lambda _job_id: None)
+    update = MagicMock()
+    monkeypatch.setattr(jobs, "update_job", update)
+    item = {"id": "cron:gone", "kind": "cron", "title": "Nightly digest", "record": {"id": "gone"}}
+    await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+    update.assert_not_called()

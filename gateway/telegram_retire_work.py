@@ -474,7 +474,8 @@ async def transfer(runner, source, state, item, dest):
         job_id = item["record"]["id"]
         current = await asyncio.to_thread(get_job, job_id)
         if current is None:
-            raise RuntimeError(f"Cron {job_id} disappeared before transfer")
+            # Deleted after the handoff was recorded: there is no job left to move.
+            return
         before = json.dumps(current)
         old_address, new_address = address(source, old_sid), address(source, new_sid)
         old_delivery = f"telegram:{source.chat_id}:{source.thread_id}"
