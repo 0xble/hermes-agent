@@ -170,7 +170,7 @@ def test_partial_unbind_refuses_rebound_persistent_route(runtime):
 async def test_failed_retirement_of_a_replaced_conversation_is_not_retried(runtime, monkeypatch):
     """Auto-retry retires only the conversation the user asked to retire, never a /new successor."""
     r = runtime
-    r.state.pop("failed_at")
+    r.state["failed_at"] = 1.0
     monkeypatch.setattr(work, "cli", AsyncMock(return_value=[{"id": "17"}]))
     r.runner.session_store.get_or_create_session(r.source, force_new=True)
     await retire.save(r.runner, r.source, r.state)

@@ -285,7 +285,7 @@ async def receipt(runner, source, state, item, dest):
         # colon-free words and match the key here. ``--all`` returns every page.
         matches = await cli(runner, owner_source, "tasks", "--json", "query",
                             f'"Retired topic" {item["kind"]}', "--all")
-        if isinstance(matches, dict) and not matches.get("has_more"):
+        if isinstance(matches, dict) and not matches.get("has_more") and not matches.get("truncated"):
             matches = matches.get("items")
         if not isinstance(matches, list):
             raise RuntimeError("Handoff task lookup returned an incomplete response")

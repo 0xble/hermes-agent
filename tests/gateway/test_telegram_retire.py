@@ -572,3 +572,73 @@ async def test_cancelled_retirement_is_never_retried(runtime, monkeypatch):
     clock[0] += retire._AUTO_RETRY_MAX_SECONDS
     await retire.advance(runtime, runtime.source)
     assert (await retire.load(runtime, runtime.source))["phase"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_failures_recorded_before_auto_retry_are_never_retried(runtime, monkeypatch):
+    """A legacy failure told the user to ask; silence since then is not consent to delete."""
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    legacy = await retire.load(runtime, runtime.source)
+    legacy.pop("failed_at")
+    await retire.save(runtime, runtime.source, legacy)
+    await retire.advance(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state["phase"] == "failed" and state["generation"] == legacy["generation"]
+
+
+@pytest.mark.asyncio
+async def test_working_in_a_failed_topic_keeps_it(runtime, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    failed = await retire.load(runtime, runtime.source)
+    clock[0] += 5
+    assert await retire.intercept(runtime, MessageEvent(text="still using this", source=runtime.source)) is None
+    clock[0] += retire._AUTO_RETRY_MAX_SECONDS
+    await retire.advance(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state["phase"] == "failed" and state["generation"] == failed["generation"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_an_automatic_retry_wins(runtime, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    meta_key = retire.state_key(runtime.source)
+    calls = {"n": 0}
+
+    def peek(_key):
+        calls["n"] += 1
+        if calls["n"] == 2:  # inside request(), after the retry read the failed generation
+            raw = runtime._session_db.get_meta.side_effect(meta_key)
+            cancelled = {**json.loads(raw), "phase": "cancelled", "generation": "user-cancel"}
+            runtime._session_db.set_meta.side_effect(meta_key, json.dumps(cancelled))
+        return "session-1"
+    runtime.session_store.peek_session_id = MagicMock(side_effect=peek)
+    clock[0] += retire._AUTO_RETRY_BASE_SECONDS
+    await retire.advance(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state["phase"] == "cancelled" and state["generation"] == "user-cancel"
+    runtime.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_closing_note_is_never_retried_automatically(runtime, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    failed = await retire.load(runtime, runtime.source)
+    failed["closing_attempt"] = 999.0
+    await retire.save(runtime, runtime.source, failed)
+    clock[0] += retire._AUTO_RETRY_MAX_SECONDS
+    await retire.advance(runtime, runtime.source)
+    assert (await retire.load(runtime, runtime.source))["generation"] == failed["generation"]
