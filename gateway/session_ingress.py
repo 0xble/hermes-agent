@@ -475,11 +475,19 @@ async def deliver_response(adapter, event, session_key, response):
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
     results = []
+    attachments_pending = bool(extracted.images or extracted.media_files or extracted.local_files)
     if extracted.text_content:
         await adapter._send_final_text(event, session_key, extracted.text_content,
-                                       metadata, ttl > 0, ttl, results.append)
+                                       metadata, ttl > 0, ttl, results.append,
+                                       attachments_pending=bool(extracted.copy_blocks) or attachments_pending)
+    if extracted.copy_blocks:
+        await adapter._send_copy_blocks(
+            event, session_key, extracted.copy_blocks, metadata, results.append,
+            attachments_pending=attachments_pending,
+            is_ephemeral_response=ttl > 0, ephemeral_ttl=ttl)
     await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
-                                       record_delivery=results.append)
+                                       record_delivery=results.append, session_key=session_key,
+                                       is_ephemeral_response=ttl > 0)
 
 
 async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):

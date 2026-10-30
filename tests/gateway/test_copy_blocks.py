@@ -741,3 +741,74 @@ async def test_copy_block_recovered_from_a_deleted_topic_stays_exact() -> None:
     assert result.success is True
     assert sends[-1][0] == "exact body"
     assert "thread_id" not in sends[-1][1] and sends[-1][1]["copy_block"] is True
+
+
+# Shape of the 2026-10-29 FIFO copy-block incident: prose, then 1 top-level copy body
+# opening with an @mention, then trailing prose.
+_INCIDENT_REPLY = (
+    "Here's the announcement for the team channel. It isn't posted yet. Tell me \"send\" "
+    "and I'll post it.\n\n"
+    "[[copy]]\n"
+    "@Alex starting next week, please show customers a 2-hour arrival window instead of an "
+    "exact time. Let me know once the booking confirmations are updated.\n"
+    "[[/copy]]\n\n"
+    "I'll trim the message before it goes if anything changes."
+)
+
+
+@pytest.mark.asyncio
+async def test_fifo_delivery_sends_exact_incident_copy_block(monkeypatch) -> None:
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.base import MessageEvent, SessionSource
+    from gateway.session_ingress import deliver_response
+
+    adapter = _FakeAdapter(PlatformConfig(), Platform.TELEGRAM)
+    event = MessageEvent(text="draft", source=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat", thread_id="topic"), message_id="1")
+    sent = []
+
+    async def send_final(event, session, content, metadata, **kwargs):
+        sent.append((content, metadata, kwargs))
+        return SendResult(success=True, message_id="2"), adapter
+
+    monkeypatch.setattr(adapter, "send_final_ledgered", send_final)
+    await deliver_response(adapter, event, "incident-session", _INCIDENT_REPLY)
+    prose, blocks = extract_copy_blocks(_INCIDENT_REPLY)
+    assert len(blocks) == 1
+    assert [item[0] for item in sent] == [prose.strip(), *blocks]
+    assert blocks[0].startswith("@Alex")
+    assert sent[0][2]["release_marker"] is False
+    assert sent[1][1].items() >= {"thread_id": "topic", "notify": True,
+                                 "copy_block": True, "copy_block_index": 0, "plain": True}.items()
+    assert sent[1][2]["release_marker"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_copy_send_failure_logs_session_count_and_notifies(monkeypatch, caplog, raises) -> None:
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.base import MessageEvent, SessionSource
+
+    adapter = _FakeAdapter(PlatformConfig(), Platform.TELEGRAM)
+    event = MessageEvent(text="draft", source=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat", thread_id="topic"), message_id="1")
+    notices, results = [], []
+
+    async def send_final(*args, **kwargs):
+        if raises:
+            raise RuntimeError("transport broke")
+        return SendResult(success=False, error="transport refused"), adapter
+
+    async def send(chat_id, content, **kwargs):
+        notices.append((content, kwargs))
+        return SendResult(success=True, message_id="notice")
+
+    monkeypatch.setattr(adapter, "send_final_ledgered", send_final)
+    monkeypatch.setattr(adapter, "send", send)
+    await adapter._send_copy_blocks(event, "incident-session", ["@Alex exact"],
+                                    {"thread_id": "topic"}, results.append)
+    assert len(results) == 1 and not results[0].success
+    assert any(r.levelno == logging.ERROR and "incident-session" in r.message
+               and "1/1" in r.message for r in caplog.records)
+    assert len(notices) == 1 and "copy" in notices[0][0].lower()
+    assert notices[0][1]["metadata"]["thread_id"] == "topic"

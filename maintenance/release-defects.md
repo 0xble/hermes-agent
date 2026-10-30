@@ -65,6 +65,23 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `tests/gateway/test_legacy_delegation_refusal.py`,
   `tests/hermes_cli/test_rollback_diagnostics.py`, and existing guardian/release tests.
 
+## Automation Wakes After a Route Rebind
+
+- Fork patch identity: `automation-rebound-route`.
+- Producer wakes (`/loop` ticks, delegation completions, process notices) borrow the
+  route's last committed envelope. A session rebound to another route after its last
+  human turn (`switch_session`, as the 2026-10-30 Slack cutover moves 142 Telegram topic
+  owners to Slack threads) kept a committed envelope from the old route. Its provenance
+  names a connector that no longer serves the session, so every wake was refused
+  (`not_found` from provenance restore). A refused completion is permanent and reaches the
+  drop cap. A refused `/loop` tick is skipped.
+- `route_rebound(entry, envelope)` is true when the committed envelope's `route` is not
+  the entry's current `session_key`. Then `snapshot_automation` and `admit_route_wake`
+  use the current origin, revalidated by `revalidate_legacy_route` against the live
+  adapter like native ingress. That path mints no proof, refuses relay, role and
+  upstream-authorized origins, and keeps the sender and route comparison.
+- Guard: `tests/gateway/test_automation_rebound_route.py`.
+
 ## Billing outage persistence and provider-wide classification
 
 - Fork patch identity: `billing-outage-recovery`.
@@ -1029,7 +1046,21 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Only gateway producer entry points mint private synthetic provenance. The native
   envelope carries its metadata and internal semantics separately, and restores
   them before execution. Source, authorization, content and route validation still
-  run. Ordinary user metadata and the WhatsApp-only projection are unchanged.
+  run. Ordinary adapter metadata crosses a per-platform allowlist/projection
+  registry. WhatsApp retains its existing validation and 16 KiB drop policy.
+- Telegram's `telegram_rich_message` projection keeps exactly `block_count`
+  (non-negative int, excluding bool), `block_types` (at most 256 non-empty
+  strings, each at most 64 characters), `source` (None or a non-empty string
+  at most 64 characters), and `truncated` (bool). The adapter's source labels
+  are `attribute` and `api_kwargs`. Missing fields, unknown keys, malformed
+  values and unregistered platforms' non-empty metadata refuse admission.
+  Native and synthetic replay preserve their separate metadata contracts.
+- Guards: `tests/gateway/test_telegram_rich_message_admission.py` drives the
+  real Rich Message handler through durable native admission, JSON restore,
+  route revalidation and synthetic replay. It covers projection bounds,
+  independent nested lists, invalid shapes and foreign-platform refusals.
+  `tests/gateway/test_native_admission_metadata.py` retains the unchanged
+  WhatsApp bridge and codec regressions.
 - Admission refusals for producer/internal inputs are silent in chat. Internal
   refusals share one operator warning per 600-second window, with clause counts
   logged at debug level and summarized in the next window's warning. Human refusal

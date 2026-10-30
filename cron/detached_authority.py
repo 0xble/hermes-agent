@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import threading
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 from hermes_state_runtime import RuntimeStoreError
 
 PREFIX = 'cron-worker:'
+logger = logging.getLogger(__name__)
 
 
 def detached_assignment(job_id, execution_id):
@@ -123,6 +125,19 @@ def stored_result(result):
                        'cron_job_flags': result['job_flags']}, 'usage': {}}
 
 
+def _log_lost_detached(row, job_id, execution_id):
+    from cron.executions import _owner_identity, get_execution
+    execution = get_execution(execution_id)
+    identity = (_owner_identity(execution['pid'], execution['process_started_at'])
+                if execution is not None else 'absent')
+    details = execution or {}
+    logger.warning(
+        'detached_cron_worker_lost admission_id=%s job_id=%s execution_id=%s '
+        'status=%s pid=%s process_id=%s process_started_at=%s owner_liveness=%s',
+        row['admission_id'], job_id, execution_id, details.get('status', 'absent'),
+        details.get('pid'), details.get('process_id'), details.get('process_started_at'), identity)
+
+
 async def observe_detached(row):
     """Observe without taking ownership of the worker or cancelling it on teardown."""
     request = row['request_id'].split(':', 2)
@@ -131,6 +146,12 @@ async def observe_detached(row):
         if result is not None:
             return result
         if await asyncio.to_thread(detached_execution, request[1], request[2]) is None:
+            # The worker publishes its receipt before terminalizing the ledger.
+            # The initial read may have preceded both commits.
+            result = await asyncio.to_thread(detached_result, row)
+            if result is not None:
+                return result
+            await asyncio.to_thread(_log_lost_detached, row, request[1], request[2])
             raise RuntimeStoreError('detached_cron_worker_lost')
         await asyncio.sleep(.1)
 
