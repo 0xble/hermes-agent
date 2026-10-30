@@ -33,6 +33,30 @@ class TelegramTopicRoutingMixin:
     # Memory bound only (local clock), far above any handler backlog; adoption never reads it.
     _NEW_TOPIC_RECORD_TTL_SECONDS = 600.0
 
+    def validate_existing_telegram_topic(self, chat_id: str, thread_id: str) -> dict[str, Any]:
+        """Validate a configured destination without claiming its session's topic."""
+        db = getattr(getattr(self, "_session_store", None), "_db", None)
+        if db is None:
+            raise RuntimeError("Telegram automation topic owner registry unavailable")
+        profile_name = str(getattr(self, "_owner_profile", None) or "default")
+        binding = db.get_telegram_topic_binding(
+            chat_id=str(chat_id), thread_id=str(thread_id), profile_name=profile_name)
+        if not binding:
+            raise RuntimeError(
+                f"Telegram topic thread {thread_id} has no live Hermes binding; refusing duplicate fallback")
+        session = db.get_session(str(binding.get("session_id")))
+        session_profile = str((session or {}).get("profile_name") or "default")
+        if (
+            not session
+            or session_profile != profile_name
+            or session.get("ended_at") is not None
+            or session.get("archived")
+            or session.get("hidden")
+        ):
+            raise RuntimeError(
+                f"Telegram topic thread {thread_id} has no live Hermes owner; refusing duplicate fallback")
+        return session
+
     @staticmethod
     def _creator_key(message) -> str:
         return str(getattr(getattr(message, "from_user", None), "id", ""))
