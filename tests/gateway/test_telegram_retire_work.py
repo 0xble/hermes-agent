@@ -323,7 +323,7 @@ async def test_context_settlement_carries_the_summary_without_inventing_a_ledger
 
 
 @pytest.mark.asyncio
-async def test_active_claims_are_quiet_and_destination_controls_are_not_overwritten(runtime, monkeypatch):
+async def test_active_claims_are_quiet_and_a_busy_destination_gets_the_control_as_a_task(runtime, monkeypatch):
     r = runtime
     async def admit(event):
         event._gateway_accepted = True
@@ -332,18 +332,28 @@ async def test_active_claims_are_quiet_and_destination_controls_are_not_overwrit
     assert not await work.prepare(r.runner, r.source, r.state)
     assert "Active claim" in r.adapter.handle_message.await_args.args[0].text
     r.adapter.send.assert_not_awaited()
-    record = {"goal": "Maintain Service", "status": "active"}
-    r.db.set_meta("goal:next", json.dumps(record))
+    from hermes_cli import goals
+    monkeypatch.setattr(goals, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    goals.save_goal("old", goals.GoalState(goal="Maintain Service"))
+    record = json.loads(r.db.get_meta("goal:old"))
+    destination_goal = json.dumps({"goal": "Its own goal", "status": "active"})
+    r.db.set_meta("goal:next", destination_goal)
     r.state["owners"] = {"goal": "Service Operations"}
     item = {"id": "goal", "kind": "goal", "title": "Maintain Service", "record": record}
-    monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[item]))
-    monkeypatch.setattr(work, "destination", AsyncMock(return_value={"session_id": "next", "title": "Service Operations"}))
-    sent = AsyncMock()
+    monkeypatch.setattr(work, "inventory", AsyncMock(side_effect=[[item], []]))
+    monkeypatch.setattr(work, "destination", AsyncMock(return_value={"session_id": "next", "title": "Service Operations",
+                                                                       "thread_id": "18"}))
+    sent = AsyncMock(return_value={"receipt_id": "r1"})
     monkeypatch.setattr(work, "receipt", sent)
-    assert not await work.prepare(r.runner, r.source, r.state)
-    assert "Destination already has a control" in r.adapter.handle_message.await_args.args[0].text
-    assert json.loads(r.db.get_meta("goal:next")) == record
-    sent.assert_not_awaited()
+    handled = r.adapter.handle_message.await_count
+    # The existing destination receives the goal as its handoff task: no successor question, no new topic.
+    assert await work.prepare(r.runner, r.source, r.state)
+    assert r.adapter.handle_message.await_count == handled
+    sent.assert_awaited_once()
+    assert r.db.get_meta("goal:next") == destination_goal  # its own goal is never overwritten
+    assert json.loads(r.db.get_meta("goal:old"))["status"] == "cleared"
+    assert r.state["handoffs"]["goal"]["task_only"] and r.state["handoffs"]["goal"]["control_receipt"]["task_only"]
     r.adapter.send.assert_not_awaited()
 
 
@@ -458,7 +468,8 @@ async def test_control_transfer_refuses_conflicts_and_rolls_back_without_proof(r
         # Identical text is not evidence that an unrelated goal was moved.
         r.db.set_meta(f"{kind}:next", r.db.get_meta(f"{kind}:old"))
     elif failure == "source":
-        changed = {**item["record"], "status": "paused"}
+        # A changed definition is different work. A pause alone is not (it moves paused).
+        changed = {**item["record"], ("goal" if kind == "goal" else "prompt"): "Different work"}
         r.db.set_meta(f"{kind}:old", json.dumps(changed))
     before = (r.db.get_meta(f"{kind}:old"), r.db.get_meta(f"{kind}:next"))
     if failure == "receipt_write":
@@ -468,6 +479,13 @@ async def test_control_transfer_refuses_conflicts_and_rolls_back_without_proof(r
                 raise RuntimeError("proof write failed")
             return original(key, value, **kwargs)
         monkeypatch.setattr(r.db, "set_meta", fail)
+    if failure == "destination":
+        # An occupied destination is never overwritten: the control arrives there as its handoff task.
+        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+        assert r.db.get_meta(f"{kind}:next") == before[1]
+        assert json.loads(r.db.get_meta(f"{kind}:old"))["status"] == "cleared"
+        assert r.state["handoffs"][item["id"]]["control_receipt"]["task_only"] is True
+        return
     with pytest.raises(RuntimeError, match="Cannot transfer|proof write failed"):
         await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
     assert (r.db.get_meta(f"{kind}:old"), r.db.get_meta(f"{kind}:next")) == before
@@ -1000,3 +1018,103 @@ def test_durable_delegation_handoff_and_queued_snapshot_refresh(tmp_path, monkey
     assert "thread_id" not in event
     with pytest.raises(RuntimeError, match="ownership changed"):
         delegation.transfer_retirement_owner("retirement-test", "wrong-key", "old", "elsewhere", "another")
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+async def test_control_that_ticked_after_its_handoff_still_transfers(runtime, monkeypatch, kind):
+    """Run counters advance every tick; they never make the handed-off work a different control."""
+    from hermes_cli import goals, loops
+    r = runtime
+    monkeypatch.setattr(goals, "_get_session_db", lambda: r.db)
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    if kind == "goal":
+        goals.save_goal("old", goals.GoalState(goal="Maintain Service"))
+    else:
+        loops.save_loop("old", loops.LoopState(prompt="Watch Service", interval_seconds=60))
+    item = (await work.inventory(r.runner, r.source, r.state))[0]
+    ticked = {**item["record"], "mutation_id": "m-later", "ticks_fired": 7, "turns_used": 3,
+              "last_fired_at": 123.0, "next_due_at": 456.0, "status": "paused"}
+    if kind == "goal":
+        ticked["gates"] = [{"name": "tests pass", "attempts": 4}]
+        item["record"] = {**item["record"], "gates": [{"name": "tests pass", "attempts": 1}]}
+    r.db.set_meta(f"{kind}:old", json.dumps(ticked))
+    await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+    assert json.loads(r.db.get_meta(f"{kind}:old"))["status"] == "cleared"
+    assert json.loads(r.db.get_meta(f"{kind}:next"))["status"] == "paused"  # moved as the judge left it
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("ended", ["done", "cleared"])
+async def test_control_that_ended_after_its_handoff_settles_without_moving(runtime, monkeypatch, kind, ended):
+    from hermes_cli import goals, loops
+    r = runtime
+    monkeypatch.setattr(goals, "_get_session_db", lambda: r.db)
+    monkeypatch.setattr(loops, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    if kind == "goal":
+        goals.save_goal("old", goals.GoalState(goal="Maintain Service"))
+    else:
+        loops.save_loop("old", loops.LoopState(prompt="Watch Service", interval_seconds=60))
+    item = (await work.inventory(r.runner, r.source, r.state))[0]
+    finished = json.dumps({**item["record"], "status": ended, "ticks_fired": 9})
+    r.db.set_meta(f"{kind}:old", finished)
+    destination = json.dumps({"status": "active", "prompt": "Its own work", "goal": "Its own work"})
+    r.db.set_meta(f"{kind}:next", destination)
+    dest = {"session_id": "next", "thread_id": "18"}
+    await work.transfer(r.runner, r.source, r.state, item, dest)
+    await work.transfer(r.runner, r.source, r.state, item, dest)  # recovery replays the same proof
+    assert r.db.get_meta(f"{kind}:old") == finished and r.db.get_meta(f"{kind}:next") == destination
+    assert r.state["handoffs"][item["id"]]["control_receipt"]["ended"] is True
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gone", ["exited", "pruned"])
+async def test_process_that_finished_after_its_handoff_settles(runtime, monkeypatch, gone):
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+    r = runtime
+    registry = ProcessRegistry()
+    session = ProcessSession(id="proc-done", command="build", task_id="session:old-key",
+                             owner_task_id="old", session_key="old-key", parent_session_id="old")
+    if gone == "exited":
+        session.mark_exited(0)
+        registry._running[session.id] = session
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    r.runner.session_store.list_sessions = lambda: [SimpleNamespace(session_id="next", session_key="next-key", origin=None)]
+    item = {"id": "process:proc-done", "kind": "process", "title": "build",
+            "record": {"session_id": "proc-done", "owner_task_id": "old", "status": "running"}}
+    await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+
+
+@pytest.mark.asyncio
+async def test_running_process_owned_elsewhere_still_refuses(runtime, monkeypatch):
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+    r = runtime
+    registry = ProcessRegistry()
+    registry._running["proc-x"] = ProcessSession(id="proc-x", command="build", task_id="t", owner_task_id="someone-else",
+                                                 session_key="other-key", parent_session_id="someone-else")
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    r.runner.session_store.list_sessions = lambda: [SimpleNamespace(session_id="next", session_key="next-key", origin=None)]
+    item = {"id": "process:proc-x", "kind": "process", "title": "build",
+            "record": {"session_id": "proc-x", "owner_task_id": "old", "status": "running"}}
+    with pytest.raises(RuntimeError, match="Process ownership changed"):
+        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+
+
+
+@pytest.mark.asyncio
+async def test_cron_deleted_after_its_handoff_settles(runtime, monkeypatch):
+    from cron import jobs
+    r = runtime
+    monkeypatch.setattr(jobs, "get_job", lambda _job_id: None)
+    update = MagicMock()
+    monkeypatch.setattr(jobs, "update_job", update)
+    item = {"id": "cron:gone", "kind": "cron", "title": "Nightly digest", "record": {"id": "gone"}}
+    await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+    update.assert_not_called()
