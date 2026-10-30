@@ -83,8 +83,15 @@ async def dispatch_busy_burst(adapter, event, session_key):
     # it can merge into an authorized head, and stamp before any burst/backpressure wait.
     runner = getattr(adapter._message_handler, '__self__', None) or adapter.gateway_runner
     schedule = getattr(runner, '_schedule_attended_user_activity', None)
-    if callable(schedule):
+    if callable(schedule) and not event.internal:
+        # Keep internal work on the handler's existing automation admission. An external input's
+        # allow_gateway_control flag alone never bypasses the scoped user/bot gates.
         if not runner._is_user_authorized_for_source(event.source):
+            logger.warning(
+                "Dropping message from unauthorized user in active session: "
+                "user=%s (%s), platform=%s, session=%s", event.source.user_id, event.source.user_name,
+                event.source.platform.value if event.source.platform else "unknown", session_key,
+            )
             return
         if not getattr(event, '_bot_loop_admitted', False):
             if not runner._admit_bot_message_for_source(event.source):
