@@ -488,11 +488,14 @@ async def _auto_retry(runner, source, generation):
         return  # A cancel, a user retry or the user's own message won.
     except Exception:
         # A retry refused before it could start still spends an attempt and waits out the backoff.
-        state.update(auto_retries=attempts + 1, failed_at=time.time())
-        try:
-            await save(runner, source, state)
-        except RetirementSuperseded:
-            pass
+        # Re-read first: the user's activity or a recovered receipt may have landed meanwhile.
+        current = await load(runner, source)
+        if current and current["generation"] == generation and current["phase"] == "failed":
+            current.update(auto_retries=attempts + 1, failed_at=time.time())
+            try:
+                await save(runner, source, current)
+            except RetirementSuperseded:
+                pass
         raise
     logger.info("Topic retirement for %s retried automatically (%d of %d)",
                 state_key(source), attempts + 1, _AUTO_RETRY_LIMIT)

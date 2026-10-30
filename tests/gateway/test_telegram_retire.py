@@ -682,3 +682,23 @@ async def test_a_retry_refused_before_it_starts_still_spends_an_attempt(runtime,
     assert state["auto_retries"] == 1 and state["failed_at"] == clock[0]
     await retire.advance(runtime, runtime.source)  # inside the new backoff: no second attempt
     assert retire.request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_refused_retry_keeps_activity_recorded_meanwhile(runtime, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(retire.time, "time", lambda: clock[0])
+    monkeypatch.setattr("gateway.telegram_retire_work.prepare", AsyncMock(side_effect=RuntimeError("handoff failed")))
+    await retire.request(runtime, runtime.source)
+    await retire.advance(runtime, runtime.source)
+    meta_key = retire.state_key(runtime.source)
+
+    async def refused(*_args, **_kwargs):
+        raw = runtime._session_db.get_meta.side_effect(meta_key)
+        runtime._session_db.set_meta.side_effect(meta_key, json.dumps({**json.loads(raw), "user_active_at": clock[0]}))
+        raise RuntimeError("no unambiguous destination")
+    monkeypatch.setattr(retire, "request", refused)
+    clock[0] += retire._AUTO_RETRY_BASE_SECONDS
+    await retire.advance(runtime, runtime.source)
+    state = await retire.load(runtime, runtime.source)
+    assert state["user_active_at"] and state["auto_retries"] == 1
