@@ -513,7 +513,8 @@ def mutate_runtime_session(db, *, epoch: int, principal_id: str, session_id: str
             return replay, None
         session = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
         from hermes_state_mutation_retirement import retired_in
-        if retired_in(conn, session_id):
+        # Import validates every payload id and reports the named conflict itself.
+        if operation != 'import' and retired_in(conn, session_id):
             raise RuntimeStoreError('not_found')
         if session is None and operation != 'import':
             raise RuntimeStoreError('not_found')

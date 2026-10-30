@@ -1766,7 +1766,9 @@ class SessionSessionsMixin:
         removed_ids: list[str] = []
         expected_ids = set(expected_delete_ids) if expected_delete_ids is not None else None
         def _do(conn):
-            if conn.execute(f"SELECT 1 FROM sessions WHERE id = ? AND {visible_session_sql('sessions.id')} LIMIT 1", (session_id,)).fetchone() is None:
+            # Retirement hides reads, not explicit reclamation of a legacy row
+            # recreated beside its fence. Re-retiring also upgrades a sweep marker.
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone() is None:
                 return False
             # A local reset/compression conversation deletes whole from any segment: the listed row
             # is its latest segment, and a lone segment delete strands the owner's policy and FIFO.
@@ -1892,7 +1894,7 @@ class SessionSessionsMixin:
         removed_ids: list[str] = []
         def _do(conn):
             existing = [row["id"] for chunk in _id_chunks(unique_ids) for row in conn.execute(
-                f"SELECT id FROM sessions WHERE {visible_session_sql('sessions.id')} AND id IN ({_session_ids_placeholders(chunk)})", chunk,
+                f"SELECT id FROM sessions WHERE id IN ({_session_ids_placeholders(chunk)})", chunk,
             ).fetchall()]
             if not existing:
                 return 0

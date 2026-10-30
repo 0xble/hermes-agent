@@ -1496,7 +1496,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         rows = self._read_all(
             f"SELECT {'session_id, ' if with_session_id else ''}{'compacted, ' if with_compacted else ''}"
             f"{self._CONVERSATION_ROW_COLUMNS} "
-            f"FROM messages WHERE {_VISIBLE_MESSAGE_SQL} AND session_id IN ({_placeholders(session_ids)})"
+            f"FROM messages WHERE session_id IN ({_placeholders(session_ids)}) AND {_VISIBLE_MESSAGE_SQL}"
             f"{_DISPLAY_ACTIVE_CLAUSE if with_compacted else active_clause} ORDER BY {'+id' if active_clause == ' AND active = 1' and not with_compacted else 'id'}", tuple(session_ids))
         return self._with_removed_identities(rows, session_ids) if with_compacted else rows
 

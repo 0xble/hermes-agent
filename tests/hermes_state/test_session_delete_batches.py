@@ -7,18 +7,19 @@ import pytest
 from hermes_state import SessionDB
 
 
-@pytest.mark.parametrize("operation", ["single", "chain", "prune"])
+@pytest.mark.parametrize("operation", ["single", "chain", "prune", "runtime"])
 def test_large_delete_bounds_each_transaction(tmp_path, operation):
     db = SessionDB(tmp_path / "state.db")
     try:
         db.create_session("large", source="cli")
         db.append_messages_batch("large", [
-            {"role": "user", "content": f"deletebatchneedle {i} 世界の記録 " + "payload " * 40}
+            {"role": "user", "content": f"deletebatchneedle {i} 世界の記録 " + "payload " * 40,
+             "timestamp": 1_600_000_000.0}
             for i in range(1025)
         ])
         db.end_session("large", "done")
         db._execute_write(lambda conn: conn.execute(
-            "UPDATE sessions SET started_at=1, ended_at=2, last_activity_at=2 WHERE id='large'"))
+            "UPDATE sessions SET started_at=1600000000, last_activity_at=1600000000 WHERE id='large'"))
         deleted_per_transaction = []
         count = 0
         writer = sqlite3.connect(tmp_path / "state.db", timeout=1)
@@ -50,8 +51,18 @@ def test_large_delete_bounds_each_transaction(tmp_path, operation):
             assert db.delete_session("large")
         elif operation == "chain":
             assert db.delete_sessions(["large"], include_compression_chain=True) == 1
-        else:
+        elif operation == "prune":
             assert db.prune_sessions(older_than_days=1) == 1
+        else:
+            from hermes_state_runtime import begin_runtime_epoch, mutate_runtime_session
+            epoch = begin_runtime_epoch(db, instance_id="delete-test")
+            snap = db.get_session("large")
+            assert snap is not None
+            result = mutate_runtime_session(
+                db, epoch=epoch, principal_id="human", session_id="large", request_id="delete",
+                expected_revision=snap["runtime_revision"], expected_generation=snap["runtime_generation"],
+                operation="delete", payload={})
+            assert result["deleted_ids"] == ["large"]
         writer.close()
         assert sum(deleted_per_transaction) == 1025
         assert max(deleted_per_transaction) <= 64, deleted_per_transaction
