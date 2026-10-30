@@ -323,7 +323,7 @@ async def test_context_settlement_carries_the_summary_without_inventing_a_ledger
 
 
 @pytest.mark.asyncio
-async def test_active_claims_are_quiet_and_destination_controls_are_not_overwritten(runtime, monkeypatch):
+async def test_active_claims_are_quiet_and_a_busy_destination_gets_the_control_as_a_task(runtime, monkeypatch):
     r = runtime
     async def admit(event):
         event._gateway_accepted = True
@@ -332,18 +332,28 @@ async def test_active_claims_are_quiet_and_destination_controls_are_not_overwrit
     assert not await work.prepare(r.runner, r.source, r.state)
     assert "Active claim" in r.adapter.handle_message.await_args.args[0].text
     r.adapter.send.assert_not_awaited()
-    record = {"goal": "Maintain Service", "status": "active"}
-    r.db.set_meta("goal:next", json.dumps(record))
+    from hermes_cli import goals
+    monkeypatch.setattr(goals, "_get_session_db", lambda: r.db)
+    r.db.create_session("next", source="telegram")
+    goals.save_goal("old", goals.GoalState(goal="Maintain Service"))
+    record = json.loads(r.db.get_meta("goal:old"))
+    destination_goal = json.dumps({"goal": "Its own goal", "status": "active"})
+    r.db.set_meta("goal:next", destination_goal)
     r.state["owners"] = {"goal": "Service Operations"}
     item = {"id": "goal", "kind": "goal", "title": "Maintain Service", "record": record}
-    monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[item]))
-    monkeypatch.setattr(work, "destination", AsyncMock(return_value={"session_id": "next", "title": "Service Operations"}))
-    sent = AsyncMock()
+    monkeypatch.setattr(work, "inventory", AsyncMock(side_effect=[[item], []]))
+    monkeypatch.setattr(work, "destination", AsyncMock(return_value={"session_id": "next", "title": "Service Operations",
+                                                                       "thread_id": "18"}))
+    sent = AsyncMock(return_value={"receipt_id": "r1"})
     monkeypatch.setattr(work, "receipt", sent)
-    assert not await work.prepare(r.runner, r.source, r.state)
-    assert "Destination already has a control" in r.adapter.handle_message.await_args.args[0].text
-    assert json.loads(r.db.get_meta("goal:next")) == record
-    sent.assert_not_awaited()
+    handled = r.adapter.handle_message.await_count
+    # The existing destination receives the goal as its handoff task: no successor question, no new topic.
+    assert await work.prepare(r.runner, r.source, r.state)
+    assert r.adapter.handle_message.await_count == handled
+    sent.assert_awaited_once()
+    assert r.db.get_meta("goal:next") == destination_goal  # its own goal is never overwritten
+    assert json.loads(r.db.get_meta("goal:old"))["status"] == "cleared"
+    assert r.state["handoffs"]["goal"]["task_only"] and r.state["handoffs"]["goal"]["control_receipt"]["task_only"]
     r.adapter.send.assert_not_awaited()
 
 

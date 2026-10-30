@@ -403,10 +403,15 @@ async def transfer_control(runner, source, state, item, dest):
         old, new = read(conn, old_key), read(conn, new_key)
         proof = handoff.get("control_receipt")
         accepted_task_id = handoff.get("accepted_task_id")
+        # The destination already runs its own goal or loop: this one arrives there only as its
+        # handoff task, and the destination's control is never overwritten or duplicated.
+        task_only = bool(handoff.get("task_only"))
         if proof:
             expected = {"source": old, "session_id": dest["session_id"]}
             if proof.get("ended"):
                 expected["ended"] = True
+            elif task_only:
+                expected["task_only"] = True
             elif accepted_task_id:
                 expected["accepted_task_id"] = accepted_task_id
             else:
@@ -429,13 +434,14 @@ async def transfer_control(runner, source, state, item, dest):
         # recorded). A paused control moves paused.
         if _handoff_definition(json.loads(old)) != _handoff_definition(item["record"]):
             raise RuntimeError(f"Cannot transfer {kind}: the source changed after its handoff was recorded")
-        if not accepted_task_id and open_control(new):
+        if not accepted_task_id and not task_only and open_control(new):
             raise RuntimeError(f"Cannot transfer {kind}: destination already owns one")
+        moves = not accepted_task_id and not task_only
         if kind == "loop":
             current_loop, retired_loop = LoopState.from_json(old), LoopState.from_json(old)
             retired_loop.status = "cleared"
             retired_loop.awaiting_response = False
-            if not accepted_task_id:
+            if moves:
                 current_loop.route = {**current_loop.route, "platform": source.platform.value,
                                       "chat_id": str(source.chat_id), "chat_type": source.chat_type,
                                       "thread_id": str(dest["thread_id"])}
@@ -444,13 +450,15 @@ async def transfer_control(runner, source, state, item, dest):
         else:
             current_goal, retired_goal = GoalState.from_json(old), GoalState.from_json(old)
             retired_goal.status = "cleared"
-            if not accepted_task_id:
+            if moves:
                 save_goal(dest["session_id"], current_goal, cursor=conn)
             save_goal(state["session_id"], retired_goal, cursor=conn)
         # An accepted task owns its successor control. Clear only the source,
         # and never pin recovery to the destination's independently ticking loop.
         proof = {"source": read(conn, old_key), "session_id": dest["session_id"]}
-        if accepted_task_id:
+        if task_only:
+            proof["task_only"] = True
+        elif accepted_task_id:
             proof["accepted_task_id"] = accepted_task_id
         else:
             proof["destination"] = read(conn, new_key)
@@ -590,7 +598,7 @@ async def prepare(runner, source, state):
                        "summary": state["context"],
                        "history": "Prior decisions, evidence and limits remain searchable in source_session."}}
         if context["id"] not in state["handoffs"]:
-            selected.append((context, dest))
+            selected.append((context, dest, False))
     for item in items:
         if item["id"] in state["handoffs"]:
             raise RuntimeError(f"Previously handed-off work still targets this topic: {item['id']}")
@@ -605,16 +613,17 @@ async def prepare(runner, source, state):
         except ValueError as exc:
             unresolved.append({**item, "blocked_owner": selector, "blocked_reason": str(exc)})
             continue
-        if item["kind"] in {"goal", "loop"} and open_control(await runner._session_db.get_meta(
-                f"{item['kind']}:{dest['session_id']}")):
-            unresolved.append({**item, "blocked_owner": dest["title"],
-                               "blocked_reason": "Destination already has a control. Choose a compatible successor, do not overwrite it."})
-            continue
-        selected.append((item, dest))
-    for item, dest in selected:
+        # A destination that already runs its own goal or loop receives this one as a task, never as a
+        # new topic (2026-10-30: "choose a compatible successor" made retiring topics create new ones).
+        task_only = item["kind"] in {"goal", "loop"} and open_control(await runner._session_db.get_meta(
+            f"{item['kind']}:{dest['session_id']}"))
+        selected.append((item, dest, task_only))
+    for item, dest, task_only in selected:
         # Save the intent before either external side effect. Both receipt and
         # assignment routes have stable keys and readbacks on restart.
         handoff = {"item": item, "destination": dest, "moved": False}
+        if task_only:
+            handoff["task_only"] = True
         state["handoffs"][item["id"]] = handoff
         await save(runner, source, state)
         handoff.update(await receipt(runner, source, state, item, dest))

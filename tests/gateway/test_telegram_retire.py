@@ -702,3 +702,12 @@ async def test_a_refused_retry_keeps_activity_recorded_meanwhile(runtime, monkey
     await retire.advance(runtime, runtime.source)
     state = await retire.load(runtime, runtime.source)
     assert state["user_active_at"] and state["auto_retries"] == 1
+
+
+
+@pytest.mark.asyncio
+async def test_a_retiring_topic_cannot_create_new_topics(runtime):
+    from gateway.telegram_topic_sessions import TopicRequestError, TopicSpec, create_topic_session
+    await retire.request(runtime, runtime.source)
+    with pytest.raises(TopicRequestError, match="retiring"):
+        await create_topic_session(runtime, runtime.source, TopicSpec(name="Successor"))
