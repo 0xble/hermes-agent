@@ -208,9 +208,6 @@ async def _adopt_predecessor_duties(runner) -> None:
         logger.error("Promoted gateway could not take the host gateway role (another gateway owns this host)")
     else:
         _refresh_host_gateway_record(runner)
-    if getattr(runner.config, "durable_outbox_enabled", False):
-        from gateway.outbox import recover_gateway_destinations
-        await recover_gateway_destinations(runner)
 
 
 def reset_for_tests() -> None:

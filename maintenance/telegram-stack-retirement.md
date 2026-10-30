@@ -5,19 +5,16 @@ Patch identity: `telegram-stack-retirement`.
 The personal profile moved from Telegram to Slack, and no other profile uses the fork's
 Telegram features: Meridian runs Slack only, and Everguide uses plain Telegram DMs with an
 allowlist and no topic toolset. The fork therefore carries no Telegram-specific patches.
-`plugins/platforms/telegram/` matches the accepted release baseline except for the durable
-outbox's eight `@durable_egress` lines described below, so an upstream sync takes upstream's
-Telegram plugin as-is apart from those lines.
+`plugins/platforms/telegram/` is byte-identical to the accepted release baseline, so an
+upstream sync takes upstream's Telegram plugin as-is.
 
 Load this unit when an upstream sync touches the Telegram plugin, before adding any
 Telegram-specific behavior back, and when a retired identity below shows up in history.
 
 ## Required behavior
 
-- `hermes_state_telegram.py`, `gateway/run_topics.py`, `tools/send_message_senders.py` and every
-  Telegram plugin file except `adapter.py` match the release baseline. `adapter.py` differs only by
-  the `gateway.outbox` import and the `@durable_egress` decorators on `send`, `edit_message`,
-  `send_voice`, `send_multiple_images`, `send_image_file`, `send_document` and `send_video`. Upstream's own Telegram
+- `plugins/platforms/telegram/`, `hermes_state_telegram.py`, `gateway/run_topics.py` and
+  `tools/send_message_senders.py` match the release baseline. Upstream's own Telegram
   features (DM topic mode, `/topic`, topic bindings, rich messages, approval buttons for
   commands) keep working unchanged.
 - No fork-only Telegram module remains: topic retirement (`gateway/telegram_retire*.py`),
@@ -41,10 +38,6 @@ Telegram-specific behavior back, and when a retired identity below shows up in h
 - Telegram-conditional code that other families still own stays in place:
   - Reply anchors, the delivery ledger, outbound-class labels and cron live-lane flood
     handling: [Telegram delivery remnants](telegram-delivery.md).
-  - The durable outbox only ever covered Telegram (`gateway/run_inbound.py`, `gateway/outbox.py`).
-    Its egress capture is the adapter decorators above, kept so the outbox family stays whole until
-    its own retirement. The fork's control-card receipts (`@durable_control`) went with the cards.
-    With Telegram off on every profile that enables the outbox, it is dormant.
   - Zero-cut standby's deferred Telegram start: [Zero-cut gateway handover](zero-cut-handover.md).
   - `/bg` and `/btw` recovered-topic routing, adopted from upstream PR #123797:
     [Background topic recovery](background-topic-recovery.md).
@@ -98,8 +91,8 @@ EXISTS`, so a rollback that restores the fork code migrates forward again withou
 tests/plugins/platforms/telegram tests/e2e/core/platforms/test_telegram_contract.py
 tests/gateway/test_zero_cut_handover.py tests/gateway/test_zero_cut_handover_verb.py
 tests/hermes_cli/test_session_controls.py tests/agent/test_title_generator.py`, then
-`git diff <baseline> -- plugins/platforms/telegram hermes_state_telegram.py gateway/run_topics.py tools/send_message_senders.py`
-to confirm the only remaining delta is the outbox decorators. Also run `tests/gateway/test_durable_outbox.py`.
+`git diff --exit-code <baseline> -- plugins/platforms/telegram hermes_state_telegram.py gateway/run_topics.py tools/send_message_senders.py`
+to confirm the stock files are still stock.
 
 ## Rollback
 

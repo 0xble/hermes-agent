@@ -8,7 +8,7 @@ adapter refuses a send with a short `flood_control:<seconds>` window. The first
 send remains on the normal path; only the bounded recovery wait runs off the
 post-turn callback and turn pipeline. Longer windows and exhausted retries emit
 one warning naming the notice kind. This patch does not add a durable notice
-outbox: the existing durable outbox owns final turn responses and explicitly
+outbox: upstream's delivery ledger owns final turn responses and explicitly
 excludes unrelated background notifications, so the bounded retry and terminal
 warning are the documented recovery boundary for notices.
 

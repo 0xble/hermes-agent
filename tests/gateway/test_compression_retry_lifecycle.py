@@ -32,28 +32,6 @@ def locked_lane(monkeypatch, tmp_path):
     db.close()
 
 
-@pytest.mark.asyncio
-async def test_outbox_admission_stays_pending_across_compression_retries(locked_lane, tmp_path):
-    from gateway.outbox import Outbox, event_kind, transport_id
-
-    runner, adapter, event, key, db, sid = locked_lane
-    # Direct dispatch has an existing adapter owner, just as native retries do.
-    adapter._active_sessions[key] = asyncio.Event()
-    runner.config.durable_outbox_enabled = True
-    runner._resolve_profile_home_for_source = lambda *_: tmp_path
-    store = Outbox(tmp_path)
-    event_id = transport_id(event)
-    assert event_id is not None
-    turn_id = None
-    for _ in range(3):
-        assert await runner._handle_message(event) is None
-        turn_id = turn_id or event._outbox_turn_id
-        assert event._outbox_turn_id == turn_id
-        assert store.lookup("default", "telegram", event_id, event_kind(event)) == (turn_id, None)
-    db.release_compression_lock(sid, "worker")
-    assert await runner._handle_message(event) == "actual reply"
-    assert store.lookup("default", "telegram", event_id, event_kind(event)) == (turn_id, "completed")
-    runner._handle_message_with_agent.assert_awaited_once()
 
 
 @pytest.mark.parametrize("boundary", ["internal", "control", "bot", "relay", "loop", "command"])

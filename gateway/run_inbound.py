@@ -88,41 +88,6 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     return message_text.removeprefix(prefix)
 
 
-async def _admit_outbox_event(runner, event, source):
-    """Durably admit Telegram events, including internal notices and delegation completions."""
-    if not getattr(getattr(runner, "config", None), "durable_outbox_enabled", False) or source.platform != Platform.TELEGRAM:
-        return
-    from gateway.outbox import (
-        store_for, bind_turn, event_kind, transport_id,
-        event_admission_scope, local_admission_turn,
-    )
-    import uuid
-
-    home = runner._resolve_profile_home_for_source(source)
-    profile = getattr(source, "profile", None) or "default"
-    kind = event_kind(event)
-    event_id = transport_id(event)
-    if not event_id:
-        event_id = uuid.uuid4().hex
-        event._outbox_transport_id = event_id
-    store = store_for(home)
-    turn_id = local_admission_turn(event, runner, home)
-    if turn_id is None:
-        turn_id, fresh = await asyncio.to_thread(
-            store.admit, str(profile), "telegram", event_id, kind)
-        if fresh:
-            event._outbox_admission_scope = event_admission_scope(event, runner, home)
-    else:
-        fresh = True  # Native queue/deferred replay retains its admitted turn.
-    event._outbox_turn_id = turn_id
-    event._outbox_home = home
-    event._outbox_duplicate = not fresh
-    if not fresh:
-        logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
-    else:
-        bind_turn(home, turn_id)
-
-
 class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -343,7 +308,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if not await automatic_event_is_current(self, event):
             return None
         if is_internal:
-            await _admit_outbox_event(self, event, source)
             return event, source, True
         if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress
             return event, source, False
@@ -394,7 +358,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if not self._admit_bot_message_for_source(source):
                 return None
             event._bot_loop_admitted = True
-        await _admit_outbox_event(self, event, source)
         return event, source, False
 
     def _relay_fyi_passive_enabled(self, source: Optional[SessionSource] = None) -> bool:
@@ -1796,23 +1759,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         from agent.delegation_context import top_level_delegation_context
-        from gateway.outbox import scoped_turn_entry, restore_turn, store_for
-        token = scoped_turn_entry()
-        result = None
-        try:
-            with top_level_delegation_context():
-                result = await self._handle_admitted_message(event)
-            return result
-        finally:
-            turn_id = getattr(event, "_outbox_turn_id", None)
-            try:
-                if (turn_id and not getattr(event, "_outbox_duplicate", False)
-                        and not getattr(event, "_gateway_compression_deferred", False)):
-                    await asyncio.to_thread(
-                        store_for(event._outbox_home).finish_admission,
-                        turn_id, "completed" if result is not None else "empty")
-            finally:
-                restore_turn(token)
+        with top_level_delegation_context():
+            return await self._handle_admitted_message(event)
 
     async def _hm_busy_preempt(self, event: MessageEvent, source: SessionSource, _quick_key: str) -> bool:
         """busy_input_mode for a follow-up the durable FIFO is about to admit, through main's own busy
@@ -1880,10 +1828,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
-        if getattr(event, "_outbox_duplicate", False):
-            # The original response was already acknowledged. Returning it
-            # here would send it a second time.
-            return None
         if self._draining and not self._hm_is_registered_command(event):
             from gateway.session_retry_admission import refuse_deferred_retry
             refuse_deferred_retry(event)
