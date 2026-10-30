@@ -396,8 +396,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if not self._admit_bot_message_for_source(source):
                 return None
             event._bot_loop_admitted = True
-        from gateway.run import release_prepared_authorization_scope
-        release_prepared_authorization_scope()
         record_received(event)
         await _admit_outbox_event(self, event, source)
         return event, source, False
