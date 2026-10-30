@@ -232,10 +232,12 @@ class WorkerRPC:
                 link = self._connection(deadline)
                 try:
                     link.send(request_id, message)
-                except ConnectionClosed:
-                    # websockets raises this from send only before a complete frame is written (closed
-                    # on entry, or the socket write failed): the owner closed the link after the idle
-                    # check and never saw this request, so redial and send it once more.
+                except ConnectionClosed as exc:
+                    # websockets' send_context chains the original exception when a
+                    # write fails (sendall may already have written bytes). Only an
+                    # uncaused close on entry proves the unfragmented frame wasn't sent.
+                    if exc.__cause__ is not None:
+                        raise
                     self._drop()
                     link = self._connection(deadline)
                     link.send(request_id, message)

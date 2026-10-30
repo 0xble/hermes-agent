@@ -135,12 +135,25 @@ def test_reconnects_with_a_fresh_ticket_after_the_owner_drops_it(owner, tmp_path
     assert (owner.connections, owner.tickets) == (2, 2)
 
 
-def test_in_flight_call_on_a_dropped_connection_fails_and_is_not_resent(owner, tmp_path):
+@pytest.mark.parametrize('phase', ['before_reply', 'during_send'])
+def test_in_flight_call_on_a_dropped_connection_fails_and_is_not_resent(owner, tmp_path, monkeypatch, phase):
     from websockets.exceptions import ConnectionClosed
     from agent.runtime_session_store import WorkerRPC
     rpc = WorkerRPC(tmp_path)
     assert rpc('worker.persist') == {'n': 1}
-    owner.drop = 'before_reply'
+    if phase == 'before_reply':
+        owner.drop = 'before_reply'
+    else:
+        send = rpc.link.ws.send
+
+        def possible_write(message):
+            send(message)
+            wait_until(lambda: len(owner.requests) == 2, timeout=5)
+            # send_context chains write failures even if some/all bytes reached
+            # the owner. This must not be mistaken for a closed-on-entry socket.
+            raise ConnectionClosed(None, None) from BrokenPipeError('write failed')
+
+        monkeypatch.setattr(rpc.link.ws, 'send', possible_write)
     started = time.monotonic()
     # The write may have landed: the caller sees the transport error (outcome unknown), never a silent retry.
     with pytest.raises(ConnectionClosed):
@@ -176,8 +189,8 @@ def _owner_closes_before_the_frame_is_written(owner, monkeypatch):
 
 
 def test_owner_close_between_the_idle_check_and_the_send_redials_and_sends_once(owner, tmp_path, monkeypatch):
-    """websockets raises ConnectionClosed from send only before the frame is written: nothing reached
-    the owner, so the call redials once with a fresh ticket instead of failing as outcome-unknown."""
+    """An uncaused closed-on-entry send wrote nothing, so the call redials once with a fresh ticket.
+    A caused write failure is instead outcome-unknown, covered by the in-flight regression."""
     from agent.runtime_session_store import WorkerRPC
     owner.sabotage = 0
     _owner_closes_before_the_frame_is_written(owner, monkeypatch)

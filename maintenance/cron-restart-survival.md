@@ -20,6 +20,41 @@ pauses persistence until authenticated epoch adoption, without replaying inferen
 or tools. Explicit cron cancellation uses the admission's durable cancellation
 marker. Gateway shutdown is not that cancellation.
 
+Worker owner discovery and authentication retry pre-send lifecycle failures for
+up to 90 seconds, rediscovering the endpoint and minting a fresh ticket after
+owner replacement. Discovery, identify, ticket and WebSocket-open calls use the
+remaining connection budget. The event-loop synchronous-RPC guard still fails
+before discovery or waiting. Permission, protocol and self-RPC refusals remain
+terminal. The existing closed-on-entry send retry stays limited to 1. A chained
+send exception may follow a partial or complete socket write, so it is now
+outcome-unknown, just like a successful send followed by a lost response. Neither
+is automatically resent by WorkerRPC. The connection-reuse regression covers
+both a lost response and a write exception after the owner receives the frame.
+
+RuntimeSessionStore journals the exact operation before sending. An explicit
+`stale_epoch` refusal permits authenticated `worker.adopt`, then retry of that
+same pending sequence and payload. Owner receipt identity remains
+`(execution_id, sequence, payload_digest)`, with epoch and generation fencing.
+Non-adoptable managed workers and retired children remain refused. Exhausted
+connection patience reports `owner_restart`, not disk-full/lock guidance, and
+leaves pending writes in the existing journal for explicit retry or verified
+adoption. This does not claim that a queued operation is canonically committed.
+Regression coverage is `tests/agent/test_worker_owner_restart.py`, alongside the
+connection-reuse, outbox-adoption and persistence-explainer suites.
+
+The 2026-10-30 detached `maintain-filesystems` execution failed while its owner
+was exiting: SIGTERM at 2:21:55 AM PT, zero-second drain timeout at 2:21:56 AM PT,
+live writers retained at 2:22:43 AM PT, watchdog at 2:22:53 AM PT, and
+`incomplete_control_response` from append/finalize at 2:22:54 AM PT. A successor
+started at 2:22:57 AM PT. The control-identify EOF preceded the persistence send,
+so waiting for rediscovery is safe. The old classifier instead selected the
+unknown disk/lock explanation. Upstream main
+`92213f976785c3582502d84495cb4e5aad5833c8` and related WorkerRPC PRs were checked,
+including open [#140128](https://github.com/NousResearch/hermes-agent/pull/140128),
+which concerns loop-thread poisoning, not owner-transition patience. Retire this
+extension when a released upstream satisfies the same bounded pre-send retry,
+authenticated adoption, pending-journal and truthful-error contracts.
+
 The existing admission journal captures the worker's result until the canonical
 owner commits the same admission's terminal receipt. Reconciliation imports that
 completion before cleaning up a terminal execution journal, without requiring a
