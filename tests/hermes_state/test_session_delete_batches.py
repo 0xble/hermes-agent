@@ -1,10 +1,149 @@
 """Deletion must release the writer between bounded message/FTS batches."""
 
 import sqlite3
+from contextlib import closing
 
 import pytest
 
 from hermes_state import SessionDB
+import hermes_state_runtime as rt
+
+
+def _retire_without_reclaiming(db, monkeypatch, session_id):
+    """Leave the committed retirement boundary as an interrupted cleaner would."""
+    with monkeypatch.context() as held:
+        held.setattr("hermes_state_sessions.finish_pending_deletes", lambda *args, **kwargs: None)
+        assert db.delete_session(session_id)
+    assert db.get_session(session_id) is None
+    assert db._read_one("SELECT id FROM sessions WHERE id=?", (session_id,)) is not None
+
+
+def test_retired_session_rejects_worker_registration(tmp_path, monkeypatch):
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        db.create_session("retired", source="cli")
+        _retire_without_reclaiming(db, monkeypatch, "retired")
+        with pytest.raises(rt.RuntimeStoreError, match="not_found"):
+            rt.register_worker_execution(db, epoch=epoch, execution_id="late", session_id="retired",
+                generation=0, kind="compute", adoption_secret="fixture")
+        assert db._read_one("SELECT COUNT(*) FROM worker_executions")[0] == 0
+
+
+def test_input_admission_rechecks_retirement_after_read_probe(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    with closing(SessionDB(path)) as db, closing(SessionDB(path)) as deleter:
+        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        db.create_session("retired", source="cli")
+        execute_write = db._execute_write
+        raced = False
+
+        def retire_before_write(callback, *args, **kwargs):
+            nonlocal raced
+            # The terminal-replay read saw a live target. Another connection retires
+            # it before admission acquires the writer, with physical cleanup paused.
+            if not raced:
+                raced = True
+                _retire_without_reclaiming(deleter, monkeypatch, "retired")
+            return execute_write(callback, *args, **kwargs)
+
+        monkeypatch.setattr(db, "_execute_write", retire_before_write)
+        with pytest.raises(rt.RuntimeStoreError, match="not_found"):
+            rt.admit_session_input(db, epoch=epoch, principal_id="human", session_id="retired",
+                request_id="late", payload={"text": "must not be admitted"})
+        assert raced
+        assert db._read_one("SELECT COUNT(*) FROM session_admissions")[0] == 0
+
+
+@pytest.mark.parametrize("operation", ["delete", "prune"])
+@pytest.mark.parametrize("blocker", ["worker", "message_trigger"])
+def test_blocked_cleanup_does_not_wedge_other_deletes(tmp_path, monkeypatch, caplog, operation, blocker):
+    import hermes_state_deletion as deletion
+    from hermes_state_mutation_retirement import RETIRED_PREFIX
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        db.create_session("blocked", source="cli")
+        db.append_message("blocked", "user", "pending cleanup")
+        _retire_without_reclaiming(db, monkeypatch, "blocked")
+        if blocker == "worker":
+            # Persist the old writer bug's result so recovery is tested even after
+            # registration itself is fenced. Do not remove the runtime delete guard.
+            db._execute_write(lambda conn: conn.execute(
+                "INSERT INTO worker_executions(execution_id,session_id,kind,owner_epoch,generation,status,adoption_digest) "
+                "VALUES('late','blocked','compute',?,0,'registered','fixture')", (epoch,)))
+        else:
+            db._conn.execute("CREATE TEMP TRIGGER block_cleanup BEFORE DELETE ON messages "
+                "WHEN OLD.session_id='blocked' BEGIN SELECT RAISE(ABORT,'blocked page'); END")
+        db.create_session("other", source="cli")
+        db.end_session("other", "done")
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE sessions SET started_at=1600000000,last_activity_at=1600000000 WHERE id='other'"))
+        if operation == "delete":
+            assert db.delete_session("other")
+        else:
+            assert db.prune_sessions(older_than_days=0) == 1
+        assert db._read_one("SELECT id FROM sessions WHERE id='other'") is None
+        assert db._read_one("SELECT id FROM sessions WHERE id='blocked'") is not None
+        assert db.get_session("blocked") is None
+        assert "cleanup" in db.get_meta(RETIRED_PREFIX + "blocked")
+        assert "blocked" in caplog.text
+        if blocker == "worker":
+            assert db._read_one("SELECT status FROM worker_executions WHERE execution_id='late'")[0] == "registered"
+            db._execute_write(lambda conn: conn.execute("DELETE FROM worker_executions WHERE execution_id='late'"))
+        else:
+            db._conn.execute("DROP TRIGGER block_cleanup")
+        deletion.finish_pending_deletes(db)
+        assert db._read_one("SELECT id FROM sessions WHERE id='blocked'") is None
+        assert "cleanup" not in db.get_meta(RETIRED_PREFIX + "blocked")
+        assert not db._read_all("PRAGMA foreign_key_check")
+
+
+def test_retired_parent_rejects_compression_publication(tmp_path, monkeypatch):
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        db.create_session("parent", source="cli")
+        db.append_message("parent", "user", "deleted transcript")
+        assert db.try_acquire_compression_lock("parent", "compressor")
+        _retire_without_reclaiming(db, monkeypatch, "parent")
+        with pytest.raises(ValueError):
+            db.publish_compression_child(parent_session_id="parent", child_session_id="child", source="cli",
+                messages=[{"role": "assistant", "content": "summary of deleted transcript"}],
+                compression_lock_holder="compressor", require_compression_lease=True)
+        assert db.get_session("child") is None
+        assert db._read_one("SELECT id FROM sessions WHERE id='child'") is None
+        assert db._read_one("SELECT COUNT(*) FROM messages WHERE session_id='child'")[0] == 0
+
+
+@pytest.mark.parametrize("producer", ["compression", "branch", "reset"])
+def test_retired_parent_rejects_child_row_publication(tmp_path, monkeypatch, producer):
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        db.create_session("parent", source="cli")
+        parent = db._read_one("SELECT * FROM sessions WHERE id='parent'")
+        _retire_without_reclaiming(db, monkeypatch, "parent")
+        config = {} if producer == "compression" else {f"_{'branched' if producer == 'branch' else 'reset'}_from": "parent"}
+        with pytest.raises(rt.RuntimeStoreError, match="not_found"):
+            db._execute_write(lambda conn: db._publish_child_session_row(conn, parent,
+                parent_session_id="parent", child_session_id="child", source="cli", model=None,
+                model_config=config, system_prompt=None, cwd=None, profile_name=None))
+        assert db._read_one("SELECT id FROM sessions WHERE id='child'") is None
+
+
+@pytest.mark.parametrize("producer", ["local_reset", "branch", "reset"])
+def test_retirement_refuses_local_child_producers(tmp_path, monkeypatch, producer):
+    from hermes_state_local_lineage import reset_local_target
+    from tests.hermes_state.test_ledger_delete_consistency import _local_session
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        sid, entry = _local_session(db, epoch)
+        before = db.get_session(sid)
+        _retire_without_reclaiming(db, monkeypatch, sid)
+        with pytest.raises(rt.RuntimeStoreError):
+            if producer == "local_reset":
+                reset_local_target(db, epoch=epoch, parent_session_id=sid, entry=entry)
+            else:
+                rt.mutate_runtime_session(db, epoch=epoch, principal_id="human", session_id=sid,
+                    request_id="late-child", operation=producer, payload={},
+                    expected_revision=before["runtime_revision"], expected_generation=before["runtime_generation"])
+        assert db._read_all("SELECT id FROM sessions WHERE id!=?", (sid,)) == []
+        assert db.load_gateway_routing_entries() == {}
 
 
 @pytest.mark.parametrize("operation", ["single", "chain", "prune", "runtime"])
