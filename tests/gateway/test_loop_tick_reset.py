@@ -23,15 +23,15 @@ def _tick(runner, source, key, sid):
 
     manager = LoopManager(session_id=sid)
     manager.set("WAKE", interval_seconds=300, times=3)
-    assert manager.fire_tick() is not None
+    generation = runner._current_session_run_generation(key)
+    assert manager.fire_tick(generation) is not None
     state = manager.state
-    assert state.awaiting_response
+    assert state is not None and state.awaiting_response
     event = runner._synthetic_prompt_event(source, "WAKE", internal=True, reply_expected=False)
     event.metadata.update(loop_wake_metadata(sid, state))
     event.metadata.update(gateway_session_key=key, gateway_session_id=sid,
                           gateway_session_strict=True)
     tick = (state.created_at, state.ticks_fired)
-    generation = runner._session_state(key).turn.run_generation
     event.metadata.update(hermes_loop_wakeup=True, gateway_loop_tick=list(tick))
     event._gateway_loop_execution_fence = (sid, tick, generation, state.control_generation)
     return manager, event
