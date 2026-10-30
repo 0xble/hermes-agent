@@ -513,6 +513,9 @@ async def transfer(runner, source, state, item, dest):
         current = await asyncio.to_thread(process_registry.get, record["session_id"])
         if current and current.session_key == target_entry.session_key and current.owner_task_id == new_sid:
             return
+        if current is None or current.exited:
+            # It finished after the handoff was recorded: nothing running is left to move.
+            return
         moved = await asyncio.to_thread(process_registry.transfer_ownership, record["session_id"],
             from_owner=record["owner_task_id"], to_owner=new_sid, to_task_id="session:" + target_entry.session_key,
             to_session_key=target_entry.session_key, note="Topic retirement",

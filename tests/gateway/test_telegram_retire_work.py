@@ -1052,3 +1052,39 @@ async def test_control_that_ended_after_its_handoff_settles_without_moving(runti
     await work.transfer(r.runner, r.source, r.state, item, dest)  # recovery replays the same proof
     assert r.db.get_meta(f"{kind}:old") == finished and r.db.get_meta(f"{kind}:next") == destination
     assert r.state["handoffs"][item["id"]]["control_receipt"]["ended"] is True
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gone", ["exited", "pruned"])
+async def test_process_that_finished_after_its_handoff_settles(runtime, monkeypatch, gone):
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+    r = runtime
+    registry = ProcessRegistry()
+    session = ProcessSession(id="proc-done", command="build", task_id="session:old-key",
+                             owner_task_id="old", session_key="old-key", parent_session_id="old")
+    if gone == "exited":
+        session.mark_exited(0)
+        registry._running[session.id] = session
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    r.runner.session_store.list_sessions = lambda: [SimpleNamespace(session_id="next", session_key="next-key", origin=None)]
+    item = {"id": "process:proc-done", "kind": "process", "title": "build",
+            "record": {"session_id": "proc-done", "owner_task_id": "old", "status": "running"}}
+    await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
+
+
+@pytest.mark.asyncio
+async def test_running_process_owned_elsewhere_still_refuses(runtime, monkeypatch):
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+    r = runtime
+    registry = ProcessRegistry()
+    registry._running["proc-x"] = ProcessSession(id="proc-x", command="build", task_id="t", owner_task_id="someone-else",
+                                                 session_key="other-key", parent_session_id="someone-else")
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    r.runner.session_store.list_sessions = lambda: [SimpleNamespace(session_id="next", session_key="next-key", origin=None)]
+    item = {"id": "process:proc-x", "kind": "process", "title": "build",
+            "record": {"session_id": "proc-x", "owner_task_id": "old", "status": "running"}}
+    with pytest.raises(RuntimeError, match="Process ownership changed"):
+        await work.transfer(r.runner, r.source, r.state, item, {"session_id": "next", "thread_id": "18"})
