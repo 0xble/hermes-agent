@@ -97,9 +97,12 @@ async def dispatch_busy_burst(adapter, event, session_key):
             if not runner._admit_bot_message_for_source(event.source):
                 return
             event._bot_loop_admitted = True
-        from gateway.run import _profile_runtime_scope
-        with runner._scope_or_null(_profile_runtime_scope, runner._resolve_profile_home_for_source(event.source)):
-            schedule(event, event.source, session_key)
+        from gateway.run import _async_profile_runtime_scope
+
+        def profile_scope():  # resolved and hydrated in the stamp task, off this receive path
+            home = runner._resolve_profile_home_for_source(event.source)
+            return runner._async_scope_or_null(_async_profile_runtime_scope, home)
+        schedule(event, event.source, session_key, profile_scope=profile_scope)
     kind, bursts = _kind(adapter, event), _state(adapter, '_shared_bursts')
     while (burst := bursts.get(session_key)) is not None:
         if kind is not None and kind == _kind(adapter, burst.head) and adapter._can_merge_text_debounce_events(
