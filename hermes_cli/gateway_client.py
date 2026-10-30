@@ -247,7 +247,9 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
                     raise GatewayClientError("Gateway bootstrap timed out")
                 peer.settimeout(budget)
                 chunk = peer.recv(4096)
-                if not chunk or len(data) + len(chunk) > 65536:
+                if not chunk:
+                    raise GatewayClientError("incomplete_control_response")
+                if len(data) + len(chunk) > 65536:
                     raise GatewayClientError("Invalid gateway bootstrap response")
                 data.extend(chunk)
     grant = _identify_response(bytes(data))

@@ -133,6 +133,7 @@ def _owner_transition_error(exc):
     return isinstance(exc, (ConnectionClosed, ConnectionRefusedError, ConnectionResetError,
                             BrokenPipeError, FileNotFoundError, TimeoutError)) or str(exc) in {
         'incomplete_control_response', 'owner_unavailable',
+        'Gateway bootstrap timed out', 'Gateway bootstrap identity changed; retry launch',
     }
 
 
@@ -156,6 +157,7 @@ class WorkerRPC:
                 return self.link
             # The owner closed it while idle, before any send: redial with a fresh ticket.
             self._drop()
+        from hermes_cli.gateway_client import GatewayClientError
         from hermes_cli.gateway_runtime_discovery import DiscoveryError
         from hermes_state_errors import GatewayOwnerRestartError
         from websockets.exceptions import ConnectionClosed
@@ -164,7 +166,7 @@ class WorkerRPC:
         while True:
             try:
                 return self._dial(deadline)
-            except (DiscoveryError, WorkerPersistenceError, OSError, ConnectionClosed) as exc:
+            except (DiscoveryError, GatewayClientError, WorkerPersistenceError, OSError, ConnectionClosed) as exc:
                 if not _owner_transition_error(exc):
                     raise
                 self._drop()

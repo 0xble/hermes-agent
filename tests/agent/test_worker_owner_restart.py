@@ -124,6 +124,7 @@ def test_append_survives_mid_identify_close_and_adopts_successor(tmp_path, monke
     'incomplete_control_response', 'owner_unavailable', 'draining', 'connection_closed',
     'connection_refused', 'connection_reset', 'missing_socket', 'timeout',
     'unsafe_control_peer', 'invalid_control_response', 'synchronous_self_rpc',
+    'ticket_close', 'ticket_identity', 'ticket_timeout',
 ])
 def test_absent_owner_deadline_preserves_journal_and_explains_cause(tmp_path, monkeypatch, failure):
     from websockets.exceptions import ConnectionClosed
@@ -150,6 +151,8 @@ def test_absent_owner_deadline_preserves_journal_and_explains_cause(tmp_path, mo
         return SimpleNamespace(state=state, endpoint=endpoint if state == 'ready' else None)
 
     def identify(home, timeout):
+        if failure.startswith('ticket_'):
+            return {'pid': -1}
         errors = {
             'connection_closed': ConnectionClosed(None, None),
             'connection_refused': ConnectionRefusedError('control socket refused'),
@@ -161,6 +164,15 @@ def test_absent_owner_deadline_preserves_journal_and_explains_cause(tmp_path, mo
 
     monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint', discover)
     monkeypatch.setattr(discovery, 'query_identify', identify)
+    from hermes_cli import gateway_client
+
+    def ticket(*args, **kwargs):
+        errors = {'ticket_close': 'incomplete_control_response',
+                  'ticket_identity': 'Gateway bootstrap identity changed; retry launch',
+                  'ticket_timeout': 'Gateway bootstrap timed out'}
+        raise gateway_client.GatewayClientError(errors[failure])
+
+    monkeypatch.setattr(gateway_client, '_session_ticket', ticket)
     rpc = worker.WorkerRPC(tmp_path)
     store = worker.RuntimeSessionStore(rpc, {'session_id': 's'}, tmp_path / 'outbox')
     try:
