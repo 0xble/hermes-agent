@@ -6,11 +6,15 @@ migration, second transcript copy, or independent deletion identity is needed.
 """
 
 import json
+import logging
+import sqlite3
 import time
 from pathlib import Path
 
 from hermes_state_common import _id_chunks, _placeholders
 from hermes_state_keys import prefix_range
+
+logger = logging.getLogger(__name__)
 
 # A page bounds trigger work by rows AND serialized input. An oversized message
 # must make progress alone. SQLite cannot preempt one trigger or an fsync.
@@ -81,32 +85,44 @@ def _delete_page(conn, sid, selected, key, marker):
     return True
 
 
-def finish_pending_deletes(db):
+def finish_pending_deletes(db, *, required_ids=()):
     """Finish committed deletes on the next explicit delete/prune, never at read time.
 
     Each step is idempotent under whole-callback retry or concurrent cleaners.
-    Errors propagate: a failed cleanup is not a successful empty query result.
+    A blocked older marker remains fenced and logged without wedging unrelated
+    deletes. Errors for the caller's required ids still propagate after the pass.
     """
     from hermes_state_mutation_retirement import RETIRED_PREFIX
+    required = set(required_ids)
+    first_error = None
     rows = db._read_all(
         "SELECT key,value FROM state_meta WHERE key>=? AND key<? "
         "AND json_valid(value) AND json_type(value, '$.cleanup')='object'",
         prefix_range(RETIRED_PREFIX))
     for key, value in rows:
         sid = key[len(RETIRED_PREFIX):]
-        while True:
-            selected = _page_ids(db, sid)
-            progress = db._execute_write(lambda conn: _delete_page(conn, sid, selected, key, value),
-                                         session_id=sid, input_rows=len(selected))
-            if not progress:
-                break
-            time.sleep(0.01)  # same writer-fairness yield as retention pruning
-        if progress is None:
-            continue
-        directory = json.loads(value)["cleanup"]["sessions_dir"]
-        db._remove_session_files(Path(directory) if directory is not None else None, sid)
-        db._execute_write(lambda conn: conn.execute(
-            "UPDATE state_meta SET value=json_remove(value, '$.cleanup') WHERE key=? AND value=?", (key, value)))
+        try:
+            while True:
+                selected = _page_ids(db, sid)
+                progress = db._execute_write(lambda conn: _delete_page(conn, sid, selected, key, value),
+                                             session_id=sid, input_rows=len(selected))
+                if not progress:
+                    break
+                time.sleep(0.01)  # same writer-fairness yield as retention pruning
+            if progress is None:
+                continue
+            directory = json.loads(value)["cleanup"]["sessions_dir"]
+            db._remove_session_files(Path(directory) if directory is not None else None, sid)
+            db._execute_write(lambda conn: conn.execute(
+                "UPDATE state_meta SET value=json_remove(value, '$.cleanup') WHERE key=? AND value=?", (key, value)))
+        except sqlite3.IntegrityError as exc:
+            # Keep the guard and durable cleanup marker. A legacy late writer or
+            # one row's failing trigger must not block every later delete/prune.
+            logger.warning("Session cleanup deferred for %r; retirement fence retained", sid, exc_info=True)
+            if sid in required and first_error is None:
+                first_error = exc
     if rows:
         while db._execute_write(lambda conn: db._delete_unreferenced_system_prompts(conn, limit=100)) == 100:
             time.sleep(0.01)
+    if first_error is not None:
+        raise first_error

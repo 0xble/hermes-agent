@@ -417,7 +417,7 @@ class SessionMaintenanceMixin:
             removed_count += len(batch_removed)
             if batch_removed:
                 emit_session_deleted(self, batch_removed, reason="prune", sessions_dir=sessions_dir)
-            finish_pending_deletes(self)
+            finish_pending_deletes(self, required_ids=batch_removed)
             for sid in batch_removed:
                 self._remove_session_files(sessions_dir, sid)
             if batch_index + 1 < len(batches):

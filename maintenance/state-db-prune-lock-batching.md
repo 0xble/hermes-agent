@@ -22,6 +22,8 @@ Session-count pruning batches alone do not bound a large transcript's FTS-trigge
 
 The next explicit delete or retention prune resumes pending work. Spillover pointers are retired per page before their rows disappear. Session rows are removed only after their messages, and pending markers cannot expire or be replaced by another sweep. Each page rechecks its original marker so a delayed cleaner cannot delete a later generation. System-prompt cleanup remains separately bounded.
 
+Runtime session resolution and the shared compression/branch/reset child-row publisher check the existing retirement fence inside their write transaction. A retained physical row cannot authorize new admissions, workers or child publication. Pending cleanup isolates and logs each marker's integrity failure, retaining its fence and retry work rather than disabling a guard. Unrelated deletes and prunes continue, but failures reclaiming the caller's requested ids still propagate after the pass.
+
 `tests/hermes_state/test_session_delete_batches.py` covers a 1,025-message single/chain/prune regression, another SQLite writer committing between pages, interruption immediately after retirement and after a committed page, restart/next-prune recovery, invisibility through FTS and LIKE, propagated database errors, pending-marker expiry, snapshot fences, and message-byte bounds. Existing guard, cascade, compression, retirement, media and prune tests remain authoritative.
 
 ## Compaction Attribution

@@ -1802,7 +1802,7 @@ class SessionSessionsMixin:
         deleted = self._execute_write(_do)
         if deleted:
             emit_session_deleted(self, removed_ids, reason="delete", primary=session_id, sessions_dir=sessions_dir)
-        finish_pending_deletes(self)
+        finish_pending_deletes(self, required_ids=removed_ids)
         from hermes_state_media import collect_retired_media
         collect_retired_media(self)
         for sid in removed_ids:
@@ -1949,7 +1949,7 @@ class SessionSessionsMixin:
         if count:
             emit_session_deleted(self, removed_ids, reason="delete", primary=unique_ids[0] if len(unique_ids) == 1 else None,
                                  sessions_dir=sessions_dir)
-        finish_pending_deletes(self)
+        finish_pending_deletes(self, required_ids=removed_ids)
         from hermes_state_media import collect_retired_media
         collect_retired_media(self)
         for sid in removed_ids:
