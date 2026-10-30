@@ -49,6 +49,11 @@ DEFAULT_PREFETCH_MAX_AGE_S = 1800.0
 _now = time.time
 
 
+def _overrides_discard_prefetch(provider: Any) -> bool:
+    """Whether *provider* implements ``discard_prefetch`` (the base class default is a no-op)."""
+    return getattr(type(provider), "discard_prefetch", None) not in (None, MemoryProvider.discard_prefetch)
+
+
 def parse_prefetch_max_age(value: Any) -> Optional[float]:
     """``memory.prefetch_max_age_seconds`` -> seconds, or None for no bound (``0`` or negative).
     Unset, unparseable or non-finite values (``nan``, ``inf``) fall back to the default: ``nan > 0``
@@ -413,10 +418,16 @@ class MemoryManager:
         if not clean_query or not self._owner_allows("prefetch"):
             return ""
         clean_query = _redact_for_provider(clean_query)
-        self._discard_stale_prefetch()
-        parts = self._each_provider(
-            "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
-        )
+        stale = self._discard_stale_prefetch()
+
+        def _prefetch(provider: MemoryProvider) -> str:
+            if stale and provider.name != "builtin" and not _overrides_discard_prefetch(provider):
+                # No discard hook (catalog plugins): consume the stale buffer through prefetch() and
+                # drop it. A provider that recalls live in prefetch() just answers twice this turn.
+                self._prefetch_provider(provider, clean_query, session_id=session_id)
+            return self._prefetch_provider(provider, clean_query, session_id=session_id)
+
+        parts = self._each_provider("prefetch failed (non-fatal)", _prefetch)
         return "\n\n".join(p for p in parts if p and p.strip())
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
@@ -484,11 +495,12 @@ class MemoryManager:
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
 
-    def _discard_stale_prefetch(self) -> None:
+    def _discard_stale_prefetch(self) -> bool:
         """Drop provider recall buffered by an earlier ``queue_prefetch_all`` once it is older than
-        ``prefetch_max_age_seconds``. The buffer is keyed on the last turn that queued, which can be a
-        human message many generated or trivial turns back. Within the bound that result is still the
-        latest human intent and is kept; past it, injecting nothing beats injecting an old topic."""
+        ``prefetch_max_age_seconds``; True when it did. The buffer is keyed on the last turn that queued,
+        which can be a human message many generated or trivial turns back. Within the bound that result
+        is still the latest human intent and is kept; past it, injecting nothing beats injecting an old
+        topic. Providers without ``discard_prefetch`` are drained by ``prefetch_all`` instead."""
         # Check the age, clear the timestamp, obsolete the manager token and drop provider buffers in
         # one critical section, the one queue_prefetch_all starts its token in and a queued dispatch
         # holds. A fresh request is then either seen by the check (and kept) or starts after the
@@ -506,8 +518,7 @@ class MemoryManager:
                                 lambda p: getattr(p, "discard_prefetch", lambda: None)())
             return True
 
-        if self._prefetch_max_age is not None:
-            self._prefetch_generation.discard_if(_discard_if_stale)
+        return self._prefetch_max_age is not None and self._prefetch_generation.discard_if(_discard_if_stale)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
@@ -566,6 +577,14 @@ class MemoryManager:
             return
         clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
             clean_user_content, assistant_content, messages)
+        # Filter here, not per provider: catalog providers see only the turn text, so a generated
+        # prompt and its reply would otherwise reach their stores as the user's conversation.
+        from agent.memory_retention import filter_retain_messages
+        user_part, assistant_part = filter_retain_messages(
+            clean_user_content, assistant_content, display_kind=display_kind, platform=platform)
+        if user_part is None and assistant_part is None:
+            return
+        clean_user_content, assistant_content = user_part or "", assistant_part or ""
         optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author,
                            "display_kind": display_kind, "platform": platform}
 
