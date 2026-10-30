@@ -749,8 +749,10 @@ class GatewayTurnProgressMixin:
             self._publish_execution("notification.clear", {"key": str(key)})
 
     def _status_live(self) -> bool:
-        """Status adapter present and this run is still the current generation."""
-        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
+        """Engine chrome cannot precede a supervisor's roster-validated final."""
+        ctx = self._ctx
+        return (ctx.persist_user_display_kind != "supervisor_checkin"
+                and bool(ctx._status_adapter) and ctx._run_still_current())
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx

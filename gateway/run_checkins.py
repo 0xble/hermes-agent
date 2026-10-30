@@ -200,30 +200,42 @@ async def prepare_checkin(runner, event, entry, *, start=False):
     return True
 
 
-async def silence_fallback(runner, event, entry, result):
-    """A second refusal cannot silently strand a required check-in. No second send path."""
+async def silence_fallback(runner, event, entry, result: dict) -> dict | None:
+    """A failed turn or second refusal cannot strand a required check-in. Use normal delivery."""
     if descriptor(event) is None or not isinstance(result, dict):
         return result
-    if result.get("interrupted") or result.get("completed") is False:
+    if result.get("interrupted"):
         return result
     if result.get("queued_terminal_display_kind", DISPLAY_KIND) != DISPLAY_KIND:
         return result
-    response = result.get("final_response", "")
-    if response and not runner._is_intentional_silence(result, response):
-        return result
-
+    response = str(result.get("final_response") or "").strip()
+    from agent.turn_failure_copy import exit_reason_failure
+    failed = (result.get("completed") is False or result.get("failed") or result.get("partial")
+              or result.get("failure_reason") or result.get("error")
+              or exit_reason_failure(result.get("turn_exit_reason")))
     def observe():
         manager = _manager(runner, entry)
         work = _observe(manager, entry.session_id)
         manager.reconcile(work)
-        return fallback_status(work, manager.config)
+        return fallback_status(work, manager.config) if work else ""
 
     try:
         status = await runner._run_in_executor_with_context(observe)
     except Exception:
         logger.warning("Supervisor fallback could not refresh its roster", exc_info=True)
         status = getattr(event, "_checkin_fallback", "Background work could not be inspected. Supervision will retry.")
-    return {**result, "final_response": status, "intentional_silence": False}
+    if status and not failed and response and not runner._is_intentional_silence(result, response):
+        return result
+    recovered = {**result, "final_response": status, "delivery_text": status,
+                 "_model_final_response": status, "intentional_silence": not bool(status),
+                 "already_sent": False}
+    # The worker has already captured its raw result. Recovery must agree across the live send,
+    # durable completion and delivery replay without pretending that the model turn succeeded.
+    from gateway.session_results import execution_result
+    captured = execution_result.get()
+    if captured is not None:
+        captured["result"] = {**(captured.get("result") or {}), **recovered}
+    return recovered if status else None
 
 
 def install_visible_observer(runner, adapter):

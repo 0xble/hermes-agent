@@ -3356,8 +3356,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             if not started:
                 self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
                 return
-            from gateway.run_checkins import silence_fallback
-            agent_result = await silence_fallback(self, event, session_entry, agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -3414,6 +3412,16 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
+            # Apply the mandatory status after generic error/empty-reply shaping, so a provider
+            # explainer cannot replace it in either delivery or the captured completion.
+            from gateway.run_checkins import silence_fallback
+            checkin_result = await silence_fallback(self, event, session_entry, agent_result)
+            if checkin_result is None:
+                return
+            if checkin_result is not agent_result:
+                agent_result = checkin_result
+                response = agent_result["final_response"]
+                _intentional_silence = False
             await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
                 agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,

@@ -523,10 +523,6 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         except Exception as e:
             logger.debug("event_callback hook error: %s", e)
 
-    def _status_live(self) -> bool:
-        """Status adapter present and this run is still the current generation."""
-        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
-
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
