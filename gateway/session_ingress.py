@@ -358,6 +358,15 @@ async def execute_admission(authority, ref, row):
             await _hand_over_turn_marker(authority, row['admission_id'], event)
             return response
     finally:
+        post_delivery = captured.get('post_delivery')
+        if post_delivery is not None and not native:
+            # No live adapter handler unwinds this turn, so nothing else fires its post-delivery
+            # cleanup: a recovered or internal turn's progress bubbles would stay forever. A turn
+            # that raised or was cancelled is over too.
+            if row['admission_id'] in authority.pending_deliveries:
+                _registry(authority, 'post_deliveries')[row['admission_id']] = post_delivery
+            else:
+                _fire_post_delivery(post_delivery)
         if not handed:
             await _release_turn_marker(authority, event)
         executing_admission.reset(token)
@@ -402,9 +411,32 @@ async def _execution_scope(authority, home):
     return nullcontext() if scope_home is None else _profile_runtime_scope(scope_home, secrets)
 
 
+_post_delivery_tasks = set()
+
+
+def _fire_post_delivery(post_delivery):
+    """Detached: bubble deletes can wait out a chat's flood limit, and the FIFO must not."""
+    owner, session_key, generation = post_delivery
+    fire = getattr(owner, '_fire_post_delivery_callback', None)
+    if fire is not None:
+        task = asyncio.create_task(fire(session_key, generation))
+        _post_delivery_tasks.add(task)
+        task.add_done_callback(_post_delivery_tasks.discard)
+
+
 async def deliver_settled(authority, admission_id):
-    """Send a recovered no-waiter turn's reply after its terminal outcome committed. A send
-    failure cannot rewrite that outcome; it is logged, and inference never runs again."""
+    """Send a recovered no-waiter turn's reply after its terminal outcome committed, then fire the
+    turn's post-delivery cleanup. A send failure cannot rewrite that outcome; it is logged, and
+    inference never runs again."""
+    post_delivery = _registry(authority, 'post_deliveries').pop(admission_id, None)
+    try:
+        await _deliver_settled(authority, admission_id)
+    finally:
+        if post_delivery is not None:
+            _fire_post_delivery(post_delivery)
+
+
+async def _deliver_settled(authority, admission_id):
     held = _held_markers(authority).pop(admission_id, None)
     delivery = authority.pending_deliveries.get(admission_id)
     if delivery is not None and admission_id in authority.native_waiters:
