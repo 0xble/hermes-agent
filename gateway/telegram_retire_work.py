@@ -281,7 +281,12 @@ async def receipt(runner, source, state, item, dest):
         key = handoff_key(state, item)
         # Resolve an existing key before add, so only a proven dedupe hit may
         # have older loop progress. A fresh create still requires full content.
-        matches = await cli(runner, owner_source, "tasks", "--json", "query", json.dumps(title), "--all")
+        # The query language reads "word:" as a field filter even inside quotes, so search the
+        # colon-free words and match the key here. ``--all`` returns every page.
+        matches = await cli(runner, owner_source, "tasks", "--json", "query",
+                            f'"Retired topic" {item["kind"]}', "--all")
+        if isinstance(matches, dict) and not matches.get("has_more"):
+            matches = matches.get("items")
         if not isinstance(matches, list):
             raise RuntimeError("Handoff task lookup returned an incomplete response")
         matches = [task for task in matches if task.get("dedupe_key") == key]

@@ -668,8 +668,9 @@ def loop_handoff_retry(runtime, monkeypatch):
 
     async def command(_runner, _source, *args, **_):
         if "query" in args:
-            assert args == ("tasks", "--json", "query", '"Retired topic: loop"', "--all")
-            return [dict(r.task)] if r.task else []
+            # The real CLI reads "topic: loop" as a field filter and returns a page, not a list.
+            assert args == ("tasks", "--json", "query", '"Retired topic" loop', "--all")
+            return {"items": [dict(r.task)] if r.task else [], "has_more": False}
         if "add" in args:
             if not r.task:
                 r.task.update(id="t1", title=args[3], context=args[args.index("--context") + 1],
