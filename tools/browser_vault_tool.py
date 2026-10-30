@@ -515,7 +515,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, effective_task_id: str) -> str:
     """Inspect the page, resolve the item's secret and write it; runs inside the backend's fill_context
     after the origin guard passed."""
-    from agent.redact import register_vault_redaction_value
+    from agent.redact import register_vault_card_number, register_vault_redaction_value
     from agent.vault_login_classifier import (
         ClassifiedLoginControl,
         LoginControl,
@@ -575,6 +575,8 @@ def _fill_bound_page(backend: Any, handle: str, meta: Any, page_origin: str, eff
     # Address values are not secrets but the card fields are: register every payment value.
     for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
         register_vault_redaction_value(value)
+    if meta.kind == "payment":
+        register_vault_card_number(secret.get("card_number", ""))
 
     try:
         fill_result = _eval_js_secret(

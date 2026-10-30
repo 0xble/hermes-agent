@@ -63,6 +63,24 @@ def register_vault_redaction_value(value) -> None:
             del bucket[next(iter(bucket))]
 
 
+# A card number is 13-19 digits. Checkout inputs commonly reformat it as the user types (spaces, NBSPs
+# or dashes every few digits) and managers may store it either way, so the exact registered bytes are
+# not what a later page read returns. Any registered value of that shape is matched across separators.
+_CARD_NUMBER_DIGITS = re.compile(r"[0-9]{13,19}")
+_CARD_NUMBER_SEPARATOR = r"[\s-]{0,3}"
+
+
+def register_vault_card_number(value) -> None:
+    """Register a filled card number in its stored form and as bare digits, so a page that adds or
+    strips separators still has it scrubbed (see ``redact_registered_vault_values``)."""
+    register_vault_redaction_value(value)
+    if not isinstance(value, str) or not all(ch.isspace() or ch in "-0123456789" for ch in value):
+        return
+    digits = "".join(ch for ch in value if ch in "0123456789")
+    if _CARD_NUMBER_DIGITS.fullmatch(digits):
+        register_vault_redaction_value(digits)
+
+
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:
@@ -77,6 +95,10 @@ def redact_registered_vault_values(text: str) -> str:
         bucket = _VAULT_REDACTION_VALUES.get(_vault_scope())
         values = sorted(bucket, key=len, reverse=True) if bucket else ()  # longest first: a substring never shadows its superstring
     for value in values:
+        if _CARD_NUMBER_DIGITS.fullmatch(value):
+            # This registered number only, whatever separators the page put between its digits.
+            pattern = r"(?<![0-9])" + _CARD_NUMBER_SEPARATOR.join(value) + r"(?![0-9])"
+            text = re.sub(pattern, "«redacted-vault-secret»", text)
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
     return text
