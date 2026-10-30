@@ -26,6 +26,7 @@ from agent.turn_failure_copy import (
 )
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
+from gateway import loop_completion
 from gateway.config import Platform
 from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
@@ -3331,6 +3332,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 return
             if (event.metadata or {}).get("checkin"):
                 message_text = event.text
+            event._loop_completion_identity = await self._run_in_executor_with_context(
+                loop_completion.capture_loop_identity, _run_start_session_id)
             started, agent_result = await self._invoke_loop_wake_effect(
                 event, self._run_agent,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
@@ -3378,9 +3381,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 if isinstance(agent_result.get("queued_terminal_goal_identity"), dict):
                     # Post-turn goal hooks judge the terminal turn: carry its identity on the head.
                     event._post_turn_goal_identity = agent_result["queued_terminal_goal_identity"]
-                if agent_result.get("queued_chain_loop_tick"):
-                    # The latest loop wake the chain ran owns the loop completion.
-                    event._post_turn_loop_tick = agent_result["queued_chain_loop_tick"]
+                loop_completion.carry_response(agent_result, event)
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -5269,6 +5270,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             for consumed_event in _consumed_events:
                 consumed_event._agent_turn_succeeded = False
             try:
+                loop_completion_identity = await self._run_in_executor_with_context(
+                    loop_completion.capture_loop_identity, session_id)
                 followup_result = await self._run_agent(
                     message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                     source=next_source, session_id=session_id, session_key=next_session_key,
@@ -5299,11 +5302,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
-        # The deepest queued loop wake wins (inner recursions fill this first): it is the latest
-        # tick the chain ran, so the chain's single loop completion settles exactly that tick.
-        _pending_loop_tick = self._post_turn_goal_identity(pending_event).get("loop_tick")
-        if isinstance(merged, dict) and _pending_loop_tick and not merged.get("queued_chain_loop_tick"):
-            merged = {**merged, "queued_chain_loop_tick": _pending_loop_tick}
+        merged = loop_completion.carry_followup(
+            merged, loop_completion_identity, self._post_turn_goal_identity(pending_event).get("loop_tick"))
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
         # reply is recorded under the first message's id, so a first reply that was refused (flood

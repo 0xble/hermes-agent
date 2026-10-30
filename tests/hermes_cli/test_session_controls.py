@@ -29,7 +29,8 @@ def _user(db, sid, text, *, display_kind=""):
 
 @pytest.mark.parametrize("quoted", [False, True])
 @pytest.mark.parametrize("entry", ["apply", "request"])
-def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry):
+@pytest.mark.parametrize("target", ["target", "hermes:default/target"])
+def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry, target):
     from hermes_constants import get_hermes_home
     from hermes_cli import session_controls
     from hermes_cli.goals import GoalManager, load_goal
@@ -40,24 +41,16 @@ def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry):
     _user(state, "requester", quote)
     control = session_controls.apply_control if entry == "apply" else session_controls.request_control
     kwargs = {"user_quote": quote} if quoted and entry == "apply" else {}
-    result = control("goal", "pause", "target", requester_sid="requester", **kwargs)
+    result = control("goal", "pause", target, requester_sid="requester", **kwargs)
     assert result["ok"] and result["status"] == "applied"
     record = session_controls._load_record(result["record"]["id"])
     durable = load_goal("target")
-    if quoted and entry == "apply":
-        assert durable.status == "paused" and not durable.waiting_until
-        assert record["authority"]["via"] == "quote"
-        assert "outcome" not in record and "notice" not in result
-    else:
-        assert durable.status == "active" and durable.paused_reason is None
-        assert record["authority"]["via"] == "autonomy"
-        assert record["outcome"] == result["outcome"] == "timed_wait"
-        assert record["wait_seconds"] == result["wait_seconds"] == durable.waiting_seconds == 900
-        assert record["waiting_until"] == result["waiting_until"] == durable.waiting_until
-        assert record["notice"] == result["notice"] == (
-            "Goal waiting 15 min (autonomous timed wait, no approval); still active"
-        )
-        assert "paused" not in result["notice"] and "Telegram" not in result["notice"]
+    assert durable.status == "paused" and not durable.waiting_until
+    assert record["authority"]["via"] == ("quote" if quoted and entry == "apply" else "autonomy")
+    assert record["outcome"] == result["outcome"] == "paused"
+    assert "paused" in result["notice"].lower()
+    assert "wait_seconds" not in record
+    assert "waiting_until" not in record
 
 
 def test_quote_applies_cross_session_clear_and_audits(state):

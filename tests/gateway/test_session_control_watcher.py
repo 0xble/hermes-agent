@@ -751,9 +751,8 @@ async def test_autonomous_goal_outbox_attributes_both_notices_to_autonomy(
     target = runner.adapter.sends[0][1]
     requester = runner.injections[0]["content"]
     if action == "pause":
-        expected = "Goal waiting 15 min (autonomous timed wait, no approval); still active"
-        assert expected in target and expected in requester
-        assert "paused" not in target + requester
+        assert "paused" in target
+        assert "applied autonomously without approval" in requester
     else:
         assert "(applied autonomously without approval)" in target
         assert "was applied autonomously without approval." in requester
@@ -800,12 +799,10 @@ async def test_goal_pause_notices_follow_committed_outcome_after_reload(state, q
             "was applied using your quoted words."
         )
     else:
-        assert durable.status == "active" and durable.waiting_seconds == 900
-        assert durable.paused_reason is None
-        notice = "Goal waiting 15 min (autonomous timed wait, no approval); still active"
-        assert target == f"◷ {notice}. Requested by Untitled session (requester)."
-        assert requester == f"✓ {notice} in Untitled session (target)."
-        assert "paused" not in target + requester
+        assert durable.status == "paused" and not durable.waiting_until
+        assert "Goal paused" in target
+        assert "applied autonomously without approval" in requester
+        assert "waiting" not in target + requester
         assert "Telegram" not in target + requester
     assert session_controls.pending_outbox() == []
 
