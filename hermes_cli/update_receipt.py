@@ -225,6 +225,15 @@ class UpdateReceipt:
             outcome = "partial"  # committed, but the user still has to act (record_user_action)
         self.data["outcome"] = outcome
         self.data["finished_at"] = _utc_now_iso()
+        proof = self.data.get("immutable_update")
+        if isinstance(proof, dict):
+            # Re-read the active release at the terminal boundary; unreadable stays None.
+            try:
+                from hermes_cli.immutable_releases import release_identity
+                after = release_identity(Path(proof["before"]["home"]))
+            except Exception:
+                after = None
+            self.data["immutable_update"] = {**proof, "after": after}
         self.data["post_update"] = _code_identity(refresh=True)
 
 
