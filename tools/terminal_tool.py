@@ -76,23 +76,19 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
 
-# Foreground heavy-slot wait: leave most of the command timeout for the test itself.
-# Below a 30s timeout the floor exceeds a third, so the terminal timeout may fire first.
+# Foreground heavy-work budget: hand the live shell to the background registry.
+# The helper waits without expiry, so FIFO age and earlier shell side effects survive.
 _FOREGROUND_HEAVY_SLOT_WAIT_CAP = 120
 _FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
 
 
 def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
-    """Bound heavy-slot admission without consuming the terminal's whole deadline."""
+    """Bound foreground occupancy without cancelling heavy-slot admission."""
     return min(_FOREGROUND_HEAVY_SLOT_WAIT_CAP, max(_FOREGROUND_HEAVY_SLOT_WAIT_FLOOR, effective_timeout // 3))
 
 
 def _heavy_slot_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
-    """Foreground local calls get a bounded queue wait; background jobs keep waiting.
-
-    A foreground call later adopted into the background mid-run keeps the bound it
-    started with, so it can still end with heavy-slot's exit-75 not-started result.
-    """
+    """Foreground local heavy calls hand off at this budget without expiring their ticket."""
     if background or env_type != "local":
         return None
     return _foreground_heavy_slot_max_wait(effective_timeout)
@@ -984,8 +980,8 @@ from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
     gateway_lifecycle_block, self_repo_block, trailing_amp_background_command,
 )
-from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
-from tools.terminal_tool_heavy_slot import can_promote_expired_wait, wrap_heavy_command
+from tools.terminal_tool_background import _HEAVY_SLOT_YIELDED_NOTE, _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
+from tools.terminal_tool_heavy_slot import foreground_heavy_command, wrap_heavy_command
 from tools.terminal_tool_result import finalize_foreground_result
 
 
@@ -1318,21 +1314,6 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def _with_heavy_slot_promoted_note(result_json: str) -> str:
-    """Explain that a bounded heavy-slot wait was resumed without a retry."""
-    try:
-        data = json.loads(result_json)
-    except (TypeError, ValueError):
-        return result_json
-    if not isinstance(data, dict) or data.get("error"):
-        return result_json
-    data["promoted_from_heavy_slot"] = (
-        "The foreground heavy-slot wait expired before this command started. "
-        "It was automatically moved to a tracked background process and will run "
-        "when a slot is available. Do NOT re-run it."
-    )
-    return json.dumps(data, ensure_ascii=False)
-
 
 def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
     """Cached env for the task, else create it under the per-task creation lock.
@@ -1389,7 +1370,7 @@ def _run_foreground(
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
     metered: bool = True, execution_command: Optional[str] = None,
-    on_heavy_slot_expired: Optional[Callable[[], Optional[str]]] = None,
+    yield_after_seconds: Optional[int] = None, yield_when: Optional[Callable[[], bool]] = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
     is False for Hermes' own control-plane commands (``_host_local``). ``execution_command``
@@ -1423,6 +1404,8 @@ def _run_foreground(
                 execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
+                **({"yield_after_seconds": yield_after_seconds, "yield_when": yield_when}
+                   if yield_after_seconds is not None else {}),
             )
             break
         except Exception as e:
@@ -1445,19 +1428,9 @@ def _run_foreground(
         return json.dumps({
             "output": result.get("output", ""), "exit_code": None, "error": None,
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],
-            "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
+            "pid": result.get("pid"), "notify_on_complete": True,
+            "note": _HEAVY_SLOT_YIELDED_NOTE if result.get("yield_reason") == "heavy_slot_wait" else _YIELDED_NOTE,
         }, ensure_ascii=False)
-    if result.get("returncode") == 75 and on_heavy_slot_expired is not None:
-        # Exit 75 is heavy-slot's bounded "not started" result. A single simple
-        # command can be resumed safely; compound commands keep their explicit
-        # not-started result so earlier shell side effects are never repeated.
-        try:
-            promoted = on_heavy_slot_expired()
-        except Exception:
-            logger.debug("heavy-slot expiry promotion failed", exc_info=True)
-            promoted = None
-        if promoted is not None:
-            return promoted
     if metered:
         record_terminal_outcome(command, env_type, result)
     return finalize_foreground_result(
@@ -1640,17 +1613,15 @@ def terminal_tool(
         # Approval and pre-exec security checks above saw the user-supplied command; only the
         # local execution is rewritten, putting heavy-slot in front of each recognized test or
         # CI simple command. HEAVY_SLOT_HELD (a nested run) or HERMES_HEAVY_SLOT=off disables it.
-        # Promoted foreground calls are already background jobs, so they retain an unbounded queue wait.
+        # Keep helper admission unbounded. The local wait loop yields the original
+        # shell at the foreground budget only while admission is pending.
         max_wait_seconds = _heavy_slot_max_wait_for(
             background=background, env_type=env_type, effective_timeout=plan.effective_timeout,
         )
-        execution_command = wrap_heavy_command(
-            command,
-            env_type=env_type,
-            environment=getattr(env, "env", None),
-            max_wait_seconds=max_wait_seconds,
-        )
         if background:
+            execution_command = wrap_heavy_command(
+                command, env_type=env_type, environment=getattr(env, "env", None),
+            )
             result = spawn_background_process(
                 command=execution_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
@@ -1668,37 +1639,17 @@ def terminal_tool(
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
             return _metered(None if _host_local else plan, result)
 
-        def _promote_expired_heavy_slot_wait() -> Optional[str]:
-            if not can_promote_expired_wait(
-                command, env_type=env_type, environment=getattr(env, "env", None),
-            ):
-                return None
-            unbounded_command = wrap_heavy_command(
-                command,
-                env_type=env_type,
-                environment=getattr(env, "env", None),
-                max_wait_seconds=None,
-            )
-            promoted = spawn_background_process(
-                command=unbounded_command, env=env, env_type=env_type,
-                effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
-                workdir=workdir, cwd=cwd,
-                mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
-                effective_pty=pty and not pty_disabled, notify_on_complete=True,
-                watch_patterns=None, approval_note=verdict.note,
-                pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
-                completion_output_chars=_completion_output_chars,
-                heartbeat_seconds=0, persist_on_release=False,
-            )
-            return _with_heavy_slot_promoted_note(promoted)
-
-        return _metered(None if _host_local else plan, _run_foreground(
-            command, env, plan, execution_command=execution_command,
-            on_heavy_slot_expired=_promote_expired_heavy_slot_wait,
-            task_id=task_id, session_id=session_id, session_key=session_key,
-            workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-            metered=not _host_local,
-        ))
+        with foreground_heavy_command(
+            command, env_type=env_type, environment=getattr(env, "env", None),
+        ) as (execution_command, waiting_for_admission):
+            return _metered(None if _host_local else plan, _run_foreground(
+                command, env, plan, execution_command=execution_command,
+                yield_after_seconds=max_wait_seconds if execution_command != command else None,
+                yield_when=waiting_for_admission,
+                task_id=task_id, session_id=session_id, session_key=session_key,
+                workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+                metered=not _host_local,
+            ))
     except _Rejected as r:
         return r.result_json
     except EnvironmentConnectionError as e:
