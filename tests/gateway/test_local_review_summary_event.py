@@ -22,6 +22,7 @@ def _runner(platform, published):
 
     turn._ctx = SimpleNamespace(
         source=SimpleNamespace(platform=platform),
+        persist_user_display_kind=None,
         _status_adapter=SimpleNamespace(send=send),
         _status_chat_id='chat',
         _status_thread_metadata=None,
