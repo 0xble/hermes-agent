@@ -93,6 +93,7 @@ def test_captured_completion_without_execution_books_at_most_once(tmp_path, monk
         monkeypatch.setattr(delivery_queue, 'enqueue', enqueue)
         scheduler_authority.reconcile_pending()
         assert not journal.exists()
+        assert not journal.with_name(journal.name + '.unsettled').exists()
         completed = jobs.get_job(job['id'])
         scheduler_authority.reconcile_pending()
         assert jobs.get_job(job['id']) == completed

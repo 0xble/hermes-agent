@@ -260,7 +260,8 @@ def reconcile_pending(*, allow_connect=True):
                     record['pause_recorded'] = _pause_identity(pause_job(params['job_id'], reason=reason))
                     atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
                 continue
-            success, output, answer, error = state['result']
+            received = state['result']
+            success, output, answer, error = received
             job = dict(state['job'], **(state.get('job_flags') or {}))
             job['execution_id'] = params['request_id']
             # The same result verdicts as the ordinary tail: an agent-declared [CRON_FAILURE] and a
@@ -276,7 +277,13 @@ def reconcile_pending(*, allow_connect=True):
             if finish_completed_run(delivery, None, params['request_id'], recovered=True):
                 # No execution row may remain to fence the next tick (legacy or
                 # pruned runs). Successful recovery is itself terminal bookkeeping.
-                journal.unlink(missing_ok=True)
+                captured = (record.get('worker_result') or {}).get('result')
+                if (pending_canonical and not _settled_now(journal)
+                        and json.dumps(captured) != json.dumps(received)):
+                    # Booked from a receipt that is not the capture: keep the capture's only copy.
+                    _set_aside_unsettled(journal)
+                else:
+                    journal.unlink(missing_ok=True)
                 journal.with_suffix('.cancel').unlink(missing_ok=True)
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
         except Exception:
