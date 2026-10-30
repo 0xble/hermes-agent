@@ -21,7 +21,7 @@ or tools. Explicit cron cancellation uses the admission's durable cancellation
 marker. Gateway shutdown is not that cancellation.
 
 Worker owner discovery and authentication retry pre-send lifecycle failures for
-up to 90 seconds, rediscovering the endpoint and minting a fresh ticket after
+up to 90 seconds per RPC call, rediscovering the endpoint and minting a fresh ticket after
 owner replacement. Discovery, identify, ticket and WebSocket-open calls use the
 remaining connection budget. The event-loop synchronous-RPC guard still fails
 before discovery or waiting. Permission, protocol and self-RPC refusals remain
@@ -39,8 +39,18 @@ Non-adoptable managed workers and retired children remain refused. Exhausted
 connection patience reports `owner_restart`, not disk-full/lock guidance, and
 leaves pending writes in the existing journal for explicit retry or verified
 adoption. This does not claim that a queued operation is canonically committed.
+The detached executor retains its existing pause-until-adoption contract across
+multiple bounded connection windows, including exhaustion while adopting. Its
+outer reconnect wrapper never retries a ConnectionClosed that escapes WorkerRPC:
+that call may have reached the owner. Discovery resets and broken pipes retain
+the interrupted-control-response cause instead of becoming invalid-control-peer
+refusals. Malformed peers, authorization failures and explicit assignment
+refusals remain terminal.
 Regression coverage is `tests/agent/test_worker_owner_restart.py`, alongside the
-connection-reuse, outbox-adoption and persistence-explainer suites.
+connection-reuse, outbox-adoption and persistence-explainer suites. Detached
+multi-window and no-replay coverage is `tests/cron/test_detached_owner_restart.py`.
+Discovery transport and terminal-peer coverage is
+`tests/agent/test_worker_discovery_recovery.py`.
 
 The 2026-10-30 detached `maintain-filesystems` execution failed while its owner
 was exiting: SIGTERM at 2:21:55 AM PT, zero-second drain timeout at 2:21:56 AM PT,
