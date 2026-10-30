@@ -31,7 +31,7 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   rehydration; hygiene compression's provenance stamps (a forced activity write), failure-streak
   reads, cooldown writes and streak resets run in worker threads, including from the
   turn-hold done-callback and the unwind path, which schedule them as retained tasks; Telegram's
-  in-send and control-send stale-topic prunes, delivery's automation topic-owner claim, `/retire`
+  in-send and control-send stale-topic prunes, delivery's automation topic-owner claim, topic retirement
   and topic-session binding peeks, and Slack thread hydration (active-session check, watermark
   read and write) run through `asyncio.to_thread`. Concurrent Slack replies in one thread may
   now persist watermarks out of order; a regressed watermark only re-injects already-seen replies

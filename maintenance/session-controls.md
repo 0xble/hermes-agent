@@ -98,11 +98,13 @@ and the existing 24-hour outcome expiry bounds retries.
 
 ### Telegram Topic Retirement
 
-**Fork patch identity:** `telegram-topic-retire`. `/retire [topic|now|cancel]`
-and `telegram_topic`'s `retire`/`cancel_retire` actions share the profile-local
-`state_meta` record and executor in `gateway/telegram_retire.py`. Pending
-retirement gates new user work, but accepts cancellation and already-owned
-internal completions. Only an explicit user request to retire or delete this topic
+**Fork patch identity:** `telegram-topic-retire`. `telegram_topic`'s
+`retire`/`cancel_retire` actions own the profile-local `state_meta` record and
+executor in `gateway/telegram_retire.py`. Core registers no `/retire` slash
+command, so a plugin can own that name (plugin registration skips built-in
+names). Pending retirement gates new user work but accepts already-owned
+internal completions. A `failed` or `delete_unresolved` retirement admits the
+user again, so the agent can retry or cancel it through the tool. Only an explicit user request to retire or delete this topic
 authorizes invocation, including a deferred request after its named conditions
 are verified and its result delivered. Finishing, inactivity, splitting or handing
 off never grants permission. `now` requires an explicit interruption request.
@@ -137,8 +139,8 @@ combined. The closing note states the choice, its reason, and continuing owners.
 Receipt IDs, transfer intentions and verified moves persist independently of
 discovery, so a restart cannot forget an item already moved. Receipt IDs are
 saved before polling. `pending`, `posted` and `sent_unconfirmed` keep retirement
-pending after each bounded 60-second check. Existing housekeeping and `/retire`
-resume status reads of that exact receipt, never another handoff send. Only
+pending after each bounded 60-second check. Existing housekeeping and an explicit
+retire request resume status reads of that exact receipt, never another handoff send. Only
 `delivered` or `replied` permits an unaccepted handoff's transfer and closing.
 Destination acceptance is independent delivery proof when the exact keyed task,
 creator, title, kind and destination assignment are verified and its original
@@ -149,7 +151,7 @@ tasks and never sends another handoff for them. Accepted goal/loop handoffs clea
 only the source control atomically with recovery proof. The destination owns its
 successor, which retirement neither overwrites nor arms, and later successor
 progress does not invalidate that proof. A failed retirement admits ordinary
-user messages and explains `/retire` retry and `/retire cancel` recovery.
+user messages and says to ask for a retry or cancellation.
 Keyed native-task lookup reuses the existing task without another add. Its ID,
 key, title and destination creator are read back. Cron/loop/goal task briefs and
 legacy-brief readback share an authored-definition projection: prompt or goal,
@@ -192,8 +194,8 @@ Housekeeping never retries an unresolved destructive request or sends a probe.
 When the user CLI is available, it may passively reconcile exact-topic absence
 under the executor lock and the saved generation-matching closing receipt, then
 finish unbinding. Existing, unknown or incomplete lookup results, disconnected
-transports and invalid receipts leave the record quiet and unchanged. `/retire`
-or `/retire cancel` explicitly probes the exact topic under the same lock.
+transports and invalid receipts leave the record quiet and unchanged. An explicit
+retire or cancel request probes the exact topic under the same lock.
 Confirmed absence only cleans up its binding. Confirmed existence permits
 cancellation or a fresh generation that inventories again and requires a new
 closing receipt. An unknown result never repeats the previous dispatch.
