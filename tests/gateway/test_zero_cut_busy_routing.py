@@ -9,8 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.outbox import Outbox
-from gateway.outbox import _recover_locked
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource, SessionStore
 from gateway.zero_cut_busy import (
@@ -196,24 +194,7 @@ def test_fifo_burst_and_cap_are_left_to_existing_queue(tmp_path):
     assert [event.message_id for event in events] == ["m-0", "m-1", "m-2"]
 
 
-@pytest.mark.asyncio
-async def test_outbox_ambiguous_is_not_replayed_and_pending_claims_once(tmp_path):
-    one, two = Outbox(Path(tmp_path) / "home"), Outbox(Path(tmp_path) / "home")
-    ambiguous = one.enqueue("turn-a", "send", {"text": "already maybe sent"})
-    assert one.begin_send(ambiguous)
 
-    class Adapter:
-        sends = 0
-
-        async def send(self, **_payload):
-            self.sends += 1
-
-    adapter = Adapter()
-    assert await _recover_locked(two, adapter, startup=True) == (0, 1)
-    assert adapter.sends == 0
-    pending = one.enqueue("turn-b", "send", {"text": "retry"})
-    assert two.begin_send(pending)
-    assert not one.begin_send(pending)
 
 def test_flag_off_does_not_read_marker_or_start_watcher(tmp_path, monkeypatch):
     a, b = _stores(tmp_path, enabled=False)

@@ -2193,9 +2193,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         if not is_standby():  # a standby opens no shared store until promotion
             await self._start_prime_session_db_after_ready()
         self.delivery_router.adapters = self.adapters
-        if getattr(self.config, "durable_outbox_enabled", False) and not is_standby():
-            from gateway.outbox import recover_gateway_destinations
-            await recover_gateway_destinations(self)  # a standby replays after promotion
+        if getattr(self.config, "durable_outbox_enabled", False):
+            logger.warning("gateway.durable_outbox.enabled is set, but the durable outbox was removed; "
+                           "the setting has no effect")
         self._wire_teams_pipeline_runtime()
         self._running = True
         self._install_plugin_message_injector()

@@ -3910,22 +3910,17 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         # Scheduled command wakes (a /loop tick of /status) count their tick on this receipt.
         event._gateway_inline_command_handled = True
         event._gateway_accepted = True
-        from gateway.outbox import bind_event_turn, restore_turn
-        token = bind_event_turn(event)
-        try:
-            text, eph_ttl = self._unwrap_ephemeral(response)
-            if not text:
-                return
-            if log_cmd is not None:
-                logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
-                            len(text), event.source.chat_id)
-            result = await self._send_with_retry(
-                chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-                metadata=_mark_notify_metadata(thread_meta))
-            if eph_ttl > 0 and result.success and result.message_id:
-                self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
-        finally:
-            restore_turn(token)
+        text, eph_ttl = self._unwrap_ephemeral(response)
+        if not text:
+            return
+        if log_cmd is not None:
+            logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
+                        len(text), event.source.chat_id)
+        result = await self._send_with_retry(
+            chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+            metadata=_mark_notify_metadata(thread_meta))
+        if eph_ttl > 0 and result.success and result.message_id:
+            self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
 
     def spawn_ingress_reply(self, coro: Awaitable[Any], *, label: str) -> "asyncio.Task":
         """Run an ingress-path reply (command reply, busy ack, retry notice) off the update consumer.
@@ -4435,21 +4430,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
-        # An already-admitted Telegram update must not enter the busy queue: the
-        # runner would see it only after the original turn completed and could
-        # otherwise turn a transport redelivery into another user turn.
-        if (self.platform == Platform.TELEGRAM and not event.internal
-                and getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)):
-            from gateway.outbox import store_for, event_kind, transport_id, local_admission_turn
-            event_id = transport_id(event)
-            if event_id:
-                home = getattr(self.gateway_runner, "_resolve_profile_home_for_source")(event.source)
-                original = await asyncio.to_thread(
-                    store_for(home).lookup, str(event.source.profile or "default"),
-                    "telegram", event_id, event_kind(event))
-                if original and local_admission_turn(event, self.gateway_runner, home) is None:
-                    event._gateway_accepted = True
-                    return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
         # different topic would redirect them and yield before the session claim.
@@ -4691,26 +4671,14 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         record_delivery(tts_result)
         return bool(caption and getattr(tts_result, "success", False))
 
-    def _outbox_covers_final(self, event: MessageEvent, delivery_adapter: "BasePlatformAdapter") -> bool:
-        """Whether the durable outbox, not the ledger, owns this final's crash recovery."""
-        from gateway.outbox import active_turn
-        outbox_turn = (getattr(event, "_outbox_home", None), getattr(event, "_outbox_turn_id", None))
-        return bool(
-            getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)
-            and delivery_adapter.platform == Platform.TELEGRAM
-            and getattr(type(delivery_adapter).send, "_durable_outbox", False)
-            and active_turn() == outbox_turn
-        )
-
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
-        metadata: Optional[Dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
+        metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
-        or None. ``outbox_refused`` ledgers an outbox-covered final after the adapter refused it
-        before sending: the outbox never replays a proven-unsent row, the ledger's reconnect sweep does."""
-        if (is_ephemeral_response or (not outbox_refused and self._outbox_covers_final(event, delivery_adapter)) or
+        or None."""
+        if (is_ephemeral_response or
                 str(event.text or "").lstrip().startswith(
                     ("/", self.typed_command_prefix or "!"))):
             return None
@@ -4902,11 +4870,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         task = asyncio.current_task()
         if task is not None and task.cancelling():
             await asyncio.sleep(0)
-        if (obligation_id is None and not result.success and result.pre_send
-                and self._outbox_covers_final(event, delivery_adapter)):
-            obligation_id = await self._record_delivery_obligation(
-                event, session_key, text_content, delivery_adapter, is_ephemeral_response,
-                metadata=metadata, outbox_refused=True)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if on_refused is not None and not getattr(result, "success", False):
             # Ledger whatever must follow this message BEFORE finalizing it: finalizing can run a
@@ -5029,10 +4992,10 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         held: list = []
         for index in range(start, len(copy_blocks)):
             block_metadata = {**metadata, "copy_block_index": index}
-            # Never sent, so the durable outbox will not replay it: the ledger must own it.
+            # Never sent, so the ledger must own it.
             obligation_id = await self._record_delivery_obligation(
                 event, session_key, copy_blocks[index], delivery_adapter, is_ephemeral_response,
-                metadata=block_metadata, outbox_refused=True)
+                metadata=block_metadata)
             if obligation_id is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(mark_failed, obligation_id, error)
@@ -5298,8 +5261,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         _thread_metadata = _thread_metadata_for_event(event)
         _typing_metadata = typing_metadata_for_event(event)
         typing_task = review_capture.start_typing(self, event, interrupt_event, _typing_metadata)
-        from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
-        turn_token = scoped_turn_entry()
         delivery_generation = None
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -5307,7 +5268,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             response = await self._handle_compression_retries(event, session_key, interrupt_event)
             if self._pending_messages.get(session_key) is event and getattr(event, "_drain_deferred", False):
                 return  # Shutdown owns the retained input, not a completed delivery.
-            bind_event_turn(event)
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
@@ -5419,7 +5379,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
-            bind_event_turn(event)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await review_capture.notify_error(self, event, e, session_key)) or _thread_metadata
@@ -5427,7 +5386,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
-            restore_turn(turn_token)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it

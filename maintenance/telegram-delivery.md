@@ -4,8 +4,7 @@ The fork's Telegram adapter patches were retired, and the adapter is stock upstr
 (see [Telegram stack retirement](telegram-stack-retirement.md)). This unit owns the
 Telegram-conditional behavior that stayed in shared delivery code because other
 families still rely on it. Load it when changing reply anchors, the delivery ledger,
-outbound-class labels, the durable outbox's class handling, or cron live-lane flood
-handling.
+outbound-class labels, or cron live-lane flood handling.
 
 ## Required behavior
 
@@ -17,8 +16,9 @@ handling.
   duplicate fallback (`gateway/delivery_ledger.py`).
   - Patch identity: `slice-10-delivery-ledger`.
 - Non-final sends are labelled through `outbound_class` (`OUTBOUND_NOTICE`, progress) at their
-  call sites, and unlabelled sends are finals. No stock adapter reads the label today; it is kept
-  because the durable outbox stores it (below).
+  call sites, and unlabelled sends are finals. Nothing reads the label since the durable outbox
+  was removed ([Durable outbox retirement](durable-outbox-retirement.md)). Removing the labels is a
+  follow-up.
   - Patch identity: `telegram-chat-budget`.
 - The shared splitter derives its `(i/n)` indicator reserve from the source codepoint length, so
   arbitrary chunk counts never overflow the caller's limit (`BasePlatformAdapter.truncate_message`).
@@ -53,16 +53,6 @@ The adjacent success, interrupted-send and concurrent-obligation tests retain th
 contracts. Retire this adaptation when released upstream provides equivalent
 final-producer cancellation ordering. Roll back only this checkpoint and its test
 adaptation, without rewriting ledger rows.
-
-## Deferred Outbound-Class Isolation
-
-**Patch identity:** `telegram-outbound-class`. Durable outbox rows preserve their outbound class
-before a deferred sweep is created, and replay binds that class explicitly. A sweep created while a
-notice or progress send is in flight therefore cannot shed a replayed final at the daily ceiling;
-legacy rows without a class default to the protected final class, while interim metadata remains
-progress. Source: `gateway/outbox.py`; proof: `tests/gateway/test_outbox_coalesced_sweep.py`.
-Retire when the durable delivery owner records and restores outbound classes through an equivalent
-released upstream mechanism.
 
 ## Cron Short Flood Wait
 
@@ -117,12 +107,12 @@ changes.
 ## Verification
 
 `scripts/run_tests.sh tests/gateway/test_delivery_ledger.py tests/gateway/test_delivery_flood_invariants.py
-tests/gateway/test_outbox_coalesced_sweep.py tests/cron/test_cron_live_delivery_confirmation.py
+tests/cron/test_cron_live_delivery_confirmation.py
 tests/gateway/test_telegram_thread_fallback.py tests/gateway/test_slack.py tests/gateway/test_discord_split_cap.py`.
 
 ## Retirement and rollback
 
-Retire each remnant with its owning family: the outbox items with the durable outbox, the
-cron items when upstream cron delivery stops falling back to a second sender during an
+Retire each remnant with its owning family: the outbound-class labels once their call sites
+are removed, the cron items when upstream cron delivery stops falling back to a second sender during an
 active flood deadline, and the reply-anchor guard when upstream stops using synthetic IDs
 as Telegram reply targets. Roll back by reverting the logical patch; no persistent data changes.

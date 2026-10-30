@@ -489,7 +489,7 @@ def _hold_lock(path):
 
 
 @pytest.mark.asyncio
-async def test_promoted_slot_adopts_host_role_and_replays_outbox_only_after_predecessor_exits(
+async def test_promoted_slot_adopts_host_role_only_after_predecessor_exits(
         monkeypatch, tmp_path):
     """Review: promotion never took the host gateway role nor replayed the durable outbox, both skipped
     at standby boot. They wait for the predecessor, which holds the role and may still be sending."""
@@ -499,30 +499,16 @@ async def test_promoted_slot_adopts_host_role_and_replays_outbox_only_after_pred
     monkeypatch.setattr("gateway.run._claim_host_gateway_role", lambda force=False: calls.append("claim"))
     monkeypatch.setattr("gateway.run._refresh_host_gateway_record", lambda r: calls.append("record"))
 
-    async def recover(runner):
-        calls.append("outbox")
-
-    monkeypatch.setattr("gateway.outbox.recover_gateway_destinations", recover)
     predecessor = _hold_lock(tmp_path / "gateway.lock")  # slot a still alive, finishing its turns
-    runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=True))
+    runner = SimpleNamespace(config=SimpleNamespace())
     task = asyncio.create_task(zcs._adopt_predecessor_duties(runner))
     await asyncio.sleep(0.1)
     assert calls == []
     predecessor.close()  # slot a exits
     await asyncio.wait_for(task, 2)
-    assert calls == ["claim", "record", "outbox"]
-
-
-@pytest.mark.asyncio
-async def test_adopt_skips_outbox_replay_when_durable_outbox_is_off(monkeypatch, tmp_path):
-    calls = []
-    monkeypatch.setattr("gateway.status._get_process_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr("gateway.run._claim_host_gateway_role", lambda force=False: calls.append("claim"))
-    monkeypatch.setattr("gateway.run._refresh_host_gateway_record", lambda r: calls.append("record"))
-    monkeypatch.setattr("gateway.outbox.recover_gateway_destinations",
-                        lambda r: asyncio.sleep(0, result=calls.append("outbox")))
-    await zcs._adopt_predecessor_duties(SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=False)))
     assert calls == ["claim", "record"]
+
+
 
 
 def test_clients_follow_a_promoted_b_once_a_is_gone(monkeypatch, tmp_path):

@@ -21,7 +21,7 @@ _PROVIDERS = (
 )
 
 
-@pytest.mark.parametrize("entry", ["providers", "gateway", "request-metadata", "nonvision-metadata", "outbox-spawn"])
+@pytest.mark.parametrize("entry", ["providers", "gateway", "request-metadata", "nonvision-metadata"])
 def test_metadata_import_and_spawn_do_not_resolve_provenance(tmp_path, entry):
     """Observe canonical identity use before real discovery and spawn imports."""
     repo = Path(__file__).resolve().parents[2]
@@ -68,18 +68,6 @@ elif sys.argv[1] == 'nonvision-metadata':
         assert _relay_vision_marker_metadata('opencode-zen', 'plain-text-model') is None
     finally:
         builtins.__import__ = original_import
-elif sys.argv[1] == 'outbox-spawn':
-    module = importlib.import_module('tests.gateway.test_durable_outbox')
-    child = mp.get_context('spawn').Process(
-        target=module._die_after_begin, args=(Path(sys.argv[2]) / 'outbox',))
-    child.start()
-    try:
-        child.join(timeout=10)
-        assert child.exitcode == 0, child.exitcode
-    finally:
-        if child.is_alive():
-            child.terminate()
-            child.join(timeout=5)
 assert not Path(sys.argv[3]).exists(), Path(sys.argv[3]).read_text()
 """
     env = os.environ.copy()
