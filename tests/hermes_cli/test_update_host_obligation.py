@@ -28,6 +28,73 @@ from hermes_cli import update_cmd
 SHA = "a" * 40
 
 
+@pytest.mark.parametrize("immutable", [False, True])
+def test_default_obligation_identity_agrees_with_gateway(tmp_path, monkeypatch, immutable):
+    """Source and release callers arm, observe and discharge one installation's debt."""
+    from gateway import update_notifications
+    from hermes_cli import immutable_releases
+
+    home = tmp_path / "home"
+    home.mkdir()
+    source = tmp_path / "source"
+    running = home / "releases" / SHA if immutable else source
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "host-state"))
+
+    def source_checkout(actual_home, root):
+        assert actual_home == home
+        assert root in (source, running)
+        return source
+
+    monkeypatch.setattr(immutable_releases, "update_source_checkout", source_checkout)
+    monkeypatch.setattr(host_obligation, "__file__", str(source / "hermes_cli/update_host_obligation.py"))
+    source_path = host_obligation.host_obligation_path(source)
+    assert host_obligation.write_host_obligation(expected_sha=SHA)
+    assert source_path.is_file()
+
+    monkeypatch.setattr(host_obligation, "__file__", str(running / "hermes_cli/update_host_obligation.py"))
+    monkeypatch.setattr(update_notifications, "__file__", str(running / "gateway/update_notifications.py"))
+    assert update_notifications._update_recovery_pending(home)
+    assert host_obligation.host_obligation_present()
+    assert host_obligation.read_host_obligation()["expected_sha"] == SHA
+    assert host_obligation.host_obligation_path() == source_path
+
+    host_obligation.clear_host_obligation()
+    assert not source_path.exists()
+    assert not host_obligation.host_obligation_present()
+    assert host_obligation.read_host_obligation() is None
+    assert not update_notifications._update_recovery_pending(home)
+
+    assert host_obligation.write_host_obligation(expected_sha=SHA, owner="update")
+    assert source_path.is_file()
+    host_obligation.release_host_obligation("update")
+    assert not source_path.exists()
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_default_obligation_identity_falls_back_to_running_tree(tmp_path, monkeypatch, unavailable):
+    """Unknown layouts and historical interpreters retain the checkout-keyed fallback."""
+    import sys
+
+    from hermes_cli import immutable_releases
+
+    home = tmp_path / "home"
+    running = tmp_path / "checkout"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "host-state"))
+    monkeypatch.setattr(host_obligation, "__file__", str(running / "hermes_cli/update_host_obligation.py"))
+    if unavailable:
+        monkeypatch.setitem(sys.modules, "hermes_cli.immutable_releases", None)
+    else:
+        monkeypatch.setattr(immutable_releases, "update_source_checkout", lambda *_: None)
+
+    assert host_obligation.host_obligation_path() == host_obligation.host_obligation_path(running)
+    assert host_obligation.write_host_obligation(expected_sha=SHA)
+    assert host_obligation.read_host_obligation()["expected_sha"] == SHA
+    host_obligation.clear_host_obligation()
+    assert not host_obligation.host_obligation_present()
+
+
 @pytest.fixture(autouse=True)
 def _units_belong_to_this_update(monkeypatch):
     """The fake units here run on invented PIDs (4242, per-unit tables) with no readable home;
