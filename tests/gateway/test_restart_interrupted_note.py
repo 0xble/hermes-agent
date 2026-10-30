@@ -3,7 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -190,7 +190,7 @@ async def test_cut_human_turn_uses_one_note_when_broadcast_enabled(tmp_path):
     runner._authorization_adapter = lambda *_args: adapter
     runner._owning_profile = lambda *_args: (True, None)
     runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
-    runner._served_home_channel_configs = lambda: []
+    runner._served_home_channel_configs = list
     runner._restart_requested = False
     runner._restart_command_source = None
     runner._restart_reason = None
@@ -231,7 +231,7 @@ async def test_shutdown_broadcast_skips_only_lanes_that_received_s2_note(tmp_pat
     runner._owning_profile = lambda *_args: (True, None)
     runner._resolve_profile_home_for_source = lambda _source: tmp_path
     runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": args[2]}
-    runner._served_home_channel_configs = lambda: []
+    runner._served_home_channel_configs = list
     runner._restart_requested = False
     runner._restart_command_source = None
     runner._restart_reason = None
@@ -1192,7 +1192,7 @@ async def test_cancelled_note_task_detaches_after_grace_and_keeps_sending_claim(
     timed_out = False
     try:
         await asyncio.wait_for(asyncio.shield(returned.wait()), timeout=0.9)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         timed_out = True
     assert not timed_out
     adapter.release.set()
@@ -1253,7 +1253,7 @@ async def test_reconnect_detaches_cancel_ignoring_note_before_resume(tmp_path, m
     timed_out = False
     try:
         await asyncio.wait_for(asyncio.shield(returned.wait()), timeout=0.9)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         timed_out = True
     assert not timed_out
     adapter.release.set()
@@ -1279,7 +1279,7 @@ async def test_startup_detaches_cancel_ignoring_note_before_resume(monkeypatch):
         started.set()
         try:
             await asyncio.wait_for(release.wait(), timeout=kwargs["timeout"])
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return 0
 
     runner._claim_pending_obligations = AsyncMock(return_value=[])
@@ -1304,7 +1304,7 @@ async def test_startup_detaches_cancel_ignoring_note_before_resume(monkeypatch):
     timed_out = False
     try:
         await asyncio.wait_for(asyncio.shield(returned.wait()), timeout=0.9)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         timed_out = True
     assert not timed_out
     release.set()
@@ -1556,6 +1556,8 @@ async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monke
     store.mark_resume_pending(entry.session_key, turn_id="turn-marker", human=True)
     marker = store.get_resume_pending_marker(entry.session_key)
     runner = object.__new__(GatewayTurnMixin)
+    runner._run_in_executor_with_context = GatewayRunner._run_in_executor_with_context.__get__(runner)
+    runner._get_executor = lambda: None
     runner.async_session_store = AsyncSessionStore(store)
     runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
     runner._hmwa_prepare_turn = AsyncMock(
@@ -1585,6 +1587,8 @@ async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monke
 
     event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
     assert await runner._handle_message_with_agent(event, source, entry.session_key, 1) == "done"
+    runner._run_agent.assert_awaited_once()
+    assert event._loop_completion_identity is None
     clear_resume_pending.assert_awaited_once_with(entry.session_key, expected_marker=marker)
 
 
@@ -1600,6 +1604,8 @@ async def test_post_delivery_clear_accepts_same_turn_drain_remark_but_not_succes
     store.mark_resume_pending(entry.session_key, turn_id="turn-interrupted", human=True)
     marker_a = store.get_resume_pending_marker(entry.session_key)
     runner = object.__new__(GatewayTurnMixin)
+    runner._run_in_executor_with_context = GatewayRunner._run_in_executor_with_context.__get__(runner)
+    runner._get_executor = lambda: None
     runner.async_session_store = AsyncSessionStore(store)
     runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
     runner._hmwa_prepare_turn = AsyncMock(
@@ -1634,6 +1640,8 @@ async def test_post_delivery_clear_accepts_same_turn_drain_remark_but_not_succes
 
     runner._hmwa_deliver_turn_response = remark_during_drain
     assert await runner._handle_message_with_agent(event, source, entry.session_key, 1) == "done"
+    runner._run_agent.assert_awaited_once()
+    assert event._loop_completion_identity is None
     assert store._entries[entry.session_key].resume_pending is False
     assert store.get_resume_pending_marker(entry.session_key) is None
 
@@ -1692,7 +1700,7 @@ async def test_successor_interruption_sends_one_new_note_without_resending_prede
         current.restart_note_turn_id = "turn-a"
         current.restart_note_marked_at = predecessor_marked_at
         current.active_turn_token = "turn-b"
-        current.active_turn_started_at = datetime.now(timezone.utc)
+        current.active_turn_started_at = datetime.now(UTC)
         current.active_turn_human = True
         store._save()
 
@@ -2106,7 +2114,7 @@ async def test_startup_timeout_cancels_note_before_resume(tmp_path, monkeypatch)
         events.append("note-start")
         try:
             await asyncio.wait_for(blocker.wait(), timeout=kwargs["timeout"])
-        except asyncio.TimeoutError:
+        except TimeoutError:
             events.append("note-cancelled")
             return 0
 
@@ -2148,7 +2156,7 @@ async def test_startup_note_timeout_does_not_cancel_other_boot_sends(monkeypatch
         events.append(("note", kwargs["cancel_on_timeout"], kwargs["timeout"]))
         try:
             await asyncio.wait_for(asyncio.Event().wait(), timeout=kwargs["timeout"])
-        except asyncio.TimeoutError:
+        except TimeoutError:
             events.append("note-cancelled")
             return 0
 
@@ -2210,7 +2218,7 @@ async def test_startup_slow_note_finishes_before_detached_boot_sends_and_resume(
         events.append("note-start")
         try:
             await asyncio.wait_for(asyncio.Event().wait(), timeout=kwargs["timeout"])
-        except asyncio.TimeoutError:
+        except TimeoutError:
             events.append("note-cancelled")
             return 0
 
@@ -2280,7 +2288,7 @@ async def test_reconnect_timeout_cancels_note_before_resume(tmp_path, monkeypatc
             return 0
         try:
             await asyncio.wait_for(task, timeout=kwargs["timeout"])
-        except asyncio.TimeoutError:
+        except TimeoutError:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             return 0
