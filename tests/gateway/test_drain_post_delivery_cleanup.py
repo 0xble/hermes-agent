@@ -16,7 +16,7 @@ class _Owner:
         self.log.append(('cleanup', session_key, generation))
 
 
-async def _run(tmp_path, monkeypatch, reply):
+async def _run(tmp_path, monkeypatch, reply, native=False):
     from gateway import session_ingress
     from gateway.config import Platform
     from gateway.session import SessionSource
@@ -29,6 +29,8 @@ async def _run(tmp_path, monkeypatch, reply):
 
     async def answer(event):
         execution_result.get()['post_delivery'] = (_Owner(log), 'k', 7)
+        if isinstance(reply, BaseException):
+            raise reply
         return reply
     authority = await _store_authority(tmp_path, monkeypatch, answer)
     authority.sessions['s'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='c'), 's')
@@ -38,7 +40,16 @@ async def _run(tmp_path, monkeypatch, reply):
         log.append(('sent', response))
     monkeypatch.setattr(session_ingress, 'deliver_response', deliver)
     actor = Principal('human', 'p', frozenset({'session:submit'}), 't')
-    await authority.submit(actor, Submission('m1', SessionRef('p', 's'), {'text': 'hi'}, 'queue'))
+    if native:
+        from gateway.platforms.event import MessageEvent
+
+        async def admit_native(event):
+            return await authority.submit(actor, Submission('m1', SessionRef('p', 's'), {'text': 'hi'}, 'queue'))
+        monkeypatch.setattr(authority, 'admit_native', admit_native)
+        await asyncio.wait_for(session_ingress.admit_message(
+            authority, MessageEvent(text='hi', source=authority.sessions['s'].source)), 10)
+    else:
+        await authority.submit(actor, Submission('m1', SessionRef('p', 's'), {'text': 'hi'}, 'queue'))
     await asyncio.wait_for(authority.sessions['s'].task, 10)
     for _ in range(50):
         if getattr(session_ingress, '_post_delivery_tasks', ()):
@@ -57,6 +68,38 @@ async def test_no_waiter_reply_fires_cleanup_after_the_send(tmp_path, monkeypatc
 async def test_silent_turn_fires_cleanup_without_a_send(tmp_path, monkeypatch):
     log, _ = await _run(tmp_path, monkeypatch, '')
     assert log == [('cleanup', 'k', 7)]
+
+
+@pytest.mark.asyncio
+async def test_turn_that_raised_still_fires_cleanup(tmp_path, monkeypatch):
+    log, _ = await _run(tmp_path, monkeypatch, RuntimeError('boom'))
+    assert ('cleanup', 'k', 7) in log
+
+
+@pytest.mark.asyncio
+async def test_live_native_waiter_keeps_the_cleanup(tmp_path, monkeypatch):
+    log, _ = await _run(tmp_path, monkeypatch, 'model reply', native=True)
+    assert ('cleanup', 'k', 7) not in log
+
+
+def test_registered_bubble_cleanup_is_recorded_for_the_drain():
+    from types import SimpleNamespace
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.session_results import execution_result
+
+    registered = []
+    owner = SimpleNamespace(register_post_delivery_callback=lambda key, cb, generation=None: registered.append((key, generation)))
+    turn_ctx = SimpleNamespace(
+        _cleanup_msg_ids=['m1'], session_key='k', _status_delivery=None, _bubble_cleanup_registered=False,
+        _cleanup_progress=True, _post_delivery_adapter=None, source=SimpleNamespace(chat_id='c'), run_generation=7)
+    captured = {}
+    token = execution_result.set(captured)
+    try:
+        GatewayTurnMixin._run_agent_schedule_bubble_cleanup(object(), {'final_response': 'ok'}, owner, turn_ctx)
+    finally:
+        execution_result.reset(token)
+    assert registered == [('k', 7)]
+    assert captured['post_delivery'] == (owner, 'k', 7)
 
 
 @pytest.mark.asyncio

@@ -350,18 +350,19 @@ async def execute_admission(authority, ref, row):
                         waiter_replies(authority)[row['admission_id']] = delivery
                     else:
                         authority.pending_deliveries[row['admission_id']] = delivery
-            post_delivery = captured.get('post_delivery')
-            if post_delivery is not None and not native:
-                # No live adapter handler unwinds this turn, so nothing else fires its post-delivery
-                # cleanup: a recovered or internal turn's progress bubbles would stay forever.
-                if row['admission_id'] in authority.pending_deliveries:
-                    _registry(authority, 'post_deliveries')[row['admission_id']] = post_delivery
-                else:
-                    _fire_post_delivery(post_delivery)
             handed = True
             await _hand_over_turn_marker(authority, row['admission_id'], event)
             return response
     finally:
+        post_delivery = captured.get('post_delivery')
+        if post_delivery is not None and not native:
+            # No live adapter handler unwinds this turn, so nothing else fires its post-delivery
+            # cleanup: a recovered or internal turn's progress bubbles would stay forever. A turn
+            # that raised or was cancelled is over too.
+            if row['admission_id'] in authority.pending_deliveries:
+                _registry(authority, 'post_deliveries')[row['admission_id']] = post_delivery
+            else:
+                _fire_post_delivery(post_delivery)
         if not handed:
             await _release_turn_marker(authority, event)
         executing_admission.reset(token)
