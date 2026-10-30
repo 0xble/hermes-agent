@@ -251,6 +251,15 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream provides equivalent agent-judged tier routing, protected-query overrides, request isolation, and cache-hit tier metadata.
 - **Rollback:** Revert the commit carrying `Fork-Patch: exa-lite-routing`.
 
+## Active Patch Record: Exa Result Images
+
+- **Patch identity:** `exa-result-images`.
+- **Behavior:** Exa `web_search` hits include the page's preview `image` URL when Exa reports one, so the agent can show a product or place photo without browsing for it. Hits without an image keep the previous shape. Other providers are unchanged.
+- **Source surfaces:** `plugins/web/_common.py` and `plugins/web/exa/provider.py`.
+- **Focused regression:** `tests/tools/test_web_exa_lite_routing.py::test_search_hits_carry_exa_preview_images`.
+- **Retirement:** Remove when upstream search results carry provider preview images.
+- **Rollback:** Revert the commit carrying `Fork-Patch: exa-result-images`.
+
 ## Active patch record: state.db prune lock batching
 
 - **Patch identity:** `state-prune-lock-batching`.

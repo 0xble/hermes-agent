@@ -205,3 +205,16 @@ def test_protected_direct_provider_call_and_other_provider_compatibility(backend
     monkeypatch.setattr("agent.web_search_registry.get_provider", lambda name: legacy)
     assert _search("clinical trial findings", stakes="high")["success"]
     legacy.search.assert_called_once_with("clinical trial findings", 10)
+
+
+def test_search_hits_carry_exa_preview_images(backend_harness):
+    """The agent gets a page's preview image straight from the search hit, and rows without one stay unchanged."""
+    _, sdk = backend_harness
+    sdk.search.return_value = SimpleNamespace(results=[
+        SimpleNamespace(url="https://shop.test/drill", title="Drill", highlights=["A drill"],
+                        image="https://cdn.shop.test/drill.jpg"),
+        SimpleNamespace(url="https://site.test/page", title="Page", highlights=[], image=None),
+    ])
+    first, second = _search("compact brushless drill kit")["data"]["web"]
+    assert first["image"] == "https://cdn.shop.test/drill.jpg"
+    assert "image" not in second
