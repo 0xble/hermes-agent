@@ -78,6 +78,8 @@ A deliberate gateway stop writes `<HERMES_HOME>/gateway-guardian-stopped`; a sta
 
 Inspect `<HERMES_HOME>/logs/guardian/` for JSON attempt, result, capped and alert receipts, plus `stdout.log` and `stderr.log`. Identical recent alerts are deduplicated and receipts older than an hour are pruned. The guardian does not retry interrupted work.
 
+The guardian job's program is `/usr/bin/osascript`, through the same `launchd_program_arguments` wrapper as the gateway, which runs `current/.venv/bin/python -m hermes_cli.gateway_guardian run` as its child. launchd records a launch constraint (LWCR) for the program binary, and the release interpreter changes under `current` with interpreter bumps, `hermes update --rollback` and the guardian's own rollback. When the guardian ran the venv Python directly, release `d32adcc2` moved it from Python 3.14.7 to 3.14.9 on 2026-10-29. From then on every spawn failed with `Unable to get updated LWCR ... error 0x3` (`job state = spawn failed`, exit 78), and the promotion's kickstart did not refresh the constraint. A guardian installed before this change keeps its old definition, because `install` refuses a differing plist. To rewrite and re-bootstrap it, run `hermes gateway guardian uninstall` and then `install` with the release CLI. Regressions: `test_gateway_guardian.py::test_guardian_program_survives_a_release_interpreter_change`, plus `test_gateway_guardian_launchd_real.py`, which runs the installer's own definition under real launchd.
+
 ## Blocking state.db work stays off the event loop
 
 Patch identity: `seamless-restart; keep gateway startup and loop off blocking state.db I/O`

@@ -736,3 +736,34 @@ def test_rollback_acknowledgement_probe_spends_the_run_deadline(tmp_path, monkey
     monkeypatch.setattr(immutable_releases, "acknowledge_running_release", acknowledge)
     assert guardian._run(home, plist, label, grace=0, domain=None, deadline=103.0) == "healthy"
     assert seen == [3.0]
+
+
+@pytest.mark.platforms("macos")
+def test_guardian_program_survives_a_release_interpreter_change(tmp_path):
+    """launchd pins a launch constraint to the job's program binary, so the release interpreter
+    must not be that binary: it changes under ``current`` on every interpreter bump or rollback."""
+    home, plist, label, a, b = layout(tmp_path)
+    definition = plistlib.loads(guardian.guardian_plist(home, plist, label, domain="gui/501"))
+    argv = definition["ProgramArguments"]
+    assert argv[0] == "/usr/bin/osascript"
+    assert str(home / "current") not in argv[0]
+    logs = home / "logs/guardian"
+    logs.mkdir(parents=True)
+    for release, code in ((b, 1), (a, 0)):
+        python = release / ".venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.write_text(f'#!/bin/sh\necho "{release.name[:1]} $*"\necho err >&2\nexit {code}\n')
+        python.chmod(0o755)
+    # Run the definition as launchd would, before and after ``current`` moves to another interpreter.
+    for release, code in ((b, 1), (a, 0)):
+        (home / "current").unlink()
+        (home / "current").symlink_to(release)
+        result = subprocess.run(argv, cwd=definition["WorkingDirectory"], timeout=30,
+                                capture_output=True, text=True, check=False)
+        assert result.returncode == code
+    assert (logs / "stdout.log").read_text().splitlines() == [
+        f"{name} -m hermes_cli.gateway_guardian run --gateway-plist {plist} --gateway-label {label} --domain gui/501"
+        for name in ("b", "a")]
+    assert (logs / "stderr.log").read_text() == "err\nerr\n"
+    assert definition["StandardOutPath"] == str(logs / "stdout.log")
+    assert definition["EnvironmentVariables"] == {"HERMES_HOME": str(home)}
