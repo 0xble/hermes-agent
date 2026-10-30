@@ -65,10 +65,11 @@ remain paused. Legacy blocked/input/approval states and automatic pauses migrate
 to active timed waits on load. Idle scans include those rows so migration is not
 dependent on a new user message. Stale resume_pending takeover continues through
 the existing generation-fenced gateway path.
-Agent-requested pauses use the same native retry interval as other timed holds.
-A reason string or unverified quote is not user authority. A current explicit
-user pause quote is revalidated under the session-control write lock and keeps
-the goal paused. Native user pauses and default-off controls remain unchanged.
+Explicit `goal_set action=pause` controls use the native paused transition for both self
+and cross-session targets. They clear wait barriers, survive reload and stay out of the idle
+wake scan until resumed. Session-control pause reasons carry a control prefix so legacy
+judge/budget migration cannot reinterpret model-supplied reason text as an automatic pause.
+Native user pauses and default-off authority requirements remain unchanged.
 The CLI idle hook refreshes its cached goal snapshot before deciding whether a
 tool-authored wait is due. Reload adopts durable state and retains the existing
 snapshot/CAS fences.

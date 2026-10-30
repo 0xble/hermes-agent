@@ -9,7 +9,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 from hermes_cli.goals import (
     _REPLY_QUOTE_RE,
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TTL_SECONDS = 24 * 60 * 60
 _CONTROL_PREFIX = "session_control:"
-_CURRENT_AUTHORITY: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+_CURRENT_AUTHORITY: ContextVar[Optional[dict[str, Any]]] = ContextVar(
     "session_control_authority", default=None
 )
 
@@ -56,7 +56,7 @@ PRESERVES_GOAL_REPLACEMENT_REQUIREMENTS = True
 _REPLACE_PAYLOAD_KEYS = frozenset({"goal", "contract", "max_turns"})
 
 
-def replacement_contract(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
+def replacement_contract(payload: Optional[dict[str, Any]]) -> dict[str, str]:
     """Explicit replacement contract edits. Omitted fields retain their current values."""
     from hermes_cli.goals import _CONTRACT_FIELDS
     raw = (payload or {}).get("contract")
@@ -64,7 +64,7 @@ def replacement_contract(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
     return {f: str(raw[f] or "").strip() for f in _CONTRACT_FIELDS if f in raw}
 
 
-def _check_payload(kind: str, action: str, payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _check_payload(kind: str, action: str, payload: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Validate a payload and return it normalized exactly as it will be stored, shown and applied."""
     if kind == "goal" and action == "replace":
         payload = dict(payload or {})
@@ -80,7 +80,7 @@ def _check_payload(kind: str, action: str, payload: Optional[Dict[str, Any]]) ->
         if max_turns is not None and (
                 isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 0):
             raise ValueError("invalid_max_turns")  # shown exactly as approval installs it
-        normalized: Dict[str, Any] = {"goal": new}
+        normalized: dict[str, Any] = {"goal": new}
         if "contract" in payload:
             normalized["contract"] = replacement_contract(payload)
         if max_turns is not None:
@@ -255,7 +255,7 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
     return normalized, stripped
 
 
-def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
+def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> tuple[str, str] | str:
     """Validate a quote against only the requester's latest typed user message."""
     checked = _read_current_user_quote(requester_session_id, quote, cursor=cursor)
     if isinstance(checked, str):
@@ -423,7 +423,7 @@ def _is_stop_condition_removal(words: list[str]) -> bool:
 
 
 def _quote_matches_control(kind: str, action: str, target_sid: str, requester_sid: str,
-                           quote: str, payload: Optional[Dict[str, Any]], *, cursor=None) -> bool:
+                           quote: str, payload: Optional[dict[str, Any]], *, cursor=None) -> bool:
     """True when the quoted words state this exact control: kind, action, target and payload."""
     all_words = _negation_words(quote)
     if (kind == "goal" and action == "replace" and target_sid == requester_sid
@@ -460,7 +460,7 @@ def _quote_matches_control(kind: str, action: str, target_sid: str, requester_si
     return True
 
 
-def _load_record(request_id: str) -> Optional[Dict[str, Any]]:
+def _load_record(request_id: str) -> Optional[dict[str, Any]]:
     db = _db()
     if db is None:
         return None
@@ -473,7 +473,7 @@ def _load_record(request_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _save_record(record: Dict[str, Any], *, cursor=None) -> None:
+def _save_record(record: dict[str, Any], *, cursor=None) -> None:
     db = _db()
     if db is None:
         raise RuntimeError("session database unavailable")
@@ -481,8 +481,8 @@ def _save_record(record: Dict[str, Any], *, cursor=None) -> None:
 
 
 def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
-                   payload: Optional[Dict[str, Any]] = None,
-                   authority: Optional[Dict[str, Any]] = None, cursor=None) -> Dict[str, Any]:
+                   payload: Optional[dict[str, Any]] = None,
+                   authority: Optional[dict[str, Any]] = None, cursor=None) -> dict[str, Any]:
     payload = dict(payload or {})
     handler = CONTROLS.get((kind, action))
     if action == "replace" and kind == "goal":
@@ -544,13 +544,8 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         code = f"nothing_to_{action}"
         return {"result": {"ok": False, "error_code": code, "error": code}, "state": state}
     receipt = {"result": result, "state": state}
-    if (kind, action) == ("goal", "pause") and (authority or {}).get("via") == "autonomy":
-        seconds = state.waiting_seconds
-        duration = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} sec"
-        receipt.update(
-            outcome="timed_wait", wait_seconds=seconds, waiting_until=state.waiting_until,
-            notice=f"Goal waiting {duration} (autonomous timed wait, no approval); still active",
-        )
+    if (kind, action) == ("goal", "pause"):
+        receipt.update(outcome="paused", notice="Goal paused; use /goal resume to continue")
     return receipt
 
 
@@ -567,7 +562,7 @@ def _session_title(session_id: str, *, cursor=None) -> str:
         return ""
 
 
-def _affected_text(kind: str, action: str, raw: Optional[str], payload: Optional[Dict[str, Any]] = None) -> str:
+def _affected_text(kind: str, action: str, raw: Optional[str], payload: Optional[dict[str, Any]] = None) -> str:
     payload = payload or {}
     try:
         if kind == "goal":
@@ -575,7 +570,7 @@ def _affected_text(kind: str, action: str, raw: Optional[str], payload: Optional
             state = GoalState.from_json(raw) if raw else None
             old = str(getattr(state, "goal", "") or "")
             if action == "replace":
-                return f"goal: {old or '(none)'} -> {str(payload.get('goal') or '')}"
+                return f"goal: {old or '(none)'} -> {payload.get('goal') or ''!s}"
             return f"goal: {old or '(none)'}"
         if kind == "loop":
             from hermes_cli.loops import LoopState
@@ -712,7 +707,7 @@ def migrated_successor(kind: str, session_id: str, stored: Any = ...) -> Optiona
         return None
 
 
-def _rebind_wake_session(metadata: Dict[str, Any], key: str, session_id: str) -> None:
+def _rebind_wake_session(metadata: dict[str, Any], key: str, session_id: str) -> None:
     """Publish the validated child's identity for execution and post-turn settlement."""
     old_sid = metadata[key]
     if session_id and old_sid != session_id:
@@ -770,7 +765,7 @@ LOOP_WAKE_METADATA_KEY = "loop_wakeup"
 RETRY_WAKE_METADATA_KEY = "delegation_retry_notice"
 
 
-def loop_wake_metadata(session_id: str, state: Any, *, command: bool = False) -> Dict[str, Any]:
+def loop_wake_metadata(session_id: str, state: Any, *, command: bool = False) -> dict[str, Any]:
     """Identity stamped on a loop wake: the loop instance and the tick it claimed.
 
     ``command`` marks a slash-command tick, which the scheduler completes as soon as the command is
@@ -815,7 +810,7 @@ def loop_wake_is_current(metadata: Any, session_id: str = "", *, cursor=None) ->
         return not rebinding
 
 
-def _loop_wake_matches(metadata: Dict[str, Any], sid: str, *, cursor=None, require_stored: bool = False) -> bool:
+def _loop_wake_matches(metadata: dict[str, Any], sid: str, *, cursor=None, require_stored: bool = False) -> bool:
     try:
         db = _db() if cursor is None else None
         if cursor is None and db is None:
@@ -925,7 +920,7 @@ def _definition_key(kind: str, session_id: str) -> str:
     return f"{'goal' if kind == 'goal' else 'loop'}:{session_id}"
 
 
-def _bind_control_result(record: Dict[str, Any], result: Dict[str, Any], cursor) -> None:
+def _bind_control_result(record: dict[str, Any], result: dict[str, Any], cursor) -> None:
     for key in ("outcome", "wait_seconds", "waiting_until", "notice"):
         if key in result:
             record[key] = result[key]
@@ -937,8 +932,8 @@ def _bind_control_result(record: Dict[str, Any], result: Dict[str, Any], cursor)
             record["continuation_instance"] = json.loads(raw)["created_at"]
 
 def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
-                reason: str, payload: Optional[Dict[str, Any]], authority: Dict[str, Any],
-                status: str, now: float, expires_at: Optional[float], affected_text: str, cursor=None) -> Dict[str, Any]:
+                reason: str, payload: Optional[dict[str, Any]], authority: dict[str, Any],
+                status: str, now: float, expires_at: Optional[float], affected_text: str, cursor=None) -> dict[str, Any]:
     return {
         "id": uuid.uuid4().hex[:12], "kind": kind, "action": action,
         "target_session_id": target_sid, "requester_session_id": requester_sid,
@@ -956,7 +951,7 @@ def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
 
 
 @contextmanager
-def _approved_authority(authority: Optional[Dict[str, Any]]):
+def _approved_authority(authority: Optional[dict[str, Any]]):
     token = _CURRENT_AUTHORITY.set(authority if authority else None)
     try:
         yield
@@ -1015,7 +1010,7 @@ def _goal_replace_failure(target_sid: str, *, cursor=None) -> Optional[dict[str,
 
 
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
-                    reason: str = "", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    reason: str = "", payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Create a pending request, or apply an autonomous goal control immediately."""
     from hermes_cli.goals_autonomy import goal_autonomy_enabled
     if kind == "goal" and goal_autonomy_enabled():
@@ -1058,7 +1053,7 @@ def _is_cross_session_goal_change(kind: str, action: str, target_sid: str, reque
 
 def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                   reason: str = "", user_quote: str = "",
-                  payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                  payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Apply an authorized control immediately, or queue an asynchronous approval request.
 
     A session may clear or replace another session's goal directly. Only a self-targeted
@@ -1094,7 +1089,7 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                 _governing_sentence(*quote_check), payload,
             )
 
-    def commit(conn, authority: Dict[str, Any], savepoint: str) -> Dict[str, Any]:
+    def commit(conn, authority: dict[str, Any], savepoint: str) -> dict[str, Any]:
         """Apply and record one immediate control while holding the SessionDB write lock."""
         if kind == "goal" and action == "replace":
             failure = _goal_replace_failure(target_sid, cursor=conn)
@@ -1158,7 +1153,7 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     if not _has_gateway_route(target_sid):
         return {"ok": False, "error_code": "target_unroutable", "error": "target_unroutable"}
 
-    def request_approval(refused: str) -> Dict[str, Any]:
+    def request_approval(refused: str) -> dict[str, Any]:
         # A missing or refused quote never blocks the requester. The durable request is delivered
         # asynchronously, and its outcome returns to the requester as a later internal event.
         try:
@@ -1199,7 +1194,7 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         return request_approval(outcome[_REFUSED])
     return outcome
 
-def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Dict[str, Any]]:
+def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[dict[str, Any]]:
     """Validate, mutate through the shared manager, and settle in one write transaction.
 
     The pending check, the manager mutation and the outcome receipt commit together, so a crash
@@ -1298,7 +1293,7 @@ def continuation_is_current(request_id: str) -> bool:
 
     return db._execute_write(validate)
 
-def fail_request(request_id: str, error: str) -> Optional[Dict[str, Any]]:
+def fail_request(request_id: str, error: str) -> Optional[dict[str, Any]]:
     """CAS a pending request to failed so an unroutable target can notify its requester."""
     db = _db()
     if db is None:
@@ -1322,7 +1317,7 @@ def fail_request(request_id: str, error: str) -> Optional[Dict[str, Any]]:
     return db._execute_write(_fail)
 
 
-def expire_request(request_id: str) -> Optional[Dict[str, Any]]:
+def expire_request(request_id: str) -> Optional[dict[str, Any]]:
     """Compare-and-set one pending request to expired inside its write transaction."""
     db = _db()
     if db is None:
@@ -1346,7 +1341,7 @@ def expire_request(request_id: str) -> Optional[Dict[str, Any]]:
     return db._execute_write(_expire)
 
 
-def pending_outbox() -> list[Dict[str, Any]]:
+def pending_outbox() -> list[dict[str, Any]]:
     db = _db()
     if db is None:
         return []
@@ -1370,7 +1365,7 @@ def pending_outbox() -> list[Dict[str, Any]]:
     return out
 
 
-def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[Dict[str, Any]]:
+def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[dict[str, Any]]:
     """Atomically set an outbox delivery flag, preserving concurrent flags."""
     db = _db()
     if db is None:
@@ -1396,12 +1391,10 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
 
     manager = GoalManager(sid, cursor=cursor)
-    if authority.get("via") == "autonomy":
-        if not manager.is_active():
-            return None
-        return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
-                                        reason=reason or "session-control")
-    return manager.pause(reason=reason or "session-control")
+    # Mark explicit controls separately from migratable legacy judge/budget pauses.
+    # Model-supplied reason text must not accidentally opt this pause into migration.
+    return manager.pause(reason="session-control: " + (reason or "paused"))
+
 
 
 CONTROLS = {
@@ -1415,8 +1408,18 @@ CONTROLS = {
 }
 
 __all__ = [
-    "CONTROLS", "resolve_target", "check_user_quote", "quote_matches_control", "apply_control", "request_control",
-    "resolve_request", "fail_request", "expire_request", "pending_outbox", "mark_outbox", "continuation_is_current",
+    "CONTROLS",
+    "apply_control",
+    "check_user_quote",
+    "continuation_is_current",
+    "expire_request",
+    "fail_request",
+    "mark_outbox",
+    "pending_outbox",
+    "quote_matches_control",
+    "request_control",
+    "resolve_request",
+    "resolve_target",
 ]
 
 quote_matches_control = _quote_matches_control
