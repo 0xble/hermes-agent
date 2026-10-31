@@ -111,8 +111,12 @@ strategy and cron-exclusion behavior.
   recall feedback into apparent personal evidence. Reuse the shared human-part classifier, not
   result-wording rules. Preserve assistant context when a real human suffix survives, and do not
   drop ordinary assistant-only or recalled-context-only turns without generated provenance.
-  Proof: `tests/plugins/memory/test_hindsight_generated_turns.py` and the existing provider suite.
-  Retire when the selected upstream provider applies the same whole-turn exclusion. Revert only
+  `MemoryManager.sync_all` applies `agent.memory_retention.filter_retain_messages` before any
+  provider sees the turn, so a catalog provider whose `sync_turn` takes only the text still
+  never retains a generated turn. A generated-only turn reaches no provider; a dropped half
+  arrives as `""`. Proof: `tests/agent/test_memory_retention.py`,
+  `tests/plugins/memory/test_hindsight_generated_turns.py` and the existing provider suite.
+  Retire when upstream Hermes applies the same whole-turn exclusion. Revert only
   that patch to restore user-side-only filtering.
 - First-person auto-recall (`recall_owner_subject`, default empty = off). "What car do I drive"
   names no subject, so the owner's personal facts never enter Hindsight's candidate pool: the
@@ -151,7 +155,10 @@ strategy and cron-exclusion behavior.
   `prefetch_all`, calls every provider's `discard_prefetch()` once that is older than
   `memory.prefetch_max_age_seconds` (default 1800, `0` = no limit). The clock is wall time because
   macOS's monotonic clock stops during sleep. It is manager-level so every buffering provider is
-  covered. A discard must also stop a worker already in flight from republishing, so the manager,
+  covered. A provider that keeps the base no-op `discard_prefetch` (the catalog Hindsight plugin)
+  is drained instead: on a stale turn the manager calls its `prefetch()` once, drops that result,
+  then prefetches normally, so a live-recall provider answers twice rather than losing its recall.
+  Proof: `tests/agent/test_synthetic_prompt.py::test_*_without_the_discard_hook`. A discard must also stop a worker already in flight from republishing, so the manager,
   Hindsight, RetainDB and Honcho share `agent.memory_provider.PrefetchGeneration`: each request
   takes a token, a discard or newer request obsoletes it, and a worker publishes only while its
   token is current, checked under the provider's existing state lock. Hindsight drops its buffered
@@ -259,7 +266,7 @@ and dependency preparation and preserve the initialized fixture home's files.
   upstream issue or PR covered synthetic-turn recall as of 2026-10-05. Retire it when
   upstream skips provider prefetch for runtime-generated turns. Roll back by reverting
   its commit, which restores the `hindsight-session-lifecycle` retention-only filter in
-  `plugins/memory/hindsight/retention.py`.
+  `agent/memory_retention.py`.
 
 - `memory-note-not-authoritative` changes the note `build_memory_context_block()` puts
   before every provider recall. The upstream note called recalled memory
