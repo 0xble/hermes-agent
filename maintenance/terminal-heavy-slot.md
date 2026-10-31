@@ -8,17 +8,17 @@ Fork patch identities: `terminal-heavy-slot`; lifecycle-guard addition: `lifecyc
 
 On the Mac Studio, agents started test suites and gates from the Hermes terminal tool directly. A 10-minute load probe on 2026-10-05 found an average of 9.5 suites or gates running outside the host's `heavy-slot` semaphore at once (12 at peak), on 28 cores at load 60-120. The shell-function wrappers in `~/.config/shell/heavy-slot.sh` only cover `./bin/ci` and `scripts/run_tests.sh` typed literally, and miss `pytest`, `uv run pytest`, `pnpm test` and `vitest`.
 
-For the local backend only, `wrap_heavy_command` parses the command with the existing quote-aware shell scanner (`_scan_shell`), with heredoc bodies masked by `_mask_heredocs`. It routes each simple command in command position that runs a broad pytest, vitest or jest run, `scripts/run_tests.sh`, tox or nox, a package `test`/`test:*` script in any spelling (`pnpm test`, `npm run test`, `yarn workspace app test`, `pnpm -r test`) including heavy build/check/lint/typecheck scripts and dependency installation (`add`, `install`, `ci` and similar), `turbo`/`nx`/`lerna` test runs, or a `./bin/ci` profile other than `preflight`, `list` or `install-hooks` through `_hermes_heavy_slot LABEL CMD ...`, a shell function the rewrite defines on its first line. An external program goes through `heavy-slot --label` with the cwd it runs in. A name the session shell resolves itself (alias, function, builtin, in bash or zsh) runs unchanged, so a user's own wrapper such as the `./bin/ci` function from `~/.config/shell/heavy-slot.sh` keeps deciding. The `_` prefix keeps the snapshot re-dump from persisting the function. Exec-style prefix utilities (`env`, `nice`, `timeout`, `nohup`) cannot run a shell function, so the dispatcher goes in front of them. `command NAME` and `exec NAME` are left unwrapped because they deliberately bypass functions or replace the session shell. The rest of the command stays in the session shell, so `cd`, exports, functions, `&` and the cwd marker behave as before. Approval, guards, metrics, exit-code notes, verification evidence and redaction all see the user's original command.
+For the local backend only, `wrap_heavy_command` parses the command with the existing quote-aware shell scanner (`_scan_shell`), with heredoc bodies masked by `_mask_heredocs`. It routes each simple command in command position that runs a broad pytest, vitest or jest run, `scripts/run_tests.sh`, tox or nox, a package `test`/`test:*` script in any spelling (`pnpm test`, `npm run test`, `yarn workspace app test`, `pnpm -r test`) including heavy build/check scripts, `turbo`/`nx`/`lerna` test runs, or a `./bin/ci` profile other than `preflight`, `list` or `install-hooks` through `_hermes_heavy_slot LABEL CMD ...`, a shell function the rewrite defines on its first line. An external program goes through `heavy-slot --label` with the cwd it runs in. A name the session shell resolves itself (alias, function, builtin, in bash or zsh) runs unchanged, so a user's own wrapper such as the `./bin/ci` function from `~/.config/shell/heavy-slot.sh` keeps deciding. The `_` prefix keeps the snapshot re-dump from persisting the function. Exec-style prefix utilities (`env`, `nice`, `timeout`, `nohup`) cannot run a shell function, so the dispatcher goes in front of them. `command NAME` and `exec NAME` are left unwrapped because they deliberately bypass functions or replace the session shell. The rest of the command stays in the session shell, so `cd`, exports, functions, `&` and the cwd marker behave as before. Approval, guards, metrics, exit-code notes, verification evidence and redaction all see the user's original command.
 
-Never wrapped: non-local backends (Docker, SSH, Modal, Singularity, Daytona, Vercel), commands whose environment already has `HEAVY_SLOT_HELD` (nested runs share the outer slot), the opt-out `HERMES_HEAVY_SLOT=off` (also `0`, `false`, `no`) in the process or terminal environment, hosts without the helper, mentions of a runner in arguments, quotes, comments or heredoc bodies (`grep pytest`, `git commit -m 'pytest'`), targeted direct pytest/Jest/Vitest runs of 1-10 explicit test files whose options are all on a small single-run allowlist (`-q`, `-x`, `-k`, `--tb` and similar; any other option, such as `-n`, `--maxWorkers` or `--pool`, keeps the slot), and git-guard's `ci-gate`, which already takes its own slot around the repository gate. Any classifier error runs the command unwrapped.
+Never wrapped: non-local backends (Docker, SSH, Modal, Singularity, Daytona, Vercel), commands whose environment already has `HEAVY_SLOT_HELD` (nested runs share the outer slot), the opt-out `HERMES_HEAVY_SLOT=off` (also `0`, `false`, `no`) in the process or terminal environment, hosts without the helper, mentions of a runner in arguments, quotes, comments or heredoc bodies (`grep pytest`, `git commit -m 'pytest'`), targeted direct pytest/Jest/Vitest/`bun test` runs of 1-10 explicit test files whose options are all on a small single-run allowlist (`-q`, `-x`, `-k`, `--tb`, `--maxfail`, `--junitxml` and similar, including attached short values such as `-rA`; any other option, such as `-n`, `--maxWorkers` or `--pool`, keeps the slot), `python -m unittest` with 1-10 explicit test names or `discover` limited to one literal `-p` file pattern, the [light commands](#light-commands) below, and git-guard's `ci-gate`, which already takes its own slot around the repository gate. Any classifier error runs the command unwrapped.
 
 The helper runs the heavy command in its own process group under the shell's group and stops its whole tree when signalled. Foreground timeouts, background kills and PTY kills therefore still tear everything down and release the slot. A wait for a slot counts against the command's foreground timeout. Long gates should run in the background, as they already must.
 
 ## Expanded launchers and per-job budget
 
-The classifier and cheap prefilter also cover Node workspace/Playwright checks,
-ESLint/typechecks, `uv sync` and package installation, Python unittest/compileall,
-Go tests/builds, PM installs, and `agentkit evals run`/`admit`. `run_tests.sh` and
+The classifier and cheap prefilter also cover Node workspace checks, Playwright
+tests, broad Python unittest discovery, compileall, Go tests/builds, PM installs,
+and `agentkit evals run`/`admit`. `run_tests.sh` and
 `run_tests_parallel.py` always take a slot even for one file: targeted shell runs
 still compile the whole checkout or realize their test environment. Direct
 single-runner targeted pytest/Jest/Vitest commands retain their light exemption.
@@ -33,6 +33,30 @@ stripping ambient UV settings; uv sizes its bytecode compiler from install
 concurrency. Positive explicit worker budgets remain opt-ins. The host's
 chezmoi-managed shell sets the same four-worker default while retaining two
 machine-wide slots. No daemon, process kills, or queue-policy change is needed.
+
+## Light commands
+
+Dependency sync and installation (`uv sync`/`install`/`add`, `uv pip install`,
+`poetry`/`pipenv`/`hatch`/`pdm`/`rye` installs, `pip install`, package-manager
+`install`/`add`/`ci`, `playwright install`), `tsc`, `eslint`, and package `lint`
+and `typecheck` scripts run unslotted. Redirection words (`2>&1`, `>&2`, `&>log`,
+`> out`, `<<EOF`) and their targets are dropped before classification, so the
+usual `pytest -q tests/test_a.py 2>&1 | tail -30` keeps its targeted exemption.
+
+Provenance: in the 24 hours to 2026-10-31 20:00 UTC the `heavy-slot` event log
+recorded 489 admissions with a median wait of 1.5 h (p90 4.5 h), 73 runs were
+queued at once, and 192 of 488 releases (39%) held their slot under 1 minute.
+Over 7 days every `hermes install` (40), `uv-sync` (21), `typecheck` (21), `tsc`
+(16), `lint` (14) and `uv-install` (7) admission released in under 60 seconds
+(`install` p90 9.9 s, `uv-sync` p90 4.7 s). In the last 24 hours `install` still
+waited a median 2.7 h (n=9) and `uv-sync` 4.2 h (n=5) for that slot. The
+queue's waiters included single-file pytest and Vitest runs that lost the
+existing targeted exemption only to a trailing `2>&1 | tail`, because the
+scanner yielded `2>` and `1` as runner arguments. PR #576 slotted installs
+because they bypassed admission while fanning out across every CPU. The
+`UV_CONCURRENT_*` and four-worker budgets it added (below) still bound uv's
+fan-out without a slot. Test suites, gates, `check`/`build` scripts, `run_tests.sh`, PM installs and
+evals keep their slots.
 
 ## Lifecycle guard contract
 
