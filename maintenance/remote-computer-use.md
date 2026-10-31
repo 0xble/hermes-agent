@@ -44,6 +44,9 @@ profile/session/connection-qualified mutable state and a per-scope lock. Raw
 realpaths, metadata and hashes. Keep read stamps, patch baselines, compaction
 reset, scope locks and cleanup aligned with that same backend identity.
 Controller twins must not satisfy remote existence or overwrite authorization.
+Mutation locks span sessions within one controller for the same configured SSH
+alias, platform and resolved path. Distinct aliases for one host and separate
+controllers do not share these locks. Read authority remains session-scoped.
 
 The existing process record carries `SSHProcessBinding`, not another registry.
 Its immutable alias, originating profile home and target-side incarnation UUID

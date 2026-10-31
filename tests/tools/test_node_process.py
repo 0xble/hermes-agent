@@ -234,6 +234,46 @@ def test_recovery_preserves_connection_and_owner_without_current_nodes(spawn, re
     assert [call["action"] for call in peer.calls] == ["inspect"]
 
 
+@pytest.mark.parametrize("action", ["poll", "log", "kill"])
+def test_recovered_offline_handle_keeps_unknown_outcome_and_archive_owner(spawn, monkeypatch, node, action):
+    from model_tools import handle_function_call
+    from tools.environments import ssh
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.node_execution import collect_result_environment, UnavailableResultEnvironment
+
+    original = spawn()
+    successor = pr.ProcessRegistry()
+    monkeypatch.setattr(successor, "_start_ssh_poller", lambda session: None)
+    assert successor.recover_from_checkpoint() == 1
+    monkeypatch.setattr(pr, "process_registry", successor)
+    recovered = successor._lookup_session(original.id)
+    assert recovered is not None and recovered.env_ref is None
+    monkeypatch.setattr(ssh, "_ensure_ssh_available", lambda: None)
+    connection = Mock(side_effect=EnvironmentConnectionError("fixture peer offline"))
+    monkeypatch.setattr(ssh.SSHEnvironment, "_establish_connection", connection)
+    local_signal = Mock(side_effect=AssertionError("remote handle reached controller signaling"))
+    monkeypatch.setattr(successor, "_terminate_host_pid", local_signal)
+    with collect_result_environment() as destination:
+        result = json.loads(handle_function_call("process_manage", {"action": action, "session_id": original.id}))
+    assert result["status"] == ("error" if action == "kill" else "running"), result
+    assert result["session_id"] == original.id, result
+    assert result["remote_status"] == "unavailable", result
+    assert result["node"] == node.name and result["ssh"] == node.ssh, result
+    assert result["remote_error"] == "fixture peer offline", result
+    assert result.get("exit_code") is None, result
+    if action == "kill":
+        assert result["error"] == "fixture peer offline", result
+        assert result["process_running"] is True, result
+    assert not recovered.exited and recovered.exit_code is None
+    assert recovered.id in successor._running
+    assert successor.completion_queue.empty()
+    assert isinstance(destination[0], UnavailableResultEnvironment)
+    assert destination[0]._hermes_node == node
+    # Status, policy, and redaction lookups may each refresh the original SSH handle.
+    connection.assert_called()
+    local_signal.assert_not_called()
+
+
 def test_foreign_ssh_handoff_survives_unrelated_checkpoint_writer(spawn):
     session = spawn()
     unrelated = pr.ProcessRegistry()

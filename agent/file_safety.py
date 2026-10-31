@@ -58,11 +58,14 @@ def _hermes_dirs() -> list[Path]:
 
 
 def _resolve_each(paths) -> list[Path]:
-    """``p.resolve()`` for each path, skipping ones that fail to resolve."""
+    """Resolve anchors, retaining local best-effort but failing closed remotely."""
     out: list[Path] = []
     for p in paths:
-        with suppress(Exception):
-            out.append(Path(_realpath(p)) if _named_remote() else p.resolve())
+        if _named_remote():
+            out.append(Path(_realpath(p)))
+        else:
+            with suppress(Exception):
+                out.append(p.resolve())
     return out
 
 
