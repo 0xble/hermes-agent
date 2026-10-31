@@ -1,4 +1,5 @@
 """Transactional contracts against exclusively owned temporary profile databases."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 
 import pytest
@@ -22,7 +23,7 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
     with pytest.raises(ValueError):
         admission_fingerprint(canonical_target='s', payload={'a': float('nan')})
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='one', payload={'text': 'hello'})
         first = rt.admit_session_input(db, **args)
         assert rt.admit_session_input(db, **args) == first
@@ -44,7 +45,7 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         assert running['admission_id'] == second['admission_id'] and running['generation'] > claimed['generation']
         db.close()
         db = SessionDB(db_path=tmp_path / 'state.db')
-        new_epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
+        new_epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
         assert new_epoch > epoch
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 0
@@ -68,7 +69,7 @@ def test_sqlite_failure_never_acknowledges_or_partially_claims(tmp_path):
     db = store(tmp_path)
     import hermes_state_runtime as rt
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='one', payload={'text': 'hello'})
         db._conn.execute("CREATE TRIGGER refuse_admission BEFORE INSERT ON session_admissions BEGIN SELECT RAISE(ABORT, 'full fixture'); END")
         with pytest.raises(sqlite3.IntegrityError, match='full fixture'):

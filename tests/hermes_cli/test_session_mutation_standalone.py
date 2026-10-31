@@ -10,7 +10,8 @@ from fastapi import FastAPI
 from gateway.runtime_ownership import ProfileOwnership
 from hermes_cli.web_routers.sessions import manage_router
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch
+from hermes_state_runtime import admit_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 AUTH = {'Authorization': 'Bearer standalone-token'}
 

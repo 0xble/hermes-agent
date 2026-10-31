@@ -9,7 +9,8 @@ from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_contract import Principal
 from gateway.session_local_title import resolve_titled_session
 from hermes_state import SessionDB
-from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
+from hermes_state_runtime import RuntimeStoreError
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def _authority(db):

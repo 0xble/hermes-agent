@@ -93,7 +93,8 @@ def test_local_hosted_member_revoked_during_preparation_is_not_admitted(hosted_o
 def test_room_binding_exact_retry_terminal_history_and_unknown(hosted_owner):
     from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
     from gateway.hosted_room_driver import TaskIdentity
-    from hermes_state_runtime import RuntimeStoreError, list_session_admissions, claim_session_input, settle_session_input, begin_runtime_epoch, recover_session_inputs
+    from hermes_state_runtime import RuntimeStoreError, list_session_admissions, claim_session_input, settle_session_input, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     authority, loop, principal, _ = hosted_owner
     allowed = [True]
     seen = []
@@ -210,7 +211,8 @@ def test_terminal_callback_follows_canonical_drain_without_polling(hosted_owner,
 def test_unknown_info_is_inactive_with_hosted_not_canonical_generation(hosted_owner):
     from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
     from gateway.hosted_room_driver import TaskIdentity
-    from hermes_state_runtime import claim_session_input, begin_runtime_epoch, recover_session_inputs
+    from hermes_state_runtime import claim_session_input, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     authority, loop, principal, _ = hosted_owner
     rpc = HostedRoomAuthorityRPC(authority, loop, room_id='room', member_id='member', profile='default', principal=principal, authorize=lambda *args: True)
     coords = dict(profile='default', source='bot_room')
@@ -230,7 +232,8 @@ def test_unknown_info_is_inactive_with_hosted_not_canonical_generation(hosted_ow
 def test_discard_requires_exact_owned_unknown_tuple_without_replay(hosted_owner, monkeypatch):
     from gateway.session_hosted_rpc import HostedRoomAuthorityRPC
     from gateway.hosted_room_driver import TaskIdentity
-    from hermes_state_runtime import RuntimeStoreError, list_session_admissions, claim_session_input, begin_runtime_epoch, recover_session_inputs
+    from hermes_state_runtime import RuntimeStoreError, list_session_admissions, claim_session_input, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     authority, loop, principal, _ = hosted_owner
     allowed = [True]
     rpc = HostedRoomAuthorityRPC(authority, loop, room_id='room', member_id='member', profile='default', principal=principal, authorize=lambda *args: allowed[0])

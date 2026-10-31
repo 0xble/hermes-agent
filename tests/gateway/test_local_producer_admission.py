@@ -214,7 +214,8 @@ async def messaging(tmp_path, monkeypatch):
     """A Discord DM under the session authority with one committed human message; inputs stay queued."""
     from gateway.config import Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback, register_transport_home
     from hermes_state import SessionDB
     from plugins.platforms.discord.adapter import DiscordAdapter

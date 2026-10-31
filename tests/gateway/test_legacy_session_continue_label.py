@@ -16,7 +16,7 @@ async def test_a_turn_on_an_adopted_legacy_row_keeps_its_source(tmp_path, monkey
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local_title import resolve_titled_session
 

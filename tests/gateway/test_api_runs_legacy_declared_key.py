@@ -20,7 +20,7 @@ async def probe():
     from gateway.config import Platform, PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     runner = GatewayRunner()
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='legacy-test')

@@ -12,10 +12,8 @@ def test_append_survives_mid_identify_close_and_adopts_successor(tmp_path, monke
     from agent import runtime_session_store as worker
     from hermes_cli import gateway_client, gateway_runtime, gateway_runtime_discovery as discovery
     from hermes_state import SessionDB
-    from hermes_state_runtime import (
-        RuntimeStoreError, adopt_worker_execution, begin_runtime_epoch,
-        mutate_worker_execution, register_worker_execution,
-    )
+    from hermes_state_runtime import RuntimeStoreError, adopt_worker_execution, mutate_worker_execution, register_worker_execution
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     db = SessionDB(tmp_path / 'owner.db')
     db.create_session('s', 'cli')

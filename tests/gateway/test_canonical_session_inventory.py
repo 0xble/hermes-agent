@@ -24,7 +24,7 @@ async def test_created_session_snapshot_carries_inventory_for_frozen_toolsets(tm
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from hermes_cli import banner
     from tui_gateway.contracts.registry import CANONICAL_METHODS
@@ -83,7 +83,7 @@ async def test_cli_surface_snapshot_carries_main_cli_toolsets_and_startup_warnin
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from hermes_cli import banner
     from hermes_cli.tools_config import _get_platform_tools
@@ -126,7 +126,7 @@ async def test_cli_surface_counts_kanban_skills_like_main_cli_without_leaking(tm
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from hermes_cli import banner
     from tools.skills_tool import find_all_skills

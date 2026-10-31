@@ -38,7 +38,7 @@ def _build_runtime(tmp_path, monkeypatch):
 async def _served_authority(tmp_path, monkeypatch, instance_id, db=None):
     """Launch home plus one served secondary sharing the runner's store, as a multiplex gateway
     builds them; returns (served authority, its state db, the secondary home path)."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_state import SessionDB
     runner, registry, root, secondary = _build_runtime(tmp_path, monkeypatch)
     launch = await initialize_session_authority(runner, profile_id=str(root), instance_id=instance_id)

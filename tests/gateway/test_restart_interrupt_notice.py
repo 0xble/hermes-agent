@@ -95,7 +95,8 @@ async def test_user_stop_is_not_relabelled_when_shutdown_starts_during_settlemen
     from gateway.session_results import admission_result
     from gateway.session_settlement_recovery import commit_and_publish
     from hermes_state import SessionDB
-    from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
+    from hermes_state_runtime import admit_session_input, claim_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     runner = SimpleNamespace(_draining=False, _running=True, _restart_requested=False)
     with SessionDB(db_path=tmp_path / 'state.db') as db:
@@ -178,7 +179,8 @@ def test_managed_worker_turn_settles_with_the_cause_of_the_stop_that_reached_it(
     from gateway.session_policy import build_policy
     from gateway.session_settlement_recovery import commit_and_publish
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input
+    from hermes_state_runtime import claim_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tests.gateway.restart_test_helpers import make_restart_runner
     from tests.waiting import async_wait_until
 
@@ -333,7 +335,8 @@ def _settle_on_real_store(tmp_path, cause, principal='person', payload=None):
     from gateway.session_contract import SessionRef
     from gateway.session_settlement_recovery import commit_and_publish
     from hermes_state import SessionDB
-    from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
+    from hermes_state_runtime import admit_session_input, claim_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     runner = SimpleNamespace(_draining=False, _running=True, _restart_requested=True)
     db = SessionDB(db_path=tmp_path / 'state.db')
@@ -409,7 +412,8 @@ def _core_closed_turn(tmp_path, monkeypatch, *, principal='person', earlier_fail
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_contract import SessionRef
     from hermes_state import SessionDB
-    from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
+    from hermes_state_runtime import admit_session_input, claim_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from run_agent import AIAgent
 
     runner = SimpleNamespace(_draining=False, _running=True, _restart_requested=True)
@@ -478,7 +482,8 @@ def test_shutdown_stop_before_the_managed_worker_spawned_carries_its_cause(tmp_p
     from gateway.session_contract import Principal, SessionRef, Submission
     from gateway.session_policy import build_policy
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input
+    from hermes_state_runtime import claim_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tests.gateway.restart_test_helpers import make_restart_runner
     from tests.waiting import async_wait_until
 
@@ -542,7 +547,8 @@ def test_a_stop_during_context_reference_expansion_never_spawns_the_worker(tmp_p
     from gateway.session_contract import Principal, SessionRef, Submission
     from gateway.session_policy import build_policy
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input
+    from hermes_state_runtime import claim_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tests.gateway.restart_test_helpers import make_restart_runner
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
