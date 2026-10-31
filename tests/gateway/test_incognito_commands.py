@@ -4,7 +4,7 @@ import json
 import secrets
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
@@ -150,8 +150,9 @@ async def test_two_private_tool_turns_off_then_public_persistence(harness, monke
     from agent.incognito import incognito_scope
     runner, store, entry, _config, event, db = harness
     runner._session_db = db
-    monkeypatch.setattr(runner, "_hmwa_store_turn_prompt_tokens", AsyncMock())
-    monkeypatch.setattr(runner, "_refresh_agent_cache_message_count", AsyncMock())
+    # Autospec keeps the real signatures: a bare AsyncMock hid a wrong-arity private call.
+    for name in ("_hmwa_store_turn_prompt_tokens", "_refresh_agent_cache_message_count"):
+        monkeypatch.setattr(runner, name, create_autospec(getattr(runner, name)))
     sid = entry.session_id
     for row in ({"role": "user", "content": "original question"}, {"role": "assistant", "content": "original answer"}):
         store.append_to_transcript(sid, row)
