@@ -413,7 +413,11 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
     def _persisted(path: str, host_suffix: str = "") -> str:
         logger.info("Persisted large tool result: %s (%s, %d chars -> %s%s)",
                     tool_name, tool_use_id, len(persisted_content), path, host_suffix)
-        return _build_persisted_message(preview, has_more, len(persisted_content), path)
+        message = _build_persisted_message(preview, has_more, len(persisted_content), path)
+        node = getattr(env, "_hermes_node", None)
+        if node is not None:
+            message = message.replace("Use the read_file tool", f"Use the read_file tool with node={node.name!r}")
+        return message
 
     # Always persist host-side first: cache/spillover is the single canonical home.
     host_path = _write_to_spillover(persisted_content, filename)
@@ -461,7 +465,7 @@ def _spill_largest_text_part(parts: list, tool_use_id: str, env, config: BudgetC
 
 
 def enforce_turn_budget(tool_messages: list[dict], env=None,
-                        config: BudgetConfig = DEFAULT_BUDGET) -> list[dict]:
+                        config: BudgetConfig = DEFAULT_BUDGET, env_for_message=None) -> list[dict]:
     """Layer 3: persist the largest non-persisted results first until the turn's aggregate is
     under budget. Mutates the list in-place and returns it. A multimodal result (part list) counts its
     text characters and spills its largest text part; its images stay inline."""
@@ -476,9 +480,10 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
         if total_size <= config.turn_budget:
             break
         content = tool_messages[idx]["content"]
+        result_env = env_for_message(tool_messages[idx], env) if env_for_message else env
         tool_use_id = tool_messages[idx].get("tool_call_id", f"budget_{idx}")
         if isinstance(content, list):
-            parts, saved = _spill_largest_text_part(content, tool_use_id, env, config)
+            parts, saved = _spill_largest_text_part(content, tool_use_id, result_env, config)
             if saved:
                 total_size -= saved
                 tool_messages[idx]["content"] = parts
@@ -486,7 +491,7 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
             continue
         replacement = maybe_persist_tool_result(
             content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
-            env=env, config=config, threshold=0)
+            env=result_env, config=config, threshold=0)
         if replacement != content:
             total_size += len(replacement) - size
             tool_messages[idx]["content"] = replacement

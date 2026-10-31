@@ -55,6 +55,7 @@ from agent.tool_dispatch_helpers import (
     make_tool_result_message,
 )
 from tools.terminal_tool_lifecycle import get_active_env
+from agent.tool_result_destination import result_destination_batch, remember_result_environment, result_environment
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
@@ -479,6 +480,7 @@ class _ManagedToolResult:
     blocked: bool
     dispatched: bool
     data_use: frozenset[str] = frozenset()
+    result_env: Any = None
 
 
 class _ToolTimeoutResult(str):
@@ -758,11 +760,12 @@ def _dispatch_authorized_once(
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
     from agent.tool_progress_relay import bound_tool_progress
     from tools.connectors.data_use import collect_data_use
-    with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
+    from tools.node_execution import collect_result_environment
+    with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use, collect_result_environment() as destination:
         try:
             return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
         finally:
-            state.data_use = frozenset(data_use)
+            state.data_use, state.result_env = frozenset(data_use), destination[0]
 
 
 def _run_agent_tool_execution_middleware(
@@ -1087,6 +1090,7 @@ def _commit_tool_result(
     effect_disposition,
     observed: bool = False,
     data_use: frozenset[str] = frozenset(),
+    result_env=None,
     error_preview: Callable[[Any], Any] = lambda result: result,
     success_log_chars: Optional[int] = None,
     verbose_text: Callable[[Any], Any] = lambda result: result,
@@ -1130,17 +1134,18 @@ def _commit_tool_result(
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
+    result_env = result_env if result_env is not None else get_active_env(effective_task_id)
     persisted_result = function_result
     if _is_multimodal_tool_result(persisted_result):
         persisted_result = _persist_multimodal_text_parts(
-            persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
+            persisted_result, function_name, tool_call_id, result_env, budget,
         )
     else:
         persisted_result = maybe_persist_tool_result(
             content=persisted_result,
             tool_name=function_name,
             tool_use_id=tool_call_id,
-            env=get_active_env(effective_task_id),
+            env=result_env,
             config=budget,
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
@@ -1173,6 +1178,7 @@ def _commit_tool_result(
                 tool_message["display_metadata"] = metadata
         except Exception as callback_error:
             logging.debug("Tool result metadata callback error: %s", callback_error)
+    remember_result_environment(tool_message, result_env)
     stamp_data_use(tool_message, sorted(data_use))
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
@@ -1228,7 +1234,7 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
         return
     batch = messages[-num_tools:]
     contents_before = [message.get("content") for message in batch]
-    enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget)
+    enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget, env_for_message=result_environment)
     plugin_live_notes.keep_after_turn_budget(agent, batch)
     record_tool_batch(agent, batch, contents_before)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
@@ -1264,6 +1270,7 @@ class _ToolOutcome:
     is_error: bool
     blocked: bool
     data_use: frozenset[str] = frozenset()
+    result_env: Any = None
 
 
 def _start_order_gate_timeout(batch_timeout: float | None) -> float:
@@ -1357,6 +1364,7 @@ class _ConcurrentBatch:
         start = time.time()
         blocked = dispatched = False
         data_use: frozenset[str] = frozenset()
+        result_env = None
         try:
             managed = _run_agent_tool_execution_middleware(
                 agent,
@@ -1375,7 +1383,7 @@ class _ConcurrentBatch:
                 authorization_gate=self.authorization_gate,
             )
             result, ref.args, ref.trace = managed.result, managed.args, managed.middleware_trace
-            blocked, dispatched, data_use = managed.blocked, managed.dispatched, managed.data_use
+            blocked, dispatched, data_use, result_env = managed.blocked, managed.dispatched, managed.data_use, managed.result_env
         except _BatchAbandoned:
             logger.info("tool %s abandoned at start-order gate; skipping dispatch", ref.name)
             return None
@@ -1400,7 +1408,7 @@ class _ConcurrentBatch:
             logger.info(
                 "tool %s completed (%.2fs, %d chars)", ref.name, duration, result_chars
             )
-        return _ToolOutcome(ref, result, duration, is_error, blocked, data_use)
+        return _ToolOutcome(ref, result, duration, is_error, blocked, data_use, result_env)
 
     def run_worker(self, index: int, start_order: int) -> None:
         """Worker function executed in a thread."""
@@ -1570,7 +1578,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
         committed = _commit_tool_result(
             agent, messages, ref, function_result,
             budget=budget, tool_duration=tool_duration, is_error=is_error, blocked=blocked,
-            effect_disposition=effect_disposition, observed=r is not None, data_use=r.data_use if r else frozenset(),
+            effect_disposition=effect_disposition, observed=r is not None, data_use=r.data_use if r else frozenset(), result_env=r.result_env if r else None,
             error_preview=lambda res: _multimodal_text_summary(res)[:200],
         )
         if committed is None:
@@ -1587,6 +1595,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
     return True
 
 
+@result_destination_batch()
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls concurrently; results are appended in original call order.
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
@@ -1845,7 +1854,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     committed = _commit_tool_result(
         agent, messages, ref, function_result,
         budget=budget, tool_duration=tool_duration, is_error=_is_error_result, blocked=managed.blocked,
-        effect_disposition="unknown" if _execution_timed_out else None, observed=True, data_use=managed.data_use,
+        effect_disposition="unknown" if _execution_timed_out else None, observed=True, data_use=managed.data_use, result_env=managed.result_env,
         error_preview=lambda res: res[:200] if isinstance(res, str) and not agent.verbose_logging else res,
         success_log_chars=_result_len,
         verbose_text=_multimodal_text_summary,
@@ -1867,6 +1876,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     return True
 
 
+@result_destination_batch()
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
@@ -1937,6 +1947,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
         _finalize_tool_batch(agent, messages, effective_task_id, len(tool_calls), _tool_budget)
 
 
+@result_destination_batch()
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
     """Execute a mixed batch as ordered parallel/sequential segments (the ``(kind, calls)``
     plan from ``_plan_tool_batch_segments``), preserving per-call result order and barrier
