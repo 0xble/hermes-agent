@@ -62,9 +62,10 @@ class SlackThreadStatusMixin:
                     or self._typing_owner_retired(chat_id, metadata, owner or asyncio.current_task())):
                 return
             if not entry.get("processing_attempted"):
-                # Mark before awaiting, including failure, so refreshes cannot exhaust Tier 3.
-                entry["processing_attempted"] = True
+                # Completed failures are best effort; admission cancelled by the
+                # gateway's tick timeout must remain retryable on the next tick.
                 await self._set_agent_session_status(chat_id, team_id, str(thread_ts), "processing")
+                entry["processing_attempted"] = True
             if (self._active_status_threads.get(key) is not entry or entry.get("ending")
                     or self._typing_owner_retired(chat_id, metadata, owner or asyncio.current_task())):
                 return

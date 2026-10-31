@@ -242,6 +242,74 @@ async def test_adapter_reply_reaction_status_and_progress_share_transport(transp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prior_write", ["reaction", "concurrent_root"])
+async def test_gateway_typing_retries_processing_after_admission_timeout(transport, monkeypatch, prior_write):
+    """A timed-out admission is not a completed lifecycle transition."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    def now():
+        transport.now = 1000.0 + loop.time() - started
+        return transport.now
+
+    cancelled, refreshed, stop = (asyncio.Event() for _ in range(3))
+
+    # Keep real admission delays and the gateway's unchanged 1.5s send timeout.
+    monkeypatch.setattr(budget, "monotonic", now)
+    monkeypatch.setattr(budget, "sleep", asyncio.sleep)
+    monkeypatch.setattr(slack_adapter, "_sdk_supports_agent_sessions", lambda: True)
+    app = client()
+    adapter = SlackAdapter(PlatformConfig(extra={"tool_progress": False}))
+    adapter._app = object()
+    monkeypatch.setattr(adapter, "_get_client", Mock(return_value=app))
+    roots = {"C1": "1700.1"}
+    if prior_write == "reaction":
+        await app.reactions_add(channel="C1", timestamp=roots["C1"], name="eyes")
+    else:
+        roots["C2"] = "1700.2"
+    ticks = dict.fromkeys(roots, 0)
+    send_typing = adapter.send_typing
+
+    async def observed_typing(chat_id, metadata=None):
+        try:
+            await send_typing(chat_id, metadata=metadata)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        finally:
+            ticks[chat_id] += 1
+            if all(count >= 3 for count in ticks.values()):
+                refreshed.set()
+                stop.set()
+
+    monkeypatch.setattr(adapter, "send_typing", observed_typing)
+    tasks = [asyncio.create_task(adapter._keep_typing(
+        channel, metadata={"thread_id": root, "slack_team_id": "T1"}, stop_event=stop))
+        for channel, root in roots.items()]
+    try:
+        await asyncio.wait_for(cancelled.wait(), 10)
+        await asyncio.wait_for(refreshed.wait(), 20)
+        await asyncio.wait_for(asyncio.gather(*tasks), 20)
+        native = [entry for entry in transport.sent if entry[1] == "agents.sessions.setStatus"]
+        for channel, root in roots.items():
+            payloads = [entry[2] for entry in native if entry[2]["channel_id"] == channel]
+            assert payloads == [
+                {"channel_id": channel, "thread_ts": root, "status": "processing"},
+                {"channel_id": channel, "thread_ts": root, "status": "active"},
+            ]
+        assert all(b[0] - a[0] >= 4 for a, b in pairwise(native))
+        for channel in roots:
+            writes = [entry for entry in transport.sent
+                      if (entry[2].get("channel_id") or entry[2].get("channel")) == channel]
+            assert all(b[0] - a[0] >= 2 for a, b in pairwise(writes))
+    finally:
+        stop.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_copied_start_has_no_hidden_sdk_retries_and_keeps_budget(transport, monkeypatch):
     app = client()
     attempts = []
