@@ -73,10 +73,14 @@ not only the command reply.
   and sent-message IDs may resolve existing RAM prompt state and its session lane.
   Stale buttons cannot run or consume a newer prompt. Unmatched pickers remain
   privacy-ambiguous, not guessed public topics.
-- A failed private turn records only its exception type and innermost Hermes
-  frame, created outside the private scope by `agent.incognito.log_private_failure`.
-  Every other record from the turn stays redacted whole, so never add the message,
-  arguments or locals to that line.
+- A failed private turn or route resolution records only its exception type and
+  innermost Hermes frame, each name checked against a source-code identifier
+  pattern, created outside the private scope by `agent.incognito.log_private_failure`.
+  It never raises into the reply path. Every other record from the turn stays
+  redacted whole, so never add the message, arguments or locals to that line.
+- Credential-pool status keeps only classifier fields while private. Provider
+  error text can echo the prompt, so it never reaches `auth.json` from a private
+  turn.
 - Async ingress reads the loaded store's published routing index on the event
   loop. Only an unloaded store resolves off-loop. Routing every message through
   the default executor queues ingress behind unrelated jobs and lets held
@@ -91,13 +95,17 @@ The focused proof surfaces are `tests/agent/test_incognito.py`,
 `tests/plugins/platforms/telegram/test_incognito_ingress.py`, and
 `tests/tools/test_delegate_tool.py`. The real Telegram admission and multiplex
 transport tests exercise the receiving adapter rather than a synthetic shortcut.
-`tests/gateway/test_incognito_turn_e2e.py` is the end-to-end contract: a
-configured `incognito.model` reached through a model alias, a private turn that
-compacts in RAM and replies, `/new` with a parked agent, `/incognito off`
-restoring the route and saved prefix, and the content-free failure record. It
-mocks only the provider boundary. Do not replace the gateway methods it crosses
-with mocks, which is how the private persistence call shipped with the wrong
-signature.
+`tests/gateway/test_incognito_turn_e2e.py` is the end-to-end contract. Its
+resolver test runs real gateway turns through the production agent resolver and
+cache, replacing only the provider client, Hindsight's cloud client and the
+summary call: a configured `incognito.model` reached through a model alias,
+compaction in RAM anchored on real usage, agent reuse across private turns, a
+classified provider failure, no retain, and `/incognito off` restoring the route
+and saved prefix. The `/new` test runs the real reset and observes only the
+parked agent's release. The failure-record tests replace `_run_agent` to inject
+an exception. Do not replace the gateway methods these tests cross with plain
+mocks, which is how the private persistence call shipped with the wrong
+signature. Where a test must stub one, use `create_autospec`.
 Compare the complete suite's failures against the exact base before promotion.
 Off-mode differential proofs must compare the merged main revision, retaining
 exact SQL traces, SQLite pages and plugin callback assertions. A historical base
