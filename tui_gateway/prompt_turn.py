@@ -375,7 +375,7 @@ def _turn_outcome(result: Any, error_surface: dict | None = None) -> tuple[Any, 
 
 def _goal_followup_after_turn(
     sid: str, session: dict, result: Any, status: str, raw: Any,
-    *, user_initiated: bool = True,
+    *, user_initiated: bool = True, turn_started_at: float | None = None,
 ) -> str | None:
     """/goal continuation (mirrors gateway/run._post_turn_goal_continuation): the prompt to
     chain once ``running`` is released, or None.  Compression failures are never judge
@@ -411,7 +411,8 @@ def _goal_followup_after_turn(
                 _bg_procs = None
             # Goals are keyed by session_key; tool results live under the agent's transcript id.
             decision = goal_mgr.evaluate_after_turn(
-                raw, user_initiated=user_initiated, background_processes=_bg_procs, active_delegations=_active_deleg,
+                raw, user_initiated=user_initiated, turn_started_at=turn_started_at,
+                background_processes=_bg_procs, active_delegations=_active_deleg,
                 evidence_session_id=getattr(session.get("agent"), "session_id", None) or None)
             if (verdict_msg := decision.get("message") or "") and goal_notices_enabled():
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
@@ -1271,6 +1272,7 @@ def _run_prompt_submit(
         display_kind = "hidden"
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
     # session_key and the agent's live session_id together.  No prompt content is logged.
+    turn_started_at = time.time()
     _turn_started_monotonic = time.monotonic()
     logger.info(
         # Desktop/TUI observability (#86647): this is the ONE INFO record proving a Desktop/TUI prompt was
@@ -1323,7 +1325,7 @@ def _run_prompt_submit(
                 note_task_done(session, st.result, st.agent, display_kind)
             _emit("message.complete", sid, payload)
             goal_followup = _goal_followup_after_turn(
-                sid, session, st.result, status, raw, user_initiated=user_turn)
+                sid, session, st.result, status, raw, user_initiated=user_turn, turn_started_at=turn_started_at)
             if status == "complete":
                 _after_complete_turn(sid, session, st, raw)
             else:

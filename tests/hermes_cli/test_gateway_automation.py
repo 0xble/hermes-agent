@@ -89,6 +89,31 @@ def test_judge_decision_comes_from_the_gateway(cli, monkeypatch):
     assert mgr.state.status == 'done'
 
 
+@pytest.mark.parametrize("turn_age", [None, -1.0, 1.0])
+def test_gateway_proxy_pierces_only_waits_predating_turn(cli, monkeypatch, turn_age):
+    from unittest.mock import Mock
+    from hermes_cli import goals
+
+    judge = Mock(return_value=('continue', 'more work', False, None, False))
+    monkeypatch.setattr(goals, 'judge_goal', judge)
+    mgr = cli.cli._get_goal_manager()
+    mgr.set('wait for the report')
+    mgr.wait_for_seconds(86_400, reason='report due tomorrow')
+    since = mgr.state.waiting_since
+    turn_started_at = None if turn_age is None else since + turn_age
+
+    decision = mgr.evaluate_after_turn('report update', turn_started_at=turn_started_at)
+
+    if turn_age is None or turn_age > 0:
+        judge.assert_called_once()
+        assert decision['should_continue'] is True
+        assert mgr.state.waiting_since == 0
+    else:
+        judge.assert_not_called()
+        assert decision['should_continue'] is False
+        assert mgr.state.waiting_since == since
+
+
 def test_idle_polls_cost_no_round_trip(cli):
     hb = cli.cli._get_heartbeat_manager()
     loop = cli.cli._get_loop_manager()
