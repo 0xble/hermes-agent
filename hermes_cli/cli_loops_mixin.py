@@ -944,7 +944,7 @@ class CLILoopsMixin:
             _bg_procs = None
         decision = mgr.evaluate_after_turn(
             last_response, user_initiated=getattr(self, "_goal_turn_user_initiated", True),
-            turn_started_at=getattr(self, "_prompt_start_time", None),
+            turn_started_at=getattr(self, "_last_turn_started_at", None),
             background_processes=_bg_procs, active_delegations=_active_deleg)
         if goal_notices_enabled():
             _print_decision_message(decision)

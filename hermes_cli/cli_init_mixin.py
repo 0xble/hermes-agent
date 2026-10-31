@@ -422,6 +422,7 @@ class CLIInitMixin:
         # Per-prompt elapsed timer shown in the status bar.
         self._prompt_start_time: Optional[float] = None
         self._prompt_duration: float = 0.0
+        self._last_turn_started_at: Optional[float] = None
         self._last_turn_finished_at: Optional[float] = None
         self._init_session_store()
         self._pending_title: Optional[str] = None
