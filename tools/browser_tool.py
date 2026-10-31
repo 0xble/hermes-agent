@@ -476,7 +476,21 @@ atexit.register(_lifecycle._stop_browser_cleanup_thread)
 # ----------------------------------------------------------------------------
 # Tool Schemas
 # ----------------------------------------------------------------------------
+BROWSER_CLOSE_SCHEMA = {
+    "name": "browser_close",
+    "description": (
+        "Close 1 Camofox tab created by this browser task, defaulting to its current tab. "
+        "Optionally pass a caller-owned tab_id from browser_tabs. Adopted/shared tabs and "
+        "other tasks' tabs cannot be closed. Success requires server readback confirming "
+        "the tab is gone. Does not close the browser, account, or other tabs."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "tab_id": {"type": "string", "description": "Optional exact caller-owned tab ID. Omit for the current tab."}
+    }, "required": []},
+}
+
 BROWSER_TOOL_SCHEMAS = [
+    BROWSER_CLOSE_SCHEMA,
     {
         "name": "browser_handoff",
         "description": "Show a named account's browser window for a person. May restart that account's hidden Camofox browser as visible (page-only state such as half-filled forms can be lost; logins persist). Confirm no other work is using the account first, then call before the step whose page state matters, such as submitting a password when an OTP is likely. Use release=true when the user is done with the visible window to return the account to the background.",
@@ -758,7 +772,7 @@ def _post_redirect_block(nav_session_key: str, url: str, final_url: str, auto_lo
     return json.dumps(_err(f"Blocked: redirect landed on {what}"))
 
 
-def _snapshot_fields(snap_result: Dict[str, Any], nav_session_key: str = "default") -> Dict[str, Any]:
+def _snapshot_fields(snap_result: dict[str, Any], nav_session_key: str = "default") -> dict[str, Any]:
     """``snapshot`` + ``element_count`` fields from a successful snapshot result; oversized
     snapshots truncate at line boundaries with the full tree stored for read_file paging."""
     data = snap_result.get("data", {})
@@ -945,6 +959,14 @@ def _tool_response(result: dict[str, Any], ok: dict[str, Any], default_error: st
     return _json_with_fallback({"success": True, **ok}, result)
 
 
+def browser_close(tab_id: Optional[str] = None, task_id: Optional[str] = None) -> str:
+    """Close one caller-owned Camofox tab, confirming its absence on the server."""
+    from tools.browser_camofox import is_camofox_mode, camofox_close_tab
+    if is_camofox_mode():
+        return camofox_close_tab(task_id=task_id, tab_id=tab_id)
+    return tool_error("browser_close currently requires the Camofox backend", success=False, closed=False)
+
+
 def browser_tabs(tab_id: Optional[str] = None, task_id: Optional[str] = None) -> str:
     """Ownership-aware Camofox tab discovery and selection."""
     if not _is_camofox_mode():
@@ -1114,7 +1136,7 @@ def _parse_eval_value(raw_result: Any) -> Any:
     return raw_result
 
 
-def _eval_ok_response(parsed: Any, *, vault_tab: str = "default", vault_origin: str = "", **extra) -> Dict[str, Any]:
+def _eval_ok_response(parsed: Any, *, vault_tab: str = "default", vault_origin: str = "", **extra) -> dict[str, Any]:
     return {
         "success": True,
         "result": _snapshot._redact_browser_output(parsed,
@@ -1414,7 +1436,7 @@ from tools.browser_extension_router import extension_controller_available, route
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 
-def _camofox_handoff_schema_override() -> Dict[str, Any]:
+def _camofox_handoff_schema_override() -> dict[str, Any]:
     from tools.browser_camofox_state import get_camofox_account_aliases
     return {"parameters": {"type": "object", "properties": {"account": {
         "type": "string", "enum": list(get_camofox_account_aliases()),
@@ -1425,7 +1447,7 @@ def _camofox_handoff_schema_override() -> Dict[str, Any]:
     }}, "required": ["account"]}}
 
 
-def _camofox_account_schema_override() -> Dict[str, Any]:
+def _camofox_account_schema_override() -> dict[str, Any]:
     """Advertise account selection only when Camofox is the active backend."""
     if not _is_camofox_mode():
         return {}
@@ -1505,6 +1527,10 @@ registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCH
                                                                release=args.get("release") is True),
                   check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
                   emoji="🌐")
+
+registry.register(name="browser_close", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_close"],
+                  handler=lambda args, **kw: browser_close(args.get("tab_id"), task_id=kw.get("task_id")),
+                  check_fn=_is_camofox_mode, emoji="🌐")
 
 registry.register(name="browser_tabs", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_tabs"],
                   handler=lambda args, **kw: browser_tabs(args.get("tab_id"), task_id=kw.get("task_id")),
