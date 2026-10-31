@@ -3,6 +3,7 @@
 Main applied both to the live sidecar session. On the owner the next turn runs under the frozen
 LocalSessionPolicy, so each is a revision-fenced ``session.mutate`` that rewrites that policy.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import asyncio
 import json
 from types import SimpleNamespace
@@ -29,7 +30,7 @@ def _owner(tmp_path, monkeypatch, handle):
                              _handle_message=handle, _resolve_session_agent_runtime=lambda **k: ('frozen', {}))
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
+                                 epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
     owner = AuthorityConnection(authority, object(), {'user_id': 'human'})
     start = tmp_path / 'project-a'
     start.mkdir()

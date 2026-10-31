@@ -55,7 +55,7 @@ class _Owners:
         return self
 
     async def boot(self, instance_id):
-        from gateway.session_authority import initialize_session_authority
+        from tests.fakes.runtime_owner import initialize_session_authority
         owner = SimpleNamespace(session_store=self.store, _session_db=self.store._db, adapters={}, _draining=False,
                                 _cached_agent_for=lambda route: None, _evict_cached_agent=lambda route: None)
         owner._adapter_for_source = lambda source: owner.adapters.get(source.platform)

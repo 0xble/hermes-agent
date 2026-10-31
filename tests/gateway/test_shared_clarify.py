@@ -10,7 +10,7 @@ def test_real_shared_clarify_survives_detach(tmp_path):
     home.mkdir()
     state.mkdir()
     repo = Path(__file__).resolve().parents[2]
-    env = {key: os.environ[key] for key in ('PATH', 'LANG', 'TZ') if key in os.environ}
+    env = {key: os.environ[key] for key in ('HERMES_TEST_ISOLATION', 'PATH', 'LANG', 'TZ') if key in os.environ}
     env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state), PYTHONPATH=str(repo))
     result = subprocess.run(
         [sys.executable, str(Path(__file__).parent / 'fixtures' / 'authority_clarify_peer.py')],

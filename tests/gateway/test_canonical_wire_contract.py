@@ -7,7 +7,7 @@ from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_controls import AuthorityConnection
 from gateway.session_group_controls import GROUP_METHODS
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tui_gateway.contracts.registry import CANONICAL_METHODS, METHODS
 
 

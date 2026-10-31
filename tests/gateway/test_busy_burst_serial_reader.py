@@ -17,7 +17,7 @@ from gateway.config import GatewayConfig, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session_authority import initialize_session_authority
+from tests.fakes.runtime_owner import initialize_session_authority
 from gateway.session_ingress_burst import holds_busy_burst
 from gateway.session_results import execution_result
 from hermes_state_runtime import list_session_admissions

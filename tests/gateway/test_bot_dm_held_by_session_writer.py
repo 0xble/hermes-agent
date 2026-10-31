@@ -20,7 +20,7 @@ async def held(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from hermes_cli import gateway_runtime
     from hermes_cli.active_sessions import release_active_session, try_acquire_active_session

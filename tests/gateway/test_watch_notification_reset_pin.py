@@ -18,7 +18,8 @@ async def _gateway(monkeypatch):
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session_results import execution_result
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from plugins.platforms.discord.adapter import DiscordAdapter
 
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')

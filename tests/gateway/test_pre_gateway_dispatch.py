@@ -164,7 +164,8 @@ async def test_rewritten_message_keeps_its_callback_provenance_and_is_admitted(m
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import capture_provenance, native_callback, register_transport_home
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions
@@ -453,7 +454,7 @@ async def test_relay_resend_of_a_rewritten_delivery_resolves_its_admission(tmp_p
     from gateway.relay.descriptor import CapabilityDescriptor
     from gateway.relay.ws_transport import WebSocketRelayTransport
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
     from tests.waiting import async_wait_until
 
@@ -539,7 +540,8 @@ async def test_relay_resend_of_a_rewritten_media_delivery_reuses_its_admission_a
     from gateway.relay.media import RelayMediaClient
     from gateway.relay.ws_transport import WebSocketRelayTransport
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_media import _media_root
     from tests.gateway.test_native_media_redelivery import PNG, _Media
     from tests.waiting import async_wait_until
@@ -693,7 +695,7 @@ async def test_a_relay_media_delivery_no_admission_owns_retains_no_bytes(
     from gateway.relay.media import RelayMediaClient
     from gateway.relay.ws_transport import WebSocketRelayTransport
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_media import _media_root
     from hermes_cli.plugins import get_plugin_manager
     from tests.gateway.test_native_media_redelivery import _Media

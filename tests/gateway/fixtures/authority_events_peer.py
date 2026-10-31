@@ -53,7 +53,7 @@ def main():
         from gateway.config import Platform
         from gateway.run import GatewayRunner
         from gateway.session import SessionSource
-        from gateway.session_authority import initialize_session_authority
+        from tests.fakes.runtime_owner import initialize_session_authority
         from gateway.session_controls import AuthorityConnection
         from gateway.session_contract import Submission
         from hermes_state_runtime import list_session_admissions

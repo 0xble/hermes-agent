@@ -5,6 +5,7 @@ fine and then refuse every turn. ``import_sessions`` (behind ``adopt_session_lin
 the runtime ``import`` mutation both refuse such an id when they read the payload, and write
 nothing. An id a housekeeping sweep retired restores once its fence ages out, as before.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import pytest
 
 import hermes_state_runtime as rt
@@ -26,7 +27,7 @@ def _exported_then_deleted(db, epoch, sid):
 
 def test_import_sessions_refuses_a_deleted_id_by_name(tmp_path):
     with SessionDB(tmp_path / 'state.db') as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         exported = _exported_then_deleted(db, epoch, 's')
         result = db.import_sessions([exported])
         assert result['ok'] is False and result['imported'] == 0, result
@@ -36,7 +37,7 @@ def test_import_sessions_refuses_a_deleted_id_by_name(tmp_path):
 
 def test_the_runtime_import_refuses_a_deleted_id_by_name(tmp_path):
     with SessionDB(tmp_path / 'state.db') as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         exported = _exported_then_deleted(db, epoch, 's')
         with pytest.raises(rt.RuntimeStoreError) as refused:
             rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='s', request_id='restore',

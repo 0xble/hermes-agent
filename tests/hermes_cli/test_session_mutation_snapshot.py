@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from gateway.session_authority import SessionAuthority
 from hermes_cli.web_routers.sessions import manage_router
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.mark.asyncio

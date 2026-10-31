@@ -7,7 +7,7 @@ from gateway.session_authority import SessionAuthority
 from gateway.session_contract import Principal, SessionRef
 from gateway.session_mutations import mutate_session
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 _CAPS = frozenset({'session:read', 'session:control', 'session:create'})
 

@@ -386,7 +386,8 @@ def test_explicit_cancel_remains_durable_after_owner_recovery(tmp_path, monkeypa
     from cron import jobs, scheduler_authority
     from cron.detached_authority import _cancel_path
     from gateway import session_cron
-    from hermes_state_runtime import claim_session_input, begin_runtime_epoch, recover_session_inputs
+    from hermes_state_runtime import claim_session_input, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tests.cron.test_cron_recovery import _owner
     owner, db = _owner(tmp_path, monkeypatch)
     try:
@@ -465,8 +466,8 @@ def test_captured_detached_completion_is_adopted_not_replayed(tmp_path, monkeypa
     from cron.detached_authority import recover_detached
     from gateway import session_cron
     from gateway.session_results import admission_result
-    from hermes_state_runtime import (claim_session_input, begin_runtime_epoch,
-                                     recover_session_inputs, get_session_admission)
+    from hermes_state_runtime import claim_session_input, recover_session_inputs, get_session_admission
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tests.cron.test_cron_recovery import _owner
     owner, db = _owner(tmp_path, monkeypatch)
     try:

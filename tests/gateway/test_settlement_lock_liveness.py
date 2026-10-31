@@ -157,7 +157,8 @@ async def test_submit_claim_and_discard_behind_a_held_writer_leave_the_loop_free
     """Admission, the FIFO claim and Discard wait on a held writer in a worker thread, tracked so
     retirement joins them; the claim's execution stamp still lands with its commit."""
     from gateway.session_runtime_workers import mutation_tasks
-    from hermes_state_runtime import get_session_admission, recover_session_inputs, begin_runtime_epoch
+    from hermes_state_runtime import get_session_admission, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     db, authority = _authority(tmp_path, monkeypatch)
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     live = authority.sessions['s']
