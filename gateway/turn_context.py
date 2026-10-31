@@ -105,6 +105,8 @@ class TurnContext:
     _cleanup_progress: bool = False
     _status_delivery: Any = None
     _cleanup_msg_ids: list[str] = field(default_factory=list)
+    _card_recorder: Optional[Callable[[str], None]] = None
+    _card_writes: set = field(default_factory=set)
     _bubble_cleanup_registered: bool = False
     _post_delivery_adapter: Any = None
     _progress_metadata: Optional[dict] = None
@@ -177,6 +179,12 @@ class TurnContext:
     native_tool_complete_callback: Optional[Callable] = None
     # Current turn worker, assigned before agent resolution so its completion events can bind the agent.
     _worker: Optional[TurnWorker] = None
+
+    def track_cleanup_id(self, message_id: str) -> None:
+        """Remember a temporary progress card for end-of-turn deletion, and record it durably."""
+        self._cleanup_msg_ids.append(message_id)
+        if self._card_recorder is not None:
+            self._card_recorder(message_id)
 
     def bind_agent_lifetime(self, agent: Any) -> None:
         """Keep only drain fences on the agent, never the entire turn context."""

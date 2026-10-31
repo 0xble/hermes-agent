@@ -135,7 +135,7 @@ class GatewayTurnProgressMixin:
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
         ctx = self._ctx
         if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+            ctx.track_cleanup_id(str(result.message_id))
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:

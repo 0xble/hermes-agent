@@ -4317,6 +4317,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                                    if reasoning_override is _NO_ATTENDED_ACTIVITY_STAMP else reasoning_override),
             "reasoning_scope": state.conversation.reasoning_override_scope if state is not None else "session",
         }
+        if _cleanup_progress and session_key:
+            turn_ctx._card_recorder = self._progress_card_recorder(turn_ctx)
         turn_runner = TurnRunner(self, turn_ctx, model_assignment=model_assignment)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -5492,6 +5494,39 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
             )
 
+    def _progress_card_recorder(self, turn_ctx: TurnContext) -> Callable[[str], None]:
+        """Durably record each temporary card as it is sent: the deletion callback below lives only
+        in memory, and a restart before it fires would strand the card (boot deletes orphans).
+        Tracking sites run on the loop or a worker thread, so the write is handed to the loop and
+        then off it."""
+        loop, pending = asyncio.get_running_loop(), turn_ctx._card_writes
+        key, chat_id = turn_ctx.session_key, turn_ctx.source.chat_id
+
+        def spawn(message_id: str) -> None:
+            task = self._retain_background_task(asyncio.ensure_future(
+                self._persist_progress_cards("record_progress_card", key, chat_id, message_id)))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+
+        def record(message_id: str) -> None:
+            with suppress(RuntimeError):  # loop already closed: the card just goes unrecorded
+                loop.call_soon_threadsafe(spawn, message_id)
+        return record
+
+    async def _persist_progress_cards(self, method: str, session_key: str, *args: Any) -> None:
+        try:
+            await getattr(self.async_session_store, method)(session_key, *args)
+        except Exception as exc:
+            logger.warning("Progress card %s failed for session %s: %s", method, session_key, exc)
+
+    async def _forget_turn_progress_cards(self, turn_ctx: TurnContext, message_ids: list[str]) -> None:
+        # A record still in flight would otherwise land after its forget and outlive it.
+        pending = list(turn_ctx._card_writes)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await self._persist_progress_cards(
+            "forget_progress_cards", turn_ctx.session_key, turn_ctx.source.chat_id, message_ids)
+
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Register turn-local deletion, awaited after confirmed final delivery."""
         ids, key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
@@ -5507,6 +5542,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         ):
             if turn_ctx._cleanup_progress and ids and isinstance(response, dict) and response.get("failed"):
                 logger.info("Temp bubble cleanup skipped for session %s: failed run", key)
+                if key:  # failed runs keep their cards on purpose, so boot must not delete them either
+                    self._retain_background_task(asyncio.ensure_future(
+                        self._forget_turn_progress_cards(turn_ctx, list(ids))))
             return
         owner = turn_ctx._post_delivery_adapter or _cleanup_adapter
         chat_id = turn_ctx.source.chat_id
@@ -5541,6 +5579,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     raise
                 except Exception as error:
                     failures.extend(f"{mid}:{type(error).__name__}" for mid in owned)
+            # Settled after one attempt, as before the record existed: a cancelled cleanup (shutdown)
+            # re-raised above and keeps its record, so the next boot finishes it.
+            await self._forget_turn_progress_cards(turn_ctx, snapshot)
             if failures:
                 logger.warning("Temp bubble cleanup failures for session %s: %s", key,
                                ", ".join(failures[:10]))
@@ -5648,7 +5689,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)
                         if turn_ctx._cleanup_progress:
-                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                            turn_ctx.track_cleanup_id(_heartbeat_msg_id)
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
