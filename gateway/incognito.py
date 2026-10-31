@@ -11,7 +11,7 @@ import sqlite3
 import threading
 from typing import Callable
 
-from agent.incognito import any_incognito_sessions, incognito_scope, is_incognito, register_session
+from agent.incognito import any_incognito_sessions, incognito_scope, is_incognito, is_registered, register_session
 
 _TOPIC: ContextVar[str | None] = ContextVar("gateway_private_topic", default=None)
 
@@ -36,6 +36,18 @@ def transition_scope(session_key: str):
             yield
     finally:
         _TRANSITIONING.discard(session_key)
+        _TOPIC.reset(token)
+
+
+@contextmanager
+def ended_private_topic(session_id: str | None = None):
+    """Run the rest of a reset as public work once it has ended the private interval."""
+    from agent.incognito import ended_private_scope
+    token = _TOPIC.set(None)
+    try:
+        with ended_private_scope(session_id):
+            yield
+    finally:
         _TOPIC.reset(token)
 
 
@@ -116,7 +128,11 @@ class _IngressScope:
         return self._scope.__enter__()
 
     def __enter__(self):
-        return self._enter(self._resolve())
+        # Synchronous ingress runs on the loop too, so prefer the non-blocking answer.
+        decision = self._fast() if self._fast is not None else _OFFLOAD
+        if decision is _OFFLOAD:
+            decision = self._resolve()
+        return self._enter(decision)
 
     def __exit__(self, *exc):
         assert self._scope is not None
@@ -167,7 +183,9 @@ def _event_decision(owner, event, *, blocking=True):
     key_for = getattr(owner, "_session_key_for_source", None) or getattr(owner, "_source_session_key", None)
     key = key_for(source) if callable(key_for) else None
     enabled = is_incognito(key) if isinstance(key, str) else False
-    store = getattr(owner, "session_store", None)
+    # Adapters hold the runner's store as ``_session_store``.
+    store = getattr(owner, "session_store", None) or getattr(owner, "_session_store", None)
+    decision = None
     if store is not None and isinstance(key, str):
         if blocking:
             decision = store.incognito_enabled(key)
@@ -178,16 +196,17 @@ def _event_decision(owner, event, *, blocking=True):
                 return _OFFLOAD
         if isinstance(decision, bool):
             enabled = decision
-    elif isinstance(key, str):
+    if not isinstance(decision, bool) and isinstance(key, str):
         records = _routing_records()
         enabled = key in records or enabled
         if key in records:
             session_id = records[key]["session_id"]
-            if not blocking and not (is_incognito(session_id) and is_incognito(key)):
-                # Registering waits for in-flight persistence; keep that off the loop.
-                return _OFFLOAD
-            register_session(session_id, True)
-            register_session(key, True)
+            if not (is_registered(session_id) and is_registered(key)):
+                if not blocking:
+                    # Registering waits for in-flight persistence; keep that off the loop.
+                    return _OFFLOAD
+                register_session(session_id, True)
+                register_session(key, True)
     # The entry command and its confirmation must also avoid normal admission/result stores.
     command = getattr(event, "get_command", None)
     entering = callable(command) and command() == "incognito"
@@ -208,7 +227,8 @@ def slash_refusal(event) -> str | None:
     name = definition.name if definition else ""
     args = (event.get_command_args() or "") if definition else ""
     durable = name in {"title", "branch", "resume", "sessions", "bg", "review", "refine",
-                       "goal", "subgoal", "loop", "heartbeat", "plan", "pause", "personality"}
+                       "goal", "subgoal", "loop", "heartbeat", "plan", "pause", "personality",
+                       "topic"}
     global_route = name in {"model", "reasoning", "fast"} and "--global" in args.split()
     permanent_approval = name == "approve" and "always" in args.split()
     if durable or global_route or permanent_approval:

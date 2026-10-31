@@ -249,7 +249,19 @@ class GatewaySessionCommandsMixin:
                                       parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
             _reset_process_scoped_tool_state()
 
+            from agent.incognito import is_incognito
+            was_private = is_incognito()
             new_entry = await self.async_session_store.reset_session(session_key)
+        if not was_private:
+            return await self._finish_session_reset(event, source, session_key, old_entry, new_entry)
+        # The reset ended the private interval. Bind, title and announce the new public
+        # session outside the private ingress scope, or the next message returns to the old one.
+        from gateway.incognito import ended_private_topic
+        with ended_private_topic(new_entry.session_id if new_entry else None):
+            return await self._finish_session_reset(event, source, session_key, old_entry, new_entry)
+
+    async def _finish_session_reset(self, event: MessageEvent, source: SessionSource, session_key: str,
+                                    old_entry, new_entry) -> str | EphemeralReply:
         _old_sid = old_entry.session_id if old_entry else None
         from gateway.session_automation import move_route_wakes
         await move_route_wakes(self, session_key, _old_sid)  # main #114456: a parked wake survives /new

@@ -432,7 +432,7 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
             return SendResult(success=False, error="outbox payload has an uncertain prior dispatch", held=True)
         if not await _store_io_retry(store.begin_send, row):
             return SendResult(success=False, error="earlier outbox row is unresolved", held=True)
-        flight = (store.path, row.idempotency_key)
+        flight = (store.identity, row.idempotency_key)
         _IN_FLIGHT.add(flight)
         try:
             try:
@@ -484,7 +484,7 @@ async def _schedule_retry(store: Outbox, adapter) -> None:
     """Ensure one coalesced deferred sweep for this store and adapter identity, without blocking
     ingress. A sweep that is already parked is woken to re-read the earliest deadline."""
     profile = _retry_profile(adapter)
-    key = (store.path, getattr(adapter, "platform", None), profile)
+    key = (store.identity, getattr(adapter, "platform", None), profile)
     existing = _SWEEPS.get(key)
     if existing is not None and not existing[0].done():
         existing[1].set()
@@ -547,18 +547,18 @@ async def _deferred_sweep(store: Outbox, adapter, profile: str | None, key: tupl
 
 def _recover_lock(store: Outbox) -> asyncio.Lock:
     locks = _RECOVER_LOCKS.setdefault(asyncio.get_running_loop(), {})
-    return locks.setdefault(store.path, asyncio.Lock())
+    return locks.setdefault(store.identity, asyncio.Lock())
 
 
 def _report_held(store: Outbox, ambiguous: list[OutboxRow]) -> int:
     """Log each held row once per process; rows this process is dispatching are in flight."""
-    held = [row for row in ambiguous if (store.path, row.idempotency_key) not in _IN_FLIGHT]
-    keys = {(store.path, row.idempotency_key) for row in held}
+    held = [row for row in ambiguous if (store.identity, row.idempotency_key) not in _IN_FLIGHT]
+    keys = {(store.identity, row.idempotency_key) for row in held}
     for row in held:
-        if (store.path, row.idempotency_key) not in _HELD_LOGGED:
+        if (store.identity, row.idempotency_key) not in _HELD_LOGGED:
             logger.error("Held ambiguous outbox dispatch: turn=%s sequence=%s key=%s",
                          row.turn_id, row.sequence, row.idempotency_key)
-    _HELD_LOGGED.difference_update({k for k in _HELD_LOGGED if k[0] == store.path} - keys)
+    _HELD_LOGGED.difference_update({k for k in _HELD_LOGGED if k[0] == store.identity} - keys)
     _HELD_LOGGED.update(keys)
     return len(held)
 
@@ -630,7 +630,7 @@ async def _recover_locked(store: Outbox, adapter, *, startup: bool) -> tuple[int
                 continue
             if not await _store_io_retry(store.begin_send, row):
                 continue
-            flight = (store.path, row.idempotency_key)
+            flight = (store.identity, row.idempotency_key)
             _IN_FLIGHT.add(flight)
             try:
                 from gateway.platforms.base import outbound_class
@@ -703,6 +703,9 @@ class Outbox:
         from gateway.incognito import private_topic
         self._private_topic = private_topic() if private else None
         self.path = Path(home) / "gateway-outbox.db"
+        # A private RAM store shares the public path only as its namespace. Process-wide
+        # sweep, recovery and in-flight registries key on identity to keep the stores apart.
+        self.identity: Any = ("private", self._private_topic, self.path) if private else self.path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.executescript("""

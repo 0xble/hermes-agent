@@ -104,6 +104,12 @@ def is_incognito(session_id: str | None = None) -> bool:
         )
 
 
+def is_registered(session_id: str | None) -> bool:
+    """Registry membership only, ignoring the caller's own turn scope."""
+    with _lock:
+        return isinstance(session_id, str) and session_id in _sessions
+
+
 def any_incognito_sessions() -> bool:
     """Protect unattributable ingress without guessing which private topic owns it."""
     with _lock:
@@ -167,6 +173,21 @@ def incognito_scope(enabled: bool = True, session_id: str | None = None):
         _session_id.reset(session_token)
         _volatile.reset(state_token)
         _scope.reset(token)
+
+
+@contextmanager
+def ended_private_scope(session_id: str | None = None):
+    """Continue the handler that just ended its own private interval as public work.
+
+    Only the boundary owner may use this, after the registry no longer marks the
+    conversation private. Nested off scopes otherwise never weaken privacy.
+    """
+    tokens = (_scope.set(False), _volatile.set(None), _session_id.set(session_id), _work.set(()))
+    try:
+        yield
+    finally:
+        for var, token in zip((_scope, _volatile, _session_id, _work), tokens, strict=True):
+            var.reset(token)
 
 
 def shared_worker_context() -> Context:

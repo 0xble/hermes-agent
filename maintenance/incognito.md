@@ -30,14 +30,25 @@ not only the command reply.
   frozen prompt changes the accepted behavior.
 - SQLite admission precedes SQL execution and is serialized against registration
   changes. Rollback, deletion and WAL cleanup cannot substitute for withholding
-  the write, because private bytes may already have reached storage.
+  the write, because private bytes may already have reached storage. Writes share
+  `agent.incognito.persistence_admission()` and entering a boundary is exclusive.
+  Registry reads, including the logging filter, must never wait for a commit.
+- Entering incognito delivers public work queued before the boundary instead of
+  dropping it: queued memory writes, usage deltas and Hindsight retains or
+  buffered turns. Only work created while private is refused.
+- A stale sidecar record refuses only its own topic and keeps its recorded
+  session private. Remove the record to repair that topic.
+- `/new` in a private topic ends the interval, then binds, titles and announces
+  the new session as public work. `/topic` is refused while private.
 - The content-free sidecar preserves privacy routing across restart. Model
   overrides pass through the existing sanitizer. Do not persist a private model
   selection or credentials as recovery metadata.
 - Plugin content observation is opt-in through `incognito_safe`, including tools,
   hooks, middleware and event subscribers. New execution paths need the same
   admission owner, not an independently maintained exception list. Hindsight read
-  operations remain available while its provider writes are epoch-fenced.
+  operations remain available. A queued recall keeps the route it was queued
+  under, and pending recall is discarded at every boundary. A refused private
+  recall shows in the recall indicator instead of returning silently empty.
 - Hindsight's private transport in `plugins/memory/hindsight/private_reads.py`
   deliberately bypasses public SDK transports and embedded-daemon startup. Its
   bodyless `/version` handshake requires `features.private_reads: true`, then

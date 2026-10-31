@@ -367,7 +367,8 @@ async def test_first_command_in_a_fresh_topic_persists_only_its_boundary(harness
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", ["/model private --global", "/fork private", "/goal private", "/refine private"])
+@pytest.mark.parametrize("text", ["/model private --global", "/fork private", "/goal private", "/refine private",
+                                  "/topic 20261030_000000_abcdef"])
 async def test_durable_slash_commands_refused_before_admission(harness, monkeypatch, text):
     runner, _store, _entry, _config, event, _db = harness
     await runner._handle_incognito_command(event("/incognito on"))
@@ -477,3 +478,54 @@ async def test_internal_slack_event_bypasses_channel_gate_but_keeps_privacy(harn
         assert seen == [True]
     finally:
         store.set_incognito(entry.session_key, False)
+
+
+@pytest.mark.asyncio
+async def test_new_in_private_topic_binds_titles_and_announces_the_public_session(harness, monkeypatch):
+    """/new ends the private interval. Its binding, title and reset hook are public writes."""
+    from agent.incognito import is_incognito
+    from gateway.incognito import event_scope, private_topic
+    runner, store, entry, _config, event, db = harness
+    runner._session_db = db
+    await runner._handle_incognito_command(event("/incognito on"))
+    seen = {}
+
+    def record(name):
+        def observe(*args, **kwargs):
+            seen[name] = (is_incognito(), private_topic())
+        return observe
+
+    async def titled(header, session_id, title):
+        record("title")()
+        return header
+
+    monkeypatch.setattr(runner, "_hm_stop_owner_turn", AsyncMock())
+    monkeypatch.setattr(runner, "_cleanup_old_agent_for_reset", AsyncMock())
+    monkeypatch.setattr(runner, "_clear_conversation_scope_locked_async", AsyncMock())
+    monkeypatch.setattr(runner, "_fire_session_reset_hooks", AsyncMock(side_effect=record("hooks")))
+    monkeypatch.setattr(runner, "_reset_notice_session_info", lambda source: "")
+    monkeypatch.setattr(runner, "_telegram_topic_new_header", lambda source: "")
+    monkeypatch.setattr(runner, "_is_telegram_topic_lane", lambda source: True)
+    monkeypatch.setattr(runner, "_record_telegram_topic_binding", record("binding"))
+    monkeypatch.setattr(runner, "_reset_titled_header", titled)
+    monkeypatch.setattr("gateway.session_automation.move_route_wakes", AsyncMock())
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", record("on_session_reset"))
+    new = event("/new Public title")
+    async with event_scope(runner, new):
+        assert is_incognito()
+        await runner._handle_reset_command(new)
+        assert is_incognito()  # the caller's own scope is restored afterward
+    assert seen == {name: (False, None) for name in ("hooks", "title", "binding", "on_session_reset")}
+    fresh = store.lookup_by_session_key(entry.session_key)
+    assert fresh.session_id != entry.session_id and not fresh.incognito
+
+
+@pytest.mark.asyncio
+async def test_off_rebuilds_an_agent_that_was_built_private(harness):
+    """An agent born private never had the configured context engine; off must not keep it."""
+    runner, _store, entry, _config, event, _db = harness
+    await runner._handle_incognito_command(event("/incognito on"))
+    born_private = SimpleNamespace(model="normal-model", _incognito_born=True, set_incognito=lambda enabled: None)
+    runner._agent_cache[entry.session_key] = (born_private, "private-signature")
+    assert "OFF" in await runner._handle_incognito_command(event("/incognito off"))
+    assert runner._cached_agent_for(entry.session_key) is None

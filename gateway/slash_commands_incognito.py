@@ -56,6 +56,13 @@ class GatewayIncognitoCommandsMixin:
 
     async def _enter_incognito(self, event, entry):
         key = entry.session_key
+        # Public memory writes queued before this boundary are delivered first, while
+        # the session is still public.
+        cached = self._cached_agent_for(key)
+        flush = getattr(cached, "flush_public_memory", None)
+        if callable(flush):
+            from agent.incognito import shared_worker_context
+            await asyncio.to_thread(shared_worker_context().run, flush)
         # The durable flag must land before any private input can be admitted. On failure
         # propagate the exception, never acknowledge privacy that was not persisted.
         await asyncio.to_thread(self.session_store.set_incognito, key, True)
@@ -131,6 +138,10 @@ class GatewayIncognitoCommandsMixin:
         # Drop the private context before enabling durable writes again.
         if agent is not None:
             await asyncio.to_thread(agent.set_incognito, False)
+            if getattr(agent, "_incognito_born", False) and key not in parked:
+                # Built private, it never had the configured context engine or memory
+                # writers. The next public turn rebuilds it from the saved session.
+                self._evict_cached_agent(key)
         if key in parked:
             self._evict_cached_agent(key)
             original = parked.pop(key)

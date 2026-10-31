@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import logging
 from pathlib import Path
 
 from agent.incognito import is_incognito, register_session
@@ -19,11 +20,20 @@ class SessionIncognitoMixin:
         if not isinstance(records, dict):
             raise ValueError("Invalid incognito routing metadata, refusing ingress")
         self._incognito_records = records
+        stale = set()
         for key, record in records.items():
             entry = self._entries.get(key)
-            if entry is None or entry.session_id != record["session_id"]:
-                # A stale boundary must not silently make this topic public.
-                raise ValueError("Incognito boundary does not match the routing index")
+            recorded = record.get("session_id") if isinstance(record, dict) else None
+            if entry is None or entry.session_id != recorded:
+                # A stale boundary must not silently make this topic public. Refuse only
+                # this topic, keep its recorded identity private, and load every other one.
+                stale.add(key)
+                if isinstance(recorded, str) and recorded:
+                    register_session(recorded, True)
+                logging.getLogger(__name__).warning(
+                    "Incognito boundary does not match the routing index; refusing that topic until "
+                    "its record is removed from %s", path.name)
+                continue
             entry._incognito_persisted = entry.to_dict()
             entry.incognito = True
             if "active_override" in record:
@@ -34,10 +44,16 @@ class SessionIncognitoMixin:
             # and absolute deadline. A restart must not turn a timed pick permanent.
             register_session(entry.session_id, True)
             register_session(key, True)
+        self._incognito_stale = frozenset(stale)
+
+    def _refuse_stale_incognito(self, session_key: str) -> None:
+        if session_key in getattr(self, "_incognito_stale", ()):
+            raise ValueError("Incognito boundary does not match the routing index")
 
     def incognito_enabled(self, session_key: str) -> bool:
         with self._lock:
             self._ensure_loaded_locked()
+            self._refuse_stale_incognito(session_key)
             return session_key in getattr(self, "_incognito_records", {})
 
     def published_incognito_enabled(self, session_key: str) -> bool | None:
@@ -46,7 +62,7 @@ class SessionIncognitoMixin:
         The index is replaced, never mutated, under the store lock, so one attribute read
         observes a complete published state, exactly as a locked read would.
         """
-        if not getattr(self, "_loaded", False):
+        if not getattr(self, "_loaded", False) or session_key in getattr(self, "_incognito_stale", ()):
             return None
         records = getattr(self, "_incognito_records", None)
         return None if records is None else session_key in records
@@ -67,6 +83,8 @@ class SessionIncognitoMixin:
         # Read the saved prefix before registering the private identity. Reads stay available
         # afterward too, but the normal replay path may repair malformed role alternation.
         history = self.load_transcript(entry.session_id) if enabled else None
+        if enabled:
+            self._flush_public_token_counts()
         with self._lock:
             records = deepcopy(getattr(self, "_incognito_records", {}))
             if enabled:
@@ -83,6 +101,8 @@ class SessionIncognitoMixin:
                 records.pop(session_key, None)
             atomic_json_write(self._incognito_path(), records)
             self._incognito_records = records
+            # The rewritten record matches this topic's route again.
+            self._incognito_stale = getattr(self, "_incognito_stale", frozenset()) - {session_key}
             if enabled:
                 entry._incognito_persisted = entry.to_dict()
                 self._lazy("_incognito_histories", dict)[entry.session_id] = deepcopy(history)
@@ -103,6 +123,18 @@ class SessionIncognitoMixin:
                 from gateway.incognito import discard_private_topic
                 discard_private_topic(session_key)
         return entry
+
+    def _flush_public_token_counts(self) -> None:
+        """Apply usage deltas queued while public before the session becomes private."""
+        try:
+            db = self._db
+            flush = getattr(db, "flush_token_counts", None)
+            if callable(flush):
+                from agent.incognito import shared_worker_context
+                shared_worker_context().run(flush)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning("Incognito: public usage flush incomplete")
 
     def set_incognito_model(self, session_key: str, override):
         """Record only the configured route, never a user-entered private /model selection."""
