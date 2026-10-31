@@ -22,7 +22,8 @@ class DebugSession:
 
     def __init__(self, tool_name: str, *, env_var: str) -> None:
         self.tool_name = tool_name
-        self.enabled = os.getenv(env_var, "false").lower() == "true"
+        from agent.incognito import is_incognito
+        self.enabled = os.getenv(env_var, "false").lower() == "true" and not is_incognito()
         self.session_id = str(uuid.uuid4()) if self.enabled else ""
         self.log_dir = get_hermes_home() / "logs"
         self._calls: list[dict[str, Any]] = []
@@ -42,6 +43,10 @@ class DebugSession:
 
     def save(self) -> None:
         """Flush the in-memory log to a JSON file in the logs directory."""
+        from agent.incognito import is_incognito
+        if is_incognito():
+            self._calls.clear()
+            return
         if not self.enabled:
             return
         try:

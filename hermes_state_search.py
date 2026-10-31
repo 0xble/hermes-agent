@@ -440,7 +440,7 @@ class SessionSearchMixin:
             return upper < high_water
 
         try:
-            more = self._execute_write(_do)
+            more = self._execute_write(_do, skip_result=False)
         except sqlite3.OperationalError as exc:
             logger.debug(fail_msg, exc)
             return True  # transient (lock contention) — caller retries
@@ -512,7 +512,7 @@ class SessionSearchMixin:
             return True
 
         try:
-            return bool(self._execute_write(_do))
+            return bool(self._execute_write(_do, skip_result=False))
         except sqlite3.OperationalError as exc:
             logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
             return True
@@ -669,7 +669,7 @@ class SessionSearchMixin:
             _delete_meta(conn, "fts_optimize_available")
             return hw
 
-        hw = int(self._execute_write(_stage))
+        hw = int(self._execute_write(_stage, skip_result=0))
         # Outside the write transaction (executescript commits); markers are durable.
         self._ensure_v23_fts_tables("failed to create v23 messages_fts during optimize-storage demote")
         return hw
@@ -802,7 +802,7 @@ class SessionSearchMixin:
         if vacuum:
             _emit("vacuum")
             vacuum_ok = self._optimize_vacuum()
-        refusal = self._execute_write(self._optimize_settle)
+        refusal = self._execute_write(self._optimize_settle, skip_result={})
         if refusal is not None:
             # A concurrent process changed state since the pre-vacuum check; a re-run can still settle.
             logger.warning("FTS storage optimization settle refused (%s)", refusal)

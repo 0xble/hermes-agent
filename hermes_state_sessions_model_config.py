@@ -30,7 +30,7 @@ def update_conversation_model_config_value(db, session_id: str, key: str,
             config[key] = value
         conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?", (json.dumps(config), tip))
         return tip
-    return db._execute_write(_do)
+    return db._execute_write(_do, session_ids=(session_id,), skip_result=None)
 
 
 def session_ids_with_model_config_key(db, key: str) -> list[str]:

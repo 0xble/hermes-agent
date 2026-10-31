@@ -232,6 +232,10 @@ class GatewaySessionCommandsMixin:
                 await self._run_in_executor_with_context(retire)
             await _retire_old_controls()
         await self._cleanup_old_agent_for_reset(session_key)
+        getattr(self, "_incognito_gateway_snapshots", {}).pop(session_key, None)
+        parked = getattr(self, "_incognito_parked_agents", {}).pop(session_key, None)
+        if parked is not None:
+            self._release_evicted_cached_agents([parked])
         self._evict_cached_agent(session_key)
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one
         # funnel call (see _CONVERSATION_SCOPED_STATE in gateway/run.py).
@@ -245,7 +249,19 @@ class GatewaySessionCommandsMixin:
                                       parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
             _reset_process_scoped_tool_state()
 
+            from agent.incognito import is_incognito
+            was_private = is_incognito()
             new_entry = await self.async_session_store.reset_session(session_key)
+        if not was_private:
+            return await self._finish_session_reset(event, source, session_key, old_entry, new_entry)
+        # The reset ended the private interval. Bind, title and announce the new public
+        # session outside the private ingress scope, or the next message returns to the old one.
+        from gateway.incognito import ended_private_topic
+        with ended_private_topic(new_entry.session_id if new_entry else None):
+            return await self._finish_session_reset(event, source, session_key, old_entry, new_entry)
+
+    async def _finish_session_reset(self, event: MessageEvent, source: SessionSource, session_key: str,
+                                    old_entry, new_entry) -> str | EphemeralReply:
         _old_sid = old_entry.session_id if old_entry else None
         from gateway.session_automation import move_route_wakes
         await move_route_wakes(self, session_key, _old_sid)  # main #114456: a parked wake survives /new
@@ -836,9 +852,13 @@ class GatewaySessionCommandsMixin:
         makes the NEW session durable (already published, else rewritten) so the original stays searchable;
         persist BEFORE repointing so a failed write is fatal and old history stays reachable.
         In-place compaction already archived + inserted rows, and a rewrite would DELETE the
-        archive; an unchanged id without in-place means rotation FAILED."""
+        archive; an unchanged id without in-place means rotation FAILED. Incognito
+        deliberately keeps its id and commits only to the RAM transcript."""
         new_session_id = tmp_agent.session_id
-        if new_session_id != session_entry.session_id:
+        if session_entry.incognito:
+            if not await self.async_session_store.rewrite_transcript(session_entry.session_id, compressed):
+                raise RuntimeError("failed to update the incognito compression transcript")
+        elif new_session_id != session_entry.session_id:
             # Published child is already durable; a rewrite would drop rows cloned at publish.
             if not await self.async_session_store.persist_rotated_compression_child(
                     session_entry.session_id, new_session_id, compressed):

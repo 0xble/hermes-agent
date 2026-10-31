@@ -101,12 +101,15 @@ class SessionUsageMixin:
                    billing_base_url = ?,
                    billing_mode = COALESCE(?, billing_mode)
                    WHERE id = ?""", (provider, base_url, billing_mode, session_id))
-        self._execute_write(_do)
+        self._execute_write(_do, session_ids=(session_id,))
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:
         """Enqueue a token/cost delta for the background writer (same kwargs as
         :meth:`update_token_counts`). After close() stopped the writer, falls back to the
         synchronous path and may raise."""
+        from hermes_state_incognito import private_write
+        if private_write(session_id):
+            return
         with self._token_queue_cond:
             thread = self._token_writer_thread
             writer_alive = thread is not None and thread.is_alive()
@@ -298,7 +301,7 @@ class SessionUsageMixin:
         values.pop('source')
         self._insert_session_row(session_id, source or "unknown", model=model)
         self._execute_write(lambda conn: self._update_token_counts_in_transaction(
-            conn, session_id, **values))
+            conn, session_id, **values), session_ids=(session_id,), skip_result=None)
 
     def _update_token_counts_in_transaction(
         self, conn, session_id: str, input_tokens: int=0, output_tokens: int=0, model: str | None=None,
@@ -410,7 +413,7 @@ class SessionUsageMixin:
                     "UPDATE sessions SET profile_name=? WHERE id=? AND profile_name IS NULL",
                     (own_profile, session_id))
             self._record_model_usage(conn, session_id, task=task, **usage)
-        self._execute_write(_write, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        self._execute_write(_write, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S, session_ids=(session_id,), skip_result=None)
 
     def auxiliary_usage_by_task(self, session_id: str) -> dict[str, dict[str, float]]:
         """Per-task auxiliary usage (``task != ''``: vision, compression, title_generation, ...) summed

@@ -299,7 +299,7 @@ class SessionGatewayMixin:
                     (session_id, source, source, user_id, session_key, chat_id, chat_type, thread_id, display_name,
                      origin_json, self._own_profile_name(), transport_profile, time.time()),
                 )
-        self._execute_write(_do)
+        self._execute_write(_do, session_ids=(session_id,))
 
     def save_gateway_routing_entry(self, session_key: str, entry_json: str, *, scope: str = "") -> None:
         """Upsert one gateway routing entry (session_key -> SessionEntry JSON); ``scope``
@@ -341,6 +341,9 @@ class SessionGatewayMixin:
                 return False
             if not isinstance(payload, dict) or payload.get("active_turn_token") != token:
                 return False
+            from hermes_state_incognito import private_write
+            if private_write(payload):
+                return False
             payload["active_turn_token"] = None
             payload["active_turn_started_at"] = None
             payload.pop("active_turn_owner_pid", None)
@@ -351,7 +354,7 @@ class SessionGatewayMixin:
                 (json.dumps(payload), time.time(), scope, session_key),
             )
             return True
-        return bool(self._execute_write(_do))
+        return bool(self._execute_write(_do, skip_result=False))
 
     def replace_gateway_routing_entries(self, entries: dict[str, str], *, scope: str = "") -> set[str]:
         """Atomically replace *scope*, writing only its diff inside SQLite.
@@ -371,19 +374,34 @@ class SessionGatewayMixin:
                   "json_extract(value, '$.ns') AS ns FROM json_each(:payload)) ")
         retired = ROUTE_RETIRED_SQL.replace(":entry", "wanted.entry").replace(":ns", "wanted.ns")
         def _do(conn):
+            from agent.incognito import any_incognito_sessions
+            from hermes_state_incognito import private_write
+            write_params = params
+            if any_incognito_sessions():
+                # Keep main's SQL-only fast path when all routes are public. During
+                # a private interval, preserve the saved routing prefix byte-exact.
+                protected = {row[0]: row[1] for row in conn.execute(
+                    "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,))
+                    if private_write((row[0], row[1]))}
+                public = {key: value for key, value in entries.items()
+                          if key and value and key not in protected and not private_write((key, value))}
+                public.update(protected)
+                write_params = {**params, "payload": json.dumps(
+                    {key: {"entry": value, "ns": route_namespace(key)} for key, value in public.items()},
+                    ensure_ascii=False)}
             conn.execute(
                 "DELETE FROM gateway_routing WHERE scope = :scope "
-                "AND session_key NOT IN (SELECT key FROM json_each(:payload))", params)
+                "AND session_key NOT IN (SELECT key FROM json_each(:payload))", write_params)
             conn.execute(
                 wanted + "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
                 "SELECT :scope, key, entry, :now FROM wanted WHERE NOT " + retired +
                 " ON CONFLICT(scope, session_key) DO UPDATE SET "
                 "entry_json=excluded.entry_json, updated_at=excluded.updated_at "
-                "WHERE gateway_routing.entry_json IS NOT excluded.entry_json", params)
+                "WHERE gateway_routing.entry_json IS NOT excluded.entry_json", write_params)
             return {row[0] for row in conn.execute(
                 wanted + "SELECT key FROM wanted WHERE NOT EXISTS ("
-                "SELECT 1 FROM gateway_routing WHERE scope = :scope AND session_key = wanted.key)", params)}
-        return self._execute_write(_do)
+                "SELECT 1 FROM gateway_routing WHERE scope = :scope AND session_key = wanted.key)", write_params)}
+        return self._execute_write(_do, skip_result=set())
 
     def unbind_gateway_session_peer(self, session_key: str, expected_session_id: str) -> bool:
         """Finish a partial routing unbind without deleting transcript history."""
@@ -486,7 +504,7 @@ class SessionGatewayMixin:
         def _do(conn):
             from hermes_state_mutation_retirement import fence_shared_routes
             fence_shared_routes(conn, namespace, ids, expiring=expiring)
-        self._execute_write(_do)
+        self._execute_write(_do, session_ids=(session_ids,), skip_result=None)
 
 
     def _delete_routing_entries_for_sessions(self, session_ids: set[str]) -> int:
@@ -504,7 +522,7 @@ class SessionGatewayMixin:
                 doomed.append((row["scope"], row["session_key"]))
         if not doomed:
             return 0
-        self._write_sql("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", doomed, many=True)
+        self._write_sql("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", doomed, many=True, session_ids=(session_ids,))
         return len(doomed)
 
     def prune_never_active_keyed_sessions(
@@ -721,7 +739,7 @@ class SessionGatewayMixin:
                 "end_reason = 'superseded_by_repair' WHERE id = ?",
                 (time.time(), donor_id))
             return True
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(orphan_id, donor_id,), skip_result=False)
 
     def increment_hygiene_failure_streak(self, session_key: str) -> int:
         """Atomically increment the session-hygiene failure streak for one chat."""
@@ -739,7 +757,7 @@ class SessionGatewayMixin:
                 "SELECT failure_streak FROM gateway_hygiene_state WHERE session_key = ?", (session_key,),
             ).fetchone()
             return int(row[0])
-        return self._execute_write(_do)
+        return self._execute_write(_do, skip_result=0)
 
     def reset_hygiene_failure_streak(self, session_key: str) -> None:
         """Clear the persisted session-hygiene failure streak for one chat."""
@@ -853,7 +871,7 @@ class SessionGatewayMixin:
                     (new_session_key, new_json, rowid))
             counts["gateway_routing"] = len(routing)
 
-        self._execute_write(_do)
+        self._execute_write(_do, skip_result={})
         return counts
 
     def purge_profile_state(self, profile: str) -> dict[str, int]:
@@ -925,7 +943,7 @@ class SessionGatewayMixin:
                     "DELETE FROM telegram_dm_topic_bindings "
                     f"WHERE {by_profile}substr(session_key, 1, ?) = ?", params).rowcount
 
-        self._execute_write(_do)
+        self._execute_write(_do, skip_result={})
         return counts
 
     @staticmethod
@@ -1005,7 +1023,7 @@ class SessionGatewayMixin:
                 "DELETE FROM gateway_heartbeats WHERE last_heartbeat < ? RETURNING backend_id",
                 (cutoff,))
             return [str(r[0]) for r in cur.fetchall()]
-        return list(self._execute_write(_do) or [])
+        return list(self._execute_write(_do, skip_result=[]) or [])
 
     def list_backend_heartbeats(self) -> list[dict[str, Any]]:
         """Snapshot of every backend heartbeat (diagnostics/tests); fields mirror the table."""
@@ -1020,8 +1038,7 @@ class SessionGatewayMixin:
             "UPDATE sessions SET handoff_state = 'pending',     handoff_platform = ?, "
             "    handoff_error = NULL WHERE id = ? AND (handoff_state IS NULL "
             "                  OR handoff_state IN ('completed', 'failed'))",
-            (platform, session_id),
-        ) > 0
+            (platform, session_id), session_ids=(session_id,)) > 0
 
     def get_handoff_state(self, session_id: str) -> Optional[dict[str, Any]]:
         """Return ``{"state", "platform", "error"}`` or None if the session has no handoff record."""
@@ -1052,8 +1069,7 @@ class SessionGatewayMixin:
         """Atomically transition pending → running. Returns True if claimed."""
         return self._write_rowcount(
             "UPDATE sessions SET handoff_state = 'running' WHERE id = ? AND handoff_state = 'pending'",
-            (session_id,),
-        ) > 0
+            (session_id,), session_ids=(session_id,)) > 0
 
     def has_pending_handoffs(self) -> bool:
         """Bounded existence probe for the handoff watcher's idle gate (the gate fails open on error)."""
@@ -1063,7 +1079,7 @@ class SessionGatewayMixin:
         """Mark a handoff as completed."""
         self._write_sql(
             "UPDATE sessions SET handoff_state = 'completed', handoff_error = NULL WHERE id = ?",
-            (session_id,))
+            (session_id,), session_ids=(session_id,))
 
     def fail_handoff(
         self, session_id: str, error: str, *, only_states: Optional[tuple[str, ...]] = None) -> bool:
@@ -1077,7 +1093,7 @@ class SessionGatewayMixin:
         states = tuple(only_states) if only_states else ()
         sql = _HANDOFF_FAIL_SQL + "id = ?" + (
             f" AND handoff_state IN ({', '.join('?' for _ in states)})" if states else "")
-        return self._write_rowcount(sql, (error[:500], session_id, *states)) > 0
+        return self._write_rowcount(sql, (error[:500], session_id, *states), session_ids=(session_id,)) > 0
 
     def reclaim_stale_running_handoffs(self, error: str) -> list[str]:
         """Fail every handoff stuck in ``running``; returns the ids reclaimed. Only the gateway watcher sets
@@ -1094,7 +1110,7 @@ class SessionGatewayMixin:
                 conn.execute(_HANDOFF_FAIL_SQL + "handoff_state = 'running'", (error[:500],))
             return ids
         try:
-            return self._execute_write(_do) or []
+            return self._execute_write(_do, skip_result=[]) or []
         except Exception:
             # Swallow but never silently: a persistently failing reclaim leaves poisonous
             # 'running' rows in place, so the operator needs a trace.

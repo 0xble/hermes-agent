@@ -110,8 +110,8 @@ class SessionTitlesMixin:
         return bool(self._execute_write(
             lambda conn: self._set_session_title_in_transaction(
                 conn, session_id, title, source=source, reject_auto_collision=reject_auto_collision,
-            )
-        ))
+            ),
+            session_ids=(session_id,), skip_result=False))
 
     def _set_session_title_in_transaction(self, conn, session_id: str, title: str, *, source: str,
                                           reject_auto_collision: bool = False):
@@ -271,8 +271,7 @@ class SessionTitlesMixin:
         if source not in self._TITLE_SOURCE_RANK:
             raise ValueError(f"invalid title source: {source!r}")
         return self._write_rowcount(
-            "UPDATE sessions SET title_source = ? WHERE id = ? AND title IS NOT NULL", (source, session_id)
-        ) > 0
+            "UPDATE sessions SET title_source = ? WHERE id = ? AND title IS NOT NULL", (source, session_id), session_ids=(session_id,)) > 0
 
     def get_session_by_title(self, title: str) -> Optional[dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""

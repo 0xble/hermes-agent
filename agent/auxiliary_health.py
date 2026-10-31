@@ -21,6 +21,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from agent.incognito import persistence_admission
+from agent.incognito import is_incognito, private_state
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_constants import get_hermes_home, hermes_home_key
 from utils import atomic_write_text
@@ -67,6 +69,7 @@ _LOCK_NAME = ".auxiliary_route_health.lock"
 _MAX_RECORD_SECONDS = 31 * 86_400
 _STALE_GRACE_SECONDS = 600.0
 _PROBE_NONCE = uuid.uuid4().hex
+_private_lock = threading.RLock()
 
 
 def _probe_owner() -> str:
@@ -198,6 +201,8 @@ def _load_state(path: Path) -> dict[str, Any]:
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
+    if is_incognito():
+        return
     routes = state.get("routes") or {}
     if routes:
         atomic_write_text(
@@ -213,27 +218,39 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
 
 @contextmanager
 def _locked_state() -> Iterator[tuple[Path, dict[str, Any]]]:
-    path = _state_path()
-    lock_path = _lock_path()
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        try:
-            import fcntl
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            unlock = lambda: fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        except ImportError:  # pragma: no cover - Windows-only branch
-            import msvcrt
-            lock_file.seek(0, os.SEEK_END)
-            if lock_file.tell() == 0:
-                lock_file.write(" ")
-                lock_file.flush()
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
-            unlock = lambda: (lock_file.seek(0), msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1))  # type: ignore[attr-defined]
-        try:
-            yield path, _load_state(path)
-        finally:
-            unlock()
+    # Admission and the complete short file transaction share the transition
+    # lock, as state.db writes do. No provider request runs inside this boundary.
+    with persistence_admission():
+        private = private_state("auxiliary_route_health")
+        if private is not None:
+            # The shared read path also creates locks, repairs and prunes. Keep
+            # the entire transaction in RAM, not just its final write.
+            with _private_lock:
+                private.setdefault("version", _STATE_VERSION)
+                private.setdefault("routes", {})
+                yield _state_path(), private
+            return
+        path = _state_path()
+        lock_path = _lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            try:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                unlock = lambda: fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except ImportError:  # pragma: no cover - Windows-only branch
+                import msvcrt
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(" ")
+                    lock_file.flush()
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
+                unlock = lambda: (lock_file.seek(0), msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1))  # type: ignore[attr-defined]
+            try:
+                yield path, _load_state(path)
+            finally:
+                unlock()
 
 
 def _prune(state: dict[str, Any], now: float) -> bool:

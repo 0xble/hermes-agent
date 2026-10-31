@@ -323,3 +323,30 @@ def test_rows_without_a_persisted_class_still_match_their_resend(tmp_path):
     assert store.held_payload("t", "send", resend)
     assert store.held_payload("t", "send", {**legacy, "_outbound_class": OUTBOUND_NOTICE})
     assert not store.held_payload("t", "send", {**resend, "content": "other"})
+
+
+@pytest.mark.asyncio
+async def test_private_and_public_stores_for_one_home_keep_separate_sweeps(tmp_path, monkeypatch):
+    """A private RAM outbox shares the public path as its namespace only; a deferral in one
+    store must never occupy, or strand replies behind, the other store's sweep slot."""
+    from agent.incognito import incognito_scope
+    from gateway.incognito import discard_private_topic, transition_scope
+
+    parked = asyncio.Event()
+
+    async def park(store, adapter, profile, key, wake):
+        await parked.wait()
+
+    monkeypatch.setattr(outbox, "_deferred_sweep", park)
+    public = Outbox(tmp_path)
+    with transition_scope("private-topic"), incognito_scope(True, "private-topic"):
+        private = Outbox(tmp_path, private=True)
+    adapter = _Adapter()
+    try:
+        assert public.path == private.path and public.identity != private.identity
+        await _schedule_retry(public, adapter)
+        await _schedule_retry(private, adapter)
+        assert len(outbox._SWEEPS) == 2
+    finally:
+        parked.set()
+        discard_private_topic("private-topic")

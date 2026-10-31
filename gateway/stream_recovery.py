@@ -98,6 +98,12 @@ def _journal(op, *, busy_timeout_ms=_PREVIEW_BUSY_TIMEOUT_MS):
     from hermes_cli.sqlite_util import open_db, transaction
 
     path = str(ledger._db_path())
+    from agent.incognito import is_incognito
+    if is_incognito():
+        from contextlib import closing
+        from gateway.incognito import ram_connect
+        with closing(ram_connect("previews:" + path, _prepare_journal)) as conn:
+            return op(conn)
     for attempt in (0, 1):
         with _prepared_lock:
             prepare = path not in _prepared_paths

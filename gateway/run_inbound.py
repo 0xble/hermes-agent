@@ -256,11 +256,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if notifier.first_time(platform_name, source.user_id) and getattr(self, "config", None) is not None:
             await notifier.notify(self, source, hint)
 
-    async def _hm_admit_event(
-        self, event: MessageEvent
-    ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
-        """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
-        (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+    def _hm_preflight_event(self, event: MessageEvent) -> bool:
+        """Apply content-free identity/channel gates before privacy or session lookup."""
         from gateway.run import _is_slack_ignored_channel
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
@@ -287,7 +284,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             with suppress(Exception):
                 _intake = self._intake_adapter_for(source)
             drop_rejected_route(_intake, source)  # a parked target is also refused to the sender
-            return None
+            return False
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
 
@@ -306,7 +303,18 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             and _is_slack_ignored_channel(_config, _chat_id, _slack_adapter)
         ):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
+            return False
+        return True
+
+    async def _hm_admit_event(
+        self, event: MessageEvent
+    ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
+        """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
+        (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+        if not self._hm_preflight_event(event):
             return None
+        source = event.source
+        is_internal = bool(getattr(event, "internal", False))
 
         # Capture before any admission buffer can park input for shutdown spooling,
         # including restore gates, compression deferral, and orphan FIFO rescue.
@@ -1801,23 +1809,36 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         from agent.delegation_context import top_level_delegation_context
+        from gateway.incognito import event_scope, transition_pending, slash_refusal
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
-        token = scoped_turn_entry()
-        result = None
-        try:
-            with top_level_delegation_context():
-                result = await self._handle_admitted_message(event)
-            return result
-        finally:
-            turn_id = getattr(event, "_outbox_turn_id", None)
-            try:
-                if (turn_id and not getattr(event, "_outbox_duplicate", False)
-                        and not getattr(event, "_gateway_compression_deferred", False)):
-                    await asyncio.to_thread(
-                        store_for(event._outbox_home).finish_admission,
-                        turn_id, "completed" if result is not None else "empty")
-            finally:
-                restore_turn(token)
+        # Preflight resets the task's session identity for this fresh turn, so it runs
+        # inside the scope that restores an inline caller's identity afterward.
+        with top_level_delegation_context():
+            if not self._hm_preflight_event(event):
+                return None
+            async with event_scope(self, event):
+                refusal = slash_refusal(event)
+                if refusal is not None:
+                    return refusal
+                key_for = getattr(self, "_session_key_for_source", None)
+                key = key_for(event.source) if callable(key_for) else None
+                if isinstance(key, str) and transition_pending(key):
+                    return "Incognito is switching. Retry this message after the confirmation."
+                token = scoped_turn_entry()
+                result = None
+                try:
+                    result = await self._handle_admitted_message(event)
+                    return result
+                finally:
+                    turn_id = getattr(event, "_outbox_turn_id", None)
+                    try:
+                        if (turn_id and not getattr(event, "_outbox_duplicate", False)
+                                and not getattr(event, "_gateway_compression_deferred", False)):
+                            await asyncio.to_thread(
+                                store_for(event._outbox_home).finish_admission,
+                                turn_id, "completed" if result is not None else "empty")
+                    finally:
+                        restore_turn(token)
 
     async def _hm_busy_preempt(self, event: MessageEvent, source: SessionSource, _quick_key: str) -> bool:
         """busy_input_mode for a follow-up the durable FIFO is about to admit, through main's own busy
@@ -1845,6 +1866,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         (preempted, plugin-consumed or admitted to its durable FIFO); ``(False, None)`` to continue
         on the in-process path. Raises ``RuntimeStoreError('profile_mismatch')`` for a scope this
         process does not serve."""
+        # Durable admission stores the full input envelope. Private lanes retain the
+        # normal in-process serialization and RAM session/outbox owners instead.
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return False, None
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
         from gateway.session_ingress import admit_message, executing_admission

@@ -9,6 +9,7 @@ from agent.topic_icons import (
     validate_model_icon,
     validate_ranked_icons,
 )
+from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -97,7 +98,7 @@ def test_topic_service_messages_are_routed_to_the_manual_icon_recorder(monkeypat
 async def test_forum_topic_edited_records_manual_icon_for_private_chat():
     from types import SimpleNamespace
 
-    adapter = object.__new__(TelegramAdapter)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._manual_topic_icons = {}
     message = SimpleNamespace(
         chat=SimpleNamespace(id=42, type="private"), message_thread_id=7,
@@ -111,7 +112,7 @@ async def test_forum_topic_edited_records_manual_icon_for_private_chat():
 async def test_bots_own_topic_edit_echo_is_not_recorded_as_manual():
     from types import SimpleNamespace
 
-    adapter = object.__new__(TelegramAdapter)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._manual_topic_icons = {}
     adapter._auto_topic_icons_written = {}
     adapter._bot = type("Bot", (), {"edit_forum_topic": AsyncMock()})()
