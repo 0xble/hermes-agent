@@ -1338,6 +1338,9 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:  # resolves _run_review_in_thread at call time (tests patch it)
+        from agent.incognito import is_incognito
+        if getattr(agent, "incognito", False) or is_incognito(getattr(agent, "session_id", None)):
+            return
         _run_review_in_thread(
             agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
             review_memory=review_memory, explicit=explicit)

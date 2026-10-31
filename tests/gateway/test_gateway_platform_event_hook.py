@@ -82,7 +82,7 @@ def _reaction(*, emoji=None, custom_emoji_id=None):
 
 def _reaction_update(reactions, chat_id: object = 123, message_id: object = 456):
     """A PTB Update stand-in carrying a message_reaction with ``reactions``."""
-    update = MagicMock()
+    update = MagicMock(message=None, effective_message=None, callback_query=None)
     update.message_reaction = MagicMock()
     update.message_reaction.chat.id = chat_id
     update.message_reaction.message_id = message_id
@@ -246,7 +246,7 @@ class TestNormalizePlatformEvent:
     def test_non_reaction_update_returns_none(self):
         """Unsupported update types return None until a concrete contract exists."""
         a = _adapter()
-        update = MagicMock()
+        update = MagicMock(message=None, effective_message=None, callback_query=None)
         update.message_reaction = None  # e.g. a chat_member update
         update.edited_message = None
 
@@ -266,7 +266,7 @@ def _edited_update(
     chat_type: str = "private",
 ):
     """A PTB Update stand-in carrying an edited_message."""
-    update = MagicMock()
+    update = MagicMock(message=None, effective_message=None, callback_query=None)
     update.message_reaction = None
     m = MagicMock()
     m.chat.id = chat_id
@@ -282,6 +282,7 @@ def _edited_update(
     m.from_user.username = "editor"
     m.from_user.full_name = "Editor"
     update.edited_message = m
+    update.effective_message = m
     return update
 
 
@@ -413,7 +414,7 @@ class TestOnPlatformUpdate:
             seen.append((event, source))
         a.set_platform_event_handler(observe)
 
-        update = MagicMock()
+        update = MagicMock(message=None, effective_message=None, callback_query=None)
         update.message_reaction = None
         asyncio.run(a._on_platform_update(update, context=MagicMock()))
 
@@ -431,7 +432,9 @@ class TestOnPlatformUpdate:
             raise RuntimeError("malformed update")
 
         a._normalize_platform_event = boom  # type: ignore[assignment]
-        asyncio.run(a._on_platform_update(MagicMock(), context=MagicMock()))  # must not raise
+        asyncio.run(a._on_platform_update(
+            MagicMock(message=None, effective_message=None, callback_query=None), context=MagicMock(),
+        ))  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +466,7 @@ class TestOnPlatformUpdateAuthBoundary:
             seen.append((event, source))
         a.set_platform_event_handler(observe)
 
-        update = MagicMock()
+        update = MagicMock(message=None, effective_message=None, callback_query=None)
         update.message_reaction = None  # a future, not-yet-wired event type
         update.edited_message = None
         # Simulate that future normalization produced an event for it.

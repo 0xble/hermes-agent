@@ -55,6 +55,11 @@ def _ensure_directory(path: Path, *, create: bool, secure: bool, home: Path) -> 
 
 def initialize_home(home: Path, subdirs: tuple[str, ...], ensured: set[str]) -> None:
     from hermes_cli.config import _ensure_default_soul_md, is_managed
+    from agent.incognito import is_incognito
+
+    # Reading a private route must not seed notes or mark a home initialized.
+    if is_incognito():
+        return
 
     managed = is_managed()
     old_umask = os.umask(0o007) if managed else None

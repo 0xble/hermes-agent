@@ -177,7 +177,7 @@ def destructive_ops(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _background_delete_gate(store, action, operations, target="memory", content=None,
-                            old_text=None) -> Tuple[Optional[str], bool]:
+                            old_text=None) -> tuple[Optional[str], bool]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
     stays available (it is all any review prompt asks for), while ``patch``/``remove`` —
     single or inside a batch — are never applied unattended. The op is staged in the pending
@@ -201,7 +201,7 @@ def _background_delete_gate(store, action, operations, target="memory", content=
     return _stage_background_delete(store, payload), False
 
 
-def _stage_background_delete(store, payload: Dict[str, Any]) -> str:
+def _stage_background_delete(store, payload: dict[str, Any]) -> str:
     """Stage instead of merely denying: the fork's own review summary is never published
     back, so a plain denial would drop the consolidation request with no surfacing path at
     all. A staging failure fails closed to a plain denial."""
@@ -231,7 +231,7 @@ def _stage_background_delete(store, payload: Dict[str, Any]) -> str:
             "batch); 'add' is still available.", success=False)
 
 
-def _commit_unattended(store, require_durable: bool, payload: Dict[str, Any], commit) -> Tuple[str, str]:
+def _commit_unattended(store, require_durable: bool, payload: dict[str, Any], commit) -> tuple[str, str]:
     """Run *commit*; a durable-path admission must find a durable observer in the snapshot
     the commit itself uses, else nothing is written and the op is staged as at admission."""
     if not require_durable:
@@ -252,6 +252,9 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
     """Tool entry point; returns a JSON string. Single op (action + content/old_text)
     or batch (``operations``, atomic against the final budget). ``new_text``
     aliases ``content``."""
+    from agent.incognito import is_incognito
+    if is_incognito() or getattr(store, "read_only", False) is True:
+        return tool_error("Memory writes are disabled in incognito mode.", success=False)
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
     token = FAILURE_CLASS.set("other")

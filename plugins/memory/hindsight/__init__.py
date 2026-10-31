@@ -15,6 +15,7 @@ import atexit
 import collections
 import concurrent.futures
 import contextlib
+from contextvars import ContextVar
 import itertools
 import json
 import logging
@@ -24,11 +25,11 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, PrefetchGeneration, RecallStatus, spawn_context_thread
+from agent.memory_provider import MemoryProvider, PrefetchGeneration, RecallStatus, ctx_bound, spawn_context_thread
 from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import cfg_get
 from hermes_constants import get_hermes_home
@@ -53,6 +54,21 @@ from .settings import (
 from .retention import PendingRetainOperation, filter_retain_messages
 
 logger = logging.getLogger(__name__)
+
+# The route (private no-store or public) a queued background recall was requested under.
+# A recall must never take the other route because privacy changed while it waited.
+_QUEUED_PRIVATE_ROUTE: ContextVar[bool | None] = ContextVar("hindsight_queued_private_route", default=None)
+# A ``_do_recall`` count meaning automatic private recall was refused, not empty.
+_RECALL_REFUSED = -1
+
+
+@contextlib.contextmanager
+def _public_route():
+    token = _QUEUED_PRIVATE_ROUTE.set(False)
+    try:
+        yield
+    finally:
+        _QUEUED_PRIVATE_ROUTE.reset(token)
 
 _LOCAL_MODES = {"local", "local_embedded"}
 # Retain retry bounds: a failed job is retried with exponential backoff up to this many
@@ -119,7 +135,7 @@ def _cloud_api_key(config: dict) -> str:
 # per process so every provider on the same API+key shares one /version round trip. A failed probe
 # caches False, so the key must include the credential or one profile's 401 would silently downgrade
 # a sibling profile that shares the URL with a valid key.
-_append_capability_cache: Dict[tuple[str, str | None], bool] = {}
+_append_capability_cache: dict[tuple[str, str | None], bool] = {}
 _append_capability_lock = threading.Lock()
 
 
@@ -132,7 +148,7 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
     url = api_url.rstrip("/") + "/version"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as exc:
         logger.debug("Hindsight /version probe failed for %s: %s", url, exc)
@@ -353,7 +369,7 @@ class HindsightMemoryProvider(MemoryProvider):
     _RETAIN_OP_POLL_INTERVAL_S = 0.5
     _RETAIN_LATE_POLL_INTERVAL_S = 5.0
 
-    def backup_paths(self) -> List[str]:
+    def backup_paths(self) -> list[str]:
         """Legacy shared config + embedded-mode profile env files live under ~/.hindsight."""
         with contextlib.suppress(Exception):
             return [str(Path.home() / ".hindsight")]
@@ -390,7 +406,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._sync_thread = None  # legacy alias external callers may join; points at the writer
         self._shutting_down = threading.Event()
         self._atexit_registered = False
-        self._retain_tags: List[str] = []
+        self._retain_tags: list[str] = []
         self._tags: list[str] | None = None
         self._retain_source = _DEFAULT_RETAIN_SOURCE
         self._retain_strategy = _DEFAULT_RETAIN_STRATEGY
@@ -421,6 +437,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_running = False
         self._prefetch_pending = None
         self._last_recall_returned, self._last_recall_count = False, 0
+        self._last_recall_refused = False
         self._apply_recall_settings({})
 
     @property
@@ -570,6 +587,18 @@ class HindsightMemoryProvider(MemoryProvider):
         """Run an async client operation; for local_embedded, a stale-daemon
         connection failure recreates the client and retries once. A *timeout* is one budget
         for the whole operation: the retry gets only what the first attempt left, or none."""
+        private = _QUEUED_PRIVATE_ROUTE.get()
+        if private is None:
+            private = self.read_only
+        if private:
+            from agent.incognito import incognito_scope
+            from .private_reads import PrivateReadClient
+            with incognito_scope(True, getattr(self, "_session_id", None)):
+                client = PrivateReadClient(base_url=self._api_url, api_key=self._api_key,
+                                           timeout=float(self._timeout or _DEFAULT_TIMEOUT),
+                                           session_id=str(getattr(self, "_session_id", "") or ""),
+                                           epoch=getattr(self, "_privacy_epoch", 0))
+                return self._run_sync(operation(client), timeout=timeout)
         deadline = None if timeout is None else time.monotonic() + timeout
         try:
             return self._run_sync(operation(self._get_client()), keep_pending=keep_pending, timeout=timeout)
@@ -593,7 +622,10 @@ class HindsightMemoryProvider(MemoryProvider):
             return
         # A previous writer may have exited after shutdown(); allow the fresh one to drain.
         self._shutting_down.clear()
-        thread = spawn_context_thread(self._writer_loop, name="hindsight-writer")
+        # The dispatcher outlives its initiating turn. Each job below carries its
+        # own provenance, while the dispatcher keeps the owning profile/secrets.
+        from agent.incognito import shared_worker_context
+        thread = shared_worker_context().run(spawn_context_thread, self._writer_loop, name="hindsight-writer")
         self._writer_thread = self._sync_thread = thread
         thread.start()
 
@@ -757,9 +789,9 @@ class HindsightMemoryProvider(MemoryProvider):
         server-side async ops complete (async retain returns on acceptance, not
         durability). False on timeout/shutdown."""
         deadline = None if timeout <= 0 else time.monotonic() + timeout
-        expired = lambda: deadline is not None and time.monotonic() >= deadline  # noqa: E731
+        expired = lambda: deadline is not None and time.monotonic() >= deadline
         # The budget bounds each status request and poll sleep too, not only the loop checks.
-        remaining = lambda: None if deadline is None else max(0.0, deadline - time.monotonic())  # noqa: E731
+        remaining = lambda: None if deadline is None else max(0.0, deadline - time.monotonic())
         # A failed retain leaves the queue (task_done) but stays in the retry backlog until it
         # succeeds or is abandoned, so the backlog is part of the barrier too.
         while self._retain_queue.unfinished_tasks > 0 or self._retain_backlog:
@@ -1070,19 +1102,21 @@ class HindsightMemoryProvider(MemoryProvider):
         return why is not None
 
     def _recall(self, query: str) -> list:
+        return self._recall_response(query).results or []
+
+    def _recall_response(self, query: str):
         kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         if self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
-        resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-        return resp.results or []
+        return self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
 
     def _apply_bank_missions(self, bank_id: str) -> None:
         """Apply configured ``bank_mission``/``bank_retain_mission`` to *bank_id* through the
         Banks API, once per bank (dynamic banks included). Best effort: a failure is logged
         and not retried, so an unavailable endpoint never taxes every retain."""
-        if not (self._bank_mission or self._bank_retain_mission) or not bank_id:
+        if self.read_only or not (self._bank_mission or self._bank_retain_mission) or not bank_id:
             return
         with self._mission_lock:
             done = self._mission_banks.get(bank_id)
@@ -1096,7 +1130,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # let this caller overtake a slow but successful application.
             done.wait()
             return
-        kwargs: Dict[str, Any] = {"bank_id": bank_id}
+        kwargs: dict[str, Any] = {"bank_id": bank_id}
         if self._bank_mission:
             kwargs["reflect_mission"] = self._bank_mission
         if self._bank_retain_mission:
@@ -1124,11 +1158,13 @@ class HindsightMemoryProvider(MemoryProvider):
             done.set()
 
     def _reflect(self, query: str) -> str | None:
+        return self._reflect_response(query).text
+
+    def _reflect_response(self, query: str):
         self._apply_bank_missions(self._bank_id)
-        resp = self._run_hindsight_operation(
+        return self._run_hindsight_operation(
             lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget)
         )
-        return resp.text
 
     def _owner_subject_query(self, query: str) -> str | None:
         """The owner-anchored twin of a first-person query, or None when it doesn't apply.
@@ -1201,11 +1237,17 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
+            from .private_reads import PrivateReadError
+            if isinstance(e, PrivateReadError):
+                # Content-free by construction. Report it instead of a silent empty recall.
+                logger.warning("Hindsight private recall refused: %s", e)
+                return "", _RECALL_REFUSED
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
             return "", 0
 
     def _finish_prefetch(self, result: str, count: int) -> str:
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
+        self._last_recall_refused = count == _RECALL_REFUSED
         self._last_recall_returned, self._last_recall_count = bool(result), count if result else 0
         if not result:
             logger.debug("Prefetch: no results available")
@@ -1240,6 +1282,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def recall_status(self) -> Optional[RecallStatus]:
         """Count injected by the last prefetch; None if nothing injected or ``recall_indicator=false``."""
+        if self._last_recall_refused:
+            # A degraded private recall is shown even with the count indicator off.
+            return RecallStatus(provider_label="Hindsight", count=0, glyph=_HINDSIGHT_GLYPH,
+                                detail="private recall unavailable, no memories used")
         if not self._recall_indicator or not self._last_recall_returned:
             return None
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
@@ -1266,7 +1312,7 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._shutting_down.is_set():
                 return
             generation = self._prefetch_generation.begin(self._reset_prefetch_result)
-            self._prefetch_pending = (query, generation)
+            self._prefetch_pending = (query, generation, self.read_only)
             if self._prefetch_running:
                 return
             self._prefetch_running = True
@@ -1287,7 +1333,8 @@ class HindsightMemoryProvider(MemoryProvider):
                     if pending is None or self._shutting_down.is_set():
                         self._prefetch_running = False
                         return
-                query, generation = pending
+                query, generation, private = pending
+                route = _QUEUED_PRIVATE_ROUTE.set(private)
                 try:
                     if self._prefetch_waits_for_retain:
                         self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
@@ -1299,9 +1346,12 @@ class HindsightMemoryProvider(MemoryProvider):
                     text, count = self._do_recall(query)
                     with self._prefetch_generation.publishing(generation) as current:
                         if current:
-                            self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
+                            self._prefetch_result, self._prefetch_count = (
+                                (text, count) if text or count == _RECALL_REFUSED else ("", 0))
                 except Exception:
                     logger.debug("Hindsight prefetch failed", exc_info=True)
+                finally:
+                    _QUEUED_PRIVATE_ROUTE.reset(route)
         except BaseException:
             # A BaseException escaping the worker must not leave ``_prefetch_running`` stuck True,
             # or every later queue_prefetch() would wait on a worker that no longer exists.
@@ -1313,13 +1363,13 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- retain ------------------------------------------------------------------
 
     def _build_turn_messages(self, user_content: str, assistant_content: str, *,
-                             display_kind: Optional[str] = None, platform: Optional[str] = None) -> List[Dict[str, str]]:
+                             display_kind: Optional[str] = None, platform: Optional[str] = None) -> list[dict[str, str]]:
         user_content, assistant_content = filter_retain_messages(
             user_content, assistant_content, display_kind=display_kind, platform=platform)
         if not user_content and not assistant_content:
             return []
         now = _event_timestamp()  # one turn -> both messages share the event timestamp
-        messages: List[Dict[str, str]] = []
+        messages: list[dict[str, str]] = []
         for role, prefix, content in (
             ("user", self._retain_user_prefix, user_content),
             ("assistant", self._retain_assistant_prefix, assistant_content),
@@ -1328,10 +1378,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 messages.append({"role": role, "content": f"{prefix}: {content}", "timestamp": now})
         return messages
 
-    def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
-        metadata: Dict[str, str] = {
+    def _build_metadata(self, *, message_count: int, turn_index: int) -> dict[str, str]:
+        metadata: dict[str, str] = {
             # UTC write/audit time (event time lives on the item timestamp).
-            "retained_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "retained_at": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "message_count": str(message_count),
             "turn_index": str(turn_index),
         }
@@ -1341,12 +1391,12 @@ class HindsightMemoryProvider(MemoryProvider):
         return metadata
 
     def _build_retain_kwargs(self, content: str, *, context: str | None = None,
-                             metadata: Dict[str, str] | None = None, tags: List[str] | None = None,
-                             occurred_at: str | None = None, update_mode: str | None = None) -> Dict[str, Any]:
+                             metadata: dict[str, str] | None = None, tags: list[str] | None = None,
+                             occurred_at: str | None = None, update_mode: str | None = None) -> dict[str, Any]:
         """Build one aretain_batch item. The server resolves occurred_start/end (incl.
         relative phrases in content) from the item timestamp: explicit occurred_at
         wins, else the configured event clock."""
-        item: Dict[str, Any] = {
+        item: dict[str, Any] = {
             # See #93568.
             "content": content,
             "metadata": metadata or self._build_metadata(message_count=1, turn_index=self._turn_index),
@@ -1365,10 +1415,17 @@ class HindsightMemoryProvider(MemoryProvider):
                       retain_async: bool | None = None, keep_pending: Callable[[Any], None] | None = None):
         """Dispatch one item via aretain_batch (bank_id/document_id/retain_async are
         call-level args, never item keys)."""
+        # A job queued while public keeps its public route after a later boundary.
+        private = _QUEUED_PRIVATE_ROUTE.get()
+        if private is None:
+            private = self.read_only
+        if private:
+            return None
         self._apply_bank_missions(bank_id)
-        kwargs: Dict[str, Any] = {"bank_id": bank_id, "items": [item], "document_id": document_id, "retain_async": retain_async}
+        kwargs: dict[str, Any] = {"bank_id": bank_id, "items": [item], "document_id": document_id, "retain_async": retain_async}
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs), keep_pending=keep_pending)
+        return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs),
+                                             keep_pending=keep_pending)
 
     def _make_turn_retain_job(self, turns: list[str], *, document_id: str, update_mode: str | None,
                               label: str, track_ops: bool = True) -> Callable[[], None]:
@@ -1399,8 +1456,13 @@ class HindsightMemoryProvider(MemoryProvider):
         # A timed-out send keeps running on the shared loop. Re-sending it while it may still land
         # would append the same turns twice, so a retry first settles the earlier attempt.
         in_flight: list = []
+        # Snapshotted public turns stay public. A job built while private never sends.
+        route = _QUEUED_PRIVATE_ROUTE.get()
+        built_private = self.read_only if route is None else route
 
         def _job() -> None:
+            if built_private:
+                return
             if in_flight:
                 earlier = in_flight[0]
                 # Give the earlier send one more timeout to settle, then judge it by its own outcome
@@ -1489,15 +1551,46 @@ class HindsightMemoryProvider(MemoryProvider):
             self._session_turns.clear()
             self._last_retained_turn_count = 0
 
-    def _enqueue_retain(self, job: Callable[[], None]) -> None:
-        """Hand *job* to the (lazily started) writer and arm the atexit drain."""
+    def _privacy_changed(self) -> None:
+        # Recall queued or buffered under the other privacy state never crosses the boundary.
+        self.discard_prefetch()
+        if not getattr(self, "_read_only", False):
+            return
+        # Entering private: buffered public turns are public work. Queue the unsent tail now,
+        # on the public route, instead of holding it in a buffer the interval cannot flush.
+        if (not self._shutting_down.is_set() and not self._cron_skipped and self._auto_retain
+                and self._session_turns and self._turn_counter % self._retain_every_n_turns):
+            document_id, update_mode = self._resolve_retain_target(self._document_id)
+            start = self._last_retained_turn_count if update_mode == "append" else 0
+            turns = list(self._session_turns[start:])
+            if turns:
+                with _public_route():
+                    job = self._make_turn_retain_job(turns, document_id=document_id,
+                                                     update_mode=update_mode, label="flush-on-private")
+                self._enqueue_retain(job, public=True)
+                if update_mode == "append":
+                    self._session_turns.clear()
+                    self._last_retained_turn_count = 0
+
+    def _enqueue_retain(self, job: Callable[[], None], *, public: bool = False) -> None:
+        """Hand *job* to the (lazily started) writer and arm the atexit drain.
+
+        Only public work is queued, and it keeps the public route when it runs or retries
+        after a privacy boundary. ``public`` is for the boundary's own flush of public turns.
+        """
+        if self.read_only and not public:
+            return
+        original_job = job
+        def guarded_job():
+            with _public_route():
+                original_job()
         self._ensure_writer()
         self._register_atexit()
-        self._retain_queue.put(job)
+        self._retain_queue.put(ctx_bound(guarded_job))
 
     # -- tools -------------------------------------------------------------------
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         if self._memory_mode == "context" or self._mode == "disabled":
             return []
         if self._cron_skipped:
@@ -1505,6 +1598,8 @@ class HindsightMemoryProvider(MemoryProvider):
         return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
 
     def _tool_retain(self, args: dict) -> str:
+        if self.read_only:
+            return tool_error("Memory writes are disabled in incognito mode.")
         content, context = args["content"], args.get("context")
         item = self._build_retain_kwargs(content, context=context, tags=args.get("tags"),
                                          occurred_at=args.get("occurred_at"))
@@ -1512,23 +1607,34 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._bank_id, len(content), context)
         self._retain_batch(item, bank_id=self._bank_id)
         logger.debug("Tool hindsight_retain: success")
-        return "Memory stored successfully."
+        return json.dumps({"result": "Memory stored successfully."})
 
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                      self._bank_id, len(query), self._budget)
-        results = self._recall(query)
+        response = self._recall_response(query) if self.read_only else None
+        results = (response.results or []) if response is not None else self._recall(query)
         logger.debug("Tool hindsight_recall: %d results", len(results))
-        return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        text = "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        return self._private_tool_result(response, text)
 
     def _tool_reflect(self, args: dict) -> str:
         query = args["query"]
         logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                      self._bank_id, len(query), self._budget)
-        text = self._reflect(query) or ""
+        response = self._reflect_response(query) if self.read_only else None
+        text = (response.text if response is not None else self._reflect(query)) or ""
         logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
-        return text or "No relevant memories found."
+        return self._private_tool_result(response, text or "No relevant memories found.")
+
+    def _private_tool_result(self, response, text: str) -> str:
+        if response is None:
+            return json.dumps({"result": text})
+        from .private_reads import PrivateReadError, PrivateReadResponse
+        if not isinstance(response, PrivateReadResponse):
+            raise PrivateReadError("Private Hindsight read was not acknowledged.")
+        return response.tool_result(text)
 
     # tool name -> (required arg, handler, user-facing failure prefix)
     _TOOL_HANDLERS = {
@@ -1540,6 +1646,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._mode == "disabled":
             return tool_error("Hindsight is disabled (local runtime unavailable).")
+        if self.read_only and tool_name == "hindsight_retain":
+            return tool_error("Memory writes are disabled in incognito mode.")
         if self._cron_skipped and tool_name == "hindsight_retain":
             return tool_error("Hindsight retain is disabled in cron context.")
         if tool_name not in self._TOOL_HANDLERS:
@@ -1548,7 +1656,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if not args.get(required, ""):
             return tool_error(f"Missing required parameter: {required}")
         try:
-            return json.dumps({"result": handler(self, args)})
+            # Every handler returns the native JSON tool envelope. A private read
+            # already carries its dispatch-bound proof and must not be wrapped again.
+            return handler(self, args)
         except Exception as e:
             logger.warning("%s failed: %s", tool_name, e, exc_info=True)
             return tool_error(f"{failure}: {e}")
@@ -1692,6 +1802,6 @@ def register(ctx) -> None:
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
 # The whole block is removed by reverting the commit that added it.
-from dataclasses import dataclass  # noqa: F401,E402
-import importlib  # noqa: F401,E402
+from dataclasses import dataclass
+import importlib
 # ---- END PLUGIN-COMPAT ----

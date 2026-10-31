@@ -830,7 +830,7 @@ def _action_remove(job: dict[str, Any], a: dict[str, Any]) -> str:
     })
 
 
-def _action_pause(job: Dict[str, Any], a: Dict[str, Any]) -> str:
+def _action_pause(job: dict[str, Any], a: dict[str, Any]) -> str:
     run_result = {}
     updated = pause_job(job["id"], reason=a["reason"], run_result=run_result)
     _notify_provider_jobs_changed_safe()
@@ -1120,9 +1120,9 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     job_timezone: Optional[str] = None,
-    failure_deliver: Optional[Union[str, List[str]]] = None,
+    failure_deliver: Optional[str | list[str]] = None,
     keep_pinned_lane: Optional[bool] = None,
-    task_id: str = None,
+    task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -1134,6 +1134,9 @@ def cronjob(
     allow_shrink: bool = False) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
+    from agent.incognito import is_incognito
+    if is_incognito(session_id):
+        return tool_error("Durable cron operations are unavailable in incognito mode.", success=False)
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:
         normalized = (action or "").strip().lower()

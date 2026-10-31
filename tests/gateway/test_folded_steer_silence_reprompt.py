@@ -187,7 +187,7 @@ async def _run(h, finals, *, typed=True, preamble=False, display_kind=None, firs
 
 async def _shape(h, result):
     return await h.runner._hmwa_shape_agent_response(result, h.event.source, history=[],
-        session_entry=SimpleNamespace(session_id=result.get("session_id")), session_key=None,
+        session_entry=SimpleNamespace(session_id=result.get("session_id"), incognito=False), session_key=None,
         _quick_key=SESSION_KEY, run_generation=1, _run_start_session_id=result.get("session_id"),
         _platform_name="telegram", _msg_start_time=0.0, reply_expected=h.event.reply_expected,
         persist_user_display_kind=h.calls[0].persist_user_display_kind)
@@ -320,7 +320,7 @@ async def test_proxy_silence_keeps_fallback_without_retry(harness, monkeypatch, 
     assert remote_run.await_args.kwargs["ephemeral_system_prompt"] is None
     assert result["final_response"] == marker
     shaped = await h.runner._hmwa_shape_agent_response(
-        result, h.event.source, history=[], session_entry=SimpleNamespace(session_id="silence-test"),
+        result, h.event.source, history=[], session_entry=SimpleNamespace(session_id="silence-test", incognito=False),
         session_key=None, _quick_key=SESSION_KEY, run_generation=1, _run_start_session_id="silence-test",
         _platform_name="telegram", _msg_start_time=0.0, reply_expected=None, persist_user_display_kind=None,
     )

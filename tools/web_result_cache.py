@@ -46,6 +46,9 @@ def _web_config() -> dict:
 
 def cache_enabled() -> bool:
     """Both caches honor ``web.cache_enabled`` (default: on)."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return False
     return True if (val := _web_config().get("cache_enabled")) is None else bool(val)
 
 

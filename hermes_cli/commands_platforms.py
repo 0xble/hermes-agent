@@ -386,7 +386,7 @@ _SLACK_VIA_HERMES_ONLY = frozenset({
     "refine", "review", "pause", "whoami", "platform", "profile", "insights", "login",
     "discard",
     # One-time answer to the low-disk prompt; `/hermes autoprune on` reaches it.
-    "autoprune"})
+    "autoprune", "incognito"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

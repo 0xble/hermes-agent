@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
     # attended routing stays disabled; see website/docs/user-guide/configuration.md.
     # model.attended.start_new_sessions defaults true when that opt-in block is present.
     "model": "",
+    # Optional per-topic private route. Empty keeps the current model.
+    "incognito": {"model": ""},
     "providers": {},
     "fallback_providers": [],
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset

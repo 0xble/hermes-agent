@@ -2435,7 +2435,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
-        if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
+        from agent.incognito import is_incognito
+        private = getattr(session_entry, "incognito", False) or is_incognito(session_entry.session_id)
+        if not private and agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
             if session_entry.session_id == _run_start_session_id:
                 session_entry.session_id = agent_result["session_id"]
                 # The held turn lease follows the rotation (persistence writes to the NEW id).
@@ -2771,6 +2773,16 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
         # into a gateway-side write by returning False.
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+        from agent.incognito import is_incognito
+        if is_incognito(sid):
+            if not (agent_failed_early or hidden_reasoning_incomplete or is_context_overflow_failure):
+                # The provider may have compressed the full history in-place. RAM replaces
+                # the private transcript without creating a persistent child or summary.
+                await self.async_session_store.rewrite_transcript(sid, agent_messages)
+                await self._hmwa_store_turn_prompt_tokens(session_key, session_entry.session_key, agent_result)
+                await self._refresh_agent_cache_message_count(session_key, len(agent_messages))
+                return
+            agent_persisted = False
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
         _proxy_user_row_persisted = bool(agent_result.get("_gateway_user_turn_persisted"))
         if _proxy_user_row_persisted:

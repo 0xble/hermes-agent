@@ -1798,6 +1798,12 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         # can't see it; compress_context() sets this flag and the gateway re-baselines as for a split.
         compacted_in_place = bool(getattr(agent, "_last_compaction_in_place", False)) if agent else False
         agent_session_id = getattr(agent, 'session_id', ctx.session_id) if agent else ctx.session_id
+        from agent.incognito import is_incognito
+        if is_incognito(ctx.session_id):
+            rotated = agent_session_id != ctx.session_id
+            if agent is not None and rotated:
+                agent.session_id = ctx.session_id
+            return compacted_in_place or rotated, ctx.session_id, (0 if rotated or compacted_in_place else len(agent_history))
         session_was_split = bool(agent and ctx.session_key and agent_session_id != ctx.session_id)
         if session_was_split:
             logger.info("Session split detected: %s → %s (compression)", ctx.session_id, agent_session_id)
