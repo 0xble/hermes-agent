@@ -82,8 +82,10 @@ not only the command reply.
   error text can echo the prompt, so it never reaches `auth.json` from a private
   turn.
 - A private agent prints nothing to raw stdout. A gateway redirects stdout to
-  `gateway.log`, which the privacy log filter never sees. Status and warnings
-  still reach the user through `status_callback`.
+  `gateway.log`, which the privacy log filter never sees. Agent status output,
+  including turn-recovery diagnostics, goes through `_safe_print`, which owns
+  that guard. New output on a turn path must use it rather than bare `print`.
+  Status and warnings still reach the user through `status_callback`.
 - Async ingress reads the loaded store's published routing index on the event
   loop. Only an unloaded store resolves off-loop. Routing every message through
   the default executor queues ingress behind unrelated jobs and lets held
