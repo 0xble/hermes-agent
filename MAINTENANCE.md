@@ -521,7 +521,13 @@ reviewed patch content without rewriting shared history or advancing the floor.
 Fork-Patch-Backfill: dd8b51a7f52d926fc084cd7e84bc8b72a651ff0f; evidence
 Published upstream maintenance merge `c8d3ae60f4f6` arrived without a trailer.
 New commits still require trailers, including the final squash merge message.
-A trailer proves classification, not functional coverage. Retire a patch only after its
+A trailer proves classification, not functional coverage. Functional coverage is pinned per
+unit on a `Contract tests:` line naming backticked pytest targets (`tests/x.py` or
+`tests/x.py::test_name`) that drive the behaviour through its real boundary. The checker fails
+when a pinned target's file or test is gone, so a sync cannot drop the proof silently; the
+hosted suite runs it. `--list-contract-tests` prints the pinned targets for a focused sync
+run, and `--list-uncovered` lists identity-owning units that still pin none.
+Retire a patch only after its
 regression passes on the selected upstream release without the local implementation.
 Load [runtime ownership](maintenance/runtime-ownership.md) whenever changing
 installation, update/rollback tooling, scheduled procedures, or recovery evidence.

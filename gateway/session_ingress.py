@@ -21,6 +21,9 @@ busy_acceptance = ContextVar('busy_acceptance', default=None)
 # commit task, which command barriers and /restart wait on): ``busy_acceptance`` may already resolve
 # once the input's FIFO position is fixed behind an earlier input of its chat still capturing.
 busy_commit = ContextVar('busy_commit', default=None)
+# Set by a messaging caller to run synchronously once its committed row is still ``queued`` (not yet
+# claimed by a drain), so work it starts is visible before the turn's own preprocessing can run.
+admitted_queued = ContextVar('admitted_queued', default=None)
 # ``_validate_native`` clauses about the message's own content, safe to name to the sender's chat.
 _CONTENT_CLAUSES = frozenset({
     'text', 'auto_skill', 'channel_prompt', 'channel_context', 'reply_expected',
@@ -35,9 +38,10 @@ QUEUE_FULL_REPLY = ('⏳ Too many messages are already waiting in this conversat
 async def admit_message(authority, event):
     from gateway.session_refusals import internal_input, log_internal_refusal, user_notice_due
     from gateway.session_authority import messaging_admission
-    accepted, committed = busy_acceptance.get(), busy_commit.get()
+    accepted, committed, on_queued = busy_acceptance.get(), busy_commit.get(), admitted_queued.get()
     busy_acceptance.set(None)  # the drain task this schedules must not inherit the busy caller's future
     busy_commit.set(None)
+    admitted_queued.set(None)
     ingress = messaging_admission.set(True if accepted is None else accepted)
     try:
         receipt = await authority.admit_native(event)
@@ -87,6 +91,8 @@ async def admit_message(authority, event):
             del adopters[receipt.admission_id]
         return (None if status == 'terminal' or internal_input(event)
                 else pause_notice(authority, receipt.ref, 'unknown_execution'))
+    if on_queued is not None and status == 'queued':
+        on_queued()
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
