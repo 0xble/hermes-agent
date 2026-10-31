@@ -12,6 +12,12 @@ def _flag(parser, *names, help, **kw):
     parser.add_argument(*names, action="store_true", help=help, **kw)
 
 
+def cmd_session_evidence_lazy(args):
+    from hermes_cli.session_evidence import cmd_session_evidence
+
+    return cmd_session_evidence(args)
+
+
 def cmd_sessions_lazy(args, **kwargs):
     """``hermes sessions`` handler; sessions_cmd imports only when the subcommand runs."""
     from hermes_cli.sessions_cmd import cmd_sessions
@@ -28,23 +34,10 @@ def _add_rename_and_discard(sessions_subparsers) -> None:
     add_discard_parser(sessions_subparsers)
 
 
-def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
-    """Attach the ``sessions`` subcommand to ``subparsers``."""
-    sessions_parser = subparsers.add_parser(
-        "sessions", help="Manage session history (list, rename, export, prune, delete)",
-        description="View and manage the SQLite session store")
-    sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
+def _build_state_parser(sessions_subparsers):
+    from hermes_cli.sessions_inspect import cmd_session_state
 
-    from hermes_cli.sessions_inspect import cmd_session_search, cmd_session_state
-
-    search_parser = sessions_subparsers.add_parser("search", help="Search session history and print JSON")
-    search_parser.add_argument("query", help="Session-search query")
-    search_parser.add_argument("--limit", type=int, default=3, help="Maximum sessions (clamped to 1-10)")
-    search_parser.add_argument("--after", help="Inclusive ISO-8601 or relative-duration lower bound")
-    search_parser.add_argument("--before", help="Exclusive ISO-8601 or relative-duration upper bound")
-    search_parser.set_defaults(func=cmd_session_search)
-
-    state_parser = sessions_subparsers.add_parser("state", help="Read bounded session/topic/delivery state as JSON")
+    state_parser = sessions_subparsers.add_parser("state", help="Read session state or stream graph/audit JSONL")
     state_subs = state_parser.add_subparsers(dest="state_action", required=True)
     topic_parser = state_subs.add_parser("resolve-topic", help="Resolve a Telegram topic binding")
     topic_parser.add_argument("--chat-id", required=True)
@@ -59,6 +52,33 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         delivery_selector.add_argument(flag)
     delivery_parser.add_argument("--include-content", action="store_true", help="Include bounded delivery text")
     delivery_parser.set_defaults(func=cmd_session_state, state_action="inspect_delivery")
+
+    inventory_parser = state_subs.add_parser(
+        "inventory", help="Stream every structural session node and raw parent edge as read-only JSONL")
+    inventory_parser.set_defaults(func=cmd_session_evidence_lazy)
+    transcript_parser = state_subs.add_parser(
+        "transcript", help="Stream user/assistant audit rows from one exact segment as read-only JSONL")
+    transcript_parser.add_argument("--session-id", required=True, help="Exact stored session ID, never a prefix or lineage")
+    transcript_parser.set_defaults(func=cmd_session_evidence_lazy)
+
+
+def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
+    """Attach the ``sessions`` subcommand to ``subparsers``."""
+    sessions_parser = subparsers.add_parser(
+        "sessions", help="Manage session history (list, rename, export, prune, delete)",
+        description="View and manage the SQLite session store")
+    sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
+
+    from hermes_cli.sessions_inspect import cmd_session_search
+
+    search_parser = sessions_subparsers.add_parser("search", help="Search session history and print JSON")
+    search_parser.add_argument("query", help="Session-search query")
+    search_parser.add_argument("--limit", type=int, default=3, help="Maximum sessions (clamped to 1-10)")
+    search_parser.add_argument("--after", help="Inclusive ISO-8601 or relative-duration lower bound")
+    search_parser.add_argument("--before", help="Exclusive ISO-8601 or relative-duration upper bound")
+    search_parser.set_defaults(func=cmd_session_search)
+
+    _build_state_parser(sessions_subparsers)
 
     sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions")
     sessions_list.add_argument("--source", help="Filter by source (cli, telegram, discord, etc.)")
