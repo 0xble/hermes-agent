@@ -54,8 +54,7 @@ def _vlines(agent: Any, *lines: str) -> None:
 
 
 def _plines(agent: Any, *lines: str) -> None:
-    """Print each line prefixed with ``agent.log_prefix`` through ``agent._safe_print``, which
-    honours the private-turn stdout guard (provider bodies here can echo the request)."""
+    """Print each line with ``agent.log_prefix`` via ``agent._safe_print`` (private stdout guard)."""
     from gateway.warning_notifications import render_notification
     render_notification(
         lambda: [agent._safe_print(f"{agent.log_prefix}{line}") for line in lines],
