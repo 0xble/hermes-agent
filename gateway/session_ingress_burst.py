@@ -13,6 +13,7 @@ most one uncommitted burst (the next one waits for that commit, main's backpress
 command first waits until every earlier input of that reader has committed (``burst_gate``).
 """
 import asyncio
+import contextvars
 from dataclasses import dataclass, field
 from functools import partial
 import logging
@@ -32,6 +33,9 @@ class _Burst:
     timer: asyncio.Task | None = None
     commit: asyncio.Task | None = None
     absorbed: list = field(default_factory=list)
+    # The head's ingress context, holding its off-loop authorization secrets. The commit runs in
+    # it whoever flushes the burst (its timer, a command, an internal completion).
+    context: contextvars.Context | None = None
 
 
 def _kind(adapter, event):
@@ -140,7 +144,8 @@ async def _dispatch_busy_burst(adapter, runner, event, session_key):
             await asyncio.wait({previous})
         return await dispatch_shared_busy(adapter, event, session_key)
     now = time.monotonic()
-    burst = bursts[session_key] = _Burst(event, asyncio.get_running_loop().create_future(), now, now)
+    burst = bursts[session_key] = _Burst(event, asyncio.get_running_loop().create_future(), now, now,
+                                         context=contextvars.copy_context())
     _arm(adapter, session_key, burst)
     return await _accepted(adapter, burst, event)
 
@@ -179,7 +184,7 @@ def _flush(adapter, session_key, burst):
         if burst.timer is not asyncio.current_task():
             burst.timer.cancel()
         burst.commit = tails[session_key] = _track(adapter, asyncio.create_task(
-            _commit(adapter, session_key, burst, tails.get(session_key))))
+            _commit(adapter, session_key, burst, tails.get(session_key)), context=burst.context))
         burst.commit.add_done_callback(lambda task: tails.get(session_key) is task and tails.pop(session_key))
         burst.commit.add_done_callback(partial(_settle, burst))
     return burst.commit
