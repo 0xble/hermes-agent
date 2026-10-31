@@ -5,10 +5,20 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
 
 ## Required behavior
 
+Fork patch identity: `terminal-background-survival`.
+
 - Cut receipts are written before a `gateway_shutdown` signal or a bounded process
   sweep. They are additive JSON records and do not mutate the live session state.
 - Cut receipts use their own age and count retention budget; they are not evicted
   by the normal completed-result cap.
+- Every local POSIX non-PTY job writes its output and exit status outside the
+  gateway process. Exit markers are published by atomic rename, including managed
+  workers' existing output-log handoffs. Only explicitly opted-in background
+  commands claim restart-safe dispatch and exactly-once delivery. Ordinary jobs
+  retain their existing lifecycle kill policy. Legacy detached jobs whose PID is
+  gone are retained as completed results, with `exit_code=null`, an explicit
+  `exited, status unknown (not collected)` completion, and any available log tail.
+  No missing status is inferred to be success or silently pruned.
 - Only explicitly opted-in local non-PTY background commands may survive a
   gateway restart. The wrapper owns `out.log`, an exit file, and a delivered
   marker in a profile-local directory; it starts a new session and never carries
