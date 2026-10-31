@@ -147,6 +147,43 @@ def _discard_continuation(cli) -> None:
         cli._pending_input.get_nowait()
 
 
+@pytest.mark.parametrize("surface", ["cli", "tui"])
+def test_real_surface_preserves_wait_armed_during_turn(hermes_home, monkeypatch, surface):
+    from hermes_cli import goals
+
+    sid, _db, manager = _new_goal()
+    turn_started_at = time.time() - 10
+    manager.wait_for_seconds(86_400, reason="report is due tomorrow")
+    assert manager.state is not None
+    until = manager.state.waiting_until
+    calls = []
+    _stub_judge(monkeypatch, {"verdict": "continue", "reason": "more work"}, calls)
+    result = {"completed": True, "final_response": "waiting for tomorrow"}
+    if surface == "cli":
+        cli = _cli(manager, user_initiated=True)
+        cli._prompt_start_time = turn_started_at
+        cli._last_turn_result = result
+        cli.conversation_history = [{"role": "assistant", "content": result["final_response"]}]
+        cli._maybe_continue_goal_after_turn()
+        assert cli._pending_input.empty()
+    else:
+        from tui_gateway import server
+
+        monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(server, "_active_goal_manager", lambda _session: manager)
+        monkeypatch.setattr(server, "_plan_goal_compression_recovery", lambda *_a, **_kw: (None, None))
+        followup = server._goal_followup_after_turn(
+            sid, {"session_key": sid, "agent": SimpleNamespace(session_id=sid)},
+            result, "complete", result["final_response"], turn_started_at=turn_started_at,
+        )
+        assert followup is None
+    assert calls == []
+    state = goals.load_goal(sid)
+    assert state is not None
+    assert state.waiting_until == until
+    assert state.turns_used == 0
+
+
 def test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice(
     hermes_home, monkeypatch,
 ):
