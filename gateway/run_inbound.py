@@ -1808,35 +1808,37 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
-        if not self._hm_preflight_event(event):
-            return None
+        from agent.delegation_context import top_level_delegation_context
         from gateway.incognito import event_scope, transition_pending, slash_refusal
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
-        async with event_scope(self, event):
-            from agent.delegation_context import top_level_delegation_context
-            refusal = slash_refusal(event)
-            if refusal is not None:
-                return refusal
-            key_for = getattr(self, "_session_key_for_source", None)
-            key = key_for(event.source) if callable(key_for) else None
-            if isinstance(key, str) and transition_pending(key):
-                return "Incognito is switching. Retry this message after the confirmation."
-            token = scoped_turn_entry()
-            result = None
-            try:
-                with top_level_delegation_context():
-                    result = await self._handle_admitted_message(event)
-                return result
-            finally:
-                turn_id = getattr(event, "_outbox_turn_id", None)
+        # Preflight resets the task's session identity for this fresh turn, so it runs
+        # inside the scope that restores an inline caller's identity afterward.
+        with top_level_delegation_context():
+            if not self._hm_preflight_event(event):
+                return None
+            async with event_scope(self, event):
+                refusal = slash_refusal(event)
+                if refusal is not None:
+                    return refusal
+                key_for = getattr(self, "_session_key_for_source", None)
+                key = key_for(event.source) if callable(key_for) else None
+                if isinstance(key, str) and transition_pending(key):
+                    return "Incognito is switching. Retry this message after the confirmation."
+                token = scoped_turn_entry()
+                result = None
                 try:
-                    if (turn_id and not getattr(event, "_outbox_duplicate", False)
-                            and not getattr(event, "_gateway_compression_deferred", False)):
-                        await asyncio.to_thread(
-                            store_for(event._outbox_home).finish_admission,
-                            turn_id, "completed" if result is not None else "empty")
+                    result = await self._handle_admitted_message(event)
+                    return result
                 finally:
-                    restore_turn(token)
+                    turn_id = getattr(event, "_outbox_turn_id", None)
+                    try:
+                        if (turn_id and not getattr(event, "_outbox_duplicate", False)
+                                and not getattr(event, "_gateway_compression_deferred", False)):
+                            await asyncio.to_thread(
+                                store_for(event._outbox_home).finish_admission,
+                                turn_id, "completed" if result is not None else "empty")
+                    finally:
+                        restore_turn(token)
 
     async def _hm_busy_preempt(self, event: MessageEvent, source: SessionSource, _quick_key: str) -> bool:
         """busy_input_mode for a follow-up the durable FIFO is about to admit, through main's own busy

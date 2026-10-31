@@ -55,7 +55,11 @@ class RuntimeSessionCompressionMixin:
         return self._apply('compression.boundary', {'session_key': session_key, 'source': source})['value']
 
     def get_messages_as_conversation(self, session_id, include_ancestors=False, include_inactive=False,
-                                     repair_alternation=False, include_row_ids=False, include_compacted=False):
+                                     repair_alternation=False, include_row_ids=False, include_compacted=False,
+                                     resident_only=False):
+        if resident_only:
+            # A worker has no resident writer connection; fail like an unavailable local one.
+            raise RuntimeError("Resident session read unavailable")
         return self._apply('compression.history', dict(target=session_id, include_ancestors=include_ancestors,
             include_inactive=include_inactive, repair_alternation=repair_alternation,
             include_row_ids=include_row_ids, include_compacted=include_compacted))['messages']
