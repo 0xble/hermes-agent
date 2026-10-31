@@ -3541,6 +3541,14 @@ def main():
     except Exception:
         pass
 
+    # Reap cua-driver serve processes whose Hermes owner has already died, and
+    # stale hc- sockets. Never raises and never signals a live owner's driver.
+    try:
+        from tools.computer_use.cua_driver_lifetime import sweep_on_startup
+        sweep_on_startup()
+    except Exception:
+        pass
+
     # Checkout changed since last launch → sweep stale __pycache__ once so no
     # process resolves fresh source against old bytecode. Never raises.
     _sweep_stale_bytecode_if_checkout_changed()
