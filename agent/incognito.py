@@ -230,6 +230,54 @@ class _PrivacyFilter(logging.Filter):
         return True
 
 
+def failure_class(exc: BaseException) -> str:
+    """Name a failure without its message: exception type and innermost Hermes frame.
+
+    Exception text, arguments and locals can carry private content. Type names, module
+    names, function names and line numbers come from source code, never from the turn.
+    """
+    import os
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
+    where = "unknown"
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        path = os.path.abspath(frame.f_code.co_filename)
+        if path.startswith(root) and os.sep + "site-packages" + os.sep not in path:
+            module = frame.f_globals.get("__name__")
+            module = module if isinstance(module, str) and re.fullmatch(r"[\w.]+", module) else "?"
+            where = f"{module}.{frame.f_code.co_qualname}:{tb.tb_lineno}"
+        tb = tb.tb_next
+    kind = type(exc)
+    return f"{kind.__module__}.{kind.__qualname__} at {where}"
+
+
+def log_private_failure(logger: logging.Logger, exc: BaseException | None = None, *,
+                        operation: str, reason: str | None = None, session_id: str | None = None) -> None:
+    """Record a content-free failure class when a private turn fails. Public turns are a no-op.
+
+    The privacy filter redacts every record a private scope creates, so this one is
+    created outside it and carries only code-derived names. ``reason`` is accepted only
+    as a classifier token such as ``rate_limit``.
+    """
+    import re
+    if not (is_incognito() or is_incognito(session_id)):
+        return
+    parts = []
+    if exc is not None:
+        parts.append(failure_class(exc))
+    if isinstance(reason, str) and re.fullmatch(r"[a-z0-9_:.-]{1,64}", reason):
+        parts.append(f"reason={reason}")
+    summary = "; ".join(parts) or "unclassified"
+    operation = operation if re.fullmatch(r"[\w .-]{1,40}", operation or "") else "turn"
+
+    def emit():
+        logger.error("Incognito %s failed: %s", operation, summary)
+
+    shared_worker_context().run(emit)
+
+
 _filter = _PrivacyFilter()
 _installed_factory = None
 
