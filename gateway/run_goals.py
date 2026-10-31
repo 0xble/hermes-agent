@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform
 from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
-from hermes_cli.goal_notices import goal_notices_enabled
+from hermes_cli.goal_notices import HIDDEN, notice_level
 from gateway.run_background_admission import BACKGROUND_RESERVATION_ATTR
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 
@@ -36,6 +36,8 @@ _GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
 # wait on Telegram's flood window. The shared short-wait helper owns the 15s budget and 0.5s slack;
 # this attempt cap bounds additional traffic when Telegram keeps extending the penalty.
 _GOAL_NOTICE_MAX_ATTEMPTS = 3
+# Goal card kinds that mean the goal stopped making progress. Hidden ones wake the session.
+_STALL_KINDS = frozenset({"blocked", "paused", "failed"})
 
 
 def _goal_notice_kind(message: str) -> str:
@@ -350,9 +352,42 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
+    async def _hidden_card(self, source: Any, message: str, section: str, stall: Optional[bool]) -> None:
+        """A card ``<section>.notices`` keeps out of chat. Under ``hidden``, a stall card durably
+        wakes the session (hermes_cli/lifecycle_wakes.py) so a stuck goal or loop never goes
+        silent. Other hidden cards only log: the goal or loop row keeps the outcome."""
+        if stall is None:
+            stall = _goal_notice_kind(message) in _STALL_KINDS
+        if not stall or notice_level(section) != HIDDEN:
+            logger.info("%s card hidden: %s", section, message)
+            return
+        session_key = None
+        with suppress(Exception):
+            session_key = self._session_key_for_source(source)
+        store = getattr(self, "session_store", None)
+        if not session_key or store is None:
+            logger.warning("%s stall card hidden with no session to wake: %s", section, message)
+            return
+
+        def record() -> bool:
+            from hermes_cli import lifecycle_wakes
+            entry = store.lookup_by_session_key(session_key)
+            if entry is None:
+                return False
+            return lifecycle_wakes.record_stall(session_key=session_key, session_id=entry.session_id,
+                                                section=section, message=str(message))
+
+        try:
+            queued = await self._run_in_executor_with_context(record)
+        except Exception:
+            logger.warning("%s stall card wake could not be recorded: %s", section, message, exc_info=True)
+            return
+        logger.info("%s stall card hidden; %s: %s", section,
+                    "session wake queued" if queued else "already woke recently", message)
+
     async def _retry_goal_status_notice(
         self, source: Any, message: str, metadata: Any, wait: float, already_waited: float,
-        attempts: int, notice_kind: Optional[str] = None, *, goal_notice: bool = True,
+        attempts: int, notice_kind: Optional[str] = None, *, section: str = "goals",
     ) -> None:
         from gateway.delivery_ledger import short_flood_wait
 
@@ -366,7 +401,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                     notice_kind or _goal_notice_kind(message), attempts,
                 )
                 raise
-            if goal_notice and not goal_notices_enabled():
+            if notice_level(section) != "all":
                 return
             adapter = self._goal_notice_adapter(source)
             if not adapter:
@@ -399,10 +434,16 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         self._log_goal_status_notice_failure(message, error, attempts, notice_kind=notice_kind)
 
     async def _send_goal_status_notice(
-        self, source: Any, message: str, *, notice_kind: Optional[str] = None, goal_notice: bool = True,
+        self, source: Any, message: str, *, notice_kind: Optional[str] = None, section: str = "goals",
+        stall: Optional[bool] = None,
     ) -> None:
-        """Send a /goal judge status line without holding the turn open for flood recovery."""
-        if goal_notice and not goal_notices_enabled():
+        """Send a /goal or /loop status line without holding the turn open for flood recovery.
+
+        ``section`` names the config section whose ``notices`` level gates the card. ``stall``
+        says whether a hidden card must wake the session; None infers it from a goal card's kind.
+        """
+        if notice_level(section) != "all":
+            await self._hidden_card(source, message, section, stall)
             return
         if getattr(source, "platform", None) == Platform.LOCAL:
             # The local adapter's send is a no-op (viewers read the event stream): main's TUI
@@ -445,21 +486,22 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         task = asyncio.create_task(
             self._retry_goal_status_notice(
                 source, message, metadata, wait, wait, attempts=1, notice_kind=notice_kind,
-                goal_notice=goal_notice,
+                section=section,
             ),
             name=f"goal-status-retry:{notice_kind or _goal_notice_kind(message)}",
         )
         self._track_goal_notice_retry(task)
 
     async def _defer_goal_status_notice_after_delivery(
-        self, source: Any, message: str, *, goal_notice: bool = True,
+        self, source: Any, message: str, *, section: str = "goals", stall: Optional[bool] = None,
     ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
         its one-shot post-delivery callback when available, else deliver directly (never drop).
         """
-        if goal_notice and not goal_notices_enabled():
+        if notice_level(section) != "all":
+            await self._hidden_card(source, message, section, stall)
             return
         adapter = self._goal_notice_adapter(source)
         if not adapter:
@@ -469,7 +511,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             try:
                 # Adapters invoke post-delivery callbacks after the turn's profile scope exits.
                 with self._profile_scope_for_source(source):
-                    await self._send_goal_status_notice(source, message, goal_notice=goal_notice)
+                    await self._send_goal_status_notice(source, message, section=section)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -558,7 +600,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             try:
                 await self._send_goal_status_notice(
                     source, f"⏸ Goal paused: {goal}\nUse /goal resume to continue, or /goal clear to end it.",
-                    notice_kind="paused",
+                    notice_kind="paused", stall=False,  # the user's own /stop: never wake the agent
                 )
             except Exception as exc:
                 logger.debug("goal stop: notice failed: %s", exc)
@@ -919,7 +961,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             functools.partial(mgr.complete_tick, final_response or "", tick=loop_tick))
         msg = decision.get("message") or ""
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg, goal_notice=False)
+            # A tick-budget pause or an unachievable stop condition stalls the loop; a finish does not.
+            stall = decision.get("status") == "paused" or (
+                decision.get("status") == "active" and not decision.get("stopped"))
+            await self._defer_goal_status_notice_after_delivery(source, msg, section="loops", stall=stall)
 
     async def _post_command_loop_completion(self, event: Any, source: Any) -> None:
         """Settle only a command dispatch that completed without falling through to model work."""

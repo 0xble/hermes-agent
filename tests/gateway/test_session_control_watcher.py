@@ -730,7 +730,7 @@ async def test_autonomous_goal_outbox_attributes_both_notices_to_autonomy(
     manager = GoalManager("target")
     manager.set("old objective")
     if action == "resume":
-        manager.pause()
+        manager.pause(by="agent")  # the agent's own pause: an autonomous resume never lifts a user one
     result = session_controls.apply_control(
         "goal", action, "target", requester_sid="requester", reason="wait for tests",
         payload={"goal": "new objective"} if action == "replace" else None,

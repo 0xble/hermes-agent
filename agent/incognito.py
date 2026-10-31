@@ -3,7 +3,7 @@
 Only routing metadata belongs in durable session stores. This registry deliberately
 holds no content and is never serialized.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import Context, ContextVar, copy_context
 import logging
 import threading
@@ -228,6 +228,66 @@ class _PrivacyFilter(logging.Filter):
             record.exc_text = None
             record.stack_info = None
         return True
+
+
+_CODE_NAME = r"[\w.<>]{1,200}"
+
+
+def _code_name(value) -> str:
+    """A dotted source-code name, or ``?``. Dynamically built types and code can carry any text."""
+    import re
+    return value if isinstance(value, str) and re.fullmatch(_CODE_NAME, value) else "?"
+
+
+def failure_class(exc: BaseException) -> str:
+    """Name a failure without its message: exception type and innermost Hermes frame.
+
+    Exception text, arguments and locals can carry private content. Only names that
+    match a source-code identifier pattern, and line numbers, are kept.
+    """
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
+    where = "unknown"
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        path = os.path.abspath(frame.f_code.co_filename)
+        if path.startswith(root) and os.sep + "site-packages" + os.sep not in path:
+            module, qualname = _code_name(frame.f_globals.get("__name__")), _code_name(frame.f_code.co_qualname)
+            where = f"{module}.{qualname}:{tb.tb_lineno}"
+        tb = tb.tb_next
+    kind = type(exc)
+    return f"{_code_name(kind.__module__)}.{_code_name(kind.__qualname__)} at {where}"
+
+
+def log_private_failure(logger: logging.Logger, exc: BaseException | None = None, *,
+                        operation: str, reason: str | None = None, session_id: str | None = None) -> None:
+    """Record a content-free failure class when a private turn fails. Public turns are a no-op.
+
+    The privacy filter redacts every record a private scope creates, so this one is
+    created outside it and carries only code-derived names. ``reason`` is accepted only
+    as a classifier token such as ``rate_limit``. Diagnosis is best effort: this never
+    raises into the reply path that calls it.
+    """
+    import re
+    try:
+        if not (is_incognito() or is_incognito(session_id)):
+            return
+        parts = []
+        if exc is not None:
+            parts.append(failure_class(exc))
+        if isinstance(reason, str) and re.fullmatch(r"[a-z0-9_:.-]{1,64}", reason):
+            parts.append(f"reason={reason}")
+        summary = "; ".join(parts) or "unclassified"
+        operation = operation if re.fullmatch(r"[\w .-]{1,40}", operation or "") else "turn"
+
+        def emit():
+            logger.error("Incognito %s failed: %s", operation, summary)
+
+        shared_worker_context().run(emit)
+    except Exception:  # health: allow BLE001 -- diagnosis must never replace the user's reply; its own error may carry content
+        with suppress(Exception):
+            shared_worker_context().run(logger.error, "Incognito failure diagnosis unavailable")
 
 
 _filter = _PrivacyFilter()

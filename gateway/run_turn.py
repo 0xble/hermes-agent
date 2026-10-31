@@ -18,6 +18,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.incognito import log_private_failure
 from agent.notice_style import ContextNotice
 from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import AwakeIdleMeter, format_iteration_progress
@@ -2429,6 +2430,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # Fix for #18765.
         if not _intentional_silence:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
+            if agent_result.get("failed"):
+                log_private_failure(logger, operation="agent turn", reason=agent_result.get("failure_reason"),
+                                    session_id=getattr(session_entry, "session_id", None))
             response = _sanitize_gateway_final_response(
                 source.platform, response, interrupted=bool(agent_result.get("interrupted")),
             )
@@ -2779,8 +2783,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 # The provider may have compressed the full history in-place. RAM replaces
                 # the private transcript without creating a persistent child or summary.
                 await self.async_session_store.rewrite_transcript(sid, agent_messages)
-                await self._hmwa_store_turn_prompt_tokens(session_key, session_entry.session_key, agent_result)
-                await self._refresh_agent_cache_message_count(session_key, len(agent_messages))
+                await self._hmwa_store_turn_prompt_tokens(
+                    store, session_entry.session_key, session_key, agent_result.get("last_prompt_tokens", 0),
+                    getattr(prepared, "hygiene_adoption_epoch", 0),
+                    touch_activity=not bool(getattr(event, "internal", False)),
+                )
+                await self._refresh_agent_cache_message_count(session_key, sid)
                 return
             agent_persisted = False
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
@@ -3012,6 +3020,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # A private turn's record above is redacted whole; keep a content-free class for diagnosis.
+        log_private_failure(logger, e, operation="agent turn", session_id=getattr(session_entry, "session_id", None))
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
