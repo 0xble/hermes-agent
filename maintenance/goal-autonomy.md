@@ -82,7 +82,7 @@ shipped entries, including wordings whose source branches have been retired.
 
 ## Notice Visibility
 
-`goals.notices` defaults to `true`. When false, the shared profile-scoped helper
+`goals.notices` and `loops.notices` default to `true`. When `goals.notices` is false, the shared profile-scoped helper
 suppresses routine gateway lifecycle output, automatic CLI/TUI revival, barrier
 and judge output, and every persisted `goal_set` receipt, including completion.
 The legacy `goals.auto_notices` preference still independently controls inline
@@ -97,6 +97,23 @@ perform normal cleanup, continuation admission, supersession checks and expiry.
 Reconnect does not replay the skipped notices. Quote, button and session
 authorities retain their outcome replies. Visibility never authorizes a mutation
 or bypasses evidence, inherited requirements or wake fences.
+
+`loops.notices: false` hides loop outcome cards and `loop_set` receipts the same
+way, and settles autonomous loop control receipts like goal ones.
+
+`notices: none` (per section) hides every automatic card for that lifecycle in the
+gateway. That covers achieved, failed, blocked and paused outcomes, loop
+completion and backstop cards, `goal_set`/`loop_set` receipts and the target's
+session-control receipt for every authority. Approval cards cannot be answered
+while hidden, so `request_control` refuses with `approval_cards_hidden` and asks
+the agent to quote the user's words, and the watcher fails any older unposted
+request with the same code. A requester that was not the autonomous actor still
+receives the outcome injection. Replies to the user's own `/goal` and `/loop`
+commands and the agent's own replies stay visible, except the `/goal` set
+confirmation that `false` already hides. Each hidden status card is handed to the
+session's next agent turn as a sidecar note, in memory, at most 5 per session.
+The durable goal or loop row keeps the outcome across restarts. CLI and TUI
+status lines keep their existing gates.
 
 Upstream preflight read root and affected-subsystem guidance at
 `0c771d7a5ba7742bd336adb98d30058ba545e327`. Searches for goal notices and the
@@ -115,6 +132,7 @@ requirements, removal quotes, blocker and gate/budget waits, external rechecks,
 legacy migration, profile selection, and default-off behavior. Historical prompt
 classification runs in `tests/agent/test_synthetic_prompt_legacy_goals.py`.
 Notice visibility runs in `tests/agent/test_quiet_goal_receipts.py`,
+`tests/gateway/test_lifecycle_cards_hidden.py`,
 `tests/gateway/test_goal_notices_config.py`,
 `tests/gateway/test_quiet_goal_control_recovery.py` and both
 `test_goal_notice_surfaces.py` files under `tests/hermes_cli` and `tests/tui_gateway`.

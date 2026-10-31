@@ -38,6 +38,10 @@ DEFAULT_MAX_TICKS = 100
 DEFAULT_SELF_PACED_FLOOR_SECONDS = 60
 DEFAULT_SELF_PACED_CEILING_SECONDS = _NO_PROGRESS_BACKOFF_S[-1]
 
+# paused_reason prefix of an autonomous agent pause. With loops.autonomy the agent may resume
+# only a pause carrying it, so a user, Ctrl+C or tick-budget pause is never overridden.
+AGENT_PAUSE_PREFIX = "agent-paused: "
+
 # Completion sentinel the wakeup prompt teaches the agent to emit.
 LOOP_COMPLETE_MARKER = "LOOP_COMPLETE"
 # Marker on its own line, tolerating surrounding whitespace / trailing punctuation.
@@ -890,6 +894,17 @@ class LoopManager(LoopRevisionsMixin):
             # Re-arm relative to now so a long pause doesn't fire instantly N times.
             delay = state.current_delay or state.interval_seconds or self_paced_floor_seconds()
             state.next_due_at = time.time() + min(delay, 5.0)
+            return state
+
+        return self._mutate_current(apply)
+
+    @snapshot_control
+    def finish(self, reason: str) -> Optional[LoopState]:
+        """Mark an active or paused loop done, keeping its row. Clearing stays a user control."""
+        def apply(state):
+            if state is None or state.status not in {"active", "paused"}:
+                return None
+            state.status, state.last_stop_reason, state.awaiting_response = "done", reason, False
             return state
 
         return self._mutate_current(apply)

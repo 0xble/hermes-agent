@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from hermes_cli.session_controls import REPLACEMENT_MAX_CHARS
-from hermes_cli.goal_notices import goal_notices_enabled
+from hermes_cli.goal_notices import lifecycle_cards_hidden, notice_level
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +250,17 @@ class GatewaySessionControlsMixin:
                     return
                 record = expired
                 status = record.get("status")
+            elif (not record.get("request_posted") and not record.get("request_skipped")
+                  and lifecycle_cards_hidden(record.get("kind", ""))):
+                # Created before cards were hidden: nobody would see it, so fail it now and let
+                # the requester's outcome notice tell the agent to ask in chat.
+                failed = await self._run_in_executor_with_context(
+                    session_controls.fail_request, request_id, "approval_cards_hidden"
+                )
+                if failed is None:
+                    return
+                record = failed
+                status = record.get("status")
             elif not record.get("request_posted") and not record.get("request_skipped"):
                 source, adapter = await self._session_control_route(target_entry)
                 if source is not None and adapter is None:
@@ -408,17 +419,25 @@ class GatewaySessionControlsMixin:
             await self._mark_control(session_controls, request_id, "outbox_done")
 
     async def _settle_quiet_autonomy_notices(self, session_controls, record):
-        """Settle only cosmetic delivery of autonomous goal outcomes when goal notices are off.
+        """Settle only cosmetic delivery of goal and loop outcomes that their notices hide.
 
         Runs even offline. Continuation admission and cleanup still own progress, supersession
-        and recovery, and explicit authorities (quote, button, session) keep their replies.
+        and recovery. With notices off, only autonomous outcomes are settled, and explicit
+        authorities (quote, button, session) keep their replies. With ``notices: none``, the
+        target's chat receipt is settled for every authority, while the requester's outcome
+        still reaches it unless the control was autonomous (its tool result already reported it).
         """
-        if (record.get("kind") != "goal"
-                or (record.get("authority") or {}).get("via") != "autonomy"
-                or goal_notices_enabled()):
+        kind = record.get("kind")
+        if kind not in {"goal", "loop"}:
             return record
-        for sent, skipped in (("target_notice_sent", "target_notice_skipped"),
-                              ("requester_notified", "requester_notification_skipped")):
+        level = notice_level(f"{kind}s")
+        autonomous = (record.get("authority") or {}).get("via") == "autonomy"
+        if level == "all" or (level == "quiet" and not autonomous):
+            return record
+        flags = [("target_notice_sent", "target_notice_skipped")]
+        if autonomous:
+            flags.append(("requester_notified", "requester_notification_skipped"))
+        for sent, skipped in flags:
             if not record.get(sent) and not record.get(skipped):
                 record = await self._mark_and_finish(session_controls, record, skipped)
         return record
