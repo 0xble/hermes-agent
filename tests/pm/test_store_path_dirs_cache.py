@@ -6,8 +6,17 @@ gateway, which also stretched SQLite writer-lock holds queued behind the GIL.
 """
 from __future__ import annotations
 
+import pytest
+
 import pm.install
 from pm.filesystem import durable_write_bytes
+
+
+@pytest.fixture(autouse=True)
+def _fixed_cache_clock(monkeypatch):
+    # These counts assume one TTL bucket. Even adjacent calls can straddle a real rollover.
+    # The expiry test below advances its own clock to exercise invalidation.
+    monkeypatch.setattr(pm.install, "_clock", lambda: 1000.0)
 
 
 def _counting_compositions(monkeypatch):
@@ -79,6 +88,27 @@ def test_terminal_run_envs_share_one_composition(tmp_path, monkeypatch):
     calls = _counting_compositions(monkeypatch)
 
     assert _user_tools_first("/usr/bin") == _user_tools_first("/usr/bin")
+    assert len(calls) == 1
+
+
+def test_concurrent_terminal_run_envs_share_one_composition(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from tools.environments.local import _user_tools_first
+
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
+    calls = _counting_compositions(monkeypatch)
+    ready = Barrier(8, timeout=10)
+
+    def compose(_):
+        ready.wait()
+        return _user_tools_first("/usr/bin")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = list(pool.map(compose, range(8)))
+
+    assert paths == [paths[0]] * 8
     assert len(calls) == 1
 
 

@@ -499,6 +499,13 @@ descendants. It mocks the pane and needs no tmux, so it lives outside
 Retire these driver adaptations when upstream supplies equivalent bounded,
 condition-based synchronization and output capture.
 
+The terminal PATH cache count tests pin the module-local TTL clock. Two adjacent
+commands can straddle a real 30-second bucket boundary, correctly recomposing
+and violating a test's one-composition assumption. The expiry test advances its
+own clock, and concurrent terminal callers still require exactly one composition
+in a shared bucket. No production invalidation or locking behavior is changed.
+Retire this fixture when upstream supplies equally deterministic cache tests.
+
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
 complete-suite gap or proves an installed runtime.
