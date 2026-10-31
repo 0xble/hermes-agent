@@ -10,6 +10,7 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import shlex
@@ -709,6 +710,24 @@ def _installed_heavy_slot_path(token: str) -> bool:
         return False
 
 
+def _valid_heavy_slot_wait(value: str) -> bool:
+    try:
+        seconds = float(value)
+    except ValueError:
+        return False
+    return math.isfinite(seconds) and seconds >= 0
+
+
+# heavy-slot's argparse interface. Both the trusted peel and strict fallback must consume the
+# same value options, including attached --option=value forms. Help never executes a payload.
+_HEAVY_SLOT_VALUE_OPTIONS: dict[str, Callable[[str], bool]] = {
+    "--label": lambda value: True,
+    "--max-wait": _valid_heavy_slot_wait,
+    "--gate-fd": lambda value: re.fullmatch(r"[0-9]+", value) is not None,
+}
+_HEAVY_SLOT_FLAG_OPTIONS = frozenset({"-h", "--help"})
+
+
 def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
     """Peel only an explicit absolute path to the installed helper and its exact grammar.
 
@@ -723,14 +742,14 @@ def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
         if option == "--":
             return position + 1 if position + 1 < len(segment) else None
         name, equals, value = option.partition("=")
-        if name not in {"--label", "--gate-fd"}:
+        if name not in _HEAVY_SLOT_VALUE_OPTIONS:
             return None
         if not equals:
             position += 1
             if position >= len(segment) or segment[position].startswith("-"):
                 return None
             value = segment[position]
-        if name == "--gate-fd" and re.fullmatch(r"[0-9]+", value) is None:
+        if not _HEAVY_SLOT_VALUE_OPTIONS[name](value):
             return None
         position += 1
     return None
@@ -748,7 +767,7 @@ def _heavy_slot_fallback_command_index(
     if _executable_name(segment[index]) != "heavy-slot" and not _installed_heavy_slot_path(segment[index]):
         return None, None
     arguments = segment[index + 1:]
-    if not arguments or arguments in (["--help"], ["-h"]):
+    if not arguments or (len(arguments) == 1 and arguments[0] in _HEAVY_SLOT_FLAG_OPTIONS):
         return None, None
     position = index + 1
     while position < len(segment):
@@ -758,17 +777,17 @@ def _heavy_slot_fallback_command_index(
                 return None, "heavy-slot wrapper has `--` but no wrapped command"
             return position + 1, None
         name, equals, value = option.partition("=")
-        if name in {"--label", "--gate-fd"}:
+        if name in _HEAVY_SLOT_VALUE_OPTIONS:
             if not equals:
                 position += 1
                 if position >= len(segment) or segment[position].startswith("-"):
                     return None, f"heavy-slot wrapper has an incomplete option `{name}`"
                 value = segment[position]
-            if name == "--gate-fd" and re.fullmatch(r"[0-9]+", value) is None:
+            if not _HEAVY_SLOT_VALUE_OPTIONS[name](value):
                 return None, f"heavy-slot wrapper has an invalid option `{option}`"
             position += 1
             continue
-        if option in {"-h", "--help"}:
+        if option in _HEAVY_SLOT_FLAG_OPTIONS:
             return None, None
         if option.startswith("-"):
             return None, f"heavy-slot wrapper has an unknown option `{option}`"
