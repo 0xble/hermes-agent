@@ -1,4 +1,5 @@
 """Deletion covers live descendants before their durable claim."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from types import SimpleNamespace
 import pytest
 from gateway.session_authority import LiveSession, SessionAuthority
@@ -12,7 +13,7 @@ async def test_delete_cannot_remove_a_live_delegate_without_a_claim(tmp_path):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('s', source='test')
         db.create_session('child', source='test', parent_session_id='s', model_config={'_delegate_from': 's'})
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id='owned', instance_id='owner', db=db, epoch=epoch)
         authority.sessions['s'] = LiveSession(None, 'route')
         authority.sessions['child'] = LiveSession(None, 'child-route')

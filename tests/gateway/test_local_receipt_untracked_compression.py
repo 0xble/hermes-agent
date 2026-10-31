@@ -20,7 +20,7 @@ async def _owner(tmp_path, monkeypatch, instance_id):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
@@ -63,7 +63,7 @@ def _unrecovered_owner(tmp_path, instance_id):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import SessionAuthority
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
                              _cached_agent_for=lambda route: None, _adapter_for_source=lambda source: None)

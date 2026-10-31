@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch, list_session_admissions
+from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.mark.platforms("linux")

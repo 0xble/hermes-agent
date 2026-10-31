@@ -8,7 +8,8 @@ import pytest
 async def _discord_owner(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority, SessionAuthority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from plugins.platforms.discord.adapter import DiscordAdapter
 
     monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)

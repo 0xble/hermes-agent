@@ -173,7 +173,8 @@ def test_worker_handoff_duplicate_uids_adopt_one_dict_per_uid(tmp_path, rotate):
     """The worker facade adopts the owner's committed generation: a dropped duplicate dict would carry
     no row id back and be re-appended as a second active copy on the next flush."""
     from agent.runtime_session_store import RuntimeSessionStore
-    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+    from hermes_state_runtime import mutate_worker_execution, register_worker_execution
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     store_db = SessionDB(tmp_path / "worker.db")
     store_db.create_session("root", "cli", system_prompt="PREFIX")

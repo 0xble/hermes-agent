@@ -31,7 +31,7 @@ class _Transport:
 async def _connect(tmp_path, monkeypatch, *, native=True, config=None):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from tui_gateway import server
 

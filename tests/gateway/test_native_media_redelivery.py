@@ -31,7 +31,8 @@ async def test_redelivered_media_message_returns_its_receipt_and_changed_bytes_c
     from gateway.platforms.event import MessageEvent, MessageType
     from gateway.relay.media import RelayMediaClient
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback
     from gateway.session_ingress_media import _media_root, release_admission_media
     from hermes_constants import get_hermes_home

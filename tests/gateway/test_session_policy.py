@@ -50,7 +50,7 @@ async def test_launch_options_reach_the_owner_frozen_and_hooks_consented(tmp_pat
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_policy import restore_policy
     from hermes_state_local import local_receipt

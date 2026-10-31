@@ -21,7 +21,7 @@ async def _compressed_chat(tmp_path):
     import json
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     runner = GatewayRunner(GatewayConfig())
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')

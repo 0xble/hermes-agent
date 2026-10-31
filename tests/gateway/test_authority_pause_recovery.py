@@ -8,8 +8,8 @@ from gateway.config import Platform
 from gateway.session import SessionSource
 from gateway.session_authority import LiveSession
 from gateway.session_contract import Principal, SessionRef
-from hermes_state_runtime import (RuntimeStoreError, admit_session_input, begin_runtime_epoch,
-    get_session_admission, recover_session_inputs, register_worker_execution)
+from hermes_state_runtime import RuntimeStoreError, admit_session_input, get_session_admission, recover_session_inputs, register_worker_execution
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def session(owner):

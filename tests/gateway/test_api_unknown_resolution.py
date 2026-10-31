@@ -12,7 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import GatewayConfig, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.session import SessionStore
-from gateway.session_authority import initialize_session_authority
+from tests.fakes.runtime_owner import initialize_session_authority
 from gateway.session_api import restore_api_session
 from hermes_state import SessionDB
 from hermes_state_runtime import claim_session_input, list_session_admissions

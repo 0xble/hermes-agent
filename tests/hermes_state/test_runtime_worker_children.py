@@ -1,5 +1,6 @@
 """Owner-reserved delegated children of a worker execution (#141793): the owner mints every child,
 caps them, scopes their writes to their own row, and retires them with their parent."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import os
 from functools import partial
 
@@ -31,7 +32,7 @@ def ledger(tmp_path):
     db = SessionDB(db_path=tmp_path / 'state.db')
     db.create_session('parent', source='kanban', profile_name='coder')
     db.create_session('other', source='cli')
-    epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
     rt.register_worker_execution(db, epoch=epoch, execution_id='worker', session_id='parent', generation=0,
                                  kind='compute', adoption_secret='private-fixture')
     yield db, epoch
@@ -76,7 +77,7 @@ def test_owner_restart_retires_in_flight_children_instead_of_recovering_them(led
     with db._read_ctx() as conn:
         child_eid, child_sid = conn.execute("SELECT execution_id,session_id FROM worker_executions WHERE kind='child'").fetchone()
     assert _reserve(db, epoch, 2, limits=(1, 1)) == {'refused': 'delegation_capacity'}
-    replacement = rt.begin_runtime_epoch(db, instance_id='restart')
+    replacement = _begin_owned_runtime_epoch(db, instance_id='restart')
     rt.recover_session_inputs(db, epoch=replacement)
     with db._read_ctx() as conn:
         states = dict(conn.execute('SELECT execution_id,status FROM worker_executions').fetchall())
@@ -130,7 +131,7 @@ async def test_child_reserve_verifies_the_parent_claim_and_refuses_while_drainin
     def admission_open():
         if draining:
             raise rt.RuntimeStoreError('runtime_draining')
-    authority = SimpleNamespace(db=db, epoch=rt.begin_runtime_epoch(db, instance_id='owner'), profile_id='p',
+    authority = SimpleNamespace(db=db, epoch=_begin_owned_runtime_epoch(db, instance_id='owner'), profile_id='p',
                                 _require_admission_open=admission_open, wake_after_worker=lambda session_id: None,
                                 authorize=lambda actor, ref, capability: None,
                                 sessions={}, logical_owner=lambda sid: sid)

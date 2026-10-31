@@ -115,9 +115,9 @@ def begin_runtime_epoch(db, *, instance_id: str, successor: bool = False) -> int
 
     Refused while another process holds that lock: the live owner's epoch fences all of its writes,
     so a foreign bump stales every settlement and admission it makes, and the recovery a begin
-    precedes would turn the owner's running turns ``unknown``. A store nobody owns stays open to an
-    offline caller, whose epoch the next owner's own begin supersedes. ``successor`` is the zero-cut
-    promotion's allowance to begin while its predecessor slot still holds its own lock.
+    precedes would turn the owner's running turns ``unknown``. Offline callers must hold the
+    current thread's exclusive-maintenance reservation; an unreserved store is not writable.
+    ``successor`` allows a reserved zero-cut promotion beside its predecessor, not an unowned begin.
     """
     _text(instance_id)
     from pathlib import Path
@@ -131,7 +131,9 @@ def begin_runtime_epoch(db, *, instance_id: str, successor: bool = False) -> int
         conn.execute('''INSERT INTO runtime_epoch(singleton,epoch,instance_id) VALUES(1,1,?)
             ON CONFLICT(singleton) DO UPDATE SET epoch=runtime_epoch.epoch+1, instance_id=excluded.instance_id''', (instance_id,))
         return conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()[0]
-    return db._execute_write(write)
+    from gateway.runtime_ownership import assert_runtime_epoch_owner
+    with assert_runtime_epoch_owner(db.db_path):
+        return db._execute_write(write)
 
 
 # Main's busy-queue cap (GatewayRunner._BUSY_QUEUE_MAX_PENDING): queued inputs one session holds.
