@@ -17,7 +17,7 @@ import re
 import shlex
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Optional, Union
 
@@ -208,9 +208,13 @@ def _home_thread_from_source(source) -> Optional[str]:
     return None if synthetic else str(thread_id)
 
 
+from gateway.slash_commands_incognito import GatewayIncognitoCommandsMixin
+
+
 class GatewaySlashCommandsMixin(
     GatewayLoginCommandsMixin, GatewayAttendCommandsMixin,
     GatewayModelCommandsMixin,
+    GatewayIncognitoCommandsMixin,
     GatewaySessionCommandsMixin,
     GatewayStatusCommandsMixin,
     GatewayGoalCommandsMixin):
@@ -1443,7 +1447,7 @@ class GatewaySlashCommandsMixin(
         pending = {
             "platform": src.platform.value, "chat_id": src.chat_id, "chat_type": src.chat_type,
             "user_id": src.user_id, "session_key": self._session_key_for_source(src),
-            "timestamp": datetime.now(timezone.utc).isoformat()}
+            "timestamp": datetime.now(UTC).isoformat()}
         # ``profile``: the update watcher (possibly the NEXT gateway process) must answer through the
         # requester's own profile bot, not the default profile's adapter for the same platform.
         pending.update({k: v for k, v in (("thread_id", src.thread_id), ("message_id", event.message_id),

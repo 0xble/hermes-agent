@@ -51,9 +51,9 @@ _RECORD_VERSION = 1
 def host_obligation_path(install_root: Path | None = None) -> Path:
     """The host obligation record keyed by the resolved installation checkout.
 
-    Callers running from an immutable release supply its journal-bound source root.
-    Other callers default to the checkout this module runs from, preserving the
-    updater's per-install, cross-profile record identity.
+    Immutable releases default to their journal-bound source checkout, using the same
+    resolver as the gateway's recovery reader. Other layouts keep the running tree's
+    per-install, cross-profile record identity. An explicit root overrides resolution.
     """
     # Not ``gateway.host_rendezvous.host_state_dir``: ``gateway.status`` imports ``utils`` -> ruamel,
     # absent from the historical interpreter an old updater's takeover arms this record in; the
@@ -61,6 +61,17 @@ def host_obligation_path(install_root: Path | None = None) -> Path:
     from hermes_cli.update_restart_recovery import _host_state_dir
 
     root = Path(__file__).resolve().parents[1] if install_root is None else Path(install_root).resolve()
+    if install_root is None:
+        try:
+            # Lazy: historical takeover interpreters may lack release dependencies.
+            from hermes_constants import get_default_hermes_root, get_hermes_home
+            from hermes_cli.immutable_releases import update_source_checkout
+
+            # A named profile's home holds no release layout; the installation root does.
+            installation = get_default_hermes_root(home=get_hermes_home())
+            root = update_source_checkout(installation, root) or root
+        except ImportError:
+            logger.debug("Immutable release resolver unavailable; using the running tree's obligation key")
     install = os.path.normcase(str(root))
     key = hashlib.sha256(install.encode("utf-8")).hexdigest()[:16]
     return Path(_host_state_dir()) / f"{Path(HOST_OBLIGATION_NAME).stem}-{key}.json"

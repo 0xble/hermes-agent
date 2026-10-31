@@ -3583,6 +3583,7 @@ explainer:
     error_near_max_iterations: "az iterációs limit közelében hiba történt, még a végső válasz előtt. Nézd meg a fenti eszközkimenetet, majd küldj `continue` üzenetet."
     repeated_outer_errors: "a kör ismétlődő hibákkal folyton elakadt, ezért idő előtt leállt, hogy ne próbálkozzon a végtelenségig. Nézd meg a fenti hibákat, majd küldj `continue` üzenetet az újrapróbáláshoz."
   persistence:
+    owner_restart: "a Hermes átjáró újraindult vagy elérhetetlenné vált a kör során, és az újrapróbálkozási határidőig nem tért vissza. A feldolgozó függőben lévő írásai a helyi naplóban maradnak kifejezett újrapróbálkozáshoz vagy hitelesített átvételhez. Ne küldje el újra a kört."
     compression: "a kör leállt, mert egy másik folyamat éppen tömörítette ezt a munkamenetet. Az üzeneted valószínűleg már mentve van — kérlek, küldd el újra, amint a tömörítés befejeződött."
     compression_closed: "a kör leállt, mert a kontextustömörítés lecserélte ezt a munkamenetet, és az élő folytatását nem lehetett átvenni. A tároló maga rendben van — frissítsd a klienst (vagy kezdj új kört), hogy felvegye az új munkamenet-azonosítót, majd küldd el újra az üzenetedet."
     turn_lease: "a kör leállt, mert egy másik Hermes-folyamat átvette ezt a munkamenetet. A válaszod nem lett mentve — várd meg, amíg a másik folyamat befejezi, majd küldd el újra az üzenetedet."

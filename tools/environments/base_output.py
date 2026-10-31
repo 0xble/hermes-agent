@@ -253,6 +253,9 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
         capture_limit = get_max_bytes()
     except Exception:
         capture_limit = 50_000
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return _BoundedOutputCollector(capture_limit)
     spill_path = None
     try:
         spill_dir = get_hermes_home() / "cache" / "terminal-output"

@@ -1081,12 +1081,14 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             agent._gateway_attended_decision_key = desired_key
             if ctx.session_key:
                 _handoff(conversation={"last_resolved_model": model})
-            if decision.switched_back and not unavailable_emitted:
+            notices = parse_attended_config(ctx.user_config or {}).notices
+            if decision.switched_back and not unavailable_emitted and notices:
                 self._emit_persistent_attended_notice(format_attended_switch_back_notice(
                     model, parse_attended_config(ctx.user_config or {}).idle_revert_minutes,
                 ))
             elif (
-                decision.reason == "attended"
+                notices
+                and decision.reason == "attended"
                 and not decision.new_session
                 and not unavailable_emitted
                 # Turn-start resolution may already have selected and announced this route.
@@ -1796,6 +1798,12 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         # can't see it; compress_context() sets this flag and the gateway re-baselines as for a split.
         compacted_in_place = bool(getattr(agent, "_last_compaction_in_place", False)) if agent else False
         agent_session_id = getattr(agent, 'session_id', ctx.session_id) if agent else ctx.session_id
+        from agent.incognito import is_incognito
+        if is_incognito(ctx.session_id):
+            rotated = agent_session_id != ctx.session_id
+            if agent is not None and rotated:
+                agent.session_id = ctx.session_id
+            return compacted_in_place or rotated, ctx.session_id, (0 if rotated or compacted_in_place else len(agent_history))
         session_was_split = bool(agent and ctx.session_key and agent_session_id != ctx.session_id)
         if session_was_split:
             logger.info("Session split detected: %s → %s (compression)", ctx.session_id, agent_session_id)

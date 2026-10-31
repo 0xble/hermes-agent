@@ -20,7 +20,8 @@ _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
 
 def execute_transcript_write(
     db: Any, fn: Callable[[sqlite3.Connection], T], messages: list[dict[str, Any]], *,
-    session_id: str, patience_s: float | None = None,
+    session_id: str, patience_s: float | None = None, session_ids: Any = (),
+    skip_result: Any = None,
 ) -> T:
     """Restore caller row markers before each attempt and on final failure.
 
@@ -47,7 +48,8 @@ def execute_transcript_write(
 
     try:
         return db._execute_write(attempt, patience_s=patience_s,
-            session_id=session_id, input_rows=len(messages))
+            session_id=session_id, input_rows=len(messages),
+            session_ids=session_ids, skip_result=skip_result)
     except BaseException:
         restore()
         raise

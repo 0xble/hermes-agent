@@ -254,7 +254,9 @@ class MemoryManager:
 
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None,
                  recall_synthetic_turns: bool = False,
-                 prefetch_max_age_seconds: Optional[float] = DEFAULT_PREFETCH_MAX_AGE_S) -> None:
+                 prefetch_max_age_seconds: Optional[float] = DEFAULT_PREFETCH_MAX_AGE_S,
+                 read_only: bool = False) -> None:
+        self.read_only = bool(read_only)
         self._providers: list[MemoryProvider] = []
         # Host policy (memory.recall_synthetic_turns): whether Hermes-generated turns may key
         # automatic recall. Read by the turn-start and post-turn prefetch gates.
@@ -298,6 +300,43 @@ class MemoryManager:
         self._bound_scope: Optional[dict[str, Any]] = None
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
 
+    # Bounds how long entering incognito waits for already-queued public memory writes.
+    _PRIVACY_FLUSH_TIMEOUT_S = 10.0
+
+    @property
+    def read_only(self) -> bool:
+        from agent.incognito import is_incognito
+        return getattr(self, "_read_only", False) or is_incognito(getattr(self, "_session_id", None))
+
+    @read_only.setter
+    def read_only(self, enabled: bool) -> None:
+        self._read_only = bool(enabled)
+
+    def flush_public_writes(self) -> bool:
+        """Wait for writes queued while public. Call before the session is marked private,
+        so these public turns reach the providers instead of being refused. Bounded."""
+        with self._sync_executor_lock:
+            pending = [future for future, kind in self._background_futures.items() if kind == "write"]
+        _done, unfinished = wait(pending, timeout=self._PRIVACY_FLUSH_TIMEOUT_S)
+        if unfinished:
+            logger.warning("Incognito: %d public memory write(s) still pending at the boundary",
+                           len(unfinished))
+        return not unfinished
+
+    def set_read_only(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == getattr(self, "_read_only", False):
+            return
+        if enabled:
+            self.flush_public_writes()
+        self._read_only = enabled
+        self._privacy_epoch = getattr(self, "_privacy_epoch", 0) + 1
+        for provider in self._providers:
+            try:
+                provider.read_only = enabled
+            except Exception:
+                logger.warning("Incognito: memory provider privacy transition failed")
+
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
                        providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
         """Call ``call(provider)`` per provider, logging+swallowing failures; returns successes in order.
@@ -332,6 +371,7 @@ class MemoryManager:
 
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a provider; builtin always accepted, only ONE external allowed."""
+        provider.read_only = self.read_only
         if provider.name != "builtin" and self._has_external:
             existing = next((p.name for p in self._providers if p.name != "builtin"), "unknown")
             logger.warning(
@@ -479,8 +519,9 @@ class MemoryManager:
             if status is None:
                 continue
             # count <= 0: content injected but no discrete count (reflect)
-            detail = ("recalled 1 memory" if status.count == 1 else f"recalled {status.count} memories"
-                      if status.count > 1 else "recalled relevant memory")
+            detail = status.detail or (
+                "recalled 1 memory" if status.count == 1 else f"recalled {status.count} memories"
+                if status.count > 1 else "recalled relevant memory")
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
 
@@ -560,6 +601,8 @@ class MemoryManager:
         ``turn_author`` and the turn's provenance (``display_kind``, ``platform``) reach only providers
         whose ``sync_turn`` accepts them.
 """
+        if self.read_only:
+            return
         providers = list(self._providers)
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content or not self._owner_allows("sync_turn"):
@@ -585,6 +628,16 @@ class MemoryManager:
         """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
         durability class. Runs under the caller's contextvars (``ctx_bound``). If the executor is
         unavailable outside shutdown, run inline — the historical fail-safe."""
+        if self.read_only and kind == "write":
+            return
+        if kind == "write":
+            original_fn = fn
+            def guarded_fn():
+                # Only public work is accepted. Re-check in case it waited past a boundary.
+                if self.read_only:
+                    return
+                return original_fn()
+            fn = guarded_fn
         fn = ctx_bound(in_owner_home(self._bound_scope, fn))
         executor = None if self._shutting_down else self._sync_executor
         if executor is None and not self._shutting_down:
@@ -698,6 +751,8 @@ class MemoryManager:
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
+        if self.read_only and tool_name not in {"hindsight_recall", "hindsight_reflect"}:
+            return tool_error("Memory writes are disabled in incognito mode.")
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
@@ -709,18 +764,22 @@ class MemoryManager:
         accepted = self._tool_call_keywords(provider)
         if accepted is not None:
             kwargs = {k: v for k, v in kwargs.items() if k in accepted}
-        args = _redact_for_provider(args)
-        from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
-        try:
-            result = provider.handle_tool_call(tool_name, args, **kwargs)
-        except Exception as e:
-            logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
-            record_provider_memory_call(provider.name, tool_name, args, raised=True)
-            return tool_error(f"Memory tool '{tool_name}' failed: {e}")
-        record_provider_memory_call(provider.name, tool_name, args, result)
-        return result
+        from agent.incognito import incognito_scope
+        with incognito_scope(self.read_only, self._session_id):
+            args = _redact_for_provider(args)
+            from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
+            try:
+                result = provider.handle_tool_call(tool_name, args, **kwargs)
+            except Exception as e:
+                logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
+                record_provider_memory_call(provider.name, tool_name, args, raised=True)
+                return tool_error(f"Memory tool '{tool_name}' failed: {e}")
+            record_provider_memory_call(provider.name, tool_name, args, result)
+            return result
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        if self.read_only:
+            return
         if not self._owner_allows("on_turn_start"):
             return
         message = _redact_for_provider(message)
@@ -734,6 +793,8 @@ class MemoryManager:
         self._each_provider("on_turn_start failed", _tick)
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
+        if self.read_only:
+            return
         if not self._owner_allows("on_session_end"):
             return
         messages = _redact_messages_for_egress(messages or [])
@@ -825,6 +886,8 @@ class MemoryManager:
         only to checkpoint (v2+) providers. With ``require_checkpoint`` at least one checkpoint provider
         must succeed — its exception propagates so the caller keeps the uncompressed transcript.
         """
+        if self.read_only:
+            return ""
         if not self._owner_allows("on_pre_compress"):
             if require_checkpoint:  # the caller keeps the uncompressed transcript
                 raise RuntimeError("Memory pre-compress checkpoint refused; see `hermes logs errors`")
@@ -870,6 +933,8 @@ class MemoryManager:
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[dict[str, Any]] = None) -> None:
         """Notify external providers when the built-in memory tool writes (skips builtin, the source)."""
+        if self.read_only:
+            return
         if not self._owner_allows("on_memory_write"):
             return
         content, metadata = _redact_for_provider(content, dict(metadata or {}))
@@ -953,6 +1018,8 @@ class MemoryManager:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
 
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
+        if self.read_only:
+            return
         if not self._owner_allows("on_delegation"):
             return
         task, result = _redact_for_provider(task, result)

@@ -16,6 +16,53 @@ All settings are stored in the `~/.hermes/` directory for easy access.
 Run `hermes setup --portal` — one OAuth gets you a model provider and all four Tool Gateway tools without hand-editing YAML. Portal subscribers also get 10% off token-billed providers. See [Nous Portal](../integrations/nous-portal.md).
 :::
 
+## Incognito Gateway Topics
+
+`/incognito on` keeps the current topic's Hermes conversation in RAM. `/incognito off`
+discards the private interval and resumes saving in the same session, from its saved
+prefix and prior model selection. It does not create a replacement session.
+`/incognito status` reports the state and active model. `/incognito` toggles the state,
+and `/status` includes it. Switching is refused while a turn is running. `/new` drops
+private history and starts a normal session.
+
+Incognito starts off in every topic. Prior saved history remains readable, including
+session search and Hindsight recall. Hermes does not save new private conversation
+content, automatic memory writes, explicit memory writes, hook payloads, or durable
+restart/outbox payloads. Plugin tools are denied unless their manifest or tool
+registration declares them incognito-safe. Incognito does not change the visible
+tool schema or the frozen system prompt. It is not anonymity: the messaging platform,
+model provider and any deliberately contacted external service still receive content.
+
+Only the topic's on-flag, saved session boundary and model-restore routing metadata
+survive a restart. Private messages and tool results do not. After restart the topic
+remains incognito and starts again from its saved prefix.
+
+Hindsight reads require a server with no-store read support. Hermes checks that
+capability before sending a private query and requires an explicit no-store
+acknowledgment. An unsupported server makes the read unavailable, not public.
+
+Telegram attachments that require a disk cache are refused before download while
+incognito is on. Text and captions still work. In observe-enabled groups, incognito
+is refused if commands and ordinary conversation route to different sessions. Use
+a DM or a shared topic in that case.
+
+Optionally choose a private model using the same model-route syntax as `/model`:
+
+```yaml
+incognito:
+  model: openrouter/anthropic/claude-sonnet-4
+```
+
+```bash
+hermes config set incognito.model openrouter/anthropic/claude-sonnet-4
+hermes config get incognito.model
+hermes config unset incognito.model
+```
+
+An empty or absent value keeps the current model. A failed configured route still
+turns privacy on, keeps the current model, and reports the model error. Turning
+incognito off restores the previous override, including having no override.
+
 ## Attended model switching (optional)
 
 Configure this only when the main gateway session should use a stronger model while Brian is actively messaging in a topic:
@@ -1526,7 +1573,9 @@ If you do not want Hermes to auto-generate titles after the first exchange, set
 `auxiliary.title_generation.enabled: false`. Manual titles still work through
 `/title` and `hermes sessions rename`.
 
-`auxiliary.title_generation.min_words` / `max_words` set the title word budget (defaults 3/7), `case_style` is `sentence_case` or `title_case`, `instructions` adds trusted operator guidance, and `name_aliases` restores configured display spellings (for example `onepass: 1Password`).
+`auxiliary.title_generation.min_words` / `max_words` set the title word budget (defaults 3/7), and `name_aliases` restores configured display spellings (for example `onepass: 1Password`).
+
+Ordinary noun-style titles honor `case_style` (`sentence_case` or `title_case`) and trusted operator guidance in `instructions`. Slack's `verb_first` task titles intentionally use sentence case and omit the entire raw `instructions` string, including non-style rules. Word bounds, `language`, recent-title avoidance, and `name_aliases` remain shared between both styles.
 
 For Telegram DM topics, `platforms.telegram.extra.auto_topic_icons` enables Bot API semantic icons. `preserve_manual_topic_icons` defaults to true and protects manually chosen icons from automatic renames; an explicit `/title` re-picks the icon from the new title and replaces a manual one; `topic_icon_instructions` and `topic_icon_overrides` customize selection. Name and icon are sent in one topic edit, and `/title` reserves a private lineage alias when a visible Telegram label is duplicated.
 

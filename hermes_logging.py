@@ -366,6 +366,9 @@ def setup_logging(
     global _logging_initialized
     global _fallback_warned
     home = hermes_home or get_hermes_home()
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return home / "logs"
     log_dir = mkdir_under_hermes_home(home / "logs")
 
     # Stdout is block-buffered when piped (no TTY); line-buffer it so a
@@ -811,6 +814,13 @@ class _NonFormattingQueueHandler(QueueHandler):
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
         return copy.copy(record)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Decide on the producer thread, before the listener loses its privacy context.
+        from agent.incognito import is_incognito
+        if not getattr(record, "_hermes_incognito", False) and not is_incognito(
+                getattr(record, "session_id", None)):
+            super().emit(record)
 
 
 def _stop_queue_listener() -> None:

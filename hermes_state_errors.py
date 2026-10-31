@@ -113,7 +113,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
     "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "session_row_missing", "unknown",
+    "replaced", "deleted_wal", "disk", "session_row_missing", "owner_restart", "unknown",
 )
 
 
@@ -216,6 +216,10 @@ class SessionActiveWriteGuardError(RuntimeError):
     """Raised when an active turn lease or compression lock rejects session deletion."""
 
 
+class GatewayOwnerRestartError(RuntimeError):
+    """The worker could not reconnect before its owner-transition deadline."""
+
+
 class StateDbReplacedError(RuntimeError):
     """The state.db path no longer names the file this SessionDB opened
     (out-of-band cp/mv/restore). In-place FTS repair and fail-open trigger
@@ -286,6 +290,7 @@ _STATE_DB_CORRUPT_MSG = (
 
 
 _PERSISTENCE_CAUSE_BY_TYPE = (
+    (GatewayOwnerRestartError, "owner_restart"),
     (SessionTurnLeaseLostError, "turn_lease"),
     (CompressionSessionClosedError, "compression_closed"),
     (CompressionSessionBusyError, "compression"),
@@ -296,6 +301,7 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
     (StateDbCorruptError, "corrupt"),
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
+    (("owner_restart", "owner_unavailable", "incomplete_control_response"), "owner_restart"),
     (("turn lease",), "turn_lease"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),
@@ -318,7 +324,8 @@ def classify_persistence_error(exc_or_str) -> str:
     corruption to the FTS index (the transcript store is not damaged); "replaced" =
     main-file replacement; "deleted_wal" = a retired sidecar generation requiring
     capture inspection; "session_row_missing" = the session row was deleted under a
-    live agent (FK rejection; the flush recreates it)."""
+    live agent (FK rejection; the flush recreates it); "owner_restart" = gateway owner
+    unavailable during worker persistence (pending journal retained)."""
     if exc_or_str is None:
         return "unknown"
     # Lease refusals contain neither "locked" nor "busy": match by type first,

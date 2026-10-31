@@ -940,13 +940,78 @@ class TestStandaloneTelegramRichMessages:
             assert bot.send_message.await_args.kwargs["text"] == message
             assert bot.send_message.await_args.kwargs["parse_mode"] is None
 
-    def test_media_stays_on_existing_caption_path(self, bot, tmp_path):
+    @pytest.mark.parametrize("rich_messages", ["always", "never"])
+    def test_media_preserves_text_rendering_policy(self, bot, tmp_path, rich_messages):
         path = tmp_path / "doc.txt"
         path.write_text("attachment")
         result = asyncio.run(_send_telegram(
-            "test-token", "123", "**caption**", media_files=[(str(path), False)], rich_messages="always"))
+            "test-token", "123", "**caption**", media_files=[(str(path), False)],
+            thread_id="234", rich_messages=rich_messages))
         assert result["success"] is True
-        bot.do_api_request.assert_not_awaited()
+        bot.send_document.assert_awaited_once()
+        upload = bot.send_document.await_args.kwargs
+        assert upload["message_thread_id"] == 234
+        if rich_messages == "always":
+            bot.do_api_request.assert_awaited_once()
+            assert "caption" not in upload
+            assert "parse_mode" not in upload
+        else:
+            bot.do_api_request.assert_not_awaited()
+            assert upload["parse_mode"] == "MarkdownV2"
+        bot.send_message.assert_not_awaited()
+
+    def test_report_with_image_normalizes_footnotes_before_upload(self, bot, tmp_path):
+        path = tmp_path / "activity.png"
+        path.write_bytes(b"image")
+        bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=2))
+        message = "# Daily Reflection\n\n- **Systems** 30%[^1]\n\n[^1]: [Source](https://example.com/report)"
+        result = asyncio.run(_send_to_platform(
+            Platform.TELEGRAM, SimpleNamespace(token="test-token", extra={"rich_messages": "always"}),
+            "123", message, thread_id="234", media_files=[(str(path), False)]))
+        assert result["success"] is True
+        payload = bot.do_api_request.await_args.kwargs["api_kwargs"]
+        assert payload["message_thread_id"] == 234
+        assert "<!-- -->" in payload["rich_message"]["markdown"]
+        assert "https://example.com/report" in payload["rich_message"]["markdown"]
+        bot.send_photo.assert_awaited_once()
+        upload = bot.send_photo.await_args
+        assert upload is not None
+        assert "caption" not in upload.kwargs
+        assert upload.kwargs["message_thread_id"] == 234
+        bot.send_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("failure", ["missing", "upload"])
+    def test_rich_report_receipt_survives_attachment_failure(self, bot, tmp_path, failure):
+        path = tmp_path / "doc.txt"
+        if failure == "upload":
+            path.write_text("attachment")
+            bot.send_document.side_effect = RuntimeError("upload failed")
+        result = asyncio.run(_send_telegram(
+            "test-token", "123", "**report**", media_files=[(str(path), False)], rich_messages="always"))
+        assert result["success"] is True and result["message_id"] == "123"
+        assert len(result["warnings"]) == 1
+        bot.do_api_request.assert_awaited_once()
+        bot.send_message.assert_not_awaited()
+
+    def test_ambiguous_rich_send_with_media_does_not_upload_or_resend(self, bot, tmp_path):
+        path = tmp_path / "doc.txt"
+        path.write_text("attachment")
+        bot.do_api_request.side_effect = TimeoutError("timed out")
+        result = asyncio.run(_send_telegram(
+            "test-token", "123", "**report**", media_files=[(str(path), False)], rich_messages="always"))
+        assert "error" in result
+        bot.do_api_request.assert_awaited_once()
+        bot.send_document.assert_not_awaited()
+        bot.send_message.assert_not_awaited()
+
+    def test_permanent_rich_refusal_with_media_uses_legacy_caption(self, bot, tmp_path):
+        path = tmp_path / "doc.txt"
+        path.write_text("attachment")
+        bot.do_api_request.side_effect = type("BadRequest", (Exception,), {})("rejected")
+        result = asyncio.run(_send_telegram(
+            "test-token", "123", "**report**", media_files=[(str(path), False)], rich_messages="always"))
+        assert result["success"] is True
+        bot.do_api_request.assert_awaited_once()
         bot.send_document.assert_awaited_once()
         assert bot.send_document.await_args.kwargs["parse_mode"] == "MarkdownV2"
         bot.send_message.assert_not_awaited()

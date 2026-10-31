@@ -379,6 +379,9 @@ def load_usage() -> dict[str, dict[str, Any]]:
 
 def save_usage(data: dict[str, dict[str, Any]]) -> bool:
     """Write the usage map atomically; True when it committed."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return False
     path = _usage_file()
     try:
         atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False), tmp_prefix=".usage_")
