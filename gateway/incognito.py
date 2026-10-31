@@ -93,11 +93,22 @@ def _routing_records() -> dict:
     return records
 
 
-class _IngressScope:
-    """Resolve blocking routing off-loop, but enter ContextVars in the calling task."""
+_OFFLOAD = object()
 
-    def __init__(self, resolve: Callable[[], tuple[str | None, bool] | None]):
+
+class _IngressScope:
+    """Resolve routing without the shared executor when the published index answers.
+
+    ``fast`` returns ``_OFFLOAD`` only when a blocking read (an unloaded session store)
+    is unavoidable. Ingress must not queue behind unrelated jobs on the default executor,
+    and the extra hop also delays received work past handover/drain admission windows.
+    ContextVars are always entered in the calling task.
+    """
+
+    def __init__(self, resolve: Callable[[], tuple[str | None, bool] | None],
+                 fast: Callable[[], object] | None = None):
         self._resolve = resolve
+        self._fast = fast
         self._scope = None
 
     def _enter(self, decision):
@@ -112,7 +123,10 @@ class _IngressScope:
         return self._scope.__exit__(*exc)
 
     async def __aenter__(self):
-        return self._enter(await asyncio.to_thread(self._resolve))
+        decision = self._fast() if self._fast is not None else _OFFLOAD
+        if decision is _OFFLOAD:
+            decision = await asyncio.to_thread(self._resolve)
+        return self._enter(decision)
 
     async def __aexit__(self, *exc):
         return self.__exit__(*exc)
@@ -138,10 +152,10 @@ def _unattributed_decision():
 
 
 def unattributed_event_scope():
-    return _IngressScope(_unattributed_decision)
+    return _IngressScope(_unattributed_decision, _unattributed_decision)
 
 
-def _event_decision(owner, event):
+def _event_decision(owner, event, *, blocking=True):
     source = getattr(event, "source", None)
     if source is None:
         return None
@@ -155,7 +169,13 @@ def _event_decision(owner, event):
     enabled = is_incognito(key) if isinstance(key, str) else False
     store = getattr(owner, "session_store", None)
     if store is not None and isinstance(key, str):
-        decision = store.incognito_enabled(key)
+        if blocking:
+            decision = store.incognito_enabled(key)
+        else:
+            published = getattr(store, "published_incognito_enabled", None)
+            decision = published(key) if callable(published) else None
+            if decision is None:
+                return _OFFLOAD
         if isinstance(decision, bool):
             enabled = decision
     elif isinstance(key, str):
@@ -171,7 +191,8 @@ def _event_decision(owner, event):
 
 
 def event_scope(owner, event):
-    return _IngressScope(lambda: _event_decision(owner, event))
+    return _IngressScope(lambda: _event_decision(owner, event),
+                         lambda: _event_decision(owner, event, blocking=False))
 
 
 def slash_refusal(event) -> str | None:

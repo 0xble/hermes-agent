@@ -40,6 +40,17 @@ class SessionIncognitoMixin:
             self._ensure_loaded_locked()
             return session_key in getattr(self, "_incognito_records", {})
 
+    def published_incognito_enabled(self, session_key: str) -> bool | None:
+        """Lock-free read for the event loop; None until the routing index has loaded.
+
+        The index is replaced, never mutated, under the store lock, so one attribute read
+        observes a complete published state, exactly as a locked read would.
+        """
+        if not getattr(self, "_loaded", False):
+            return None
+        records = getattr(self, "_incognito_records", None)
+        return None if records is None else session_key in records
+
     def incognito_metadata(self, session_key: str) -> dict:
         with self._lock:
             self._ensure_loaded_locked()
