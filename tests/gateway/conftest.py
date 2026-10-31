@@ -39,6 +39,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# Bootstrap selects the checkout's dependencies at process start. Gateway tests
+# also reach it through lazy imports, after the per-test real-home I/O guard is
+# active, so initialize it once here while the collection sandbox is in force.
+import hermes_bootstrap  # noqa: F401
+
 
 @pytest.fixture
 def private_db_probe_cleanup(tmp_path):

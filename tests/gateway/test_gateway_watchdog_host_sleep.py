@@ -85,8 +85,9 @@ def test_turn_watchdog_thread_ignores_host_sleep(clock, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_turn_poll_loop_ignores_host_sleep(clock, monkeypatch):
-    turn_ctx = TurnContext()
+@pytest.mark.parametrize("display_kind", [None, "supervisor_checkin"])
+async def test_turn_poll_loop_ignores_host_sleep(clock, monkeypatch, display_kind):
+    turn_ctx = TurnContext(persist_user_display_kind=display_kind)
     agent = _ScriptedAgent(clock, [lambda c: c.sleep(SLEEP_S), lambda c: c.awake(TIMEOUT_S)])
     turn_ctx.agent_holder[0] = agent
     runner = object.__new__(GatewayRunner)
@@ -119,7 +120,7 @@ async def test_turn_poll_loop_ignores_host_sleep(clock, monkeypatch):
     result = await runner._run_agent_await_turn_worker(worker, turn_ctx, asyncio.Event(), None)
 
     assert result == "timed out"
-    assert warned_at_read == [2]
+    assert warned_at_read == ([] if display_kind == "supervisor_checkin" else [2])
     assert agent.reads == 2
 
 
