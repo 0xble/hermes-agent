@@ -1404,6 +1404,12 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     """
     if db is None:
         db = getattr(runner._session_db, '_db', runner._session_db)
+    if db is None:
+        # The runner's store failed to open (the live-DB guard refusing a probe, a locked or corrupt
+        # file); name that cause instead of failing on ``None.db_path`` below.
+        from gateway.run_runtime import _store_open_failure
+        from hermes_constants import get_hermes_home
+        raise RuntimeError(f'session authority has no state.db: {_store_open_failure(runner, get_hermes_home())}')
     # Resolved off-loop before any state is published: the rest of the bring-up runs without
     # yielding, so no other task observes a half-registered authority.
     from pathlib import Path
