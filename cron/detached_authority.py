@@ -226,6 +226,37 @@ async def register_detached(connection, ref, params, claim):
         kind='cron', adoption_secret=claim)
 
 
+def _attach_worker(rpc, scope):
+    """Registration is idempotent only with this exact fenced scope, including its secret."""
+    from agent.runtime_session_store import WorkerPersistenceError
+    from hermes_state_errors import GatewayOwnerRestartError
+    from websockets.exceptions import ConnectionClosed
+
+    ambiguous = False
+    for attempt in range(4):
+        try:
+            try:
+                rpc('worker.register', **scope, kind='cron')
+            except WorkerPersistenceError as exc:
+                # A successor may refuse the old epoch's registration; authenticate the
+                # original worker instead. Never create a replacement identity.
+                if not ambiguous or str(exc) not in ('admission_conflict', 'producer_not_started', 'stale_epoch'):
+                    raise
+            return rpc('worker.adopt', **scope)
+        except (WorkerPersistenceError, GatewayOwnerRestartError, ConnectionClosed, OSError) as exc:
+            if isinstance(exc, WorkerPersistenceError) and str(exc) not in (
+                    'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
+                raise
+            if attempt == 3:
+                raise
+            ambiguous = True
+            logger.warning('detached_cron_handshake_retry execution_id=%s session_id=%s '
+                           'generation=%s attempt=%s cause=%s: %s',
+                           scope['execution_id'], scope['session_id'], scope['generation'],
+                           attempt + 1, type(exc).__name__, exc)
+            time.sleep(.1 * 2 ** attempt)
+
+
 def run_detached(job, receipt, state, record, save, *, execution_id, extra_prompt, cancel_event):
     """Run in the existing external worker, with the canonical owner's receipt facade."""
     from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC, WorkerPersistenceError
@@ -242,8 +273,11 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
                  execution_id=PREFIX + execution_id, generation=state['generation'],
                  pid=os.getpid(), birth=process_birth(psutil.Process()), secret=secrets.token_urlsafe(32))
     rpc = WorkerRPC(get_hermes_home())
-    rpc('worker.register', **scope, kind='cron')
-    adopted = rpc('worker.adopt', **scope)
+    try:
+        adopted = _attach_worker(rpc, scope)
+    except BaseException:
+        rpc.close()
+        raise
     scope['epoch'] = adopted['owner_epoch']
     store = None
     stopping = threading.Event()

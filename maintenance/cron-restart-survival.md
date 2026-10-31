@@ -73,6 +73,21 @@ which concerns loop-thread poisoning, not owner-transition patience. Retire this
 extension when a released upstream satisfies the same bounded pre-send retry,
 authenticated adoption, pending-journal and truthful-error contracts.
 
+Ambiguous canonical submission is observed over fresh gateway links with the original
+job/request identity, never by submitting a new fire. Known admissions are reread by their
+exact receipt. Four bounded fresh-link reads wait through a delayed commit; exhausted
+patience retains the admission journal and an unverified pause. A `missing` lookup is a
+snapshot, not proof of non-admission, so reconciliation may not retire its journal or book
+"never admitted" from that answer. A later verified terminal receipt settles the fire and
+lifts only the uncertainty pause it caused. Gateway RPC timeouts preserve method, answer
+phase, timeout cause and stable identifiers instead of becoming connection failures.
+Detached registration also retries only the same birth/generation/secret-fenced scope;
+a lost register receipt never generates a replacement execution. This is an exception
+owned by the idempotent worker handshake, not a relaxation of WorkerRPC's no-resend guard.
+Proof: `tests/cron/test_ambiguous_admission.py`, `tests/cron/test_cron_recover_pause.py`,
+`tests/cron/test_detached_owner_restart.py`, and
+`tests/hermes_cli/test_gateway_client_failure_phase.py`.
+
 The existing admission journal captures the worker's result until the canonical
 owner commits the same admission's terminal receipt. Reconciliation imports that
 completion before cleaning up a terminal execution journal, without requiring a
