@@ -1236,6 +1236,9 @@ class SessionAuthority:
                 if outcome == 'settled_unknown':
                     self.deferred_resets.pop(live.route, None)  # no settlement follows, as below
                     continue
+                from gateway.session_settlement_recovery import requeue_shutdown_unstarted
+                if await requeue_shutdown_unstarted(self, ref, live, row):
+                    continue  # the next claim refuses (runtime_draining) and pauses this FIFO
             except BaseException as exc:
                 # No settlement follows (a lost managed worker, a cancelled drain): the turn is never
                 # replayed, so its deferred reset is dropped (the next turn re-detects the overflow),
