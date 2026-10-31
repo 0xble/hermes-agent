@@ -3532,6 +3532,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         external_event: bool = False,
+        turn_started_at: Optional[float] = None,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
@@ -3540,18 +3541,20 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
         ``external_event`` marks a watched-process/delegation notification. These
         events are allowed to pierce a timed continuation gap because they carry
-        new evidence; ordinary continuation-only turns are throttled.
+        new evidence; ordinary continuation-only turns are throttled. A wait armed
+        during this turn survives its own input when ``turn_started_at`` is supplied.
         """
         from hermes_cli.goals_evaluation import evaluate_goal_snapshot
         return evaluate_goal_snapshot(
             self, last_response, user_initiated=user_initiated, external_event=external_event,
             background_processes=background_processes, active_delegations=active_delegations,
-            evidence_session_id=evidence_session_id,
+            evidence_session_id=evidence_session_id, turn_started_at=turn_started_at,
         )
 
     def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         external_event: bool = False,
+        turn_started_at: Optional[float] = None,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
@@ -3578,11 +3581,16 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         new_eligible_non_read_only = (
             evidence_scan_truncated_for_turn or not _evidence_only_read_only_status(turn_evidence)
         )
+        # Only input newer than the wait may pierce it. The agent can park again in
+        # response to that input, so the current turn must not undo its own wait.
+        pierce_wait = (user_initiated or external_event) and (
+            turn_started_at is None or state.waiting_since < turn_started_at
+        )
         if state.waiting_on_pid is not None or state.waiting_on_session is not None or getattr(state, "waiting_on_user_message", False):
             holds, age_notice, pause_reason = self._stage_live_barrier()
             # A real user message or delivered external event is fresh evidence: it pierces
-            # every wait kind and re-judges now. Synthetic continuation wakes do not.
-            if user_initiated or external_event:
+            # every older wait kind. Synthetic continuation wakes do not.
+            if pierce_wait:
                 state.clear_wait(preserve_notice_key=True)
                 holds, age_notice, pause_reason = False, None, None
             elif getattr(state, "waiting_on_user_message", False):
@@ -3595,8 +3603,8 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         elif state.waiting_until:
             if self._barrier_holds():
                 # A real user message or delivered external event is fresh evidence and re-judges
-                # a waiting goal immediately. Synthetic continuation wakes do not pierce it.
-                if user_initiated or external_event:
+                # an older waiting goal immediately, never a wait armed during this turn.
+                if pierce_wait:
                     state.clear_wait(preserve_notice_key=True)
                 else:
                     return self._waiting_decision(state)

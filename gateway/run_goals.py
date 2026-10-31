@@ -665,9 +665,13 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
+        turn_state = getattr(self, "_peek_session_state", lambda _key: None)(
+            getattr(session_entry, "session_key", ""))
+        turn_started_at = (turn_state.conversation.last_turn_started_at or None) if turn_state else None
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=user_initiated, external_event=external_event,
+                turn_started_at=turn_started_at,
                 background_processes=_bg_procs,
                 active_delegations=_active_deleg,
             ),
