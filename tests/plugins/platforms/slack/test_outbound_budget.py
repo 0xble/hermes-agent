@@ -207,23 +207,38 @@ async def test_adapter_progress_retries_latest_projection_without_raw_fallback(t
 
 
 @pytest.mark.asyncio
-async def test_adapter_reply_reaction_status_and_progress_share_transport(transport, monkeypatch):
+@pytest.mark.parametrize("native_sessions", [False, True])
+async def test_adapter_reply_reaction_status_and_progress_share_transport(transport, monkeypatch, native_sessions):
     app = client()
     adapter = SlackAdapter(PlatformConfig(extra={"native_task_cards": True}))
     adapter._app = object()
     monkeypatch.setattr(adapter, "_get_client", Mock(return_value=app))
+    monkeypatch.setattr(slack_adapter, "_sdk_supports_agent_sessions", lambda: native_sessions)
     assert (await adapter.send("C1", "Answer")).success
     await adapter.send_typing("C1", {"thread_id": "thread-2"})
-    assert len(transport.sent) == 1  # Status tick is shed, not queued.
+    expected = ["chat.postMessage"]
+    if native_sessions:
+        # A once-per-turn lifecycle transition waits for admission, unlike cosmetic ticks.
+        expected.append("agents.sessions.setStatus")
+        assert transport.sent[-1][2] == {
+            "channel_id": "C1", "thread_ts": "thread-2", "status": "processing"}
+    assert [entry[1] for entry in transport.sent] == expected
+    await adapter.send_typing("C1", {"thread_id": "thread-2"})
+    assert [entry[1] for entry in transport.sent] == expected  # No repeated transition or queued phrase.
     assert await adapter._add_reaction("C1", "1", "eyes")
     task = {"id": "call-1", "title": "Checking", "status": "in_progress"}
     result = await adapter.send_native_task_card_progress("C1", [task], reply_to="thread-3")
     assert result.retryable  # Start was admitted, cosmetic append remains recoverable.
     await adapter.stop_typing("C1", {"thread_id": "thread-2"})
-    assert [entry[1] for entry in transport.sent] == [
-        "chat.postMessage", "reactions.add", "chat.startStream", "assistant.threads.setStatus"]
+    expected.extend(["reactions.add", "chat.startStream", "assistant.threads.setStatus"])
+    if native_sessions:
+        expected.append("agents.sessions.setStatus")
+        assert transport.sent[-1][2] == {
+            "channel_id": "C1", "thread_ts": "thread-2", "status": "active"}
+    assert [entry[1] for entry in transport.sent] == expected
     assert all(b[0] - a[0] >= 2 for a, b in pairwise(transport.sent))
-    assert transport.sent[-1][2]["status"] == ""
+    clears = [entry[2] for entry in transport.sent if entry[1] == "assistant.threads.setStatus"]
+    assert clears == [{"channel_id": "C1", "thread_ts": "thread-2", "status": ""}]
 
 
 @pytest.mark.asyncio

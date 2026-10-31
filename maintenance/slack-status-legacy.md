@@ -20,7 +20,7 @@ Reuse `_active_status_threads`. Successors keep their own lifecycle and share on
 
 ## Verification and Retirement
 
-Run `scripts/run_tests.sh tests/gateway/test_slack.py tests/gateway/test_slack_agent_sessions_api.py tests/gateway/test_slack_native_stop.py tests/gateway/test_slack_thread_status.py tests/plugins/platforms/slack/test_session_status.py tests/gateway/test_typing_stale_cleanup.py tests/gateway/test_typing_surface_ownership.py`.
+Run `scripts/run_tests.sh tests/gateway/test_slack.py tests/gateway/test_slack_agent_sessions_api.py tests/gateway/test_slack_native_stop.py tests/gateway/test_slack_thread_status.py tests/plugins/platforms/slack/test_session_status.py tests/plugins/platforms/slack/test_outbound_budget.py tests/gateway/test_typing_stale_cleanup.py tests/gateway/test_typing_surface_ownership.py`. The real-SDK transport case covers both native-session and legacy-only SDK paths. Lifecycle transitions wait for shared admission, cosmetic phrase ticks remain shed under contention, and both clear paths retain the channel gap.
 
 With live-message authorization, mention the bot in a channel thread and verify its root is processing with native Stop during work and active after completion or Stop. Unit coverage does not establish live Slack rollout or UI behavior.
 
