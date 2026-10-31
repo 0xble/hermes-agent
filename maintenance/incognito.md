@@ -62,6 +62,10 @@ not only the command reply.
   and sent-message IDs may resolve existing RAM prompt state and its session lane.
   Stale buttons cannot run or consume a newer prompt. Unmatched pickers remain
   privacy-ambiguous, not guessed public topics.
+- Async ingress reads the loaded store's published routing index on the event
+  loop. Only an unloaded store resolves off-loop. Routing every message through
+  the default executor queues ingress behind unrelated jobs and lets held
+  Telegram input miss handover admission.
 
 ## Proof And Retirement
 
@@ -76,6 +80,10 @@ Compare the complete suite's failures against the exact base before promotion.
 Off-mode differential proofs must compare the merged main revision, retaining
 exact SQL traces, SQLite pages and plugin callback assertions. A historical base
 with an older schema cannot establish current main compatibility.
+`tests/hermes_state/test_incognito_off_regression.py` runs only where git
+history shows the unmerged feature on its pinned `BASE`, so shallow hosted CI
+skips it. Run it from a full checkout before promotion and re-pin `BASE` after
+any rebase.
 
 Runtime proof needs both an ordinary topic and a private interval. Audit the
 interval's exact session and canary hash, not unrelated bank-wide activity. Arm
