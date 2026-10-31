@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import stat
 import threading
+import weakref
 from hermes_dir_acl import make_user_dir
 
 
@@ -138,8 +139,16 @@ def _still_names(path: Path, fd: int) -> bool:
         return False
 
 
+#: Every ``ProfileOwnership`` alive in this process: the gateway's ``process_ownership``, an
+#: ``exclusive_maintenance`` reservation (its own instance, possibly entered on another thread) and
+#: any embedded owner. :func:`foreign_runtime_owner` asks them before probing a lock, because a flock
+#: probe from this process would report its own reservation as held.
+_live_ownerships: weakref.WeakSet[ProfileOwnership] = weakref.WeakSet()
+
+
 class ProfileOwnership:
     def __init__(self, *, all_slots: bool = False):
+        _live_ownerships.add(self)
         self._all_slots = all_slots
         self._handles: dict[Path, ExitStack] = {}
         self._writers: list[threading.Thread] = []
@@ -216,6 +225,27 @@ class ProfileOwnership:
 
 
 process_ownership = ProfileOwnership()
+
+
+def held_in_process(home: Path) -> bool:
+    """True when any reservation in this process holds *home*'s runtime lock."""
+    home = canonical_home(home)
+    return any(owner.owns(home) for owner in list(_live_ownerships))
+
+
+def foreign_runtime_owner(home: Path) -> bool:
+    """True when ANOTHER process holds *home*'s runtime lock (either gateway slot).
+
+    The holder is a live gateway (or a maintenance reservation) whose runtime epoch fences every
+    write it makes, so nothing outside it may begin a new epoch on that store. A home nobody holds
+    (an offline store, a test's temporary home) is not foreign: the next owner's own begin
+    supersedes whatever epoch a lock-less caller took there.
+    """
+    if held_in_process(home):
+        return False
+    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, slot_lock_held
+    home = canonical_home(home)
+    return any(slot_lock_held(home, slot) for slot in (SLOT_ACTIVE, SLOT_STANDBY))
 _maintenance = threading.local()
 
 

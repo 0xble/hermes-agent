@@ -111,8 +111,21 @@ def _row(row):
 
 
 def begin_runtime_epoch(db, *, instance_id: str) -> int:
-    """Caller MUST hold the profile ownership lock, not merely an endpoint ticket."""
+    """Caller MUST hold the profile ownership lock, not merely an endpoint ticket.
+
+    Refused while another process holds that lock: the live owner's epoch fences all of its writes,
+    so a foreign bump stales every settlement and admission it makes, and the recovery a begin
+    precedes would turn the owner's running turns ``unknown``. A store nobody owns stays open to an
+    offline caller, whose epoch the next owner's own begin supersedes.
+    """
     _text(instance_id)
+    from pathlib import Path
+    from gateway.runtime_ownership import OwnershipConflict, foreign_runtime_owner
+    home = Path(db.db_path).resolve().parent
+    if foreign_runtime_owner(home):
+        raise OwnershipConflict(
+            f'runtime epoch refused for {instance_id!r}: another process owns the gateway runtime '
+            f'of {home}; reserve the profile (or stop that gateway) before beginning an epoch')
     def write(conn):
         conn.execute('''INSERT INTO runtime_epoch(singleton,epoch,instance_id) VALUES(1,1,?)
             ON CONFLICT(singleton) DO UPDATE SET epoch=runtime_epoch.epoch+1, instance_id=excluded.instance_id''', (instance_id,))
