@@ -25,10 +25,18 @@ class StatusOutputMixin:
             return
         if diagnostic and not self._warning_presentation_enabled():
             return
+        if self._print_fn is None and self._private_turn():
+            # Raw stdout bypasses the privacy log filter and a gateway redirects it to a log
+            # file. Status and warnings still reach the user through status_callback.
+            return
         try:
             (self._print_fn or print)(*args, **kwargs)
         except (OSError, ValueError):
             pass
+
+    def _private_turn(self) -> bool:
+        from agent.incognito import is_incognito
+        return getattr(self, "incognito", False) is True or is_incognito(getattr(self, "session_id", None))
 
     def _vprint(self, *args, force: bool = False, diagnostic: bool = False, **kwargs):
         """Verbose print — suppressed while tokens are streaming (allowed during tool execution) and after
