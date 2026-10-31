@@ -617,6 +617,7 @@ LOOP_CONTROLS = {
     "pause": lambda runner, source, sid: loops.LoopManager(sid).pause(),
     "resume": lambda runner, source, sid: loops.LoopManager(sid).resume(),
     "clear": lambda runner, source, sid: loops.LoopManager(sid).clear(),
+    "finish": lambda runner, source, sid: loops.LoopManager(sid).finish("agent finished the loop"),
     "wake_now_for_external_event": lambda runner, source, sid: loops.LoopManager(sid).wake_now_for_external_event(),
 }
 # Control paths outside the class's public methods.

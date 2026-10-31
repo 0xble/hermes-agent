@@ -38,7 +38,7 @@ async def test_profile_notice_policy_controls_sends_and_preserves_loops(tmp_path
                 _, callback = adapter.callbacks.popitem()[1]
                 await callback()
             if home == quiet:
-                await runner._send_goal_status_notice(source, "Loop completed", goal_notice=False)
+                await runner._send_goal_status_notice(source, "Loop completed", section="loops")
         finally:
             reset_hermes_home_override(token)
     assert [call["content"] for call in adapter.calls] == [

@@ -22,11 +22,20 @@ AUTONOMY_CONTINUATION_TEMPLATE = (
 )
 
 
-def goal_autonomy_enabled() -> bool:
+def autonomy_enabled(section: str) -> bool:
+    """Whether ``<section>.autonomy`` is on, for the goals and loops lifecycles."""
     # Resolve at call time under the owning profile, including idle wake scans.
     from hermes_cli.config_effective import load_user_config_effective
 
-    return (load_user_config_effective().get("goals") or {}).get("autonomy") is True
+    return (load_user_config_effective().get(section) or {}).get("autonomy") is True
+
+
+def goal_autonomy_enabled() -> bool:
+    return autonomy_enabled("goals")
+
+
+def loop_autonomy_enabled() -> bool:
+    return autonomy_enabled("loops")
 
 
 def completion_criteria(state) -> list[str]:
