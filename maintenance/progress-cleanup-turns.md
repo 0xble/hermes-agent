@@ -6,6 +6,8 @@ Post-delivery callbacks for overlapping queued turns retain independent generati
 
 With `cleanup_progress: true`, temporary progress deletion is registered before pending-message inspection and awaited after the first response reaches the chat, before the next queued turn starts. A refused first response keeps the progress breadcrumbs and the queued event for retry. Deletion follows the live replacement adapter while callback ownership stays with the original adapter. Failed agent runs keep their progress.
 
+Every turn the durable FIFO runs fires its own cleanup once its reply is sent, whichever path delivers it. A live native waiter's sender fires it: the first message's adapter lifecycle, or the observer of a follow-up sent while the session is busy (`dispatch_shared_busy`), which receives the turn's exact owner and generation from the drain (`fire_turn_post_delivery`). A waiter that stops waiting has the cleanup fired when its turn settles. A turn with no live waiter (producer wakes, recovered turns) has the drain fire it after `deliver_settled`.
+
 ## Provenance and patches
 
 Fork patch identity: `progress-cleanup-turns`.
@@ -15,6 +17,8 @@ Ported/adapted from archived HERMES-086 and HERMES-096 (gateway-delivery unit), 
 ## Verification
 
 Both current fork main and current upstream main failed the queued-handoff callback and queued-progress-deletion regressions before this patch: the former fired only the newer callback; the latter started turn two with zero deletions. `scripts/run_tests.sh tests/gateway/test_post_delivery_callback_chaining.py tests/gateway/test_run_cleanup_progress.py tests/gateway/test_status_command.py tests/gateway/test_run_progress_topics.py tests/gateway/test_active_session_text_merge.py -j 6 -q` exercises callback ownership, deletion order, and existing gateway progress behavior.
+
+`scripts/run_tests.sh tests/gateway/test_turn_bubble_cleanup.py tests/gateway/test_drain_post_delivery_cleanup.py` is the behaviour contract for every turn path: the adapter lifecycle, busy follow-ups, producer wakes the drain delivers, a waiter that stopped waiting, and a waiter released before its turn ended. Before the busy-follow-up fix (2026-10-31) the follow-up's cleanup never fired, which left its tool cards in the chat.
 
 ## Retirement and rollback
 
