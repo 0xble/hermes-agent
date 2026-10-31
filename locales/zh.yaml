@@ -468,6 +468,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**会话 ID：** `{session_id}`"
+    incognito: "**无痕模式：** {state}"
     title: "**标题：** {title}"
     created: "**创建时间：** {timestamp}"
     last_activity: "**最近活动：** {timestamp}"

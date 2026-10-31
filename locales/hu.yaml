@@ -471,6 +471,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**Munkamenet-azonosító:** `{session_id}`"
+    incognito: "**Inkognitó:** {state}"
     title: "**Cím:** {title}"
     created: "**Létrehozva:** {timestamp}"
     last_activity: "**Utolsó tevékenység:** {timestamp}"
