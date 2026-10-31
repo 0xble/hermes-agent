@@ -94,6 +94,12 @@ def _probe_session_store(runtime_status: dict[str, Any], state_db_probe: dict[st
     return _check("ok" if state_db_probe.get("status") == "ok" else "unavailable")
 
 
+def _probe_runtime_epoch(runtime_status: dict[str, Any]) -> dict[str, Any]:
+    epoch = runtime_status.get("runtime_epoch")
+    lost = isinstance(epoch, dict) and epoch.get("status") == "lost"
+    return _check("unavailable", "lost") if lost else _check("ok")
+
+
 def collect_runtime_readiness(
     *, configured_model: str, runtime_status: dict[str, Any] | None, active_api_runs: int = 0,
     process_completion_queue_depth: int = 0, active_delegations: int = 0,
@@ -110,6 +116,9 @@ def collect_runtime_readiness(
         "model": _check("ok" if str(configured_model or "").strip() else "degraded"),
         "disk": _probe_disk(home),
         "gateway": _probe_gateway(runtime),
+        # Another writer took the store's runtime epoch while this owner still runs: every
+        # settlement and admission it makes is refused until a restart re-begins one.
+        "runtime_epoch": _probe_runtime_epoch(runtime),
         "background_queues": _check(
             "ok", active_api_runs=max(0, int(active_api_runs)),
             process_completions=max(0, int(process_completion_queue_depth)),
