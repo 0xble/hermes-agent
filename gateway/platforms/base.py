@@ -2002,6 +2002,58 @@ def resolve_channel_skills(
     return None
 
 
+def track_temporary_notice(event: Any, adapter: Any, result: Any) -> None:
+    """Remember a status notice sent about ``event`` (a busy ack) for deletion once the event's own
+    turn has delivered its reply. A receipt that arrives after that is deleted right away."""
+    message_id = getattr(result, "message_id", None) if getattr(result, "success", False) else None
+    if not message_id:
+        return
+    notice = (adapter, event.source.chat_id, str(message_id))
+    if getattr(event, "_temporary_notices_released", False):
+        task = asyncio.get_running_loop().create_task(_delete_temporary_notices([notice]))
+        _TEMPORARY_NOTICE_TASKS.add(task)
+        task.add_done_callback(_TEMPORARY_NOTICE_TASKS.discard)
+        return
+    notices = getattr(event, "_temporary_notices", None)
+    if notices is None:
+        notices = event._temporary_notices = []
+    notices.append(notice)
+
+
+async def release_temporary_notices(event: Any) -> None:
+    """Delete the status notices sent about ``event``: its own turn is over and its reply delivered."""
+    event._temporary_notices_released = True
+    notices = getattr(event, "_temporary_notices", None) or []
+    event._temporary_notices = []
+    await _delete_temporary_notices(notices)
+
+
+_TEMPORARY_NOTICE_TASKS: set = set()
+
+
+async def _delete_temporary_notices(notices) -> None:
+    for adapter, chat_id, message_id in notices:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(adapter.delete_message(chat_id, message_id), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+
+
+def temporary_cleanups(callback: Any) -> list:
+    """The parts of a (possibly chained or wrapped) post-delivery callback that only delete a turn's
+    temporary messages (marked ``_temporary_cleanup``). A superseded turn runs these and drops the
+    rest: its deferred notices describe a result nobody will see, but its cards must still go."""
+    if not callable(callback):
+        return []
+    if getattr(callback, "_temporary_cleanup", False):
+        return [callback]
+    parts = getattr(callback, "_post_delivery_parts", None)
+    if parts is not None:
+        return [found for part in parts for found in temporary_cleanups(part)]
+    wrapped = getattr(callback, "__wrapped__", None)
+    if wrapped is not None and getattr(wrapped, "_temporary_cleanup", False):
+        return [callback]  # keep the wrapper: it restores the context the cleanup runs under
+    return temporary_cleanups(wrapped)
+
+
 def _split_post_delivery_entry(entry: Any) -> tuple[Optional[int], Any]:
     """``(generation, callback)`` from a post-delivery slot; legacy bare callbacks have no
     generation."""
@@ -3798,6 +3850,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         else:
             owned[(session_key, generation)] = callback
 
+    def claim_post_delivery(self, session_key: str, generation: int | None) -> None:
+        """A deliverer will fire this generation's callback once its reply is sent, so a newer
+        generation's stale sweep must leave it alone until then."""
+        if session_key and generation is not None:
+            _lazy_attr(self, "_post_delivery_claims", set).add((session_key, int(generation)))
+
     @staticmethod
     def _chain_callbacks(*callbacks: Callable) -> Callable[[], Awaitable[None]]:
         """Async wrapper running ``callbacks`` in order with per-callback exception isolation;
@@ -3810,6 +3868,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                         await _result
                 except Exception:
                     logger.debug("Post-delivery callback failed", exc_info=True)
+        _chained._post_delivery_parts = callbacks
         return _chained
 
     def pop_post_delivery_callback(
@@ -5248,11 +5307,16 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     ) -> None:
         """Run the one-shot callback for the generation captured after this handler returned, after
         any older generation's callback for the session that nothing fired: that turn is over, and its
-        callback (temporary progress cleanup above all) would otherwise be held forever."""
+        callback (temporary progress cleanup above all) would otherwise be held forever. An older
+        generation a deliverer has claimed (``claim_post_delivery``) is not over: its reply may still
+        be sending, and its own deliverer fires it after that send."""
         callbacks = []
         if generation is not None:
+            claims = _lazy_attr(self, "_post_delivery_claims", set)
+            claims.discard((session_key, int(generation)))
             owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
-            stale = sorted(k for k in owned if k[0] == session_key and k[1] < int(generation))
+            stale = sorted(k for k in owned
+                           if k[0] == session_key and k[1] < int(generation) and k not in claims)
             callbacks.extend(owned.pop(k) for k in stale)
         callbacks.append(self.pop_post_delivery_callback(session_key, generation=generation))
         for _post_cb in callbacks:
@@ -5517,6 +5581,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 from gateway.session_ingress import fire_turn_post_delivery
                 if not await fire_turn_post_delivery(event):
                     await self._fire_post_delivery_callback(session_key, delivery_generation)
+                await release_temporary_notices(event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)

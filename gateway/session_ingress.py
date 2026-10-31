@@ -212,6 +212,10 @@ def retain_unsettled_delivery(authority, admission_id):
         delivery = authority.pending_deliveries.pop(admission_id, None)
     if delivery is not None:
         _registry(authority, 'unsettled_deliveries')[admission_id] = delivery
+    # The turn is over either way: a reply a later Discard sends carries no cards of its own.
+    post_delivery = _registry(authority, 'post_deliveries').pop(admission_id, None)
+    if post_delivery is not None:
+        _fire_post_delivery(post_delivery)
 
 
 async def deliver_resolved(authority, admission_id, *, owed):
@@ -403,6 +407,7 @@ async def execute_admission(authority, ref, row):
             # Every waiter does, not only the first message's adapter lifecycle: a busy follow-up's
             # observer (``dispatch_shared_busy``) never unwinds one (2026-10-31, stale tool cards).
             _registry(authority, 'waiter_post_deliveries')[row['admission_id']] = post_delivery
+            _claim(post_delivery)
         elif post_delivery is not None and native:
             # The waiter was already released (a pause, /stop) and claims nothing now.
             _fire_post_delivery(post_delivery)
@@ -412,6 +417,7 @@ async def execute_admission(authority, ref, row):
             # that raised or was cancelled is over too.
             if row['admission_id'] in authority.pending_deliveries:
                 _registry(authority, 'post_deliveries')[row['admission_id']] = post_delivery
+                _claim(post_delivery)
             else:
                 _fire_post_delivery(post_delivery)
         if not handed:
@@ -461,6 +467,14 @@ async def _execution_scope(authority, home):
 _post_delivery_tasks = set()
 
 
+def _claim(post_delivery):
+    """The turn's reply is still to be sent: keep a newer generation's sweep off its cleanup."""
+    owner, session_key, generation = post_delivery
+    claim = getattr(owner, 'claim_post_delivery', None)
+    if claim is not None:
+        claim(session_key, generation)
+
+
 def _fire_post_delivery(post_delivery):
     """Detached: bubble deletes can wait out a chat's flood limit, and the FIFO must not."""
     owner, session_key, generation = post_delivery
@@ -476,16 +490,23 @@ async def deliver_settled(authority, admission_id):
     turn's post-delivery cleanup. A send failure cannot rewrite that outcome; it is logged, and
     inference never runs again."""
     post_delivery = _registry(authority, 'post_deliveries').pop(admission_id, None)
+    handed = False
     try:
-        await _deliver_settled(authority, admission_id)
+        handed = await _deliver_settled(authority, admission_id)
     finally:
-        if post_delivery is not None:
+        if post_delivery is not None and handed:
+            # A waiter that registered after the turn started sends the reply after this returns
+            # (``_resolve_settled_waiter``): its sender fires the cleanup after that send.
+            _registry(authority, 'waiter_post_deliveries')[admission_id] = post_delivery
+        elif post_delivery is not None:
             _fire_post_delivery(post_delivery)
 
 
 async def _deliver_settled(authority, admission_id):
+    """True when the reply was handed to a waiter that registered late, which sends it itself."""
     held = _held_markers(authority).pop(admission_id, None)
     delivery = authority.pending_deliveries.get(admission_id)
+    handed = False
     if delivery is not None and admission_id in authority.native_waiters:
         # ``admit_message`` registered its delivery waiter after this turn started: the drain
         # hands that waiter the reply and its adapter lifecycle sends it, so this send is not owed.
@@ -495,12 +516,12 @@ async def _deliver_settled(authority, admission_id):
         if held is not None and adopter is not None:
             _move_marker(held, adopter)
             held = None
-        delivery = None
+        delivery, handed = None, True
     if delivery is None:
         if held is not None:
             # Fenced unknown: no answer is owed, so no later boot may deliver one either.
             await _release_turn_marker(authority, held)
-        return
+        return handed
     adapter, event, session_key, response, home = delivery
     try:
         with await _execution_scope(authority, home):
@@ -574,6 +595,8 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             # After the marker release, so bubble deletes waiting out a flood limit never hold the
             # drain's bounded wait for it.
             await fire_turn_post_delivery(event)
+            from gateway.platforms.base import release_temporary_notices
+            await release_temporary_notices(event)  # its busy ack: the queued turn has answered
 
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
     try:
