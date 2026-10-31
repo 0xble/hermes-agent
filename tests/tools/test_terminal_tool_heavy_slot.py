@@ -224,6 +224,39 @@ def test_terminal_tool_bounds_only_foreground_local_waits(background, env_type, 
         ) == (None if origin == "cron" else expected)
 
 
+@pytest.mark.parametrize(("remaining", "expected_timeout"), [(2.75, 1), (1.5, None), (0.5, None)])
+def test_cron_cell_reserves_cleanup_budget(tmp_path, monkeypatch, remaining, expected_timeout):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from gateway.session_context import preserved_session_context, set_turn_origin
+    from tools import terminal_tool
+    from tools.code_execution_rpc import cell_deadline
+
+    env = SimpleNamespace(execute=Mock(return_value={"returncode": 0, "output": "completed"}))
+    plan = terminal_tool._ExecPlan(config={}, env_type="local", effective_task_id="budget",
+                                   image="", cwd=str(tmp_path), host_cwd=None, effective_timeout=30)
+    monkeypatch.setattr(terminal_tool, "finalize_foreground_result", lambda **_: '{}')
+    with preserved_session_context():
+        set_turn_origin("cron")
+        token = cell_deadline.set(time.monotonic() + remaining)
+        try:
+            result = json.loads(terminal_tool._run_foreground(
+                "true", env, plan, task_id="budget", session_id=None, session_key="budget",
+                workdir=None, approval_note=None, clear_interrupt=False, metered=False,
+            ))
+        finally:
+            cell_deadline.reset(token)
+    if expected_timeout is None:
+        env.execute.assert_not_called()
+        assert result["exit_code"] == 124
+        assert "not started" in result["error"].lower()
+    else:
+        env.execute.assert_called_once()
+        assert env.execute.call_args.kwargs["timeout"] == expected_timeout
+
+
 @pytest.mark.parametrize(("command", "expected"), [
     ("env -u FOO PYTHONPATH=. timeout 600 pytest tests",
      "_hermes_heavy_slot 'hermes pytest' env -u FOO PYTHONPATH=. timeout 600 pytest tests"),

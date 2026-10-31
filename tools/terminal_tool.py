@@ -84,6 +84,11 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT
 _FOREGROUND_HEAVY_SLOT_WAIT_CAP = 120
 _FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
 
+# The backend starts its relative timer after shell setup, then polls (up to 0.2s)
+# and tears down the process tree / drains output before the cell RPC can reply.
+# Flooring alone can leave almost no slack; reserve a full second even then.
+_CRON_CELL_CLEANUP_MARGIN_S = 1.0
+
 
 def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
     """Bound foreground occupancy without cancelling heavy-slot admission."""
@@ -1410,9 +1415,12 @@ def _run_foreground(
             from tools.code_execution_rpc import cell_deadline
             deadline = cell_deadline.get()
             if bound_turn_origin() == "cron" and deadline is not None:
-                # Round down to leave time for process-tree cleanup and the RPC reply.
-                # Recompute per attempt: setup/retries and earlier calls spent this budget.
-                effective_timeout = min(effective_timeout, int(deadline - time.monotonic()))
+                # Recompute per attempt from the absolute host deadline: setup/retries
+                # and earlier calls spent this budget. Leave explicit cleanup/reply slack
+                # BEFORE rounding down; a fractional remainder is not a safety margin.
+                effective_timeout = min(
+                    effective_timeout, int(deadline - time.monotonic() - _CRON_CELL_CLEANUP_MARGIN_S),
+                )
                 if effective_timeout <= 0:
                     return _error_json(
                         "Command not started: execute_code cell deadline expired", exit_code=124,
