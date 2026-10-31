@@ -196,4 +196,5 @@ async def test_idle_consumer_retries_latest_projection_without_new_events(monkey
     assert [c.args[0] for c in client.api_call.await_args_list] == [
         "chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream", "chat.delete",
     ]
+    assert client.api_call.await_args.kwargs["json"] == {"channel": "D1", "ts": "stream-1"}
     state.adapter.send.assert_not_awaited()

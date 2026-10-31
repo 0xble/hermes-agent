@@ -1728,18 +1728,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         fence = attempt.commit_fence
         _hyg_keep_admission = bool(getattr(fence, "commit_watermark_fenced", False)) and not fence.is_cancelled
         if _hyg_keep_admission:
-            self._hmwa_hygiene_defer_cleanup(attempt, "session hygiene turn-hold")
             # NO retry-after here (it would also block the agent-side preflight compressor); spacing
             # comes from the durable compression lock. The done-callback records the flat retry-after
             # ONLY if the worker ends without committing anything.
             _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
             _meta = attempt.meta
 
-            def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
+            async def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
                 _exc = None
                 try:
-                    _exc = _fut.exception()
-                except (asyncio.CancelledError, Exception):
+                    await asyncio.shield(_fut)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _exc = exc
                     _committed = False
                 else:
                     _committed = _exc is None and (
@@ -1762,33 +1764,37 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     # the inline adoption reset and fence out this turn's stale end-of-turn count.
                     session_entry.last_prompt_tokens = 0
                     _gw._note_hygiene_deferred_adoption(_skey)
-                    _gw._retain_background_task(asyncio.ensure_future(
+                    update = _gw._retain_background_task(asyncio.ensure_future(
                         _gw.async_session_store.update_session(
                             _skey, last_prompt_tokens=0, touch_activity=False,
                         )
                     ))
-                    # Done-callbacks run on the loop; both state.db writes below go to a thread.
-                    _gw._retain_background_task(asyncio.ensure_future(_gw._hmwa_hygiene_off_loop(
+                    reset = _gw._retain_background_task(asyncio.ensure_future(_gw._hmwa_hygiene_off_loop(
                         _reset_hygiene_failure_streak, _gw, _skey,
                         failure_label="hygiene streak reset after deferred adoption failed",
                     )))
+                    await asyncio.gather(update, reset, return_exceptions=True)
                 elif _summary_failed:
                     # A real summary failure, not a turn-hold: same escalation and warning as the
                     # inline abort path, which this deferred attempt never reaches.
-                    _gw._retain_background_task(asyncio.ensure_future(
-                        _gw._hmwa_hygiene_deferred_failure(hs, _skey, _sid, _agent, source, _meta)
-                    ))
+                    await _gw._hmwa_hygiene_deferred_failure(hs, _skey, _sid, _agent, source, _meta)
                 else:
                     # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
                     # sustained traffic doesn't spawn and abandon a compressor every turn.
-                    _gw._hmwa_hygiene_schedule_cooldown(
+                    await _gw._hmwa_hygiene_schedule_cooldown(
                         _sid, _record_hygiene_cooldown, _gw, _sid, _HYGIENE_TURNHOLD_RETRY_SECONDS,
                         "hygiene compression deferred: turn-hold budget expired and the "
                         "detached attempt did not commit",
                         failure_label="hygiene turn-hold retry spacing failed",
                     )
 
-            attempt.future.add_done_callback(_hyg_adopt_or_space_retry)
+            # Cleanup owns the whole adoption, including its off-loop durable bookkeeping.
+            # A completed compressor alone does not mean the deferred lifecycle has settled.
+            settlement = asyncio.create_task(_hyg_adopt_or_space_retry(attempt.future))
+            self._defer_agent_cleanup_until_future_done(
+                settlement, attempt.agent, context="session hygiene turn-hold",
+            )
+            attempt.cleanup_deferred = True
             _log_suffix = (
                 " — the watermark-fenced worker keeps its commit admission and the summary "
                 "will be adopted when it finishes"

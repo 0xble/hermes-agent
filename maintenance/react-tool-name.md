@@ -4,7 +4,7 @@ Fork patch identity: `react-tool-name`.
 
 ## Contract
 
-Advertise and dispatch the reaction tool as `react`, with `👍` as its progress icon. Preserve its opt-in gate, reaction payloads and persistence behavior. Saved `react_to_message` calls remain silent in desktop transcripts, but the legacy name is not registered as a callable alias. The existing retired-name metrics set preserves previously saved rows while current recording uses `react`.
+Advertise and dispatch the reaction tool as `react`, with `👍` as its progress icon. Preserve its desktop opt-in gate, reaction payloads and persistence behavior. Messaging gateways use the existing `reactions` toolset without requiring desktop opt-in. Preserve triggering-message routing, gateway-loop dispatch and acknowledgement only after confirmed delivery, including reaction-only replies and lifecycle ownership. Desktop and gateway selections share 1 registration, not callable aliases. Saved `react_to_message` calls remain silent in desktop transcripts, but the legacy name is not registered as a callable alias. The existing retired-name metrics set preserves previously saved rows while current recording uses `react`.
 
 ## Upstream Findings
 
