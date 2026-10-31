@@ -25,12 +25,13 @@ class StatusOutputMixin:
             return
         if diagnostic and not self._warning_presentation_enabled():
             return
-        if self._print_fn is None and self._private_turn():
+        print_fn = getattr(self, "_print_fn", None)  # unset while __init__ is still printing
+        if print_fn is None and self._private_turn():
             # Raw stdout bypasses the privacy log filter and a gateway redirects it to a log
             # file. Status and warnings still reach the user through status_callback.
             return
         try:
-            (self._print_fn or print)(*args, **kwargs)
+            (print_fn or print)(*args, **kwargs)
         except (OSError, ValueError):
             pass
 
