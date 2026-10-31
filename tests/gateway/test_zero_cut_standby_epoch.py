@@ -6,6 +6,7 @@ its authorities unclaimed (epoch 0, every fenced write refused) and claims at pr
 """
 import asyncio
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -114,6 +115,7 @@ async def test_a_secondary_claim_failure_parks_it_and_promotion_still_serves(sta
             return await real_claim(authority, **kwargs)
         monkeypatch.setattr(session_authority, "claim_session_authority", claim)
 
+        runner._served_profile_homes = {"default": home, "guest": guest}  # recorded at boot
         await claim_gateway_runtime(runner)
         instance = runner.session_runtime_descriptor["instance_id"]
         assert _store_epoch(home) == (serving_epoch + 1, instance)
@@ -122,6 +124,17 @@ async def test_a_secondary_claim_failure_parks_it_and_promotion_still_serves(sta
         assert not process_ownership.owns(guest)
         from gateway.run_runtime import parked_profile_map
         assert "guest" in parked_profile_map(runner)
+        assert "guest" not in runner._served_profile_homes
+
+        # Promotion then starts deferred secondaries from the served set: never the parked one.
+        started, statuses = [], []
+        runner._start_one_profile_adapters = lambda profile, home, claimed: asyncio.sleep(
+            0, result=started.append(profile))
+        runner._update_platform_runtime_status = lambda key, **fields: statuses.append(key)
+        failed = []
+        await zcs._promote_secondary_profiles(runner, ["guest"], failed)
+        assert started == [], "a parked profile got adapters with no authority"
+        assert failed == ["guest:telegram"]
     finally:
         for authority in list(getattr(runner, "session_authorities", []) or []):
             authority.db.close()
@@ -222,6 +235,73 @@ async def test_an_unopenable_predecessor_lock_does_not_stall_adoption(tmp_path, 
     try:
         await asyncio.wait_for(
             zcs._adopt_predecessor_duties(SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=False))), 5)
+    finally:
+        lock.chmod(0o600)
+    assert calls == ["claim", "record"]
+
+
+
+@pytest.mark.asyncio
+async def test_a_retried_promotion_reclaims_an_epoch_taken_since_its_claim(standby_home):
+    """A promotion that claimed and then rolled back leaves slot b answering standby while slot a
+    restarts and begins a newer epoch. The retry must claim again, not serve on its old epoch."""
+    home, serving_epoch = standby_home
+    runner = GatewayRunner(GatewayConfig())
+    process_ownership.reserve([home])
+    try:
+        await initialize_gateway_runtime(runner)
+        await claim_gateway_runtime(runner)
+        # Slot a restarts (it may: slot b answers standby) and begins its own epoch.
+        conn = sqlite3.connect(home / "state.db")
+        with conn:
+            conn.execute("UPDATE runtime_epoch SET epoch=epoch+1, instance_id='slot-a-restarted'")
+        conn.close()
+        await claim_gateway_runtime(runner)
+        instance = runner.session_runtime_descriptor["instance_id"]
+        assert _store_epoch(home) == (serving_epoch + 3, instance)
+        assert runner.session_authority.epoch == serving_epoch + 3, "slot b serves on a stale epoch"
+        assert runner.session_runtime_descriptor["authority_epoch"] == serving_epoch + 3
+    finally:
+        for authority in list(getattr(runner, "session_authorities", []) or []):
+            authority.db.close()
+        process_ownership.release(home)
+
+
+@pytest.mark.parametrize("error, state", [
+    (OSError(24, "Too many open files"), gateway_slot.LOCK_HELD),
+    (PermissionError(13, "Permission denied"), gateway_slot.LOCK_UNKNOWN),
+], ids=["emfile", "eacces"])
+def test_only_a_permission_error_makes_a_lock_unknown(tmp_path, monkeypatch, error, state):
+    """EMFILE is transient and says nothing about the holder: a waiter keeps polling."""
+    (tmp_path / "gateway.lock").touch()
+
+    def refuse(*_a, **_k):
+        raise error
+    monkeypatch.setattr(gateway_slot, "open", refuse, raising=False)
+    assert gateway_slot.slot_lock_state(tmp_path, "a") == state
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="needs an unopenable POSIX lock")
+async def test_adoption_waits_on_an_unopenable_lock_while_the_predecessor_answers(tmp_path, monkeypatch):
+    """An unopenable predecessor lock is not an exit: adoption waits while that slot still answers."""
+    calls, answering = [], [True]
+    monkeypatch.setattr(zcs, "_PREDECESSOR_POLL_S", 0.01)
+    monkeypatch.setattr(zcs, "_slot_answers", lambda home, slot: answering[0], raising=False)
+    monkeypatch.setattr("gateway.status._get_process_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("gateway.gateway_slot.effective_gateway_slot", lambda config=None: "b")
+    monkeypatch.setattr("gateway.run._claim_host_gateway_role", lambda force=False: calls.append("claim"))
+    monkeypatch.setattr("gateway.run._refresh_host_gateway_record", lambda r: calls.append("record"))
+    lock = tmp_path / "gateway.lock"
+    lock.touch()
+    lock.chmod(0)
+    try:
+        task = asyncio.create_task(
+            zcs._adopt_predecessor_duties(SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=False))))
+        await asyncio.sleep(0.2)
+        assert calls == [], "adopted the host role while slot a still answers"
+        answering[0] = False  # slot a exits
+        await asyncio.wait_for(task, 5)
     finally:
         lock.chmod(0o600)
     assert calls == ["claim", "record"]

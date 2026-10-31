@@ -200,6 +200,12 @@ async def claim_gateway_runtime(runner):
     release_unknown_turn_markers(runner)
     for authority in [a for a in registry if a is not None]:
         await _recover_profile_bot_mailbox(runner, authority)
+    # Promotion starts deferred secondaries from the served set recorded at boot: re-record it
+    # against the registry, so a profile parked above never gets adapters without an authority.
+    served = getattr(runner, '_served_profile_homes', None)
+    if served is not None and callable(getattr(runner, '_record_served_profiles', None)):
+        runner._record_served_profiles(getattr(runner, '_primary_profile_name', None) or 'default',
+                                       list(served.items()))
 
 
 def release_unknown_turn_markers(runner):

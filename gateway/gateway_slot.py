@@ -149,9 +149,10 @@ LOCK_FREE, LOCK_HELD, LOCK_UNKNOWN = "free", "held", "unknown"
 
 
 def slot_lock_state(home: Any, slot: str) -> str:
-    """``free`` (no lock file, or one nobody holds), ``held`` (a flock probe lost), or ``unknown``
-    (the file exists but cannot be opened). Callers that wait for a release tell ``unknown`` apart,
-    since it may never change; ownership checks treat it as held."""
+    """``free`` (no lock file, or one nobody holds), ``held`` (a flock probe lost, or a transient
+    open error such as EMFILE), or ``unknown`` (this user may not open the file at all). Callers that
+    wait for a release tell ``unknown`` apart, since it may never change; ownership checks treat it as
+    held."""
     import os
     from pathlib import Path
 
@@ -163,8 +164,10 @@ def slot_lock_state(home: Any, slot: str) -> str:
         handle = open(path, "a+", encoding="utf-8")
     except FileNotFoundError:
         return LOCK_FREE  # removed since the stat: nobody holds it
+    except PermissionError:
+        return LOCK_UNKNOWN  # another user's inode: may never change
     except OSError:
-        return LOCK_UNKNOWN
+        return LOCK_HELD  # transient (EMFILE, EIO): the holder may well be alive, ask again
     return LOCK_HELD if _probe_lock_file(handle) else LOCK_FREE
 
 

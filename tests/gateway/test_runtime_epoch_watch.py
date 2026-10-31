@@ -140,10 +140,16 @@ def test_a_failed_handover_does_not_excuse_the_move(owned, successor, live_sibli
     assert len(_criticals(caplog)) == 1
 
 
-def test_accepted_handover_without_an_answering_sibling_is_still_lost(owned, caplog):
-    """Accepting a handover does not excuse a move nobody can show the sibling made."""
+def test_an_unanswered_sibling_is_pending_then_escalates(owned, caplog):
+    """A promoting slot b too busy to answer one 0.5 s identify is not a theft yet: slot a rechecks
+    each tick and reports the move only after HANDOVER_PENDING_TICKS unanswered ticks."""
+    from gateway.session_epoch_watch import HANDOVER_PENDING_TICKS
     owned.runner._zero_cut_handover_state = {"accepted": True}
     _take_epoch(owned.db, holder="successor-b")
     caplog.set_level(logging.CRITICAL)
+    for _ in range(HANDOVER_PENDING_TICKS - 1):
+        assert check_runtime_epochs(owned.runner) == []
+    assert _criticals(caplog) == []
+    assert owned.published == [{"runtime_epoch": {"status": "ok"}}], "readiness dropped mid-handover"
     assert len(check_runtime_epochs(owned.runner)) == 1
     assert len(_criticals(caplog)) == 1

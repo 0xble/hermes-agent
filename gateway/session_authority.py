@@ -1444,7 +1444,12 @@ async def claim_session_authority(authority, *, successor=False):
     store's local-reset fence unset. ``epoch_claimed`` is set only once every step finished.
     """
     if getattr(authority, 'epoch_claimed', False):
-        return
+        if await asyncio.to_thread(_stored_epoch, authority.db) == authority.epoch:
+            return
+        # A rolled-back promotion kept its claim while slot a restarted and began a newer epoch:
+        # serving on the old one would fail every write stale_epoch. Claim again.
+        authority.epoch_claimed = False
+        authority.begun_epoch = None
     db_key = await _claim_epoch(authority, successor=successor)
     _publish_claimed_epoch(authority, db_key, register=authority.runner.session_authority is authority)
     authority.epoch_claimed = True
@@ -1455,6 +1460,8 @@ async def _claim_epoch(authority, *, successor=False):
     db = authority.db
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
     epoch = getattr(authority, 'begun_epoch', None)
+    if epoch is not None and await asyncio.to_thread(_stored_epoch, db) != epoch:
+        epoch = None  # another owner began since this half-finished claim: its epoch is gone
     if epoch is None:
         epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=authority.instance_id,
                                         successor=successor)
@@ -1472,6 +1479,12 @@ async def _claim_epoch(authority, *, successor=False):
     from gateway.session_local_adoption import adopt_local_compressions
     await adopt_local_compressions(authority)
     return db_key
+
+
+def _stored_epoch(db):
+    with db._read_ctx() as conn:
+        row = conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()
+    return row[0] if row is not None else None
 
 
 def _publish_claimed_epoch(authority, db_key, *, register):
