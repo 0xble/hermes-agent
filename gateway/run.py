@@ -1887,6 +1887,8 @@ def _profile_runtime_scope(
         home_token = set_hermes_home_override(str(profile_home))
         if prepared_secret_scope is not None:
             secrets = prepared_secret_scope
+        elif (prepared := _PREPARED_AUTHORIZATION_SCOPE.get()) is not None and prepared[0] == _home_key(profile_home):
+            secrets = prepared[1]  # this ingress task already loaded this profile off the loop
         elif hydrate_secrets:
             secrets = _load_profile_secret_scope(Path(profile_home))
         else:
@@ -1930,13 +1932,17 @@ async def prepared_authorization_scope(runner, source):
     if home is None:
         yield
         return
-    from hermes_constants import hermes_home_key
     secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(home))
-    token = _PREPARED_AUTHORIZATION_SCOPE.set((hermes_home_key(home), secrets))
+    token = _PREPARED_AUTHORIZATION_SCOPE.set((_home_key(home), secrets))
     try:
         yield
     finally:
         _PREPARED_AUTHORIZATION_SCOPE.reset(token)
+
+
+def _home_key(home) -> str:
+    from hermes_constants import hermes_home_key
+    return hermes_home_key(home)
 
 
 def without_prepared_authorization_scope():
@@ -4166,11 +4172,7 @@ class GatewayRunner(
         authorization_home = self._authorization_home_for_source(source)
         if authorization_home is None:
             return check()
-        from hermes_constants import hermes_home_key
-        prepared = _PREPARED_AUTHORIZATION_SCOPE.get()
-        secrets = (prepared[1] if prepared is not None and prepared[0] == hermes_home_key(authorization_home)
-                   else None)
-        with _profile_runtime_scope(Path(authorization_home), secrets):
+        with _profile_runtime_scope(Path(authorization_home)):
             return check()
 
     def _cache_session_source(self, session_key: str, source) -> None:

@@ -247,7 +247,8 @@ async def test_native_retry_retains_original_receipt_but_changed_content_still_c
 
 
 @pytest.mark.asyncio
-async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_busy, monkeypatch, tmp_path):
+@pytest.mark.parametrize('flush', ['timer', 'command'])
+async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_busy, monkeypatch, tmp_path, flush):
     import threading
     import gateway.run as gateway_run
     from hermes_constants import get_hermes_home_override
@@ -272,12 +273,14 @@ async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_bu
     monkeypatch.setattr(gateway_run, '_load_profile_secret_scope', load)
     monkeypatch.setattr(env.runner, '_mark_attended_user_activity', mark)
     monkeypatch.setattr(env.runner, '_authorization_home_for_source', lambda source: transport)
-    # Commit from the burst's own timer, as production does, rather than the test's flush helper.
-    monkeypatch.setattr(env.adapter, '_busy_text_debounce_seconds', 0.01)
-    monkeypatch.setattr(env.adapter, '_busy_text_hard_cap_seconds', 0.01)
+    if flush == 'timer':  # the burst's own timer commits it
+        monkeypatch.setattr(env.adapter, '_busy_text_debounce_seconds', 0.01)
+        monkeypatch.setattr(env.adapter, '_busy_text_hard_cap_seconds', 0.01)
     event = MessageEvent(text='scoped follow-up', source=env.source, message_id='scoped')
     await env.adapter.handle_message(event)
     await event._attended_activity_task
+    if flush == 'command':  # an early flush from another task, inside the debounce window
+        await flush_busy_burst(env.adapter, env.owner.key)
     await async_wait_until(lambda: any(row['request_id'] == 'scoped' for row in _rows(env.owner.authority)),
                            timeout=10, what='the follow-up to commit')
     loop_thread = threading.get_ident()
@@ -286,6 +289,33 @@ async def test_busy_receipt_loads_profile_secrets_off_the_receive_loop(shared_bu
     assert [path for path, _ in loads].count(str(transport)) == 1
     assert marks == [str(home)]
     assert event._attended_activity_marked
+
+
+@pytest.mark.asyncio
+async def test_profile_scope_reuses_prepared_authorization_secrets(monkeypatch, tmp_path):
+    """Any authorization check inside busy ingress (allowlist, bot budget, native role re-check)
+    enters its profile with the secrets loaded off the loop, and other homes still load."""
+    import gateway.run as gateway_run
+    from agent.secret_scope import current_secret_scope
+
+    transport, other = tmp_path / 'transport', tmp_path / 'other'
+    for home in (transport, other):
+        home.mkdir()
+    loads = []
+    monkeypatch.setattr(gateway_run, '_load_profile_secret_scope',
+                        lambda home: loads.append(str(home)) or {'MARK': str(home)})
+    runner = SimpleNamespace(_authorization_home_for_source=lambda source: transport)
+    async with gateway_run.prepared_authorization_scope(runner, None):
+        assert loads == [str(transport)]
+        with gateway_run._profile_runtime_scope(transport):
+            assert current_secret_scope()['MARK'] == str(transport)
+        assert loads == [str(transport)]
+        with gateway_run._profile_runtime_scope(other):
+            pass
+        assert loads == [str(transport), str(other)]
+    with gateway_run._profile_runtime_scope(transport):
+        pass
+    assert loads == [str(transport), str(other), str(transport)]
 
 
 @pytest.mark.asyncio
