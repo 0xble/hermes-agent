@@ -184,7 +184,8 @@ class MemoryStore:
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
-                 memory_enabled: bool = True, user_profile_enabled: bool = True):
+                 memory_enabled: bool = True, user_profile_enabled: bool = True, read_only: bool = False):
+        self.read_only = bool(read_only)
         self.memory_entries: list[str] = []
         self.user_entries: list[str] = []
         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
@@ -346,6 +347,9 @@ class MemoryStore:
         convention) — e.g. the full text a replace overwrote (#117952). ANY dict the closure
         returns is passed through verbatim and nothing is persisted: error dicts, or the
         success payload of a read-only closure (``resolve_entry``, ``resolve_batch_entries``)."""
+        from agent.incognito import is_incognito
+        if self.read_only or is_incognito():
+            return _error("Memory writes are disabled in incognito mode.", "incognito")
         path = self._path_for(target)
         with self._file_lock(path):
             raw, read_ok = self._read_raw_checked(path)
@@ -372,13 +376,16 @@ class MemoryStore:
             return self._success_response(target, result[1], **extra_fields)
 
     def compare_and_restore(self, target: str, *, expected: str, replacement: str,
-                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                            metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Restore an exact trusted snapshot under the same lock as ordinary writes.
 
         Native/plugin callers own snapshot authorization. This is not a model tool.
         Observers may reject stale transaction metadata before any write. Prompt
         snapshots remain frozen, as with ordinary memory mutations.
         """
+        from agent.incognito import is_incognito
+        if self.read_only or is_incognito():
+            return _error("Memory writes are disabled in incognito mode.", "incognito")
         if target not in {"memory", "user"}:
             return _error("Invalid memory target", "invalid_args")
         from tools.memory_transactions import MemoryTransaction, observe_memory_transaction

@@ -982,6 +982,9 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     """
     base = Path(home) if home is not None else get_hermes_home()
     scratch = base / "cache" / "scratch"
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return scratch
     try:
         scratch.mkdir(parents=True, exist_ok=True)
         if sys.platform != "win32":

@@ -11,6 +11,8 @@ from tools.delegation_redaction import (
     parent_copy, redact_child_result, redact_child_text, redact_child_value, redact_summary,
 )
 
+from agent.incognito_agent import private_delegate
+
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
 def _stringify_tool_content(content: Any) -> str:
@@ -174,6 +176,9 @@ def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
     """Write the full summary under ``cache/delegation`` (mounted read-only into remote backends via
     ``credential_files._CACHE_DIRS``, so the parent's terminal/``read_file`` can page it on any backend). Absolute
     path, or None on failure — the trimmed head+tail is still returned regardless."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return None
     try:
         from hermes_constants import get_hermes_dir
         import datetime as _dt
@@ -312,6 +317,7 @@ _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
 _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
 _CHILD_CONSTRUCTION_LOCK = threading.RLock()
 
+@private_delegate
 def _build_child_preserving_parent_tools(**kwargs):
     """Build a child without leaking its resolved toolset into the parent."""
     from tools.delegate_tool import _build_child_agent

@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_state_common import _COMPRESSION_CHILD_SQL, escape_like as _escape_like
+from hermes_state_deletion import visible_session_sql
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -109,8 +110,8 @@ class SessionTitlesMixin:
         return bool(self._execute_write(
             lambda conn: self._set_session_title_in_transaction(
                 conn, session_id, title, source=source, reject_auto_collision=reject_auto_collision,
-            )
-        ))
+            ),
+            session_ids=(session_id,), skip_result=False))
 
     def _set_session_title_in_transaction(self, conn, session_id: str, title: str, *, source: str,
                                           reject_auto_collision: bool = False):
@@ -235,7 +236,7 @@ class SessionTitlesMixin:
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
-        row = self._read_one("SELECT title FROM sessions WHERE id = ?", (session_id,))
+        row = self._read_one(f"SELECT title FROM sessions WHERE {visible_session_sql('sessions.id')} AND id = ?", (session_id,))
         return row["title"] if row else None
 
     def has_auto_title_collision(self, title: str, *, exclude_session_id: Optional[str] = None) -> bool:
@@ -248,7 +249,7 @@ class SessionTitlesMixin:
     def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: int = 20):
         """Return non-empty titles, newest first, excluding the active session."""
         params = []
-        where = "title IS NOT NULL AND TRIM(title) != ''"
+        where = f"{visible_session_sql('sessions.id')} AND title IS NOT NULL AND TRIM(title) != ''"
         if exclude_session_id:
             where += " AND id != ?"
             params.append(str(exclude_session_id))
@@ -261,7 +262,7 @@ class SessionTitlesMixin:
 
     def get_session_title_source(self, session_id: str) -> Optional[str]:
         """Get the provenance of a session's title, or None when untitled."""
-        row = self._read_one("SELECT title, title_source FROM sessions WHERE id = ?", (session_id,))
+        row = self._read_one(f"SELECT title, title_source FROM sessions WHERE {visible_session_sql('sessions.id')} AND id = ?", (session_id,))
         return row["title_source"] if row and row["title"] is not None else None
 
     def set_session_title_source(self, session_id: str, source: str) -> bool:
@@ -270,15 +271,14 @@ class SessionTitlesMixin:
         if source not in self._TITLE_SOURCE_RANK:
             raise ValueError(f"invalid title source: {source!r}")
         return self._write_rowcount(
-            "UPDATE sessions SET title_source = ? WHERE id = ? AND title IS NOT NULL", (source, session_id)
-        ) > 0
+            "UPDATE sessions SET title_source = ? WHERE id = ? AND title IS NOT NULL", (source, session_id), session_ids=(session_id,)) > 0
 
     def get_session_by_title(self, title: str) -> Optional[dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
         row = self._read_one(
             "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
             "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-            "WHERE s.title = ?", (title,))
+            f"WHERE {visible_session_sql('s.id')} AND s.title = ?", (title,))
         return self._session_row_dict(row) if row else None
 
     def resolve_session_by_title(self, title: str) -> Optional[str]:
@@ -296,7 +296,7 @@ class SessionTitlesMixin:
         # Escape LIKE wildcards so "%"/"_" in titles cannot false-match.
         numbered = self._read_all(
             "SELECT id, title, started_at FROM sessions "
-            "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
+            f"WHERE {visible_session_sql('sessions.id')} AND title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
             (f"{_escape_like(title)} #%",))
         return numbered[0]["id"] if numbered else (exact["id"] if exact else None)
 

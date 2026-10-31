@@ -1890,19 +1890,19 @@ def _record_absorbed_pending_event(existing: MessageEvent, event: MessageEvent) 
     absorbed = getattr(existing, "_hermes_absorbed_events", None)
     if not isinstance(absorbed, list):
         absorbed = []
-        setattr(existing, "_hermes_absorbed_events", absorbed)
+        existing._hermes_absorbed_events = absorbed
     for candidate in (event, *getattr(event, "_hermes_absorbed_events", ())):
         if candidate is not existing and not any(item is candidate for item in absorbed):
             absorbed.append(candidate)
         if candidate is not existing:
             # Recovery may be watching an absorbed event while the successor persists the
             # merged slot. Keep the live successor reachable for its durability probe.
-            setattr(candidate, "_hermes_absorbed_into", existing)
+            candidate._hermes_absorbed_into = existing
     recovery_id = getattr(event, "_hermes_recovery_id", None)
     if recovery_id is not None and getattr(existing, "_hermes_recovery_id", None) is None:
         # A recovered event may be consumed by this pending successor. Carry only the
         # persistence/durability key; event.message_id and source.message_id remain transport ids.
-        setattr(existing, "_hermes_recovery_id", recovery_id)
+        existing._hermes_recovery_id = recovery_id
 
 
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
@@ -2091,11 +2091,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         # Commands accepted while a turn is active but requiring a committed session boundary.
         # Kept separate from ordinary follow-up text so a deferred mutation cannot be merged into
         # or displaced by the one-slot prompt queue.
-        self._deferred_commands: Dict[str, List[tuple[str, int, MessageEvent]]] = {}
+        self._deferred_commands: dict[str, list[tuple[str, int, MessageEvent]]] = {}
         # Monotonic identity for the committed session represented by each session key. A
         # deferred event from an older incarnation must never run after /new, /reset, /stop,
         # shutdown, or any other teardown/replacement path reuses the key.
-        self._session_generations: Dict[str, int] = {}
+        self._session_generations: dict[str, int] = {}
 
         # Consecutive in-band drains per session of the just-dispatched event bouncing straight
         # back into the queue (session busy elsewhere); drives the drain back-off (#123229).
@@ -2119,7 +2119,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: dict[str, Any] = {}
-        self._post_delivery_callbacks_by_generation: Dict[Tuple[str, int], Callable] = {}
+        self._post_delivery_callbacks_by_generation: dict[tuple[str, int], Callable] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
@@ -2155,8 +2155,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if len(queue) >= self._MAX_DEFERRED_COMMANDS_PER_SESSION:
             return None
         generation = self._session_generations.setdefault(session_key, 0)
-        setattr(event, "_deferred_session_key", session_key)
-        setattr(event, "_deferred_generation", generation)
+        event._deferred_session_key = session_key
+        event._deferred_generation = generation
         queue.append((session_key, generation, event))
         return len(queue)
 
@@ -2194,7 +2194,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if (getattr(event, "_deferred_session_key", None) != session_key
                 or getattr(event, "_deferred_generation", None) != generation):
             return
-        setattr(event, "_deferred_parked", True)
+        event._deferred_parked = True
         self._deferred_commands.setdefault(session_key, []).insert(0, (session_key, generation, event))
 
     def resume_deferred_commands(self, session_key: str) -> None:
@@ -2205,7 +2205,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             return
         for _session, _generation, event in queue:
             if getattr(event, "_deferred_parked", False):
-                setattr(event, "_deferred_parked", False)
+                event._deferred_parked = False
         if session_key in self._active_sessions:
             return
         deferred = self._pop_deferred_command(session_key)
@@ -2787,6 +2787,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
+    from gateway.incognito import private_ingress as _private_text_ingress
+
+    @_private_text_ingress
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
@@ -2992,10 +2995,10 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """
         return False
 
-    async def delete_messages(self, chat_id: str, message_ids: List[str]) -> Dict[str, bool]:
+    async def delete_messages(self, chat_id: str, message_ids: list[str]) -> dict[str, bool]:
         """Delete several sent messages; ``{message_id: deleted}``. The default deletes one by one;
         platforms with a batch API override it so cleanup spends one request instead of N."""
-        results: Dict[str, bool] = {}
+        results: dict[str, bool] = {}
         for message_id in message_ids:
             results[str(message_id)] = await self.delete_message(chat_id, message_id)
         return results
@@ -3165,7 +3168,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
 
     async def send_control_request(
         self, chat_id: str, text: str, request_id: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         """Send a session-control approval request; non-button adapters use text fallback."""
         return await self.send(
@@ -4488,6 +4491,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    from gateway.incognito import private_ingress as _private_ingress
+
+    @_private_ingress
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
@@ -4507,6 +4513,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
+        from gateway.incognito import slash_refusal
+        refusal = slash_refusal(event)
+        if refusal is not None:
+            await self.send(event.source.chat_id, refusal, reply_to=event.message_id,
+                            metadata={"thread_id": event.source.thread_id})
+            return
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
@@ -4518,7 +4530,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             from gateway.outbox import store_for, event_kind, transport_id, local_admission_turn
             event_id = transport_id(event)
             if event_id:
-                home = getattr(self.gateway_runner, "_resolve_profile_home_for_source")(event.source)
+                home = self.gateway_runner._resolve_profile_home_for_source(event.source)
                 original = await asyncio.to_thread(
                     store_for(home).lookup, str(event.source.profile or "default"),
                     "telegram", event_id, event_kind(event))
@@ -4795,7 +4807,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
-        metadata: Optional[Dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
+        metadata: Optional[dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None. ``outbox_refused`` ledgers an outbox-covered final after the adapter refused it
@@ -4956,7 +4968,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         record_delivery(result)
 
     async def send_final_ledgered(
-        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
+        self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False, release_marker: bool = True,
         on_refused: Optional[Callable[["SendResult", "BasePlatformAdapter"], Awaitable[None]]] = None,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
@@ -5078,7 +5090,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
 
     async def _defer_copy_blocks(
         self, event: MessageEvent, session_key: str, copy_blocks: list[str], start: int,
-        metadata: Dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
+        metadata: dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
         *, is_ephemeral_response: bool,
     ) -> list:
         """Ledger blocks ``start..`` as failed, in order, without sending them; one result each."""
@@ -5335,7 +5347,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             # Restart recovery follows session-task successors. Keep the event that each shared
             # background task actually consumes so a merged pending-slot event can report its
             # terminal result back to the parked recovery observer.
-            setattr(current_task, "_hermes_event", event)
+            current_task._hermes_event = event
         deferred_session = getattr(event, "_deferred_session_key", None)
         if deferred_session is not None:
             current_generation = self._session_generations.get(session_key, 0)

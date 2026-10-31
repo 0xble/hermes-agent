@@ -672,6 +672,7 @@ def test_immutable_notice_checks_recovery_in_journal_bound_source(
     from hermes_cli.venv_sync import completion_pending_path
     from tests.hermes_cli.test_update_target_identity import git
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     # Start fresh rather than reinitializing the autouse fixture's synthetic gitdir.
     # A real source identity keeps the immutable resolver's git validation in the test.
     source = immutable_source(tmp_path)
@@ -699,7 +700,7 @@ def test_immutable_notice_checks_recovery_in_journal_bound_source(
         owed.write_text("unreadable recovery record")
     # Model module locations in the gateway process, after the source updater exits.
     monkeypatch.setattr(obligation, "__file__", str(release / "hermes_cli" / "update_host_obligation.py"))
-    assert obligation.host_obligation_path() != markers["host"]
+    assert obligation.host_obligation_path() == markers["host"]
 
     ok, detail = final_outcome(tmp_path, data)
     assert ok is False

@@ -1187,7 +1187,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             # Authority-backed routes commit to the canonical FIFO; slash commands and legacy
             # adapters retain the fork's strict admission-receipt path.
             if wakeup.lstrip().startswith("/") or not await admit_route_wake(
-                self, adapter, source, wakeup, "loop-tick",
+                self, adapter, source, wakeup, "loop-tick", event=event,
             ):
                 from gateway.wake import admit_internal_event
                 has_admission_receipt = "_message_handler" in getattr(adapter, "__dict__", {})

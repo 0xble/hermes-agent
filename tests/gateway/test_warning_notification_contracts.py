@@ -70,7 +70,7 @@ def test_real_retry_producers_keep_final_failure_and_persistence(tmp_path, monke
     assert "Empty response" in caplog.text
     result = {"final_response": final, "messages": messages, "failed": True}
     response, silent, _ = asyncio.run(gateway._hmwa_shape_agent_response(
-        result, source, [], SimpleNamespace(session_id="session"), None, None, None, "session", "slack", 0))
+        result, source, [], SimpleNamespace(session_id="session", incognito=False), None, None, None, "session", "slack", 0))
     assert response and response != "(empty)" and not silent
     sent.clear()
     with patch("agent.nous_rate_guard.nous_rate_limit_remaining", return_value=60), \

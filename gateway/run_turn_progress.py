@@ -211,6 +211,8 @@ class GatewayTurnProgressMixin:
     def _progress_subagent_notice(self, preview, kwargs: dict) -> None:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""
         ctx = self._ctx
+        if ctx.persist_user_display_kind == "supervisor_checkin":
+            return
         from gateway.warning_notifications import render_notification
         status = kwargs.get("status")
         try:
@@ -551,6 +553,9 @@ class GatewayTurnProgressMixin:
 
     async def send_progress_messages(self):
         ctx = self._ctx
+        if ctx.persist_user_display_kind == "supervisor_checkin":
+            self._drain_progress_queue()
+            return
         adapter = self._runner._delivery_adapter_for(ctx.source) if ctx.progress_queue else None
         if not adapter:
             return

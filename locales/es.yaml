@@ -3566,6 +3566,7 @@ explainer:
     error_near_max_iterations: "ocurrió un error cerca del límite de iteraciones antes de una respuesta final. Revisa la salida de la herramienta arriba y luego envía `continue`."
     repeated_outer_errors: "el turno siguió fallando con errores repetidos y se detuvo antes de tiempo en lugar de reintentar indefinidamente. Revisa los errores arriba y luego envía `continue` para reintentar."
   persistence:
+    owner_restart: "la pasarela Hermes se reinició o dejó de estar disponible durante este turno y no volvió antes del plazo de reintento. Las escrituras pendientes del worker permanecen en el diario local para un reintento explícito o una adopción autenticada. No reenvíes el turno."
     compression: "el turno se detuvo porque otro proceso estaba comprimiendo esta sesión. Tu mensaje ya debería estar guardado — vuelve a enviarlo cuando termine la compresión."
     compression_closed: "el turno se detuvo porque la compresión de contexto rotó esta sesión y no se pudo adoptar su continuación activa. El almacenamiento está en buen estado — actualiza el cliente (o inicia un nuevo turno) para que tome el nuevo id de sesión y vuelve a enviar tu mensaje."
     turn_lease: "el turno se detuvo porque otro proceso de Hermes tomó el control de esta sesión. Tu respuesta no se guardó — espera a que el otro proceso termine y vuelve a enviar tu mensaje."

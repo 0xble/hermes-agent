@@ -3677,6 +3677,7 @@ explainer:
     error_near_max_iterations: "an error occurred near the iteration limit before a final answer. Check the tool output above, then send `continue`."
     repeated_outer_errors: "the turn kept failing with repeated errors and was stopped early instead of retrying forever. Check the errors above, then send `continue` to retry."
   persistence:
+    owner_restart: "the Hermes gateway restarted or became unavailable during this turn and did not return before the retry deadline. Pending worker writes remain in the local journal for explicit retry or authenticated adoption. Do not resend the turn."
     compression: "the turn was stopped because another process was compressing this session. Your message should already be saved — please send it again after compression completes."
     compression_closed: "the turn was stopped because this session was rotated by context compression and its live continuation could not be adopted. The storage itself is healthy — refresh the client (or start a new turn) so it picks up the new session id, then send your message again."
     turn_lease: "the turn was stopped because another Hermes process took over this session. Your reply was not saved — wait for the other process to finish, then send your message again."

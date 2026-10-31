@@ -45,6 +45,9 @@ def _load(path: str) -> dict:
 
 def _update(chat_id, message_id, fields: dict) -> None:
     """Merge ``fields`` into the ``(chat_id, message_id)`` entry. No-op on any failure."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return  # optional quote index is durable, the private transcript already lives in RAM
     path = _store_path()
     with _LOCK:
         try:

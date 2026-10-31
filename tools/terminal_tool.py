@@ -1361,6 +1361,9 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
 
 def _yield_kwargs(command: str, **ctx) -> dict:
     """``env.execute`` kwargs enabling yield-to-background (local backend only)."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return {}
     handler = yield_to_background_handler(command=command, **ctx)
     return {"yield_handler": handler} if handler is not None else {}
 
@@ -1431,7 +1434,8 @@ def _run_foreground(
             "pid": result.get("pid"), "notify_on_complete": True,
             "note": _HEAVY_SLOT_YIELDED_NOTE if result.get("yield_reason") == "heavy_slot_wait" else _YIELDED_NOTE,
         }, ensure_ascii=False)
-    if metered:
+    from agent.incognito import is_incognito
+    if metered and not is_incognito(session_id):
         record_terminal_outcome(command, env_type, result)
     return finalize_foreground_result(
         command=command, result=result, env=env, env_type=env_type, effective_task_id=eff,
@@ -1543,7 +1547,13 @@ def terminal_tool(
     ``_host_local`` forces the local backend for Hermes-owned control-plane
     children (kept in a separate env cache from the configured backend).
     """
+    from agent.incognito import is_incognito
+    if is_incognito(session_id) and (background or persist_on_release or survive_restart or pty):
+        return _error_json("Background and durable processes are unavailable in incognito mode.", status="error")
     from hermes_cli.observability.shared_metrics_loop import record_terminal_backend as _metered
+    if is_incognito(session_id):
+        def _metered(plan, result, **kwargs):
+            return result
     plan = None
     try:
         plan = _plan_execution(
@@ -1554,6 +1564,10 @@ def terminal_tool(
             # From here on this IS a background=true call for the stripped command: every guard
             # below (lifecycle, workdir, self-repo, dangerous-command approval) sees what runs.
             command, background = auto_bg, True
+            if is_incognito(session_id):
+                # A trailing ``&`` is a background spawn, whose registry and log persist.
+                raise _Rejected(_error_json(
+                    "Background and durable processes are unavailable in incognito mode.", status="error"))
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
         if survive_restart and (not background or pty or env_type != "local"):
@@ -1606,6 +1620,8 @@ def terminal_tool(
         verdict = _run_approval_guards(command, env_type, plan.config, force=force)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
+        if plan.promoted_from_foreground_timeout is not None and is_incognito(session_id):
+            return _error_json("Long-running process persistence is unavailable in incognito mode.", status="error")
         if plan.promoted_from_foreground_timeout is not None:
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.

@@ -426,6 +426,9 @@ class BaseEnvironment(ABC):
         On success ``_snapshot_ready`` is set so commands source the snapshot instead of running
         under ``bash -l``. On failure, fall back to ``bash -l`` per command — unless a non-login
         probe shows login bash itself is dead, in which case prefer ``bash -c``."""
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return
         bootstrap = _snapshot_bootstrap_script(
             excluded_names=self._snapshot_excluded_passthrough_names(), **self._snapshot_script_kwargs(self.cwd))
         try:
@@ -483,12 +486,13 @@ class BaseEnvironment(ABC):
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         from agent.delegation_context import in_process_child_relay_parent_address
+        from agent.incognito import is_incognito
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
             snapshot_ready=self._snapshot_ready,
             relay_parent_address=in_process_child_relay_parent_address(),
-            persist_env=self._persist_env,
+            persist_env=self._persist_env and not is_incognito(),
             **self._snapshot_script_kwargs(cwd))
 
     @staticmethod

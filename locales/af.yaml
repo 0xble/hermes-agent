@@ -3566,6 +3566,7 @@ explainer:
     error_near_max_iterations: "'n fout het naby die iterasielimiet voorgekom voor 'n finale antwoord. Kyk na die gereedskapsuitvoer hierbo en stuur dan `continue`."
     repeated_outer_errors: "die beurt het met herhaalde foute bly misluk en is vroeg gestop in plaas van om eindeloos te herprobeer. Kyk na die foute hierbo en stuur dan `continue` om weer te probeer."
   persistence:
+    owner_restart: "die Hermes-poort het tydens hierdie beurt herbegin of onbeskikbaar geraak en het nie voor die herprobeersperdatum teruggekeer nie. Hangende werkerskryfbewerkings bly in die plaaslike joernaal vir uitdruklike herprobering of geverifieerde oorname. Moenie die beurt weer stuur nie."
     compression: "die beurt is gestop omdat 'n ander proses hierdie sessie besig was om saam te pers. Jou boodskap behoort reeds gestoor te wees — stuur dit asseblief weer nadat die kompressie voltooi is."
     compression_closed: "die beurt is gestop omdat hierdie sessie deur kontekskompressie geroteer is en sy lewendige voortsetting nie oorgeneem kon word nie. Die berging self is gesond — verfris die kliënt (of begin 'n nuwe beurt) sodat dit die nuwe sessie-ID oppik, en stuur dan jou boodskap weer."
     turn_lease: "die beurt is gestop omdat 'n ander Hermes-proses hierdie sessie oorgeneem het. Jou antwoord is nie gestoor nie — wag totdat die ander proses klaar is, en stuur dan jou boodskap weer."

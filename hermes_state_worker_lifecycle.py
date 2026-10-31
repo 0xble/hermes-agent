@@ -235,8 +235,8 @@ def insert_session_row_in_transaction(
     # A delayed constructor/accounting backfill must not recreate a deleted session
     # beside its durable tombstone (the exact delete retry would then report a stale
     # success while a fresh delete collides with the existing marker).
-    if (conn.execute('SELECT 1 FROM sessions WHERE id=?', (session_id,)).fetchone() is None
-            and conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + session_id,)).fetchone()):
+    if any(conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + sid,)).fetchone()
+           for sid in (session_id, parent_session_id) if sid):
         raise RuntimeStoreError('not_found')
     if not (profile_name or "").strip():
         profile_name = self._own_profile_name()

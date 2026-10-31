@@ -97,6 +97,26 @@ its optional icon, and the durable alias can be observed through one Telegram to
   missing values are neutral and lookup failures retain deferral. Patch identity:
   `title-concurrent-endpoint`.
 
+## Configured Cron Topic Targets
+
+A numeric Telegram destination selected by a cron job is a send target, not an
+ownership transfer. The router validates a live, visible, unended session binding
+in the adapter's profile without consulting or changing the historical
+`cron:<job_id>` lane. This includes jobs whose `origin` still names an old topic
+and jobs with `keep_pinned_lane` enabled. That authored flag controls lane
+conversion, not the Telegram owner registry.
+
+Explicit `telegram_topic_owner_key` metadata and named-topic creation retain
+strict owner validation. They cannot follow an unrelated topic or take over its
+owner. Missing, ended, archived, hidden, and cross-profile numeric destinations
+remain invalid on the live lane. This correction does not change the scheduler's
+standalone fallback policy.
+
+`tests/gateway/test_telegram_topic_owner_routing.py` covers a stale cron lane,
+unchanged canonical owners, explicit-owner refusal, and invalid destinations.
+`tests/cron/test_cron_live_delivery_confirmation.py` checks that the configured
+thread wins over a pinned job's stale origin before the send.
+
 ## Provenance and patches
 
 - **Identity and status:** active fork adaptations `slice-15-title-config`,

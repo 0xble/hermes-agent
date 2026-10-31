@@ -362,6 +362,7 @@ class SessionPersistenceMixin:
         db_load_succeeded = self._load_routing_rows_locked()
         db_had_entries = db_load_succeeded and bool(self._entries)
         mirror_retired = self._import_legacy_sessions_json(db_had_entries)
+        self._load_incognito_locked()
         self._loaded = True
         self._routing_db_loaded = db_load_succeeded
         self._routing_fallback_baseline = None if db_load_succeeded else self._entries_as_dicts()
@@ -627,7 +628,9 @@ class SessionPersistenceMixin:
         guard = contextlib.nullcontext() if lock_held else self._lock
         with guard:
             entry = self._entries.get(session_key)
-            if entry is None:
+            from agent.incognito import is_incognito
+            if (entry is None or getattr(entry, "incognito", False)
+                    or is_incognito(getattr(entry, "session_id", None))):
                 return
             serialized = dict(entry_data) if entry_data is not None else entry.to_dict()
             # The O(n) full snapshot is deferred to the fallback branch.

@@ -18,9 +18,12 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
+
+OWNER_RESTART_TIMEOUT = 90.0
 
 _worker_process = False
 
@@ -117,6 +120,23 @@ class _OwnerLink:
         return reply
 
 
+def _connection_budget(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('owner_unavailable')
+    return min(5.0, remaining)
+
+
+def _owner_transition_error(exc):
+    """Only pre-send owner loss, not permission/protocol errors or an ambiguous receipt."""
+    from websockets.exceptions import ConnectionClosed
+    return isinstance(exc, (ConnectionClosed, ConnectionRefusedError, ConnectionResetError,
+                            BrokenPipeError, FileNotFoundError, TimeoutError)) or str(exc) in {
+        'incomplete_control_response', 'owner_unavailable',
+        'Gateway bootstrap timed out', 'Gateway bootstrap identity changed; retry launch',
+    }
+
+
 class WorkerRPC:
     """Bounded authenticated calls to an existing owner; never starts a daemon.
 
@@ -131,33 +151,61 @@ class WorkerRPC:
         self.link = None
         self.request_id = 0
 
-    def _connection(self):
+    def _connection(self, deadline=None):
         if self.link is not None:
             if self.link.reader.is_alive():
                 return self.link
             # The owner closed it while idle, before any send: redial with a fresh ticket.
             self._drop()
+        from hermes_cli.gateway_client import GatewayClientError
+        from hermes_cli.gateway_runtime_discovery import DiscoveryError
+        from hermes_state_errors import GatewayOwnerRestartError
+        from websockets.exceptions import ConnectionClosed
+
+        deadline = deadline if deadline is not None else time.monotonic() + OWNER_RESTART_TIMEOUT
+        while True:
+            try:
+                return self._dial(deadline)
+            except (DiscoveryError, GatewayClientError, WorkerPersistenceError, OSError, ConnectionClosed) as exc:
+                if not _owner_transition_error(exc):
+                    raise
+                self._drop()
+                self.endpoint = None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GatewayOwnerRestartError('owner_restart: gateway did not return before the retry deadline') from exc
+                time.sleep(min(0.1, remaining))
+
+    def _dial(self, deadline):
         from hermes_cli.gateway_client import _session_ticket, gateway_ws_target
         from hermes_cli.gateway_runtime_discovery import query_identify
         from websockets.sync.client import connect
         # A served secondary has no socket; its multiplexer's descriptor names it.
         from hermes_cli.gateway_runtime import discover_gateway_endpoint
-        discovery = discover_gateway_endpoint(self.home, timeout=5)
+        discovery = discover_gateway_endpoint(self.home, timeout=_connection_budget(deadline))
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
+            reason = getattr(discovery, 'reason_code', None)
+            # Lock/descriptor uncertainty can span owner replacement. Explicit
+            # protocol, authorization and malformed-peer verdicts cannot heal here.
+            transient = discovery.state == 'inaccessible' and reason in (
+                None, 'control_timeout', 'incomplete_control_response',
+                'invalid_runtime_state', 'foreign_stale_lock')
+            if discovery.state in ('inaccessible', 'incompatible') and not transient:
+                raise WorkerPersistenceError(reason or 'owner_inaccessible')
             raise WorkerPersistenceError('owner_unavailable')
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
-        descriptor = query_identify(control_home_for(self.home, endpoint), timeout=5)
+        descriptor = query_identify(control_home_for(self.home, endpoint), timeout=_connection_budget(deadline))
         if descriptor.get('pid') == os.getpid():
             raise WorkerPersistenceError('synchronous_self_rpc')
-        ticket = _session_ticket(self.home, endpoint, purpose='worker-adoption')
+        ticket = _session_ticket(self.home, endpoint, purpose='worker-adoption', timeout=_connection_budget(deadline))
         url, protocols = gateway_ws_target(endpoint, ticket)
         # The owner is loopback, like connect_gateway's peer: an inherited HTTPS_PROXY must not carry it.
         # No library keepalive: its pong deadline would run independently of (and could fail) a call
         # inside its receipt budget; that budget and the observed close are the liveness checks.
-        self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=5, close_timeout=1,
+        self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=_connection_budget(deadline), close_timeout=1,
                                        max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
         return self.link
 
@@ -182,19 +230,22 @@ class WorkerRPC:
             raise WorkerPersistenceError('synchronous_rpc_on_event_loop')
         from websockets.exceptions import ConnectionClosed
         with self.lock:
+            deadline = time.monotonic() + OWNER_RESTART_TIMEOUT
             self.request_id += 1
             request_id = self.request_id
             message = json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
             try:
-                link = self._connection()
+                link = self._connection(deadline)
                 try:
                     link.send(request_id, message)
-                except ConnectionClosed:
-                    # websockets raises this from send only before a complete frame is written (closed
-                    # on entry, or the socket write failed): the owner closed the link after the idle
-                    # check and never saw this request, so redial and send it once more.
+                except ConnectionClosed as exc:
+                    # websockets' send_context chains the original exception when a
+                    # write fails (sendall may already have written bytes). Only an
+                    # uncaused close on entry proves the unfragmented frame wasn't sent.
+                    if exc.__cause__ is not None:
+                        raise
                     self._drop()
-                    link = self._connection()
+                    link = self._connection(deadline)
                     link.send(request_id, message)
                 response = link.receive(20)
             except BaseException:
@@ -332,13 +383,25 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.journal = candidate
             return self.retry_pending()[0]
 
+    def _persist_entry(self, entry):
+        try:
+            return self.rpc('worker.persist', **self.scope, **entry)
+        except WorkerPersistenceError as exc:
+            if str(exc) != 'stale_epoch':
+                raise
+        # The owner refused before mutation. Adopt the existing assignment, then
+        # retry the SAME journal entry, never a new sequence or an ambiguous send.
+        adopted = self.rpc('worker.adopt', **{k: v for k, v in self.scope.items() if k != 'epoch'})
+        self.adopt(adopted['owner_epoch'])
+        return self.rpc('worker.persist', **self.scope, **entry)
+
     def retry_pending(self):
         with self.lock:
             results = []
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
+                    result = self._persist_entry(entry)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)

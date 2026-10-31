@@ -772,6 +772,9 @@ def skill_manage(
     session_id: str | None = None, operations=None) -> str:
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
+    from agent.incognito import is_incognito
+    if is_incognito(session_id):
+        return tool_error("Skill writes are disabled in incognito mode.", success=False)
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
