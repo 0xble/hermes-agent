@@ -410,18 +410,25 @@ def handle_process(args, **kw):
             binding = session.ssh_binding
             if binding is None or (binding.node_name, binding.ssh, binding.platform) != (node.name, node.ssh, node.platform):
                 raise NodeError("Explicit node conflicts with the process handle's original node/SSH identity")
-        if session is not None and session.ssh_binding is not None:
-            from tools.node_execution import record_result_environment
-            record_result_environment(source.process_registry._ssh_environment(session))
-        if action == "handoff":
-            result = source._handoff_process(session_id, args, kw.get("task_id"))
-        elif action in source._SESSION_ACTIONS:
-            handler, redact = source._SESSION_ACTIONS[action]
-            result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
-            if redact:
-                result = source._redact_process_result(result)
-        else:
-            return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+        try:
+            if action == "handoff":
+                result = source._handoff_process(session_id, args, kw.get("task_id"))
+            elif action in source._SESSION_ACTIONS:
+                handler, redact = source._SESSION_ACTIONS[action]
+                result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
+                if redact:
+                    result = source._redact_process_result(result)
+            else:
+                return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+        finally:
+            if session is not None and session.ssh_binding is not None:
+                from tools.node_execution import record_result_environment, UnavailableResultEnvironment
+                from tools.nodes import Node
+                binding = session.ssh_binding
+                # Capturing an archive owner must not connect before an action
+                # can report cached state or an unknown remote outcome.
+                record_result_environment(session.env_ref or UnavailableResultEnvironment(
+                    Node(binding.node_name, binding.ssh, binding.platform)))
     except NodeError as exc:
         result = {"status": "error", "error": str(exc)}
     if node is not None:

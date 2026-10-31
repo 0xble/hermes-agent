@@ -57,3 +57,28 @@ def test_unavailable_policy_anchor_refuses_without_writing(peers, monkeypatch):
     result = call("write_file", {"node": "macstudio", "path": path + "/untouched.txt", "content": "refused"})
     assert "policy metadata unavailable" in result.get("error", ""), result
     assert not (roots["macstudio"] / "untouched.txt").exists()
+
+
+@pytest.mark.parametrize("anchor", ["auth.json", "vault"])
+def test_unavailable_read_anchor_refuses_symlinked_credential(peers, monkeypatch, anchor):
+    from tools import file_backend_state
+
+    roots, path, *_ = peers
+    root = roots["macstudio"]
+    hermes = root / "home/.hermes"
+    hermes.mkdir()
+    payload = root / "hidden"
+    payload.mkdir()
+    (payload / "token.txt").write_text("fixture credential must not be returned")
+    (hermes / anchor).symlink_to(payload if anchor == "vault" else payload / "token.txt")
+    remote_path = file_backend_state.remote_path
+
+    def unavailable(candidate, **kwargs):
+        if str(candidate) == str(hermes / anchor):
+            raise RuntimeError("fixture selected-node read policy unavailable")
+        return remote_path(candidate, **kwargs)
+
+    monkeypatch.setattr(file_backend_state, "remote_path", unavailable)
+    result = call("read_file", {"node": "macstudio", "path": path + "/hidden/token.txt"})
+    assert "read policy unavailable" in result.get("error", ""), result
+    assert "fixture credential must not be returned" not in str(result), result

@@ -45,7 +45,7 @@ def path_key(path: str) -> str:
 
 
 def physical_path_key(path: str) -> str:
-    """Serialize mutations by filesystem, not by the caller's read authority."""
+    """Serialize mutations per controller and configured SSH alias, across sessions."""
     execution = current_execution()
     if execution is None:
         return path
