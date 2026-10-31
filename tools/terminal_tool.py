@@ -1564,6 +1564,10 @@ def terminal_tool(
             # From here on this IS a background=true call for the stripped command: every guard
             # below (lifecycle, workdir, self-repo, dangerous-command approval) sees what runs.
             command, background = auto_bg, True
+            if is_incognito(session_id):
+                # A trailing ``&`` is a background spawn, whose registry and log persist.
+                raise _Rejected(_error_json(
+                    "Background and durable processes are unavailable in incognito mode.", status="error"))
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
         if survive_restart and (not background or pty or env_type != "local"):
