@@ -253,7 +253,12 @@ def test_non_blocking_listing_opens_no_socket(monkeypatch, tmp_path):
                 "MISTRAL_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.setenv(key, "dummy")
     (tmp_path / "provider_models_cache.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda *a, **k: {})
+
+    def registry_cache_only(*args, **kwargs):
+        assert kwargs.get("allow_network") is False, "cache-only listing fetched models.dev"
+        return {}
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", registry_cache_only)
 
     live: list[str] = []
 
