@@ -263,8 +263,10 @@ def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = 
                  "Sentence case: capitalize only the first word and proper nouns; this is the only capitalization rule.")
     avoid = [str(t).strip() for t in (recent_titles or []) if str(t).strip()][:20]
     avoid_block = "Avoid these recent session titles; do not copy them:\n" + "\n".join(f"- {t}" for t in avoid) if avoid else ""
-    instruction_block = f"Trusted operator guidance (follow literally): {prefs['instructions']}" if prefs["instructions"] else ""
     task_style = title_style == "verb_first"
+    # Global noun-title conventions can contradict the platform's task-title contract.
+    instruction_block = (f"Trusted operator guidance (follow literally): {prefs['instructions']}"
+                         if prefs["instructions"] and not task_style else "")
     pairs = _TASK_PROMPT_PAIRS if task_style else _PROMPT_PAIRS[prefs["case_style"]]
     examples = "".join(f'Bad: {{"title": "{bad}"}}\nGood: {{"title": "{good}"}}\n' for bad, good in pairs)
     word_rule = (f"{prefs['min_words']} to {prefs['max_words']} words. Use the fewest words that still "

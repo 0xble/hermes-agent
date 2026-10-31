@@ -14,7 +14,7 @@ Patch identity: `slack-generated-thread-titles`.
 - Send only the LLM stage to Slack, not the session sidebar's derived stage.
 - Reserve the bounded upgrade guard before API I/O, including API failures, so later callbacks cannot repeatedly overwrite a manual title.
 - Fence the rename on session identity (reset, `/new`, removal), not run generation: a quick follow-up keeps the session and the titler never fires again for it. Respect config changes before the rename. Fail silently with debug logs.
-- The verb-first prompt fixes sentence case and ignores `case_style`, because Slack task titles follow Brian's sentence-case label convention.
+- The verb-first prompt fixes sentence case and ignores `case_style` and raw `auxiliary.title_generation.instructions`, because global noun conventions can contradict Slack's action-first contract. Keep shared word bounds, language, recent-title avoidance, and structured `name_aliases`. Noun-style prompts retain the operator instructions unchanged.
 - Ask the model for about 28 characters, the width Slack's mobile thread header shows, without enforcing it. The 80-character ceiling stays the only hard limit.
 - Drop typographic apostrophes, which `agents.sessions.rename` rejects as `invalid_name`. Fall back to `assistant.threads.setTitle` only on `not_authorized`, which legacy Assistant roots return.
 - Do not replace the shared worker with an intake-path model request.
@@ -26,6 +26,6 @@ Patch identity: `slack-generated-thread-titles`.
 
 ## Proof and Retirement
 
-`tests/agent/test_task_title_style.py` covers prompt selection, independent echo guards, output length, and background style propagation. `tests/gateway/test_slack_generated_titles.py` covers placeholder upgrade, channel root titling (bot roots, seeded openers only with the author's token, free human text untouched, once only), single-attempt failure, stale/disabled fencing, bounded workspace guards, and the real Slack SDK against the local HTTP stand-in. Existing noun/title, Telegram, and Discord tests remain unchanged.
+`tests/agent/test_task_title_style.py` covers prompt selection, independent echo guards, output length, and background style propagation. `tests/agent/test_task_title_policy.py` exercises configured noun conventions through the outbound model boundary for both title styles, shared structured preferences, and greeting abstention followed by a substantive title upgrade. `tests/gateway/test_slack_generated_titles.py` covers placeholder upgrade, channel root titling (bot roots, seeded openers only with the author's token, free human text untouched, once only), single-attempt failure, stale/disabled fencing, bounded workspace guards, and the real Slack SDK against the local HTTP stand-in. Existing noun/title, Telegram, and Discord tests remain unchanged.
 
 Upstream prior art: [NousResearch/hermes-agent#74385](https://github.com/NousResearch/hermes-agent/pull/74385) was closed. Retire this patch only when an accepted upstream implementation provides generated task titles through the current title callback with bounded, single-upgrade behavior and preserves noun defaults elsewhere.
