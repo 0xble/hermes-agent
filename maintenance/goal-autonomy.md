@@ -101,19 +101,40 @@ or bypasses evidence, inherited requirements or wake fences.
 `loops.notices: false` hides loop outcome cards and `loop_set` receipts the same
 way, and settles autonomous loop control receipts like goal ones.
 
-`notices: none` (per section) hides every automatic card for that lifecycle in the
-gateway. That covers achieved, failed, blocked and paused outcomes, loop
+`notices: hidden` (per section) hides every automatic card for that lifecycle in
+the gateway. That covers achieved, failed, blocked and paused outcomes, loop
 completion and backstop cards, `goal_set`/`loop_set` receipts and the target's
-session-control receipt for every authority. Approval cards cannot be answered
-while hidden, so `request_control` refuses with `approval_cards_hidden` and asks
-the agent to quote the user's words, and the watcher fails any older unposted
-request with the same code. A requester that was not the autonomous actor still
-receives the outcome injection. Replies to the user's own `/goal` and `/loop`
-commands and the agent's own replies stay visible, except the `/goal` set
-confirmation that `false` already hides. Each hidden status card is handed to the
-session's next agent turn as a sidecar note, in memory, at most 5 per session.
-The durable goal or loop row keeps the outcome across restarts. CLI and TUI
-status lines keep their existing gates.
+session-control receipt for every authority. The level is `hidden`, not `none`,
+because `hermes config set` turns `none` into null. Approval cards cannot be
+answered while hidden, so `request_control` refuses with `approval_cards_hidden`
+and asks the agent to quote the user's words, and the watcher fails any older
+unposted request with the same code. A requester that was not the autonomous
+actor still receives the outcome injection. Replies to the user's own `/goal`
+and `/loop` commands, including the `/goal` set confirmation and drafting
+progress, and the agent's own replies stay visible. CLI and TUI loop outcome and
+wakeup lines follow `loops.notices` the way goal lines follow `goals.notices`.
+
+A hidden stall card (goal blocked, paused or failed, a loop tick-budget pause or
+an unachievable stop condition) must not leave the lifecycle silent. The gateway
+records it in SessionDB `state_meta` (`hermes_cli/lifecycle_wakes.py`), and the
+session-control watcher wakes that exact session with an internal turn through
+the shared plugin injector, pinned to the recorded session ID. The agent resolves
+the stall within its authority or tells the user in its own reply. Records
+survive restarts, refused admission retries on the next pass, and an
+undeliverable wake settles after a day. The same card text wakes a session at
+most once every 6 hours, so a stall that repeats each turn cannot loop. A user's
+`/stop` pause never wakes the agent. Other hidden cards only log, because the goal
+or loop row keeps the outcome.
+
+## Pause Authority
+
+`GoalState.paused_by` records who paused a goal (`agent`, `user` or `system`).
+It is never inferred from `paused_reason`. Under `goals.autonomy` a session-control
+resume lifts only an `agent` pause and refuses any other with `user_paused`, so a
+`/goal pause`, `/stop`, Ctrl+C, quoted or system pause stays the user's. Autonomous
+pauses are timed waits rather than pauses, so in practice the agent never resumes a
+paused goal. A current user quote to resume still applies with quote authority.
+Legacy rows load with an empty owner, which counts as not the agent's.
 
 Upstream preflight read root and affected-subsystem guidance at
 `0c771d7a5ba7742bd336adb98d30058ba545e327`. Searches for goal notices and the
@@ -132,7 +153,7 @@ requirements, removal quotes, blocker and gate/budget waits, external rechecks,
 legacy migration, profile selection, and default-off behavior. Historical prompt
 classification runs in `tests/agent/test_synthetic_prompt_legacy_goals.py`.
 Notice visibility runs in `tests/agent/test_quiet_goal_receipts.py`,
-`tests/gateway/test_lifecycle_cards_hidden.py`,
+`tests/gateway/test_lifecycle_cards_hidden.py` (including the durable stall wake),
 `tests/gateway/test_goal_notices_config.py`,
 `tests/gateway/test_quiet_goal_control_recovery.py` and both
 `test_goal_notice_surfaces.py` files under `tests/hermes_cli` and `tests/tui_gateway`.

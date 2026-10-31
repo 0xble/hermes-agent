@@ -38,10 +38,6 @@ DEFAULT_MAX_TICKS = 100
 DEFAULT_SELF_PACED_FLOOR_SECONDS = 60
 DEFAULT_SELF_PACED_CEILING_SECONDS = _NO_PROGRESS_BACKOFF_S[-1]
 
-# paused_reason prefix of an autonomous agent pause. With loops.autonomy the agent may resume
-# only a pause carrying it, so a user, Ctrl+C or tick-budget pause is never overridden.
-AGENT_PAUSE_PREFIX = "agent-paused: "
-
 # Completion sentinel the wakeup prompt teaches the agent to emit.
 LOOP_COMPLETE_MARKER = "LOOP_COMPLETE"
 # Marker on its own line, tolerating surrounding whitespace / trailing punctuation.
@@ -361,6 +357,10 @@ class LoopState:
     # --until blocks, and resets when a reply changes or a user revises/resumes the loop.
     backoff_level: int = 0
     paused_reason: Optional[str] = None
+    # Who paused it: "agent", "user" or "system" (the tick budget). With loops.autonomy the agent
+    # may resume or finish only its own pause. Never inferred from paused_reason text, which
+    # callers write. Legacy rows load as "" and count as not the agent's.
+    paused_by: str = ""
     last_stop_reason: Optional[str] = None
     # Gateway routing (platform / chat_id / chat_type / thread_id) captured at creation so the
     # idle watcher can inject ticks into the right chat. Empty for CLI/TUI (own schedulers).
@@ -872,37 +872,52 @@ class LoopManager(LoopRevisionsMixin):
         return self._state
 
     @snapshot_control
-    def pause(self, reason: str = "user-paused") -> Optional[LoopState]:
+    def pause(self, reason: str = "user-paused", *, by: str = "user") -> Optional[LoopState]:
+        """Pause the loop. ``by="agent"`` pauses only an active loop, so it never relabels an
+        existing user or system pause as the agent's own."""
         def apply(state):
-            if state is None or state.status not in {"active", "paused"}:
+            if state is None or state.status not in ({"active"} if by == "agent" else {"active", "paused"}):
                 return None
             state.status, state.paused_reason, state.awaiting_response = "paused", reason, False
+            state.paused_by = by
             return state
 
         return self._mutate_current(apply)
 
     @snapshot_control
-    def resume(self) -> Optional[LoopState]:
+    def resume(self, *, by: str = "user") -> Optional[LoopState]:
+        """Resume the loop. ``by="agent"`` lifts only the agent's own pause and keeps the cadence:
+        the next tick waits for the full interval (or self-paced floor) since the last one."""
         def apply(state):
             if state is None or state.status == "cleared":
                 return None
+            if by == "agent" and not (state.status == "paused" and state.paused_by == "agent"):
+                return None
             state.status, state.paused_reason, state.awaiting_response = "active", None, False
+            state.paused_by = ""
             state.backoff_level = 0
             state.last_response_digest = ""
             if state.mode == "self_paced":
                 state.current_delay = float(self_paced_floor_seconds())
             # Re-arm relative to now so a long pause doesn't fire instantly N times.
             delay = state.current_delay or state.interval_seconds or self_paced_floor_seconds()
-            state.next_due_at = time.time() + min(delay, 5.0)
+            now = time.time()
+            state.next_due_at = now + min(delay, 5.0)
+            if by == "agent" and state.last_fired_at:
+                state.next_due_at = max(state.next_due_at, state.last_fired_at + delay)
             return state
 
         return self._mutate_current(apply)
 
     @snapshot_control
     def finish(self, reason: str) -> Optional[LoopState]:
-        """Mark an active or paused loop done, keeping its row. Clearing stays a user control."""
+        """Mark the agent's loop done, keeping its row. Clearing stays a user control.
+
+        Only an active loop or the agent's own pause can finish: a user or tick-budget pause is
+        the user's to lift or end."""
         def apply(state):
-            if state is None or state.status not in {"active", "paused"}:
+            if state is None or not (state.status == "active"
+                                     or (state.status == "paused" and state.paused_by == "agent")):
                 return None
             state.status, state.last_stop_reason, state.awaiting_response = "done", reason, False
             return state
@@ -1219,7 +1234,7 @@ class LoopManager(LoopRevisionsMixin):
             if status == "done":
                 state.last_stop_reason = reason
             else:
-                state.paused_reason = reason
+                state.paused_reason, state.paused_by = reason, "system"
 
         if s is None or not self._save_tick_outcome(s.ticks_fired, settle):
             return self._superseded_result()
@@ -1238,7 +1253,7 @@ class LoopManager(LoopRevisionsMixin):
         if status == "done":
             state.last_stop_reason = reason
         else:
-            state.paused_reason = reason
+            state.paused_reason, state.paused_by = reason, "system"
 
     @staticmethod
     def _settle_continue(state: LoopState, digest: str, now: float) -> None:

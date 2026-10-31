@@ -195,6 +195,38 @@ class GatewaySessionControlsMixin:
                     record.get("id"),
                     exc_info=True,
                 )
+        await self._drain_lifecycle_wakes()
+
+    async def _drain_lifecycle_wakes(self) -> None:
+        """Wake each session whose stall card ``notices: hidden`` kept out of chat.
+
+        The wake is an internal turn through the shared plugin injector, pinned to the session the
+        card belonged to, so a /new or /resume never routes it into another conversation. Refused
+        admission retries on the next pass. An undeliverable wake settles after a day.
+        """
+        from hermes_constants import get_hermes_home
+        from hermes_cli import lifecycle_wakes
+
+        for record in await self._run_in_executor_with_context(lifecycle_wakes.pending):
+            key = record.get("key", "")
+            try:
+                accepted = await self._dispatch_plugin_message_injection(
+                    session_key=record.get("session_key", ""),
+                    expected_session_id=record.get("session_id", ""),
+                    content=lifecycle_wakes.wake_text(record),
+                    plugin_id="session-controls",
+                    plugin_home=get_hermes_home(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("lifecycle wake injection failed for %s", key, exc_info=True)
+                accepted = False
+            if accepted:
+                await self._run_in_executor_with_context(lifecycle_wakes.settle, key, "delivered")
+            elif lifecycle_wakes.is_undeliverable(record):
+                logger.warning("lifecycle wake %s undeliverable for a day; settling as skipped", key)
+                await self._run_in_executor_with_context(lifecycle_wakes.settle, key, "skipped")
 
     async def _drain_target_notice(self, record: dict, session_controls, source, adapter):
         if record.get("target_notice_sent") or record.get("target_notice_skipped"):
@@ -423,7 +455,7 @@ class GatewaySessionControlsMixin:
 
         Runs even offline. Continuation admission and cleanup still own progress, supersession
         and recovery. With notices off, only autonomous outcomes are settled, and explicit
-        authorities (quote, button, session) keep their replies. With ``notices: none``, the
+        authorities (quote, button, session) keep their replies. With ``notices: hidden``, the
         target's chat receipt is settled for every authority, while the requester's outcome
         still reaches it unless the control was autonomous (its tool result already reported it).
         """

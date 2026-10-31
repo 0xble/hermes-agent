@@ -57,3 +57,14 @@ def test_tui_human_revival_keeps_snapshot_and_progress(monkeypatch, notices):
     assert goals.GoalManager(manager.session_id).is_active()
     with patch("hermes_cli.goals.judge_goal", return_value=("continue", "work remains", False, None, False)):
         assert manager.evaluate_after_turn("Decision received")["should_continue"]
+
+
+@pytest.mark.parametrize("notices,shown", [("true", True), ("false", False), ("hidden", False)])
+def test_tui_loop_cards_follow_loop_notices(monkeypatch, notices, shown):
+    from hermes_constants import get_hermes_home
+    from tui_gateway import server
+    get_hermes_home().joinpath("config.yaml").write_text(f"loops:\n  notices: {notices}\n")
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    server._notif_loop_card("room", "✓ Loop finished after 3 ticks — task complete.")
+    assert bool(emitted) is shown

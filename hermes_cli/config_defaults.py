@@ -1474,7 +1474,7 @@ DEFAULT_CONFIG = {
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
         # True shows every goal card. False hides automatic lifecycle output, not queries or
-        # approvals. "none" also hides approval cards and control receipts (hermes_cli/goal_notices.py).
+        # approvals. "hidden" also hides approval cards and control receipts (hermes_cli/goal_notices.py).
         "notices": True,
         "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
         # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
@@ -1499,7 +1499,7 @@ DEFAULT_CONFIG = {
         "min_interval_seconds": 30,  # smallest fixed interval; tighter cadences raised to it
         "max_ticks": 100,  # auto-pause after this many wakeups unless --times set; 0 = unlimited
         "auto_notices": True,  # show agent loop_set receipts (set/revise/replace) to the user
-        # True shows loop outcome cards; False hides them and loop_set receipts; "none" also hides
+        # True shows loop outcome cards; False hides them and loop_set receipts; "hidden" also hides
         # loop approval cards and control receipts (hermes_cli/goal_notices.py).
         "notices": True,
         # Agent sets, revises, replaces, pauses, resumes its own pauses, and finishes loops without

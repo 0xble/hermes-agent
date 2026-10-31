@@ -904,14 +904,11 @@ class GatewayAgentCacheMixin:
         self._session_state(session_key).conversation.sidecar_notes = list(notes)
 
     def _consume_pending_turn_sidecar_notes(self, session_key: str) -> list[str]:
-        # Lifecycle cards hidden by notices: none wait here for the session's next agent run,
-        # whatever prepared it, so they are taken even when no per-turn notes were staged.
-        hidden = (self.__dict__.get("_hidden_lifecycle_notes") or {}).pop(session_key, None) if session_key else None
         state = self._peek_session_state(session_key) if session_key else None
-        staged = []
-        if state is not None:
-            staged, state.conversation.sidecar_notes = state.conversation.sidecar_notes, []
-        return [*(staged if isinstance(staged, list) else []), *(hidden or [])]
+        if state is None:
+            return []
+        staged, state.conversation.sidecar_notes = state.conversation.sidecar_notes, []
+        return list(staged) if isinstance(staged, list) else []
 
     def _voice_channel_sidecar_note(self, event, source: SessionSource, session_key: str) -> Optional[str]:
         """``[Voice channel now: ...]`` note when VC state changed; ``None`` when unchanged so per-turn

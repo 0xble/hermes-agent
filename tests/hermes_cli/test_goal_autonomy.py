@@ -143,8 +143,37 @@ def test_model_controls_never_request_approval_or_clear(home, action):
     if action == "clear":
         assert not result["ok"]
         assert goals.load_goal("autonomy").status == "active"
+    elif action == "resume":
+        # The pause above is the user's, which the agent never lifts.
+        assert not result["ok"] and result["error_code"] == "user_paused", result
+        assert goals.load_goal("autonomy").status == "paused"
     else:
         assert result["ok"], result
+
+
+@pytest.mark.parametrize("pause", ["slash", "stop", "quoted_resume", "agent"])
+def test_agent_resumes_only_its_own_goal_pause(home, pause):
+    _, db = home
+    mgr = manager()
+    if pause == "slash":
+        dispatch_goal_command(mgr, "pause", authorize_gate=lambda: None)
+    elif pause == "stop":
+        goals.GoalManager("autonomy").pause(reason="user-interrupted (/stop)")
+    elif pause == "quoted_resume":
+        dispatch_goal_command(mgr, "pause", authorize_gate=lambda: None)
+        db.append_message("autonomy", "user", "Resume the goal.")
+    else:
+        goals.GoalManager("autonomy").pause(reason="waiting on a deploy", by="agent")
+    quote = "Resume the goal." if pause == "quoted_resume" else ""
+    result = session_controls.apply_control("goal", "resume", "autonomy", requester_sid="autonomy",
+                                            reason="next step", user_quote=quote)
+    state = goals.load_goal("autonomy")
+    if pause in {"slash", "stop"}:
+        assert not result["ok"] and result["error_code"] == "user_paused", result
+        assert state.status == "paused" and state.paused_by == "user"
+    else:
+        assert result["ok"], result
+        assert state.status == "active" and state.paused_by == ""
 
 
 @pytest.mark.parametrize("entry", ["apply", "request"])
@@ -304,8 +333,10 @@ def test_explicit_pauses_and_approval_entry_respect_autonomy(home):
     assert goals.load_goal("autonomy").status == "paused"
     result = session_controls.request_control("goal", "resume", "autonomy",
                                              requester_sid="autonomy", reason="continue")
-    assert result["ok"] and result["status"] == "applied"
-    assert goals.load_goal("autonomy").status == "active"
+    # Autonomy answers at once with no approval card, but an explicit user pause stands.
+    assert result.get("status") != "pending"
+    assert not result["ok"] and result["error_code"] == "user_paused", result
+    assert goals.load_goal("autonomy").status == "paused"
 
 
 def test_autonomy_reads_the_owning_profile_for_each_activity(home):

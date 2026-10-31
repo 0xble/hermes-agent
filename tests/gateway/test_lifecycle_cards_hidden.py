@@ -1,5 +1,6 @@
-"""notices: none hides every goal and loop card from chat and hands it to the agent instead."""
+"""notices: hidden keeps every goal and loop card out of chat, and wakes the agent on a stall."""
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,69 +9,96 @@ import hermes_bootstrap
 from agent.inline_tool_executors import _goal_receipt_text
 from tests.gateway.test_goal_notices_config import runner_and_source
 
-_HIDE_ALL = "goals:\n  notices: none\nloops:\n  notices: none\n"
+
+@pytest.fixture
+def hidden_home(tmp_path, monkeypatch):
+    """Set both levels through the real ``hermes config set`` path, then open its SessionDB."""
+    from pathlib import Path
+    from hermes_cli import config, goals
+    from hermes_cli.goal_notices import notice_level
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config.set_config_value("goals.notices", "hidden")
+    config.set_config_value("loops.notices", "hidden")
+    assert notice_level("goals") == notice_level("loops") == "hidden"
+    goals._DB_CACHE.clear()
+    db = goals._get_session_db()
+    db.create_session("target", "telegram", profile_name="default", chat_id="target",
+                      chat_type="private", session_key="agent:main:telegram:dm:target")
+    yield tmp_path
+    goals._DB_CACHE.clear()
+
+
+def test_config_set_stores_the_hidden_level(hidden_home):
+    import hermes_yaml as yaml
+    data = yaml.safe_load((hidden_home / "config.yaml").read_text())
+    assert data["goals"]["notices"] == "hidden" and data["loops"]["notices"] == "hidden"
 
 
 @pytest.mark.asyncio
-async def test_hidden_goal_and_loop_cards_reach_the_next_agent_turn(tmp_path):
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+async def test_hidden_stall_cards_wake_the_session_durably(hidden_home):
+    from hermes_cli import goals, lifecycle_wakes
     runner, adapter, source = runner_and_source()
-    (tmp_path / "config.yaml").write_text(_HIDE_ALL, encoding="utf-8")
-    token = set_hermes_home_override(tmp_path)
-    try:
-        await runner._send_goal_status_notice(source, "⏸ Goal paused: ship it", notice_kind="paused")
-        await runner._defer_goal_status_notice_after_delivery(source, "✗ Goal failed: no route")
-        await runner._defer_goal_status_notice_after_delivery(
-            source, "⏳ Loop still active — stop condition judged unachievable: no canary", section="loops")
-        await runner._send_goal_status_notice(source, "⏸ Loop paused — 3/3 ticks used", section="loops")
-        receipt = json.dumps({"success": True, "persisted": True, "notice": "Loop set"})
-        assert _goal_receipt_text("loop_set", receipt) == ""
-        assert _goal_receipt_text("goal_set", receipt) == ""
-        key = runner._session_key_for_source(source)
-        notes = runner._consume_pending_turn_sidecar_notes(key)
-    finally:
-        reset_hermes_home_override(token)
+    key = runner._session_key_for_source(source)
+    runner.session_store = SimpleNamespace(
+        lookup_by_session_key=lambda k: SimpleNamespace(session_id="target") if k == key else None)
+
+    async def run_in_executor(fn, *args):
+        return fn(*args)
+
+    runner._run_in_executor_with_context = run_in_executor
+    stalls = ["⏸ Goal blocked — paused: no route", "✗ Goal failed: judge unavailable"]
+    for message in stalls:
+        await runner._defer_goal_status_notice_after_delivery(source, message)
+    await runner._send_goal_status_notice(source, "⏸ Goal paused: ship it", notice_kind="paused", stall=False)
+    await runner._send_goal_status_notice(source, "✓ Goal achieved: shipped")
+    await runner._defer_goal_status_notice_after_delivery(
+        source, "⏳ Loop still active — stop condition judged unachievable: no canary", section="loops", stall=True)
+    await runner._defer_goal_status_notice_after_delivery(
+        source, "✓ Loop finished after 3 ticks — task complete.", section="loops", stall=False)
+    await runner._defer_goal_status_notice_after_delivery(source, stalls[0])  # repeat: no second wake
+    receipt = json.dumps({"success": True, "persisted": True, "notice": "Loop set"})
+    assert _goal_receipt_text("loop_set", receipt) == "" and _goal_receipt_text("goal_set", receipt) == ""
     assert adapter.calls == [] and adapter.callbacks == {}
-    assert [note.split("] ", 1)[1] for note in notes] == [
-        "⏸ Goal paused: ship it", "✗ Goal failed: no route",
-        "⏳ Loop still active — stop condition judged unachievable: no canary",
-        "⏸ Loop paused — 3/3 ticks used",
-    ]
-    assert all("hidden from the user" in note for note in notes)
-    assert runner._consume_pending_turn_sidecar_notes(key) == []
+
+    goals._DB_CACHE.clear()  # a restart keeps only what SessionDB holds
+    queued = lifecycle_wakes.pending()
+    assert sorted(r["message"] for r in queued) == sorted(
+        [*stalls, "⏳ Loop still active — stop condition judged unachievable: no canary"])
+
+    injected = []
+
+    async def inject(**kwargs):
+        injected.append(kwargs)
+        return True
+
+    runner._dispatch_plugin_message_injection = inject
+    await runner._drain_lifecycle_wakes()
+    assert {(i["session_key"], i["expected_session_id"]) for i in injected} == {(key, "target")}
+    assert all("has stalled" in i["content"] and "hidden from the user" in i["content"] for i in injected)
+    assert lifecycle_wakes.pending() == []
+    await runner._defer_goal_status_notice_after_delivery(source, stalls[0])
+    assert lifecycle_wakes.pending() == []  # the delivered wake blocks a rewake for the window
 
 
 @pytest.mark.parametrize("kind,action", [("goal", "pause"), ("loop", "stop")])
-def test_hidden_approval_cards_refuse_instead_of_waiting(tmp_path, monkeypatch, kind, action):
-    from pathlib import Path
+def test_hidden_approval_cards_refuse_instead_of_waiting(hidden_home, kind, action):
     from hermes_cli import goals, loops, session_controls
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "config.yaml").write_text(_HIDE_ALL, encoding="utf-8")
-    goals._DB_CACHE.clear()
-    try:
-        db = goals._get_session_db()
-        db.create_session("target", "telegram", profile_name="default", chat_id="target",
-                          chat_type="private", session_key="agent:main:telegram:dm:target")
-        if kind == "goal":
-            goals.GoalManager("target").set("Ship the repair")
-        else:
-            loops.LoopManager("target").set("watch", interval_seconds=300)
-        result = session_controls.request_control(kind, action, "target", requester_sid="target",
-                                                  reason="next step")
-        assert not result["ok"] and result["error_code"] == "approval_cards_hidden"
-        assert "user_quote" in result["error"]
-        assert session_controls.pending_outbox() == []
-    finally:
-        goals._DB_CACHE.clear()
+    if kind == "goal":
+        goals.GoalManager("target").set("Ship the repair")
+    else:
+        loops.LoopManager("target").set("watch", interval_seconds=300)
+    result = session_controls.request_control(kind, action, "target", requester_sid="target",
+                                              reason="next step")
+    assert not result["ok"] and result["error_code"] == "approval_cards_hidden"
+    assert "user_quote" in result["error"]
+    assert session_controls.pending_outbox() == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("via", ["quote", "autonomy"])
-async def test_hidden_control_receipts_still_tell_a_waiting_requester(tmp_path, via):
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+async def test_hidden_control_receipts_still_tell_a_waiting_requester(hidden_home, via):
     runner, _adapter, _source = runner_and_source()
-    (tmp_path / "config.yaml").write_text(_HIDE_ALL, encoding="utf-8")
     marked = []
 
     class Controls:
@@ -84,12 +112,15 @@ async def test_hidden_control_receipts_still_tell_a_waiting_requester(tmp_path, 
     runner._run_in_executor_with_context = run_in_executor
     record = {"id": "r1", "kind": "loop", "action": "pause", "status": "applied",
               "authority": {"via": via}, "created_at": 1.0}
-    token = set_hermes_home_override(tmp_path)
-    try:
-        await runner._settle_quiet_autonomy_notices(Controls, record)
-    finally:
-        reset_hermes_home_override(token)
+    await runner._settle_quiet_autonomy_notices(Controls, record)
     expected = ["target_notice_skipped"]
     if via == "autonomy":
         expected.append("requester_notification_skipped")
     assert [flag for flag in marked if flag != "outbox_done"] == expected
+
+
+def test_hidden_keeps_the_goal_set_confirmation(hidden_home):
+    from hermes_cli import goals
+    from hermes_cli.goal_command import dispatch_goal_command
+    result = dispatch_goal_command(goals.GoalManager("target"), "ship it", authorize_gate=lambda: None)
+    assert "ship it" in result.output and result.kickoff

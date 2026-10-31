@@ -509,7 +509,11 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
         autonomous = (authority or {}).get("via") == "autonomy"
-        result = manager.resume(reset_budget=not autonomous, user_override=not autonomous)
+        if autonomous and manager.state.paused_by != "agent":
+            # A /goal pause, /stop, Ctrl+C, quoted or system pause is the user's to lift.
+            return {"result": _user_paused(manager.state, "goal"), "state": manager.state}
+        result = manager.resume(reset_budget=not autonomous, user_override=not autonomous,
+                                by="agent" if autonomous else "user")
         if result is None:
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
@@ -1033,7 +1037,7 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
         # Nobody would see the card, so a pending request could only expire. Refuse now so the
         # requester learns at once and asks in conversation instead.
         return {"ok": False, "error_code": "approval_cards_hidden",
-                "error": (f"{kind} approval cards are hidden ({kind}s.notices: none). Ask the user "
+                "error": (f"{kind} approval cards are hidden ({kind}s.notices: hidden). Ask the user "
                           "in chat, then pass their exact words as user_quote")}
     payload = _check_payload(kind, action, payload)
     target_sid = resolve_target(target_sid)
@@ -1138,8 +1142,9 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         # receipt. Replacement is an agent edit, so every existing requirement still binds.
         def apply_autonomous(conn):
             authority = {"via": "autonomy", "session_id": str(requester_sid), "quote": user_quote}
-            if action == "pause" and user_quote:
-                # Only a still-current user instruction may suspend automatic waking.
+            if action in {"pause", "resume", "stop"} and user_quote:
+                # Only a still-current user instruction may suspend automatic waking, lift a user
+                # pause, or stop (clear) a loop. Anything else stays the agent's own act.
                 checked = check_user_quote(requester_sid, user_quote, cursor=conn)
                 if not isinstance(checked, str) and _quote_matches_control(
                     kind, action, target_sid, requester_sid,
@@ -1416,40 +1421,43 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
 
 
 def _pause_loop(sid, reason, payload, authority, cursor=None):
-    from hermes_cli.loops import AGENT_PAUSE_PREFIX, LoopManager
+    from hermes_cli.loops import LoopManager
 
-    manager = LoopManager(sid, cursor=cursor)
-    reason = reason or "session-control"
-    if (authority or {}).get("via") == "autonomy":
-        if not manager.is_active():
-            return None  # re-pausing would relabel a user pause as the agent's own
-        reason = AGENT_PAUSE_PREFIX + reason
-    return manager.pause(reason=reason)
+    autonomous = (authority or {}).get("via") == "autonomy"
+    # An agent pause applies only to an active loop and records the agent as its owner.
+    return LoopManager(sid, cursor=cursor).pause(
+        reason=reason or "session-control", by="agent" if autonomous else "user")
 
 
 def _resume_loop(sid, reason, payload, authority, cursor=None):
-    from hermes_cli.loops import AGENT_PAUSE_PREFIX, LoopManager
+    from hermes_cli.loops import LoopManager
 
     manager = LoopManager(sid, cursor=cursor)
+    if (authority or {}).get("via") != "autonomy":
+        return manager.resume()
     state = manager.state
-    if (authority or {}).get("via") == "autonomy":
-        if state is None or state.status != "paused":
-            return None  # never revive a finished loop or re-arm an active one
-        if not (state.paused_reason or "").startswith(AGENT_PAUSE_PREFIX):
-            # A user, Ctrl+C or tick-budget pause is the user's to lift.
-            return {"ok": False, "error_code": "user_paused",
-                    "error": f"only the user can resume this loop ({state.paused_reason or 'paused'})"}
-    return manager.resume()
+    if state is not None and state.status == "paused" and state.paused_by != "agent":
+        # A user, Ctrl+C or tick-budget pause is the user's to lift.
+        return _user_paused(state, "loop")
+    return manager.resume(by="agent")  # None unless this is the agent's own pause
 
 
 def _stop_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.loops import LoopManager
 
     manager = LoopManager(sid, cursor=cursor)
-    if (authority or {}).get("via") == "autonomy":
-        # The agent finishes its loop; clearing it stays a user control.
-        return manager.finish(reason or "agent finished the loop")
-    return manager.clear()
+    if (authority or {}).get("via") != "autonomy":
+        return manager.clear()
+    state = manager.state
+    if state is not None and state.status == "paused" and state.paused_by != "agent":
+        return _user_paused(state, "loop")
+    # The agent finishes its loop; clearing it stays a user control.
+    return manager.finish(reason or "agent finished the loop")
+
+
+def _user_paused(state, kind):
+    return {"ok": False, "error_code": "user_paused",
+            "error": f"only the user can lift this {kind} pause ({state.paused_reason or 'paused'})"}
 
 
 CONTROLS = {

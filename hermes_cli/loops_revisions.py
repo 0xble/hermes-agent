@@ -298,6 +298,13 @@ class LoopRevisionsMixin:
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
         new_times = max(0, int(times or 0))
         new_until = (until or "").strip()
+        # Without the user's words a replacement is the same loop under new orders, so the
+        # tick budget keeps counting and the cadence floor still holds from the last tick. The
+        # requested run count means that many more runs.
+        carry = not quote
+        carried_ticks = state.ticks_fired if carry else 0
+        if carry and new_times:
+            new_times += carried_ticks
         old_snapshot = {
             "prompt": state.prompt,
             "mode": state.mode,
@@ -314,7 +321,7 @@ class LoopRevisionsMixin:
             "current_delay": float(self_paced_floor_seconds()) if self_paced else interval,
             "times": new_times,
             "until": new_until,
-            "ticks_fired": 0,
+            "ticks_fired": carried_ticks,
         }
         revision = {
             "at": now,
@@ -340,10 +347,11 @@ class LoopRevisionsMixin:
         state.times = new_times
         state.until = new_until
         state.max_ticks = max_ticks_default()
-        state.ticks_fired = 0
+        state.ticks_fired = carried_ticks
         state.created_at = now
-        state.last_fired_at = 0.0
-        state.next_due_at = now
+        state.last_fired_at = state.last_fired_at if carry else 0.0
+        floor = interval if not self_paced else float(self_paced_floor_seconds())
+        state.next_due_at = max(now, state.last_fired_at + floor) if state.last_fired_at else now
         state.awaiting_response = False
         state.last_response_digest = ""
         state.backoff_level = 0

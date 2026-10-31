@@ -1050,6 +1050,9 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    # Who paused it: "agent", "user" or "system". With goals.autonomy the agent may resume only
+    # its own pause. Never inferred from paused_reason text. Legacy rows load as "".
+    paused_by: str = ""
     # Tracked for diagnostics only; judge outages fail open and never pause a goal.
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
@@ -1125,6 +1128,7 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
+            paused_by=str(data.get("paused_by") or ""),
             subgoals=contract_items("subgoals", raw_subgoals),
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_pid_live_at_park=(
@@ -2965,6 +2969,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         self._state.clear_wait()
         self._state.status = "paused"
         self._state.paused_reason = reason
+        self._state.paused_by = "system"
         self._save()
 
     def _pause_decision(self, paused_reason: str, verdict: str, reason: str, message: str) -> dict[str, Any]:
@@ -3025,12 +3030,13 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         return self._mutate_current(_apply)
 
     @snapshot_control
-    def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
+    def pause(self, reason: str = "user-paused", *, by: str = "user") -> Optional[GoalState]:
         def _apply(state):
             if state is None or state.status == "cleared":
                 return None   # a concurrent /goal clear stays cleared
             state.status = "paused"
             state.paused_reason = reason
+            state.paused_by = by
             state.clear_wait()   # a wait barrier is meaningless once paused
             state.consecutive_no_progress = 0
             state.backoff_level = 0
@@ -3038,10 +3044,15 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         return self._mutate_current(_apply)
 
     @snapshot_control
-    def resume(self, *, reset_budget: bool = True, user_override: bool = True) -> Optional[GoalState]:
-        """Resume through a live-row mutation, optionally recording a user override."""
+    def resume(self, *, reset_budget: bool = True, user_override: bool = True,
+               by: str = "user") -> Optional[GoalState]:
+        """Resume through a live-row mutation, optionally recording a user override.
+
+        ``by="agent"`` lifts only the agent's own pause, never a user or system pause."""
         def _apply(state):
             if state is None or state.status == "cleared":
+                return None
+            if by == "agent" and not (state.status == "paused" and state.paused_by == "agent"):
                 return None
             prior_block_reason = state.last_reason or state.paused_reason or "unknown blocker"
             record_override = user_override and (
@@ -3063,6 +3074,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
     def _resume_state(state: GoalState, *, reset_budget: bool) -> None:
         state.status = "active"
         state.paused_reason = None
+        state.paused_by = ""
         state.consecutive_no_progress = 0
         state.backoff_level = 0
         state.clear_wait()
