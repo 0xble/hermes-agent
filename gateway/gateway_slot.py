@@ -133,7 +133,9 @@ def serving_slot(home: Any = None) -> str:
 def slot_lock_held(home: Any, slot: str) -> bool:
     """True while some live process holds ``slot``'s runtime lock in ``home`` (a direct flock probe;
     the status helpers resolve paths through this module and would recurse). A missing lock file is
-    one ``stat`` and opens nothing, so flag-off readers pay no file handle for it."""
+    one ``stat`` and opens nothing, so flag-off readers pay no file handle for it. A lock file that
+    exists but cannot be opened (another user's inode, an I/O error) is reported held, as
+    ``is_gateway_runtime_lock_active`` does: unknown ownership never grants it."""
     import os
     from pathlib import Path
 
@@ -142,9 +144,12 @@ def slot_lock_held(home: Any, slot: str) -> bool:
     if not os.path.exists(path):
         return False
     try:
-        return _probe_lock_file(open(path, "a+", encoding="utf-8"))
+        handle = open(path, "a+", encoding="utf-8")
+    except FileNotFoundError:
+        return False  # removed since the stat: nobody holds it
     except OSError:
-        return False
+        return True
+    return _probe_lock_file(handle)
 
 
 def sibling_lock_name(pid_filename: str, lock_filename: str) -> str:

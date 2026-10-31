@@ -6,6 +6,7 @@ against the live store) stales every later settlement and admission of the live 
 restart. The child below stands in for the live gateway by holding the lock.
 """
 
+import os
 import subprocess
 import sys
 
@@ -36,11 +37,12 @@ def store(tmp_path):
     db.close()
 
 
-@pytest.fixture
-def live_owner(store):
-    """Another process holding the profile's runtime lock, as the live gateway does."""
+@pytest.fixture(params=["gateway.lock", "gateway.b.lock"], ids=["slot-a", "slot-b"])
+def live_owner(store, request):
+    """Another process holding the profile's runtime lock, as the live gateway does (either slot:
+    a zero-cut standby or a promoted slot b serves from ``gateway.b.lock``)."""
     home = store[0]
-    proc = subprocess.Popen([sys.executable, "-c", _HOLDER, str(home / "gateway.lock")],
+    proc = subprocess.Popen([sys.executable, "-c", _HOLDER, str(home / request.param)],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert proc.stdout.readline().strip() == "held"
@@ -82,3 +84,18 @@ def test_offline_maintenance_reservation_may_begin(store):
     home, db, live_epoch = store
     with exclusive_maintenance([home]):
         assert begin_runtime_epoch(db, instance_id="dashboard-offline") == live_epoch + 1
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root opens any lock file")
+def test_an_unopenable_lock_counts_as_held(store):
+    """Unknown ownership never grants the store: a lock file this user cannot open is foreign."""
+    home, db, live_epoch = store
+    lock = home / "gateway.lock"
+    lock.touch()
+    lock.chmod(0)
+    try:
+        with pytest.raises(OwnershipConflict):
+            begin_runtime_epoch(db, instance_id="owner")
+    finally:
+        lock.chmod(0o600)
+    assert _store_epoch(db) == (live_epoch, "live-gateway")

@@ -131,6 +131,9 @@ async def promote(runner) -> dict[str, Any]:
 
 
 async def _promote(runner) -> dict[str, Any]:
+    # Begin the runtime epochs only now: the serving slot owned the stores until this promotion.
+    from gateway.run_runtime import claim_gateway_runtime
+    await claim_gateway_runtime(runner)
     await runner._start_prime_session_db_after_ready()
     # Replay the launch profile's durable delegation completions the standby left untouched at boot.
     from tools.process_registry import process_registry

@@ -5,6 +5,7 @@ Without this the only symptom is every turn failing with ``stale_epoch`` until s
 
 import logging
 import sqlite3
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -71,3 +72,49 @@ def test_released_owner_is_shutting_down_not_robbed(owned, caplog):
 def test_readiness_without_the_field_stays_ok():
     """Older gateways publish no ``runtime_epoch``."""
     assert _probe_runtime_epoch({}) == {"status": "ok"}
+
+
+_HOLDER = r"""
+import fcntl, sys
+handle = open(sys.argv[1], "a+")
+fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("held", flush=True)
+sys.stdin.read()
+"""
+
+
+@pytest.fixture
+def sibling_slot(owned):
+    """A zero-cut sibling (slot b) alive in another process."""
+    import subprocess
+    import sys
+    proc = subprocess.Popen([sys.executable, "-c", _HOLDER, str(owned.home / "gateway.b.lock")],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "held"
+    yield proc
+    proc.stdin.close()
+    proc.wait(timeout=30)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock stand-in for the sibling slot")
+def test_handed_over_epoch_is_the_promoted_sibling_not_a_theft(owned, sibling_slot, caplog):
+    """Slot a accepted a zero-cut handover; slot b's promotion begins the next epoch while a finishes
+    its in-flight turns. That move logs INFO once, never CRITICAL, and readiness stays ok."""
+    owned.runner._zero_cut_handover_state = {"accepted": True}
+    _take_epoch(owned.db)
+    caplog.set_level(logging.INFO, logger="gateway.session_epoch_watch")
+    for _ in range(2):
+        assert check_runtime_epochs(owned.runner) == []
+    assert _criticals(caplog) == []
+    infos = [r for r in caplog.records if r.levelno == logging.INFO and "zero-cut successor" in r.getMessage()]
+    assert len(infos) == 1
+    assert owned.published == [{"runtime_epoch": {"status": "ok"}}]
+
+
+def test_accepted_handover_without_a_live_sibling_is_still_lost(owned, caplog):
+    """Accepting a handover does not excuse a move nobody beside this gateway could have made."""
+    owned.runner._zero_cut_handover_state = {"accepted": True}
+    _take_epoch(owned.db)
+    caplog.set_level(logging.CRITICAL)
+    assert len(check_runtime_epochs(owned.runner)) == 1
+    assert len(_criticals(caplog)) == 1

@@ -1233,6 +1233,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 write_runtime_status,
                 gateway_state="starting",
                 exit_reason=None,
+                # A previous run's lost epoch is not this one's: this start begins its own.
+                runtime_epoch={"status": "ok"},
                 clear_profile_platforms=True,
                 reload_existing=True,
                 wait_timeout=2.0,
