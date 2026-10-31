@@ -268,6 +268,16 @@ A poison global config with `commit.gpgsign=true` fails setup before the patch,
 and all 95 affected tests pass after it. Retire the fork adaptation when a
 released upstream revision provides the same hermetic tests.
 
+## Escalated-kill finalization ownership
+
+The `fork-ci-reliability` identity also covers
+`tests/tools/test_kill_verify_tree_death.py::test_escalated_kill_of_sigterm_ignoring_child_reports_killed`.
+After SIGKILL, the reader thread can observe exit and claim finalization before
+the kill commits. The kill then returns `killed` without waiting for the owner's
+receipt IO, by design. The owner moves the session to `_finished` and then sets
+`_completion_event`. The test waits on that event before asserting the finished
+map and the durable `killed` receipt. A `reader_owns` case forces this interleaving.
+
 ## Audio playback isolation
 
 The `fork-ci-reliability` identity also covers test audio isolation. The autouse
