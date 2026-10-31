@@ -48,7 +48,7 @@
         "type": "boolean"
       },
       "timeout": {
-        "description": "Max seconds (default 180, foreground max 600). Finishing early returns at once, so set it generously. Above 600s the command runs as a tracked background process with notify_on_complete=true (the result says so; do not re-run it).",
+        "description": "Max seconds (default 180, interactive foreground max 600). Finishing early returns at once, so set it generously. Interactive calls above 600s run as tracked background processes with notify_on_complete=true (the result says so; do not re-run them). Cron foreground calls wait inline for heavy-slot admission and completion until their timeout, bounded by the enclosing code cell deadline when present; they are not automatically backgrounded.",
         "minimum": 1,
         "type": "integer"
       },

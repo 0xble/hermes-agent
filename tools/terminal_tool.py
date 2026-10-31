@@ -1407,6 +1407,16 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
+            from tools.code_execution_rpc import cell_deadline
+            deadline = cell_deadline.get()
+            if bound_turn_origin() == "cron" and deadline is not None:
+                # Round down to leave time for process-tree cleanup and the RPC reply.
+                # Recompute per attempt: setup/retries and earlier calls spent this budget.
+                effective_timeout = min(effective_timeout, int(deadline - time.monotonic()))
+                if effective_timeout <= 0:
+                    return _error_json(
+                        "Command not started: execute_code cell deadline expired", exit_code=124,
+                    )
             result = env.execute(
                 execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
@@ -1715,7 +1725,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds (default 180, foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Above {FOREGROUND_MAX_TIMEOUT}s the command runs as a tracked background process with notify_on_complete=true (the result says so; do not re-run it).",
+                "description": f"Max seconds (default 180, interactive foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Interactive calls above {FOREGROUND_MAX_TIMEOUT}s run as tracked background processes with notify_on_complete=true (the result says so; do not re-run them). Cron foreground calls wait inline for heavy-slot admission and completion until their timeout, bounded by the enclosing code cell deadline when present; they are not automatically backgrounded.",
                 "minimum": 1
             },
             "workdir": {

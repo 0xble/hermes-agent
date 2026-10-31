@@ -158,6 +158,14 @@ survives `execute_code` RPC dispatch through its per-cell authority. The helper
 receives no `HEAVY_SLOT_MAX_WAIT`, and terminal does not automatically promote
 or adopt cron work. A terminal timeout with admission still pending kills the
 queued process and explicitly reports that the heavy command was not started.
+Inside `execute_code`, host-side RPC context also carries the cell's monotonic
+deadline. Cron foreground terminal calls clamp each execution attempt to the
+remaining whole seconds, leaving room for process-tree cleanup and the RPC
+reply. An exhausted cell cannot start another command; releasing admission
+after a cell returns cannot revive its cancelled ticket. This applies to local
+per-cell authority and remote file-RPC dispatch, not a sandbox-supplied timeout.
+The terminal schema and generated prompt snapshots distinguish cron's inline
+wait from interactive timeout promotion.
 Interactive and gateway handoff budgets remain unchanged. Regressions live in
 `tests/tools/test_terminal_tool_heavy_slot.py` and
 `tests/tools/test_terminal_heavy_slot_handoff.py`.
