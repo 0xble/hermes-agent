@@ -25,7 +25,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextvars import Context, copy_context
+from contextvars import Context, ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Tuple, cast
@@ -1887,6 +1887,8 @@ def _profile_runtime_scope(
         home_token = set_hermes_home_override(str(profile_home))
         if prepared_secret_scope is not None:
             secrets = prepared_secret_scope
+        elif (prepared := _PREPARED_AUTHORIZATION_SCOPE.get()) is not None and prepared[0] == _home_key(profile_home):
+            secrets = prepared[1]  # this ingress task already loaded this profile off the loop
         elif hydrate_secrets:
             secrets = _load_profile_secret_scope(Path(profile_home))
         else:
@@ -1913,6 +1915,43 @@ async def _async_profile_runtime_scope(profile_home: Path):
     secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(profile_home))
     with _profile_runtime_scope(Path(profile_home), secrets):
         yield
+
+
+# One authorization home's secrets, loaded off the loop for the synchronous gates awaited inside
+# ``prepared_authorization_scope`` (``GatewayRunner._under_authorization_profile`` reads it).
+_PREPARED_AUTHORIZATION_SCOPE: ContextVar[Optional[tuple[str, dict]]] = ContextVar(
+    "_PREPARED_AUTHORIZATION_SCOPE", default=None)
+
+
+@_asynccontextmanager
+async def prepared_authorization_scope(runner, source):
+    """Hydrate *source*'s authorization-profile secrets off the event loop for the auth and bot
+    budget checks awaited inside, so a receive path never loads them inline. The checks still
+    enter that profile's scope; they only skip the load."""
+    home = runner._authorization_home_for_source(source)
+    if home is None:
+        yield
+        return
+    secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(home))
+    token = _PREPARED_AUTHORIZATION_SCOPE.set((_home_key(home), secrets))
+    try:
+        yield
+    finally:
+        _PREPARED_AUTHORIZATION_SCOPE.reset(token)
+
+
+def _home_key(home) -> str:
+    from hermes_constants import hermes_home_key
+    return hermes_home_key(home)
+
+
+def without_prepared_authorization_scope():
+    """A copy of the current context with no prepared authorization secrets, for a task that
+    outlives ingress (a session drain): its turns load the profile afresh, so a failed secret
+    source is still retried."""
+    context = copy_context()
+    context.run(_PREPARED_AUTHORIZATION_SCOPE.set, None)
+    return context
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
