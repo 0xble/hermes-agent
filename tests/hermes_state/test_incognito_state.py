@@ -154,6 +154,34 @@ class IncognitoStateTests(unittest.TestCase):
         self.assertEqual(self.db.get_session(self.sid)["title"], "before on")
         self.assertNoCanaryOnDisk()
 
+    def test_privacy_reads_and_logging_do_not_wait_for_an_admitted_commit(self):
+        import logging
+        import threading
+        import time
+
+        from agent.incognito import install_logging_filter, is_incognito
+        entered, release = threading.Event(), threading.Event()
+
+        def write(conn):
+            entered.set()
+            release.wait(5)
+            conn.execute("UPDATE sessions SET title = 'held' WHERE id = ?", (self.sid,))
+
+        worker = threading.Thread(target=self.db._execute_write, args=(write,))
+        install_logging_filter()
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            started = time.monotonic()
+            self.assertFalse(is_incognito(self.sid))
+            logging.getLogger(__name__).info("public diagnostic while a commit is held")
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.db.get_session(self.sid)["title"], "held")
+
     def test_new_private_session_is_never_inserted(self):
         with incognito_scope():
             self.db.create_session("private-new", "cli", system_prompt=CANARY)

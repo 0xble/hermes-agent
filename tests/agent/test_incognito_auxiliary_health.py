@@ -50,9 +50,9 @@ def test_private_health_boundary_never_changes_files(tmp_path, monkeypatch, pree
 
 
 def test_health_file_transaction_is_serialized_with_private_entry(tmp_path, monkeypatch):
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
     from threading import Event
-    from agent.incognito import _lock, register_session
+    from agent.incognito import is_incognito, register_session
     from agent.memory_provider import ctx_bound
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -73,15 +73,20 @@ def test_health_file_transaction_is_serialized_with_private_entry(tmp_path, monk
                 future = pool.submit(ctx_bound(health.read_health), identity)
             try:
                 assert entered.wait(5)
-                # A successful acquire would prove admission was already released
-                # before the lock-file/read/repair/write transaction finished.
-                acquired = _lock.acquire(blocking=False)
-                if acquired:
-                    _lock.release()
-                assert not acquired
+                # Entering the boundary must wait until the admitted public
+                # lock-file/read/repair/write transaction has finished.
+                with ThreadPoolExecutor(max_workers=1) as boundary:
+                    entering = boundary.submit(register_session, "health-transaction")
+                    with pytest.raises(FuturesTimeout):
+                        entering.result(timeout=0.3)
+                    assert not is_incognito("health-transaction")
+                    release.set()
+                    assert future.result(timeout=5) is None
+                    entering.result(timeout=5)
+                assert is_incognito("health-transaction")
+                register_session("health-transaction", False)
             finally:
                 release.set()
-            assert future.result(timeout=5) is None
         before = _files(tmp_path)
         register_session("health-transaction")
         with incognito_scope(False, "health-transaction"):

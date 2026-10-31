@@ -45,16 +45,16 @@ def _identifiers(value: Any):
 def write_admission(session_ids: Any = ()):
     """Serialize a committed write with flag changes, including worker callbacks.
 
-    The registry's RLock also protects register_session. Holding it through COMMIT
-    means an on-boundary cannot race between the privacy check and a disk write.
+    Holding shared admission through COMMIT means an on-boundary cannot race between
+    the privacy check and a disk write, without making registry readers wait.
     """
     try:
-        from agent.incognito import _lock
+        from agent.incognito import persistence_admission
     except Exception:
         _warning("state.db mutation skipped: privacy admission unavailable")
         yield False
         return
-    with _lock:
+    with persistence_admission():
         yield not private_write(session_ids)
 
 

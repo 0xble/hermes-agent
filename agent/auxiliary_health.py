@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from agent.incognito import _lock as _privacy_lock
+from agent.incognito import persistence_admission
 from agent.incognito import is_incognito, private_state
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_constants import get_hermes_home, hermes_home_key
@@ -220,7 +220,7 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
 def _locked_state() -> Iterator[tuple[Path, dict[str, Any]]]:
     # Admission and the complete short file transaction share the transition
     # lock, as state.db writes do. No provider request runs inside this boundary.
-    with _privacy_lock:
+    with persistence_admission():
         private = private_state("auxiliary_route_health")
         if private is not None:
             # The shared read path also creates locks, repairs and prunes. Keep

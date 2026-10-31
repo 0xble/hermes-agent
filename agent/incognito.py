@@ -28,6 +28,71 @@ _private_states: dict[str, dict] = {}
 _lock = threading.RLock()
 
 
+class _TransitionGate:
+    """Persistence transactions share admission. Entering a private boundary is exclusive.
+
+    Registry reads take only ``_lock`` briefly, so logging and the event loop never wait
+    for a SQLite commit or file transaction. A pending boundary blocks new transactions
+    so it cannot starve, and waits for in-flight ones, which already passed their privacy
+    check, before registering. Each thread may re-enter its own admission.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._shared: dict[int, int] = {}
+        self._owner: int | None = None
+        self._depth = 0
+        self._pending = 0
+
+    @contextmanager
+    def shared(self):
+        me = threading.get_ident()
+        with self._cond:
+            if me not in self._shared and self._owner != me:
+                while self._owner is not None or self._pending:
+                    self._cond.wait()
+            self._shared[me] = self._shared.get(me, 0) + 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                if self._shared[me] == 1:
+                    del self._shared[me]
+                    self._cond.notify_all()
+                else:
+                    self._shared[me] -= 1
+
+    @contextmanager
+    def exclusive(self):
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner != me:
+                self._pending += 1
+                try:
+                    while self._owner is not None or any(owner != me for owner in self._shared):
+                        self._cond.wait()
+                finally:
+                    self._pending -= 1
+                self._owner = me
+            self._depth += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._depth -= 1
+                if not self._depth:
+                    self._owner = None
+                    self._cond.notify_all()
+
+
+_gate = _TransitionGate()
+
+
+def persistence_admission():
+    """Hold across a privacy check and the durable write it admits."""
+    return _gate.shared()
+
+
 def is_incognito(session_id: str | None = None) -> bool:
     if _scope.get():
         return True
@@ -46,14 +111,19 @@ def any_incognito_sessions() -> bool:
 
 
 def register_session(session_id: str, enabled: bool = True) -> None:
-    with _lock:
-        if enabled:
-            # Revoke at entry, even if a worker never runs during the interval.
-            work = _public_work.pop(session_id, None)
-            if work is not None:
-                work.revoked = True
-            _sessions.add(session_id)
-        else:
+    if enabled:
+        with _lock:
+            registered = session_id in _sessions
+        if not registered:
+            # Writes admitted before this boundary finish first. Later ones see it.
+            with _gate.exclusive(), _lock:
+                # Revoke at entry, even if a worker never runs during the interval.
+                work = _public_work.pop(session_id, None)
+                if work is not None:
+                    work.revoked = True
+                _sessions.add(session_id)
+    else:
+        with _lock:
             _sessions.discard(session_id)
             _private_states.pop(session_id, None)
     install_logging_filter()

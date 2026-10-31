@@ -182,7 +182,11 @@ def _event_decision(owner, event, *, blocking=True):
         records = _routing_records()
         enabled = key in records or enabled
         if key in records:
-            register_session(records[key]["session_id"], True)
+            session_id = records[key]["session_id"]
+            if not blocking and not (is_incognito(session_id) and is_incognito(key)):
+                # Registering waits for in-flight persistence; keep that off the loop.
+                return _OFFLOAD
+            register_session(session_id, True)
             register_session(key, True)
     # The entry command and its confirmation must also avoid normal admission/result stores.
     command = getattr(event, "get_command", None)
