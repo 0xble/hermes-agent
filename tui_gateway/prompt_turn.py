@@ -433,7 +433,8 @@ def _settle_loop_after_turn(sid: str, session: dict, raw: Any) -> None:
             loop_state = loop_mgr.state
             if loop_state is not None and loop_state.awaiting_response:
                 loop_decision = loop_mgr.complete_tick(raw if isinstance(raw, str) else "")
-                if loop_msg := loop_decision.get("message") or "":
+                from hermes_cli.goal_notices import loop_notices_enabled
+                if (loop_msg := loop_decision.get("message") or "") and loop_notices_enabled():
                     _emit("status.update", sid, {"kind": "loop", "text": loop_msg})
     except Exception as _loop_exc:
         logger.warning("loop completion hook failed: %s", _loop_exc, exc_info=True)
