@@ -47,7 +47,7 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_automation import admit_route_wake
     from gateway.session_results import execution_result
     from gateway.session_runtime_workers import mutation_tasks
@@ -154,7 +154,7 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
 async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatch, tmp_path, caplog, superseded):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Submission
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session

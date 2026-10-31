@@ -42,7 +42,7 @@ async def _busy_owner(monkeypatch, turns):
     """Real runner + authority over SQLite; turn production is a gated stand-in (no model)."""
     import gateway.session_finite as finite
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
 

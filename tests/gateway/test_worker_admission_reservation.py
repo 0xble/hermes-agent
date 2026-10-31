@@ -8,8 +8,8 @@ import psutil
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_runtime import (admit_session_input, begin_runtime_epoch, claim_session_input,
-                                  register_worker_execution, settle_session_input)
+from hermes_state_runtime import admit_session_input, claim_session_input, register_worker_execution, settle_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def hello(process):

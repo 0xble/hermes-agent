@@ -1,3 +1,4 @@
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 import pytest
 from hermes_state import SessionDB
@@ -8,7 +9,7 @@ def test_usage_receipt_includes_route_rows_and_rolls_back_on_receipt_failure(tmp
     db = SessionDB(tmp_path / 'state.db')
     try:
         db.create_session('s', source='cli')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
         rt.register_worker_execution(db, **scope, kind='compute', adoption_secret='private')
         payload = {'input_tokens': 13, 'output_tokens': 7, 'api_call_count': 1,
@@ -43,7 +44,7 @@ def test_worker_voice_turn_usage_counts_but_never_rewrites_the_session_route(tmp
     db = SessionDB(tmp_path / 'state.db')
     try:
         db.create_session('s', source='cli', model='main-model')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
         rt.register_worker_execution(db, **scope, kind='compute', adoption_secret='private')
         payload = {'input_tokens': 10, 'api_call_count': 1, 'model': 'voice-model',

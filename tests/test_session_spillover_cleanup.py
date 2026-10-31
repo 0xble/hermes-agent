@@ -7,6 +7,7 @@ Two halves under test:
 - ``delete_session`` / ``delete_sessions`` / ``prune_sessions`` capture the doomed messages'
   pointers inside the delete transaction and unlink the archives afterwards — but only once no
   SURVIVING session references them (branch/compression siblings may share the pointer)."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 
 import os
 import time
@@ -166,7 +167,7 @@ def test_canonical_delete_retires_the_spill_for_collection(_home):
     try:
         _aged_session(db, "s_web", "web.txt")
         spill = _spill(_home, "web.txt")
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
         rt.mutate_runtime_session(db, epoch=epoch, principal_id="human", session_id="s_web", request_id="del",
                                   expected_revision=0, expected_generation=0, operation="delete", payload={})
         assert spill.exists()  # the transaction only records the candidate

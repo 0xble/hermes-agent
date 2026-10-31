@@ -4,6 +4,7 @@ of its current physical segment (JoaoMarcos44 R1, andrexibiza 8, dokterdok corr-
 Canonical reset keeps the creation id S0 as the owner (policy, FIFO, generation) and moves the
 transcript to child S1; a follower queued on S0 runs against S1. Deleting or sweeping S1 alone
 used to retire S0's policy and leave the queued admission with nothing to run on."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from contextlib import closing
 import time
 
@@ -27,7 +28,7 @@ OPERATIONS = {
 
 def _conversation(tmp_path, operation, queued):
     db = SessionDB(tmp_path / 'state.db')
-    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
     s0 = _local_session(db, epoch, tmp_path)
     db.append_message(s0, 'user', 'root history')
     s1 = _mutate(db, epoch, s0, 'reset')['target_session_id']

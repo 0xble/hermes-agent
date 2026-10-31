@@ -20,7 +20,7 @@ async def _local_session(tmp_path, monkeypatch):
     from gateway import run, session_local
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from hermes_state_local import local_receipt
     monkeypatch.setattr(run, '_load_gateway_config', dict)

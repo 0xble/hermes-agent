@@ -154,7 +154,7 @@ async def _restart(tmp_path, monkeypatch, old):
     """A real owner restart over the same state.db: new runner, new epoch, local sessions recovered."""
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_state import AsyncSessionDB, SessionDB
     path = old.db.db_path
     old.db.close()

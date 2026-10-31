@@ -18,7 +18,7 @@ async def probe(peer):
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from plugins.platforms.discord.adapter import DiscordAdapter
     from hermes_state_runtime import list_session_admissions
 

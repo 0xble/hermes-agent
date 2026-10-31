@@ -6,7 +6,8 @@ import threading
 import pytest
 
 from gateway.session_contract import Submission
-from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch, get_session_admission
+from hermes_state_runtime import RuntimeStoreError, get_session_admission
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tests.gateway.test_session_authority_cancel_settlement import _authority, ACTOR, REF
 
 

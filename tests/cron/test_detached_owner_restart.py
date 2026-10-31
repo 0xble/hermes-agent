@@ -121,10 +121,8 @@ def test_detached_receipt_replay_is_exactly_once(tmp_path, monkeypatch, fault):
     from hermes_cli import gateway_client, gateway_runtime, gateway_runtime_discovery as discovery
     import hermes_constants
     from hermes_state import SessionDB
-    from hermes_state_runtime import (
-        RuntimeStoreError, adopt_worker_execution, begin_runtime_epoch,
-        mutate_worker_execution, register_worker_execution,
-    )
+    from hermes_state_runtime import RuntimeStoreError, adopt_worker_execution, mutate_worker_execution, register_worker_execution
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tools import async_delegation_worker
 
     db = SessionDB(tmp_path / 'owner.db')

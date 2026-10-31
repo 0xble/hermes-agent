@@ -7,11 +7,8 @@ import pytest
 from cron import executions, jobs, scheduler_authority
 from gateway import session_cron
 from gateway.session_results import admission_result
-from hermes_state_runtime import (
-    adopt_worker_execution, begin_runtime_epoch, claim_session_input,
-    get_session_admission, mutate_runtime_session, recover_session_inputs,
-    register_worker_execution,
-)
+from hermes_state_runtime import adopt_worker_execution, claim_session_input, get_session_admission, mutate_runtime_session, recover_session_inputs, register_worker_execution
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tests.cron.test_cron_recovery import _owner
 
 

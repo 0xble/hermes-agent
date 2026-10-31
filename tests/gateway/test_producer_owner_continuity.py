@@ -14,7 +14,8 @@ async def test_automation_after_compression_and_released_media_uses_logical_owne
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority, SessionAuthority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback
     from gateway.session_ingress_media import release_admission_media
     from gateway.session_automation import check_automation_route
@@ -60,7 +61,8 @@ async def test_automation_for_an_unserved_scope_never_dereferences_a_missing_aut
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority, SessionAuthority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback
     from gateway.session_automation import check_automation_route
     from hermes_constants import get_hermes_home

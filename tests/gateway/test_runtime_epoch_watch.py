@@ -11,7 +11,7 @@ import pytest
 
 from gateway import status
 from gateway.readiness import _probe_runtime_epoch
-from gateway.runtime_ownership import ProfileOwnership
+from gateway.runtime_ownership import process_ownership
 from gateway.session_epoch_watch import check_runtime_epochs
 from hermes_state import SessionDB
 from hermes_state_runtime import begin_runtime_epoch
@@ -22,7 +22,7 @@ def owned(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     db = SessionDB(db_path=home / "state.db")
-    owner = ProfileOwnership()
+    owner = process_ownership
     owner.reserve([home])
     authority = SimpleNamespace(db=db, epoch=begin_runtime_epoch(db, instance_id="gateway"), retired=False)
     published = []
