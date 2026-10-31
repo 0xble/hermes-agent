@@ -1873,7 +1873,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return False, None
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
-        from gateway.session_ingress import admit_message, executing_admission
+        from gateway.session_ingress import admit_message, admitted_queued, executing_admission
         authority = active_authority(self)
         if authority is not None and not event.get_command() and not is_internal:
             if not executing_admission.get():
@@ -1884,7 +1884,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
                 # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
                 # A turn a slash command produced (``/queue yes``) is never live typing.
-                if self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False) and (
+                _busy = self._is_session_running(_quick_key)
+                if _busy and not getattr(event, "_fifo_only", False) and (
                         await self._route_plaintext_approval_while_busy(event, _quick_key)
                         or await self._hm_busy_preempt(event, source, _quick_key)):
                     return True, None
@@ -1895,7 +1896,16 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     return True, None  # a /stop or /new came after its command, as it clears the slot
                 # A failed admit stays the authority's answer (refusal notice or turn error), never a
                 # pending legacy turn: that would run unadmitted, outside the FIFO's order.
-                return True, await admit_message(authority, event)
+                # Voice queued behind the running turn starts STT once its row is durably queued, so
+                # its transcript echoes now; the claimed turn adopts it (queued-voice-eager-stt).
+                if not (_busy and self._pending_event_audio_paths(event)):
+                    return True, await admit_message(authority, event)
+                _token = admitted_queued.set(lambda: self._prefetch_admitted_voice(event))
+                try:
+                    return True, await admit_message(authority, event)
+                finally:
+                    admitted_queued.reset(_token)
+                    self._forget_admitted_voice(event)
         if (authority is None and not is_internal and not event.get_command()
                 and getattr(self, 'session_authority', None) is not None):
             # Scoped to a home this process does not serve: never fall back to the launch ledger.
@@ -2411,6 +2421,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         @ references behave the same. Side effect: buffers per-session native image paths when the
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
         rehome_inbound_media(event)  # before any consumer (vision, STT, document notes) reads media_urls
+        await self._adopt_admitted_voice(event)
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""
         # Prefer the caller's resolved session key so this write key matches the consume key at the
@@ -2807,6 +2818,65 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         await self._echo_stt_transcripts(
             adapter, source, transcripts[already_echoed:], event=event, metadata=metadata, log_context=log_context,
         )
+
+    @staticmethod
+    def _admitted_voice_key(event) -> Optional[tuple[str, str, str]]:
+        """Transport identity shared by a live event and the event a durable claim restores from it."""
+        source, message_id = getattr(event, "source", None), getattr(event, "message_id", None)
+        if source is None or source.platform is None or not message_id:
+            return None
+        return source.platform.value, str(source.chat_id), str(message_id)
+
+    def _prefetch_admitted_voice(self, event) -> None:
+        """Start STT for a voice message the durable FIFO queued behind a running turn.
+
+        The claimed turn runs a NEW event restored from the committed row, so the live event's
+        in-flight STT is published under its transport identity for that turn to adopt
+        (``_adopt_admitted_voice``) instead of transcribing and echoing a second time."""
+        try:
+            key = self._admitted_voice_key(event)
+            if key is None:
+                return
+            self._prefetch_queued_voice_transcript(event, self._delivery_adapter_for(event.source))
+            # Steer fallback and interrupt mode already transcribed (and echoed) it: publish that too.
+            if (getattr(event, "_gateway_pending_stt_prefetch", None) is not None
+                    or hasattr(event, "_gateway_pending_stt_text")):
+                self.__dict__.setdefault("_admitted_voice_prefetches", {})[key] = event
+        except Exception:
+            logger.warning("Queued voice prefetch could not start; the turn will transcribe", exc_info=True)
+
+    def _forget_admitted_voice(self, event) -> None:
+        key = self._admitted_voice_key(event)
+        registry = self.__dict__.get("_admitted_voice_prefetches")
+        if key is not None and registry and registry.get(key) is event:
+            del registry[key]
+
+    async def _adopt_admitted_voice(self, event) -> None:
+        """Give a claimed turn the STT result (and echo ledger) its queued live event already started."""
+        registry = self.__dict__.get("_admitted_voice_prefetches")
+        key = self._admitted_voice_key(event) if registry else None
+        live = registry.get(key) if key is not None else None
+        if live is None or live is event or hasattr(event, "_gateway_pending_stt_text"):
+            return
+        # Restored media is the committed copy (``<sha256>/<name>``) of the same clip.
+        if [os.path.basename(p) for p in self._pending_event_audio_paths(live)] != [
+                os.path.basename(p) for p in self._pending_event_audio_paths(event)]:
+            return
+        del registry[key]
+        prefetch = getattr(live, "_gateway_pending_stt_prefetch", None)
+        if prefetch is not None:
+            try:
+                await asyncio.shield(prefetch)
+            except asyncio.CancelledError:
+                if not prefetch.cancelled():
+                    raise  # this turn was cancelled, not the prefetch
+            except Exception:
+                return
+        if not hasattr(live, "_gateway_pending_stt_text"):
+            return  # STT failed or was cancelled: the turn transcribes as before
+        event._gateway_pending_stt_text = live._gateway_pending_stt_text
+        event._gateway_pending_stt_transcripts = list(getattr(live, "_gateway_pending_stt_transcripts", []) or [])
+        event._gateway_pending_stt_echoed = int(getattr(live, "_gateway_pending_stt_echoed", 0) or 0)
 
     async def _transcribe_and_echo_pending_voice(
         self, event, adapter, source, text: str, *, log_context: str, metadata=_UNSET
