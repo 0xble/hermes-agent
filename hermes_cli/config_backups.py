@@ -50,6 +50,17 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
     try:
         if not config_path.is_file() or config_path.stat().st_size == 0:
             return None
+        good_bytes = None
+        if reason == "good":
+            from hermes_cli.config_write_guards import validate_candidate
+            from utils import fast_safe_load
+            good_bytes = config_path.read_bytes()
+            try:
+                loaded = fast_safe_load(good_bytes.decode("utf-8-sig"))
+                validate_candidate({} if loaded is None else loaded)
+            except Exception as exc:
+                logger.warning("Not backing up invalid config as good: %s", exc)
+                return None
         root = backups_dir(config_path)
         root.mkdir(parents=True, exist_ok=True)
         _sweep_legacy_siblings(config_path, root)
@@ -61,7 +72,13 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         dest = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"
         if dest.is_symlink() or dest.exists():  # never write through a planted link
             return None
-        shutil.copy2(config_path, dest)
+        if good_bytes is not None:
+            # Copy the exact bytes admitted above, not a file an editor may have just replaced.
+            with dest.open("xb") as stream:
+                stream.write(good_bytes)
+            shutil.copystat(config_path, dest)
+        else:
+            shutil.copy2(config_path, dest)
         for stale in [dest, *existing][keep:]:
             stale.unlink(missing_ok=True)
         return dest
@@ -71,23 +88,21 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
 
 
 def load_newest_good_backup(config_path: Path) -> Optional[dict]:
-    """Parse the newest ``good`` backup (the file as it was at the last successful load).
+    """Return the newest semantically valid raw good snapshot, skipping damaged/invalid copies."""
+    from hermes_cli.config_write_guards import validate_candidate
+    from utils import fast_safe_load
 
-    Returns the raw mapping, or None when there is no usable copy. Older ``good`` copies are not
-    tried: a backup that fails to parse means the on-disk copy was damaged after the fact, and
-    guessing further back would serve a config the user never saw as current.
-    """
-    newest = list_config_backups(config_path, "good")[:1]
-    if not newest:
-        return None
-    try:
-        from utils import fast_safe_load
-        with newest[0].open(encoding="utf-8") as f:
-            data = fast_safe_load(f)
-    except Exception as exc:
-        logger.warning("Last-known-good backup %s is unreadable: %s", newest[0], exc)
-        return None
-    return data if isinstance(data, dict) else None
+    for candidate in list_config_backups(config_path, "good"):
+        try:
+            with candidate.open(encoding="utf-8-sig") as f:
+                loaded = fast_safe_load(f)
+            data = {} if loaded is None else loaded
+            validate_candidate(data)
+        except Exception as exc:
+            logger.warning("Skipping invalid last-known-good backup %s: %s", candidate, exc)
+            continue
+        return data
+    return None
 
 
 def _sweep_legacy_siblings(config_path: Path, root: Path) -> None:

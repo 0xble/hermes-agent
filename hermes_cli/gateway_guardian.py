@@ -101,7 +101,7 @@ def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
 
 def enabled(home: Path) -> bool:
     from hermes_cli.config_effective import load_user_config_effective
-    config = load_user_config_effective(home / "config.yaml", fail_closed=True)
+    config = load_user_config_effective(home / "config.yaml", fail_closed=True, validate_structure=False)
     value = (config.get("gateway") or {}).get("guardian", {}).get("enabled", False)
     if type(value) is not bool:
         raise ValueError("gateway.guardian.enabled must be a boolean")
@@ -568,7 +568,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
             from hermes_cli.config import _validate_updates
             if grace is None:
                 from hermes_cli.config_effective import load_user_config_effective
-                config = load_user_config_effective(home / "config.yaml", fail_closed=True)
+                config = load_user_config_effective(home / "config.yaml", fail_closed=True, validate_structure=False)
             else:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
             updates = config.get("updates")

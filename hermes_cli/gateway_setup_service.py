@@ -16,12 +16,9 @@ def record_service_choice(choice: str, config: dict | None = None) -> None:
 
     if choice not in {"install", "decline"}:
         raise ValueError("service_install_choice must be install or decline")
-    current = load_config()
+    current = config if config is not None else load_config()
     current.setdefault("gateway", {})["service_install_choice"] = choice
     save_config(current)
-    # Setup keeps a working config which it saves again after this step.
-    if config is not None:
-        config.setdefault("gateway", {})["service_install_choice"] = choice
 
 
 def wants_service_install(*, interactive: bool, install: bool = False,

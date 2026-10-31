@@ -449,10 +449,10 @@ def _drift_structure(f: Finding, should_fix: bool, config_path) -> None:
         return
     _section("Config Structure")
     for ci in config_issues:
-        (check_fail if ci.severity == "error" else check_warn)(ci.message)
+        (check_fail if ci.severity == "error" else check_warn)(ci.local_detail or ci.message)
         for hint_line in ci.hint.splitlines():
             check_info(hint_line)
-        f.issues.append(ci.message)
+        f.issues.append(ci.local_detail or ci.message)
 
 
 def _endpoint_url(entry: dict) -> str:

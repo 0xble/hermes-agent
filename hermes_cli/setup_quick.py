@@ -31,8 +31,8 @@ def _reload_config_into(config: dict, *, dict_only: bool = False) -> None:
     from hermes_cli.setup import load_config
     refreshed = load_config()
     if not dict_only or isinstance(refreshed, dict):
-        config.clear()
-        config.update(refreshed)
+        from hermes_cli.config_write_guards import replace_snapshot
+        replace_snapshot(config, refreshed)
 
 
 def _run_nous_flow(config: dict, *, context: str, cancel_exc: tuple, cancel_lines: tuple, print_error) -> bool:

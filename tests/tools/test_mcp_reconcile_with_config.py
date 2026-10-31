@@ -16,7 +16,7 @@ def test_reconcile_tears_down_server_dropped_from_config(monkeypatch, tmp_path):
     from tools.mcp_tool import MCPServerTask
 
     configured = {"linear": {"url": "https://mcp.example.test/mcp", "auth": "oauth"}}
-    monkeypatch.setattr(_config, "_load_mcp_config", lambda: dict(configured))
+    monkeypatch.setattr(_config, "_load_mcp_config", lambda *, strict: dict(configured))
     discovered: list = []
     monkeypatch.setattr(disc, "discover_mcp_tools", lambda *a, **k: discovered.append(1) or [])
 
@@ -59,7 +59,7 @@ def test_disabled_lazy_and_connecting_entries(monkeypatch, tmp_path):
     from tools import mcp_tool_lifecycle as _lifecycle
     from tools import mcp_tool_registration as _registration
 
-    monkeypatch.setattr(_config, "_load_mcp_config", lambda: {"linear": {"url": "https://x/mcp", "enabled": False}})
+    monkeypatch.setattr(_config, "_load_mcp_config", lambda *, strict: {"linear": {"url": "https://x/mcp", "enabled": False}})
     torn_down: list = []
     deregistered: list = []
     monkeypatch.setattr(_lifecycle, "shutdown_mcp_servers", lambda **kw: torn_down.append(kw))
@@ -100,7 +100,7 @@ def test_reconcile_retries_failed_first_connect_only_after_cooldown(monkeypatch,
     from tools import mcp_tool_loop as _loop
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(_config, "_load_mcp_config", lambda: {"ghost": {"url": "https://x/mcp"}})
+    monkeypatch.setattr(_config, "_load_mcp_config", lambda *, strict: {"ghost": {"url": "https://x/mcp"}})
     discovered: list = []
     monkeypatch.setattr(disc, "discover_mcp_tools", lambda *a, **k: discovered.append(1) or [])
     try:
@@ -140,7 +140,7 @@ def test_reconcile_counts_adopted_shared_connection_as_live(monkeypatch, tmp_pat
     from tools import mcp_tool_discovery as disc
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(_config, "_load_mcp_config", lambda: {"x": {"url": "https://x/mcp"}})
+    monkeypatch.setattr(_config, "_load_mcp_config", lambda *, strict: {"x": {"url": "https://x/mcp"}})
     monkeypatch.setattr(mcp_tool, "_mcp_registry_scope", lambda: "B")
     discovered: list = []
     monkeypatch.setattr(disc, "discover_mcp_tools", lambda *a, **k: discovered.append(1) or [])

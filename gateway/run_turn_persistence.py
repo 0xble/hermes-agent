@@ -610,7 +610,12 @@ class GatewayTurnPersistenceMixin:
         turn once, and build the sanitized user-facing error reply."""
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
-        logger.exception("Agent error in session %s", session_key)
+        from hermes_cli.config_errors import config_error_reason, log_config_error_once
+        config_reason = config_error_reason(e)
+        if config_reason is not None:
+            log_config_error_once(logger, config_reason)
+        else:
+            logger.exception("Agent error in session %s", session_key)
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
@@ -632,6 +637,10 @@ class GatewayTurnPersistenceMixin:
                 await self._hmwa_close_failed_turn(session_entry.session_id, PARTIAL_FAILED_TURN_NOTICE)
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
+        if config_reason is not None:
+            from gateway.session_results import record_unexecuted_failure
+            from hermes_cli.config_errors import config_error_notice
+            return record_unexecuted_failure(config_error_notice(config_reason))
         # Never expose raw exception types/messages to end users (info-leakage risk).
         _hint_key = self._STATUS_HINTS.get(status_code)
         status_hint = t(_hint_key) if _hint_key and status_code != 401 else ""

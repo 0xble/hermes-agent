@@ -90,7 +90,16 @@ def config_load_issue(exc: Exception):
 
     if isinstance(exc, (HomeInitializationError, OSError)):
         return ConfigIssue(
-            "error", f"Hermes storage is unavailable: {exc}",
+            "error", "Hermes storage is unavailable",
             "Check the reported path, link target, mount and permissions; keep config.yaml unchanged.",
+            local_detail=f"Hermes storage is unavailable: {exc}",
+        )
+    from hermes_cli.config_errors import ConfigValidationError
+    if isinstance(exc, ConfigValidationError):
+        return ConfigIssue(
+            "error", "config.yaml is invalid",
+            "Run 'hermes config edit' to repair it, or 'hermes config set <key> <value>' "
+            "with a fully valid replacement. Runtime settings have not been loaded.",
+            local_detail=f"config.yaml is invalid: {exc}",
         )
     return ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")

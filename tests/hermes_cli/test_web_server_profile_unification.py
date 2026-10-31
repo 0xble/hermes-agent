@@ -71,11 +71,21 @@ class TestProfileScopedConfig:
         """The SPA's fetchJSON injects ?profile= — must scope like body.profile."""
         resp = client.put(
             "/api/config?profile=worker_beta",
-            json={"config": {"timezone": "Pluto/Far"}},
+            json={"config": {"timezone": "Pacific/Honolulu"}},
         )
         assert resp.status_code == 200
-        assert _cfg(isolated_profiles["worker_beta"]).get("timezone") == "Pluto/Far"
-        assert _cfg(isolated_profiles["default"]).get("timezone") != "Pluto/Far"
+        assert _cfg(isolated_profiles["worker_beta"]).get("timezone") == "Pacific/Honolulu"
+        assert _cfg(isolated_profiles["default"]).get("timezone") != "Pacific/Honolulu"
+
+    def test_invalid_config_rejects_without_changing_either_profile(self, client, isolated_profiles):
+        before = {name: (home / "config.yaml").read_bytes()
+                  for name, home in isolated_profiles.items()}
+        resp = client.put("/api/config?profile=worker_beta",
+                          json={"config": {"timezone": "Pluto/Far"}})
+        assert resp.status_code == 400
+        assert "valid IANA zone" in resp.json()["detail"]
+        assert {name: (home / "config.yaml").read_bytes()
+                for name, home in isolated_profiles.items()} == before
 
     def test_unknown_profile_404(self, client, isolated_profiles):
         resp = client.get("/api/config", params={"profile": "ghost"})

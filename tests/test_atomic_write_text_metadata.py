@@ -54,7 +54,7 @@ class TestPreserveMode:
     ) -> None:
         """The temp fd gets fchmod'd, so the target never transits 0600."""
         target = tmp_path / "config.yaml"
-        target.write_text("old\n", encoding="utf-8")
+        target.write_text("old: true\n", encoding="utf-8")
         os.chmod(target, 0o640)
 
         import utils as utils_mod
@@ -67,7 +67,7 @@ class TestPreserveMode:
             return real_replace(tmp, dst)
 
         monkeypatch.setattr(utils_mod, "atomic_replace", spying_replace)
-        atomic_write_text(target, "new\n", preserve_mode=True)
+        atomic_write_text(target, "new: true\n", preserve_mode=True)
 
         assert seen == [0o640]
 
@@ -154,13 +154,13 @@ class TestCreateMode:
     ) -> None:
         """Without os.fchmod (Windows), the mode is applied post-replace."""
         target = tmp_path / "config.yaml"
-        target.write_text("old\n", encoding="utf-8")
+        target.write_text("old: true\n", encoding="utf-8")
         os.chmod(target, 0o640)
 
         monkeypatch.delattr(os, "fchmod")
-        atomic_write_text(target, "new\n", preserve_mode=True)
+        atomic_write_text(target, "new: true\n", preserve_mode=True)
 
-        assert target.read_text(encoding="utf-8") == "new\n"
+        assert target.read_text(encoding="utf-8") == "new: true\n"
         assert stat.S_IMODE(target.stat().st_mode) == 0o640
 
     def test_atomic_yaml_write_create_mode(self, tmp_path: Path) -> None:
