@@ -99,6 +99,38 @@ async def admit_message(authority, event):
     finally:
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
+        _claim_post_delivery(authority, receipt.admission_id, event, waiter)
+
+
+def _claim_post_delivery(authority, admission_id, event, waiter):
+    """Hand the drained turn's post-delivery cleanup to this waiter's sender, which fires it once
+    the reply is sent (``fire_turn_post_delivery``). A caller that stopped waiting sends nothing, so
+    the cleanup then fires when the turn settles."""
+    if waiter.done():
+        post_delivery = _registry(authority, 'waiter_post_deliveries').pop(admission_id, None)
+        if post_delivery is not None:
+            event._turn_post_delivery = post_delivery
+        return
+
+    def abandoned(_):
+        post_delivery = _registry(authority, 'waiter_post_deliveries').pop(admission_id, None)
+        if post_delivery is not None:
+            _fire_post_delivery(post_delivery)
+    waiter.add_done_callback(abandoned)
+
+
+async def fire_turn_post_delivery(event):
+    """Fire, once, the post-delivery cleanup (temporary progress bubbles) of the turn whose reply
+    ``event``'s sender just delivered. False when the drain handed this event none."""
+    post_delivery = getattr(event, '_turn_post_delivery', None)
+    if post_delivery is None:
+        return False
+    event._turn_post_delivery = None
+    owner, session_key, generation = post_delivery
+    fire = getattr(owner, '_fire_post_delivery_callback', None)
+    if fire is not None:
+        await fire(session_key, generation)
+    return True
 
 
 def _marker_adopters(authority):
@@ -359,7 +391,12 @@ async def execute_admission(authority, ref, row):
             return response
     finally:
         post_delivery = captured.get('post_delivery')
-        if post_delivery is not None and not native:
+        if post_delivery is not None and native:
+            # The live waiter sends this reply, so its sender fires the cleanup after that send.
+            # Every waiter does, not only the first message's adapter lifecycle: a busy follow-up's
+            # observer (``dispatch_shared_busy``) never unwinds one (2026-10-31, stale tool cards).
+            _registry(authority, 'waiter_post_deliveries')[row['admission_id']] = post_delivery
+        elif post_delivery is not None:
             # No live adapter handler unwinds this turn, so nothing else fires its post-delivery
             # cleanup: a recovered or internal turn's progress bubbles would stay forever. A turn
             # that raised or was cancelled is over too.
@@ -524,6 +561,9 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             # which listens on the adopter (``event``).
             await adapter._release_turn_marker(delivery_event)
             await adapter._release_turn_marker(event)
+            # After the marker release, so bubble deletes waiting out a flood limit never hold the
+            # drain's bounded wait for it.
+            await fire_turn_post_delivery(event)
 
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
     try:

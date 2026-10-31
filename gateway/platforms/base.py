@@ -5512,7 +5512,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
             if not (self._pending_messages.get(session_key) is event
                     and getattr(event, "_gateway_compression_deferred", False)):
-                await self._fire_post_delivery_callback(session_key, delivery_generation)
+                # A FIFO-run turn names its exact owner and generation; the interrupt event's
+                # generation is the fallback for in-process turns.
+                from gateway.session_ingress import fire_turn_post_delivery
+                if not await fire_turn_post_delivery(event):
+                    await self._fire_post_delivery_callback(session_key, delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
