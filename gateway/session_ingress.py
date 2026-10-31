@@ -32,7 +32,11 @@ QUEUE_FULL_REPLY = ('⏳ Too many messages are already waiting in this conversat
                     'send this again after the current reply.')
 
 
-async def admit_message(authority, event):
+async def admit_message(authority, event, *, on_queued=None):
+    """Commit ``event`` to its route's durable FIFO and wait for its turn's reply.
+
+    ``on_queued`` runs synchronously once the committed row is still ``queued`` (not yet claimed
+    by a drain), so work it starts is visible before the turn's own preprocessing can run."""
     from gateway.session_refusals import internal_input, log_internal_refusal, user_notice_due
     from gateway.session_authority import messaging_admission
     accepted, committed = busy_acceptance.get(), busy_commit.get()
@@ -87,6 +91,8 @@ async def admit_message(authority, event):
             del adopters[receipt.admission_id]
         return (None if status == 'terminal' or internal_input(event)
                 else pause_notice(authority, receipt.ref, 'unknown_execution'))
+    if on_queued is not None and status == 'queued':
+        on_queued()
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
