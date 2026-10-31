@@ -134,3 +134,13 @@ See [Subagent Process Handoff Route](../../../maintenance/subagent-process-hando
 - **Rollback and retirement:** Revert the durability commit to restore #494's opener-local gate.
   Retire when upstream's warm-open implementation both retries blocked initial checkpoints and
   skips settled checkpoints, verified by the same reader-held/main-file-only regression.
+
+## cron-local-delivery-hint
+
+- **Status:** Candidate; not landed or activated.
+- **Contract:** When every comma-separated `deliver` token is `local` (missing or empty resolves to `local`), the cron preamble says the reply is saved to local output only and tells the run to perform any relay its instructions require. Other values, including mixed `local,origin`, keep the upstream hint. SILENT, FAILURE and RECURSION text stays byte-identical.
+- **Source surfaces:** `cron/scheduler_prompt.py` (`_CRON_HINT_LOCAL`, `_cron_hint_for`), `tests/cron/test_cron_local_delivery_hint.py`; unit `maintenance/cron-local-delivery-hint.md`.
+- **Upstream findings:** Closed, unmerged NousResearch/hermes-agent#44042 proposed a local-only variant. Open #127174 and #127185 add hint opt-outs instead, and open issue #69495 asks for a customizable preamble. Upstream `main` still uses the unconditional hint.
+- **Verification:** Red regression: 6 failed on the base for local, missing, empty, list, repeated and padded `local` values. `scripts/run_tests.sh tests/cron/test_cron_local_delivery_hint.py tests/cron/test_scheduler.py tests/agent/test_synthetic_prompt.py`.
+- **Rollback:** Revert the commit carrying `Fork-Patch: cron-local-delivery-hint`. No state or config migration is involved.
+- **Retirement:** Remove when a released upstream hint distinguishes local-only delivery and allows instruction-required self-relay.
