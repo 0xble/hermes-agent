@@ -418,6 +418,20 @@ Linux handoff behavior requires native Linux evidence, not a macOS platform skip
 Retire this adaptation when the accepted upstream guard proves the same owned
 process topologies without allowing signals to unrelated live processes.
 
+## Attachment Probe Runtime Isolation
+
+The `fork-ci-reliability` identity also covers the attachment-handshake probe.
+It supplies the test runner's already-required Node.js through `HERMES_NODE`,
+resolved with `node -p process.execPath` in the runner's real environment, not
+as a PATH shim that depends on version-manager configuration under `HOME`.
+It disables lazy installs in its credential-stripped child environment. An
+unused bootstrap flag did not prevent a fresh PM runtime and Node installation
+inside each isolated home. The genuine-owner control also requires that no
+managed tool store was created. Keep the real CLI, HTTP discovery, owner lease,
+90-second deadline and live-system guard unchanged. Run the attachment file
+on Linux and macOS. Retire this adaptation when upstream's attachment fixture
+selects its supplied runtime without provisioning one during the assertion.
+
 ## Verification and retirement
 
 The host-installation tripwire also protects the captured account's `.local/bin`
