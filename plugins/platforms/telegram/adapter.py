@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
 
+from agent.attachment_context import format_document_content
 from agent.deadline import run_bounded_async
 from agent.ssl_verify import platform_ssl_context
 from gateway.outbox import durable_control, durable_egress
@@ -8551,7 +8552,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 try:
                     text_content = raw_bytes.decode("utf-8")
                     display_name = re.sub(r'[^\w.\- ]', '_', original_filename or f"document{ext or '.txt'}")
-                    injection = f"[Content of {display_name}]:\n{text_content}"
+                    injection = format_document_content(display_name, text_content)
                     event.text = f"{injection}\n\n{event.text}" if event.text else injection
                     event.media_text_inlined = [True]
                 except UnicodeDecodeError:

@@ -106,6 +106,37 @@ strategy and cron-exclusion behavior.
   formatter boundary decides, keeping any human text merged after it. Add a new generated prompt there, beside its producer constant,
   rather than in a provider. `memory.recall_synthetic_turns` (default off) restores recall on
   generated turns. Proof: `tests/agent/test_synthetic_prompt.py`.
+- Automatic recall also excludes producer-owned inline document bodies and channel backfill.
+  All text-document producers use `agent.attachment_context.format_document_content`, whose
+  character count frames the existing filename/content injection without altering file text.
+  Resolve the last channel boundary before accepting document counts, so a frame-shaped line
+  in another speaker's backfill cannot consume the current message. Only start-of-message or
+  blank-line-separated document frames are producer positions, including the gateway's
+  optional current-speaker prefix. A channel header inside a document is not a prelude. Extract those frames before
+  trimming whitespace or interpreting generated-prompt boundaries. Unframed legacy document
+  text has no provable end and is preserved rather than guessed. The shared channel marker
+  registry also owns Discord's unverified notice and reply-only context, Slack's trusted and
+  unverified thread headers, and the relay recent-history header. Channel history ends at its
+  last `[New message]` boundary, accepting the same quoted-boundary limitation as generated
+  templates. Model input and retention keep the complete file and channel content.
+  Proof: `tests/agent/test_document_channel_recall_query.py` and the platform document suites.
+  Retire when upstream carries the human caption separately through all attachment producers.
+- Recall-note peeling preserves the original leftmost regex choice and image-description fallback,
+  including notes that become complete across a deletion seam. `agent.recall_context` compiles only
+  the existing recall regex subset into ordered states. A literal-opener regex derived from
+  that registry skips bracket-dense benign text without per-character state. Complete notes
+  use the original regex matches and a single join, with the post-deletion stripped EOF.
+  A failed opener or a possible deletion seam falls back to the bounded engine on the original
+  input. Memoized lookahead evaluates each
+  `(state, input offset)` at most once for each of the 2 possible EOF positions, and retained-prefix
+  snapshots avoid restarting at the beginning after deletion. This bounds work and space linearly
+  in input length for the fixed registry. The compiler uses CPython's internal regex parser, so
+  qualifying Python-version upgrades must run the corpus against the original eraser. Unsupported
+  regex constructs fail explicitly rather than silently changing the format contract.
+  Proof: `tests/agent/test_recall_context_scanning.py` compares producer, malformed, nested/seam,
+  escaped-quote, EOF, and whitespace cases, checks adversarial execution-step growth by input
+  size, and rejects bounded-state allocation on 1 MB of bracket-dense JSON with or without a note.
+  Retire when upstream has equivalent bounded peeling with the same semantics.
 - A generated-only turn also excludes its assistant reply from automatic transcript retention.
   Filtering only the user half creates an orphan assistant result that can turn test, relay or
   recall feedback into apparent personal evidence. Reuse the shared human-part classifier, not
