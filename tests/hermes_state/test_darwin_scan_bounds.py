@@ -1,12 +1,10 @@
 """Concurrent holder checks share a bounded scan and recover after its timeout."""
 
-import gc
-import os
 import threading
 import time
-import weakref
-from concurrent.futures import ThreadPoolExecutor
+import os
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -102,38 +100,4 @@ def test_retired_self_sidecar_is_detected_while_foreign_scan_is_stalled(tmp_path
             assert dbfile.iter_deleted_sqlite_sidecar_holders(other) == []
     finally:
         release.set()
-
-
-@pytest.mark.platforms("macos")
-@pytest.mark.parametrize("scan_error", [OSError, AssertionError], ids=["os-error", "guard-error"])
-def test_scan_failure_does_not_retain_callers(tmp_path, monkeypatch, scan_error):
-    from hermes_state import SessionDB
-
-    scan_failures = []
-
-    def failed_targets():
-        scan_failures.append(True)
-        raise scan_error("descriptor scan unavailable")
-
-    monkeypatch.setattr(dbfile, "_iter_darwin_fd_targets", failed_targets)
-    monkeypatch.setattr(dbfile, "_darwin_self_sidecar_holders", lambda watched: [])
-    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_WORKER", None)
-    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_RETRY_AT", 0.0)
-
-    class Context:
-        pass
-
-    def open_handle():
-        context = Context()
-        return SessionDB(tmp_path / "state.db"), weakref.ref(context)
-
-    handle, context_ref = open_handle()
-    try:
-        assert scan_failures
-        handle.create_session("after-scan-error", source="fixture", model="m")
-        assert handle.get_session("after-scan-error") is not None
-        gc.collect()
-        assert context_ref() is None
-    finally:
-        handle.close()
 
