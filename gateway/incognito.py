@@ -185,10 +185,11 @@ def _event_decision(owner, event, *, blocking=True):
     enabled = is_incognito(key) if isinstance(key, str) else False
     # Adapters hold the runner's store as ``_session_store``.
     store = getattr(owner, "session_store", None) or getattr(owner, "_session_store", None)
+    checker = getattr(store, "incognito_enabled", None)
     decision = None
-    if store is not None and isinstance(key, str):
+    if callable(checker) and isinstance(key, str):
         if blocking:
-            decision = store.incognito_enabled(key)
+            decision = checker(key)
         else:
             published = getattr(store, "published_incognito_enabled", None)
             decision = published(key) if callable(published) else None
