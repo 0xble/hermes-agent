@@ -163,7 +163,7 @@ def _tick_admitted(
         from cron.scheduler_admission import note_due_scan
 
         scan_started = jobs._hermes_now()
-        due_jobs = _sched.get_due_jobs()
+        due_jobs = _sched.get_due_jobs(adapters=adapters, loop=loop)
         _sched._sweep_stale_inflight_for_tick(due_jobs)
         if headless:
             from cron.scheduler_gateway_gate import refuse_agent_jobs_without_gateway

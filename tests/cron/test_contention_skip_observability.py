@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 
 
 def test_already_running_skip_persists_reason(tmp_path, monkeypatch):
-    import cron.jobs as jobs
-    import cron.scheduler as scheduler
+    from cron import jobs
+    from cron import scheduler
 
     home = tmp_path / ".hermes"
     cron_dir = home / "cron"
@@ -19,7 +19,7 @@ def test_already_running_skip_persists_reason(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
     monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
     monkeypatch.setattr(scheduler, "_hermes_home", home)
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [])
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda **_kw: [])
 
     script = home / "scripts" / "probe.py"
     script.parent.mkdir()
@@ -27,7 +27,7 @@ def test_already_running_skip_persists_reason(tmp_path, monkeypatch):
     job = jobs.create_job(
         prompt="contention", schedule="every 5m", no_agent=True, script=str(script))
     jobs.update_job(job["id"], {
-        "next_run_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+        "next_run_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
     })
 
     # Exercise the same guard branch used by the ticker without starting a worker.
@@ -53,7 +53,7 @@ def test_already_running_skip_persists_reason(tmp_path, monkeypatch):
 
 def test_completed_run_clears_the_persisted_skip():
     """The second I6 review: a single contention skip showed the callout forever."""
-    import cron.jobs as jobs
+    from cron import jobs
     job = {"id": "j1", "last_skipped_at": "2026-09-01T09:00:00+00:00", "last_skip_reason": "already_running"}
     jobs._record_run_outcome(job, True, None, None, None, "2026-09-02T09:00:00+00:00")
     assert "last_skipped_at" not in job and "last_skip_reason" not in job
