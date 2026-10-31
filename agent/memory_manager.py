@@ -300,6 +300,9 @@ class MemoryManager:
         self._bound_scope: Optional[dict[str, Any]] = None
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
 
+    # Bounds how long entering incognito waits for already-queued public memory writes.
+    _PRIVACY_FLUSH_TIMEOUT_S = 10.0
+
     @property
     def read_only(self) -> bool:
         from agent.incognito import is_incognito
@@ -309,18 +312,25 @@ class MemoryManager:
     def read_only(self, enabled: bool) -> None:
         self._read_only = bool(enabled)
 
+    def flush_public_writes(self) -> bool:
+        """Wait for writes queued while public. Call before the session is marked private,
+        so these public turns reach the providers instead of being refused. Bounded."""
+        with self._sync_executor_lock:
+            pending = [future for future, kind in self._background_futures.items() if kind == "write"]
+        _done, unfinished = wait(pending, timeout=self._PRIVACY_FLUSH_TIMEOUT_S)
+        if unfinished:
+            logger.warning("Incognito: %d public memory write(s) still pending at the boundary",
+                           len(unfinished))
+        return not unfinished
+
     def set_read_only(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if enabled == getattr(self, "_read_only", False):
             return
+        if enabled:
+            self.flush_public_writes()
         self._read_only = enabled
         self._privacy_epoch = getattr(self, "_privacy_epoch", 0) + 1
-        # Cut both directions. Work accepted before the boundary must not replay
-        # after private history has been discarded or normal saving resumes.
-        with self._sync_executor_lock:
-            pending = [future for future, kind in self._background_futures.items() if kind == "write"]
-        for future in pending:
-            future.cancel()
         for provider in self._providers:
             try:
                 provider.read_only = enabled
@@ -509,8 +519,9 @@ class MemoryManager:
             if status is None:
                 continue
             # count <= 0: content injected but no discrete count (reflect)
-            detail = ("recalled 1 memory" if status.count == 1 else f"recalled {status.count} memories"
-                      if status.count > 1 else "recalled relevant memory")
+            detail = status.detail or (
+                "recalled 1 memory" if status.count == 1 else f"recalled {status.count} memories"
+                if status.count > 1 else "recalled relevant memory")
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
 
@@ -620,10 +631,10 @@ class MemoryManager:
         if self.read_only and kind == "write":
             return
         if kind == "write":
-            epoch = getattr(self, "_privacy_epoch", 0)
             original_fn = fn
             def guarded_fn():
-                if self.read_only or epoch != getattr(self, "_privacy_epoch", 0):
+                # Only public work is accepted. Re-check in case it waited past a boundary.
+                if self.read_only:
                     return
                 return original_fn()
             fn = guarded_fn

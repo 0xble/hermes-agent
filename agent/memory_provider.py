@@ -59,6 +59,8 @@ class RecallStatus:
     provider_label: str
     count: int
     glyph: str = INDICATOR_GLYPH
+    # Replaces the recalled-count wording, e.g. when recall was refused rather than empty.
+    detail: str | None = None
 
 
 # Prompts with no semantic signal; single source of truth for the core prefetch gate and

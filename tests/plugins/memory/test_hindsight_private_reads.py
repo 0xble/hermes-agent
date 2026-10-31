@@ -343,3 +343,88 @@ def test_provenance_stays_bound_to_dispatch_epoch(endpoint):
         "session_sha256"
     ] == digest(SESSION)
     assert json.loads(response.tool_result(FACT))["_hermes_private_read"]["epoch"] == 7
+
+
+class _RecordingPublicClient:
+    def __init__(self, hold=None):
+        self.recalls, self.retains = [], []
+        self._hold = hold
+
+    async def arecall(self, **kwargs):
+        self.recalls.append(kwargs["query"])
+        return SimpleNamespace(results=[SimpleNamespace(text=FACT)])
+
+    async def aretain_batch(self, **kwargs):
+        if self._hold is not None and not self.retains:
+            await asyncio.get_running_loop().run_in_executor(None, self._hold.wait, 5)
+        self.retains.append(json.dumps(kwargs["items"]))
+        return SimpleNamespace()
+
+    async def aclose(self):
+        pass
+
+
+def _until(predicate, timeout=5.0):
+    import time
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.01)
+
+
+def test_queued_private_prefetch_never_takes_the_public_route_after_off(provider, monkeypatch):
+    """A recall queued while private is dropped at the boundary, never sent publicly."""
+    gate, waiting = threading.Event(), threading.Event()
+    public = _RecordingPublicClient()
+    provider._client = public
+    provider._auto_recall = True
+    provider._prefetch_waits_for_retain = True
+
+    def held_drain(timeout):
+        waiting.set()
+        return gate.wait(5)
+
+    monkeypatch.setattr(provider, "_wait_for_retains_drained", held_drain)
+    provider.read_only = True
+    provider.queue_prefetch("PRIVATE_PREFETCH_QUERY")
+    assert waiting.wait(5)
+    provider.read_only = False
+    gate.set()
+    provider._join_prefetch(5)
+    assert public.recalls == []
+    assert provider.prefetch("next public turn") == ""
+
+
+def test_public_retains_survive_entering_incognito(provider):
+    """Queued and buffered public turns still reach Hindsight; private turns never do."""
+    release = threading.Event()
+    public = _RecordingPublicClient(hold=release)
+    provider._client = public
+    provider._auto_retain = True
+    provider._retain_async = False
+    provider.sync_turn("PUBLIC_ONE question", "answer")
+    _until(lambda: provider._retain_queue.unfinished_tasks == 1 and provider._writer_thread is not None)
+    provider.sync_turn("PUBLIC_TWO question", "answer")  # queued behind the held send
+    provider._retain_every_n_turns = 2
+    provider.sync_turn("PUBLIC_THREE buffered", "answer")  # buffered, not yet sent
+    provider.read_only = True
+    provider.sync_turn("PRIVATE_TURN", "answer")
+    release.set()
+    _until(lambda: len(public.retains) == 3)
+    sent = "".join(public.retains)
+    assert "PUBLIC_ONE" in sent and "PUBLIC_TWO" in sent and "PUBLIC_THREE" in sent
+    assert "PRIVATE_TURN" not in sent
+
+
+def test_refused_private_auto_recall_is_reported_not_silently_empty(endpoint, provider):
+    endpoint.capability = {"features": {"private_reads": False}}
+    provider._auto_recall = True
+    provider._recall_sync = True
+    provider.read_only = True
+    assert provider.prefetch(QUERY) == ""
+    status = provider.recall_status()
+    assert status is not None and status.detail == "private recall unavailable, no memories used"
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    assert "private recall unavailable" in manager.describe_recall()
+    assert provider._client is None

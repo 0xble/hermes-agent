@@ -15,6 +15,7 @@ import atexit
 import collections
 import concurrent.futures
 import contextlib
+from contextvars import ContextVar
 import itertools
 import json
 import logging
@@ -53,6 +54,21 @@ from .settings import (
 from .retention import PendingRetainOperation, filter_retain_messages
 
 logger = logging.getLogger(__name__)
+
+# The route (private no-store or public) a queued background recall was requested under.
+# A recall must never take the other route because privacy changed while it waited.
+_QUEUED_PRIVATE_ROUTE: ContextVar[bool | None] = ContextVar("hindsight_queued_private_route", default=None)
+# A ``_do_recall`` count meaning automatic private recall was refused, not empty.
+_RECALL_REFUSED = -1
+
+
+@contextlib.contextmanager
+def _public_route():
+    token = _QUEUED_PRIVATE_ROUTE.set(False)
+    try:
+        yield
+    finally:
+        _QUEUED_PRIVATE_ROUTE.reset(token)
 
 _LOCAL_MODES = {"local", "local_embedded"}
 # Retain retry bounds: a failed job is retried with exponential backoff up to this many
@@ -421,6 +437,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_running = False
         self._prefetch_pending = None
         self._last_recall_returned, self._last_recall_count = False, 0
+        self._last_recall_refused = False
         self._apply_recall_settings({})
 
     @property
@@ -570,7 +587,10 @@ class HindsightMemoryProvider(MemoryProvider):
         """Run an async client operation; for local_embedded, a stale-daemon
         connection failure recreates the client and retries once. A *timeout* is one budget
         for the whole operation: the retry gets only what the first attempt left, or none."""
-        if self.read_only:
+        private = _QUEUED_PRIVATE_ROUTE.get()
+        if private is None:
+            private = self.read_only
+        if private:
             from agent.incognito import incognito_scope
             from .private_reads import PrivateReadClient
             with incognito_scope(True, getattr(self, "_session_id", None)):
@@ -1217,11 +1237,17 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
+            from .private_reads import PrivateReadError
+            if isinstance(e, PrivateReadError):
+                # Content-free by construction. Report it instead of a silent empty recall.
+                logger.warning("Hindsight private recall refused: %s", e)
+                return "", _RECALL_REFUSED
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
             return "", 0
 
     def _finish_prefetch(self, result: str, count: int) -> str:
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
+        self._last_recall_refused = count == _RECALL_REFUSED
         self._last_recall_returned, self._last_recall_count = bool(result), count if result else 0
         if not result:
             logger.debug("Prefetch: no results available")
@@ -1256,6 +1282,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def recall_status(self) -> Optional[RecallStatus]:
         """Count injected by the last prefetch; None if nothing injected or ``recall_indicator=false``."""
+        if self._last_recall_refused:
+            # A degraded private recall is shown even with the count indicator off.
+            return RecallStatus(provider_label="Hindsight", count=0, glyph=_HINDSIGHT_GLYPH,
+                                detail="private recall unavailable, no memories used")
         if not self._recall_indicator or not self._last_recall_returned:
             return None
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
@@ -1282,7 +1312,7 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._shutting_down.is_set():
                 return
             generation = self._prefetch_generation.begin(self._reset_prefetch_result)
-            self._prefetch_pending = (query, generation)
+            self._prefetch_pending = (query, generation, self.read_only)
             if self._prefetch_running:
                 return
             self._prefetch_running = True
@@ -1303,7 +1333,8 @@ class HindsightMemoryProvider(MemoryProvider):
                     if pending is None or self._shutting_down.is_set():
                         self._prefetch_running = False
                         return
-                query, generation = pending
+                query, generation, private = pending
+                route = _QUEUED_PRIVATE_ROUTE.set(private)
                 try:
                     if self._prefetch_waits_for_retain:
                         self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
@@ -1315,9 +1346,12 @@ class HindsightMemoryProvider(MemoryProvider):
                     text, count = self._do_recall(query)
                     with self._prefetch_generation.publishing(generation) as current:
                         if current:
-                            self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
+                            self._prefetch_result, self._prefetch_count = (
+                                (text, count) if text or count == _RECALL_REFUSED else ("", 0))
                 except Exception:
                     logger.debug("Hindsight prefetch failed", exc_info=True)
+                finally:
+                    _QUEUED_PRIVATE_ROUTE.reset(route)
         except BaseException:
             # A BaseException escaping the worker must not leave ``_prefetch_running`` stuck True,
             # or every later queue_prefetch() would wait on a worker that no longer exists.
@@ -1381,26 +1415,17 @@ class HindsightMemoryProvider(MemoryProvider):
                       retain_async: bool | None = None, keep_pending: Callable[[Any], None] | None = None):
         """Dispatch one item via aretain_batch (bank_id/document_id/retain_async are
         call-level args, never item keys)."""
-        if self.read_only:
+        # A job queued while public keeps its public route after a later boundary.
+        private = _QUEUED_PRIVATE_ROUTE.get()
+        if private is None:
+            private = self.read_only
+        if private:
             return None
-        epoch = getattr(self, "_privacy_epoch", 0)
         self._apply_bank_missions(bank_id)
         kwargs: dict[str, Any] = {"bank_id": bank_id, "items": [item], "document_id": document_id, "retain_async": retain_async}
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        async def retain(client):
-            task = asyncio.current_task()
-            active = getattr(self, "_privacy_write_tasks", None)
-            if active is None:
-                active = set()
-                self._privacy_write_tasks = active
-            active.add(task)
-            try:
-                if self.read_only or epoch != getattr(self, "_privacy_epoch", 0):
-                    return None
-                return await client.aretain_batch(**kwargs)
-            finally:
-                active.discard(task)
-        return self._run_hindsight_operation(retain, keep_pending=keep_pending)
+        return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs),
+                                             keep_pending=keep_pending)
 
     def _make_turn_retain_job(self, turns: list[str], *, document_id: str, update_mode: str | None,
                               label: str, track_ops: bool = True) -> Callable[[], None]:
@@ -1431,10 +1456,12 @@ class HindsightMemoryProvider(MemoryProvider):
         # A timed-out send keeps running on the shared loop. Re-sending it while it may still land
         # would append the same turns twice, so a retry first settles the earlier attempt.
         in_flight: list = []
-        epoch = getattr(self, "_privacy_epoch", 0)
+        # Snapshotted public turns stay public. A job built while private never sends.
+        route = _QUEUED_PRIVATE_ROUTE.get()
+        built_private = self.read_only if route is None else route
 
         def _job() -> None:
-            if self.read_only or epoch != getattr(self, "_privacy_epoch", 0):
+            if built_private:
                 return
             if in_flight:
                 earlier = in_flight[0]
@@ -1525,24 +1552,37 @@ class HindsightMemoryProvider(MemoryProvider):
             self._last_retained_turn_count = 0
 
     def _privacy_changed(self) -> None:
-        self._session_turns = []
-        self._last_retained_turn_count = 0
-        # Cancel outstanding client-side sends. Already accepted server writes
-        # precede the boundary and cannot be revoked by a client toggle.
-        for task in list(getattr(self, "_privacy_write_tasks", ())):
-            with contextlib.suppress(RuntimeError):
-                task.get_loop().call_soon_threadsafe(task.cancel)
-        # Previously queued jobs are epoch-fenced, including backlog retries.
-        # Do not mutate the deque concurrently with its single writer.
-
-    def _enqueue_retain(self, job: Callable[[], None]) -> None:
-        """Hand *job* to the (lazily started) writer and arm the atexit drain."""
-        if self.read_only:
+        # Recall queued or buffered under the other privacy state never crosses the boundary.
+        self.discard_prefetch()
+        if not getattr(self, "_read_only", False):
             return
-        epoch = getattr(self, "_privacy_epoch", 0)
+        # Entering private: buffered public turns are public work. Queue the unsent tail now,
+        # on the public route, instead of holding it in a buffer the interval cannot flush.
+        if (not self._shutting_down.is_set() and not self._cron_skipped and self._auto_retain
+                and self._session_turns and self._turn_counter % self._retain_every_n_turns):
+            document_id, update_mode = self._resolve_retain_target(self._document_id)
+            start = self._last_retained_turn_count if update_mode == "append" else 0
+            turns = list(self._session_turns[start:])
+            if turns:
+                with _public_route():
+                    job = self._make_turn_retain_job(turns, document_id=document_id,
+                                                     update_mode=update_mode, label="flush-on-private")
+                self._enqueue_retain(job, public=True)
+                if update_mode == "append":
+                    self._session_turns.clear()
+                    self._last_retained_turn_count = 0
+
+    def _enqueue_retain(self, job: Callable[[], None], *, public: bool = False) -> None:
+        """Hand *job* to the (lazily started) writer and arm the atexit drain.
+
+        Only public work is queued, and it keeps the public route when it runs or retries
+        after a privacy boundary. ``public`` is for the boundary's own flush of public turns.
+        """
+        if self.read_only and not public:
+            return
         original_job = job
         def guarded_job():
-            if not self.read_only and epoch == getattr(self, "_privacy_epoch", 0):
+            with _public_route():
                 original_job()
         self._ensure_writer()
         self._register_atexit()

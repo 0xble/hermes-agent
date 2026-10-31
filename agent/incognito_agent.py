@@ -31,6 +31,10 @@ def private_init(method):
                     "compression_checkpoint_required": False,
                 }
                 agent._incognito_checkpoint_enabled = kwargs.get("checkpoints_enabled", False)
+                # Leaving restores the built-in compressor's store. A configured external
+                # engine was never built for this agent, so owners should rebuild it.
+                agent._incognito_engine_db = getattr(agent, "_incognito_session_db", None)
+                agent._incognito_born = True
             return result
     return wrapped
 
@@ -53,6 +57,17 @@ def _snapshot(agent):
 
 
 class IncognitoMixin:
+    def flush_public_memory(self) -> None:
+        """Deliver memory writes queued while public, before a privacy boundary is recorded."""
+        manager = getattr(self, "_memory_manager", None)
+        flush = getattr(manager, "flush_public_writes", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning("Incognito: public memory flush incomplete")
+
     def set_incognito(self, enabled: bool = True) -> None:
         """Cut memory work and detach persistence. Turning off drops private history.
 
@@ -63,6 +78,7 @@ class IncognitoMixin:
         if enabled == bool(getattr(self, "incognito", False)):
             return
         if enabled:
+            self.flush_public_memory()
             self._incognito_snapshot = _snapshot(self)
             self._incognito_settings = {
                 name: getattr(self, name, None) for name in

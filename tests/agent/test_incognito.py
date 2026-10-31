@@ -210,7 +210,9 @@ def test_memory_reads_continue_but_every_lifecycle_write_is_gated():
     manager.shutdown_all()
 
 
-def test_boundary_discards_preexisting_write_queue_even_after_off():
+def test_boundary_keeps_preexisting_public_write_queue(monkeypatch):
+    """Writes queued while public are public turns; a boundary delivers rather than drops them."""
+    monkeypatch.setattr(MemoryManager, "_PRIVACY_FLUSH_TIMEOUT_S", 0.01)
     provider = Provider()
     manager = MemoryManager()
     manager.add_provider(provider)
@@ -233,10 +235,42 @@ def test_boundary_discards_preexisting_write_queue_even_after_off():
     manager.set_read_only(False)
     for work, future in queued:
         work()
-    assert provider.writes == []
+    assert provider.writes == [("queued", "old")]
     provider.sync_turn("normal", "after")
-    assert provider.writes == [("normal", "after")]
+    assert provider.writes == [("queued", "old"), ("normal", "after")]
     manager._sync_executor = None
+
+
+def test_entering_privacy_delivers_queued_public_writes_first():
+    from threading import Event, Thread
+
+    provider = Provider()
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    manager.initialize_all("privacy-test")
+    started, release = Event(), Event()
+
+    def busy_worker():
+        started.set()
+        assert release.wait(5)
+
+    # The single worker is busy, so this public turn is still queued at the boundary.
+    manager._submit_background(busy_worker, kind="write")
+    assert started.wait(5)
+    manager._submit_background(lambda: provider.sync_turn("public before on", "kept"), kind="write")
+    entering = Thread(target=manager.set_read_only, args=(True,))
+    entering.start()
+    try:
+        release.set()
+        entering.join(5)
+        assert not entering.is_alive()
+        assert provider.writes == [("public before on", "kept")]
+        manager.sync_all("private user", "private assistant")
+        assert provider.writes == [("public before on", "kept")]
+    finally:
+        release.set()
+        manager.set_read_only(False)
+        manager.shutdown_all()
 
 
 def test_builtin_memory_loads_but_refuses_all_mutations(tmp_path, monkeypatch):
@@ -269,10 +303,10 @@ def test_hindsight_direct_retain_central_sink_and_queue_are_fenced():
     provider.read_only = True
     provider.read_only = False
     provider._retain_queue.get_nowait()()
-    job.assert_not_called()
+    job.assert_called_once()  # queued while public: public work survives the boundary
     provider._session_turns = ["old"]
     provider.read_only = True
-    assert provider._session_turns == []
+    assert provider._session_turns == ["old"]  # already retained public history is kept
     with patch.object(provider, "_run_hindsight_operation") as network:
         assert (
             provider._retain_batch({"content": "private"}, bank_id="test-bank") is None
@@ -287,7 +321,7 @@ def test_hindsight_direct_retain_central_sink_and_queue_are_fenced():
     provider._writer_stopped = True
 
 
-def test_shared_hindsight_writer_drops_old_work_and_accepts_fresh_public_work(
+def test_shared_hindsight_writer_keeps_public_work_and_refuses_private_work(
     monkeypatch,
 ):
     from threading import Event
@@ -311,7 +345,7 @@ def test_shared_hindsight_writer_drops_old_work_and_accepts_fresh_public_work(
     try:
         with incognito_scope(False, provider._session_id):
             provider._enqueue_retain(already_started)
-            provider._enqueue_retain(lambda: delivered.append("obsolete queued work"))
+            provider._enqueue_retain(lambda: delivered.append("public queued before on"))
         assert entered.wait(5)
         original_writer = provider._writer_thread
         register_session(provider._session_id)
@@ -323,7 +357,7 @@ def test_shared_hindsight_writer_drops_old_work_and_accepts_fresh_public_work(
         release.set()
         assert completed.wait(5)
         assert provider._writer_thread is original_writer
-        assert delivered == ["public after"]
+        assert delivered == ["public queued before on", "public after"]
         private_job.assert_not_called()
     finally:
         release.set()
@@ -413,6 +447,29 @@ def test_toggle_restores_saved_history_and_persistence_settings():
     assert agent._session_db is database
     assert agent.save_trajectories and agent.compression_checkpoint_required
     assert agent._checkpoint_mgr.enabled
+
+
+def test_agent_born_private_restores_compressor_store_on_off():
+    from agent.incognito_agent import private_init
+
+    database = object()
+
+    class Agent(IncognitoMixin):
+        @private_init
+        def __init__(self, *, session_id, incognito=False, session_db=None):
+            self.session_id = session_id
+            self.incognito = incognito
+            self._incognito_session_db = session_db if incognito else None
+            self._session_db = None if incognito else session_db
+            self.context_compressor = SimpleNamespace(_session_db=self._session_db)
+            self._memory_manager = None
+            self._memory_store = None
+
+    agent = Agent(session_id="private-init", incognito=True, session_db=database)
+    assert agent._incognito_born and agent.context_compressor._session_db is None
+    agent.set_incognito(False)
+    assert agent._session_db is database
+    assert agent.context_compressor._session_db is database
 
 
 @pytest.mark.parametrize(
