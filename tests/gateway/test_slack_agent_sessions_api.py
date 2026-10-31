@@ -1,6 +1,6 @@
 """Slack status preserves free text while titles use the Agent Sessions API."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -35,18 +35,21 @@ class TestAgentSessionsApiRouting:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("supported", [False, True])
-    async def test_typing_keeps_free_text_on_legacy_api(self, supported):
+    @pytest.mark.parametrize("channel", ["C123", "D123"])
+    async def test_typing_keeps_free_text_on_legacy_api(self, supported, channel):
         _slack_mod._AGENT_SESSIONS_SUPPORTED = supported
         a = self._adapter()
         a._app.client.agents_sessions_setStatus = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.assistant_threads_setStatus.assert_awaited_once_with(
-            channel_id="C123",
-            thread_ts="parent_ts",
-            status="is thinking...",
-        )
-        a._app.client.agents_sessions_setStatus.assert_not_called()
+        md = {"thread_id": "parent_ts", "slack_team_id": "T1"}
+        a.set_status_text(channel, "Hermes Searching...", metadata=md)
+        for _ in range(3):
+            await a.send_typing(channel, metadata=md)
+        assert a._app.client.assistant_threads_setStatus.await_args_list == [
+            call(channel_id=channel, thread_ts="parent_ts", status="Hermes Searching...")
+        ] * 3
+        expected = [call(channel_id=channel, thread_ts="parent_ts", status="processing")] if supported else []
+        assert a._app.client.agents_sessions_setStatus.await_args_list == expected
 
 
     @pytest.mark.asyncio
@@ -64,7 +67,9 @@ class TestAgentSessionsApiRouting:
             thread_ts="parent_ts",
             status="",
         )
-        a._app.client.agents_sessions_setStatus.assert_not_called()
+        expected = [call(channel_id="C123", thread_ts="parent_ts", status=value)
+                    for value in ("processing", "active")] if supported else []
+        assert a._app.client.agents_sessions_setStatus.await_args_list == expected
 
     @pytest.mark.asyncio
     async def test_thread_title_uses_agents_sessions_rename(self):
