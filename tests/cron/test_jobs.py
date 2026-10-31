@@ -347,7 +347,7 @@ def test_removed_job_journal_prunes_entries_older_than_seven_days(tmp_cron_dir, 
     import json
     from cron import jobs
 
-    fixed_now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 1, 10, tzinfo=UTC)
     jobs.ensure_dirs()
     removed_file = jobs._removed_jobs_file()
     removed_file.write_text(json.dumps({
@@ -379,7 +379,7 @@ def test_removed_job_journal_salvages_valid_records_around_corruption(tmp_cron_d
     removed_file = jobs._removed_jobs_file()
     valid = json.dumps({
         "id": "already-deleted",
-        "removed_at": datetime.now(timezone.utc).isoformat(),
+        "removed_at": datetime.now(UTC).isoformat(),
     }).encode()
     removed_file.write_bytes(valid + b"\n{\xff\n")
 
@@ -1238,6 +1238,7 @@ class TestGetDueJobs:
         dueA = get_due_jobs()
         assert [j["id"] for j in dueA] == ["long-oneshot"]
         assert get_job("long-oneshot").get("run_claim") is not None
+        monkeypatch.setattr("cron.jobs._job_running_in_this_process", lambda _: True)
 
         # Process B (and A's own subsequent ticks) while A is still running:
         # 28s later (the exact gap in the report) AND 61s later (past any
@@ -1276,9 +1277,8 @@ class TestGetDueJobs:
         owner = get_job("slowrun")["run_claim"]["by"]
         assert heartbeat_run_claim("slowrun", expected_owner=owner) is True
 
-        # Past the ORIGINAL claim's TTL horizon: without the heartbeat this
-        # tick would stale-remove the maxed one-shot; with it the claim is
-        # fresh, so the job is skipped and the record survives.
+        # Process B sees a fresh heartbeat past the original TTL, not an orphaned local run.
+        monkeypatch.setattr("cron.jobs._machine_id", lambda: "other-host:456")
         monkeypatch.setattr("cron.jobs._hermes_now",
                             lambda: t0 + timedelta(seconds=ttl + 10))
         assert get_due_jobs() == []

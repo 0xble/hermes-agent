@@ -228,10 +228,14 @@ def recheck_idle() -> None:
     record.last_probe = now
     error = probe_store(cron_dir)
     if error is None:
-        from cron.jobs import _jobs_lock, load_jobs, save_jobs
+        from cron.jobs import JobsLockContended, _jobs_lock, load_jobs, save_jobs
         try:
             with _jobs_lock():
                 save_jobs(load_jobs())
+            return
+        except JobsLockContended as exc:
+            logger.warning("Cron idle recovery deferred until the next tick: %s", exc)
+            record.last_probe = None
             return
         except OSError as exc:  # e.g. EDQUOT or a read-only jobs.json in a writable dir
             error = exc
@@ -278,8 +282,12 @@ def probe_store(cron_dir: Path) -> Optional[OSError]:
         size = jobs_file.stat().st_size + 4096
     except OSError:
         size = 4096
-    # A read-only jobs.json symlink target, or a tick lock the ticker cannot open (root-owned in a
-    # writable dir: the tick skips every run while the dir itself still accepts writes).
+    # A root-owned lock in a writable directory still prevents every scheduler write.
+    try:
+        with open(cron_dir / ".jobs.lock", "a+", encoding="utf-8-sig"):
+            pass
+    except OSError as exc:
+        return exc
     for target in (os.path.realpath(jobs_file), str(cron_dir / ".tick.lock")):
         if os.path.exists(target) and not os.access(target, os.W_OK):
             return OSError(errno.EACCES, os.strerror(errno.EACCES), target)

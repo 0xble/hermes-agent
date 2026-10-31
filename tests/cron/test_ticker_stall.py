@@ -3,9 +3,9 @@
 Three fixes under test:
 
 1. ``_jobs_lock()`` bounds its cross-process flock: when another process holds
-   ``.jobs.lock`` indefinitely, acquisition times out, logs at ERROR, and falls
-   through to in-process-only locking — instead of blocking the calling thread
-   (and, transitively, the cron ticker heartbeat) forever.
+   ``.jobs.lock`` indefinitely, acquisition times out and logs the holder. Reads
+   remain available, but writes are refused without cross-process ownership,
+   instead of blocking the calling thread (and the cron ticker heartbeat) forever.
 
 2. Claim freshness checks are bounded on both sides (``0 <= age < ttl``): a
    ``fire_claim``/``run_claim`` stamped in the FUTURE (clock/TZ skew across a
@@ -15,6 +15,7 @@ Three fixes under test:
    "already being fired".
 """
 
+import os
 import threading
 import time
 from datetime import timedelta
@@ -51,6 +52,9 @@ def _hold_jobs_flock(path: Path, release: threading.Event, held: threading.Event
     fd = open(path, "a+", encoding="utf-8")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        from cron.lock_owner import write_owner
+
+        write_owner(fd, "_hold_jobs_flock")
         held.set()
         release.wait(timeout=30)
     finally:
@@ -62,9 +66,11 @@ def _hold_jobs_flock(path: Path, release: threading.Event, held: threading.Event
 
 
 class TestBoundedJobsLock:
-    def test_lock_acquisition_times_out_and_degrades(self, monkeypatch, caplog):
+    def test_lock_acquisition_times_out_and_refuses_writes(self, monkeypatch, caplog):
         """A foreign holder of .jobs.lock must NOT block _jobs_lock forever."""
-        jobs_mod.ensure_dirs()
+        job = create_job(name="held store", schedule="0 7 * * *", prompt="unchanged")
+        jobs_file = jobs_mod._current_cron_store().jobs_file
+        before = jobs_file.read_bytes()
         lock_path = jobs_mod._jobs_lock_file()
         lock_path.touch()
 
@@ -81,16 +87,26 @@ class TestBoundedJobsLock:
         try:
             start = time.monotonic()
             entered = False
-            with caplog.at_level("ERROR", logger="cron.jobs"):
+            with caplog.at_level("WARNING", logger="cron.jobs"):
                 with _jobs_lock():
                     entered = True
+                    records = load_jobs()
+                    assert records[0]["id"] == job["id"], "reads remain available under contention"
+                    records[0]["prompt"] = "must not be persisted"
+                    with pytest.raises(jobs_mod.JobsLockContended, match="Refusing cron write"):
+                        save_jobs(records)
             elapsed = time.monotonic() - start
 
-            assert entered, "critical section must still run in degraded mode"
+            assert entered, "read-only critical section must remain available"
             assert elapsed < 10, f"lock wait was not bounded (took {elapsed:.1f}s)"
-            assert any(r.levelname == "ERROR" for r in caplog.records), (
-                "degraded-mode fallback must be logged at ERROR"
-            )
+            assert holder.is_alive(), "waiter must finish before the holder releases the lock"
+            assert jobs_file.read_bytes() == before, "refused write must not change the store"
+            timeout = next(r for r in caplog.records if "Timed out" in r.message)
+            assert timeout.levelname == "WARNING"
+            assert f"holder pid={os.getpid()}" in timeout.message
+            assert "command=" in timeout.message and "held=" in timeout.message
+            assert "operation='_hold_jobs_flock'" in timeout.message
+            assert "writes are refused" in timeout.message
         finally:
             release.set()
             holder.join(timeout=10)
