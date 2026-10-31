@@ -81,6 +81,9 @@ not only the command reply.
 - Credential-pool status keeps only classifier fields while private. Provider
   error text can echo the prompt, so it never reaches `auth.json` from a private
   turn.
+- A private agent prints nothing to raw stdout. A gateway redirects stdout to
+  `gateway.log`, which the privacy log filter never sees. Status and warnings
+  still reach the user through `status_callback`.
 - Async ingress reads the loaded store's published routing index on the event
   loop. Only an unloaded store resolves off-loop. Routing every message through
   the default executor queues ingress behind unrelated jobs and lets held

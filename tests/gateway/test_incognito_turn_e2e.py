@@ -1,7 +1,10 @@
 """Incognito through the gateway: a configured private route, a compacting turn, /new and off.
 
-Only the provider boundary is replaced. Model routing, the agent loop, in-place compaction,
-transcript persistence, reset and restoration run through their production owners.
+Model routing, the agent loop, in-place compaction, transcript persistence, reset and
+restoration run through their production owners. The resolver test replaces only the
+provider client, Hindsight's cloud client and the summary call. The failure-record tests
+replace ``_run_agent`` to inject an exception, and the /new test observes the parked
+agent's release instead of tearing down a real one.
 """
 import asyncio
 import json
@@ -173,7 +176,7 @@ class _ProviderBoundary:
 
 @pytest.mark.asyncio
 async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify_failure(
-        private_route, monkeypatch, tmp_path, caplog):
+        private_route, monkeypatch, tmp_path, caplog, capsys):
     """Real gateway turns: production agent resolver and cache, only the provider client replaced."""
     import logging
     from agent.incognito import is_incognito
@@ -229,9 +232,10 @@ async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify
     agent = runner._cached_agent_for(key)
     provider.replies = ["Second OK"]
     second = await turn("Private follow-up", "private-2")
-    rejected = RuntimeError(f"provider echoed {canary}")
-    rejected.status_code = 400
-    provider.replies = [rejected] * 8
+    # A 429 runs the real private path through the credential pool, whose status is persisted.
+    limited = RuntimeError(f"rate limited while reading {canary}")
+    limited.status_code = 429
+    provider.replies = [limited] * 12
     failed = await turn("Private failure", "private-3")
 
     assert (first, second) == ("OK", "Second OK"), adapter.sent
@@ -252,6 +256,9 @@ async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify
     hindsight.aretain_batch.assert_not_called()
     assert db.get_messages(sid) == saved_rows
     assert canary.encode() not in disk_bytes(tmp_path)
+    # A gateway's stdout is a log file, and it bypasses the privacy log filter.
+    printed = capsys.readouterr()
+    assert canary not in printed.out and canary not in printed.err
 
     assert "OFF" in await incognito(runner, event, "/incognito off")
     assert entry.model_override is None and runner._session_model_override(key) is None
