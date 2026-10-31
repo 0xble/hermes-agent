@@ -73,6 +73,10 @@ not only the command reply.
   and sent-message IDs may resolve existing RAM prompt state and its session lane.
   Stale buttons cannot run or consume a newer prompt. Unmatched pickers remain
   privacy-ambiguous, not guessed public topics.
+- A failed private turn records only its exception type and innermost Hermes
+  frame, created outside the private scope by `agent.incognito.log_private_failure`.
+  Every other record from the turn stays redacted whole, so never add the message,
+  arguments or locals to that line.
 - Async ingress reads the loaded store's published routing index on the event
   loop. Only an unloaded store resolves off-loop. Routing every message through
   the default executor queues ingress behind unrelated jobs and lets held
@@ -87,6 +91,13 @@ The focused proof surfaces are `tests/agent/test_incognito.py`,
 `tests/plugins/platforms/telegram/test_incognito_ingress.py`, and
 `tests/tools/test_delegate_tool.py`. The real Telegram admission and multiplex
 transport tests exercise the receiving adapter rather than a synthetic shortcut.
+`tests/gateway/test_incognito_turn_e2e.py` is the end-to-end contract: a
+configured `incognito.model` reached through a model alias, a private turn that
+compacts in RAM and replies, `/new` with a parked agent, `/incognito off`
+restoring the route and saved prefix, and the content-free failure record. It
+mocks only the provider boundary. Do not replace the gateway methods it crosses
+with mocks, which is how the private persistence call shipped with the wrong
+signature.
 Compare the complete suite's failures against the exact base before promotion.
 Off-mode differential proofs must compare the merged main revision, retaining
 exact SQL traces, SQLite pages and plugin callback assertions. A historical base

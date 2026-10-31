@@ -102,7 +102,7 @@ class GatewayIncognitoCommandsMixin:
             if getattr(getattr(self, "config", None), "multiplex_profiles", False):
                 profile_home = self._resolve_profile_home_for_source(event.source)
             ctx = self._model_switch_context(event.source, key, profile_home=profile_home, persist_global=False)
-            result, error = await self._perform_model_switch(ctx, request, None, event.source)
+            result, error = await self._perform_model_switch(ctx, request, "", event.source)
             if error is not None:
                 return self._incognito_reply(entry, error)
             override = {
