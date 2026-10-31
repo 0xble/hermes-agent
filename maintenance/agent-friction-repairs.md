@@ -138,14 +138,29 @@ secret-safe attribution contract with these regressions passing.
 
 ## Foreground heavy-slot queue waits
 
-Foreground local commands now bound their shared-slot admission wait to
-`min(120, max(10, effective_timeout // 3))` via `HEAVY_SLOT_MAX_WAIT`, while
-background commands keep the helper's unbounded wait. A single simple heavy
-command that reaches exit 75 is promoted automatically to a tracked background
-run without asking the model to retry; compound commands retain the explicit
-not-started result because replaying their shell would repeat earlier side effects.
+Interactive foreground local commands yield after
+`min(120, max(10, effective_timeout // 3))` while waiting for shared capacity.
+[Ticket-preserving handoff](heavy-slot-ticket-handoff.md) superseded the earlier
+`HEAVY_SLOT_MAX_WAIT` expiry and exit-75 replay: it adopts the original shell
+without losing queue age or repeating compound-shell side effects. Background
+commands keep the helper's unbounded wait.
 Provenance: 1,196 terminal calls timed out over two days, including 432 pytest and
 202 unittest calls; dotfiles#941 added the host helper support.
+
+The 2026-10-29 `sync-hermes-fork` run (`1c9eee960a24`) failed before its tests
+started because bounded admission expired under queue contention. Cron has no
+later turn to receive a background completion, so foreground cron commands now
+keep waiting inline until their own effective timeout, including requests above
+the interactive foreground timeout cap. `cron/scheduler.py::_CronRunScope`
+binds `turn_origin="cron"`; terminal reads `bound_turn_origin()` from that
+task-local session context, never ambient environment state. The same binding
+survives `execute_code` RPC dispatch through its per-cell authority. The helper
+receives no `HEAVY_SLOT_MAX_WAIT`, and terminal does not automatically promote
+or adopt cron work. A terminal timeout with admission still pending kills the
+queued process and explicitly reports that the heavy command was not started.
+Interactive and gateway handoff budgets remain unchanged. Regressions live in
+`tests/tools/test_terminal_tool_heavy_slot.py` and
+`tests/tools/test_terminal_heavy_slot_handoff.py`.
 
 ## Actionable failure hints
 
