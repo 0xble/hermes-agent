@@ -391,11 +391,15 @@ async def execute_admission(authority, ref, row):
             return response
     finally:
         post_delivery = captured.get('post_delivery')
-        if post_delivery is not None and native:
+        waiter = authority.waiters.get(row['admission_id'])
+        if post_delivery is not None and native and waiter is not None and not waiter.done():
             # The live waiter sends this reply, so its sender fires the cleanup after that send.
             # Every waiter does, not only the first message's adapter lifecycle: a busy follow-up's
             # observer (``dispatch_shared_busy``) never unwinds one (2026-10-31, stale tool cards).
             _registry(authority, 'waiter_post_deliveries')[row['admission_id']] = post_delivery
+        elif post_delivery is not None and native:
+            # The waiter was already released (a pause, /stop) and claims nothing now.
+            _fire_post_delivery(post_delivery)
         elif post_delivery is not None:
             # No live adapter handler unwinds this turn, so nothing else fires its post-delivery
             # cleanup: a recovered or internal turn's progress bubbles would stay forever. A turn

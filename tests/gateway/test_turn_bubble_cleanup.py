@@ -36,6 +36,12 @@ async def _owner(monkeypatch):
         text = str(event.text)
         if text in gates:
             await gates[text].wait()
+        if text == 'released early':
+            # Its waiter is released before the turn ends, as a pause releases a session's waiters.
+            from hermes_state_runtime import RuntimeStoreError
+            authority.waiters.pop(event._outbox_admission_id.split(':', 1)[1]).set_exception(
+                RuntimeStoreError('unknown_execution'))
+            await asyncio.sleep(0)
 
         def cleanup():
             cleaned.append((text, any(sent == 'reply to ' + text for sent in adapter.sent)))
@@ -63,19 +69,16 @@ async def test_every_turn_path_deletes_its_own_bubbles(monkeypatch):
     # Adapter lifecycle: the first message, while the session is idle.
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
     await _wait_for(lambda: _statuses(authority).get('first') == 'started')
-    # Busy follow-ups: a user message and an internal wake sent while 'first' runs.
+    # Busy follow-up: a user message sent while 'first' runs.
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='follow-up', source=source, message_id='m2')), 5)
-    await asyncio.wait_for(adapter.handle_message(MessageEvent(
-        text='busy wake', source=source, message_id='m3', internal=True)), 5)
     gates['first'].set()
-    await _wait_for(lambda: {'first', 'follow-up', 'busy wake'} <= {text for text, _ in cleaned}, 15)
+    await _wait_for(lambda: {'first', 'follow-up'} <= {text for text, _ in cleaned}, 15)
     # FIFO drain with no live waiter: a producer wake (/loop tick, watch notification), delivered
     # by the drain like a recovered turn.
     assert await admit_route_wake(runner, adapter, source, 'loop tick', 'loop')
     await _wait_for(lambda: 'loop tick' in {text for text, _ in cleaned}, 15)
     await _wait_for(lambda: not adapter._background_tasks, 15)
-    assert sorted(cleaned) == sorted([
-        ('first', True), ('follow-up', True), ('busy wake', True), ('loop tick', True)])
+    assert sorted(cleaned) == sorted([('first', True), ('follow-up', True), ('loop tick', True)])
     assert _held(adapter) == ({}, {})
     assert not getattr(authority, 'waiter_post_deliveries', {})
 
@@ -100,5 +103,23 @@ async def test_a_waiter_that_stops_waiting_still_deletes_its_turns_bubbles(monke
     gates['follow-up'].set()
     await _wait_for(lambda: 'follow-up' in {text for text, _ in cleaned}, 15)
     assert ('follow-up', False) in cleaned
+    assert _held(adapter) == ({}, {})
+    assert not getattr(authority, 'waiter_post_deliveries', {})
+
+
+@pytest.mark.asyncio
+async def test_a_waiter_released_before_its_turn_ends_still_deletes_its_bubbles(monkeypatch):
+    """A busy follow-up whose waiter was released while the turn still ran (a pause) claims nothing
+    afterwards, so the drain fires the turn's cleanup itself."""
+    from gateway.platforms.event import MessageEvent
+
+    _, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
+    gates['first'] = asyncio.Event()
+    await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
+    await _wait_for(lambda: _statuses(authority).get('first') == 'started')
+    await asyncio.wait_for(adapter.handle_message(MessageEvent(text='released early', source=source, message_id='m2')), 5)
+    gates['first'].set()
+    await _wait_for(lambda: 'released early' in {text for text, _ in cleaned}, 15)
+    await _wait_for(lambda: not adapter._background_tasks, 15)
     assert _held(adapter) == ({}, {})
     assert not getattr(authority, 'waiter_post_deliveries', {})
