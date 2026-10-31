@@ -5,7 +5,6 @@ Without this the only symptom is every turn failing with ``stale_epoch`` until s
 
 import logging
 import sqlite3
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -34,11 +33,11 @@ def owned(tmp_path, monkeypatch):
     db.close()
 
 
-def _take_epoch(db):
+def _take_epoch(db, holder="owner"):
     """A writer outside ``begin_runtime_epoch``'s ownership check (raw SQL)."""
     conn = sqlite3.connect(db.db_path)
     with conn:
-        conn.execute("UPDATE runtime_epoch SET epoch=epoch+1, instance_id='owner' WHERE singleton=1")
+        conn.execute("UPDATE runtime_epoch SET epoch=epoch+1, instance_id=? WHERE singleton=1", (holder,))
     conn.close()
 
 
@@ -74,6 +73,34 @@ def test_readiness_without_the_field_stays_ok():
     assert _probe_runtime_epoch({}) == {"status": "ok"}
 
 
+
+@pytest.fixture
+def successor(owned, monkeypatch):
+    """A zero-cut handover this gateway accepted; the sibling slot identifies as ``successor-b``."""
+    owned.runner._zero_cut_handover_state = {"accepted": True}
+    asked = []
+
+    def query(home, verb, *, slot=None, timeout=None, **_):
+        asked.append((verb, slot))
+        return {"instance_id": "successor-b"} if verb == "identify" and slot == "b" else None
+    monkeypatch.setattr("gateway.control_socket.query_gateway_control", query)
+    return asked
+
+
+def test_handed_over_epoch_is_the_promoted_sibling_not_a_theft(owned, successor, caplog):
+    """Slot b's promotion begins the next epoch while slot a finishes its in-flight turns: the new
+    holder is the instance slot b identifies as, so the move logs INFO once and readiness stays ok."""
+    _take_epoch(owned.db, holder="successor-b")
+    caplog.set_level(logging.INFO, logger="gateway.session_epoch_watch")
+    for _ in range(3):
+        assert check_runtime_epochs(owned.runner) == []
+    assert _criticals(caplog) == []
+    infos = [r for r in caplog.records if r.levelno == logging.INFO and "zero-cut successor" in r.getMessage()]
+    assert len(infos) == 1
+    assert successor == [("identify", "b")], "the sibling is asked once per epoch move"
+    assert owned.published == [{"runtime_epoch": {"status": "ok"}}]
+
+
 _HOLDER = r"""
 import fcntl, sys
 handle = open(sys.argv[1], "a+")
@@ -84,8 +111,8 @@ sys.stdin.read()
 
 
 @pytest.fixture
-def sibling_slot(owned):
-    """A zero-cut sibling (slot b) alive in another process."""
+def live_sibling(owned):
+    """Slot b alive in another process, holding its runtime lock."""
     import subprocess
     import sys
     proc = subprocess.Popen([sys.executable, "-c", _HOLDER, str(owned.home / "gateway.b.lock")],
@@ -96,25 +123,27 @@ def sibling_slot(owned):
     proc.wait(timeout=30)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock stand-in for the sibling slot")
-def test_handed_over_epoch_is_the_promoted_sibling_not_a_theft(owned, sibling_slot, caplog):
-    """Slot a accepted a zero-cut handover; slot b's promotion begins the next epoch while a finishes
-    its in-flight turns. That move logs INFO once, never CRITICAL, and readiness stays ok."""
-    owned.runner._zero_cut_handover_state = {"accepted": True}
-    _take_epoch(owned.db)
-    caplog.set_level(logging.INFO, logger="gateway.session_epoch_watch")
-    for _ in range(2):
-        assert check_runtime_epochs(owned.runner) == []
-    assert _criticals(caplog) == []
-    infos = [r for r in caplog.records if r.levelno == logging.INFO and "zero-cut successor" in r.getMessage()]
-    assert len(infos) == 1
-    assert owned.published == [{"runtime_epoch": {"status": "ok"}}]
+def test_a_handover_does_not_excuse_a_different_holder(owned, successor, live_sibling, caplog):
+    """The probe's ``instance_id='owner'`` during an accepted handover, with slot b alive, is still
+    a theft: only the instance slot b identifies as is its promotion."""
+    _take_epoch(owned.db, holder="owner")
+    caplog.set_level(logging.CRITICAL)
+    assert len(check_runtime_epochs(owned.runner)) == 1
+    assert len(_criticals(caplog)) == 1
 
 
-def test_accepted_handover_without_a_live_sibling_is_still_lost(owned, caplog):
-    """Accepting a handover does not excuse a move nobody beside this gateway could have made."""
+def test_a_failed_handover_does_not_excuse_the_move(owned, successor, live_sibling, caplog):
+    owned.runner._zero_cut_handover_state = {"accepted": True, "failed": "token lock lost"}
+    _take_epoch(owned.db, holder="successor-b")
+    caplog.set_level(logging.CRITICAL)
+    assert len(check_runtime_epochs(owned.runner)) == 1
+    assert len(_criticals(caplog)) == 1
+
+
+def test_accepted_handover_without_an_answering_sibling_is_still_lost(owned, caplog):
+    """Accepting a handover does not excuse a move nobody can show the sibling made."""
     owned.runner._zero_cut_handover_state = {"accepted": True}
-    _take_epoch(owned.db)
+    _take_epoch(owned.db, holder="successor-b")
     caplog.set_level(logging.CRITICAL)
     assert len(check_runtime_epochs(owned.runner)) == 1
     assert len(_criticals(caplog)) == 1

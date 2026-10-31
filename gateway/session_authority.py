@@ -1427,6 +1427,7 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     bind_owner(authority)
     if claim:
         _publish_claimed_epoch(authority, db_key, register=register)
+        authority.epoch_claimed = True
     return authority
 
 
@@ -1435,19 +1436,29 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
 UNCLAIMED_EPOCH = 0
 
 
-async def claim_session_authority(authority):
-    """Begin the runtime epoch and run the startup recovery a standby's boot skipped (promotion)."""
-    if authority.epoch != UNCLAIMED_EPOCH:
+async def claim_session_authority(authority, *, successor=False):
+    """Begin the runtime epoch and run the startup recovery a standby's boot skipped (promotion).
+
+    Resumable: a retried promotion after a step raised reuses the epoch it already began and runs
+    every later step again (each is idempotent), so the authority never stays half-claimed with its
+    store's local-reset fence unset. ``epoch_claimed`` is set only once every step finished.
+    """
+    if getattr(authority, 'epoch_claimed', False):
         return
-    db_key = await _claim_epoch(authority)
+    db_key = await _claim_epoch(authority, successor=successor)
     _publish_claimed_epoch(authority, db_key, register=authority.runner.session_authority is authority)
+    authority.epoch_claimed = True
 
 
-async def _claim_epoch(authority):
+async def _claim_epoch(authority, *, successor=False):
     from pathlib import Path
     db = authority.db
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
-    epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=authority.instance_id)
+    epoch = getattr(authority, 'begun_epoch', None)
+    if epoch is None:
+        epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=authority.instance_id,
+                                        successor=successor)
+        authority.begun_epoch = epoch
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.

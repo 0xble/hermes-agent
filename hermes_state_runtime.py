@@ -110,19 +110,20 @@ def _row(row):
     return result
 
 
-def begin_runtime_epoch(db, *, instance_id: str) -> int:
+def begin_runtime_epoch(db, *, instance_id: str, successor: bool = False) -> int:
     """Caller MUST hold the profile ownership lock, not merely an endpoint ticket.
 
     Refused while another process holds that lock: the live owner's epoch fences all of its writes,
     so a foreign bump stales every settlement and admission it makes, and the recovery a begin
     precedes would turn the owner's running turns ``unknown``. A store nobody owns stays open to an
-    offline caller, whose epoch the next owner's own begin supersedes.
+    offline caller, whose epoch the next owner's own begin supersedes. ``successor`` is the zero-cut
+    promotion's allowance to begin while its predecessor slot still holds its own lock.
     """
     _text(instance_id)
     from pathlib import Path
     from gateway.runtime_ownership import OwnershipConflict, foreign_runtime_owner
     home = Path(db.db_path).resolve().parent
-    if foreign_runtime_owner(home):
+    if foreign_runtime_owner(home, successor=successor):
         raise OwnershipConflict(
             f'runtime epoch refused for {instance_id!r}: another process owns the gateway runtime '
             f'of {home}; reserve the profile (or stop that gateway) before beginning an epoch')

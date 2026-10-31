@@ -9,7 +9,8 @@ housekeeping tick runs this check, which logs CRITICAL once per taken epoch and 
 ``runtime_epoch: lost`` to the runtime status that readiness reports.
 
 A zero-cut handover this gateway accepted is not a theft: its promoted sibling slot begins the next
-epoch while this one finishes its in-flight turns, so that move is logged at INFO only.
+epoch while this one finishes its in-flight turns. Only when the handover has not failed and the new
+holder is the instance the sibling slot identifies as is that move logged at INFO instead.
 
 It never re-claims the epoch. The process that took it may still be writing, so a re-claim would only
 stale it in turn, and the recovery a begin runs would mark this owner's own running turns ``unknown``.
@@ -29,15 +30,18 @@ def _store_epoch(db) -> tuple[int, str] | None:
     return (int(row[0]), str(row[1])) if row is not None else None
 
 
-def _handed_over(runner, home) -> bool:
-    """This gateway accepted a zero-cut handover and its sibling slot is alive: the sibling's
-    promotion begins the next epoch while this one finishes its in-flight turns."""
+def _handed_over(runner, home, holder) -> bool:
+    """The epoch moved to the zero-cut successor this gateway handed over to: the handover was
+    accepted and has not failed, and the new holder's instance id is the one the sibling slot
+    publishes. Anything short of that proof is reported as a taken epoch."""
     state = getattr(runner, '_zero_cut_handover_state', None) or {}
-    if not state.get('accepted'):
+    if not state.get('accepted') or state.get('failed') or state.get('status') == 'failed':
         return False
-    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, effective_gateway_slot, slot_lock_held
+    from gateway.control_socket import query_gateway_control
+    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, effective_gateway_slot
     sibling = SLOT_STANDBY if effective_gateway_slot() == SLOT_ACTIVE else SLOT_ACTIVE
-    return slot_lock_held(home, sibling)
+    identity = query_gateway_control(home, "identify", slot=sibling, timeout=0.5) or {}
+    return bool(holder) and identity.get('instance_id') == holder
 
 
 def lost_runtime_epochs(runner) -> list[dict]:
@@ -55,11 +59,12 @@ def lost_runtime_epochs(runner) -> list[dict]:
         home = Path(authority.db.db_path).resolve().parent
         if not held_in_process(home):
             continue  # ownership already released: this authority is shutting down, not robbed
-        if _handed_over(runner, home):
-            if getattr(authority, '_epoch_handover_logged', None) != current[0]:
-                authority._epoch_handover_logged = current[0]
-                logger.info('Runtime epoch of %s moved to %d (instance %r): the zero-cut successor '
-                            'this gateway handed over to was promoted.', home, current[0], current[1])
+        if getattr(authority, '_epoch_handed_over', None) == current:
+            continue  # this exact move was already proven to be the successor (asked once)
+        if _handed_over(runner, home, current[1]):
+            authority._epoch_handed_over = current
+            logger.info('Runtime epoch of %s moved to %d (instance %r): the zero-cut successor '
+                        'this gateway handed over to was promoted.', home, current[0], current[1])
             continue
         lost.append({'authority': authority, 'home': home, 'held': authority.epoch,
                      'store': current[0], 'holder': current[1]})

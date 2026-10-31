@@ -198,12 +198,19 @@ async def _adopt_predecessor_duties(runner) -> None:
     """Once the predecessor slot has exited: take the host gateway role it held and replay the durable
     outbox it may have left pending. Both wait for the exit, because the predecessor keeps the host lock
     and may still be sending its last finals until then (the outbox CAS keeps a replay from doubling)."""
-    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, effective_gateway_slot, slot_lock_held
+    from gateway.gateway_slot import (
+        LOCK_HELD, LOCK_UNKNOWN, SLOT_ACTIVE, SLOT_STANDBY, effective_gateway_slot, slot_lock_state)
     from gateway.status import _get_process_hermes_home
     other = SLOT_ACTIVE if effective_gateway_slot() == SLOT_STANDBY else SLOT_STANDBY
     home = _get_process_hermes_home()
-    while await asyncio.to_thread(slot_lock_held, home, other):
+    while (state := await asyncio.to_thread(slot_lock_state, home, other)) == LOCK_HELD:
         await asyncio.sleep(_PREDECESSOR_POLL_S)
+    if state == LOCK_UNKNOWN:
+        # A predecessor lock this user cannot open (another user's stale inode) never reads free:
+        # waiting on it would stall the host role forever. Go on; the host-role claim below has its
+        # own lock and refuses if another gateway really owns this host.
+        logger.warning("Predecessor slot %s lock in %s cannot be opened; adopting its duties anyway",
+                       other, home)
     from gateway.run import _claim_host_gateway_role, _refresh_host_gateway_record
     try:
         _claim_host_gateway_role()  # on the loop thread, so its SIGTERM cleanup handler installs

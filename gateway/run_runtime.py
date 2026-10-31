@@ -183,10 +183,20 @@ async def claim_gateway_runtime(runner):
         return
     from gateway.run import _profile_runtime_scope
     from gateway.session_authority import claim_session_authority
-    for authority in [a for a in registry if a is not None]:
-        with _profile_runtime_scope(Path(authority.db.db_path).resolve().parent, hydrate_secrets=False):
-            await claim_session_authority(authority)
-    runner.session_runtime_descriptor['authority_epoch'] = registry.launch.epoch
+    # The launch profile first: its claim is the point of no return (slot a's epoch goes stale).
+    # A secondary that fails after it is parked as boot parks one, never aborting a promotion
+    # that would leave nothing serving.
+    launch = registry.launch
+    for authority in [launch, *(a for a in registry if a is not None and a is not launch)]:
+        try:
+            with _profile_runtime_scope(Path(authority.db.db_path).resolve().parent, hydrate_secrets=False):
+                await claim_session_authority(authority, successor=True)
+        except Exception as exc:
+            if authority is launch:
+                raise
+            await _park_live_secondary(runner, authority, exc, 'promotion epoch claim failed')
+    runner.session_runtime_descriptor['authority_epoch'] = launch.epoch
+    _publish_served_set(runner)
     release_unknown_turn_markers(runner)
     for authority in [a for a in registry if a is not None]:
         await _recover_profile_bot_mailbox(runner, authority)
@@ -547,21 +557,27 @@ async def _recover_profile_bot_mailbox(runner, authority):
         name = None if registry is None else registry.profile_name(authority)
         if name is None:
             raise  # the launch profile's store is the process's own; nothing to park it behind
-        logger.error("[MULTIPLEX] Profile '%s' not served: startup recovery failed: %s", name, exc,
-                     exc_info=True)
-        home = await asyncio.to_thread(Path(authority.profile_id).resolve)
-        if not await _retire_profile_authority(authority):
-            # A writer outlived Stop: the lock and the retiring authority stay for shutdown to
-            # settle, but the profile leaves the served set, so later boot never starts it.
-            _withdraw_profile_home(runner, home)
-            park_profile(runner, name, f'startup recovery failed; ownership retained (a control-socket rescan, '
-                                       f'`hermes -p {name} gateway run`, serves it once its writer stops): {exc}')
-            return
-        registry.remove(home)
-        _publish_served_set(runner)
-        release_profile_home(runner, home)
-        park_profile(runner, name, f'startup recovery failed (a control-socket rescan, '
-                                   f'`hermes -p {name} gateway run`, serves it again): {exc}')
+        await _park_live_secondary(runner, authority, exc, 'startup recovery failed')
+
+
+async def _park_live_secondary(runner, authority, exc, what):
+    """Retire, unreserve and park a built secondary whose startup step failed; the rest keep serving."""
+    registry = runner.session_authorities
+    name = registry.profile_name(authority)
+    logger.error("[MULTIPLEX] Profile '%s' not served: %s: %s", name, what, exc, exc_info=True)
+    home = await asyncio.to_thread(Path(authority.profile_id).resolve)
+    if not await _retire_profile_authority(authority):
+        # A writer outlived Stop: the lock and the retiring authority stay for shutdown to
+        # settle, but the profile leaves the served set, so later boot never starts it.
+        _withdraw_profile_home(runner, home)
+        park_profile(runner, name, f'{what}; ownership retained (a control-socket rescan, '
+                                   f'`hermes -p {name} gateway run`, serves it once its writer stops): {exc}')
+        return
+    registry.remove(home)
+    _publish_served_set(runner)
+    release_profile_home(runner, home)
+    park_profile(runner, name, f'{what} (a control-socket rescan, '
+                               f'`hermes -p {name} gateway run`, serves it again): {exc}')
 
 
 async def recover_gateway_native_sessions(runner):

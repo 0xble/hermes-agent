@@ -99,3 +99,67 @@ def test_an_unopenable_lock_counts_as_held(store):
     finally:
         lock.chmod(0o600)
     assert _store_epoch(db) == (live_epoch, "live-gateway")
+
+
+
+def _reserve_as(monkeypatch, home, slot):
+    """This process reserves *home* as gateway slot *slot*, the way its runtime startup does."""
+    monkeypatch.setattr("gateway.gateway_slot.effective_gateway_slot", lambda config=None: slot)
+    owner = ProfileOwnership()
+    owner.reserve([home])
+    return owner
+
+
+def _sibling_answers(monkeypatch, answer):
+    monkeypatch.setattr("gateway.control_socket.query_gateway_control",
+                        lambda home, verb, *, slot=None, timeout=None, **_: answer)
+
+
+@pytest.mark.parametrize("answer", [None, {"standby": False}], ids=["no-answer", "active"])
+def test_a_slot_b_reservation_cannot_begin_over_a_serving_slot_a(store, monkeypatch, answer):
+    """Slot b that booted active (its role query gave up) holds its own lock only: slot a still
+    serves and owns the epoch, so b's begin is refused unless a answers as a standby."""
+    home, db, live_epoch = store
+    holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(home / "gateway.lock")],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        _sibling_answers(monkeypatch, answer)
+        owner = _reserve_as(monkeypatch, home, "b")
+        try:
+            with pytest.raises(OwnershipConflict):
+                begin_runtime_epoch(db, instance_id="slot-b")
+            assert _store_epoch(db) == (live_epoch, "live-gateway")
+            # Only a zero-cut promotion passes the successor allowance.
+            assert begin_runtime_epoch(db, instance_id="slot-b", successor=True) == live_epoch + 1
+        finally:
+            owner.release(home)
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=30)
+
+
+def test_an_active_slot_may_begin_beside_an_unpromoted_standby(store, monkeypatch):
+    """Slot a restarting while a zero-cut standby waits in slot b: the standby begins no epoch."""
+    home, db, live_epoch = store
+    holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(home / "gateway.b.lock")],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        _sibling_answers(monkeypatch, {"standby": True})
+        owner = _reserve_as(monkeypatch, home, "a")
+        try:
+            assert begin_runtime_epoch(db, instance_id="slot-a") == live_epoch + 1
+        finally:
+            owner.release(home)
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=30)
+
+
+def test_the_successor_allowance_needs_a_reservation(store, live_owner):
+    """A lock-less probe gains nothing by claiming to be a successor."""
+    _home, db, live_epoch = store
+    with pytest.raises(OwnershipConflict):
+        begin_runtime_epoch(db, instance_id="owner", successor=True)
+    assert _store_epoch(db) == (live_epoch, "live-gateway")

@@ -77,11 +77,16 @@ def _resolve_gateway_role(slot: str, config: Any = None, *, timeout: float = 0.5
         return False
     from hermes_constants import get_hermes_home
     other_slot = SLOT_STANDBY if slot == SLOT_ACTIVE else SLOT_ACTIVE
+    home = get_hermes_home()
     try:
-        status = _query_other_slot(get_hermes_home(), other_slot, timeout)
+        status = _query_other_slot(home, other_slot, timeout)
     except (OSError, RuntimeError, ValueError, TypeError, ImportError):
-        return False
-    return bool(status and status.get("standby") is False)
+        status = None
+    if not status:
+        # No answer is not "not standby" while the sibling holds its runtime lock: a slow or wedged
+        # serving gateway would otherwise have this one boot active and take its runtime epoch.
+        return slot_lock_held(home, other_slot)
+    return status.get("standby") is False
 
 
 def effective_gateway_standby(config: Any = None) -> bool:
@@ -136,20 +141,31 @@ def slot_lock_held(home: Any, slot: str) -> bool:
     one ``stat`` and opens nothing, so flag-off readers pay no file handle for it. A lock file that
     exists but cannot be opened (another user's inode, an I/O error) is reported held, as
     ``is_gateway_runtime_lock_active`` does: unknown ownership never grants it."""
+    return slot_lock_state(home, slot) != LOCK_FREE
+
+
+#: :func:`slot_lock_state` answers.
+LOCK_FREE, LOCK_HELD, LOCK_UNKNOWN = "free", "held", "unknown"
+
+
+def slot_lock_state(home: Any, slot: str) -> str:
+    """``free`` (no lock file, or one nobody holds), ``held`` (a flock probe lost), or ``unknown``
+    (the file exists but cannot be opened). Callers that wait for a release tell ``unknown`` apart,
+    since it may never change; ownership checks treat it as held."""
     import os
     from pathlib import Path
 
     from gateway.status import _probe_lock_file
     path = Path(home) / slot_filename("gateway.lock", slot)
     if not os.path.exists(path):
-        return False
+        return LOCK_FREE
     try:
         handle = open(path, "a+", encoding="utf-8")
     except FileNotFoundError:
-        return False  # removed since the stat: nobody holds it
+        return LOCK_FREE  # removed since the stat: nobody holds it
     except OSError:
-        return True
-    return _probe_lock_file(handle)
+        return LOCK_UNKNOWN
+    return LOCK_HELD if _probe_lock_file(handle) else LOCK_FREE
 
 
 def sibling_lock_name(pid_filename: str, lock_filename: str) -> str:
