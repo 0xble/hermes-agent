@@ -33,7 +33,7 @@ def reserved_profile_homes(runner):
     return homes
 
 
-async def _build_profile_authority(runner, name, home, *, register):
+async def _build_profile_authority(runner, name, home, *, register, claim=True):
     """One profile's authority against its own ``state.db``; raises when that store is unusable."""
     from gateway.run import _profile_runtime_scope
     from gateway.session_authority import initialize_session_authority
@@ -50,7 +50,7 @@ async def _build_profile_authority(runner, name, home, *, register):
         registry.add(home, None, name=name)
         try:
             authority = await initialize_session_authority(
-                runner, profile_id=str(home), instance_id=instance_id, db=db, register=register)
+                runner, profile_id=str(home), instance_id=instance_id, db=db, register=register, claim=claim)
         except BaseException:
             registry.remove(home)
             raise
@@ -155,9 +155,13 @@ async def initialize_gateway_runtime(runner):
     runner.session_runtime_descriptor = descriptor
     registry = SessionAuthorities(homes[0][1], multiplexed=getattr(runner.config, 'multiplex_profiles', False))
     runner.session_authorities = registry
+    # A zero-cut standby boots beside the serving slot, which still owns every store: it builds its
+    # authorities unclaimed and begins their epochs only at promotion (claim_gateway_runtime).
+    from gateway.zero_cut_standby import is_standby
+    claim = not is_standby()
     for index, (name, home) in enumerate(homes):
         try:
-            await _build_profile_authority(runner, name, home, register=index == 0)
+            await _build_profile_authority(runner, name, home, register=index == 0, claim=claim)
         except Exception as exc:
             if index == 0:
                 raise  # the launch profile's store is the process's own; nothing to park it behind
@@ -167,7 +171,41 @@ async def initialize_gateway_runtime(runner):
     # Publish this boot's verdict (an empty map clears a previous run's parked set).
     _record_parked_profiles(parked_profile_map(runner))
     runner.session_ticket_store = TicketStore(instance_id, registry.profile_ids())
+    if claim:
+        release_unknown_turn_markers(runner)
+
+
+async def claim_gateway_runtime(runner):
+    """Promotion of a zero-cut standby: begin each authority's epoch, run the startup recovery its
+    boot skipped, then the Bot Chat recovery ``start_gateway_runtime_api`` skipped. Idempotent."""
+    registry = getattr(runner, 'session_authorities', None)
+    if registry is None:
+        return
+    from gateway.run import _profile_runtime_scope
+    from gateway.session_authority import claim_session_authority
+    # The launch profile first: its claim is the point of no return (slot a's epoch goes stale).
+    # A secondary that fails after it is parked as boot parks one, never aborting a promotion
+    # that would leave nothing serving.
+    launch = registry.launch
+    for authority in [launch, *(a for a in registry if a is not None and a is not launch)]:
+        try:
+            with _profile_runtime_scope(Path(authority.db.db_path).resolve().parent, hydrate_secrets=False):
+                await claim_session_authority(authority, successor=True)
+        except Exception as exc:
+            if authority is launch:
+                raise
+            await _park_live_secondary(runner, authority, exc, 'promotion epoch claim failed')
+    runner.session_runtime_descriptor['authority_epoch'] = launch.epoch
+    _publish_served_set(runner)
     release_unknown_turn_markers(runner)
+    for authority in [a for a in registry if a is not None]:
+        await _recover_profile_bot_mailbox(runner, authority)
+    # Promotion starts deferred secondaries from the served set recorded at boot: re-record it
+    # against the registry, so a profile parked above never gets adapters without an authority.
+    served = getattr(runner, '_served_profile_homes', None)
+    if served is not None and callable(getattr(runner, '_record_served_profiles', None)):
+        runner._record_served_profiles(getattr(runner, '_primary_profile_name', None) or 'default',
+                                       list(served.items()))
 
 
 def release_unknown_turn_markers(runner):
@@ -505,8 +543,10 @@ async def start_gateway_runtime_api(runner):
     from gateway.run_api import start_gateway_api
     runner.session_api = await start_gateway_api(runner)
     runner.session_runtime_descriptor['api_origin'] = runner.session_api.api_origin
+    from gateway.session_authority import UNCLAIMED_EPOCH
     for authority in _authorities(runner):
-        await _recover_profile_bot_mailbox(runner, authority)
+        if getattr(authority, 'epoch', None) != UNCLAIMED_EPOCH:  # a standby recovers it at promotion
+            await _recover_profile_bot_mailbox(runner, authority)
 
 
 async def _recover_profile_bot_mailbox(runner, authority):
@@ -523,21 +563,27 @@ async def _recover_profile_bot_mailbox(runner, authority):
         name = None if registry is None else registry.profile_name(authority)
         if name is None:
             raise  # the launch profile's store is the process's own; nothing to park it behind
-        logger.error("[MULTIPLEX] Profile '%s' not served: startup recovery failed: %s", name, exc,
-                     exc_info=True)
-        home = await asyncio.to_thread(Path(authority.profile_id).resolve)
-        if not await _retire_profile_authority(authority):
-            # A writer outlived Stop: the lock and the retiring authority stay for shutdown to
-            # settle, but the profile leaves the served set, so later boot never starts it.
-            _withdraw_profile_home(runner, home)
-            park_profile(runner, name, f'startup recovery failed; ownership retained (a control-socket rescan, '
-                                       f'`hermes -p {name} gateway run`, serves it once its writer stops): {exc}')
-            return
-        registry.remove(home)
-        _publish_served_set(runner)
-        release_profile_home(runner, home)
-        park_profile(runner, name, f'startup recovery failed (a control-socket rescan, '
-                                   f'`hermes -p {name} gateway run`, serves it again): {exc}')
+        await _park_live_secondary(runner, authority, exc, 'startup recovery failed')
+
+
+async def _park_live_secondary(runner, authority, exc, what):
+    """Retire, unreserve and park a built secondary whose startup step failed; the rest keep serving."""
+    registry = runner.session_authorities
+    name = registry.profile_name(authority)
+    logger.error("[MULTIPLEX] Profile '%s' not served: %s: %s", name, what, exc, exc_info=True)
+    home = await asyncio.to_thread(Path(authority.profile_id).resolve)
+    if not await _retire_profile_authority(authority):
+        # A writer outlived Stop: the lock and the retiring authority stay for shutdown to
+        # settle, but the profile leaves the served set, so later boot never starts it.
+        _withdraw_profile_home(runner, home)
+        park_profile(runner, name, f'{what}; ownership retained (a control-socket rescan, '
+                                   f'`hermes -p {name} gateway run`, serves it once its writer stops): {exc}')
+        return
+    registry.remove(home)
+    _publish_served_set(runner)
+    release_profile_home(runner, home)
+    park_profile(runner, name, f'{what} (a control-socket rescan, '
+                               f'`hermes -p {name} gateway run`, serves it again): {exc}')
 
 
 async def recover_gateway_native_sessions(runner):

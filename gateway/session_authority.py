@@ -1396,19 +1396,76 @@ def backfill_compression_created_sources(db):
     return stamped
 
 
-async def initialize_session_authority(runner, *, profile_id, instance_id, db=None, register=True):
+async def initialize_session_authority(runner, *, profile_id, instance_id, db=None, register=True, claim=True):
     """Call after exclusive profile ownership, before connecting adapters/API.
 
     ``register=False`` builds a served secondary's authority without making it the runner's
     launch authority (``runner.session_authority``); the per-home registry owns the lookup.
+
+    ``claim=False`` (a zero-cut standby) builds the authority without beginning a runtime epoch or
+    running startup recovery: the serving slot still owns the store, and a begin here would stale
+    every write it makes and turn its running turns ``unknown``. The authority's epoch stays 0, so
+    any fenced write it attempts is refused, until :func:`claim_session_authority` at promotion.
     """
     if db is None:
         db = getattr(runner._session_db, '_db', runner._session_db)
-    # Resolved off-loop before any state is published: the rest of the bring-up runs without
-    # yielding, so no other task observes a half-registered authority.
+    if db is None:
+        # The runner's store failed to open (the live-DB guard refusing a probe, a locked or corrupt
+        # file); name that cause instead of failing on ``None.db_path`` below.
+        from gateway.run_runtime import _store_open_failure
+        from hermes_constants import get_hermes_home
+        raise RuntimeError(f'session authority has no state.db: {_store_open_failure(runner, get_hermes_home())}')
+    authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db,
+                                 epoch=UNCLAIMED_EPOCH)
+    if claim:
+        # Resolved off-loop before any state is published: the rest of the bring-up runs without
+        # yielding, so no other task observes a half-registered authority.
+        db_key = await _claim_epoch(authority)
+    if register:
+        runner.session_authority = authority
+    from gateway.session_cron import bind_owner
+    bind_owner(authority)
+    if claim:
+        _publish_claimed_epoch(authority, db_key, register=register)
+        authority.epoch_claimed = True
+    return authority
+
+
+#: Epoch of an authority that has not begun one (a zero-cut standby): never a stored epoch, so every
+#: fenced write fails ``stale_epoch``.
+UNCLAIMED_EPOCH = 0
+
+
+async def claim_session_authority(authority, *, successor=False):
+    """Begin the runtime epoch and run the startup recovery a standby's boot skipped (promotion).
+
+    Resumable: a retried promotion after a step raised reuses the epoch it already began and runs
+    every later step again (each is idempotent), so the authority never stays half-claimed with its
+    store's local-reset fence unset. ``epoch_claimed`` is set only once every step finished.
+    """
+    if getattr(authority, 'epoch_claimed', False):
+        if await asyncio.to_thread(_stored_epoch, authority.db) == authority.epoch:
+            return
+        # A rolled-back promotion kept its claim while slot a restarted and began a newer epoch:
+        # serving on the old one would fail every write stale_epoch. Claim again.
+        authority.epoch_claimed = False
+        authority.begun_epoch = None
+    db_key = await _claim_epoch(authority, successor=successor)
+    _publish_claimed_epoch(authority, db_key, register=authority.runner.session_authority is authority)
+    authority.epoch_claimed = True
+
+
+async def _claim_epoch(authority, *, successor=False):
     from pathlib import Path
+    db = authority.db
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
-    epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
+    epoch = getattr(authority, 'begun_epoch', None)
+    if epoch is not None and await asyncio.to_thread(_stored_epoch, db) != epoch:
+        epoch = None  # another owner began since this half-finished claim: its epoch is gone
+    if epoch is None:
+        epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=authority.instance_id,
+                                        successor=successor)
+        authority.begun_epoch = epoch
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
@@ -1416,23 +1473,28 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     await asyncio.to_thread(settle_recovered_unattended, db, epoch)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     await asyncio.to_thread(backfill_compression_created_sources, db)
-    authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)
+    authority.epoch = epoch
     # A receipt's compression catch-up (#140060) writes: it commits off the loop too, before the
     # authority is published, so the recovery below only reads.
     from gateway.session_local_adoption import adopt_local_compressions
     await adopt_local_compressions(authority)
+    return db_key
+
+
+def _stored_epoch(db):
+    with db._read_ctx() as conn:
+        row = conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()
+    return row[0] if row is not None else None
+
+
+def _publish_claimed_epoch(authority, db_key, *, register):
+    store = authority.runner.session_store
     if register:
-        runner.session_authority = authority
-    from gateway.session_cron import bind_owner
-    bind_owner(authority)
-    store = runner.session_store
-    if register:
-        store._local_authority_epoch = epoch
+        store._local_authority_epoch = authority.epoch
     # Local resets write the owning profile's store; the epoch fence must be that store's.
     epochs = getattr(store, '_local_authority_epochs', None)
     if epochs is None:
         epochs = store._local_authority_epochs = {}
-    epochs[db_key] = epoch
+    epochs[db_key] = authority.epoch
     from gateway.session_local_recovery import recover_local_sessions
     recover_local_sessions(authority)
-    return authority

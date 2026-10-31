@@ -77,11 +77,16 @@ def _resolve_gateway_role(slot: str, config: Any = None, *, timeout: float = 0.5
         return False
     from hermes_constants import get_hermes_home
     other_slot = SLOT_STANDBY if slot == SLOT_ACTIVE else SLOT_ACTIVE
+    home = get_hermes_home()
     try:
-        status = _query_other_slot(get_hermes_home(), other_slot, timeout)
+        status = _query_other_slot(home, other_slot, timeout)
     except (OSError, RuntimeError, ValueError, TypeError, ImportError):
-        return False
-    return bool(status and status.get("standby") is False)
+        status = None
+    if not status:
+        # No answer is not "not standby" while the sibling holds its runtime lock: a slow or wedged
+        # serving gateway would otherwise have this one boot active and take its runtime epoch.
+        return slot_lock_held(home, other_slot)
+    return status.get("standby") is False
 
 
 def effective_gateway_standby(config: Any = None) -> bool:
@@ -133,18 +138,37 @@ def serving_slot(home: Any = None) -> str:
 def slot_lock_held(home: Any, slot: str) -> bool:
     """True while some live process holds ``slot``'s runtime lock in ``home`` (a direct flock probe;
     the status helpers resolve paths through this module and would recurse). A missing lock file is
-    one ``stat`` and opens nothing, so flag-off readers pay no file handle for it."""
+    one ``stat`` and opens nothing, so flag-off readers pay no file handle for it. A lock file that
+    exists but cannot be opened (another user's inode, an I/O error) is reported held, as
+    ``is_gateway_runtime_lock_active`` does: unknown ownership never grants it."""
+    return slot_lock_state(home, slot) != LOCK_FREE
+
+
+#: :func:`slot_lock_state` answers.
+LOCK_FREE, LOCK_HELD, LOCK_UNKNOWN = "free", "held", "unknown"
+
+
+def slot_lock_state(home: Any, slot: str) -> str:
+    """``free`` (no lock file, or one nobody holds), ``held`` (a flock probe lost, or a transient
+    open error such as EMFILE), or ``unknown`` (this user may not open the file at all). Callers that
+    wait for a release tell ``unknown`` apart, since it may never change; ownership checks treat it as
+    held."""
     import os
     from pathlib import Path
 
     from gateway.status import _probe_lock_file
     path = Path(home) / slot_filename("gateway.lock", slot)
     if not os.path.exists(path):
-        return False
+        return LOCK_FREE
     try:
-        return _probe_lock_file(open(path, "a+", encoding="utf-8"))
+        handle = open(path, "a+", encoding="utf-8")
+    except FileNotFoundError:
+        return LOCK_FREE  # removed since the stat: nobody holds it
+    except PermissionError:
+        return LOCK_UNKNOWN  # another user's inode: may never change
     except OSError:
-        return False
+        return LOCK_HELD  # transient (EMFILE, EIO): the holder may well be alive, ask again
+    return LOCK_HELD if _probe_lock_file(handle) else LOCK_FREE
 
 
 def sibling_lock_name(pid_filename: str, lock_filename: str) -> str:

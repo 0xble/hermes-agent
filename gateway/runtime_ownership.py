@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import stat
 import threading
+import weakref
 from hermes_dir_acl import make_user_dir
 
 
@@ -138,10 +139,19 @@ def _still_names(path: Path, fd: int) -> bool:
         return False
 
 
+#: Every ``ProfileOwnership`` alive in this process: the gateway's ``process_ownership``, an
+#: ``exclusive_maintenance`` reservation (its own instance, possibly entered on another thread) and
+#: any embedded owner. :func:`foreign_runtime_owner` asks them before probing a lock, because a flock
+#: probe from this process would report its own reservation as held.
+_live_ownerships: weakref.WeakSet[ProfileOwnership] = weakref.WeakSet()
+
+
 class ProfileOwnership:
     def __init__(self, *, all_slots: bool = False):
+        _live_ownerships.add(self)
         self._all_slots = all_slots
         self._handles: dict[Path, ExitStack] = {}
+        self._slots: dict[Path, tuple[str, ...]] = {}
         self._writers: list[threading.Thread] = []
         self._mutex = threading.RLock()
 
@@ -182,11 +192,17 @@ class ProfileOwnership:
                             handle.flush()
                             os.fsync(handle.fileno())
                         self._handles[home] = locks.pop_all()
+                        self._slots[home] = slots
                     added.append(home)
             except BaseException:
                 for home in reversed(added):
                     self.release(home)
                 raise
+
+    def slots(self, home: Path) -> tuple[str, ...]:
+        """The runtime slots whose ``gateway.lock`` this reservation holds for *home*."""
+        with self._mutex:
+            return self._slots.get(canonical_home(home), ())
 
     def owns(self, home: Path) -> bool:
         with self._mutex:
@@ -195,6 +211,7 @@ class ProfileOwnership:
     def release(self, home: Path) -> None:
         with self._mutex:
             locks = self._handles.pop(canonical_home(home), None)
+            self._slots.pop(canonical_home(home), None)
             if locks is not None:
                 locks.close()
 
@@ -216,6 +233,49 @@ class ProfileOwnership:
 
 
 process_ownership = ProfileOwnership()
+
+
+def held_in_process(home: Path) -> bool:
+    """True when any reservation in this process holds *home*'s runtime lock."""
+    return bool(slots_held_in_process(home))
+
+
+def slots_held_in_process(home: Path) -> frozenset[str]:
+    """The slots of *home* whose runtime lock some reservation in this process holds."""
+    home = canonical_home(home)
+    return frozenset(slot for owner in list(_live_ownerships) for slot in owner.slots(home))
+
+
+def _sibling_is_standby(home: Path, slot: str) -> bool:
+    """The gateway holding *slot* answers its own status as an unpromoted zero-cut standby, which
+    begins no epoch. Any failure to ask is not standby: unknown ownership never grants the store."""
+    from gateway.control_socket import query_gateway_control
+    status = query_gateway_control(home, "status", slot=slot, timeout=0.5)
+    return bool(status) and status.get("standby") is True
+
+
+def foreign_runtime_owner(home: Path, *, successor: bool = False) -> bool:
+    """True when ANOTHER process holds a runtime lock of *home* that this caller may not begin under.
+
+    Each slot whose lock this process does not hold is probed, including the sibling of a slot it
+    does hold: a slot-b process that booted active beside a serving slot a must not take a's epoch.
+    A sibling that answers as an unpromoted standby begins no epoch, so it does not block. The one
+    other allowance is ``successor``, which only a zero-cut promotion passes: its predecessor still
+    holds slot a while it finishes its in-flight turns. A home nobody holds (an offline store, a
+    test's temporary home) is open: the next owner's own begin supersedes such an epoch.
+    """
+    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, slot_lock_held
+    home = canonical_home(home)
+    mine = slots_held_in_process(home)
+    for slot in (SLOT_ACTIVE, SLOT_STANDBY):
+        if slot in mine or not slot_lock_held(home, slot):
+            continue
+        if mine and (successor or _sibling_is_standby(home, slot)):
+            continue
+        return True
+    return False
+
+
 _maintenance = threading.local()
 
 
