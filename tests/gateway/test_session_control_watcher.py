@@ -29,6 +29,7 @@ def state(tmp_path, monkeypatch):
 
 def _runner(state, *, target_route=True, request_success=True, send_success=True, send_error=None,
             send_retryable=True, injection_result=True, target_origin=True):
+    from gateway.run import GatewayRunner
     from gateway.run_session_controls import GatewaySessionControlsMixin
     from gateway.run_inbound import GatewayInboundMixin
     from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
@@ -65,6 +66,9 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
     class Runner(GatewaySessionControlsMixin, GatewayGoalsMixin, GatewayPluginInjectionMixin,
                  GatewayBackgroundAdmissionMixin):
         _hm_preflight_event = GatewayInboundMixin._hm_preflight_event
+        _sessions_map = GatewayRunner._sessions_map
+        _session_state = GatewayRunner._session_state
+        _peek_session_state = GatewayRunner._peek_session_state
 
         session_store = SimpleNamespace(
             lookup_by_session_id=lambda sid: {"target": target, "requester": requester}.get(sid)
