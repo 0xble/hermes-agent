@@ -475,7 +475,11 @@ class GatewaySessionControlsMixin:
         return record
 
     async def _admit_control_continuation(self, record, session_controls, source, adapter, key, prompt):
+        from gateway.run_goals import session_private
         from gateway.wake import WakeNotAccepted, WakeSuperseded, admit_internal_event
+
+        if session_private(record["target_session_id"], key):
+            return record  # held, like an unaccepted wake, until the target leaves incognito
 
         event = self._synthetic_prompt_event(
             source, prompt, reply_expected=False, goal_continuation=True,
