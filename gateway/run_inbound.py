@@ -2868,8 +2868,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         the turn against the committed copy. Notes for clips that did fail are repointed from the
         adapter's download to the committed copy, which is what the turn retains."""
         registry = self.__dict__.get("_admitted_voice_prefetches")
+        # The claim's outbox identity is ``admission:<id>:<generation>`` (execute_admission).
         claim = getattr(event, "_outbox_admission_id", None) or ""
-        admission_id = claim.removeprefix("admission:") if claim.startswith("admission:") else None
+        admission_id = claim.split(":")[1] if claim.startswith("admission:") else None
         live = registry.get(admission_id) if registry and admission_id else None
         if live is None or live is event or hasattr(event, "_gateway_pending_stt_text"):
             return
