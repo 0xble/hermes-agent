@@ -7776,7 +7776,7 @@ def _prepare_aux_request(
         task, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
-    effective_extra_body = _get_task_extra_body(task)
+    effective_extra_body = {} if private_route_active() else _get_task_extra_body(task)  # task shaping is for its own route
     effective_extra_body.update(extra_body or {})
     client, final_model, resolved_provider, effective_provider, fallback_label = _resolve_call_client(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,

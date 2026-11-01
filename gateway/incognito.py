@@ -71,6 +71,24 @@ def discard_private_topic(session_key: str) -> None:
                 keeper.close()
 
 
+INCOGNITO_ROUTE_UNAVAILABLE = (
+    "⚠️ The incognito model isn't responding right now, so this private message wasn't answered. "
+    "Nothing was sent to another model. Send it again in a minute, or use /incognito off."
+)
+
+
+def private_route_unavailable_reply(agent_result) -> str | None:
+    """Plain words for a private turn whose incognito route kept failing.
+
+    The private turn never falls back to another provider, so the provider copy that suggests
+    adding one, or names a backup, would mislead.
+    """
+    from agent.incognito import private_route
+    if private_route() is None or not isinstance(agent_result, dict) or not agent_result.get("failed"):
+        return None
+    return INCOGNITO_ROUTE_UNAVAILABLE if agent_result.get("failure_retryable") is True else None
+
+
 def ram_connect(namespace: str, initialize=None, *, topic: str | None = None):
     """Keep each private SQLite store alive only in this process. Never use a disk journal."""
     import hashlib

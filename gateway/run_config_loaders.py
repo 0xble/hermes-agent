@@ -745,6 +745,9 @@ class GatewayConfigLoadersMixin:
         and keeps one last-known-good chain per home: a single runner-wide slot filled from the launch
         home handed every secondary profile the default profile's fallback chain.
         """
+        from agent.incognito import private_route
+        if private_route() is not None:
+            return None  # a private turn on its incognito route never falls back to another provider
         from gateway.run import _gateway_config_home
         from hermes_constants import hermes_home_key
         home = _gateway_config_home()
