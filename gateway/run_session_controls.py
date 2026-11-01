@@ -554,7 +554,9 @@ class GatewaySessionControlsMixin:
             quote = cls._clip(quote, 300)
             return receipt(f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}")
         how, _ = cls._approval_notice(authority)
-        return receipt(f"⊘ {kind.title()} {verb} by {requester} ({how}){change}")
+        retirement = (f"\nReason: {cls._clip(record.get('reason') or '', 600)}"
+                      if (kind, action) == ("goal", "clear") and authority.get("via") == "autonomy" else "")
+        return receipt(f"⊘ {kind.title()} {verb} by {requester} ({how}){change}{retirement}")
 
     @classmethod
     def _requester_notice(cls, record: dict) -> str:

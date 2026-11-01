@@ -548,6 +548,8 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         code = f"nothing_to_{action}"
         return {"result": {"ok": False, "error_code": code, "error": code}, "state": state}
     receipt = {"result": result, "state": state}
+    if cleared_goal and (authority or {}).get("via") == "autonomy":
+        receipt["notice"] = f"Goal cleared autonomously without approval. Reason: {reason}"
     if (kind, action) == ("goal", "pause") and (authority or {}).get("via") == "autonomy":
         seconds = state.waiting_seconds
         duration = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} sec"
@@ -1077,14 +1079,18 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                   payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Apply an authorized control immediately, or queue an asynchronous approval request.
 
-    A session may clear or replace another session's goal directly. Only a self-targeted
-    destructive goal change falls back to Brian's approval when it lacks a fresh user quote.
+    Under goals.autonomy, clearing requires a recorded reason, not approval. Otherwise a
+    session may clear or replace another session's goal directly; a self-targeted destructive
+    goal change falls back to Brian's approval when it lacks a fresh user quote.
     """
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
     autonomous = _lifecycle_autonomy(kind)
-    if autonomous and action == "clear":
-        return {"ok": False, "error_code": "user_only", "error": "Only the user can clear a goal with /goal clear"}
+    if autonomous and kind == "goal" and action == "clear":
+        if not isinstance(reason, str) or not reason.strip():
+            return {"ok": False, "error_code": "reason_required",
+                    "error": "clearing a goal requires a nonempty reason"}
+        reason = reason.strip()
     try:
         payload = _check_payload(kind, action, payload)
         target_sid = resolve_target(target_sid)
@@ -1420,6 +1426,15 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     return manager.pause(reason=reason or "session-control")
 
 
+def _clear_goal(sid, reason, payload, authority, cursor=None):
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager(sid, cursor=cursor)
+    if (authority or {}).get("via") == "autonomy":
+        return manager.clear(reason=reason, actor="agent", authority="autonomy")
+    return manager.clear()
+
+
 def _pause_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.loops import LoopManager
 
@@ -1463,7 +1478,7 @@ def _user_paused(state, kind):
 CONTROLS = {
     ("goal", "pause"): _pause_goal,
     ("goal", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).resume(),
-    ("goal", "clear"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).clear(),
+    ("goal", "clear"): _clear_goal,
     ("loop", "pause"): _pause_loop,
     ("loop", "resume"): _resume_loop,
     ("loop", "stop"): _stop_loop,
