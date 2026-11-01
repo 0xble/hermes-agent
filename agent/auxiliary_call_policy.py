@@ -28,6 +28,8 @@ def scoped_fallback_policy(policy: CallFallbackPolicy):
         _policy.reset(token)
 
 
+BARE_CUSTOM_ROUTE_REFUSAL = "incognito.model must use a named provider (e.g. custom:venice)"
+
 # Run outside any conversation (dashboard, CLI, cron), so they never carry private turn content.
 CONTENT_FREE_TASKS = frozenset({
     "profile_describer", "kanban_estimator", "kanban_decomposer", "triage_specifier", "monitor",
@@ -46,35 +48,6 @@ def private_route_active() -> bool:
     return _private_routed.get()
 
 
-def _endpoint_key(base_url: str, model: str) -> str:
-    """The configured key of the provider entry serving ``base_url`` and ``model``; fails closed.
-
-    Resolution would otherwise fill a bare custom endpoint with another endpoint's key (the main
-    model's), sending that credential alongside private content. Several entries can share one
-    endpoint (one proxy, several accounts): only an entry listing the route's model may supply
-    the key, and an endpoint still ambiguous between keys is refused.
-    """
-    from hermes_cli.config import load_config
-    from hermes_cli.model_switch import _entry_configured_key, _scoped_key_env
-    config = load_config()
-    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
-    entries = [*providers.values(), *(config.get("custom_providers") or []), config.get("model")]
-    wanted = base_url.rstrip("/")
-    matching = [entry for entry in entries
-                if isinstance(entry, dict) and str(entry.get("base_url") or "").rstrip("/") == wanted]
-    if not matching:
-        raise RuntimeError("the incognito route's endpoint has no configured provider entry")
-
-    def serves(entry: dict) -> bool:
-        return model in (entry.get("models") or ()) or model in (entry.get("model"), entry.get("default"))
-
-    keys = {_entry_configured_key(entry, _scoped_key_env) or "no-key-required"
-            for entry in ([entry for entry in matching if serves(entry)] or matching)}
-    if len(keys) > 1:
-        raise RuntimeError("the incognito route's endpoint is shared by provider entries with different keys")
-    return keys.pop()
-
-
 @contextmanager
 def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[dict]:
     """Yield the call's kwargs, moved onto the private session's incognito route when one is bound.
@@ -89,14 +62,12 @@ def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[di
     if not (route and route.get("provider") and route.get("model")):
         yield kwargs
         return
-    # A bare ``custom`` route is only its endpoint, so its key must be that endpoint's own; a
-    # named provider resolves both itself.
-    endpoint = route.get("base_url") if route["provider"] == "custom" else None
-    if route["provider"] == "custom" and not endpoint:
-        raise RuntimeError("a bare custom incognito route needs its own base_url")
+    if route["provider"] == "custom":
+        # A bare custom route names no provider entry to take its key from, so resolution would
+        # pair the endpoint with some other entry's credential. Only named providers are routed.
+        raise RuntimeError(BARE_CUSTOM_ROUTE_REFUSAL)
     routed = {**kwargs, "provider": route["provider"], "model": route["model"],
-              "base_url": endpoint, "api_key": _endpoint_key(endpoint, route["model"]) if endpoint else None,
-              "main_runtime": None}
+              "base_url": None, "api_key": None, "main_runtime": None}
     if sync:
         routed.update(api_mode=None, fallback_chain=[])
     token = _private_routed.set(True)

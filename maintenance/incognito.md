@@ -94,7 +94,8 @@ not only the command reply.
   `fallback_providers` chain, and when its route keeps failing the user is told
   plainly that the incognito model is unavailable. MCP sampling replays the
   tool call's context, because the recv loop starts without it. A bare `custom`
-  route keeps its own base_url. Task `extra_body` and `reasoning_effort` are
+  incognito route, including a `model_aliases` direct alias, is refused: it names
+  no provider entry to take its key from. Task `extra_body` and `reasoning_effort` are
   not applied to the route. Without an `incognito.model`, auxiliary routing is
   unchanged.
 - A private agent prints nothing to raw stdout. A gateway redirects stdout to
