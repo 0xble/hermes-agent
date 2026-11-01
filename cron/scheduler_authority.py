@@ -21,9 +21,16 @@ def journal_path(job_id, request_id):
     return get_hermes_home() / 'cron' / 'admissions' / (key + '.json')
 
 
-def _pause_identity(paused):
-    """The exact pause this recovery uncertainty caused, so only that pause is ever lifted."""
-    return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason')} if paused else True
+def _pause_unless_paused(job_id, reason):
+    """Own only a pause created here; an existing hold belongs to its original owner."""
+    from cron.jobs import _jobs_lock, get_job, pause_job
+
+    with _jobs_lock():
+        job = get_job(job_id)
+        if job is None or job.get('state') == 'paused':
+            return None
+        paused = pause_job(job_id, reason=reason)
+        return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason')} if paused else None
 
 
 def replayable_completions(job_id, completions):
@@ -35,16 +42,15 @@ def replayable_completions(job_id, completions):
 def pause_for_unknown(job_id, execution_id, reason):
     """The firer pauses the job for this fire's unverified admission and records that exact pause
     on the fire's journal, so the receipt that later proves the run terminal can lift it."""
-    from cron.jobs import pause_job
     from utils import atomic_json_write
     from cron.jobs import _jobs_lock
     journal = journal_path(job_id, execution_id)
     with _jobs_lock():
-        paused = pause_job(job_id, reason=reason)
-        if paused and journal.exists():
+        pause = _pause_unless_paused(job_id, reason)
+        if pause and journal.exists():
             record = json.loads(journal.read_text(encoding='utf-8-sig'))
             record.setdefault('submit_started_at', journal.stat().st_mtime)
-            record['pause_recorded'] = _pause_identity(paused)
+            record['pause_recorded'] = pause
             atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
 
 
@@ -222,7 +228,7 @@ def retire_completed_journal(job_id, execution_id):
 
 def _observe_unverified(journal, state, current):
     """Bound a never-committed submit; a receipt/worker capture is never aged into failure."""
-    from cron.jobs import _jobs_lock, pause_job
+    from cron.jobs import _jobs_lock
     from utils import atomic_json_write
 
     with _jobs_lock():
@@ -234,7 +240,9 @@ def _observe_unverified(journal, state, current):
             record['receipt'] = {key: state[key] for key in ('session_id', 'admission_id')}
         if state['status'] in ('missing', 'unknown') and not record.get('pause_recorded'):
             reason = 'Canonical cron unverified; no automatic re-execution'
-            record['pause_recorded'] = _pause_identity(pause_job(record['params']['job_id'], reason=reason))
+            pause = _pause_unless_paused(record['params']['job_id'], reason)
+            if pause:
+                record['pause_recorded'] = pause
         if (state['status'] == 'missing' and not record.get('receipt') and 'worker_result' not in record
                 and time.time() - started >= MISSING_SUBMIT_GRACE_SECONDS
                 and record['missing_reads'] >= MISSING_SUBMIT_READS and (record.get('job') or current)):

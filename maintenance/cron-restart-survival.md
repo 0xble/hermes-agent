@@ -100,8 +100,11 @@ and no automatic resubmission of the uncertain occurrence is made.
 
 A verified terminal result also lifts its uncertainty pause through the live scheduler's
 tail, not just receipt reconciliation. Journal save, pause read/merge/write, canonical-settled
-stamp and retirement share the existing jobs lock plus atomic replacement; a later operator
-pause cannot be overwritten or lifted by an older result. Gateway RPC timeouts preserve
+stamp and retirement share the existing jobs lock plus atomic replacement. Both the firer
+and recovery observer read the current job under that lock before pausing: an already-paused
+job keeps its original timestamp/reason and grants no pause ownership to this journal.
+Repeated uncertainty preserves an existing ownership token; neither a pre-existing hold
+nor a later operator pause can be overwritten or lifted by an older result. Gateway RPC timeouts preserve
 method, answer phase, timeout cause and stable identifiers instead of becoming connection
 failures. Direct connection/RPC callers were audited: chat, discard, session pruning,
 Kanban, web mutations, worker persistence and RPC-forwarding boundaries already handle
@@ -115,7 +118,8 @@ owned by the idempotent worker handshake, not a relaxation of WorkerRPC's no-res
 Proof: `tests/cron/test_ambiguous_admission.py`, `tests/cron/test_cron_recover_pause.py`,
 `tests/cron/test_detached_owner_restart.py`, and
 `tests/hermes_cli/test_gateway_client_failure_phase.py`,
-`tests/cron/test_missing_admission_bound.py`, `tests/cron/test_recovery_refusal_diagnostics.py`,
+`tests/cron/test_missing_admission_bound.py`, `tests/cron/test_preexisting_recovery_pause.py`,
+`tests/cron/test_recovery_refusal_diagnostics.py`,
 and `tests/hermes_cli/test_goal_peer_transport_errors.py`.
 
 The existing admission journal captures the worker's result until the canonical
