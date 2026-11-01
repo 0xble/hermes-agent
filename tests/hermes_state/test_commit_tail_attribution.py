@@ -36,6 +36,14 @@ def test_slow_commit_reports_cpu_tid_operation_and_wal_size(tmp_path, monkeypatc
         conn.commit = commit
         monkeypatch.setattr(db, "_conn", conn)
         monkeypatch.setattr(hermes_state, "time", clock)
+        original_warning = hermes_state.logger.warning
+
+        def emit_warning(message, *args, **kwargs):
+            if message.startswith("state.db write transaction"):
+                assert not db._lock.locked()
+            return original_warning(message, *args, **kwargs)
+
+        monkeypatch.setattr(hermes_state.logger, "warning", emit_warning)
         with caplog.at_level("WARNING", logger="hermes_state"):
             if worker:
                 result = rt.mutate_worker_execution(db, epoch=epoch, **assignment, sequence=1,

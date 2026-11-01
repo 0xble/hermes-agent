@@ -1078,4 +1078,5 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             from hermes_state_runtime_workers import compact_terminal_receipts
             compact_terminal_receipts(conn, execution_id)
         return result
+    setattr(write, "_state_operation", operation)
     return db._execute_write(write, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S, session_ids=(session_id, payload,), skip_result={})
