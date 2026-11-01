@@ -60,6 +60,62 @@ def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry):
         assert "paused" not in result["notice"] and "Telegram" not in result["notice"]
 
 
+@pytest.mark.parametrize("target", ["requester", "target"])
+@pytest.mark.parametrize("entry", ["apply", "request"])
+def test_autonomous_clear_records_reason_actor_and_notice(state, target, entry):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalContract, GoalManager, load_goal
+    from gateway.run_session_controls import GatewaySessionControlsMixin
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    manager = GoalManager(target)
+    manager.set("duplicate repair", contract=GoalContract(verification="test passes", constraints="no restart"))
+    manager.add_subgoal("readback")
+    before = load_goal(target)
+    reason = "Duplicate of the verified takeover in hermes:default/other"
+    control = session_controls.apply_control if entry == "apply" else session_controls.request_control
+    result = control("goal", "clear", target, requester_sid="requester", reason=f"  {reason}  ")
+    assert result["ok"] and result["status"] == "applied", result
+    durable = load_goal(target)
+    assert durable is not None and before is not None
+    assert reason in result["notice"]
+    assert durable.status == "cleared"
+    assert durable.contract == before.contract and durable.subgoals == before.subgoals
+    assert durable.created_at == before.created_at
+    revision = durable.revisions[-1]
+    assert revision["kind"] == "clear" and revision["reason"] == reason
+    assert revision["actor"] == "agent" and revision["authority"] == "autonomy"
+    record = session_controls._load_record(result["record"]["id"])
+    assert record is not None and record["notice"] == result["notice"]
+    assert record["reason"] == reason and record["authority"]["via"] == "autonomy"
+    assert record["authority"]["session_id"] == "requester"
+    assert reason in GatewaySessionControlsMixin._control_notice(record)
+    assert any(row["id"] == record["id"] for row in session_controls.pending_outbox())
+    again = control("goal", "clear", target, requester_sid="requester", reason=reason)
+    assert not again["ok"] and again["error_code"] == "nothing_to_clear"
+    assert load_goal(target).revisions == durable.revisions
+    GoalManager(target).set("next task")
+    assert revision in load_goal(target).revisions
+    assert load_goal(target).revisions[-1]["reason"] == "Previous goal cleared"
+
+
+@pytest.mark.parametrize("reason", ["", "  \n\t", None, 42])
+@pytest.mark.parametrize("target", ["requester", "target"])
+def test_autonomous_clear_requires_nonempty_reason_without_mutating(state, reason, target):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    GoalManager(target).set("still required")
+    before = load_goal(target).to_json()
+    result = session_controls.apply_control("goal", "clear", target, requester_sid="requester", reason=reason)
+    assert not result["ok"] and result["error_code"] == "reason_required"
+    assert load_goal(target).to_json() == before
+    assert session_controls.pending_outbox() == []
+
+
 def test_quote_applies_cross_session_clear_and_audits(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import apply_control, pending_outbox
