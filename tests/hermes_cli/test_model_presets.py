@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from hermes_cli.model_presets import ModelPresetError, expand_model_presets
 
@@ -118,7 +118,7 @@ def test_gateway_and_delegation_loaders_do_not_swallow_invalid_preset_errors(tmp
     from tools import delegate_tool_config
 
     err = ModelPresetError("invalid preset")
-    monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: (_ for _ in ()).throw(err))
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: (_ for _ in ()).throw(err))
     with pytest.raises(ModelPresetError, match="invalid preset"):
         GatewayRunner._load_fallback_model()
 
@@ -149,8 +149,9 @@ def test_gateway_and_cron_raw_loaders_expand_temp_home_config(tmp_path, monkeypa
     from gateway import run as gateway_run
     home = tmp_path / "hermes-home"; home.mkdir()
     (home / "config.yaml").write_text(yaml.safe_dump({**routes(), "model": {"model_preset": "fast"}}), encoding="utf-8")
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: yaml.safe_load((home / "config.yaml").read_text()))
-    assert gateway_run._resolve_gateway_model(gateway_run._load_gateway_runtime_config()) == "model-c"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    assert gateway_run._resolve_gateway_model(gateway_run._load_gateway_config()) == "model-c"
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
     job_cfg = scheduler._load_cron_job_config({"id": "job-1"}, "job-1", "preset job")
     assert (job_cfg.model, job_cfg.model_cfg["provider"]) == ("model-c", "provider-c")

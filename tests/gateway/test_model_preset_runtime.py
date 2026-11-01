@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 
 def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and_context(tmp_path, monkeypatch):
@@ -19,7 +19,7 @@ def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and
     monkeypatch.setattr(socket.socket, "connect", deny_network)
     from gateway import run as gateway_run
     from gateway.config import GatewayConfig
-    from hermes_cli.model_presets import ModelPresetError
+    from hermes_cli.model_presets import ModelPresetError, expand_model_presets
 
     home = tmp_path / "hermes-home"
     home.mkdir()
@@ -43,7 +43,7 @@ def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and
     monkeypatch.setattr(gateway_run, "_hermes_home", home)
 
     raw = gateway_run._load_gateway_config()
-    assert raw == authored
+    assert raw == expand_model_presets(authored)
 
     runner = gateway_run.GatewayRunner(GatewayConfig())
     model, runtime = runner._resolve_session_agent_runtime(user_config=raw)
@@ -58,7 +58,7 @@ def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and
     assert gateway_run.GatewayRunner._load_reasoning_config(model) == {"enabled": True, "effort": "high"}
     assert gateway_run._resolve_gateway_model() == model
     assert gateway_run._resolve_gateway_model(raw) == model
-    assert raw == authored
+    assert raw == expand_model_presets(authored)
 
     captured = {}
 
