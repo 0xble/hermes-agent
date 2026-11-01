@@ -5308,6 +5308,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             _head_origin = bound_turn_origin()
             if pending_event is not None:
                 set_turn_origin(turn_origin_for_event(pending_event))
+                # In-band turns bypass the inbound slot claim. Keep the conversation clock on
+                # the latest actual input, like its terminal goal identity; never restore the head.
+                self._session_state(next_session_key).conversation.last_turn_started_at = time.time()
             _consumed_events = (
                 (pending_event, *getattr(pending_event, "_hermes_absorbed_events", ()))
                 if pending_event is not None else ()
