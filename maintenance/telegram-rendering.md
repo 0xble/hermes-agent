@@ -349,6 +349,19 @@ friendly MCP/connector labels, and testing Telegram's final wire payloads.
 
 ## Verification
 
+Contract tests: `tests/tools/test_send_message_tool.py::TestStandaloneTelegramRichMessages`,
+  `tests/gateway/test_telegram_rich_newlines.py::TestRichOrderedListAfterProse`,
+  `tests/gateway/test_telegram_chat_outbound_budget.py`,
+  `tests/gateway/test_telegram_chunk_indicator_budget.py`,
+  `tests/gateway/test_telegram_rich_messages.py::test_expandable_blockquote_renders_nested_markdown_as_html`,
+  `tests/gateway/test_telegram_rich_messages.py::test_blockquote_markdown_normalization_does_not_touch_code_examples`,
+  `tests/gateway/test_telegram_rich_messages.py::test_expandable_blockquote_preserves_code_regions_while_rendering_prose`,
+  `tests/gateway/test_telegram_rich_messages.py::test_expandable_blockquote_preserves_unfinished_code_fences`,
+  `tests/gateway/test_telegram_rich_messages.py::test_rich_mode_from_yaml_agrees_with_prompt_and_delivery`,
+  `tests/gateway/test_telegram_rich_messages.py::test_invalid_rich_mode_is_a_configuration_error`,
+  `tests/gateway/test_telegram_rich_messages.py::test_always_preserves_preview_and_content_safety_guards`,
+  `tests/gateway/test_telegram_rich_messages.py::test_always_finalizes_ordinary_stream_as_rich`
+
 Use `scripts/run_tests.sh` with the rich-message, rich-newline, system-prompt,
 gateway-config, emphasis, flood-coherence, and final-delivery test files. The
 rich-message suite reads real YAML through the gateway and prompt loaders and

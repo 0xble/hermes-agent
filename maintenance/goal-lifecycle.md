@@ -346,6 +346,30 @@ Retire when upstream provides the same outcome-based admission on all surfaces.
 
 ## Verification
 
+Contract tests: `tests/hermes_cli/test_goal_judge_evidence.py`,
+  `tests/gateway/test_goal_continuation_notice_dedupe.py`,
+  `tests/hermes_cli/test_goal_adaptive.py`,
+  `tests/agent/test_synthetic_prompt_legacy_goals.py`,
+  `tests/hermes_cli/test_goal_legacy_revision_migration.py`,
+  `tests/hermes_cli/test_cli_goal_empty_turn.py`,
+  `tests/hermes_cli/test_goal_readonly_evidence.py`,
+  `tests/hermes_cli/test_goal_judge_empty_turn.py`,
+  `tests/hermes_cli/test_goals.py::TestGoalManager::test_continuation_prompt_silences_unchanged_release_rechecks`,
+  `tests/hermes_cli/test_goals.py::TestGoalManager::test_goal_authoring_rules_have_deterministic_findings`,
+  `tests/hermes_cli/test_goals.py::TestGoalManager::test_goal_authoring_allowed_numeric_labels_and_live_outcome`,
+  `tests/hermes_cli/test_goals.py::TestGoalManager::test_goal_authoring_approved_shapes_are_clean`,
+  `tests/hermes_cli/test_goals.py::TestGoalManager::test_goal_authoring_revision_cap_preserves_legacy_small_fix`,
+  `tests/hermes_cli/test_goals.py::TestGoalManager::test_goal_authoring_revision_checks_cross_field_contradictions`,
+  `tests/hermes_cli/test_goals.py::TestGoalManager::test_goal_authoring_checks_waits_in_outcome_and_not_measurement_windows`,
+  `tests/hermes_cli/test_goals.py::TestGoalManager::test_goal_authoring_rejects_explicit_wait_over_a_measurement_window`,
+  `tests/hermes_cli/test_loops.py::TestSelfPacedBackoff::test_superseded_self_paced_release_uses_floor_when_delay_missing`,
+  `tests/gateway/test_goal_max_turns_config.py::test_gateway_goal_preserves_zero_as_unlimited`,
+  `tests/gateway/test_goal_max_turns_config.py::test_gateway_goal_uses_configured_continuation_gap`,
+  `tests/tui_gateway/test_goal_command.py::test_goal_replace_and_remove_commands_use_real_dispatch`,
+  `tests/tui_gateway/test_goal_command.py::test_goal_remove_out_of_range_uses_real_dispatch_error`,
+  `tests/tui_gateway/test_goal_command.py::test_user_turn_completes_over_a_corrupt_goal_row`,
+  `tests/tui_gateway/test_goal_command.py::test_goal_budget_flows_through_command_and_prompt_manager`
+
 Run scripts/run_tests.sh for tests/hermes_cli/test_goal_criteria_completeness.py,
 tests/hermes_cli/test_goals.py, tests/gateway/test_goal_verdict_send.py,
 tests/hermes_cli/test_blocked_goal_turn_admission.py, tests/tui_gateway/test_goal_command.py,

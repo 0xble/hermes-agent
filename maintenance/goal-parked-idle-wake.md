@@ -54,6 +54,11 @@ barrier", or "goal parked forever" as of 2026-09-26.
 
 ## Verification
 
+Contract tests: `tests/hermes_cli/test_goal_parked_idle_wake.py`,
+  `tests/gateway/test_goal_parked_idle_wake.py`,
+  `tests/tui_gateway/test_goal_parked_idle_wake.py`,
+  `tests/hermes_cli/test_goal_external_wait_backoff.py`
+
 - Focused verification uses exact one-file commands:
   - `tests/hermes_cli/test_goal_parked_idle_wake.py`
   - `tests/gateway/test_goal_continuation_drain.py`

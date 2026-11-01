@@ -36,6 +36,13 @@ source inspection alone.
 
 ## Verification and Retirement
 
+Contract tests: `tests/gateway/test_slack_thread_status.py`,
+  `tests/gateway/test_typing_stale_cleanup.py`,
+  `tests/gateway/test_typing_surface_ownership.py`,
+  `tests/gateway/test_typing_prompt_lifecycle.py`,
+  `tests/gateway/test_typing_adapter_boundaries.py`,
+  `tests/gateway/test_typing_refresh_interval.py`
+
 Regression commands and results are recorded with the delivery commit. Preserve
 Telegram's topic re-arm isolation, its 4.5-second cadence and retry budget, Slack's
 legacy free-text API, elapsed heartbeat and explicit untracked-status cleanup.

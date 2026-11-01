@@ -21,6 +21,11 @@ On 2026-10-30 at 6:25 PM PT a delegated review agent ran a `python -` probe from
 
 ## Verification and Retirement
 
+Contract tests: `tests/hermes_state/test_direct_probe_isolation.py`,
+  `tests/hermes_state/test_runtime_epoch_foreign_owner.py`,
+  `tests/gateway/test_runtime_epoch_watch.py`,
+  `tests/gateway/test_zero_cut_standby_epoch.py`
+
 `tests/hermes_state/test_direct_probe_isolation.py` runs the probe shape in a child with a temporary `HOME` and pytest ancestry pinned off. `tests/hermes_state/test_runtime_epoch_foreign_owner.py` holds the lock from a second process and covers in-process and maintenance reservations. `tests/gateway/test_runtime_epoch_watch.py` covers the once-only CRITICAL, the published status, released ownership, readiness, and the handed-over sibling with and without a live sibling lock. `tests/gateway/test_zero_cut_standby_epoch.py` boots a real standby runner beside slot a's epoch and claims at promotion. It also covers a secondary claim failure that parks the profile, a retried half-claimed promotion, the unanswered role query, the standby's profile verbs and an unopenable predecessor lock. The foreign-owner suite runs with the holder on each slot's lock and with an unopenable lock, and covers a slot-b reservation beside a serving slot a, an active slot beside a standby, and a lock-less successor claim. Each of the first two fails on the base revision, and the watch suite does not import there.
 
 Retire when upstream fences epoch begins on profile ownership and reports a lost epoch, and these regressions pass without the local implementation. Reverting changes no schema or stored data.

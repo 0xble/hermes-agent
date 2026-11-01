@@ -12,3 +12,7 @@ When a completed response to a private Telegram DM topic receives a definite del
 - **Adaptation:** Bot API only; no MTProto/custom packs, title/attachment context, or change to group/forum fallback. Existing upstream PR [#93874](https://github.com/NousResearch/hermes-agent/pull/93874) directly addresses live deleted-topic recovery, so no competing upstream PR is created. Its open head does not guard interim messages or partial split delivery; fork adaptation does both.
 - **Verification:** `scripts/run_tests.sh -j 6 tests/gateway/test_telegram_stale_final_delivery.py tests/gateway/test_telegram_thread_fallback.py tests/gateway/test_delivery.py` and `scripts/run_tests.sh -j 6 tests/gateway/`; ruff and `scripts/check_fork_patches.py --source-only`.
 - **Retirement:** remove the fork patch only after a released upstream implementation recovers confirmed deleted private-topic final replies without leaking interim sends to chat root or repeating already-delivered split content. Preserve stale binding pruning and unrelated topic title/icon ownership.
+
+## Contract tests
+
+Contract tests: `tests/gateway/test_telegram_stale_final_delivery.py`

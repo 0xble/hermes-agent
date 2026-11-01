@@ -28,6 +28,8 @@ Related maintained-fork [#432](https://github.com/0xble/hermes-agent/pull/432) r
 
 ## Verification and handoff
 
+Contract tests: `tests/gateway/test_goal_continuation_notice_dedupe.py`
+
 After the two-line shared-core correction, the new full regression module returned **12 passed, 0 failed** (7.0s pytest subprocess; 7.1s runner), including a fresh-interpreter durable read after idle CAS lift. Log: `/Users/brianle/.hermes/cache/scratch/goal-quiet-after.log`. Real gates still control execution, and command confirmations, material new automatic reasons, completion and user-input blockers are asserted.
 
 The broader affected-suite request was blocked in the machine-wide heavy-slot FIFO (initial position 66/66; still 56/76 after 362s). Its foreground tool expired at 420s before tests started; no affected-suite pass is claimed. The request is no longer running. Log: `/Users/brianle/.hermes/cache/scratch/goal-quiet-affected.log`. Do not bypass the shared resource limiter, clear foreign queue entries or count queuing as a gate pass. Parent owns exact-head independent review, broader gate completion, integration/activation, root maintenance/manifest update and real live E2E.

@@ -272,3 +272,21 @@ S3 landed before S2 (its code-SHA ledger column works without releases). S2 is *
 - **The guardian never force-repairs.** It leaves a loaded-but-unhealthy gateway alone, stops after three repairs per hour, and treats a wedged heartbeat older than 120 s as unhealthy. It never repairs a corrupt `current` pointer from the source checkout.
 - **Some hardening paths have only test evidence.** The manual-run kill, double-fork sweep and commit/enqueue-gap paths have regression tests but no live trigger yet.
 - **The full unscoped update path can only be proven live.** Disposable rehearsals cover it with throwaway launchd labels.
+
+## Contract tests
+
+Contract tests: `tests/gateway/test_native_fifo_outbox_identity.py`,
+  `tests/gateway/test_resume_queued_followup.py`,
+  `tests/gateway/test_turn_state_db_off_loop.py`,
+  `tests/gateway/test_fifo_media_settlement_no_stall.py`,
+  `tests/gateway/test_superseded_queued_rows.py`,
+  `tests/tools/test_process_registry_shutdown_survivors.py`,
+  `tests/gateway/test_multiplex_notice_egress_profile_adapter.py::test_shutdown_delivery_debt_distinguishes_private_bots_but_dedupes_shared_groups`,
+  `tests/gateway/test_multiplex_notice_egress_profile_adapter.py::test_secondary_restart_request_exempts_only_its_transport_from_diagnostic_policy`,
+  `tests/gateway/test_restart_resume_pending.py::test_startup_restore_dispatches_queued_humans_before_resume`,
+  `tests/gateway/test_restart_resume_pending.py::test_startup_restore_opens_gate_while_replay_turn_is_queued`,
+  `tests/gateway/test_restart_resume_pending.py::test_startup_queues_humans_before_resume_workers_and_fences_same_chat`,
+  `tests/gateway/test_restart_resume_pending.py::test_stop_drops_queued_resume_after_sentinel_release`,
+  `tests/gateway/test_restart_resume_pending.py::test_shutdown_retains_active_unaccepted_human_replay`,
+  `tests/gateway/test_restart_resume_pending.py::test_shutdown_drop_preserves_resume_marker`,
+  `tests/plugins/test_telegram_update_admission.py::test_pre_handoff_base_failure_keeps_update_retryable`

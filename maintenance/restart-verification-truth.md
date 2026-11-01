@@ -16,6 +16,10 @@ Load when changing updater fleet restart snapshots, gateway restart observer dea
 
 ## Provenance and verification
 
+Contract tests: `tests/hermes_cli/test_update_outgoing_gateway_identity.py`,
+  `tests/hermes_cli/test_gateway_service.py::TestRestartExitWaitBudget::test_cron_drain_extends_cli_wait_without_disabling_zero`,
+  `tests/hermes_cli/test_gateway_service.py::TestGeneratedSystemdUnits::test_unbounded_stop_budget_is_spelled_the_way_systemd_parses_it`
+
 Fork patch identities: `restart-verification-truth`, `systemd-infinite-stop-timeout` (unit spelling of an unbounded stop envelope).
 Archived HERMES-138 (`runtime-lifecycle.md`, archived fork): cron observer budget, outgoing PID identity and historical warning. On `origin/main` `649e2585bdf7`, two new focused tests failed RED: configured cron drain returned 50 seconds rather than covering a 90-second cron plus deferral, and the startup warning asserted "did not restart running gateways". A third test on the same base showed an outgoing gateway PID `17178` inventoried over its socket omitted from the updater's verification snapshot because the process scan excludes ancestors. The collector then missed that stopped gateway's down row.
 

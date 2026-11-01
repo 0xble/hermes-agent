@@ -21,3 +21,8 @@ Compare upstream's command source normalization and Telegram delivery metadata t
 ## Verify and recover
 
 Run `scripts/run_tests.sh -j 6 tests/gateway/test_background_command.py` and the relevant `tests/gateway/` directory, ruff on the changed Python files, `git diff --check`, and `scripts/check_fork_patches.py --source-only --repo .`. Roll back this patch and its row/unit together; no persisted state migration is involved.
+
+## Contract tests
+
+Contract tests: `tests/gateway/test_background_command.py::TestHandleBtwCommand::test_recovered_dm_topic_answer_drops_lobby_reply_anchor`,
+  `tests/gateway/test_background_command.py::TestHandleBackgroundCommand::test_recovered_dm_topic_drops_lobby_reply_anchor`

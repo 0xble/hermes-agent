@@ -29,6 +29,8 @@ flood worker and profile/ledger schema remain in place.
 
 ## Verification
 
+Contract tests: `tests/gateway/test_telegram_internal_delivery_recovery.py`
+
 `scripts/run_tests.sh tests/gateway/test_telegram_internal_delivery_recovery.py tests/gateway/test_delivery_ledger_producer.py tests/gateway/test_delivery_ledger.py tests/gateway/test_telegram_polling_health_confirmation.py -j 6 -q` covers health-to-ledger replay, profile isolation, stale adapter, duplicate health, late persistence, permanent failure and delivered-row exclusion.
 
 `test_cancelled_recovery_settles_or_refunds_each_claim_once` covers cancellation

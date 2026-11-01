@@ -173,3 +173,11 @@ squash commit (found by its `Fork-Patch:` trailer) as one unit and retain the tw
 rolled-back code; never edit the operator's live config as part of source rollback.
 `title-concurrent-endpoint` rolls back alone by reverting its commit: an unread
 `concurrent_requests` capability is ignored, so titles on that endpoint simply defer again.
+
+## Contract tests
+
+Contract tests: `tests/gateway/test_telegram_topic_owner_routing.py`,
+  `tests/hermes_state/test_telegram_icon_migration.py`,
+  `tests/agent/test_title_preview_eligibility.py`,
+  `tests/agent/test_title_completion_retry.py`,
+  `tests/cron/test_cron_live_delivery_confirmation.py::TestConfirmAdapterDelivery::test_configured_target_wins_over_pinned_origin`
