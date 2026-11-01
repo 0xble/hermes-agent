@@ -375,3 +375,63 @@ async def test_private_main_turn_never_falls_back_to_another_provider(private_ro
     assert boundary.calls and all(url == PRIVATE_URL for url, _messages in boundary.calls), boundary.calls
     assert reply.startswith(INCOGNITO_ROUTE_UNAVAILABLE) and "fallback" not in reply, reply
     assert not INCOGNITO_ROUTE_UNAVAILABLE.startswith("⚠️")  # the colour-emoji form, not the text symbol
+
+
+SHARED_URL = "http://127.0.0.1:9/shared"
+
+
+def private_bare_call(route):
+    from agent.auxiliary_client import call_llm
+    from agent.incognito import incognito_scope, register_session, set_private_route
+    sid = "bare-custom-shared"
+    register_session(sid, True)
+    try:
+        set_private_route([sid], route)
+        with incognito_scope(True, sid):
+            call_llm(task="compression", messages=[{"role": "user", "content": "private"}], timeout=5)
+    finally:
+        register_session(sid, False)
+
+
+def shared_endpoint_config(config, tmp_path, *entries):
+    import hermes_yaml
+    configure(config, tmp_path)
+    config["providers"] = {**e2e.PROVIDERS, **dict(entries)}
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+
+
+@pytest.mark.parametrize("route_entry_first", [True, False])
+def test_shared_endpoint_uses_the_key_of_the_entry_serving_the_route_model(
+        private_route, tmp_path, clients, route_entry_first):
+    """One proxy, several accounts: another account's key must not ride along with private content."""
+    _runner, _store, _entry, config, _event, _db = private_route
+    # config.yaml is written with sorted keys, so the names fix which entry is matched first.
+    route_name, other_name = ("a_route", "z_other") if route_entry_first else ("z_route", "a_other")
+    shared_endpoint_config(
+        config, tmp_path,
+        (route_name, {"base_url": SHARED_URL, "api_key": "route-key", "models": {"private-model": {}}}),
+        (other_name, {"base_url": SHARED_URL, "api_key": "other-key", "models": {"other-model": {}}}))
+    private_bare_call({"provider": "custom", "model": "private-model", "base_url": SHARED_URL})
+    assert set(clients.calls) == {(SHARED_URL, "route-key")}
+
+
+def test_shared_endpoint_ambiguous_between_keys_fails_closed(private_route, tmp_path, clients):
+    _runner, _store, _entry, config, _event, _db = private_route
+    shared_endpoint_config(
+        config, tmp_path,
+        ("first", {"base_url": SHARED_URL, "api_key": "first-key", "models": {"private-model": {}}}),
+        ("second", {"base_url": SHARED_URL, "api_key": "second-key", "models": {"private-model": {}}}))
+    with pytest.raises(RuntimeError, match="shared by provider entries with different keys"):
+        private_bare_call({"provider": "custom", "model": "private-model", "base_url": SHARED_URL})
+    assert clients.calls == []
+
+
+def test_bare_custom_route_without_a_base_url_fails_closed(private_route, tmp_path, clients):
+    import hermes_yaml
+    _runner, _store, _entry, config, _event, _db = private_route
+    configure(config, tmp_path)
+    config["model"] = {"default": "normal-model", "provider": "custom", "base_url": MAIN_URL, "api_key": "main-key"}
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    with pytest.raises(RuntimeError, match="needs its own base_url"):
+        private_bare_call({"provider": "custom", "model": "private-model"})
+    assert clients.calls == []
