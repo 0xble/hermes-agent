@@ -6,6 +6,7 @@ targets:
   - ../hermes_state.py
   - ../tests/hermes_state/test_commit_tail_attribution.py
   - ../tests/hermes_state/test_write_stall_sampling.py
+  - ../tests/hermes_state/test_write_stall_native.py
 maintenance:
   mode: local
 ---
@@ -30,7 +31,9 @@ writer/database lock or fail a transaction. Unsupported platforms do nothing.
 ## Upstream design preflight
 
 Guidance inspected at upstream `c419cf7c864ac0ee511dbd9f7091a8bba0b567ee`:
-root `AGENTS.md` and `CONTRIBUTING.md`. The narrow extension belongs beside the
+root `AGENTS.md` and `CONTRIBUTING.md`; both were rechecked unchanged at
+`9a76ac8e4f612c081e12008923893077f10f2ec7` before GREEN. The related issues and
+PR were also rechecked open/unmerged. The narrow extension belongs beside the
 existing transaction settlement/metrics owner, not a new tool or plugin API.
 Independent proposal: extend the warning and arm a cheap in-flight timestamp;
 use the OS native sampler rather than SQL tracing or private SQLite pointers.
@@ -55,6 +58,29 @@ and invokes `/usr/bin/sample`. This is a necessary refinement of the requested
 thread-only sketch, not a database policy change. The writer does no diagnostic
 file write or sampler subprocess work inside the transaction.
 
+## Implementation boundaries
+
+One process-owned helper observes 64 preallocated slots in an unlinked shared
+mapping. Phase publication is bounded memory writes only. Startup and slot
+reservation happen before the writer guard; the startup thread waits for the
+external interpreter outside the guard so a subsequent GIL-holding C call
+cannot prevent launch. Slots are cleared in callback/commit `finally` blocks,
+including failed attempts. Each phase has a unique sequence; failed captures
+also consume the ten-minute process cooldown. No work is sampled during writer
+acquisition, retries/backoff, rollback, or idle time.
+
+Warnings and WAL `stat` are deferred until immediately after releasing the
+writer guard and before existing checkpoint/optimization maintenance. WAL bytes
+are consequently a best-effort post-commit observation (another process can
+change the file), not a lock-held measurement or a SQLite query. Missing WAL is
+zero; inaccessible WAL is `unknown`. The native helper can read stamps without
+the target interpreter's GIL, and a parent-owned pipe bounds its lifetime.
+Sample files have mode 0600 under the active profile's `logs/write-stalls`;
+only the `write-stall-*.txt` namespace participates in twenty-file retention.
+The sampler has a five-second timeout and records only exception type on
+failure, never payload/error text. Capture warnings identify PID, native TID,
+phase, operation and the sample path.
+
 ## Inline auto-checkpoint finding
 
 At base `3e149c0d9412394a1b8b744e542d0fcd68f6e187`,
@@ -71,9 +97,16 @@ No checkpoint, synchronous, or fullfsync setting is changed by this patch.
 
 ## Verification and retirement
 
+Contract tests: `tests/hermes_state/test_commit_tail_attribution.py`,
+  `tests/hermes_state/test_write_stall_sampling.py`,
+  `tests/hermes_state/test_write_stall_native.py`,
+  `tests/hermes_state/test_transcript_write_diagnostics.py`.
+
 Regression files above cover warning fields, worker receipt identity, stalled
 callback/commit capture, quiet idle/finished writes, cross-write throttling,
-sampler failure, and retention. All SQLite work uses isolated temporary homes;
+sampler failure, and retention. The native-host regression blocks a disposable
+interpreter in a GIL-holding C read and checks that an actual native sample is
+produced before that read is released. All SQLite work uses isolated temporary homes;
 epoch-dependent setup uses `tests/fakes/runtime_owner.py` reservations.
 Retire once upstream provides equivalent attribution and a GIL-independent,
 bounded native capture. Roll back commits carrying the patch identity above;

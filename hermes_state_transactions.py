@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import threading
 from functools import wraps
 from types import ModuleType
 from typing import Any, Callable, TypeVar
@@ -12,6 +13,7 @@ from typing import Any, Callable, TypeVar
 from agent.message_metadata import CANONICAL_ROW, DB_ROW_SNAPSHOT
 from hermes_state_write_metrics import WriteMetrics, current_write_metrics
 from hermes_state_publication import record_publication_write
+from hermes_state_write_stalls import current_observation
 
 
 T = TypeVar("T")
@@ -68,22 +70,29 @@ def settle_write_transaction(
     started = clock.monotonic()
     changes_before = conn.total_changes
     cpu_started = clock.thread_time()
-    callback_s = callback_cpu_s = commit_s = rollback_s = 0.0
+    callback_s = callback_cpu_s = commit_s = commit_cpu_s = rollback_s = 0.0
+    observation = current_observation.get()
     outcome = "rollback_failed"
     metrics = WriteMetrics()
     metrics_token = current_write_metrics.set(metrics)
     try:
+        observation.phase("callback")
         try:
             result = fn(conn)
         finally:
             callback_s = clock.monotonic() - started
             callback_cpu_s = clock.thread_time() - cpu_started
             metrics.add_time("callback_total", callback_s)
+            observation.end()
+        observation.phase("commit")
         commit_started = clock.monotonic()
+        commit_cpu_started = clock.thread_time()
         try:
             conn.commit()
         finally:
             commit_s = clock.monotonic() - commit_started
+            commit_cpu_s = clock.thread_time() - commit_cpu_started
+            observation.end()
             metrics.add_time("commit", commit_s)
         outcome = "committed"
         return result
@@ -106,10 +115,10 @@ def settle_write_transaction(
         record_publication_write(hold_s=held_s, rows_written=conn.total_changes - changes_before)
         if held_s >= warn_s or acquire_s >= warn_s:
             name = getattr(fn, "__qualname__", type(fn).__qualname__)[:160]
-            logger.warning(
+            observation.warnings.append((logger,
                 "state.db write transaction held the write lock for %.1fs: callback=%s pid=%d "
                 "session=%r input_rows=%s acquire_s=%.3f callback_s=%.3f callback_cpu_s=%.3f "
-                "commit_s=%.3f rollback_s=%.3f outcome=%s %s",
-                held_s, name, os.getpid(), session_id[:128] if session_id is not None else None,
-                input_rows, acquire_s, callback_s, callback_cpu_s, commit_s, rollback_s, outcome,
-                metrics.format())
+                "commit_s=%.3f commit_cpu_s=%.3f native_tid=%d operation=%s rollback_s=%.3f outcome=%s %s",
+                (held_s, name, os.getpid(), session_id[:128] if session_id is not None else None,
+                 input_rows, acquire_s, callback_s, callback_cpu_s, commit_s, commit_cpu_s,
+                 threading.get_native_id(), observation.operation, rollback_s, outcome, metrics.format())))
