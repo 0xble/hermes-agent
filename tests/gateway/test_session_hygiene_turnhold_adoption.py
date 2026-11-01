@@ -159,6 +159,16 @@ async def _drain_deferred(runner, timeout=10.0):
         )
 
 
+async def _drain_background(runner, timeout=10.0):
+    """Await the adoption callback's retained writes (streak reset, token count). They run in
+    worker threads after the agent's cleanup, so asserting on them earlier races the thread."""
+    async def drain():
+        while tasks := list(getattr(runner, "_background_tasks", None) or ()):
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    await asyncio.wait_for(drain(), timeout)
+
+
 @pytest.mark.asyncio
 async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     monkeypatch, tmp_path
@@ -272,6 +282,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     await _drain_deferred(runner)
     await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
     FencedStreamingAgent.last_instance.close.assert_called_once()
+    await _drain_background(runner)
 
     # Successful adoption resets the hygiene failure streak and still never
     # advances it (the deferral is not a failure).
