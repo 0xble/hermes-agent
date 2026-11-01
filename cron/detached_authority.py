@@ -194,11 +194,13 @@ def recover_detached(db, epoch, row):
         finish_result(db, epoch=epoch, row=row, response=result['result'][2],
                       outcome='completed', result=stored_result(result))
     from utils import atomic_json_write
-    found = _record(row)
-    if found is not None:
-        path, record = found
-        record['canonical_settled'] = True
-        atomic_json_write(path, record, mode=0o600, fsync_dir=True)
+    from cron.jobs import _jobs_lock
+    with _jobs_lock():
+        found = _record(row)
+        if found is not None:
+            path, record = found
+            record['canonical_settled'] = True
+            atomic_json_write(path, record, mode=0o600, fsync_dir=True)
     return True
 
 

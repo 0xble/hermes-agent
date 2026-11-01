@@ -76,17 +76,47 @@ authenticated adoption, pending-journal and truthful-error contracts.
 Ambiguous canonical submission is observed over fresh gateway links with the original
 job/request identity, never by submitting a new fire. Known admissions are reread by their
 exact receipt. Four bounded fresh-link reads wait through a delayed commit; exhausted
-patience retains the admission journal and an unverified pause. A `missing` lookup is a
-snapshot, not proof of non-admission, so reconciliation may not retire its journal or book
-"never admitted" from that answer. A later verified terminal receipt settles the fire and
-lifts only the uncertainty pause it caused. Gateway RPC timeouts preserve method, answer
-phase, timeout cause and stable identifiers instead of becoming connection failures.
+patience retains the admission journal and an unverified pause. One `missing` lookup is a
+snapshot, not proof of non-admission. To avoid an indefinitely paused never-sent fire,
+reconciliation settles a missing submit as failed only after
+`MISSING_SUBMIT_GRACE_SECONDS = 600` and `MISSING_SUBMIT_READS = 2` consecutive successful
+missing owner reads. The journal records `submit_started_at` before sending (legacy journals
+pin their original mtime before the first recovery write); non-missing observations and
+failed/refused reads reset the streak. A saved admission receipt or worker result is never
+aged into a never-committed failure. The failure records the exact grace/count fence, retires
+the journal and lifts only the pause it caused, allowing the next scheduled occurrence.
+
+This is the bounded-age fallback, not a hard epoch fence: existing journals do not bind a
+submit to the owner's epoch, and observing a current epoch separately cannot prove which
+owner received that frame. `cron.submit` is idempotent under the original job/request id;
+the owner's shielded request table retains a received submit even when its socket leaves.
+A read can overtake that task in the admission queue, so repeated missing reads alone are
+not final. Ten minutes is twenty times the 30-second answer deadline and fifteen times
+the combined 20-second SQLite write budgets for session creation and admission, leaving
+ample time for ordered-admission queueing. Admission does not await model/tool execution.
+A pathological owner stalled beyond ten minutes can still commit a late shielded frame:
+this bound is an explicit operational liveness tradeoff, never a cancellation guarantee,
+and no automatic resubmission of the uncertain occurrence is made.
+
+A verified terminal result also lifts its uncertainty pause through the live scheduler's
+tail, not just receipt reconciliation. Journal save, pause read/merge/write, canonical-settled
+stamp and retirement share the existing jobs lock plus atomic replacement; a later operator
+pause cannot be overwritten or lifted by an older result. Gateway RPC timeouts preserve
+method, answer phase, timeout cause and stable identifiers instead of becoming connection
+failures. Direct connection/RPC callers were audited: chat, discard, session pruning,
+Kanban, web mutations, worker persistence and RPC-forwarding boundaries already handle
+transport errors or deliberately propagate them to their transport boundary. Goal peer's
+CLI boundary now also catches `OSError` (including `TimeoutError`), emits the original error
+and exits nonzero without a traceback or an untrue "not submitted" claim. Recovery-read
+refusals log the bounded owner reason without reclassifying the original submit failure.
 Detached registration also retries only the same birth/generation/secret-fenced scope;
 a lost register receipt never generates a replacement execution. This is an exception
 owned by the idempotent worker handshake, not a relaxation of WorkerRPC's no-resend guard.
 Proof: `tests/cron/test_ambiguous_admission.py`, `tests/cron/test_cron_recover_pause.py`,
 `tests/cron/test_detached_owner_restart.py`, and
-`tests/hermes_cli/test_gateway_client_failure_phase.py`.
+`tests/hermes_cli/test_gateway_client_failure_phase.py`,
+`tests/cron/test_missing_admission_bound.py`, `tests/cron/test_recovery_refusal_diagnostics.py`,
+and `tests/hermes_cli/test_goal_peer_transport_errors.py`.
 
 The existing admission journal captures the worker's result until the canonical
 owner commits the same admission's terminal receipt. Reconciliation imports that

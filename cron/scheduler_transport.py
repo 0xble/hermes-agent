@@ -29,6 +29,10 @@ async def recovering_cron_client(params):
                         client = await stack.enter_async_context(connect_gateway())
                         state = await client.rpc('cron.recover' if op == 'submit' else 'cron.' + op,
                                                  **(params if op == 'submit' else data))
+                    except GatewayRPCError as exc:
+                        import logging
+                        logging.getLogger(__name__).warning('Cron recovery read refused: %s', exc)
+                        continue
                     except (GatewayClientError, ConnectionClosed, OSError):
                         continue
                     if op != 'submit':
