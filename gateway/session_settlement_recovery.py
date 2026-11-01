@@ -55,12 +55,14 @@ async def requeue_shutdown_unstarted(authority, ref, live, row):
     nothing: the claim goes back to its FIFO place for the successor, which runs it once, and this
     process sends nothing for it (no "send it again"). True when requeued; anything else settles
     as before. An API, LOCAL or managed claim has its own caller and receipts, so it never qualifies."""
+    if not authority.runner._draining or authority.retiring:
+        return False  # the common case: no restart, nothing to decide
     admission_id = row['admission_id']
     result = (authority.pending_results.get(admission_id) or {}).get('result') or {}
     from gateway.run_interrupt_cause import is_owner_shutdown_interrupt
-    if not (authority.runner._draining and not authority.retiring and 'native_text_v1' in (row.get('payload') or {})
-            and result.get('interrupted') and type(result.get('api_calls')) is int
-            and result['api_calls'] == 0 and is_owner_shutdown_interrupt(result)):
+    if not ('native_text_v1' in (row.get('payload') or {}) and result.get('interrupted')
+            and type(result.get('api_calls')) is int and result['api_calls'] == 0
+            and is_owner_shutdown_interrupt(result)):
         return False
     from gateway.session_ingress import deliver_settled, waiter_replies
     from gateway.session_queued_controls import publish_transfers
