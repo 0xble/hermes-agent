@@ -46,8 +46,13 @@ def _goal_suspended_while_private(session_entry) -> bool:
     The judge would send the private reply to the auxiliary goal_judge provider, and every goal
     write is withheld from state.db while private anyway.
     """
-    from agent.incognito import is_incognito
-    return bool(getattr(session_entry, "incognito", False)) or is_incognito(getattr(session_entry, "session_id", None))
+    return bool(getattr(session_entry, "incognito", False)) or session_private(getattr(session_entry, "session_id", None))
+
+
+def session_private(*identities) -> bool:
+    """Registry check for a session id or routing key. Loops and goals suspend while it holds."""
+    from agent.incognito import is_registered
+    return any(is_registered(identity) for identity in identities)
 
 
 def _goal_notice_kind(message: str) -> str:
@@ -795,8 +800,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         loop_tick = getattr(event, "_post_turn_loop_tick", None) or identity.get("loop_tick")
         if not loop_tick and event is not None:
             loop_tick = self._post_turn_goal_identity(event).get("loop_tick")
-        hooks = [("loop completion", self._post_turn_loop_completion,
-                  {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None})]
+        hooks = [] if _goal_suspended_while_private(session_entry) else [
+            ("loop completion", self._post_turn_loop_completion,
+             {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None})]
         if successful:
             # Any delivery into the session is fresh evidence and pierces a goal wait: process or
             # delegation results, watcher/cron/kanban wakes, plugin injections. Only the goal's own
@@ -1073,6 +1079,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             session_key = self._session_key_for_source(source)
         if not session_key:
             return
+        if session_private(sid, session_key):
+            return  # paused while private: no injected tick, no count; the schedule resumes after off
 
         def _turn_owner_exists(include_marker: bool = True) -> bool:
             if self._is_session_running(session_key) or session_key in self._running_agents:
