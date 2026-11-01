@@ -265,7 +265,28 @@ def test_bare_custom_private_route_keeps_its_own_endpoint(private_route, tmp_pat
             call_llm(task="compression", messages=[{"role": "user", "content": "private"}], timeout=5)
     finally:
         register_session(sid, False)
-    assert clients.calls and {url for url, _key in clients.calls} == {PRIVATE_URL}
+    # The endpoint's own provider entry supplies the key, never the main model's.
+    assert clients.calls and set(clients.calls) == {(PRIVATE_URL, "private-key")}
+
+
+def test_bare_custom_route_without_a_configured_endpoint_fails_closed(private_route, tmp_path, clients):
+    import hermes_yaml
+    from agent.auxiliary_client import call_llm
+    from agent.incognito import incognito_scope, register_session, set_private_route
+    _runner, _store, _entry, config, _event, _db = private_route
+    configure(config, tmp_path)
+    config["model"] = {"default": "normal-model", "provider": "custom", "base_url": MAIN_URL, "api_key": "main-key"}
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    sid = "bare-custom-unknown"
+    register_session(sid, True)
+    try:
+        set_private_route([sid], {"provider": "custom", "model": "private-model",
+                                  "base_url": "http://127.0.0.1:9/unconfigured"})
+        with incognito_scope(True, sid), pytest.raises(RuntimeError, match="no configured provider entry"):
+            call_llm(task="compression", messages=[{"role": "user", "content": "private"}], timeout=5)
+    finally:
+        register_session(sid, False)
+    assert clients.calls == []
 
 
 @pytest.mark.asyncio
@@ -353,3 +374,4 @@ async def test_private_main_turn_never_falls_back_to_another_provider(private_ro
             turn, turn.source, key, runner._session_state(key).persistent.run_generation)
     assert boundary.calls and all(url == PRIVATE_URL for url, _messages in boundary.calls), boundary.calls
     assert reply.startswith(INCOGNITO_ROUTE_UNAVAILABLE) and "fallback" not in reply, reply
+    assert not INCOGNITO_ROUTE_UNAVAILABLE.startswith("⚠️")  # the colour-emoji form, not the text symbol

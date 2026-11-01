@@ -46,6 +46,24 @@ def private_route_active() -> bool:
     return _private_routed.get()
 
 
+def _endpoint_key(base_url: str) -> str:
+    """The configured key of the provider entry serving ``base_url``; fails closed when none does.
+
+    Resolution would otherwise fill a bare custom endpoint with another endpoint's key (the main
+    model's), sending that credential alongside private content.
+    """
+    from hermes_cli.config import load_config
+    from hermes_cli.model_switch import _entry_configured_key, _scoped_key_env
+    config = load_config()
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    entries = [*providers.values(), *(config.get("custom_providers") or []), config.get("model")]
+    wanted = base_url.rstrip("/")
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("base_url") or "").rstrip("/") == wanted:
+            return _entry_configured_key(entry, _scoped_key_env) or "no-key-required"
+    raise RuntimeError("the incognito route's endpoint has no configured provider entry")
+
+
 @contextmanager
 def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[dict]:
     """Yield the call's kwargs, moved onto the private session's incognito route when one is bound.
@@ -60,10 +78,12 @@ def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[di
     if not (route and route.get("provider") and route.get("model")):
         yield kwargs
         return
-    # A bare ``custom`` route is only its endpoint; a named provider resolves its own.
+    # A bare ``custom`` route is only its endpoint, so its key must be that endpoint's own; a
+    # named provider resolves both itself.
     endpoint = route.get("base_url") if route["provider"] == "custom" else None
     routed = {**kwargs, "provider": route["provider"], "model": route["model"],
-              "base_url": endpoint, "api_key": None, "main_runtime": None}
+              "base_url": endpoint, "api_key": _endpoint_key(endpoint) if endpoint else None,
+              "main_runtime": None}
     if sync:
         routed.update(api_mode=None, fallback_chain=[])
     token = _private_routed.set(True)
