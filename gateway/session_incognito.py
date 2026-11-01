@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 
-from agent.incognito import is_incognito, register_session
+from agent.incognito import is_incognito, register_session, set_private_route
 from utils import atomic_json_write
 
 
@@ -44,6 +44,7 @@ class SessionIncognitoMixin:
             # and absolute deadline. A restart must not turn a timed pick permanent.
             register_session(entry.session_id, True)
             register_session(key, True)
+            set_private_route((entry.session_id, key), record.get("active_override"))
         self._incognito_stale = frozenset(stale)
 
     def _refuse_stale_incognito(self, session_key: str) -> None:
@@ -150,6 +151,8 @@ class SessionIncognitoMixin:
             entry.model_override = cleaned
             entry.model_override_scope = "session"
             entry.model_role = None
+            # Auxiliary calls for this private interval stay on the same configured route.
+            set_private_route((entry.session_id, session_key), cleaned)
 
     def _private_history(self, session_id: str):
         """None means public. An empty list is a valid private conversation."""

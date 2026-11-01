@@ -122,7 +122,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.auxiliary_call_policy import (
     CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request, resolve_unavailable_client,
-    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response,
+    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response, private_route_scope,
 )
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
@@ -2590,10 +2590,10 @@ def _relay_aux_call_scope(args: tuple, kwargs: dict):
 
 
 def _relay_auxiliary_call(callback):
-    """Give every physical retry in one auxiliary call a shared Relay identity."""
+    """Give every physical retry in one auxiliary call a shared Relay identity and its private route."""
     @functools.wraps(callback)
     def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
+        with _relay_aux_call_scope(args, kwargs), private_route_scope(args, kwargs, sync=True) as kwargs:
             return callback(*args, **kwargs)
     return wrapped
 
@@ -2602,7 +2602,7 @@ def _relay_auxiliary_call_async(callback):
     """Async counterpart to :func:`_relay_auxiliary_call`."""
     @functools.wraps(callback)
     async def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
+        with _relay_aux_call_scope(args, kwargs), private_route_scope(args, kwargs, sync=False) as kwargs:
             return await callback(*args, **kwargs)
     return wrapped
 

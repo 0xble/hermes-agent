@@ -28,6 +28,34 @@ def scoped_fallback_policy(policy: CallFallbackPolicy):
         _policy.reset(token)
 
 
+# Run outside any conversation (dashboard, CLI, cron), so they never carry private turn content.
+CONTENT_FREE_TASKS = frozenset({
+    "profile_describer", "kanban_estimator", "kanban_decomposer", "triage_specifier", "monitor",
+})
+
+
+@contextmanager
+def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[dict]:
+    """Yield the call's kwargs, moved onto the private session's incognito route when one is bound.
+
+    Private turn content must not reach a provider the user did not choose for the interval, so
+    the configured incognito.model replaces the task's route, the main runtime and every fallback
+    hop. Credentials resolve from that provider's own configuration.
+    """
+    from agent.incognito import private_route
+    task = args[0] if args else kwargs.get("task")
+    route = None if task in CONTENT_FREE_TASKS else private_route()
+    if not (route and route.get("provider") and route.get("model")):
+        yield kwargs
+        return
+    routed = {**kwargs, "provider": route["provider"], "model": route["model"],
+              "base_url": None, "api_key": None, "main_runtime": None}
+    if sync:
+        routed.update(api_mode=None, fallback_chain=[])
+    with scoped_fallback_policy(CallFallbackPolicy(task, [])):
+        yield routed
+
+
 def has_call_fallback_chain(task: str | None) -> bool:
     policy = _policy.get()
     return policy is not None and policy.task == task and policy.chain is not None

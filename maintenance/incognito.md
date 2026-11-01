@@ -81,6 +81,13 @@ not only the command reply.
 - Credential-pool status keeps only classifier fields while private. Provider
   error text can echo the prompt, so it never reaches `auth.json` from a private
   turn.
+- With a configured `incognito.model`, every auxiliary call made inside a
+  private scope uses that route, with no fallback hop: compression summaries,
+  titles, vision, smart approvals, MCP sampling, mixture-of-agents, memory
+  query rewrites and plugin LLM calls. `private_route_scope` in
+  `agent/auxiliary_call_policy.py` owns it. Only the content-free dashboard,
+  CLI and cron tasks in `CONTENT_FREE_TASKS` keep their own route. Without an
+  `incognito.model`, auxiliary routing is unchanged.
 - A private agent prints nothing to raw stdout. A gateway redirects stdout to
   `gateway.log`, which the privacy log filter never sees. Agent status output,
   including turn-recovery diagnostics, goes through `_safe_print`, which owns
