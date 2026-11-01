@@ -1900,12 +1900,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 # its transcript echoes now; the claimed turn adopts it (queued-voice-eager-stt).
                 if not (_busy and self._pending_event_audio_paths(event)):
                     return True, await admit_message(authority, event)
-                _token = admitted_queued.set(lambda: self._prefetch_admitted_voice(event))
+                _token = admitted_queued.set(lambda admission_id: self._prefetch_admitted_voice(event, admission_id))
                 try:
                     return True, await admit_message(authority, event)
                 finally:
                     admitted_queued.reset(_token)
-                    self._forget_admitted_voice(event)
+                    self._settle_admitted_voice(authority, event)
         if (authority is None and not is_internal and not event.get_command()
                 and getattr(self, 'session_authority', None) is not None):
             # Scoped to a home this process does not serve: never fall back to the launch ledger.
@@ -2819,50 +2819,61 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             adapter, source, transcripts[already_echoed:], event=event, metadata=metadata, log_context=log_context,
         )
 
-    @staticmethod
-    def _admitted_voice_key(event) -> Optional[tuple[str, str, str]]:
-        """Transport identity shared by a live event and the event a durable claim restores from it."""
-        source, message_id = getattr(event, "source", None), getattr(event, "message_id", None)
-        if source is None or source.platform is None or not message_id:
-            return None
-        return source.platform.value, str(source.chat_id), str(message_id)
-
-    def _prefetch_admitted_voice(self, event) -> None:
+    def _prefetch_admitted_voice(self, event, admission_id: str) -> None:
         """Start STT for a voice message the durable FIFO queued behind a running turn.
 
         The claimed turn runs a NEW event restored from the committed row, so the live event's
-        in-flight STT is published under its transport identity for that turn to adopt
-        (``_adopt_admitted_voice``) instead of transcribing and echoing a second time."""
+        in-flight STT is published under the row's admission id for that turn to adopt
+        (``_adopt_admitted_voice``) instead of transcribing and echoing a second time. A redelivery
+        (lost ACK, relay replay) reconciles onto the same row: its id is already published, so the
+        duplicate starts no second STT and no second echo."""
         try:
-            key = self._admitted_voice_key(event)
-            if key is None:
+            registry = self.__dict__.setdefault("_admitted_voice_prefetches", {})
+            if admission_id in registry:
                 return
             self._prefetch_queued_voice_transcript(event, self._delivery_adapter_for(event.source))
             # Steer fallback and interrupt mode already transcribed (and echoed) it: publish that too.
             if (getattr(event, "_gateway_pending_stt_prefetch", None) is not None
                     or hasattr(event, "_gateway_pending_stt_text")):
-                self.__dict__.setdefault("_admitted_voice_prefetches", {})[key] = event
+                registry[admission_id] = event
+                event._gateway_admitted_voice_id = admission_id
         except Exception:
             logger.warning("Queued voice prefetch could not start; the turn will transcribe", exc_info=True)
 
-    def _forget_admitted_voice(self, event) -> None:
-        key = self._admitted_voice_key(event)
+    def _settle_admitted_voice(self, authority, event) -> None:
+        """The admitting call returned without its turn adopting the prefetch. A row that will still
+        run (a paused waiter) keeps it for that turn; a fenced one (/stop, /new, refusal) never runs,
+        so its STT is cancelled before a late echo answers a message nobody will act on."""
+        admission_id = getattr(event, "_gateway_admitted_voice_id", None)
         registry = self.__dict__.get("_admitted_voice_prefetches")
-        if key is not None and registry and registry.get(key) is event:
-            del registry[key]
+        if admission_id is None or not registry or registry.get(admission_id) is not event:
+            return
+        try:
+            from hermes_state_runtime import get_session_admission
+            row = get_session_admission(authority.db, admission_id=admission_id)
+        except Exception:
+            row = None
+        if row is not None and row["status"] not in ("terminal", "unknown"):
+            return
+        del registry[admission_id]
+        for name in ("_gateway_pending_stt_prefetch", "_gateway_pending_stt_task"):
+            task = getattr(event, name, None)
+            if task is not None and not task.done():
+                task.cancel()
 
     async def _adopt_admitted_voice(self, event) -> None:
-        """Give a claimed turn the STT result (and echo ledger) its queued live event already started."""
+        """Give a claimed turn the STT result (and echo ledger) its queued live event already started.
+
+        Only a result with at least one transcript is adopted: a failed or disabled STT is retried by
+        the turn against the committed copy. Notes for clips that did fail are repointed from the
+        adapter's download to the committed copy, which is what the turn retains."""
         registry = self.__dict__.get("_admitted_voice_prefetches")
-        key = self._admitted_voice_key(event) if registry else None
-        live = registry.get(key) if key is not None else None
+        claim = getattr(event, "_outbox_admission_id", None) or ""
+        admission_id = claim.removeprefix("admission:") if claim.startswith("admission:") else None
+        live = registry.get(admission_id) if registry and admission_id else None
         if live is None or live is event or hasattr(event, "_gateway_pending_stt_text"):
             return
-        # Restored media is the committed copy (``<sha256>/<name>``) of the same clip.
-        if [os.path.basename(p) for p in self._pending_event_audio_paths(live)] != [
-                os.path.basename(p) for p in self._pending_event_audio_paths(event)]:
-            return
-        del registry[key]
+        del registry[admission_id]
         prefetch = getattr(live, "_gateway_pending_stt_prefetch", None)
         if prefetch is not None:
             try:
@@ -2872,10 +2883,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     raise  # this turn was cancelled, not the prefetch
             except Exception:
                 return
-        if not hasattr(live, "_gateway_pending_stt_text"):
-            return  # STT failed or was cancelled: the turn transcribes as before
-        event._gateway_pending_stt_text = live._gateway_pending_stt_text
-        event._gateway_pending_stt_transcripts = list(getattr(live, "_gateway_pending_stt_transcripts", []) or [])
+        transcripts = list(getattr(live, "_gateway_pending_stt_transcripts", []) or [])
+        if not hasattr(live, "_gateway_pending_stt_text") or not transcripts:
+            return  # STT failed, was disabled or was cancelled: the turn transcribes as before
+        text = live._gateway_pending_stt_text or ""
+        for live_path, path in zip(self._pending_event_audio_paths(live), self._pending_event_audio_paths(event)):
+            text = text.replace(self._untranscribed_audio_note(live_path), self._untranscribed_audio_note(path))
+        event._gateway_pending_stt_text = text
+        event._gateway_pending_stt_transcripts = transcripts
         event._gateway_pending_stt_echoed = int(getattr(live, "_gateway_pending_stt_echoed", 0) or 0)
 
     async def _transcribe_and_echo_pending_voice(
