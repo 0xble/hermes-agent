@@ -40,6 +40,16 @@ _GOAL_NOTICE_MAX_ATTEMPTS = 3
 _STALL_KINDS = frozenset({"blocked", "paused", "failed"})
 
 
+def _goal_suspended_while_private(session_entry) -> bool:
+    """A goal neither judges nor changes during a private interval and resumes untouched after it.
+
+    The judge would send the private reply to the auxiliary goal_judge provider, and every goal
+    write is withheld from state.db while private anyway.
+    """
+    from agent.incognito import is_incognito
+    return bool(getattr(session_entry, "incognito", False)) or is_incognito(getattr(session_entry, "session_id", None))
+
+
 def _goal_notice_kind(message: str) -> str:
     """Stable warning label for the user-visible goal state a notice represents."""
     text = str(message or "")
@@ -636,7 +646,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _revive_blocked_goal_for_user_turn(self, session_entry, source, event) -> None:
         """Resume only after turn admission, independently of model success or delivery."""
-        if not self._is_user_turn_event(event):
+        if not self._is_user_turn_event(event) or _goal_suspended_while_private(session_entry):
             return
         from hermes_cli.goals import GoalManager
 
@@ -848,7 +858,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             instance = identity.get("goal_instance")
             if type(instance) in (int, float):
                 goal_kwargs["goal_instance"] = instance
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
+            if not _goal_suspended_while_private(session_entry):
+                hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
             try:
                 await hook(
@@ -1306,6 +1317,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         entry = await self.async_session_store.lookup_by_session_id(sid) if store is not None else None
         if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
             return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
+        if _goal_suspended_while_private(entry):
+            return  # the barrier clear is withheld while private, so waking would repeat every scan
         assert store is not None
         source = self._restored_source(entry)
         adapter = self._delivery_adapter_for(source) if source is not None else None

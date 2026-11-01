@@ -40,6 +40,10 @@ not only the command reply.
   session private. Remove the record to repair that topic.
 - `/new` in a private topic ends the interval, then binds, titles and announces
   the new session as public work. `/topic` is refused while private.
+- A goal is suspended while its topic is private: no judge call, no revive, no
+  wakeup and no continuation. The judge would send the private reply to the
+  auxiliary goal_judge provider, and goal writes are withheld anyway. The goal
+  resumes untouched after `/incognito off`.
 - The content-free sidecar preserves privacy routing across restart. Model
   overrides pass through the existing sanitizer. Do not persist a private model
   selection or credentials as recovery metadata.
