@@ -286,12 +286,25 @@ either, without the local implementation present.
 Upstream v2026.9.24 moved Hindsight to an external catalog plugin and removed
 `memory.hindsight` from `tools/lazy_deps.LAZY_DEPS`. The fork keeps the bundled
 `plugins/memory/hindsight` provider because the catalog version lacks
-`retain_strategy: agent-session` and the cron retention exclusion. The provider's
-client construction calls `ensure("memory.hindsight")`, so `hindsight-bundled-provider`
-keeps that allowlist entry, mirroring the range in its `plugin.yaml`. Without it every
-client build raises `FeatureUnavailable` and retain and recall stop.
-`tests/plugins/memory/test_memory_lazy_install.py` guards the entry. Drop this patch
-only together with the bundled provider.
+`retain_strategy: agent-session` and the cron retention exclusion. The original patch kept a
+`memory.hindsight` lazy-install allowlist entry because client construction called
+`ensure("memory.hindsight")`. The 2026-10-02 pre-tip checkpoint merge (`f787eedef4`, #283)
+removed that install path: `_ensure_client_dependency` validates the installed
+`hindsight-client` against the provider's supported range and never installs, pointing at
+`hermes pm install` instead.
+The mem0-based `tests/plugins/memory/test_memory_lazy_install.py` left with upstream's mem0
+removal (`781334eea4`). Drop this patch only together with the bundled provider.
+
+Contract tests: `tests/plugins/memory/test_hindsight_provider.py::test_declared_client_validation_rejects_missing_or_outdated_sdk`,
+  `tests/plugins/memory/test_hindsight_provider.py::test_declared_client_validation_accepts_prepared_sdk_without_install`,
+  `tests/plugins/memory/test_hindsight_provider.py::TestSchemas::test_get_tool_schemas_before_initialize`,
+  `tests/plugins/memory/test_hindsight_provider.py::TestRetainRetry`,
+  `tests/plugins/memory/test_hindsight_provider.py::TestOwnerSubjectRecall`,
+  `tests/agent/test_memory_provider.py::TestMemoryContextFencing`,
+  `tests/plugins/memory/test_hindsight_prefetch_lifetime.py`, `tests/plugins/memory/test_hindsight_generated_turns.py`,
+  `tests/hermes_cli/test_memory_status_client_dependency.py`, `tests/pm/test_bundled_memory_selection.py`,
+  `tests/gateway/test_agent_cache_memory_lifetime.py`, `tests/gateway/test_running_agent_eviction_memory.py`,
+  `tests/agent/test_attachment_recall_query.py`
 
 
 ## Native Notification Footer

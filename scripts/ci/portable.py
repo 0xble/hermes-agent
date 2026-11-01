@@ -39,10 +39,9 @@ OPTIONAL_LANES = {
 # explicit profiles rather than treating partial --lane runs as qualification.
 GATE_LANES = ('static', 'node-gate')
 # Upgrade requires upstream release tags and a 900s per-file bound. The SQLite
-# torture chamber and the transfer runner remain nightly-only while their
-# environment/process races are resolved.
+# torture chamber remains nightly-only while its environment race is resolved.
 NIGHTLY_ONLY_E2E = ('tests/e2e/core/upgrade', 'tests/e2e/core/sqlite/test_torture_chamber.py')
-NIGHTLY_ONLY_TESTS = (*NIGHTLY_ONLY_E2E, 'tests/gateway/test_generation_transfer_runner.py')
+NIGHTLY_ONLY_TESTS = NIGHTLY_ONLY_E2E
 
 
 def is_nightly_only(path: Path, root: Path = ROOT) -> bool:

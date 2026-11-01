@@ -280,6 +280,8 @@ The pure `is_waiting()`/`lifted_barrier_prompt()` checks never write state.
 
 ### Live-barrier lifecycle
 
+Retired by #611 (see the test matrix). Kept as the record of the replaced design.
+
 Judge WAIT parsing is the only model-dependent park path. The real
 `judge_goal()` parser accepts `wait_on_session`, `wait_on_pid`, or bounded
 `wait_for_seconds`; only the LLM response is stubbed in tests. A session/pid
@@ -310,6 +312,18 @@ no schema migration is required.
 
 ## Test matrix
 
+The 2026-10-15 goal redesign (#611, `ece0e9db06`) removed the live-barrier re-arm path
+(`rearm_live_barrier`, `barrier_rearms`, age-only recheck notices) and the six-hour live-target
+pause: waits are uncapped and a delivered event or user message is the wake. Their rows, and
+`test_live_barrier_rearm_respects_cas_loss`, left with that code. The redesign's acceptance
+tests replace them.
+
+Contract tests: `tests/hermes_cli/test_goal_redesign.py`,
+  `tests/hermes_cli/test_goal_external_wait_backoff_real_path.py`,
+  `tests/hermes_cli/test_goal_external_wait_backoff.py`, `tests/hermes_cli/test_goal_readonly_evidence.py`,
+  `tests/gateway/test_goal_parked_idle_wake.py::test_watcher_resumes_goal_parked_on_restart_killed_process`,
+  `tests/hermes_cli/test_goals.py::TestJudgeDrivenWait::test_judge_repark_after_continue_reannounces`
+
 Every row below drives a production entry point. The real-path file stubs only
 the auxiliary judge response, wall-clock values where exact deadlines matter,
 and pid/session liveness. Existing direct-manager tests remain supporting
@@ -335,18 +349,9 @@ coverage; they are not evidence for the rows below.
 | Gateway synthetic continuation, gate-failed continuation, and idle-wake event reach the evaluator as automatic | `GatewayRunner._run_post_turn_hooks` → `_is_user_turn_event` → `_post_turn_goal_continuation` | `test_real_gateway_post_turn_hooks_mark_continuation_gate_failure_and_idle_wake_automatic` | yes | judge response |
 | CLI input provenance is resolved by the TUI entry point, not a preset flag | `_tui_process_one_input` → `_tui_after_turn` → `_maybe_continue_goal_after_turn` | `test_real_cli_tui_input_provenance_reaches_goal_evaluator_as_automatic` | yes | judge response, runtime shell/UI |
 | TUI follow-up dispatch passes `user_turn=False` into `_goal_followup_after_turn` | `_dispatch_followup_turn` → `_run_prompt_submit` → `tui_gateway.prompt_turn._goal_followup_after_turn` | `test_real_tui_followup_dispatch_reaches_goal_followup_as_automatic` | yes | judge response, turn submit |
-| Judge WAIT session park uses real JSON parsing and durable barrier | CLI post-turn hook → `judge_goal` → `_apply_wait_directive` | `test_real_judge_wait_then_evaluator_age_recheck_stays_silent` | yes | judge response, session liveness |
-| Evaluator-path 30-minute recheck adds no unchanged-state chatter | `_stage_live_barrier` → evaluator decision → CLI output | `test_real_judge_wait_then_evaluator_age_recheck_stays_silent` | yes | judge response, session liveness |
-| Gateway idle age-only rechecks remain silent before and after evaluator commit | `_goal_wakeup_fire_one` → `rearm_live_barrier` → `_send_goal_status_notice` | `test_real_gateway_idle_age_recheck_stays_silent_on_due_scans` | yes | session liveness, capturing adapter |
-| TUI idle age rechecks do not add a status notification | `_maybe_resume_tui_parked_goal` → `_notif_loop_status` | `test_real_tui_idle_age_recheck_stays_silent` | yes | session liveness, status sink |
-| CLI idle age rechecks do not add a console notification | `_maybe_resume_parked_goal` → CLI status output | `test_real_cli_idle_age_recheck_stays_silent` | yes | session liveness, console sink |
-| Live barrier rechecks at 5/15/30 minutes and `lifted_barrier_prompt()` stays `None` while target is alive | `rearm_live_barrier` → `lifted_barrier_prompt` | `test_real_exited_after_rearm_lifts_only_after_live_barrier_rechecks` | yes | wall clock, session liveness |
-| Exited target after at least one re-arm admits exactly one idle continuation and clears only that wait | CLI idle hook → `lifted_barrier_prompt` → `clear_lifted_wait` | `test_real_exited_after_rearm_lifts_only_after_live_barrier_rechecks` | yes | session liveness, console sink |
-| Six-hour live target pauses without a second judge | evaluator live-barrier stage | `test_real_judge_wait_at_six_hours_pauses_without_a_second_judge` | yes | judge response, wall clock, session liveness |
 | A live delegation plus real SessionDB status evidence parks an automatic no-action CONTINUE for ten minutes and lifts when one returns | `SessionDB.append_message` → CLI post-turn hook → real `count_active_delegations` → `_delegation_no_progress_wait` → CLI idle hook | `test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early` | yes | judge response, delegation registry lifecycle |
 | Exited target clears the barrier and resumes judging | evaluator live-barrier stage → normal judge | `test_real_exited_target_lifts_barrier_for_a_continuation` | yes | judge response, session liveness |
 | Gateway idle wake injects an admitted continuation after exit/receipt | `_goal_wakeup_fire_one` → `admit_internal_event` → `clear_lifted_wait` | `tests/gateway/test_goal_parked_idle_wake.py::test_watcher_resumes_goal_parked_on_restart_killed_process` | yes | process/session liveness |
-| CAS loss preserves a concurrent re-park | `rearm_live_barrier` → `rearm_goal_barrier_if_since` | `tests/hermes_cli/test_goal_external_wait_backoff.py::test_live_barrier_rearm_respects_cas_loss` | yes | session liveness |
 
 Legacy tests that patch `collect_goal_evidence`, call `evaluate_after_turn`
 with a forced provenance default, or call `wait_on_session()` directly remain
