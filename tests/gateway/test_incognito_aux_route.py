@@ -167,3 +167,75 @@ async def test_private_turn_compaction_summary_uses_the_incognito_route(private_
     assert await turn("Private follow-up", "private-2") == "Second OK"
     assert clients.calls, "the private turn never compacted"
     assert {call for call in clients.calls} == {(PRIVATE_URL, "private-key")}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_route", [
+    {"base_url": "http://127.0.0.1:9/task", "api_key": "task-key"},
+    {"provider": "custom:private", "base_url": "http://127.0.0.1:9/task", "api_key": "task-key"},
+], ids=["bare-base-url", "same-provider-endpoint"])
+async def test_private_call_ignores_the_task_endpoint(private_route, tmp_path, clients, task_route):
+    """A task's own endpoint, bare or under the route's provider name, must not pull a private call off it."""
+    import hermes_yaml
+    runner, _store, _entry, config, event, _db = private_route
+    configure(config, tmp_path)
+    config["auxiliary"]["compression"] = dict(task_route)
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    aux("compression", runner, event)
+    assert clients.calls[-1] == ("http://127.0.0.1:9/task", "task-key")
+    assert "private-model" in await e2e.incognito(runner, event, "/incognito on")
+    aux("compression", runner, event)
+    assert clients.calls[-1] == (PRIVATE_URL, "private-key")
+
+
+@pytest.mark.asyncio
+async def test_private_vision_never_falls_back_to_auto_backends(private_route, tmp_path, clients, monkeypatch):
+    """An incognito route that cannot serve vision fails rather than sending the image elsewhere."""
+    from agent import auxiliary_client
+    runner, _store, _entry, config, event, _db = private_route
+    configure(config, tmp_path)
+    asked = []
+    real = auxiliary_client.resolve_vision_provider_client
+
+    def vision_client(provider=None, **kwargs):
+        asked.append(provider)
+        return (None, None, None) if provider == "custom:private" else real(provider=provider, **kwargs)
+
+    monkeypatch.setattr(auxiliary_client, "resolve_vision_provider_client", vision_client)
+    assert "private-model" in await e2e.incognito(runner, event, "/incognito on")
+    with pytest.raises(Exception):
+        aux("vision", runner, event, "describe this private photo")
+    assert asked and "auto" not in asked
+    assert all(url == PRIVATE_URL for url, _key in clients.calls)
+
+
+@pytest.mark.asyncio
+async def test_private_voice_turn_stays_on_the_incognito_route(private_route, tmp_path, monkeypatch):
+    """auxiliary.voice_chat rebinds the main agent directly, outside call_llm, so it checks too."""
+    import hermes_yaml
+    from agent import voice_turn_route
+    runner, _store, _entry, config, event, _db = private_route
+    configure(config, tmp_path)
+    config["auxiliary"]["voice_chat"] = {"provider": "custom:main", "model": "normal-model"}
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    targeted = []
+    real_target = voice_turn_route._route_target
+
+    def route_target(agent, cfg):
+        targeted.append(real_target(agent, cfg))
+        return None  # stop before binding; which route would bind is what is observed
+
+    monkeypatch.setattr(voice_turn_route, "_route_target", route_target)
+
+    def voice_agent():
+        return SimpleNamespace(_voice_turn_pending=True, provider="custom:private", model="private-model",
+                               base_url=PRIVATE_URL, api_key="private-key", api_mode="chat_completions",
+                               _cached_system_prompt=None, reasoning_config=None)
+
+    assert "private-model" in await e2e.incognito(runner, event, "/incognito on")
+    with event_scope(runner, event("a private voice note")):
+        assert voice_turn_route.begin_voice_turn_route(voice_agent(), [], "system") == "system"
+    assert targeted == []
+    assert "OFF" in await e2e.incognito(runner, event, "/incognito off")
+    voice_turn_route.begin_voice_turn_route(voice_agent(), [], "system")
+    assert [target["provider"] for target in targeted] == ["custom:main"]

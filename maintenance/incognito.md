@@ -86,8 +86,12 @@ not only the command reply.
   titles, vision, smart approvals, MCP sampling, mixture-of-agents, memory
   query rewrites and plugin LLM calls. `private_route_scope` in
   `agent/auxiliary_call_policy.py` owns it. Only the content-free dashboard,
-  CLI and cron tasks in `CONTENT_FREE_TASKS` keep their own route. Without an
-  `incognito.model`, auxiliary routing is unchanged.
+  CLI and cron tasks in `CONTENT_FREE_TASKS` keep their own route. While routed,
+  resolution ignores the task's own `auxiliary.<task>` endpoint and never falls
+  back to auto vision backends (`private_route_active`). A private voice turn
+  skips the `auxiliary.voice_chat` rebind, which acts on the agent directly
+  rather than through `call_llm`. Without an `incognito.model`, auxiliary
+  routing is unchanged.
 - A private agent prints nothing to raw stdout. A gateway redirects stdout to
   `gateway.log`, which the privacy log filter never sees. Agent status output,
   including turn-recovery diagnostics, goes through `_safe_print`, which owns

@@ -34,6 +34,18 @@ CONTENT_FREE_TASKS = frozenset({
 })
 
 
+_private_routed: ContextVar[bool] = ContextVar("aux_call_private_routed", default=False)
+
+
+def private_route_active() -> bool:
+    """True inside an auxiliary call moved onto a private session's incognito route.
+
+    Resolution must then ignore the task's own endpoint and every auto backend, since either
+    would carry private content off the route.
+    """
+    return _private_routed.get()
+
+
 @contextmanager
 def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[dict]:
     """Yield the call's kwargs, moved onto the private session's incognito route when one is bound.
@@ -52,8 +64,12 @@ def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[di
               "base_url": None, "api_key": None, "main_runtime": None}
     if sync:
         routed.update(api_mode=None, fallback_chain=[])
-    with scoped_fallback_policy(CallFallbackPolicy(task, [])):
-        yield routed
+    token = _private_routed.set(True)
+    try:
+        with scoped_fallback_policy(CallFallbackPolicy(task, [])):
+            yield routed
+    finally:
+        _private_routed.reset(token)
 
 
 def has_call_fallback_chain(task: str | None) -> bool:
