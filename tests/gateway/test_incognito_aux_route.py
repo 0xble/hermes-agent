@@ -5,6 +5,7 @@ see turn content would otherwise send private content to the task's own provider
 OpenAI-compatible client is replaced: route resolution and credentials run for real.
 """
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -26,19 +27,21 @@ class _Clients:
 
     def __init__(self, fail_private=False, asynchronous=False):
         self.calls, self.fail_private, self.asynchronous = [], fail_private, asynchronous
+        self.requests = []
 
     def __call__(self, *, api_key=None, base_url=None, **_kwargs):
-        def respond():
+        def respond(**request):
+            self.requests.append(request)
             self.calls.append((str(base_url).rstrip("/"), api_key))
             if self.fail_private and str(base_url).rstrip("/") == PRIVATE_URL:
                 raise RuntimeError("private route unavailable")
             return _mock_response(content="summary")
 
-        def create(**_kw):
-            return respond()
+        def create(**request):
+            return respond(**request)
 
-        async def acreate(**_kw):
-            return respond()
+        async def acreate(**request):
+            return respond(**request)
 
         return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
                                    create=acreate if self.asynchronous else create)),
@@ -239,3 +242,114 @@ async def test_private_voice_turn_stays_on_the_incognito_route(private_route, tm
     assert "OFF" in await e2e.incognito(runner, event, "/incognito off")
     voice_turn_route.begin_voice_turn_route(voice_agent(), [], "system")
     assert [target["provider"] for target in targeted] == ["custom:main"]
+
+
+@pytest.mark.parametrize("model_cfg", [
+    {"default": "normal-model", "provider": "custom:main", "context_length": 128000},
+    {"default": "normal-model", "provider": "custom", "base_url": MAIN_URL, "api_key": "main-key"},
+], ids=["named-main", "bare-custom-main"])
+def test_bare_custom_private_route_keeps_its_own_endpoint(private_route, tmp_path, clients, model_cfg):
+    """A route resolved to a direct endpoint is provider ``custom``: its base_url is the route."""
+    import hermes_yaml
+    from agent.auxiliary_client import call_llm
+    from agent.incognito import incognito_scope, register_session, set_private_route
+    _runner, _store, _entry, config, _event, _db = private_route
+    configure(config, tmp_path)
+    config["model"] = model_cfg
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    sid = "bare-custom-private"
+    register_session(sid, True)
+    try:
+        set_private_route([sid], {"provider": "custom", "model": "private-model", "base_url": PRIVATE_URL})
+        with incognito_scope(True, sid):
+            call_llm(task="compression", messages=[{"role": "user", "content": "private"}], timeout=5)
+    finally:
+        register_session(sid, False)
+    assert clients.calls and {url for url, _key in clients.calls} == {PRIVATE_URL}
+
+
+@pytest.mark.asyncio
+async def test_task_extra_body_stays_with_the_task_route(private_route, tmp_path, clients):
+    """auxiliary.<task>.extra_body and reasoning_effort shape that task's own provider only."""
+    import hermes_yaml
+    runner, _store, _entry, config, event, _db = private_route
+    configure(config, tmp_path)
+    config["auxiliary"]["compression"].update(extra_body={"task_only_flag": True}, reasoning_effort="high")
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    aux("compression", runner, event)
+    assert "task_only_flag" in (clients.requests[-1].get("extra_body") or {})
+    assert "private-model" in await e2e.incognito(runner, event, "/incognito on")
+    aux("compression", runner, event)
+    private_body = clients.requests[-1].get("extra_body") or {}
+    assert clients.calls[-1][0] == PRIVATE_URL
+    assert "task_only_flag" not in private_body and "reasoning" not in private_body
+
+
+@pytest.mark.asyncio
+async def test_mcp_sampling_during_a_private_tool_call_uses_the_incognito_route(private_route, tmp_path, clients):
+    """The MCP recv loop starts with an empty context; sampling replays the tool call's snapshot."""
+    import contextvars
+    from tools.mcp_tool_sampling import SamplingHandler
+    runner, _store, _entry, config, event, _db = private_route
+    configure(config, tmp_path)
+    assert "private-model" in await e2e.incognito(runner, event, "/incognito on")
+    with event_scope(runner, event("call the mcp tool with private content")):
+        tool_call_context = contextvars.copy_context()
+    handler = SamplingHandler("srv", {}, call_context=lambda: tool_call_context)
+    params = SimpleNamespace(
+        messages=[SimpleNamespace(role="user", content=SimpleNamespace(type="text", text="private tool argument"))],
+        model_preferences=None, modelPreferences=None, system_prompt=None, systemPrompt=None,
+        max_tokens=64, maxTokens=64, temperature=None, tools=None)
+    recv_loop = asyncio.get_running_loop().create_task(handler(None, params), context=contextvars.Context())
+    await recv_loop
+    assert clients.calls and clients.calls[-1] == (PRIVATE_URL, "private-key")
+
+
+class _OverloadedPrivateRoute:
+    """Main-turn client: the private endpoint answers 503, any other endpoint would answer."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args, api_key=None, base_url=None, **kwargs):
+        import httpx
+        import openai
+        url = str(base_url).rstrip("/")
+
+        def create(**request):
+            self.calls.append((url, json.dumps(request.get("messages"))))
+            if url == PRIVATE_URL:
+                raise openai.InternalServerError(
+                    "upstream overloaded", body=None,
+                    response=httpx.Response(503, request=httpx.Request("POST", url + "/chat/completions")))
+            return _mock_response(content="fallback answered")
+
+        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+                               api_key=api_key, base_url=base_url, close=lambda: None, _client=None)
+
+
+@pytest.mark.asyncio
+async def test_private_main_turn_never_falls_back_to_another_provider(private_route, tmp_path, monkeypatch, clients):
+    """fallback_providers would carry the whole private conversation to another provider."""
+    import hermes_yaml
+    from gateway.incognito import INCOGNITO_ROUTE_UNAVAILABLE
+    runner, _store, entry, config, event, db = private_route
+    configure(config, tmp_path)
+    config["fallback_providers"] = [{"provider": "custom:main", "model": "normal-model"}]
+    config["streaming"] = {"enabled": False}
+    config["display"] = {"tool_progress": "off", "interim_assistant_messages": False}
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **kw: 0.0)
+    e2e.started(runner, db)
+    boundary = _OverloadedPrivateRoute()
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", boundary)
+    assert "private-model" in await e2e.incognito(runner, event, "/incognito on")
+    key = entry.session_key
+    runner._session_state(key).persistent.run_generation += 1
+    turn = event("PRIVATE-CANARY question")
+    turn.message_id = "private-1"
+    with event_scope(runner, turn):
+        reply = await runner._handle_message_with_agent(
+            turn, turn.source, key, runner._session_state(key).persistent.run_generation)
+    assert boundary.calls and all(url == PRIVATE_URL for url, _messages in boundary.calls), boundary.calls
+    assert reply.startswith(INCOGNITO_ROUTE_UNAVAILABLE) and "fallback" not in reply, reply

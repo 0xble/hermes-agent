@@ -60,8 +60,10 @@ def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[di
     if not (route and route.get("provider") and route.get("model")):
         yield kwargs
         return
+    # A bare ``custom`` route is only its endpoint; a named provider resolves its own.
+    endpoint = route.get("base_url") if route["provider"] == "custom" else None
     routed = {**kwargs, "provider": route["provider"], "model": route["model"],
-              "base_url": None, "api_key": None, "main_runtime": None}
+              "base_url": endpoint, "api_key": None, "main_runtime": None}
     if sync:
         routed.update(api_mode=None, fallback_chain=[])
     token = _private_routed.set(True)
