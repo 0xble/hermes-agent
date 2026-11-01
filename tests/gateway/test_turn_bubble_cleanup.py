@@ -40,7 +40,7 @@ async def _owner(monkeypatch):
         if text == 'released early':
             # Its waiter is released before the turn ends, as a pause releases a session's waiters.
             from hermes_state_runtime import RuntimeStoreError
-            authority.waiters.pop(event._outbox_admission_id.split(':', 1)[1]).set_exception(
+            authority.waiters.pop(event._outbox_admission_id.split(':')[1]).set_exception(
                 RuntimeStoreError('unknown_execution'))
             await asyncio.sleep(0)
 
