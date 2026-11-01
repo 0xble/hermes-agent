@@ -244,30 +244,6 @@ async def test_private_voice_turn_stays_on_the_incognito_route(private_route, tm
     assert [target["provider"] for target in targeted] == ["custom:main"]
 
 
-@pytest.mark.parametrize("model_cfg", [
-    {"default": "normal-model", "provider": "custom:main", "context_length": 128000},
-    {"default": "normal-model", "provider": "custom", "base_url": MAIN_URL, "api_key": "main-key"},
-], ids=["named-main", "bare-custom-main"])
-def test_bare_custom_private_route_keeps_its_own_endpoint(private_route, tmp_path, clients, model_cfg):
-    """A route resolved to a direct endpoint is provider ``custom``: its base_url is the route."""
-    import hermes_yaml
-    from agent.auxiliary_client import call_llm
-    from agent.incognito import incognito_scope, register_session, set_private_route
-    _runner, _store, _entry, config, _event, _db = private_route
-    configure(config, tmp_path)
-    config["model"] = model_cfg
-    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
-    sid = "bare-custom-private"
-    register_session(sid, True)
-    try:
-        set_private_route([sid], {"provider": "custom", "model": "private-model", "base_url": PRIVATE_URL})
-        with incognito_scope(True, sid):
-            call_llm(task="compression", messages=[{"role": "user", "content": "private"}], timeout=5)
-    finally:
-        register_session(sid, False)
-    assert clients.calls and {url for url, _key in clients.calls} == {PRIVATE_URL}
-
-
 @pytest.mark.asyncio
 async def test_task_extra_body_stays_with_the_task_route(private_route, tmp_path, clients):
     """auxiliary.<task>.extra_body and reasoning_effort shape that task's own provider only."""
@@ -353,3 +329,48 @@ async def test_private_main_turn_never_falls_back_to_another_provider(private_ro
             turn, turn.source, key, runner._session_state(key).persistent.run_generation)
     assert boundary.calls and all(url == PRIVATE_URL for url, _messages in boundary.calls), boundary.calls
     assert reply.startswith(INCOGNITO_ROUTE_UNAVAILABLE) and "fallback" not in reply, reply
+    assert not INCOGNITO_ROUTE_UNAVAILABLE.startswith("⚠️")  # the colour-emoji form, not the text symbol
+
+
+@pytest.mark.parametrize("route", [
+    {"provider": "custom", "model": "private-model", "base_url": PRIVATE_URL},
+    {"provider": "custom", "model": "private-model"},
+], ids=["with-base-url", "without-base-url"])
+def test_bare_custom_private_route_is_refused_and_sends_nothing(private_route, tmp_path, clients, route):
+    """A bare endpoint names no provider entry to take its key from, so it is never routed."""
+    import hermes_yaml
+    from agent.auxiliary_client import call_llm
+    from agent.incognito import incognito_scope, register_session, set_private_route
+    _runner, _store, _entry, config, _event, _db = private_route
+    configure(config, tmp_path)
+    config["model"] = {"default": "normal-model", "provider": "custom", "base_url": MAIN_URL, "api_key": "main-key"}
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    sid = "bare-custom-private"
+    register_session(sid, True)
+    try:
+        set_private_route([sid], route)
+        with incognito_scope(True, sid), pytest.raises(RuntimeError, match="must use a named provider"):
+            call_llm(task="compression", messages=[{"role": "user", "content": "private"}], timeout=5)
+    finally:
+        register_session(sid, False)
+    assert clients.calls == []
+    # Public calls keep their configured route.
+    call_llm(task="compression", messages=[{"role": "user", "content": "public"}], timeout=5)
+    assert clients.calls == [(MAIN_URL, "main-key")]
+
+
+@pytest.mark.asyncio
+async def test_incognito_on_refuses_a_bare_custom_model_alias(private_route, tmp_path):
+    """A model_aliases direct alias resolves to provider ``custom``; /incognito on names the fix."""
+    import hermes_yaml
+    from agent.incognito import incognito_scope, private_route as bound_route
+    runner, _store, entry, config, event, _db = private_route
+    configure(config, tmp_path)
+    config["model_aliases"] = {"private-model": {"model": "private-model", "provider": "custom",
+                                                 "base_url": PRIVATE_URL, "api_key": "private-key"}}
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    answer = await e2e.incognito(runner, event, "/incognito on")
+    assert "ON" in answer and "incognito.model must use a named provider (e.g. custom:venice)" in answer
+    assert entry.incognito and entry.model_override is None
+    with incognito_scope(True, entry.session_id):
+        assert bound_route() is None
