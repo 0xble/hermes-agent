@@ -24,6 +24,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from plugins.platforms.telegram.adapter import TelegramAdapter
+from tests.gateway.test_telegram_documents import _make_message, _make_update
 
 
 @pytest.fixture
@@ -39,10 +40,8 @@ def sleeps(monkeypatch):
 
 
 @pytest.fixture
-def adapter(monkeypatch):
+def adapter():
     a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
-    monkeypatch.setattr("plugins.platforms.telegram.telegram_media_download._fresh_request_fetch",
-                        AsyncMock(side_effect=TimedOut("fallback timeout")))
     a._surface_media_cache_failure = AsyncMock()
     a.handle_message = AsyncMock()
     return a
@@ -144,7 +143,6 @@ async def test_three_timeouts_keep_the_old_failure_path(adapter, sleeps, caplog)
     adapter._surface_media_cache_failure.assert_awaited_once()
     assert isinstance(adapter._surface_media_cache_failure.await_args.args[3], TimedOut)
     assert "attempt 3/3" in caplog.text
-    assert "isolated media request-pool fallback" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -166,3 +164,42 @@ async def test_document_download_retries_network_error(adapter, sleeps):
     assert doc.calls == 2
     assert sleeps == [2.0]
     assert len(event.media_urls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["voice", "audio", "video", "photo", "document", "image_document", "video_document", "sticker"])
+async def test_all_inbound_attachment_routes_recover(adapter, sleeps, monkeypatch, kind):
+    """Drive the real route selection, not just the shared retry helper."""
+    suffix = {"photo": ".png", "image_document": ".png", "video": ".mp4", "video_document": ".mp4"}.get(kind, ".pdf")
+    # Image routes validate their signature before committing bytes to the cache.
+    data = b"RIFF\x00\x00\x00\x00WEBP" if kind == "sticker" else b"\x89PNG\r\n\x1a\nimage"
+    source = _Source([TimedOut("temporary metadata failure"), _file_obj(data=data, path=f"media/file{suffix}")],
+                     file_name=f"file{suffix}", mime_type="application/octet-stream")
+    source.emoji, source.set_name = "", ""
+    source.is_animated = source.is_video = False
+    source.file_unique_id = "retry-sticker"
+    msg = _make_message()
+    setattr(msg, "document" if kind.endswith("_document") else kind, [source] if kind == "photo" else source)
+    event = _event()
+    adapter._is_user_authorized_from_message = lambda _: True
+    adapter._should_process_message = lambda _: True
+    adapter._build_message_event = lambda *args, **kwargs: event
+    adapter._apply_telegram_group_observe_attribution = lambda value: value
+    async def route_photo(_, value):
+        await adapter.handle_message(value)
+
+    adapter._route_photo_event = route_photo
+    adapter._get_sticker_description = lambda _: None
+    adapter._set_sticker_description = lambda *args: None
+    monkeypatch.setattr("tools.vision_tools.vision_analyze_tool", AsyncMock(return_value='{"success": true, "analysis": "test sticker"}'))
+
+    await adapter._handle_media_message(_make_update(msg), SimpleNamespace())
+
+    assert source.calls == 2
+    assert sleeps == [2.0]
+    adapter._surface_media_cache_failure.assert_not_called()
+    adapter.handle_message.assert_awaited_once_with(event)
+    if kind == "sticker":
+        assert "test sticker" in event.text
+    else:
+        assert event.media_urls
