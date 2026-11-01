@@ -28,11 +28,6 @@ def helper(monkeypatch):
 @pytest.mark.parametrize(("command", "label"), [
     ("pytest -q tests", "pytest"),
     ("node scripts/run-workspace-checks.mjs", "workspace-checks"),
-    ("npx eslint .", "eslint"),
-    ("npx tsc --noEmit", "tsc"),
-    ("npm ci", "install"),
-    ("pip install -r requirements.txt", "pip-install"),
-    ("uv sync --compile-bytecode", "uv-sync"),
     ("python -m unittest discover", "unittest"),
     ("agentkit evals admit --trials 12", "evals-admit"),
     ("agentkit evals run --trials 12", "evals-run"),
@@ -43,14 +38,9 @@ def helper(monkeypatch):
     ("scripts/run_tests.sh tests/agent/test_foo.py -k test_x", "run_tests"),
     ("python scripts/run_tests_parallel.py tests/test_a.py", "run_tests"),
     ("python -m compileall -j 4 .", "compileall"),
-    ("python -m pip install pytest", "pip-install"),
-    ("uv pip install pytest", "uv-install"),
     ("pnpm build", "build"),
     ("turbo run build", "build"),
     ("pnpm --filter test build", "build"),
-    ("npm install test", "install"),
-    ("pnpm add -D vitest", "install"),
-    ("yarn workspace app add -D test", "install"),
     ("npm run check", "check"),
     ("npx playwright test", "playwright"),
     ("python -m pytest tests/", "pytest"),
@@ -89,6 +79,17 @@ def helper(monkeypatch):
     ("jest --watch=false", "jest"),
     ("pnpm test --watch=false", "test"),
     ("scripts/run_tests.sh --workers 8 tests/agent/test_foo.py", "run_tests"),
+    # Redirections never hide a broad run.
+    ("pytest tests > out.txt 2>&1", "pytest"),
+    ("pytest -n 8 tests/tools/test_a.py 2>&1 | tail -20", "pytest"),
+    ("pytest tests &", "pytest"),
+    # unittest discovery imports every matching module; a glob pattern is still broad.
+    ("python -m unittest", "unittest"),
+    ("python3 -m unittest discover -s scripts/tests", "unittest"),
+    ("python -m unittest discover -p 'test_*.py'", "unittest"),
+    ("python -m unittest tests/", "unittest"),
+    ("bun test", "test"),
+    ("bun test src/", "test"),
 ])
 def test_recognizes_heavy_commands(command, label, helper):
     assert classify_command(command) == label
@@ -120,6 +121,36 @@ def test_recognizes_heavy_commands(command, label, helper):
     "pytest tests/tools/test_a.py tests/tools/test_b.py -q",  # targeted
     "vitest run src/a.test.ts",  # targeted
     "pytest -q -x --tb=short -k smoke tests/tools/test_a.py::test_b",  # targeted with single-run options
+    # Agents usually redirect output; redirection words are not runner arguments.
+    ".venv/bin/python -m pytest -q tests/test_a.py 2>&1 | tail -30",
+    "pytest -q tests/test_a.py > /tmp/out.txt",
+    "pytest -q tests/test_a.py &>/tmp/log",
+    "pytest -q tests/test_a.py >&2",
+    "timeout 300 npx vitest run lib/a.test.ts lib/b.test.ts 2>&1 | tail",
+    "pytest -p no:xdist -q tests/test_a.py::test_b --junitxml=/tmp/red.xml",
+    "pytest -q tests/test_a.py -rA --maxfail=1 --no-cov --durations=5",
+    "python3 -m unittest test_capture_poll_reads test_capture_poll_inputs",
+    "python -m unittest -v tests.test_store.StoreTest.test_put",
+    "python3 -m unittest discover -s tests/hermes -p test_agent_fleet.py",
+    "bun --cwd apps/loops test test/daily-brief-agent-prompt.test.ts",
+    # Dependency installation, type checks and lint release a slot in seconds.
+    "uv sync --locked --quiet",
+    "uv sync --compile-bytecode",
+    "uv pip install pytest",
+    "poetry install",
+    "pip install -r requirements.txt",
+    "python -m pip install pytest",
+    "npm ci",
+    "npm install test",
+    "pnpm add -D vitest",
+    "yarn workspace app add -D test",
+    "bun install --frozen-lockfile",
+    "npx playwright install",
+    "npx tsc --noEmit",
+    "npx eslint .",
+    "pnpm typecheck",
+    "pnpm lint",
+    "npm run lint:fix",
     "command pytest tests",  # `command` deliberately bypasses shell functions: left alone
     "exec pytest tests",  # would replace the session shell: left alone
 ])
@@ -199,6 +230,11 @@ def test_terminal_tool_bounds_only_foreground_local_waits(background, env_type, 
 def test_exec_prefix_utilities_run_inside_the_dispatcher(helper, command, expected):
     """env/nice/timeout/nohup exec their argument and cannot run a shell function."""
     assert wrap_heavy_command(command, env_type="local").split("\n", 1)[1] == expected
+
+
+def test_redirections_stay_on_the_wrapped_command(helper):
+    body = wrap_heavy_command("cd repo && pytest tests 2>&1 | tail -5", env_type="local").split("\n", 1)[1]
+    assert body == "cd repo && _hermes_heavy_slot 'hermes pytest' pytest tests 2>&1 | tail -5"
 
 
 def test_routes_each_heavy_command_once(helper):
