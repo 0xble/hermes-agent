@@ -115,7 +115,7 @@ Contract tests: `tests/hermes_cli/test_update_launchd_restart_verification.py::T
   `tests/hermes_cli/test_launchd_reload_exit_budget.py`, `tests/hermes_cli/test_launchd_reload_handoff.py`,
   `tests/gateway/test_planned_restart_signal.py`
 
-Commit `d389ff3baa` (2026-10-20, a sync regression-batch repair) restored upstream's
+Commit `d389ff3baa` (a sync regression-batch repair that landed with the v0.22.5 sync, #776, on 2026-10-26) restored upstream's
 single-window verifier body and deleted the three drain-window tests while keeping the
 `shutdown_timeout` parameter and its docstring, so a drain longer than the respawn window
 would again report a healthy restart as unsupervised. The logic and tests were restored
