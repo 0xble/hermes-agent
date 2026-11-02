@@ -31,9 +31,23 @@ EXECUTIONS_FILE: Optional[Path] = None
 # and wants it silent. Only ``closed`` is terminal; a repeat of a resolved error re-opens it.
 INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 _FAILURE_TYPE_ORDER = (
+    # Local argument rejection wins over incidental auth/delivery context in a report.
+    ("config", (
+        r"\b(?:invalid_key|invalid_title|invalid_brief|intent_required|self_relay)\b",
+        r"\busage\s*:",
+        r"\b(?:argument|input) validation\b",
+        r"\bvalidation(?:error|_error| failed| error)\b",
+    )),
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
-    ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),
+    ("auth", (
+        r"\b(?:401|403|unauthorized|not_authed|invalid_auth|auth_unavailable)\b",
+        r"\b(?:authentication[ _-]?|auth[ _-])(?:error|failed|failure|required)\b",
+        r"\b(?:invalid|incorrect)[ _-]+(?:api[ _-]+key|x-api-key|credentials?)\b",
+        r"\bcredentials? (?:are |is )?invalid\b",
+        r"\btoken(?:[ _-](?:has[ _-])?(?:expired|revoked))\b",
+        r"\bexpired[ _-]token\b",
+    )),
     ("delivery", ("delivery", "deliver", "delivering")),
     ("config", ("config", "configuration", "validation")),
     ("script", ("script", "no_agent")),
@@ -139,17 +153,13 @@ def _incident_id(job_id: str, error_sig: str) -> str:
 
 
 def _classify_failure_type(error: str) -> str:
-    """Classify a failure from error-text keywords; ``unknown`` is the default."""
+    """Classify specific failure signals before broad context; default to ``unknown``."""
     text = _normalize_error(error)
     if not text:
         return "unknown"
     for kind, patterns in _FAILURE_TYPE_ORDER:
-        for pattern in patterns:
-            if pattern.startswith("\\b") and pattern.endswith("\\b"):
-                if re.search(pattern, text):
-                    return kind
-            elif pattern in text:
-                return kind
+        if any(re.search(pattern, text) for pattern in patterns):
+            return kind
     return "unknown"
 
 
