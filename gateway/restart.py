@@ -144,21 +144,23 @@ def read_launchd_exit_timeout_s(
         if getuid is None:
             return None
         uid = getuid()
-    domain = "system" if uid == 0 else f"gui/{uid}"
-    try:
-        proc = run(
-            ["launchctl", "print", f"{domain}/{label}"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return parse_launchd_exit_timeout(proc.stdout)
+    domains = ("system",) if uid == 0 else (f"gui/{uid}", f"user/{uid}")
+    for domain in domains:
+        try:
+            proc = run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        if proc.returncode == 0:
+            return parse_launchd_exit_timeout(proc.stdout)
+    return None
 
 
 def resolve_launchd_capped_drain(

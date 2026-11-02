@@ -16,7 +16,78 @@ install and release promotion, so a hand edit or a config overlay would not
 survive. No config surface exists, which makes the one-key template change in
 `hermes_cli/gateway_launchd.py` the smallest adequate patch.
 
-Fork patch identity: `gateway-launchd-qos`.
+Fork patch identities: `gateway-launchd-qos`, `gateway-session-independent-launch`.
+
+Contract tests: `tests/hermes_cli/test_launchd_session_lifetime.py`,
+  `tests/hermes_cli/test_launchd_login_trigger.py`,
+  `tests/hermes_cli/test_launchd_lifetime_safety.py`.
+
+## Explicit lifetime selection
+
+`hermes gateway install --launchd-domain user --no-start-now` selects Background
+`user/<uid>` lifetime, independent of Aqua logout. The default is unchanged for
+existing and new automatic-mode installs. `--launchd-domain gui` reverses the
+selection. Keep `ProcessType=Interactive`: Background here is a session type,
+not the starvation-prone CPU scheduling class. Preserve the osascript wrapper
+introduced in `5d63d3e5c502` for stable Local Network Privacy attribution; it is
+not proof that a graphical session is required. Domain probing from
+`a8f404b29fa9f` already supports Background contexts.
+
+Local `launchctl(1)` says a user domain “may exist independently of a logged-in
+user”; `launchd.plist(5)` defaults LaunchAgents to Aqua and permits Background
+session eligibility. Opt-in plists persist one session type, which refresh and
+immutable release renderings retain. Registration/status use explicit domains.
+Signal-stop budgeting checks `gui/<uid>` then `user/<uid>` (root remains
+`system`-only), retaining the live `ExitTimeOut` drain cap in Background mode.
+The guardian remains the same unprivileged periodic Python process, with the
+same domain and session eligibility as its gateway. Network messaging and cron
+do not require WindowServer; desktop capture, GUI notifications, AppleEvents to
+GUI apps, TCC prompts and locked-login-keychain items may remain unavailable
+without Aqua. This mode does not promise a working desktop after logout.
+
+Migrate only from an independent shell after a deliberate gateway stop. The
+migration validates home/label ownership, refuses active legacy/standby or
+duplicate-domain jobs, locks competing migrations, freezes guardian repairs,
+unloads guardian before gateway, waits for their PIDs to exit, then writes and
+loads at most one replacement. Failed bootstrap restores original definitions
+and registrations after removing replacements; ambiguous drain stays stopped
+rather than risking two writers. `--no-start-now` retains stopped intent.
+Explicit-mode uninstall drains both domains and removes guardian too. Unknown
+domain errors never degrade an explicit install to an unsupervised process.
+
+A disposable label `ai.hermes.test-session-independent.4bac0cd2296d` ran through
+osascript in user/501 (PID 23543, Background ASID 100053); its per-service GUI
+query was absent (113), and bootout/absence/plist removal were verified. No live
+gateway jobs or plists were changed. Actual last-logout survival was not tested
+because logout is outside worker authority; the lifetime claim is documented,
+not empirical. No root daemon is added. On this host autologin with FileVault
+off covers reboot login; a future autologin/FileVault change requires a separate
+boot policy (FileVault preboot cannot run a LaunchDaemon).
+
+The independent dead-man heartbeat must be migrated with gateway and guardian.
+Its dotfiles-owned installer must persist Background selection and change its
+probe from implicit `launchctl list` to explicit `launchctl print user/<uid>/...`
+with a positive live PID. Dotfiles is not modified by this patch.
+
+Rollback: stop; install `--launchd-domain gui --no-start-now`; start; read back
+all three labels only in gui/<uid>, reversing the heartbeat dotfiles policy.
+Retire lifetime support only when upstream provides an equivalent opt-in,
+profile-safe migration and exact-domain status surface.
+
+A separate unprivileged `ai.hermes.gateway-login` Aqua LaunchAgent is a login
+trigger only. Background-only home plists are not assumed to be discovered by
+the GUI loader. At the next natural autologin it registers gateway and guardian
+in user/<uid> only if absent; it never executes a gateway or kickstarts it.
+It shares the migration/start/stop/restart lock and skips both labels while
+persistent deliberate-stop or live PID-targeted planned-stop intent exists, logging
+loaded/already-loaded/skipped per label. Expired/malformed planned markers do not
+wedge the next natural login. Deferred reloads use exact-domain positive-PID
+probes; pending old helpers block migration rather than relaunching a second copy.
+Migration writes but does not execute this RunAtLoad trigger during the window;
+GUI rollback and uninstall remove it and any registration. The heartbeat needs
+the equivalent dotfiles-owned trigger, described only in the activation runbook.
+First-natural-reboot verification is outstanding, not inferred from the
+disposable-label result.
 
 ## Evidence
 
