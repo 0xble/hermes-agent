@@ -45,7 +45,7 @@ def discover(*a, **kw):
                                    instance_id='fake', runtime_protocol=1)
         return gateway_runtime.GatewayDiscovery('ready', endpoint)
     return gateway_runtime.GatewayDiscovery('absent')
-gateway_runtime._observe_replacing_stale = lambda *a: discover()
+gateway_runtime._observe_replacing_stale = lambda *a, **kw: discover()
 gateway_runtime.discover_gateway_endpoint = discover
 gateway_runtime._update_fenced = lambda *a: False
 gateway_runtime._starting_multiplexer_root = lambda *a: None
@@ -63,9 +63,8 @@ class WS:
 async def connect(*a, **kw):
     yield WS()
 async def run():
-    kwargs = {'one_shot': True} if 'one_shot' in __import__('inspect').signature(gateway_client.connect_gateway).parameters else {}
     with patch('websockets.asyncio.client.connect', connect):
-        async with gateway_client.connect_gateway(**kwargs):
+        async with gateway_client.connect_gateway(one_shot=True):
             (home / 'attached').touch()
             if sys.argv[1] != 'exit':
                 await asyncio.Future()
@@ -105,7 +104,7 @@ def test_parallel_finite_clients_leave_no_live_gateways(tmp_path, entrypoint):
             home.mkdir(mode=0o700)
             env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd())}
             child = subprocess.Popen([sys.executable, "-c", CLIENT, mode, entrypoint], env=env,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
             children.append((child, home, mode))
         for child, home, mode in children:
             assert wait_until(lambda: (home / "attached").exists() or child.poll() is not None, timeout=15)

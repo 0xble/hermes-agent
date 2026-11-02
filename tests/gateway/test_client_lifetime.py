@@ -37,7 +37,8 @@ threading.Event().wait(30)
     try:
         assert wait_until(ready.exists, timeout=10)
         child.stdin.close()
-        assert child.wait(timeout=6) == 0
+        # 74 distinguishes forced lifetime teardown from a graceful client exit.
+        assert child.wait(timeout=6) == 74
         if with_tool:
             import psutil
             tool_pid = int(ready.with_suffix('.tool').read_text())

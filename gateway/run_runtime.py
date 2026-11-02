@@ -150,9 +150,12 @@ async def initialize_gateway_runtime(runner):
     descriptor = {
         'instance_id': instance_id, 'runtime_protocol': 1,
         'state': 'starting', 'capabilities': [],
+        'client_owned': bool(getattr(runner, '_client_owned', False)),
         'served_profiles': [],
     }
     runner.session_runtime_descriptor = descriptor
+    from gateway.run import _write_runtime_status_quiet
+    _write_runtime_status_quiet(client_owned=descriptor['client_owned'])
     registry = SessionAuthorities(homes[0][1], multiplexed=getattr(runner.config, 'multiplex_profiles', False))
     runner.session_authorities = registry
     # A zero-cut standby boots beside the serving slot, which still owns every store: it builds its

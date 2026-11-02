@@ -15,6 +15,8 @@ from contextlib import suppress
 
 # Deliberately independent of the configurable 600-second unmanaged idle exit.
 CLIENT_EXIT_GRACE_SECONDS = 3.0
+# Forced teardown is not a clean gateway exit; keep it distinct from restart/config codes.
+CLIENT_LIFETIME_FORCED_EXIT_CODE = 74
 
 
 def arm_client_lifetime() -> None:
@@ -37,7 +39,8 @@ def _watch_client(stream) -> None:
     finally:
         stream.close()
     # Arm the hard bound first: gateway stop can wedge in an extension or busy loop.
-    timer = threading.Timer(CLIENT_EXIT_GRACE_SECONDS, os._exit, args=(0,))
+    timer = threading.Timer(CLIENT_EXIT_GRACE_SECONDS, os._exit,
+                            args=(CLIENT_LIFETIME_FORCED_EXIT_CODE,))
     timer.daemon = True
     timer.start()
     # Reuse only this process's already-loaded ownership registries, never a host

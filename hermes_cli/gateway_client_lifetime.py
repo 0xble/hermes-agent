@@ -5,6 +5,13 @@ import subprocess
 import threading
 
 
+def live_client_child(child, lease, status) -> dict:
+    """Only an invocation holding the live child handle may accept its finite endpoint."""
+    if lease is not None and child is not None and status is None:
+        return {"client_pid": child.pid}
+    return {}
+
+
 class ClientGatewayLease:
     def __init__(self):
         self.children: list[subprocess.Popen] = []
@@ -30,6 +37,8 @@ class ClientGatewayLease:
         for child in children:
             if child.stdin is not None:
                 child.stdin.close()
+        # Blocking reap trades about 3 s of normal exit latency (10 s worst case) for
+        # returning only after the finite client's child has exited. Never detach this wait.
         for child in children:
             try:
                 child.wait(timeout=5)

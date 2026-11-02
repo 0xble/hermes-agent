@@ -40,12 +40,50 @@ not ownership. Neither eliminates the detached lifetime after successful client
 exit. No equivalent caller-death fence found. Intentional fork divergence until
 an equivalent upstream lifetime and daemon-service fence ships.
 
+## Review corrections: ownership and crash state
+
+The runtime has one writer per canonical home: `gateway/runtime_ownership.py`
+uses nonblocking exclusive reservations of `gateway.lock`, and
+`gateway/run_bootstrap.py` reserves profiles and claims the PID file before
+opening session authorities. Two active gateways cannot safely coexist on one
+home. A competing client therefore gets an immediate `conflict: client_owned`
+with a retry-after-owner-exit remedy; it neither borrows the short-lived owner
+nor replaces it. The live descriptor and runtime status identify client-owned
+mode. Only the ensure invocation holding the exact live Popen child can accept
+that private endpoint; ordinary discovery stays non-attachable for finite,
+interactive, TUI, cron, kanban and ACP callers alike.
+
+A finite runner never performs daemon crash recovery, so it must also leave the
+previous daemon's `.clean_shutdown` receipt and restart-failure counters exactly
+as found, including when one of its own turns succeeds. Its own graceful exit
+is not evidence that the prior daemon drained.
+The next daemon still makes the original clean-versus-unclean recovery decision.
+
+The hard lifetime deadline exits **74**, not zero: a wedged forced teardown must
+not masquerade as successful graceful shutdown. The creator still blocks while
+reaping its exact child. This deliberately adds about **three seconds typical**
+exit latency when hard teardown is needed, and up to **ten seconds worst case**
+(two five-second waits with an intervening kill) if the early watcher never
+started. This no-orphan trade-off is retained; the review changes no reap timing.
+
+Review preflight: upstream guidance was rechecked at
+`717447e4217ecd9d520f60c6a06c63ec448e601b` (root and subsystem AGENTS,
+CONTRIBUTING). Independent proposal: extend existing descriptor/ensure policy
+and shutdown receipt ownership, not a second lock or lifecycle manager. Related
+open/closed PR searches for client-owned gateway and clean-shutdown recovery,
+and issue search for one-shot gateway lifetime, returned no equivalent fix.
+
+Stack fit: reused Python dataclasses, existing runtime ownership/control discovery,
+client Popen leases and pytest; added no dependency or parallel lifecycle manager.
+
 ## Scope audit
 
 All 25 original changed files remain necessary; the classic-client extension
 adds `hermes_cli/gateway_connection.py` and the borrowed-owner Vertex fixture
-in `tests/e2e/core/providers/test_native_vertex_tools.py` (27 files total).
-No protected gate files change.
+in `tests/e2e/core/providers/test_native_vertex_tools.py`. The review adds the
+real same-home competing-client and daemon-recovery regressions below and
+extends the existing status merge schema (30 files total). No protected gate
+files change.
 
 | File | Kept lifetime-bound responsibility |
 | --- | --- |
@@ -56,12 +94,13 @@ No protected gate files change.
 | `gateway/run_runtime.py` | Skip bot recovery and READY-hosted daemon coordinators. |
 | `gateway/run_shutdown.py` | Refuse restart helpers/replacements that could escape the lease. |
 | `gateway/run_startup.py` | Dispatch finite mode before ordinary daemon startup. |
+| `gateway/status.py` | Merge explicit client-owned mode into runtime status; reusable daemon startup resets it. |
 | `hermes_cli/gateway.py` | Forward the internal finite-owner marker. |
 | `hermes_cli/gateway_chat.py` | Pass finite transport-chat intent into the lease path. |
 | `hermes_cli/gateway_client.py` | Lease across discovery, attach and every failure. |
 | `hermes_cli/gateway_client_lifetime.py` | Close/reap only exact Popen children, including late spawns. |
 | `hermes_cli/gateway_connection.py` | Forward classic finite-client intent at the lazy connection dial. |
-| `hermes_cli/gateway_runtime.py` | Pass ownership only to a new unmanaged spawn; borrow existing owners. |
+| `hermes_cli/gateway_runtime.py` | Pass ownership only to a new unmanaged spawn; borrow reusable daemon owners, refuse other finite owners. |
 | `hermes_cli/gateway_runtime_start.py` | Private stdin pipe, detached session and closed inherited descriptors. |
 | `hermes_cli/main.py` | Arm the parent-death fence before heavyweight gateway imports. |
 | `hermes_cli/subcommands/gateway.py` | Parse the internal client-owned marker. |
@@ -71,6 +110,8 @@ No protected gate files change.
 | `tests/e2e/core/providers/test_native_vertex_tools.py` | Explicitly own the persistent serving fixture for unchanged cross-client token-reuse assertions; prove finite clients do not stop that borrowed owner. |
 | `tests/gateway/test_client_lifetime.py` | Real EOF and wedged-shutdown bound, including an active tool child. |
 | `tests/gateway/test_client_owned_bootstrap.py` | No daemon services/restarts; first-turn MCP readiness retained. |
+| `tests/gateway/test_client_owned_recovery.py` | Preserve prior daemon receipts, counters and interrupted turn through finite startup/exit; next daemon takes unclean recovery. |
+| `tests/hermes_cli/test_client_owned_discovery.py` | Real bootstrap/control status marks finite ownership and refuses a second same-home client before the creator exits. |
 | `tests/hermes_cli/test_gateway_chat.py` | Finite/interactive transport ownership and mock keyword contract. |
 | `tests/hermes_cli/test_gateway_client_lease.py` | Exact-child lease, cancellation/failures/borrowing and classic finite dial. |
 | `tests/hermes_cli/test_gateway_client_lifetime.py` | Concurrent real normal/SIGTERM/SIGKILL exit for transport and classic clients. |
@@ -132,6 +173,24 @@ then found the relevant Vertex persistent-fixture assumption above. After the
 explicit borrowed-owner fixture change, the urgent heavy-slot follow-up passed
 16 tests across three files (zero failed; one existing Vertex default-toolset
 xfail), including five Vertex wire tests and both lifetime/lease modules.
+
+Review-fix RED was exercised against the committed candidate before source changes:
+second-client discovery attached to the first client, both prior-clean/prior-crash
+counter assertions changed, and both forced-EOF cases returned zero instead of 74
+(five failures). The recovery fixture was first corrected to seed/read SessionStore
+off-loop, so its RED exercises the counter invariant rather than the loop guard.
+Additional RED cases catch creator-PID loss through multiplexer discovery and
+successful finite turns clearing a prior daemon counter.
+
+Review-fix GREEN: the canonical urgent heavy-slot runner with `--file-retries 0`
+passed **474 tests across 54 files**, **zero failures**, 62 platform skips and
+one existing Vertex xfail. Coverage includes lifetime/bootstrap/discovery/recovery,
+client/runtime/service, idle-exit, launchd drain caps, shutdown/status, UTF-8
+subprocess contracts, Vertex wire behavior and parity collection. The eight strict
+entrypoint parity cases remain Linux-only; their execution is a hosted gate duty,
+not a claimed macOS pass. The review delta code-health check against
+`2996d712414d820a88333a781907eab7378e7325` has zero blockers/advisories.
+`git diff --check` and the source-only Fork-Patch ownership check pass.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.

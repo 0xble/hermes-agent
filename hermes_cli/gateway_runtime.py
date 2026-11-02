@@ -95,7 +95,8 @@ def _overlay_owner_home(home: Path) -> Path:
     return target.parent
 
 
-def _endpoint(payload: dict, home: Path, control_home: Path | None = None) -> GatewayDiscovery:
+def _endpoint(payload: dict, home: Path, control_home: Path | None = None,
+              *, client_pid: int | None = None) -> GatewayDiscovery:
     if type(payload.get("runtime_protocol")) is not int or payload["runtime_protocol"] != 1:
         return GatewayDiscovery("incompatible", reason_code="runtime_protocol")
     profiles = payload.get("served_profiles")
@@ -108,6 +109,16 @@ def _endpoint(payload: dict, home: Path, control_home: Path | None = None) -> Ga
                and isinstance(p.get("home"), str) and _canonical_home(p["home"]) == wanted]
     if len(matches) != 1 or not isinstance(matches[0].get("profile_id"), str) or not matches[0]["profile_id"]:
         return GatewayDiscovery("inaccessible", reason_code="profile_mismatch")
+    # A finite gateway dies with its creator. Only that invocation's live Popen may use
+    # its endpoint; every other caller gets a terminal refusal under the per-home owner lock.
+    client_owned = payload.get("client_owned", False)
+    if type(client_owned) is not bool:
+        return GatewayDiscovery("inaccessible", reason_code="invalid_client_ownership")
+    if client_owned and (client_pid is None or type(payload.get("pid")) is not int
+                         or payload["pid"] != client_pid):
+        return GatewayDiscovery("conflict", reason_code="client_owned",
+                                detail="another finite client owns this gateway; retry after it exits "
+                                       "or use a separate HERMES_HOME")
     state = payload.get("state")
     # A graceful restart's after-turn wait still owns its in-flight turns (#139041): it stays
     # ``draining`` (exit 6, never a fresh-start target) but carries its endpoint, so an interactive
@@ -206,7 +217,8 @@ def _refused_owner_verdict(exc: PermissionError) -> GatewayDiscovery | None:
     return None
 
 
-def _served_by_multiplexer(home: Path, *, timeout: float) -> GatewayDiscovery | None:
+def _served_by_multiplexer(home: Path, *, timeout: float,
+                           client_pid: int | None = None) -> GatewayDiscovery | None:
     """A served secondary has no socket of its own: the default multiplexer's control socket
     answers for it, and its ``identify`` lists the home under ``served_profiles``. Only the
     multiplexer's live descriptor proves service; a held ``gateway.lock`` alone does not."""
@@ -231,7 +243,7 @@ def _served_by_multiplexer(home: Path, *, timeout: float) -> GatewayDiscovery | 
     except (FileNotFoundError, ConnectionRefusedError, TimeoutError, DiscoveryError,
             OSError, ValueError, TypeError):
         return None
-    result = _endpoint(payload, home, control_home=root)
+    result = _endpoint(payload, home, control_home=root, client_pid=client_pid)
     if result.state == "inaccessible" and result.reason_code == "profile_mismatch":
         return _parked_by_multiplexer(payload, home)  # else: the multiplexer does not serve this profile
     return result
@@ -286,7 +298,8 @@ def _refused(home: Path, *, windows: bool = _NATIVE_WINDOWS) -> GatewayDiscovery
     return GatewayDiscovery("inaccessible", reason_code="authorization")
 
 
-def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0) -> GatewayDiscovery:
+def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0,
+                              client_pid: int | None = None) -> GatewayDiscovery:
     """Read live control identity, preserving uncertainty instead of spawning.
 
     A named profile served by the default multiplexer resolves to the multiplexer's endpoint
@@ -300,13 +313,14 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
     # A served secondary may publish a local startup marker while the host multiplexer is already
     # ready. Prefer the multiplexer's authoritative roster before treating that stale per-profile
     # marker as the endpoint's state.
-    served = _served_by_multiplexer(home, timeout=timeout)
+    own_child = {"client_pid": client_pid} if client_pid is not None else {}
+    served = _served_by_multiplexer(home, timeout=timeout, **own_child)
     if served is not None:
         return served
     try:
-        return _endpoint(query_identify(home, timeout=timeout), home)
+        return _endpoint(query_identify(home, timeout=timeout), home, client_pid=client_pid)
     except (FileNotFoundError, ConnectionRefusedError):
-        served = _served_by_multiplexer(home, timeout=timeout)
+        served = _served_by_multiplexer(home, timeout=timeout, **own_child)
         if served is not None:
             return served
         state = missing_owner_state(home)
@@ -379,11 +393,13 @@ _REPLACE_FAILED_DETAIL = "an older Hermes gateway still owns this profile after 
 _RETIRING = frozenset({"idle_exit", "replaced"})
 
 
-def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -> GatewayDiscovery:
+def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path],
+                             *, client_pid: int | None = None) -> GatewayDiscovery:
     """Discovery, except that a gateway an older Hermes left on this home is stopped once (like
     ``hermes gateway stop``) and reported as retiring; a refusal keeps ``incompatible`` + its remedy."""
     from hermes_cli.gateway_runtime_service import remaining
-    observed = discover_gateway_endpoint(home, timeout=remaining(deadline))
+    kwargs = {"client_pid": client_pid} if client_pid is not None else {}
+    observed = discover_gateway_endpoint(home, timeout=remaining(deadline), **kwargs)
     if observed.state != "incompatible" or observed.reason_code != "runtime_protocol":
         return observed
     if home in replaced:
@@ -414,6 +430,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     (``idle_exit``); this call waits for it to go and starts the replacement transparently.
     """
     import time
+    from hermes_cli.gateway_client_lifetime import live_client_child
     from hermes_cli.gateway_runtime_service import (
         RuntimeStartError, discover_existing_gateway_service, remaining,
         start_existing_gateway_service,
@@ -441,7 +458,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # Poll BEFORE discovering: an exit observed first, then "absent", cannot be a child that
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
-            observed = _observe_replacing_stale(home, deadline, replaced)
+            own_child = live_client_child(child, client_lease, status)
+            observed = _observe_replacing_stale(home, deadline, replaced, **own_child)
             if observed.reason_code == "control_timeout":
                 return GatewayDiscovery("starting", reason_code="deadline")
             if observed.state == "draining" and observed.reason_code in _RETIRING:

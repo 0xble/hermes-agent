@@ -5790,7 +5790,7 @@ async def _start_gateway_start_control_socket(runner):
             descriptor = getattr(runner, "session_runtime_descriptor", {})
             payload.update({key: descriptor[key] for key in (
                 "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
+                "served_profiles", "parked_profiles", "capabilities", "client_owned") if key in descriptor})
             if getattr(runner, "_draining", False):
                 payload.update(state="draining")
                 # The restart's after-turn wait still owns its turns, so the endpoint stays dialable.

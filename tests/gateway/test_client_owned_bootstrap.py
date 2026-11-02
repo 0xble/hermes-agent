@@ -26,9 +26,7 @@ async def test_client_owned_bootstrap_does_not_start_daemon_services(monkeypatch
     mcp_ready = AsyncMock()
     monkeypatch.setattr(facade.GatewayRunner, '_await_mcp_discovery', mcp_ready)
     # Production marks the runner before start(), not a global inherited by other homes.
-    import inspect
-    kwargs = {"client_owned": True} if "client_owned" in inspect.signature(run_bootstrap.start_gateway).parameters else {}
-    await asyncio.wait_for(run_bootstrap.start_gateway(GatewayConfig(), **kwargs), 30)
+    await asyncio.wait_for(run_bootstrap.start_gateway(GatewayConfig(), client_owned=True), 30)
     cron.assert_not_called()
     post_connect.assert_not_called()
     watchers.assert_not_called()

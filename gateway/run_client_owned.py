@@ -28,7 +28,8 @@ async def start_client_owned_runner(runner) -> bool:
     await runner._await_mcp_discovery()  # first/only turn must see the normal bounded tool snapshot
     from hermes_startup_watchdog import disarm_startup_watchdog
     disarm_startup_watchdog()
-    runner._suppress_clean_shutdown_receipt = False
+    # This path never recovered the previous daemon: it cannot certify a clean daemon exit.
+    runner._suppress_clean_shutdown_receipt = True
     runner._running = True
     runner._update_runtime_status(runner._serving_state())
     return True
