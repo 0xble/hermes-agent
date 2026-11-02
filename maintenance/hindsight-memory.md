@@ -2,6 +2,18 @@
 
 **Patch identity:** `hindsight-retain-visibility`, `evict-memory-shutdown`, and `hindsight-client-selection`.
 
+Shutdown must skip whole-transcript egress redaction when every provider inherits
+`MemoryProvider.on_session_end` unchanged. The 58s shutdown watchdog dump at
+2026-11-01 07:36Z showed `hk_1` spending shutdown in that unnecessary scrub; it
+was not evidence of a logging lock deadlock. Real session-end consumers must
+still receive scrubbed copies. Hindsight client close has its own 1s cap, separate
+from request timeout, covering cloud, embedded inner async close and embedded
+wrapper bookkeeping; timed-out async close is cancelled with a warning. Retain
+FIFO/backlog drain and retry semantics stay unchanged. Preserve both behaviors
+until upstream includes equivalent regressions.
+
+Contract tests: `tests/plugins/memory/test_hindsight_shutdown_budget.py`.
+
 Soft agent-cache eviction must drain and shut down the agent's memory manager
 (including Hindsight's writer and the mem-sync executor), then release clients
 off the gateway event loop. Eviction removes the cache entry first, so a refetched
