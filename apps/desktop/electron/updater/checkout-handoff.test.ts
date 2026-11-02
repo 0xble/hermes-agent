@@ -213,6 +213,20 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+// Synchronous so the spawn stand-in returns only once the real tree exists.
+function waitForPidFile(file: string, timeoutMs = 10_000): void {
+  const deadline: number = Date.now() + timeoutMs
+  const pause = new Int32Array(new SharedArrayBuffer(4))
+
+  while (!/^\d+\s*$/.test(fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '')) {
+    if (Date.now() >= deadline) {
+      throw new Error(`late script never published its pid to ${file}`)
+    }
+
+    Atomics.wait(pause, 0, 0, 20)
+  }
+}
+
 // MINOR-3: after the 20 s claim wait gives up, the UI says "the updater did
 // not start". A script that starts late must not then run an update anyway:
 // the Desktop withdraws its bridge AND kills the launcher tree it spawned.
@@ -222,7 +236,7 @@ it.skipIf(IS_WINDOWS)('a timed-out hand-off kills the real script tree it spawne
   let launcherPid: number | undefined
   const realSpawn: typeof updaterProcess.spawnUpdaterProcess = updaterProcess.spawnUpdaterProcess
 
-  vi.spyOn(updaterProcess, 'spawnUpdaterProcess').mockImplementation(
+  const spawnSpy = vi.spyOn(updaterProcess, 'spawnUpdaterProcess').mockImplementation(
     (_command: string, _args: string[], options: Parameters<typeof updaterProcess.spawnUpdaterProcess>[2]) => {
       // A real launcher (detached, own process group) whose "script" is slow
       // to start: it would claim the marker 30 s later.
@@ -233,6 +247,10 @@ it.skipIf(IS_WINDOWS)('a timed-out hand-off kills the real script tree it spawne
       ) as ReturnType<typeof spawn>
 
       launcherPid = child.pid
+      // The tree must exist before the claim deadline can kill it. Otherwise a
+      // loaded host lets a correct early group kill beat the PID file, and the
+      // test reads a file that was never written.
+      waitForPidFile(grandchildPidFile)
 
       return child
     }
@@ -241,6 +259,7 @@ it.skipIf(IS_WINDOWS)('a timed-out hand-off kills the real script tree it spawne
   try {
     const result = await createCheckoutStrategy({ ...deps, handoffClaimTimeoutMs: 600 }).apply()
 
+    expect(spawnSpy).toHaveBeenCalledTimes(1)
     expect(result).toMatchObject({ ok: false, error: 'updater-spawn-failed' })
     expect(fs.existsSync(markerPath(deps.hermesHome))).toBe(false)
     const latePid: number = Number(fs.readFileSync(grandchildPidFile, 'utf8').trim())
