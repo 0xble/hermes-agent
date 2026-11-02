@@ -13,7 +13,8 @@ import asyncio
 
 import pytest
 
-from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses, _wait_for
+from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses
+from tests.waiting import async_wait_until
 
 
 async def _owner(monkeypatch):
@@ -34,7 +35,7 @@ async def _owner(monkeypatch):
 
     async def turn(event, source, quick_key, run_generation):
         text = str(event.text)
-        gates.setdefault('_entered', set()).add(text)
+        adapter.turn_started[text].set()
         if text in gates:
             await gates[text].wait()
         if text == 'released early':
@@ -62,7 +63,7 @@ def _held(adapter):
 
 async def _settled(authority, adapter, cleaned):
     """Nothing left to fire, and nothing fired twice (a double fire would delete twice)."""
-    await _wait_for(lambda: not adapter._background_tasks, 15)
+    await async_wait_until(lambda: not adapter._background_tasks, 15)
     await asyncio.sleep(0.2)  # room for a late duplicate fire
     texts = [text for text, _ in cleaned]
     assert len(texts) == len(set(texts)), f'a cleanup fired twice: {cleaned}'
@@ -81,16 +82,16 @@ async def test_every_turn_path_deletes_its_own_bubbles(monkeypatch):
     gates['first'] = asyncio.Event()
     # Adapter lifecycle: the first message, while the session is idle.
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('first') == 'started')
+    await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
     # Busy follow-up: a user message sent while 'first' runs.
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='follow-up', source=source, message_id='m2')), 5)
     gates['first'].set()
-    await _wait_for(lambda: {'first', 'follow-up'} <= {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: {'first', 'follow-up'} <= {text for text, _ in cleaned}, 15)
     # FIFO drain with no live waiter: a producer wake (/loop tick, watch notification), delivered
     # by the drain like a recovered turn.
     assert await admit_route_wake(runner, adapter, source, 'loop tick', 'loop')
-    await _wait_for(lambda: 'loop tick' in {text for text, _ in cleaned}, 15)
-    await _wait_for(lambda: not adapter._background_tasks, 15)
+    await async_wait_until(lambda: 'loop tick' in {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: not adapter._background_tasks, 15)
     assert sorted(cleaned) == sorted([('first', True), ('follow-up', True), ('loop tick', True)])
     assert _held(adapter) == ({}, {})
     assert not getattr(authority, 'waiter_post_deliveries', {})
@@ -105,16 +106,17 @@ async def test_a_waiter_that_stops_waiting_still_deletes_its_turns_bubbles(monke
     _, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     gates['first'], gates['follow-up'] = asyncio.Event(), asyncio.Event()
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('first') == 'started')
+    await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
     observers = set(adapter._background_tasks)
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='follow-up', source=source, message_id='m2')), 5)
     (observer,) = {task for task in set(adapter._background_tasks) - observers
                    if task.get_coro().__qualname__.endswith('observe')}
     gates['first'].set()
-    await _wait_for(lambda: _statuses(authority).get('follow-up') == 'started', 15)
+    await asyncio.wait_for(adapter.turn_started['follow-up'].wait(), 15)
     observer.cancel()
     gates['follow-up'].set()
-    await _wait_for(lambda: 'follow-up' in {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: {'first', 'follow-up'} <= {text for text, _ in cleaned}, 15)
+    await _settled(authority, adapter, cleaned)
     assert ('follow-up', False) in cleaned
     assert _held(adapter) == ({}, {})
     assert not getattr(authority, 'waiter_post_deliveries', {})
@@ -129,11 +131,11 @@ async def test_a_waiter_released_before_its_turn_ends_still_deletes_its_bubbles(
     _, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     gates['first'] = asyncio.Event()
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('first') == 'started')
+    await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='released early', source=source, message_id='m2')), 5)
     gates['first'].set()
-    await _wait_for(lambda: 'released early' in {text for text, _ in cleaned}, 15)
-    await _wait_for(lambda: not adapter._background_tasks, 15)
+    await async_wait_until(lambda: 'released early' in {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: not adapter._background_tasks, 15)
     assert _held(adapter) == ({}, {})
     assert not getattr(authority, 'waiter_post_deliveries', {})
 
@@ -176,7 +178,7 @@ async def test_a_superseded_turn_deletes_its_cards_but_drops_its_notices():
     GatewayTurnMixin._run_agent_schedule_bubble_cleanup(runner, {'final_response': 'ok'}, adapter, turn_ctx)
     turn_ctx._cleanup_msg_ids.append('card-2')  # a card whose receipt landed after registration
     GatewayTurnMixin._hmwa_discard_stale_result(runner, source, 'k', 7)
-    await _wait_for(lambda: len(adapter.deleted) == 2, 5)
+    await async_wait_until(lambda: len(adapter.deleted) == 2, 5)
     assert sorted(adapter.deleted) == ['card-1', 'card-2']
     assert notices == []
     assert _held(adapter) == ({}, {})
@@ -203,22 +205,22 @@ async def test_a_queued_followups_busy_ack_is_deleted_once_its_reply_is_delivere
         return False
     gates['first'] = asyncio.Event()
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
-    await _wait_for(lambda: 'first' in gates.get('_entered', ()))
+    await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
     # 'first' is running now: the stand-in registers no agent, so say so for this busy admission.
     runner._is_session_running = lambda key: True
     runner._route_plaintext_approval_while_busy = lambda event, key: _false()
     runner._hm_busy_preempt = acknowledge
     try:
         await asyncio.wait_for(adapter.handle_message(MessageEvent(text='follow-up', source=source, message_id='m2')), 5)
-        await _wait_for(lambda: _statuses(authority).get('follow-up') == 'queued', 5)
+        await async_wait_until(lambda: _statuses(authority).get('follow-up') == 'queued', 5)
     finally:
         for name in ('_is_session_running', '_route_plaintext_approval_while_busy', '_hm_busy_preempt'):
             del runner.__dict__[name]
-    await _wait_for(lambda: any(sent.startswith('⏳ Queued') for sent in adapter.sent), 5)
+    await async_wait_until(lambda: any(sent.startswith('⏳ Queued') for sent in adapter.sent), 5)
     ack = next(sent for sent in adapter.sent if sent.startswith('⏳ Queued'))
     assert not deleted, 'the ack stays while its turn waits'
     gates['first'].set()
-    await _wait_for(lambda: deleted == [ack], 15)
+    await async_wait_until(lambda: deleted == [ack], 15)
     await _settled(authority, adapter, cleaned)
     assert deleted == [ack]
     assert {'reply to first', 'reply to follow-up'} <= set(adapter.sent)
@@ -237,11 +239,11 @@ async def test_stop_cancelling_the_adapter_task_still_deletes_the_turns_bubbles(
     runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     gates['first'] = asyncio.Event()
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('first') == 'started')
+    await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
     (task,) = [task for task in adapter._session_tasks.values() if not task.done()]
     task.cancel()
     gates['first'].set()
-    await _wait_for(lambda: 'first' in {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: 'first' in {text for text, _ in cleaned}, 15)
     await _settled(authority, adapter, cleaned)
 
 
@@ -254,14 +256,14 @@ async def test_a_shutdown_release_of_the_waiters_still_deletes_the_turns_bubbles
     runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     gates['first'], gates['follow-up'] = asyncio.Event(), asyncio.Event()
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('first') == 'started')
+    await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='follow-up', source=source, message_id='m2')), 5)
     gates['first'].set()
-    await _wait_for(lambda: _statuses(authority).get('follow-up') == 'started', 15)
+    await asyncio.wait_for(adapter.turn_started['follow-up'].wait(), 15)
     (session_id,) = authority.sessions
     authority._pause(SessionRef(authority.profile_id, session_id), 'runtime_draining')
     gates['follow-up'].set()
-    await _wait_for(lambda: {'first', 'follow-up'} <= {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: {'first', 'follow-up'} <= {text for text, _ in cleaned}, 15)
     await _settled(authority, adapter, cleaned)
 
 
@@ -281,7 +283,7 @@ async def test_an_unknown_settlement_still_deletes_the_turns_bubbles(monkeypatch
         return await settle(authority_, live, ref, row, *args, **kwargs)
     monkeypatch.setattr(recovery, 'settle_with_retry', failing)
     await adapter.handle_message(MessageEvent(text='unsettled', source=source, message_id='m1'))
-    await _wait_for(lambda: 'unsettled' in {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: 'unsettled' in {text for text, _ in cleaned}, 15)
     assert 'reply to unsettled' not in adapter.sent
     await _settled(authority, adapter, cleaned)
 
@@ -294,17 +296,30 @@ async def test_a_waiter_registered_after_its_turn_started_deletes_the_bubbles_af
 
     runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     gates['late'] = asyncio.Event()
+    registered = asyncio.Event()
     admit = authority.admit_native
+
+    class NativeWaiters(set):
+        def add(self, admission_id):
+            assert adapter.turn_started['late'].is_set(), 'this test must register AFTER turn entry'
+            super().add(admission_id)
+            registered.set()
+
+    monkeypatch.setattr(authority, 'native_waiters', NativeWaiters(authority.native_waiters))
 
     async def slow_admit(event):
         receipt = await admit(event)
-        await _wait_for(lambda: _statuses(authority).get('late') == 'started', 5)
+        # A committed 'started' row precedes execute_admission's waiter snapshot.
+        # Wait until the stand-in actually runs, AFTER that snapshot, so this
+        # really exercises a late waiter instead of racing the normal early path.
+        await asyncio.wait_for(adapter.turn_started['late'].wait(), 5)
         return receipt
     monkeypatch.setattr(authority, 'admit_native', slow_admit)
     await adapter.handle_message(MessageEvent(text='late', source=source, message_id='m1'))
-    await _wait_for(lambda: authority.native_waiters, 5)
+    await asyncio.wait_for(registered.wait(), 5)
+    assert authority.native_waiters
     gates['late'].set()
-    await _wait_for(lambda: 'late' in {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: 'late' in {text for text, _ in cleaned}, 15)
     assert cleaned == [('late', True)]
     await _settled(authority, adapter, cleaned)
 
@@ -329,12 +344,12 @@ async def test_a_newer_turn_never_deletes_an_older_turns_cards_before_its_reply(
     adapter.send = slow_send
     gates['first'] = asyncio.Event()
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('first') == 'started')
+    await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='follow-up', source=source, message_id='m2')), 5)
     gates['first'].set()
-    await _wait_for(lambda: 'follow-up' in {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: 'follow-up' in {text for text, _ in cleaned}, 15)
     assert 'first' not in {text for text, _ in cleaned}, "B's fire swept A's cards before A's reply"
     release_first_reply.set()
-    await _wait_for(lambda: 'first' in {text for text, _ in cleaned}, 15)
+    await async_wait_until(lambda: 'first' in {text for text, _ in cleaned}, 15)
     assert sorted(cleaned) == [('first', True), ('follow-up', True)]
     await _settled(authority, adapter, cleaned)
