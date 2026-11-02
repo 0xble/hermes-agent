@@ -3574,9 +3574,9 @@ def _run_one_job_body(
         _fire_scope_tokens = _install_fire_secret_scope()
         # Commit a finite one-shot's dispatch BEFORE its side effect so a tick dying mid-run cannot
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
-        # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
-        # fire_due) get at-most-times semantics. See #38758.
         if not claim_dispatch(job["id"]):
+            from cron.oneshot_retirement import release_retirement_claims
+            release_retirement_claims(job)
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]))
