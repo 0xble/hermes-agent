@@ -11,7 +11,8 @@ import asyncio
 
 import pytest
 
-from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses, _wait_for
+from tests.gateway.test_shared_busy_receive_loop import Adapter
+from tests.waiting import async_wait_until
 
 
 @pytest.mark.asyncio
@@ -35,6 +36,7 @@ async def test_busy_followup_keeps_its_marker_until_the_reply_is_ledgered(monkey
 
     async def turn(event, source, quick_key, run_generation):
         await runner._mark_durable_active_turn(event, quick_key)
+        adapter.turn_started[event.text].set()
         if event.text == 'one':
             await gate.wait()
         execution_result.get()['result'] = {'final_response': 'reply to ' + event.text, 'messages': []}
@@ -51,11 +53,11 @@ async def test_busy_followup_keeps_its_marker_until_the_reply_is_ledgered(monkey
     monkeypatch.setattr(adapter, '_record_delivery_obligation', ledger)
 
     await adapter.handle_message(MessageEvent(text='one', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('one') == 'started')
+    await asyncio.wait_for(adapter.turn_started['one'].wait(), 5)
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='two', source=source, message_id='m2')), 5)
     gate.set()
-    await _wait_for(lambda: 'reply to two' in adapter.sent and not adapter._background_tasks, 15)
+    await async_wait_until(lambda: 'reply to two' in adapter.sent and not adapter._background_tasks, 15)
     assert adapter.sent == ['reply to one', 'reply to two']
     assert marker_at_ledger['reply to one'] is not None
     assert marker_at_ledger['reply to two'] is not None, 'the busy follow-up released its marker before the ledger write'
-    await _wait_for(lambda: runner.session_store._entries[key].active_turn_token is None)
+    await async_wait_until(lambda: runner.session_store._entries[key].active_turn_token is None, timeout=5)

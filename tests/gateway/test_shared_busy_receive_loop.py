@@ -5,18 +5,21 @@ a busy follow-up is admitted into the session FIFO; the adapter must return as s
 is committed, not when the queued turn finally answers, while still delivering exactly one reply.
 """
 import asyncio
+from collections import defaultdict
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
+from tests.waiting import async_wait_until
 
 
 class Adapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token='owned-fixture'), Platform.TELEGRAM)
         self.sent = []
+        self.turn_started = defaultdict(asyncio.Event)
 
     async def connect(self, *, is_reconnect=False):
         return True
@@ -47,7 +50,9 @@ async def _busy_owner(monkeypatch, turns):
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
 
     async def produce(authority, ref, row):
-        return await turns[row['payload']['text']]()
+        text = row['payload']['text']
+        adapter.turn_started[text].set()
+        return await turns[text]()
     monkeypatch.setattr(finite, 'execute_finite_admission', produce)
     runner = GatewayRunner(GatewayConfig())
     adapter = Adapter()
@@ -64,13 +69,6 @@ def _statuses(authority):
             for row in list_session_admissions(authority.db, session_id=session_id, pending_only=False)}
 
 
-async def _wait_for(predicate, timeout=5):
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not predicate():
-        assert asyncio.get_running_loop().time() < deadline, 'condition not reached'
-        await asyncio.sleep(0.01)
-
-
 @pytest.mark.asyncio
 async def test_busy_follow_up_returns_after_commit_and_is_answered_once(monkeypatch):
     first_gate, second_gate = asyncio.Event(), asyncio.Event()
@@ -84,7 +82,7 @@ async def test_busy_follow_up_returns_after_commit_and_is_answered_once(monkeypa
         return 'SECOND_REPLY'
     authority, adapter, source = await _busy_owner(monkeypatch, {'one': first, 'two': second})
     await adapter.handle_message(MessageEvent(text='one', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('one') == 'started')
+    await asyncio.wait_for(adapter.turn_started['one'].wait(), 5)
     # The receive loop hands over the follow-up while the first turn is still running.
     receive = asyncio.create_task(adapter.handle_message(MessageEvent(text='two', source=source, message_id='m2')))
     done, _ = await asyncio.wait({receive}, timeout=3)
@@ -93,9 +91,9 @@ async def test_busy_follow_up_returns_after_commit_and_is_answered_once(monkeypa
     assert _statuses(authority) == {'one': 'started', 'two': 'queued'}
     assert adapter.sent == []
     first_gate.set()
-    await _wait_for(lambda: _statuses(authority).get('two') == 'started')
+    await asyncio.wait_for(adapter.turn_started['two'].wait(), 5)
     second_gate.set()
-    await _wait_for(lambda: 'SECOND_REPLY' in adapter.sent and not adapter._background_tasks)
+    await async_wait_until(lambda: 'SECOND_REPLY' in adapter.sent and not adapter._background_tasks, timeout=5)
     assert adapter.sent == ['FIRST_REPLY', 'SECOND_REPLY']
     assert _statuses(authority) == {'one': 'terminal', 'two': 'terminal'}
 
@@ -121,11 +119,11 @@ async def test_detached_busy_completion_failure_still_tells_the_user(monkeypatch
         return await extract(text, *args, **kwargs)
     monkeypatch.setattr(adapter, '_extract_response_content', broken_extract)
     await adapter.handle_message(MessageEvent(text='one', source=source, message_id='m1'))
-    await _wait_for(lambda: _statuses(authority).get('one') == 'started')
+    await asyncio.wait_for(adapter.turn_started['one'].wait(), 5)
     # The receive loop must neither park nor see the later delivery failure.
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='two', source=source, message_id='m2')), 3)
     first_gate.set()
-    await _wait_for(lambda: len(adapter.sent) == 2 and not adapter._background_tasks)
+    await async_wait_until(lambda: len(adapter.sent) == 2 and not adapter._background_tasks, timeout=5)
     # Exactly one reply per input; the error notice may race the first turn's own delivery.
     assert 'FIRST_REPLY' in adapter.sent
     assert sum('render exploded' in text for text in adapter.sent) == 1, adapter.sent
