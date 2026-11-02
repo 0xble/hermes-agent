@@ -247,7 +247,12 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection(deadline)
                     link.send(request_id, message)
-                response = link.receive(20)
+                try:
+                    response = link.receive(20)
+                except TimeoutError as exc:
+                    identity = ' '.join(f'{key}={params[key]}' for key in
+                                        ('execution_id', 'session_id', 'generation') if key in params)
+                    raise TimeoutError(f'{method} phase=answer timeout=20s {identity}: {exc}') from exc
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()

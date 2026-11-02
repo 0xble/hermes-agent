@@ -61,8 +61,6 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
-    from cron.scheduler_authority import journal_path
-    journal = journal_path(job['id'], execution_id)
     if not job.get('no_agent'):
         mark_kwargs['execution_id'] = execution_id
     if not d.success and job.pop("_session_store_unavailable", False):
@@ -129,12 +127,6 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         settle_quietly(job["id"], execution_id)
     # The external executor can finish while the owner is absent. Keep its
     # captured result until the replacement owner settles the SAME admission.
-    import json
-    pending_owner = False
-    if journal.exists():
-        record = json.loads(journal.read_text(encoding='utf-8-sig'))
-        pending_owner = 'worker_result' in record and not record.get('canonical_settled')
-    if not pending_owner:
-        journal.unlink(missing_ok=True)
-        journal.with_suffix('.cancel').unlink(missing_ok=True)
+    from cron.scheduler_authority import retire_completed_journal
+    retire_completed_journal(job['id'], execution_id)
     return True
