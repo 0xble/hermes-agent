@@ -256,16 +256,17 @@ def get_label(provider_id: str) -> str:
     canonical = normalize_provider(provider_id)
     if canonical in _LABEL_OVERRIDES:
         return _LABEL_OVERRIDES[canonical]
-    pdef = get_provider(canonical)
+    # Labels are display metadata, never a reason to wait for registry discovery.
+    pdef = get_provider(canonical, allow_network=False)
     return pdef.name if pdef else canonical
 
 
-def is_aggregator(provider: str) -> bool:
+def is_aggregator(provider: str, *, allow_network: bool = True) -> bool:
     """Return True when the provider is a multi-model aggregator."""
     provider_norm = normalize_provider(provider or "")
     if provider_norm.startswith("custom:"):
         return True
-    pdef = get_provider(provider_norm)
+    pdef = get_provider(provider_norm) if allow_network else get_provider(provider_norm, allow_network=False)
     return pdef.is_aggregator if pdef else False
 
 
@@ -278,14 +279,14 @@ def is_aggregator(provider: str) -> bool:
 _FLAT_NAMESPACE_RESELLERS: frozenset[str] = frozenset({"opencode-go", "opencode"})
 
 
-def is_routing_aggregator(provider: str) -> bool:
+def is_routing_aggregator(provider: str, *, allow_network: bool = True) -> bool:
     """True only for TRUE routing aggregators (OpenRouter, named ``custom:*`` proxies) — excludes
     flat-namespace resellers whose catalog is first-party. Use for "would selecting this model
     silently re-route away from the intended provider?" (picker dedup)."""
     provider_norm = normalize_provider(provider or "")
     if provider_norm in _FLAT_NAMESPACE_RESELLERS:
         return False
-    return is_aggregator(provider_norm)
+    return is_aggregator(provider_norm, allow_network=allow_network)
 
 
 def is_official_openai_host(base_url: str) -> bool:

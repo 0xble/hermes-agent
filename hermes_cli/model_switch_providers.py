@@ -1273,7 +1273,9 @@ def list_authenticated_providers(
     current_base_url = str(current_base_url or "").strip()
     current_model = str(current_model or "").strip()
     user_providers = stringify_provider_map(user_providers)
-    data = fetch_models_dev()
+    # Metadata is part of the same cache-only read contract as provider catalogs.
+    # A cold models.dev cache must not turn a picker/ACP attach into a DNS wait.
+    data = fetch_models_dev(allow_network=False) if non_blocking_catalogs else fetch_models_dev()
 
     # A single excluded entry like ``copilot`` hides the provider under every key it surfaces
     # as (hermes_id / mdev_id / canonical slug).

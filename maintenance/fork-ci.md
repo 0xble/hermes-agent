@@ -100,6 +100,20 @@ Historical: before the gate/nightly split, a standalone runner published a requi
 `local-ci/full` check that ran the complete profile on every PR, including all nine Node
 checks. That check is no longer required; `qualification` replaced it.
 
+## ACP Catalog Reads
+
+ACP session creation and attachment project model choices from the shared inventory's
+cache-only path. Optional model metadata must not block session initialization on external
+DNS or HTTP. That contract includes the top-level models.dev registry, provider labels,
+aggregator classification and the Ollama Cloud registry fallback, not only provider `/models` probes. Existing cached,
+curated, configured and current-model choices remain available. Explicit catalog refreshes
+retain their live-read behavior, and background catalog refreshes may continue independently.
+
+The ACP offline-inventory fixture patches only the pytest process, not its real ACP
+subprocess. `test_gateway_catalog_offline.py` therefore guards DNS in the subprocess itself
+and checks that a cold attachment does not resolve external catalogs in a foreground worker.
+`test_list_picker_providers.py` also covers the shared registry cache-only contract.
+
 ## Provenance and disposition
 
 Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
