@@ -4748,7 +4748,7 @@ async def _acknowledge_release_when_running(*, poll_seconds: float = 1.0) -> Non
             except (OSError, RuntimeError, ValueError):
                 logger.warning("Pending release reload could not be acknowledged", exc_info=True)
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False,
-                idle_exit: bool = False):
+                idle_exit: bool = False, client_owned: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
@@ -4778,7 +4778,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     # Refresh the systemd unit on every boot so restart settings stay current even after an
     # exit-code-75 respawn (stale-code or /restart), which bypasses `hermes gateway restart`.
-    if supports_systemd_services():
+    if not client_owned and supports_systemd_services():
         try:
             refresh_systemd_unit_if_needed(system=False)
         except Exception:
@@ -4829,7 +4829,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     success = False
     try:
         success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity,
-                                            idle_exit=idle_exit))
+                                            idle_exit=idle_exit, **({"client_owned": True} if client_owned else {})))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
@@ -5259,6 +5259,7 @@ def _cmd_run(args):
         getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
         replace=getattr(args, "replace", False), force=getattr(args, "force", False),
         idle_exit=getattr(args, "idle_exit", False),
+        **({"client_owned": True} if getattr(args, "client_owned", False) else {}),
     )
 
 

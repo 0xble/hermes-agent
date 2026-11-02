@@ -75,7 +75,7 @@ def _run_stream_json_chat(monkeypatch, capsys, run_turn, credentials_ok=True):
             return {"admission_id": "adm-1"}
 
     @asynccontextmanager
-    async def connected():
+    async def connected(*, one_shot=False):
         yield Peer()
 
     monkeypatch.setattr(gateway_chat, "connect_gateway", connected)
