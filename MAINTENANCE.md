@@ -126,6 +126,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Immutable releases S2 | Pin code and venv to immutable releases behind an atomic pointer; preserve migration and rollback receipts | Update, release staging, launchd path resolution, cron worker pins or retention changes | [Immutable releases and activation runbook](maintenance/seamless-restart-s2.md) |
 | Release extras carry | New releases carry the active release's committed extras, at build time and by a PM commit into a ready candidate before activation | Release venv extras selection, PM generation layout, or `release-layout.json` source interpreter changes | [Release extras carry](maintenance/release-extras-carry.md) |
 | Telegram ingress non-blocking | The update consumer never waits on outbound pacing, the pending-update probe requires no dispatch progress, and reconnect waits for the old poller to release | Telegram update handlers, busy or inline command replies, the heartbeat pending probe, or poller token ownership | [Telegram ingress non-blocking](maintenance/telegram-ingress-nonblocking.md) |
+| Telegram inbound media recovery | Recover transient metadata/byte fetch failures before asking for a resend | Inbound attachment fetching, HTTP timeout policy, or upstream retry adoption; read ingress non-blocking before changing notices or polling | [Telegram media recovery](maintenance/telegram-media-download.md) |
 | Telegram first-poll health | Each new polling generation proves health from a non-blocking first getUpdates; steady-state polls keep the long poll | The instrumented getUpdates request, polling-generation fencing, `start_polling` arguments, or a PTB upgrade | [Telegram first-poll health](maintenance/telegram-first-poll-health.md) |
 | Stdio wrapper chain | Agent builds and thread-scoped silencing never stack or loop `sys.stdout`/`sys.stderr` wrappers, and wrapper attribute lookup cannot recurse | `_SafeWriter`, `_install_safe_stdio`, `thread_scoped_output`, or other process-lifetime stdio rebinding | [Stdio wrapper chain](maintenance/stdio-wrapper-chain.md) |
 | Telegram delivery | Preserve flood coherence, split-send recovery, and legacy emphasis | Telegram send/edit/typing, delivery ledger, or emphasis changes | [Telegram delivery](maintenance/telegram-delivery.md) |
@@ -521,7 +522,13 @@ reviewed patch content without rewriting shared history or advancing the floor.
 Fork-Patch-Backfill: dd8b51a7f52d926fc084cd7e84bc8b72a651ff0f; evidence
 Published upstream maintenance merge `c8d3ae60f4f6` arrived without a trailer.
 New commits still require trailers, including the final squash merge message.
-A trailer proves classification, not functional coverage. Retire a patch only after its
+A trailer proves classification, not functional coverage. Functional coverage is pinned per
+unit on a `Contract tests:` line naming backticked pytest targets (`tests/x.py` or
+`tests/x.py::test_name`) that drive the behaviour through its real boundary. The checker fails
+when a pinned target's file or test is gone, so a sync cannot drop the proof silently; the
+hosted suite runs it. `--list-contract-tests` prints the pinned targets for a focused sync
+run, and `--list-uncovered` lists identity-owning units that still pin none.
+Retire a patch only after its
 regression passes on the selected upstream release without the local implementation.
 Load [runtime ownership](maintenance/runtime-ownership.md) whenever changing
 installation, update/rollback tooling, scheduled procedures, or recovery evidence.

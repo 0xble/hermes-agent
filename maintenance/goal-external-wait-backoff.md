@@ -87,7 +87,12 @@ from `tui_gateway.prompt_turn._goal_followup_after_turn` after
 `_dispatch_followup_turn` routes the follow-up through
 `_run_prompt_submit(user_turn=False)`. Each caller must pass the provenance of
 the turn that just completed, rather than letting the evaluator infer it from
-prose or queue state:
+prose or queue state. Callers also pass the turn's wall-clock start as
+`turn_started_at`: user/external input pierces only waits whose `waiting_since`
+predates that start. A wait armed during the responding turn remains parked
+while its barrier holds, without a judge call or continuation. Missing turn-start
+metadata retains legacy piercing behavior. Timed expiry, delegation lifts and
+autonomy timers still release barriers normally:
 
 - admitted human input is `user_initiated=True`;
 - a goal continuation, idle wake, heartbeat, loop wakeup, process/delegation

@@ -18,6 +18,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.incognito import log_private_failure
 from agent.notice_style import ContextNotice
 from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import AwakeIdleMeter, format_iteration_progress
@@ -67,6 +68,18 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 _tool_call_logger_lock = threading.Lock()
+# Detached deletes of superseded turns' cards: a chat's flood wait never holds the turn's unwind.
+_STALE_CLEANUP_TASKS: set = set()
+
+
+async def _run_temporary_cleanups(cleanups) -> None:
+    for cleanup in cleanups:
+        try:
+            result = cleanup()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("Superseded turn's temporary cleanup failed", exc_info=True)
 _NO_ATTENDED_ACTIVITY_STAMP = object()
 # Bound on the hygiene gate's wait for a cooldown write scheduled by an unwinding or deferred attempt.
 _HYGIENE_PENDING_COOLDOWN_WAIT_S = 10.0
@@ -2429,6 +2442,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # Fix for #18765.
         if not _intentional_silence:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
+            if agent_result.get("failed"):
+                log_private_failure(logger, operation="agent turn", reason=agent_result.get("failure_reason"),
+                                    session_id=getattr(session_entry, "session_id", None))
             response = _sanitize_gateway_final_response(
                 source.platform, response, interrupted=bool(agent_result.get("interrupted")),
             )
@@ -2779,8 +2795,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 # The provider may have compressed the full history in-place. RAM replaces
                 # the private transcript without creating a persistent child or summary.
                 await self.async_session_store.rewrite_transcript(sid, agent_messages)
-                await self._hmwa_store_turn_prompt_tokens(session_key, session_entry.session_key, agent_result)
-                await self._refresh_agent_cache_message_count(session_key, len(agent_messages))
+                await self._hmwa_store_turn_prompt_tokens(
+                    store, session_entry.session_key, session_key, agent_result.get("last_prompt_tokens", 0),
+                    getattr(prepared, "hygiene_adoption_epoch", 0),
+                    touch_activity=not bool(getattr(event, "internal", False)),
+                )
+                await self._refresh_agent_cache_message_count(session_key, sid)
                 return
             agent_persisted = False
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
@@ -3014,6 +3034,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # A private turn's record above is redacted whole; keep a content-free class for diagnosis.
+        log_private_failure(logger, e, operation="agent turn", session_id=getattr(session_entry, "session_id", None))
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
@@ -3069,12 +3091,19 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         ))
 
     def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
-        """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
+        """A newer run generation superseded this turn: drop its deferred post-delivery callback,
+        except the part that deletes its temporary progress cards, which still runs."""
         logger.info(
             "Discarding stale agent result for %s — generation %d is no longer current",
             _quick_key or "?", run_generation,
         )
-        self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
+        callback = self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
+        from gateway.platforms.base import temporary_cleanups
+        cleanups = temporary_cleanups(callback)
+        if cleanups:
+            task = asyncio.get_running_loop().create_task(_run_temporary_cleanups(cleanups))
+            _STALE_CLEANUP_TASKS.add(task)
+            task.add_done_callback(_STALE_CLEANUP_TASKS.discard)
 
     @dataclasses.dataclass
     class _PreparedTurn:
@@ -5166,6 +5195,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     callback_result = callback()
                     if inspect.isawaitable(callback_result):
                         await callback_result
+            if pending_event is not None:
+                # The queued follow-up's turn starts now: its busy ack has done its job.
+                from gateway.platforms.base import release_temporary_notices
+                await release_temporary_notices(pending_event)
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -5289,6 +5322,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             _head_origin = bound_turn_origin()
             if pending_event is not None:
                 set_turn_origin(turn_origin_for_event(pending_event))
+                # In-band turns bypass the inbound slot claim. Keep the conversation clock on
+                # the latest actual input, like its terminal goal identity; never restore the head.
+                self._session_state(next_session_key).conversation.last_turn_started_at = time.time()
             _consumed_events = (
                 (pending_event, *getattr(pending_event, "_hermes_absorbed_events", ()))
                 if pending_event is not None else ()
@@ -5573,6 +5609,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             logger.info("Temp bubble cleanup complete for session %s: requested=%d deleted=%d failed=%d",
                         key, len(snapshot), deleted, len(failures))
 
+        cleanup._temporary_cleanup = True
         owner.register_post_delivery_callback(key, cleanup, generation=turn_ctx.run_generation)
         turn_ctx._post_delivery_adapter = owner
         turn_ctx._bubble_cleanup_registered = True

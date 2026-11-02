@@ -1768,7 +1768,7 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
 
 def switch_model(
     raw_input: str, current_provider: str, current_model: str, current_base_url: str = "",
-    current_api_key: str = "", is_global: bool = False, explicit_provider: str = "",
+    current_api_key: str = "", is_global: bool = False, explicit_provider: str | None = "",
     user_providers: dict | None = None, custom_providers: list | None = None) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1776,6 +1776,8 @@ def switch_model(
     step returns a failure :class:`ModelSwitchResult` to stop the chain, or ``None`` to continue.
     ``user_providers`` / ``custom_providers`` are the config.yaml ``providers:`` dict and
     ``custom_providers:`` list."""
+    # Callers without a --provider flag may pass None; every route step strips this string.
+    explicit_provider = explicit_provider or ""
     st = _Switch(
         raw_input=raw_input, current_provider=current_provider, current_model=current_model,
         current_base_url=current_base_url, current_api_key=current_api_key, is_global=is_global,

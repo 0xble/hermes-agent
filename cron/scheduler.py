@@ -3425,6 +3425,8 @@ def _finish_completed_run(
         # If the drain completed before this run's bookkeeping, now that the
         # canonical completion id is stored, settle the job record as well.
         settle_quietly(job["id"], execution_id)
+    from cron.scheduler_authority import retire_completed_journal
+    retire_completed_journal(job['id'], execution_id)
     return True
 
 

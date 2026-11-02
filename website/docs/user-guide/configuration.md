@@ -1431,6 +1431,10 @@ goals:
 
 `goals.notices` (fork setting) defaults to `true` and is read separately for each profile. Set it to `false` to hide routine goal lifecycle output, including judge verdicts, continuation/resume/pause notices, autonomous session-control notices, `/goal set` confirmations and drafting progress, and persisted `goal_set` receipts. Goal execution, continuation admission and cleanup still run. Explicit `/goal status` and `/goal show` replies, command errors and approval requests remain visible. Loop receipts and loop completion output are unaffected.
 
+Set `goals.notices` to `hidden` (`hermes config set goals.notices hidden`) to also hide approval cards and every session-control receipt for goals. An approval that would need a hidden card is refused at once, so the agent asks in chat and passes your words as its quote. A hidden blocked, paused or failed card wakes the session instead, so the agent deals with it or tells you in its own reply. Replies to your own `/goal` commands, including the set confirmation, and the agent's own replies stay visible. `loops.notices` takes the same 3 values for loops. See [Loops](./features/loops.md#configuration).
+
+Under `goals.autonomy` the agent cannot resume a goal you paused, including with `/stop`. It resumes only its own pauses, or yours when you tell it to.
+
 `goals.auto_notices` (fork setting) controls whether a goal the agent sets or extends through the `goal_set` tool is announced with its committed text and completion contract. It applies when `goals.notices` is enabled. Turning off `auto_notices` alone does not hide `/goal` replies or judge verdicts.
 
 `goals.autonomy` defaults to `false`, preserving the judge and approval behavior above. When `true`, the supporting `goal_set` plugin can set, revise, replace, pause, resume and complete goals without approval. Clear remains user-only. Completion requires a mapping from every verification criterion to recorded proof, passing quality gates and no recorded hard-limit breach. Refusals leave the goal active and name the gap in history and `/goal status`.

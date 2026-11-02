@@ -430,7 +430,9 @@ class SessionAuthority:
         live = self.sessions[ref.session_id]
         live.rescan = True
         if live.task is None or live.task.done():
-            live.task = asyncio.create_task(self._drain(ref))
+            # Admission can schedule this from a busy ingress task; ingress-only state stays there.
+            from gateway.run import without_prepared_authorization_scope
+            live.task = asyncio.create_task(self._drain(ref), context=without_prepared_authorization_scope())
             live.task.add_done_callback(_log_drain_failure)
             from gateway.session_runtime_workers import persist_work_count
             live.task.add_done_callback(lambda task: persist_work_count(self, task))
@@ -1236,6 +1238,9 @@ class SessionAuthority:
                 if outcome == 'settled_unknown':
                     self.deferred_resets.pop(live.route, None)  # no settlement follows, as below
                     continue
+                from gateway.session_settlement_recovery import requeue_shutdown_unstarted
+                if await requeue_shutdown_unstarted(self, ref, live, row):
+                    continue  # the next claim refuses (runtime_draining) and pauses this FIFO
             except BaseException as exc:
                 # No settlement follows (a lost managed worker, a cancelled drain): the turn is never
                 # replayed, so its deferred reset is dropped (the next turn re-detects the overflow),

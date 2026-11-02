@@ -379,6 +379,48 @@ def revert_steer_input(db, *, epoch: int, admission_id: str, generation: int) ->
     return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result=False)
 
 
+def requeue_unstarted_claim(db, *, epoch: int, admission_id: str, generation: int, transfers=(),
+                            transcript_mark: int | None = None) -> bool:
+    """A claim this owner's own shutdown interrupted before its first model call ran nothing, so it goes
+    back to its FIFO place (``seq``) for the next owner to run once, like an undelivered steer; the
+    steers handed to it go back to theirs. ``recover_session_inputs`` only fences ``started`` rows, so
+    the successor drains it as ordinary committed input. The turn's own transcript rows after
+    ``transcript_mark`` (its user row and the core closer's failed-turn boundary) are archived so the
+    replay writes the input once; any other row there leaves the transcript as it is. False when the
+    claim is no longer this owner's started generation (settled, fenced or discarded meanwhile)."""
+    def write(conn):
+        _epoch(conn, epoch)
+        row = _admission(conn, admission_id)
+        if row['status'] != 'started' or row['owner_epoch'] != epoch or row['generation'] != generation:
+            return False
+        conn.execute("UPDATE session_admissions SET status='queued',outcome=NULL,generation=NULL "
+                     "WHERE admission_id=?", (admission_id,))
+        for transfer in transfers or ():
+            _requeue_transfer(conn, admission_id=transfer, epoch=epoch, generation=generation)
+        if type(transcript_mark) is int:
+            _archive_unstarted_turn(db, conn, row['target_session_id'], transcript_mark)
+        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
+        return True
+    return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result=False)
+
+
+def _archive_unstarted_turn(db, conn, session_id: str, mark: int) -> None:
+    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
+    from hermes_state_local_lineage import local_physical_target
+    from hermes_state_messages import _SET_COUNTERS_SQL
+    target = _canonical_chain(conn, local_physical_target(conn, session_id))[-1]
+    rows = conn.execute("SELECT id, role, display_kind, observed, _compressed_summary FROM messages "
+                        "WHERE session_id=? AND active=1 AND id>? ORDER BY id", (target, mark)).fetchall()
+    # Only the exact shape a turn leaves without a model call: its one input row, then at most the
+    # core closer's boundary. A compaction handoff, a steer or any other row means more happened.
+    if not rows or len(rows) > 2 or rows[0][1] != 'user' or rows[0][3] or rows[0][4] or (
+            len(rows) == 2 and (rows[1][1] != 'assistant' or rows[1][2] != FAILED_TURN_DISPLAY_KIND)):
+        return
+    ids = [r[0] for r in rows]
+    conn.execute(f"UPDATE messages SET active=0 WHERE id IN ({','.join('?' * len(ids))})", ids)
+    conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?", (*db._active_transcript_counts(conn, target), target))
+
+
 REPLACEMENT_PREFIX = 'gateway.queued_replacement.v1.'
 
 

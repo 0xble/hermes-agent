@@ -420,7 +420,7 @@ async def test_autonomous_control_replay_uses_native_routing_and_outbox(home, ac
         manager = GoalManager(entry.session_id)
         manager.set("watch the build")
         if action == "resume":
-            manager.pause("waiting")
+            manager.pause("waiting", by="agent")  # the agent's own pause: an autonomous resume never lifts a user one
         db = _get_session_db()
         # A routed session can precede its first model turn. Seed that turn's normal state row.
         if db.get_session(entry.session_id) is None:

@@ -4,6 +4,8 @@ import json
 import os
 import shlex
 import sys
+import threading
+import time
 
 import pytest
 
@@ -152,5 +154,104 @@ print("completed")
         assert "completed" in result["output"]
         assert "session_id" not in result
     finally:
+        os.close(fd)
+        env.cleanup()
+
+
+@pytest.mark.parametrize(("via_code", "cell_timeout", "terminal_timeout", "cell_delay"), [
+    (False, 30, 2, 0), (True, 30, 2, 0), (True, 4, 30, 0), (True, 4, 30, 1.25),
+])
+@pytest.mark.parametrize("admit", [False, True])
+def test_cron_waits_inline_until_admission_or_its_own_timeout(
+    tmp_path, monkeypatch, via_code, cell_timeout, terminal_timeout, cell_delay, admit,
+):
+    from gateway.session_context import preserved_session_context, set_turn_origin
+    from tools.code_execution_tool import execute_code
+    from tools.code_kernel import shutdown_all_kernels
+
+    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
+    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    monkeypatch.setenv("HERMES_TURN_ORIGIN", "user")  # task-local provenance wins
+    ticket, started, release = (tmp_path / name for name in ("ticket", "started", "release"))
+    os.mkfifo(release)
+    fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+    helper = _executable(tmp_path / "heavy-slot", f'''#!{sys.executable}
+import os, sys
+from pathlib import Path
+assert not os.environ.get("HEAVY_SLOT_MAX_WAIT")
+Path({str(ticket)!r}).touch()
+with open({str(release)!r}, "rb", buffering=0) as stream:
+    stream.read(1)
+args = sys.argv[sys.argv.index("--") + 1:]
+os.execvp(args[0], args)
+''')
+    runner = _executable(tmp_path / "pytest", f"#!/bin/sh\ntouch {shlex.quote(str(started))}\nprintf 'completed\\n'\n")
+    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _: str(helper))
+    # Exercise both automatic promotion paths without a multi-minute test.
+    monkeypatch.setattr(terminal_tool, "_FOREGROUND_HEAVY_SLOT_WAIT_CAP", 0)
+    monkeypatch.setattr(terminal_tool, "FOREGROUND_MAX_TIMEOUT", 1)
+    monkeypatch.setattr(terminal_tool, "spawn_background_process", lambda **_: pytest.fail("cron must stay inline"))
+    monkeypatch.setattr(terminal_tool, "yield_to_background_handler", lambda **_: pytest.fail("cron must not adopt"))
+    env = LocalEnvironment(cwd=str(tmp_path))
+    wait_for_process = env._wait_for_process
+    terminal_done = threading.Event()
+
+    def wait_for_ticket(*args, **kwargs):
+        assert kwargs.get("yield_after_seconds") is None
+        assert "yield_handler" not in kwargs
+        assert wait_until(ticket.exists, timeout=5)
+        if admit:
+            os.write(fd, b"x")
+        try:
+            return wait_for_process(*args, **kwargs)
+        finally:
+            terminal_done.set()
+
+    monkeypatch.setattr(env, "_wait_for_process", wait_for_ticket)
+    monkeypatch.setattr(terminal_tool, "_acquire_env", lambda *_: env)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "local", "cwd": str(tmp_path), "timeout": 2, "host_cwd": None,
+    })
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", lambda *_, **__: {"approved": True})
+    monkeypatch.setattr("tools.code_execution_tool._load_config", lambda: {"mode": "strict", "timeout": cell_timeout})
+    command = f"{shlex.quote(str(runner))} -q tests"
+    try:
+        with preserved_session_context():
+            set_turn_origin("cron")
+            if via_code:
+                from model_tools import discover_builtin_tools
+                discover_builtin_tools()
+                cell = (
+                    "from hermes_tools import terminal\nimport json, threading\n"
+                    f"threading.Event().wait({cell_delay})\n"
+                    f"print(json.dumps(terminal({command!r}, timeout={terminal_timeout})))"
+                )
+                cell_start = time.monotonic()
+                response = json.loads(execute_code(cell, task_id="cron-admission"))
+                elapsed = time.monotonic() - cell_start
+                if terminal_timeout > cell_timeout and not admit:
+                    # Release admission AFTER the cell returned. A stranded RPC must
+                    # not execute the payload now that the caller may have retried.
+                    os.write(fd, b"x")
+                    assert terminal_done.wait(10), response
+                    assert not started.exists(), response
+                    assert elapsed < cell_timeout, response
+                assert response["status"] == "success", response
+                result = json.loads(response["output"])
+            else:
+                result = json.loads(terminal_tool.terminal_tool(command, timeout=terminal_timeout, task_id="cron-admission", force=True))
+        assert "session_id" not in result, result
+        assert "promoted_from_foreground" not in result, result
+        if admit:
+            assert result["exit_code"] == 0, result
+            assert started.exists()
+            assert "completed" in result["output"]
+        else:
+            assert result["exit_code"] == 124, result
+            assert "not started" in result["output"]
+            assert "waiting for heavy-slot admission" in result["output"]
+            assert not started.exists()
+    finally:
+        shutdown_all_kernels()
         os.close(fd)
         env.cleanup()

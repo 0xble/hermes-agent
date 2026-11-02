@@ -601,22 +601,27 @@ class GatewayBusySessionMixin:
             return reply_anchor if event.source.chat_type == "dm" else None
         return None if getattr(event, "internal", False) else event.message_id
 
-    async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False) -> None:
-        """Send a busy-path reply anchored to the event (thread metadata included)."""
+    async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False,
+                               temporary: bool = False) -> None:
+        """Send a busy-path reply anchored to the event (thread metadata included). A *temporary* one
+        is deleted once the event's own turn has delivered its reply (``release_temporary_notices``)."""
         reply_anchor = self._reply_anchor_for_event(event)
-        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class, track_temporary_notice
         from agent.notice_style import notice_metadata
 
         async def labelled_send():
             # A busy reply is a non-final notice: the first shed after cosmetics when the chat's
             # daily volume runs low. The label is set where the send runs, including a spawned task.
             with outbound_class(OUTBOUND_NOTICE):
-                return await adapter._send_with_retry(
+                result = await adapter._send_with_retry(
                     chat_id=event.source.chat_id, content=content,
                     reply_to=reply_anchor if plain_anchor else self._busy_reply_to(event, reply_anchor),
                     metadata=notice_metadata(self._thread_metadata_for_source(event.source, reply_anchor),
                                              platform=event.source.platform, style=getattr(content, "notice_style", None)),
                 )
+            if temporary:
+                track_temporary_notice(event, adapter, result)
+            return result
 
         send = labelled_send()
         # On the platform's update consumer, never wait out the chat's outbound budget: every later
@@ -951,6 +956,9 @@ class GatewayBusySessionMixin:
             head, tail = t("gateway.busy.interrupting_head"), t("gateway.busy.interrupting_tail")
         from agent.notice_style import ContextNotice
         message = ContextNotice(t("gateway.busy.ack", head=head, detail=status_detail, tail=tail))
+        # A queued or interrupting follow-up becomes a turn of its own, so its ack is status that
+        # goes once that turn's reply is delivered. A steer folds into the running turn: it stays.
+        message._temporary = not (is_steer_mode or is_redirect_mode)
 
         # One-time onboarding hint about the queue/interrupt knob (flag persisted to config.yaml).
         try:
@@ -962,7 +970,7 @@ class GatewayBusySessionMixin:
                     else "redirect" if is_redirect_mode
                     else "interrupt"
                 )
-                message = ContextNotice(f"{message}\n\n{busy_input_hint_gateway(_hint_mode)}")
+                message = ContextNotice(f"{message}\n\n{busy_input_hint_gateway(_hint_mode)}")  # stays: a one-time hint
                 mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
         except Exception as _onb_err:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
@@ -970,7 +978,7 @@ class GatewayBusySessionMixin:
 
     async def _send_busy_ack_reply(self, event: MessageEvent, adapter, message: str) -> None:
         try:
-            await self._send_busy_reply(event, adapter, message)
+            await self._send_busy_reply(event, adapter, message, temporary=getattr(message, "_temporary", False))
             event._gateway_busy_ack_sent = True
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)

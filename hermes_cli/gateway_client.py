@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 import json
 import os
 from pathlib import Path
@@ -217,7 +217,13 @@ class GatewayClient:
         try:
             await self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
             budget = DEFAULT_RPC_TIMEOUT if _timeout is None else _timeout
-            return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+            try:
+                return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+            except TimeoutError as exc:
+                identity = " ".join(f"{key}={params[key]}" for key in
+                                    ("job_id", "request_id", "admission_id", "session_id", "execution_id")
+                                    if key in params)
+                raise TimeoutError(f"{method} phase=answer timeout={budget}s {identity}") from exc
         finally:
             self.pending.pop(rid, None)
 
@@ -299,17 +305,15 @@ async def connect_gateway(endpoint=None, subject=None):
         endpoint = result.endpoint
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
-    try:
-        # The gateway is a loopback (or explicitly named) peer, never something to route through the
-        # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
-        # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
-        async with connect(url, subprotocols=protocols, open_timeout=10, max_size=8 * 1024 * 1024,
-                           proxy=None) as ws:
-            if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
-                raise GatewayClientError("Gateway protocol mismatch; update/restart required")
-            async with GatewayClient(ws) as client:
-                yield client
-    except GatewayClientError:
-        raise
-    except (OSError, TimeoutError) as exc:
-        raise GatewayClientError("Gateway connection failed; no local fallback") from exc
+    async with AsyncExitStack() as stack:
+        try:
+            # A loopback peer must not be routed through the user's HTTP(S) proxy.
+            ws = await stack.enter_async_context(connect(
+                url, subprotocols=protocols, open_timeout=10, max_size=8 * 1024 * 1024, proxy=None))
+        except (OSError, TimeoutError) as exc:
+            raise GatewayClientError("Gateway connection failed; no local fallback") from exc
+        if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
+            raise GatewayClientError("Gateway protocol mismatch; update/restart required")
+        async with GatewayClient(ws) as client:
+            # Caller I/O and RPC receipt failures are not connection-establishment failures.
+            yield client

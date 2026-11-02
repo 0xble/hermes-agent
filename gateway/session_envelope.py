@@ -98,6 +98,9 @@ def _adapter_event(event, **changes):
     Any other non-list still reaches ``_validate_native`` and refuses."""
     changes.update({name: [] for name in _MEDIA_FIELDS if getattr(event, name) is None})
     projected = replace(event, **changes) if changes else event
+    for name in ('_attended_activity_received_at', '_attended_activity_marked'):
+        if hasattr(event, name):
+            setattr(projected, name, getattr(event, name))
     from gateway.session_synthetic import is_synthetic, mark_synthetic
     if is_synthetic(event):
         mark_synthetic(projected)
@@ -267,6 +270,11 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                 'route': runner.session_store._generate_session_key(event.source),
                 'event': deepcopy({name: getattr(event, name) for name in _EVENT_FIELDS}),
                 'timestamp': event.timestamp.isoformat()}
+    if (received_at := getattr(event, '_attended_activity_received_at', None)) is not None:
+        # Receipt metadata survives the FIFO, including a restart, but is not delivery identity.
+        envelope['attended_activity'] = {
+            'received_at': received_at, 'marked': bool(getattr(event, '_attended_activity_marked', False)),
+        }
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -310,6 +318,7 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
         if entry is not None:
             legacy = deepcopy(payload)
             legacy['native_text_v1'].pop('provenance')
+            legacy['native_text_v1'].pop('attended_activity', None)
             for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
                 if row['request_id'] == event.message_id and row['payload'] == legacy:
                     return legacy
@@ -344,6 +353,9 @@ def restore_native(payload, runner=None):
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),
                         **deepcopy(envelope['event']))
+    if activity := envelope.get('attended_activity'):
+        event._attended_activity_received_at = activity['received_at']
+        event._attended_activity_marked = activity['marked']
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):

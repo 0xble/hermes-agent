@@ -7,6 +7,7 @@ files via ``env.execute()``.
 """
 
 import base64
+from contextvars import ContextVar
 import json
 import logging
 import secrets
@@ -20,6 +21,10 @@ from tools.registry import tool_error
 
 # Logger name kept as the origin module's so existing log expectations hold.
 logger = logging.getLogger("tools.code_execution_tool")
+
+# Host monotonic deadline, never supplied by sandbox code. Context follows each
+# cell through CellAuthority or the per-cell remote RPC thread.
+cell_deadline: ContextVar[float | None] = ContextVar("execute_code_cell_deadline", default=None)
 
 # Terminal parameters that must not be used from ephemeral sandbox scripts.
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release", "survive_restart"}
@@ -221,10 +226,11 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
 
 def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_call_counter: list,
                    max_tool_calls: int, allowed_tools: frozenset, stop_event: threading.Event,
-                   rpc_token: str):
+                   rpc_token: str, deadline: float | None = None):
     """Poll the remote filesystem for request files and answer them. Background thread; each
     ``env.execute()`` is an independent process, so this is safe alongside the script-execution
     thread. Malformed or unauthorized requests are removed without a response."""
+    cell_deadline.set(deadline)
     dispatch = _default_dispatch(task_id)
     poll_interval = 0.1
     quoted_rpc_dir = shlex.quote(rpc_dir)

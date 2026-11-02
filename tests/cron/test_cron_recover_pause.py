@@ -1,5 +1,9 @@
-"""Receipt recovery: a ``missing`` admission is a definite non-admission (booked failed, never a
-pause), and a verified terminal receipt lifts the pause its own ``CronExecutionUnknown`` caused."""
+"""A missing lookup cannot fence a still-committing submit: retain the journal and uncertainty.
+
+This corrects the former missing-is-definite contract: recover is only a snapshot, not a
+cancellation or a proof of non-admission. A verified terminal receipt still lifts only the
+pause its own uncertainty caused, never an operator's later pause.
+"""
 from contextlib import asynccontextmanager
 import json
 
@@ -28,8 +32,8 @@ def _foreign_journal(job, fire):
     return journal
 
 
-def test_missing_admission_is_booked_failed_not_paused(tmp_path, monkeypatch):
-    """The firer died after writing its journal but before the owner admitted the fire."""
+def test_missing_admission_keeps_the_fire_unverified_until_a_terminal_receipt(tmp_path, monkeypatch):
+    """Even a dead firer can leave a shielded submit in flight on the owner."""
     _peer(monkeypatch, lambda method: {'status': 'missing', 'result': None})
     with jobs.use_cron_store(tmp_path / 'cron'):
         job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
@@ -38,9 +42,18 @@ def test_missing_admission_is_booked_failed_not_paused(tmp_path, monkeypatch):
         journal = _foreign_journal(job, fire)
         scheduler_authority.reconcile_pending()
         saved = jobs.get_job(job['id'])
-        assert saved['state'] != 'paused' and saved['enabled'] is True
-        assert saved['last_status'] == 'error'
-        assert executions.get_execution(fire)['status'] == 'failed'
+        assert saved['state'] == 'paused' and saved['enabled'] is False
+        assert saved.get('last_status') != 'error'
+        assert executions.get_execution(fire)['status'] == 'running'
+        assert journal.exists()
+        pause = json.loads(journal.read_text())['pause_recorded']
+        scheduler_authority.reconcile_pending()
+        assert json.loads(journal.read_text())['pause_recorded'] == pause
+        _peer(monkeypatch, lambda method: {'status': 'terminal', 'job': job,
+                                           'result': [True, 'document', 'answer', None]})
+        scheduler_authority.reconcile_pending()
+        assert jobs.get_job(job['id'])['state'] == 'scheduled'
+        assert executions.get_execution(fire)['status'] == 'completed'
         assert not journal.exists()
 
 

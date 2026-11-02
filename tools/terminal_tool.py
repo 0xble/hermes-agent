@@ -29,6 +29,8 @@ import atexit
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Callable
 
+from gateway.session_context import bound_turn_origin
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,13 +75,19 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
         return default
 
 
-# Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
+# Interactive foreground timeout cap; cron keeps its requested deadline inline.
+# Override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
 
-# Foreground heavy-work budget: hand the live shell to the background registry.
+# Interactive foreground heavy-work budget: hand the live shell to the background registry.
 # The helper waits without expiry, so FIFO age and earlier shell side effects survive.
 _FOREGROUND_HEAVY_SLOT_WAIT_CAP = 120
 _FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
+
+# The backend starts its relative timer after shell setup, then polls (up to 0.2s)
+# and tears down the process tree / drains output before the cell RPC can reply.
+# Flooring alone can leave almost no slack; reserve a full second even then.
+_CRON_CELL_CLEANUP_MARGIN_S = 1.0
 
 
 def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
@@ -89,7 +97,7 @@ def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
 
 def _heavy_slot_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
     """Foreground local heavy calls hand off at this budget without expiring their ticket."""
-    if background or env_type != "local":
+    if background or env_type != "local" or bound_turn_origin() == "cron":
         return None
     return _foreground_heavy_slot_max_wait(effective_timeout)
 
@@ -1280,7 +1288,7 @@ def _plan_execution(
             guidance = _foreground_background_guidance(command)
             if guidance:
                 raise _Rejected(_error_json(guidance, status="error"))
-            if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+            if timeout and timeout > FOREGROUND_MAX_TIMEOUT and bound_turn_origin() != "cron":
                 promoted = timeout
     else:
         auto_bg = None
@@ -1362,7 +1370,8 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
 def _yield_kwargs(command: str, **ctx) -> dict:
     """``env.execute`` kwargs enabling yield-to-background (local backend only)."""
     from agent.incognito import is_incognito
-    if is_incognito():
+    # Neither private sessions nor scheduled turns can persist an adopted command.
+    if is_incognito() or bound_turn_origin() == "cron":
         return {}
     handler = yield_to_background_handler(command=command, **ctx)
     return {"yield_handler": handler} if handler is not None else {}
@@ -1403,6 +1412,19 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
+            from tools.code_execution_rpc import cell_deadline
+            deadline = cell_deadline.get()
+            if bound_turn_origin() == "cron" and deadline is not None:
+                # Recompute per attempt from the absolute host deadline: setup/retries
+                # and earlier calls spent this budget. Leave explicit cleanup/reply slack
+                # BEFORE rounding down; a fractional remainder is not a safety margin.
+                effective_timeout = min(
+                    effective_timeout, int(deadline - time.monotonic() - _CRON_CELL_CLEANUP_MARGIN_S),
+                )
+                if effective_timeout <= 0:
+                    return _error_json(
+                        "Command not started: execute_code cell deadline expired", exit_code=124,
+                    )
             result = env.execute(
                 execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
@@ -1434,6 +1456,11 @@ def _run_foreground(
             "pid": result.get("pid"), "notify_on_complete": True,
             "note": _HEAVY_SLOT_YIELDED_NOTE if result.get("yield_reason") == "heavy_slot_wait" else _YIELDED_NOTE,
         }, ensure_ascii=False)
+    if (bound_turn_origin() == "cron" and result.get("hermes_timed_out")
+            and yield_when is not None and yield_when()):
+        result["output"] = result.get("output", "") + (
+            "\n[Heavy command not started: terminal timeout expired while waiting for heavy-slot admission]"
+        )
     from agent.incognito import is_incognito
     if metered and not is_incognito(session_id):
         record_terminal_outcome(command, env_type, result)
@@ -1706,7 +1733,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds (default 180, foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Above {FOREGROUND_MAX_TIMEOUT}s the command runs as a tracked background process with notify_on_complete=true (the result says so; do not re-run it).",
+                "description": f"Max seconds (default 180, interactive foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Interactive calls above {FOREGROUND_MAX_TIMEOUT}s run as tracked background processes with notify_on_complete=true (the result says so; do not re-run them). Cron foreground calls wait inline for heavy-slot admission and completion until their timeout, bounded by the enclosing code cell deadline when present; they are not automatically backgrounded.",
                 "minimum": 1
             },
             "workdir": {

@@ -640,7 +640,8 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
             args=(env, f"{sandbox_dir}/rpc", effective_task_id, tool_call_log, tool_call_counter,
-                  max_tool_calls, sandbox_tools, stop_event, rpc_token))
+                  max_tool_calls, sandbox_tools, stop_event, rpc_token),
+            kwargs={"deadline": time.monotonic() + timeout if timeout else None})
         rpc_thread.start()
         # The token travels in a sourced env file, never in argv. No umask on
         # the launch command: the 700 dirs + explicit 0600 writes cover Hermes'

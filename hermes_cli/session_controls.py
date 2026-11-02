@@ -509,7 +509,11 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
         autonomous = (authority or {}).get("via") == "autonomy"
-        result = manager.resume(reset_budget=not autonomous, user_override=not autonomous)
+        if autonomous and manager.state.paused_by != "agent":
+            # A /goal pause, /stop, Ctrl+C, quoted or system pause is the user's to lift.
+            return {"result": _user_paused(manager.state, "goal"), "state": manager.state}
+        result = manager.resume(reset_budget=not autonomous, user_override=not autonomous,
+                                by="agent" if autonomous else "user")
         if result is None:
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
@@ -1014,15 +1018,27 @@ def _goal_replace_failure(target_sid: str, *, cursor=None) -> Optional[dict[str,
     }
 
 
+def _lifecycle_autonomy(kind: str) -> bool:
+    """``goals.autonomy`` or ``loops.autonomy``: the agent controls that lifecycle without approval."""
+    from hermes_cli.goals_autonomy import autonomy_enabled
+    return kind in {"goal", "loop"} and autonomy_enabled(f"{kind}s")
+
+
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                     reason: str = "", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Create a pending request, or apply an autonomous goal control immediately."""
-    from hermes_cli.goals_autonomy import goal_autonomy_enabled
-    if kind == "goal" and goal_autonomy_enabled():
+    """Create a pending request, or apply an autonomous goal or loop control immediately."""
+    if _lifecycle_autonomy(kind):
         return apply_control(kind, action, target_sid, requester_sid=requester_sid,
                              reason=reason, payload=payload)
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
+    from hermes_cli.goal_notices import lifecycle_cards_hidden
+    if lifecycle_cards_hidden(kind):
+        # Nobody would see the card, so a pending request could only expire. Refuse now so the
+        # requester learns at once and asks in conversation instead.
+        return {"ok": False, "error_code": "approval_cards_hidden",
+                "error": (f"{kind} approval cards are hidden ({kind}s.notices: hidden). Ask the user "
+                          "in chat, then pass their exact words as user_quote")}
     payload = _check_payload(kind, action, payload)
     target_sid = resolve_target(target_sid)
     if not _has_gateway_route(target_sid):
@@ -1066,9 +1082,8 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     """
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
-    from hermes_cli.goals_autonomy import goal_autonomy_enabled
-    autonomous_goal = kind == "goal" and goal_autonomy_enabled()
-    if autonomous_goal and action == "clear":
+    autonomous = _lifecycle_autonomy(kind)
+    if autonomous and action == "clear":
         return {"ok": False, "error_code": "user_only", "error": "Only the user can clear a goal with /goal clear"}
     try:
         payload = _check_payload(kind, action, payload)
@@ -1122,13 +1137,14 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         return {"ok": not bool(code), "status": record["status"], "record": record,
                 **({"error_code": code, "error": code} if code else {}), **result}
 
-    if autonomous_goal:
-        # No route/approval requirement: goal writes use the same transaction and wake receipt.
-        # Replacement is an agent edit, so every existing requirement still binds.
+    if autonomous:
+        # No route/approval requirement: goal and loop writes use the same transaction and wake
+        # receipt. Replacement is an agent edit, so every existing requirement still binds.
         def apply_autonomous(conn):
             authority = {"via": "autonomy", "session_id": str(requester_sid), "quote": user_quote}
-            if action == "pause" and user_quote:
-                # Only a still-current user instruction may suspend automatic waking.
+            if action in {"pause", "resume", "stop"} and user_quote:
+                # Only a still-current user instruction may suspend automatic waking, lift a user
+                # pause, or stop (clear) a loop. Anything else stays the agent's own act.
                 checked = check_user_quote(requester_sid, user_quote, cursor=conn)
                 if not isinstance(checked, str) and _quote_matches_control(
                     kind, action, target_sid, requester_sid,
@@ -1141,7 +1157,7 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         try:
             return _db()._execute_write(apply_autonomous)
         except Exception as exc:
-            logger.warning("autonomous goal control failed", exc_info=True)
+            logger.warning("autonomous %s control failed", kind, exc_info=True)
             return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
 
     # Cross-session goal clear/replace without a quote is intentionally non-blocking and does not
@@ -1404,13 +1420,53 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     return manager.pause(reason=reason or "session-control")
 
 
+def _pause_loop(sid, reason, payload, authority, cursor=None):
+    from hermes_cli.loops import LoopManager
+
+    autonomous = (authority or {}).get("via") == "autonomy"
+    # An agent pause applies only to an active loop and records the agent as its owner.
+    return LoopManager(sid, cursor=cursor).pause(
+        reason=reason or "session-control", by="agent" if autonomous else "user")
+
+
+def _resume_loop(sid, reason, payload, authority, cursor=None):
+    from hermes_cli.loops import LoopManager
+
+    manager = LoopManager(sid, cursor=cursor)
+    if (authority or {}).get("via") != "autonomy":
+        return manager.resume()
+    state = manager.state
+    if state is not None and state.status == "paused" and state.paused_by != "agent":
+        # A user, Ctrl+C or tick-budget pause is the user's to lift.
+        return _user_paused(state, "loop")
+    return manager.resume(by="agent")  # None unless this is the agent's own pause
+
+
+def _stop_loop(sid, reason, payload, authority, cursor=None):
+    from hermes_cli.loops import LoopManager
+
+    manager = LoopManager(sid, cursor=cursor)
+    if (authority or {}).get("via") != "autonomy":
+        return manager.clear()
+    state = manager.state
+    if state is not None and state.status == "paused" and state.paused_by != "agent":
+        return _user_paused(state, "loop")
+    # The agent finishes its loop; clearing it stays a user control.
+    return manager.finish(reason or "agent finished the loop")
+
+
+def _user_paused(state, kind):
+    return {"ok": False, "error_code": "user_paused",
+            "error": f"only the user can lift this {kind} pause ({state.paused_reason or 'paused'})"}
+
+
 CONTROLS = {
     ("goal", "pause"): _pause_goal,
     ("goal", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).resume(),
     ("goal", "clear"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).clear(),
-    ("loop", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).pause(reason=reason or "session-control"),
-    ("loop", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).resume(),
-    ("loop", "stop"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).clear(),
+    ("loop", "pause"): _pause_loop,
+    ("loop", "resume"): _resume_loop,
+    ("loop", "stop"): _stop_loop,
     ("goal", "replace"): None,
 }
 

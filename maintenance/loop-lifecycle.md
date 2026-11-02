@@ -4,7 +4,7 @@ Identity: `loop-lifecycle`
 
 ## Required Behavior
 
-Keep `/loop` agent-editable without allowing an agent to silently make a loop more active than the user's instruction permits. `LoopManager.revise` records versioned changes, requires a verbatim user quote for prompt, stop-condition, faster-cadence, or increased-run authority, and preserves in-flight lifecycle state. `replace` is the explicit full-definition path and always requires user authority; it keeps a paused loop paused because resume is user-only. Switching to self-paced counts as faster whenever the self-paced floor is below the current delay. `/loop wakeup` prompts are runtime text, never a source for a user quote. A wakeup with nothing new to report replies with a bare `[SILENT]`, which every surface hides and which never reaches the `--until` judge (see `internal-notification-silence`).
+Keep `/loop` agent-editable without allowing an agent to silently make a loop more active than the user's instruction permits. `LoopManager.revise` records versioned changes, requires a verbatim user quote for prompt, stop-condition, faster-cadence, or increased-run authority, and preserves in-flight lifecycle state. `replace` is the explicit full-definition path and requires user authority; it keeps a paused loop paused because resuming a user pause is user-only. Both quote requirements lift under `loops.autonomy` (see Autonomy below). Switching to self-paced counts as faster whenever the self-paced floor is below the current delay. `/loop wakeup` prompts are runtime text, never a source for a user quote. A wakeup with nothing new to report replies with a bare `[SILENT]`, which every surface hides and which never reaches the `--until` judge (see `internal-notification-silence`).
 
 Loop/goal overlap guidance uses the scheduler's `goal_blocks_loop_tick` predicate: only an active, non-waiting goal initially defers loop ticks. Parked/waiting, paused, and done goals do not block them, and the warning appears only when the goal currently blocks ticks. In the gateway, an idle active goal can defer a due tick for at most 1 loop interval (the floor for self-paced loops). Existing live-turn and continuation ownership fences still defer the tick at any age. Goal deferral and full-background-gate deferral each log the session and reason at INFO, at most once per session per loop interval. The background gate remains mandatory and leaves refused ticks unclaimed and due.
 
@@ -79,9 +79,38 @@ movement. A cancelled old descriptor never releases a newer loop instance's clai
 
 A due wake defers before claiming whenever another live, admitted, queued or restart-recovering turn owns the conversation. The admission CAS repeats the local ownership check. An owner appearing after successful admission leaves a consumed tick for recovery, never a refunded tick or wake text offered as a human reply. Gateway-authored synthetic events (`internal`) never answer pending clarify, `/update` or slash-confirm prompts, including the adapter's inline clarify bypass. Explicit `/new` retires the old conversation's loop and goal. Compression follows the existing lineage tip and preserves responsibility. `/resume` and topic rebinds are reversible, so a loop whose route resolves to another, non-tip session defers untouched until the route returns; the scanner never retires a loop. A restart marker counts as an owner only inside the auto-resume freshness window. The loop and goal scanners share one stale-marker rule: a stale marker is compare-and-swap cleared before the scan acts, and a refreshed marker wins.
 
+## Autonomy
+
+`loops.autonomy` defaults to `false`, mirroring `goals.autonomy`, and resolves through the same
+profile-scoped `hermes_cli.goals_autonomy.autonomy_enabled` helper. When it is true:
+
+- An agent `revise` may change any field, and `replace` needs no user quote. Each records
+  `authority: "autonomy"` on its revision. A supplied quote is still validated. The
+  `loops.min_interval_seconds` clamp and the self-paced floor still apply.
+- A replacement without the user's words keeps `ticks_fired` and `last_fired_at`, so the
+  `loops.max_ticks` backstop keeps counting. A requested `times` means that many more runs,
+  and the first tick waits for the new interval (or self-paced floor) since the last one. A
+  replacement keeps a paused loop paused.
+- Session-control `pause`, `resume` and `stop` for loops apply at once under `via: autonomy`
+  instead of creating an approval request, the same path autonomous goals use. A current user
+  quote for pause, resume or stop still applies with quote authority.
+- Pause authority lives in `LoopState.paused_by` (`agent`, `user` or `system`), never in the
+  caller-written `paused_reason`. An agent pause applies only to an active loop. An autonomous
+  resume or finish works only on the agent's own pause and refuses any other with
+  `user_paused`, so `/loop pause`, a quoted pause, Ctrl+C and a tick-budget pause stay the
+  user's. An agent resume re-arms no sooner than the full interval since the last tick.
+- An autonomous `stop` finishes an active loop or the agent's own pause: status `done` with the
+  reason, row kept. Clearing stays user-only through `/loop stop`, `/loop clear` or an approved
+  control.
+
+The external `loop-lifecycle` plugin owns the `loop_set` tool. Its pause, resume and stop
+actions reach these controls through `apply_control`. Residual: the plugin's `set` refuses only
+an active or paused loop, so after the agent finishes a loop, a new `set` starts a fresh tick
+budget.
+
 ## Proof Surface
 
-Focused tests cover LoopState compatibility and versioning, authority branches, cadence re-anchoring, preservation of ticks/route/created_at, replacement, status and wakeup text, receipt registry behavior, and stale-manager survival through CLI/TUI completion paths. `tests/hermes_cli/test_loop_settlement.py` covers continue/done/blocked races, stale revisions, legacy entry checks, no-op and commit-edge conflicts, pause/resume ABA, claim cleanup races, same-manager commands after a revision, settlement or claim commit, persistence failures, and ephemeral operation with the real SessionDB. `tests/hermes_cli/test_loop_control_atomic.py` covers stale user controls and revisions against every newer lifecycle, write failures, and cursor-owned claims, settlements and revisions. Run the affected tests through `scripts/run_tests.sh`; run the repository's canonical gate before publication.
+Focused tests cover LoopState compatibility and versioning, authority branches, cadence re-anchoring, preservation of ticks/route/created_at, replacement, status and wakeup text, receipt registry behavior, and stale-manager survival through CLI/TUI completion paths. `tests/hermes_cli/test_loop_settlement.py` covers continue/done/blocked races, stale revisions, legacy entry checks, no-op and commit-edge conflicts, pause/resume ABA, claim cleanup races, same-manager commands after a revision, settlement or claim commit, persistence failures, and ephemeral operation with the real SessionDB. `tests/hermes_cli/test_loop_control_atomic.py` covers stale user controls and revisions against every newer lifecycle, write failures, and cursor-owned claims, settlements and revisions. `tests/hermes_cli/test_loop_autonomy.py` covers autonomous revise and replace inside the floors, replacement keeping the tick budget and cadence, agent pause and resume waiting out the interval, the pause, resume and finish controls, refusal to lift or end a user, quoted, Ctrl+C or tick-budget pause (including a quoted pause whose reason imitates the agent), and default-off quote authority. `tests/gateway/test_loop_interruption_recovery.py` puts `finish` under the execution fence. Run the affected tests through `scripts/run_tests.sh`; run the repository's canonical gate before publication.
 
 `tests/gateway/test_loop_tick_native_settlement.py` exercises real scheduler admission and
 post-turn settlement for `LOOP_COMPLETE`, `NO_REPLY`, `[SILENT]`, and an `--until` verdict.

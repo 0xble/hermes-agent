@@ -74,4 +74,5 @@ async def test_telegram_fifo_runs_task_wakes_once_without_ingress_redelivery(mon
     assert len(await rows()) == 2
     store = Outbox(get_hermes_home())
     for row, (_, _, turn_id) in zip(await rows(), turns):
-        assert store.lookup('default', 'telegram', 'admission:' + row['admission_id'], 'text') == (turn_id, 'completed')
+        claim = f"admission:{row['admission_id']}:{row['generation']}"
+        assert store.lookup('default', 'telegram', claim, 'text') == (turn_id, 'completed')

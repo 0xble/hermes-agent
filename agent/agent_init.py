@@ -1155,7 +1155,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         print("📝 Trajectory saving enabled")
     if agent.ephemeral_system_prompt:
         prompt_preview = agent.ephemeral_system_prompt[:60] + "..." if len(agent.ephemeral_system_prompt) > 60 else agent.ephemeral_system_prompt
-        print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
+        agent._safe_print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
     if agent._use_prompt_caching:
         if agent._use_native_cache_layout and agent.provider == "anthropic":
             source = "native Anthropic"

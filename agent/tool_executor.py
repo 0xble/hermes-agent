@@ -1025,10 +1025,10 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
     if _tool_progress_enabled(agent):
         prefix = f"Tool {display_index}" if display_index is not None else "Tool"
         if agent.verbose_logging:
-            print(f"  📞 {prefix}: {function_name}({list(display_args.keys())})")
-            print(agent._wrap_verbose("Args: ", json.dumps(display_args, indent=2, ensure_ascii=False)))
+            agent._safe_print(f"  📞 {prefix}: {function_name}({list(display_args.keys())})")
+            agent._safe_print(agent._wrap_verbose("Args: ", json.dumps(display_args, indent=2, ensure_ascii=False)))
         else:
-            print(f"  📞 {prefix}: {function_name}({list(function_args.keys())}) - {_preview(json.dumps(display_args, ensure_ascii=False), agent.log_prefix_chars)}")
+            agent._safe_print(f"  📞 {prefix}: {function_name}({list(function_args.keys())}) - {_preview(json.dumps(display_args, ensure_ascii=False), agent.log_prefix_chars)}")
 
     agent._current_tool = function_name
     agent._touch_activity(f"executing tool: {function_name}")
@@ -1245,10 +1245,10 @@ def _preview(text: str, limit: int) -> str:
 def _print_tool_completed(agent, index: int, tool_duration: float, result) -> None:
     """Non-quiet ``✅ Tool N completed`` line (full result under verbose logging)."""
     if agent.verbose_logging:
-        print(f"  ✅ Tool {index} completed in {tool_duration:.2f}s")
-        print(agent._wrap_verbose("Result: ", result))
+        agent._safe_print(f"  ✅ Tool {index} completed in {tool_duration:.2f}s")
+        agent._safe_print(agent._wrap_verbose("Result: ", result))
     else:
-        print(f"  ✅ Tool {index} completed in {tool_duration:.2f}s - {_preview(result if isinstance(result, str) else str(result), agent.log_prefix_chars)}")
+        agent._safe_print(f"  ✅ Tool {index} completed in {tool_duration:.2f}s - {_preview(result if isinstance(result, str) else str(result), agent.log_prefix_chars)}")
 
 
 # ── Concurrent batch machinery ──────────────────────────────────────────────
@@ -1596,7 +1596,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
 
     if agent._interrupt_requested:
-        print(f"{agent.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
+        agent._safe_print(f"{agent.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
         _append_skipped_tool_results(
             agent, messages, tool_calls, effective_task_id,
             content=f"[Tool execution cancelled — {{name}} was skipped. {interrupt_skip_wording(agent)}]",
@@ -1610,7 +1610,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     tool_names_str = ", ".join(pc.name for pc in parsed_calls)
     if _tool_progress_enabled(agent):
-        print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
+        agent._safe_print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
 
     # Resolved before the batch is built so the start-order gate can clamp under the deadline.
     timeout_s = _resolve_concurrent_tool_timeout()

@@ -136,6 +136,8 @@ class CLIChatTurnMixin:
                 self._chat_setup_turn_audio(turn, message, voice_input)
                 # Per-prompt elapsed timer — frozen when the agent thread finishes.
                 self._prompt_start_time = time.time()
+                # Survives settle's timer reset: the goal hook compares wait arming against it.
+                self._last_turn_started_at = self._prompt_start_time
                 self._prompt_duration = 0.0
                 # Daemon: closing the terminal tab (SIGHUP) must not be kept alive by it.
                 agent_thread = threading.Thread(target=self._chat_run_agent, args=(turn, message), daemon=True)

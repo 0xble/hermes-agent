@@ -234,8 +234,7 @@ class GatewaySessionCommandsMixin:
         await self._cleanup_old_agent_for_reset(session_key)
         getattr(self, "_incognito_gateway_snapshots", {}).pop(session_key, None)
         parked = getattr(self, "_incognito_parked_agents", {}).pop(session_key, None)
-        if parked is not None:
-            self._release_evicted_cached_agents([parked])
+        self._release_parked_incognito_agent(session_key, parked)
         self._evict_cached_agent(session_key)
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one
         # funnel call (see _CONVERSATION_SCOPED_STATE in gateway/run.py).
