@@ -79,7 +79,7 @@ def test_native_receipt_clock_does_not_change_retired_retry_identity(tmp_path):
 
     with SessionDB(tmp_path / 'state.db') as db:
         db.create_session('native', source='signal')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         payload = {'text': 'repeatable', 'native_text_v1': {
             'attended_activity': {'received_at': 1800000000.0, 'marked': True},
             'event': {'message_id': 'retry'}, 'context': {'channel_prompt': 'semantic'},

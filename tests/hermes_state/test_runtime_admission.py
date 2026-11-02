@@ -74,7 +74,7 @@ def test_native_activity_is_local_only_at_the_admission_envelope_boundary(tmp_pa
             'metadata': {'attended_activity': 'semantic metadata'}}}
     untouched = deepcopy(payload)
     with store(tmp_path) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         args = dict(principal_id='human', session_id='s', request_id='native')
         first = rt.admit_session_input(db, epoch=epoch, payload=payload, **args)
         retry = deepcopy(payload)
