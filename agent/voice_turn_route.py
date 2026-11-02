@@ -156,6 +156,9 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
     if not getattr(agent, "_voice_turn_pending", False):
         return system_prompt
     agent._voice_turn_pending = False
+    from agent.incognito import private_route
+    if private_route() is not None:
+        return system_prompt  # a private voice turn stays on its incognito route
     from agent.auxiliary_task_config import _get_auxiliary_task_config
     from hermes_constants import parse_reasoning_effort
     cfg = _get_auxiliary_task_config(TASK)

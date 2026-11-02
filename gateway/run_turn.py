@@ -2445,6 +2445,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             if agent_result.get("failed"):
                 log_private_failure(logger, operation="agent turn", reason=agent_result.get("failure_reason"),
                                     session_id=getattr(session_entry, "session_id", None))
+                from gateway.incognito import private_route_unavailable_reply
+                response = private_route_unavailable_reply(agent_result) or response
             response = _sanitize_gateway_final_response(
                 source.platform, response, interrupted=bool(agent_result.get("interrupted")),
             )

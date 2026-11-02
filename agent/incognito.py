@@ -204,6 +204,35 @@ def shared_worker_context() -> Context:
     return context
 
 
+def set_private_route(session_ids, route: dict | None) -> None:
+    """Bind the configured incognito route that auxiliary calls for these private sessions use.
+
+    RAM-only, like all private state, and dropped when the session leaves the registry.
+    """
+    with _lock:
+        for session_id in session_ids:
+            if not (isinstance(session_id, str) and session_id in _sessions):
+                continue
+            state = _private_states.setdefault(session_id, {})
+            if route:
+                state["auxiliary_route"] = dict(route)
+            else:
+                state.pop("auxiliary_route", None)
+
+
+def private_route() -> dict | None:
+    """The incognito route bound to the current private scope, or None when public or unset."""
+    with _lock:
+        if not is_incognito():
+            return None
+        candidates = [_volatile.get(), _private_states.get(_session_id.get())]
+        candidates += [work.state for work in _work.get() if work.revoked]
+        for state in candidates:
+            if isinstance(state, dict) and state.get("auxiliary_route"):
+                return dict(state["auxiliary_route"])
+        return None
+
+
 def private_state(namespace: str) -> dict | None:
     """Return private RAM state, isolated from public caches and discarded on exit."""
     with _lock:

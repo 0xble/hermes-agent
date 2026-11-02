@@ -122,7 +122,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.auxiliary_call_policy import (
     CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request, resolve_unavailable_client,
-    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response,
+    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response, private_route_scope, private_route_active,
 )
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
@@ -2590,10 +2590,10 @@ def _relay_aux_call_scope(args: tuple, kwargs: dict):
 
 
 def _relay_auxiliary_call(callback):
-    """Give every physical retry in one auxiliary call a shared Relay identity."""
+    """Give every physical retry in one auxiliary call a shared Relay identity and its private route."""
     @functools.wraps(callback)
     def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
+        with _relay_aux_call_scope(args, kwargs), private_route_scope(args, kwargs, sync=True) as kwargs:
             return callback(*args, **kwargs)
     return wrapped
 
@@ -2602,7 +2602,7 @@ def _relay_auxiliary_call_async(callback):
     """Async counterpart to :func:`_relay_auxiliary_call`."""
     @functools.wraps(callback)
     async def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
+        with _relay_aux_call_scope(args, kwargs), private_route_scope(args, kwargs, sync=False) as kwargs:
             return await callback(*args, **kwargs)
     return wrapped
 
@@ -6496,7 +6496,7 @@ def _resolve_task_provider_model(
     shaping still applies. api_mode is "chat_completions", "codex_responses", or None (auto).
     """
     cfg_provider = cfg_model = cfg_base_url = cfg_api_key = resolved_api_mode = None
-    if task:
+    if task and not private_route_active():  # a private call's endpoint is its incognito route only
         task_config = _get_auxiliary_task_config(task)
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
@@ -7721,7 +7721,7 @@ def _resolve_call_client(
             model=resolved_model or model, base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key, async_mode=async_mode, main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if client is None and resolved_provider != "auto" and not resolved_base_url and not private_route_active():
             logger.warning("Vision provider %s unavailable, falling back to auto vision backends",
                            resolved_provider)
             effective_provider, client, final_model = resolve_vision_provider_client(
@@ -7776,7 +7776,7 @@ def _prepare_aux_request(
         task, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
-    effective_extra_body = _get_task_extra_body(task)
+    effective_extra_body = {} if private_route_active() else _get_task_extra_body(task)  # task shaping is for its own route
     effective_extra_body.update(extra_body or {})
     client, final_model, resolved_provider, effective_provider, fallback_label = _resolve_call_client(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
