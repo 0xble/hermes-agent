@@ -272,6 +272,12 @@ class SessionAuthority:
             for other in self.sessions.values():
                 if other.history_mount and other.route == route and other is not live:
                     other.superseded = True
+        elif live.route != route:
+            # The conversation moved to another lane (a Slack thread rebound to its Telegram topic):
+            # the store now routes *route* to *sid*. Keeping the old lane's source made every input
+            # on the new one fail the drain's route preflight (admission_conflict) and pause the
+            # FIFO until a restart (2026-10-30, Slack -> Telegram rollback).
+            live.source, live.route = source, route
         # The lane itself names *sid* (again): a historic mount becomes its live session.
         live.superseded = live.history_mount = False
         return SessionRef(self.profile_id, sid)
