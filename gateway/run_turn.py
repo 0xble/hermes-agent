@@ -2840,7 +2840,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
-                await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
+                notice = (response if agent_result.get("queued_terminal_display_kind", prepared.persist_user_display_kind)
+                          == "supervisor_checkin" and response else self._hmwa_failed_turn_notice(agent_result))
+                await self._hmwa_close_failed_turn(sid, notice)
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
                 # counts session_meta entries stripped before the agent saw them.
@@ -3397,8 +3399,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             if not started:
                 self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
                 return
-            from gateway.run_checkins import silence_fallback
-            agent_result = await silence_fallback(self, event, session_entry, agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -3445,7 +3445,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
-            await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
+            _terminal_display_kind = agent_result.get("queued_terminal_display_kind", prepared.persist_user_display_kind)
+            if _terminal_display_kind != "supervisor_checkin":
+                await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
 
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
@@ -3455,6 +3457,16 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
+            # Apply the mandatory status after generic error/empty-reply shaping, so a provider
+            # explainer cannot replace it in either delivery or the captured completion.
+            from gateway.run_checkins import silence_fallback
+            checkin_result = await silence_fallback(self, event, session_entry, agent_result)
+            if checkin_result is not agent_result:
+                agent_result = checkin_result
+                response = agent_result["final_response"]
+                _intentional_silence = agent_result["intentional_silence"]
+            if _terminal_display_kind == "supervisor_checkin":
+                await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
             await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
                 agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,
@@ -4810,7 +4822,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 if worker.timeout_fired.is_set():
                     break
                 _idle_secs = turn_ctx.awake_idle.measure(self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0))
-                if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
+                if (not _warning_fired and worker.agent_warning is not None
+                        and _idle_secs >= worker.agent_warning
+                        and turn_ctx.persist_user_display_kind != "supervisor_checkin"):
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
                 if _idle_secs >= worker.agent_timeout:
