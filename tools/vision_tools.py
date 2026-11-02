@@ -557,7 +557,9 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
         return False
 
 
-def _accepts_tool_result_images(provider: str, model: str, cfg: Optional[dict[str, Any]]) -> bool:
+def _accepts_tool_result_images(
+    provider: str, model: str, cfg: Optional[dict[str, Any]], *, allow_network: bool = True,
+) -> bool:
     """One gate for both native lanes — the ``vision_analyze`` fast path and the ``computer_use`` capture route
     (#115248): the profile's ``supports_vision_tool_messages=False`` veto first, then either the provider's tool
     results are known to carry media or the per-model capability lookup (config override → catalog incl. the
@@ -567,25 +569,32 @@ def _accepts_tool_result_images(provider: str, model: str, cfg: Optional[dict[st
     if _supports_media_in_tool_results(provider, model):
         return True
     from agent.image_routing import _lookup_supports_vision
-    return _lookup_supports_vision(provider, model, cfg) is True
+    return _lookup_supports_vision(provider, model, cfg, **({} if allow_network else {"allow_network": False})) is True
 
 
-def _native_tool_result_images(provider: str, model: str, cfg: Optional[dict[str, Any]]) -> bool:
+def _native_tool_result_images(
+    provider: str, model: str, cfg: Optional[dict[str, Any]], *, allow_network: bool = True,
+) -> bool:
     """THE gate for every tool that can hand the main model pixels (``vision_analyze``, browser and
     ``computer_use`` screenshots, MCP ``ImageContent``): image routing resolves to ``native``
     (``agent.image_input_mode``, an explicit ``auxiliary.vision`` backend, the catalog) AND the
     route accepts images inside tool results. One predicate, so the lane never depends on which
     tool produced the image."""
     from agent.image_routing import decide_image_input_mode
-    return decide_image_input_mode(provider, model, cfg) == "native" and _accepts_tool_result_images(provider, model, cfg)
+    extra = {} if allow_network else {"allow_network": False}
+    return (decide_image_input_mode(provider, model, cfg, **extra) == "native"
+            and _accepts_tool_result_images(provider, model, cfg, **extra))
 
 
-def _should_use_native_vision_fast_path() -> bool:
+def _should_use_native_vision_fast_path(*, allow_network: bool = True) -> bool:
     """:func:`_native_tool_result_images` for the active main model; any failure → False."""
     try:
         from agent.auxiliary_client import _read_main_provider, _read_main_model
         from hermes_cli.config import load_config
-        return _native_tool_result_images(_read_main_provider(), _read_main_model(), load_config())
+        return _native_tool_result_images(
+            _read_main_provider(), _read_main_model(), load_config(),
+            **({} if allow_network else {"allow_network": False}),
+        )
     except Exception as exc:
         logger.debug("Native vision fast-path check failed: %s", exc)
         return False
@@ -950,7 +959,8 @@ def check_vision_requirements() -> bool:
     provider the aux resolver does not know (OAuth, local vLLM) must not hide a working tool (#47149).
     ``video_analyze`` keeps the aux-only gate — its handler has no native path.
     """
-    return _should_use_native_vision_fast_path() or check_video_requirements()
+    # Tool availability is startup metadata, not an image-routing request.
+    return _should_use_native_vision_fast_path(allow_network=False) or check_video_requirements()
 
 
 from tools.registry import registry, tool_error
