@@ -1,6 +1,34 @@
 # Cron restart survival on macOS
 
-Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`.
+Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`, `cron-oneshot-retirement-alert`.
+
+## One-shot retirement notices
+
+A time-sensitive one-shot can expire while the host or scheduler is down. Never
+execute it late by default. Before retiring a never-completed one-shot outside
+its grace window or with a spent dispatch claim, commit one failure notice to
+the existing cron delivery outbox under a stable per-job identity. Resolve its
+creator origin, then the ordinary configured-home fallback and failure incident
+sink, regardless of local
+output or pinned delivery lanes. Keep ordinary failure-notification policy. A
+failed queue commit keeps the job for retry; a restart between queueing and
+removal reuses the outbox receipt, including its terminal tombstone. Keep the
+local diagnostic and removal. An interrupted dispatch may have partial effects;
+do not claim that it certainly never ran or automatically replay it.
+
+The notice names the job id/name, scheduled instant, lateness, reason and manual
+recreation action. Single-profile and multiplex startup capture the previous
+heartbeat before replacing it, so the alert can report known startup/heartbeat
+instants without inventing an exact downtime onset. This extends the existing
+retirement/delivery boundary; no new service, transport, or inference run.
+
+Contract tests: `tests/cron/test_oneshot_retirement_alert.py`. Exercise the full
+`tests/cron/` suite for in-grace, recurring, recovery, and delivery compatibility.
+Retire `cron-oneshot-retirement-alert` when a released upstream provides the
+same local-lane-independent, crash-idempotent owner alert without late firing.
+Upstream proposals #122765 and #138153 were inspected: they primarily widen or
+opt into catch-up and do not establish this safe-default owner alert contract.
+Rollback by reverting this logical patch; no live jobs or policy need mutation.
 
 ## Contract
 

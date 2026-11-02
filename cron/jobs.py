@@ -2752,7 +2752,9 @@ def mark_job_run(
 
 
 def _write_oneshot_diagnostic(job: dict[str, Any], text: str, what: str) -> bool:
-    """Best-effort operator-visible trace in the job's output dir; never breaks the caller."""
+    """Durably queue the owner failure before retirement; save the local trace best-effort."""
+    from cron.oneshot_retirement import queue_retirement_alert
+    queue_retirement_alert(job, text, what, now=_hermes_now())
     try:
         save_job_output(job.get("id", ""), text)
         return True
@@ -2799,6 +2801,10 @@ def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
 def _write_missed_oneshot_diagnostic(job: dict[str, Any], next_run: str) -> None:
     """Trace for a never-ran one-shot retired outside the grace window (else it would just vanish).
     """
+    if (job.get("repeat") or {}).get("completed", 0) > 0:
+        # A consumed dispatch is not proof that no side effects occurred.
+        _write_wedged_oneshot_diagnostic(job)
+        return
     _write_oneshot_diagnostic(
         job,
         "# Cron job removed before firing (run time outside grace window)\n\n"
@@ -2848,10 +2854,10 @@ def claim_dispatch(job_id: str) -> bool:
                 return False
             # A prior tick claimed the dispatch then died — a genuinely wedged claim. Remove it so
             # it stops appearing due, leaving an operator-visible diagnostic.
+            _write_wedged_oneshot_diagnostic(job)
             jobs.pop(i)
             # See #73973.
             save_jobs(jobs, removed_ids={job_id})
-            _write_wedged_oneshot_diagnostic(job)
             logger.info(
                 "Job '%s': dispatch limit reached (%d/%d) — removing", label, completed, times)
             return False
@@ -3464,9 +3470,9 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
         logger.info(
             "Job '%s': one-shot dispatch limit reached (%d/%d) — removing stale due entry",
             name, completed, times)
-    scan.retire(job["id"])
-    # The claimed run never completed here by definition — leave an operator-visible diagnostic.
+    # Queue before mutating the scan: enqueue failure must not retire the job.
     _write_wedged_oneshot_diagnostic(job)
+    scan.retire(job["id"])
     return True
 
 
