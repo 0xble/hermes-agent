@@ -66,7 +66,7 @@ def _login_bootstrap(home: Path, gateway_plist: Path, *, runner=None, log=print)
             log(f"{label}: skipped: stopped intent")
             continue
         state = run(["launchctl", "print", f"{domain}/{label}"],
-                    capture_output=True, text=True, timeout=10, check=False)
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
         if state.returncode == 0:
             log(f"{label}: already loaded")
             continue
@@ -77,7 +77,7 @@ def _login_bootstrap(home: Path, gateway_plist: Path, *, runner=None, log=print)
             log(f"{label}: skipped: stopped intent")
             continue
         opposite = run(["launchctl", "print", f"gui/{uid}/{label}"],
-                       capture_output=True, text=True, timeout=10, check=False)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
         if opposite.returncode == 0 or opposite.returncode not in {3, 113}:
             raise RuntimeError(f"cannot prove {label} absent from GUI domain; refusing duplicate")
         if stop_requested(home):
@@ -85,7 +85,7 @@ def _login_bootstrap(home: Path, gateway_plist: Path, *, runner=None, log=print)
             continue
         run(["launchctl", "bootstrap", domain, str(path)], check=True, timeout=30)
         verified = run(["launchctl", "print", f"{domain}/{label}"],
-                       capture_output=True, text=True, timeout=10, check=False)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
         if verified.returncode != 0:
             raise RuntimeError(f"bootstrap did not register {domain}/{label}")
         log(f"{label}: loaded")

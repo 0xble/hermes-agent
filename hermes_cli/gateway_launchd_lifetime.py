@@ -56,7 +56,7 @@ def configured_launchd_domain(label: str | None = None) -> str | None:
 def _state(run, domain: str, label: str, *, timeout: float = 10) -> tuple[bool, int | None]:
     from hermes_cli import gateway as gw
     result = run(["launchctl", "print", f"{domain}/{label}"],
-                 capture_output=True, text=True, timeout=timeout, check=False)
+                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
     if result.returncode == 0:
         return True, gw._parse_launchd_pid_from_print_output(result.stdout)
     if (result.returncode == 112 and domain.startswith("gui/")
@@ -77,7 +77,7 @@ def _unload(run, domain: str, label: str, *, home: Path | None = None) -> None:
         from hermes_cli.gateway_guardian import _rollback_owners
         _, owners = _rollback_owners(home, pid)
     result = run(["launchctl", "bootout", f"{domain}/{label}"],
-                 capture_output=True, text=True, timeout=90, check=False)
+                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90, check=False)
     if result.returncode not in {0, 3, 113}:
         raise RuntimeError(f"cannot unload {domain}/{label}: {result.stderr}")
     if pid and not gw._wait_for_pid_exit(pid, 65):
@@ -127,14 +127,14 @@ def _inspect_layout(run, domains, labels, originals, *, mode, gateway_label):
               for domain in domains for name in labels.values()}
     if mode == "gui":
         available = run(["launchctl", "print", domains[0]], capture_output=True,
-                        text=True, timeout=10, check=False)
+                        text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
         if available.returncode != 0:
             raise RuntimeError("GUI rollback requires an existing Aqua login domain")
     for path, name in labels.items():
         if originals[path] is None and any(states[(domain, name)][0] for domain in domains):
             raise RuntimeError(f"cannot prove ownership of loaded label {name} without its definition")
     for domain in domains:
-        listing = run(["launchctl", "print", domain], capture_output=True, text=True, timeout=10, check=False)
+        listing = run(["launchctl", "print", domain], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
         gui_absent = (listing.returncode == 112 and domain.startswith("gui/")
                       and "Could not find domain for user gui:" in listing.stderr)
         if listing.returncode != 0 and not gui_absent:
