@@ -398,7 +398,7 @@ def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -
 
 
 def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT_ENSURE_TIMEOUT,
-                           idle_exit: bool = False) -> GatewayDiscovery:
+                           idle_exit: bool = False, client_lease=None) -> GatewayDiscovery:
     """Ensure once; pending remains pending at deadline.
 
     Never installs anything. The one owner it replaces is a gateway an older Hermes left running on
@@ -489,7 +489,10 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                 else:
                     from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway, stdio_log_size
                     child_home, child_offset = target, stdio_log_size(target)
-                    child = spawn_unmanaged_gateway(target, deadline=deadline, idle_exit=idle_exit)
+                    spawn_kwargs = {"deadline": deadline, "idle_exit": idle_exit}
+                    if client_lease is not None:
+                        spawn_kwargs["client_lease"] = client_lease
+                    child = spawn_unmanaged_gateway(target, **spawn_kwargs)
                 requested = True
             time.sleep(min(delay, remaining(deadline)))
             # Capped low: each probe is a lock-file read or one local identify, and READY is noticed

@@ -543,6 +543,8 @@ async def start_gateway_runtime_api(runner):
     from gateway.run_api import start_gateway_api
     runner.session_api = await start_gateway_api(runner)
     runner.session_runtime_descriptor['api_origin'] = runner.session_api.api_origin
+    if getattr(runner, "_client_owned", False):
+        return
     from gateway.session_authority import UNCLAIMED_EPOCH
     for authority in _authorities(runner):
         if getattr(authority, 'epoch', None) != UNCLAIMED_EPOCH:  # a standby recovers it at promotion
@@ -633,7 +635,8 @@ def publish_gateway_runtime_ready(runner):
     descriptor.update(state='ready', capabilities=[
         'session-authority-v1', 'durable-admission-v1', 'event-replay-v1'])
     from gateway.session_hosted_service import start_ready_hosted_services
-    start_ready_hosted_services(runner)
+    if not getattr(runner, "_client_owned", False):
+        start_ready_hosted_services(runner)
 
 
 async def wait_gateway_runtime(runner):

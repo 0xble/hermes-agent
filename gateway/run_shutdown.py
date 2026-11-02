@@ -1936,6 +1936,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 )
 
     async def _launch_detached_restart_command(self) -> None:
+        if getattr(self, "_client_owned", False):
+            return  # never escape the finite client lease into a detached replacement
         from gateway.run import _resolve_hermes_bin
         import shutil
         import subprocess
@@ -2190,7 +2192,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False,
                         reason: Optional[str] = None) -> bool:
-        if self._restart_task_started:
+        if getattr(self, "_client_owned", False) or self._restart_task_started:
             return False
         self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
         self._restart_requested = True

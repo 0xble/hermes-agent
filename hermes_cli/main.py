@@ -39,6 +39,13 @@ import os
 import re
 import sys
 
+# Before config/provider imports, fence an unmanaged finite client's private gateway.
+# The spawner supplies a private stdin pipe; no service or interactive launch uses this.
+if "--client-owned" in sys.argv and any(
+        sys.argv[i:i + 2] == ["gateway", "run"] for i in range(1, len(sys.argv) - 1)):
+    from gateway.client_lifetime import arm_client_lifetime
+    arm_client_lifetime()
+
 # Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
 # is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))

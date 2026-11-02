@@ -3461,6 +3461,7 @@ class GatewayRunner(
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
+    _client_owned: bool = False  # finite local lease, never a daemon/restart enrollment
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -5349,7 +5350,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             return snapshot_shutdown_context(received_signal)
 
         planned_takeover = bool(_best_effort(_takeover, "Takeover marker check failed: %s"))
-        planned_stop = received_signal == signal.SIGINT or (
+        planned_stop = getattr(runner, "_client_owned", False) or received_signal == signal.SIGINT or (
             not planned_takeover and bool(_best_effort(_planned_stop, "Planned stop marker check failed: %s")))
         # `hermes gateway stop` writes the marker, THEN signals: the planned-stop watcher can consume
         # the marker in between, and the CLI's own SIGTERM must not then read as an external kill.
@@ -5375,7 +5376,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = True
             logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
 
-        if _shutdown_ctx is not None:
+        if _shutdown_ctx is not None and not getattr(runner, "_client_owned", False):
             def _log_context() -> None:
                 # The most useful line for "gateway keeps dying" tickets.
                 from gateway.shutdown_forensics import format_context_for_log
@@ -5920,9 +5921,12 @@ async def _start_gateway_shutdown_tail(
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
+                        client_owned: bool = False) -> bool:
     """Run the maintained bootstrap lifecycle through the public runner facade."""
     from gateway.run_bootstrap import start_gateway as bootstrap
+    if client_owned:
+        return await bootstrap(config, replace, verbosity, force, idle_exit, client_owned=True)
     return await bootstrap(config, replace, verbosity, force, idle_exit)
 
 

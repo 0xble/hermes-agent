@@ -33,13 +33,14 @@ DAEMON_STRIPPED_ENV = (
 
 
 def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: bool = False,
-                            force: bool = False) -> subprocess.Popen:
+                            force: bool = False, client_lease=None) -> subprocess.Popen:
     """Request a daemon, not readiness. Refuse Windows no-breakaway fallback.
 
     No --replace, persistence, login changes, elevation, shell, or inherited stdio.
     The gateway runtime's own exclusive ownership fence arbitrates racing starts.
     ``idle_exit``: the daemon ends itself once idle (a chat/TUI/cron client's own start; never
     Desktop's ``gateway ensure``, which keeps its attached gateway for the app's lifetime).
+    ``client_lease``: finite local client ownership; replaces idle exit with a private pipe.
     ``force``: a ``gateway restart --force --detach`` replacement keeps the ``--force`` its old owner
     needed (a named profile under a multiplexer), or it exits on the run-side guard.
     """
@@ -50,7 +51,8 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     # profile's daemon. A <root>/profiles/<name> home is already trusted as-is.
     selector = [] if home.parent.name == "profiles" else ["--profile", "default"]
     command = [sys.executable, "-m", "hermes_cli.main", *selector, "gateway", "run", "--quiet",
-               *(["--idle-exit"] if idle_exit else []), *(["--force"] if force else [])]
+               *(["--client-owned"] if client_lease is not None else ["--idle-exit"] if idle_exit else []),
+               *(["--force"] if force else [])]
     # The target profile's own secrets, never the launching client's: a `hermes -p work` client's
     # dotenv would otherwise become the default daemon's frozen launch env (host_gateway_child_env).
     from tools.environments.local import served_profile_child_env
@@ -75,9 +77,12 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     try:
         with (logs / "gateway-stdio.log").open("ab", buffering=0) as output:
             remaining(deadline)
-            return subprocess.Popen(command, cwd=root, env=env, close_fds=True,
-                                    stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                    **windows_detach_popen_kwargs())
+            child = subprocess.Popen(command, cwd=root, env=env, close_fds=True,
+                                     stdin=subprocess.PIPE if client_lease is not None else subprocess.DEVNULL,
+                                     stdout=output, stderr=output, **windows_detach_popen_kwargs())
+            if client_lease is not None:
+                client_lease.own(child)
+            return child
     except OSError as exc:
         reason = "windows_breakaway_unavailable" if sys.platform == "win32" else "spawn_failed"
         raise RuntimeStartError(reason) from exc
