@@ -21,9 +21,20 @@ Each profile's existing FIFO general executor keeps `cron.max_parallel_jobs`
 nonterminal protected job in store order, and send it to the reserved executor.
 If selection changes while the previous owner still holds the reservation,
 treat the replacement as overflow in the general pool until the slot is free.
-Additional protected jobs log an error once per loaded class and use the
+Additional protected agent jobs log an error once per loaded class and use the
 general executor best-effort in its unchanged FIFO order. A long run holding
 the reservation must not occupy a general worker or overlap itself.
+
+Script-only (`no_agent`) jobs outside that selected reservation use a separate
+serial FIFO lane per profile, managed by the same admission pool lifecycle.
+They never queue behind detached agent waiters, even while the protected
+reservation is busy. Agent jobs, including monitor or pre-run scripts that may
+wake an agent, cannot enter this lane. This adds 1 script worker, not agent
+capacity: the general cap and the single protected reservation are unchanged.
+Script jobs can still wait behind another script, bounded by the existing
+script timeout. Preserve the common execution journal, copied profile context,
+per-job guard, cancellation and process-exit fences. Departure and shutdown
+reclaim both auxiliary lanes.
 
 A finished waiter future or terminal execution row does not release the
 reservation while its detached process remains live. Only the existing
@@ -44,7 +55,7 @@ fd-exhaustion backoff and shutdown responsiveness.
 This is a fork scheduling policy, not an upstream release-baseline change.
 Its implementation belongs in `cron/scheduler_admission.py` and the existing
 job-run rearm helper, with narrow hooks at the scheduler and provider seams.
-Do not replace it with a higher general cap, a second reservation, job-specific
+Do not replace it with a higher general cap, a second protected reservation, job-specific
 identity matching, or an execution-terminal release shortcut. Retire it only
 when the selected upstream baseline preserves the same admission and timing
 contract under general-pool saturation.
@@ -52,7 +63,7 @@ contract under general-pool saturation.
 ## Dispatch Diagnostics
 
 Local `cron.scheduler_diagnostics` INFO events name the execution, job, profile
-home, actual general/reserved admission lane, existing ledger code revision,
+home, actual general/reserved/script admission lane, existing ledger code revision,
 stage and monotonic timestamp. The copied dispatch context carries attribution
 through the executor hop. Direct calls use the imported immutable release when
 available, otherwise the revision remains unknown. Do not resolve a moving
@@ -77,6 +88,10 @@ scheduling policy, reservation, configuration, alert or live acceptance credit.
 stamps against a fake clock with all 4 general workers blocked, 2 protected
 jobs, FIFO overflow, long runs, completion rearming, per-job exclusion,
 profile deadlines, and both terminal-row and waiter-error process-exit fences.
+`tests/cron/test_script_admission.py` keeps 4 general detached waiters and the
+protected waiter live while a due script writes its real marker within the
+same fake-clock tick. It also checks script FIFO, profile isolation and an
+independent protected reservation. The base fails the script-start bound.
 `tests/cron/test_admission_wakes.py` checks periodic phase, early overruns,
 and failure backoff in both ticker modes, plus zero-wait stop observation.
 Also run ticker drift, virtual-clock soak, parallel-pool, scheduler-provider,
