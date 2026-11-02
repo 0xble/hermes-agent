@@ -26,5 +26,18 @@ Cost estimate (billed Linux runner minutes; workload dependent): before retireme
 
 A passing source gate does not certify external integrations, Nix, native installers, image publication, or signed desktop releases. GitHub Actions billing limits may prevent all jobs from starting; until an actual hosted run executes, local verification is evidence only and `qualification` cannot be claimed green.
 
+## Bounded channel metadata smoke
+
+The complete-request smoke test keeps its 15-second deadline and real CLI
+process-boundary assertions. Its in-process stamp and plist mutation matrix
+uses the shared MSIX bridge's synchronous batch scope: validate the admitted
+request bytes with the authoritative Python decoder once, then reuse only
+those exact bytes in that scope. Changed JSON, duplicate keys, packaging
+conflicts and package-version conflicts must still fail; leaving the scope,
+including by exception, restores ordinary validation. No unscoped or
+persistent admission cache is allowed. The test counts its own direct child
+launches and caps them at twelve (ten CLI checks plus one batch validator),
+independent of host timing. CLI children continue to run their real validators.
+
 Fork-Patch-Backfill: 739ced4676c82324042e5b0b8d7e3ba1ed7bf432; repository-ci-contract
 Fork-Patch-Backfill: b1fd9e549fa185d80060a9116fa6b2201162cd0c; repository-ci-contract
