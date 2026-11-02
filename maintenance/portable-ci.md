@@ -217,7 +217,6 @@ bash scripts/run_tests.sh -j 4 \
   tests/hermes_cli/test_venv_holder_windows_live.py \
   tests/hermes_cli/test_taskkill_identity_windows_live.py \
   tests/hermes_cli/test_git_trampoline_windows_live.py \
-  tests/hermes_cli/test_managed_uv_windows_cutover.py \
   tests/gateway/test_telegram_closewait_windows_live.py \
   tests/tools/test_process_registry_windows_live.py \
   -o addopts= -v -p no:cacheprovider
@@ -258,7 +257,9 @@ The documentation environment bootstrap preserves its existing checkout-local ve
 
 The explicit checkpoint exception imports upstream Python 3.14 and the native PM tool owner. Native OS selection lists files covering the actual host, then selects `platforms` tests. Optional memory SDK integration is the `hindsight` extra. The separate `hindsight-embedded` extra opts into the embedded server and is not inferred from incidental shared transitive distributions. Immutable staging preserves declared extras and all active plugin entry points, and validates enabled plugin imports before activation.
 
-Release, signing, store publishing and channel promotion workflows remain removed under the fork workflow policy. Tests whose entire owner disappeared are retired with that owner. Generic archive/link, SHA admission, ancestry and receipt security tests remain. Workflow policy coverage remains in `scripts/ci/tests/test_portable.py` and `tests/ci/test_workflow_job_graph.py`. The resumable reconciliation evidence records each removed test owner and partial retirement separately.
+Release, signing, store publishing and channel promotion workflows remain removed under the fork workflow policy. Tests whose entire owner disappeared are retired with that owner. Generic archive/link, SHA admission, ancestry and receipt security tests remain. Workflow policy coverage remains in `scripts/ci/tests/test_portable.py` and `tests/ci/test_workflow_job_graph.py`. The release sync `2972421a74` (2026-10-15) dropped the job-graph test with the deleted workflows although it checks every remaining workflow and passes on the fork's set, so it was restored. `tests/hermes_cli/test_managed_uv_windows_cutover.py` was retired with the managed_uv runtime repair in `a2e1f76885` (pm owns the interpreter store).
+
+Contract tests: `tests/ci/test_workflow_job_graph.py` The resumable reconciliation evidence records each removed test owner and partial retirement separately.
 
 ## Native Checkpoint Fixture Boundaries
 

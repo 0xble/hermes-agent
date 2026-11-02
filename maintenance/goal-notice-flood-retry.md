@@ -98,3 +98,13 @@ passes the proof surface.
 
 **Rollback:** revert the logical patch in one commit; no schema, config, or
 persistent-state migration is introduced.
+
+## Contract tests
+
+Contract tests: `tests/gateway/test_goal_status_notice.py::test_goal_notice_real_daily_quota_pressure`,
+  `tests/gateway/test_goal_status_notice.py::test_deferred_outcome_keeps_protection_through_flood_retry`,
+  `tests/gateway/test_goal_status_notice.py::test_real_post_turn_outcome_survives_daily_quota`,
+  `tests/gateway/test_goal_status_notice.py::test_goal_status_notice_retries_short_flood_in_background`,
+  `tests/gateway/test_goal_status_notice.py::test_goal_status_notice_logs_once_when_flood_wait_is_too_long`,
+  `tests/gateway/test_goal_status_notice.py::test_goal_status_notice_bounds_flood_retries_and_warns_once`,
+  `tests/gateway/test_goal_status_notice.py::test_goal_status_notice_logs_when_retry_is_cancelled`

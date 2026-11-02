@@ -37,6 +37,28 @@ Rejected alternatives remain: loosening the global silence filter, suppressing p
 
 ## Verification, budget, rollback, and retirement
 
+Contract tests: `tests/agent/test_goal_set_receipt_notice.py`,
+  `tests/gateway/test_loop_quiet_wakeup.py`,
+  `tests/tui_gateway/test_quiet_wakeup_silence.py`,
+  `tests/agent/test_synthetic_prompt.py`,
+  `tests/gateway/test_goal_verdict_send.py::test_parked_goal_notice_is_deduplicated_and_persisted`,
+  `tests/gateway/test_internal_notification_marker.py::test_internal_footer_is_idempotent_for_old_and_new_contracts`,
+  `tests/gateway/test_internal_notification_marker.py::test_internal_footer_spoof_is_not_treated_as_idempotent`,
+  `tests/gateway/test_background_process_notifications.py::test_coalesced_process_completion_wake_carries_footer`,
+  `tests/gateway/test_background_process_notifications.py::test_async_delegation_batch_wake_carries_footer`,
+  `tests/hermes_cli/test_goals.py::TestWaitingDecision::test_wait_notice_reason_keeps_readable_target_when_waiting_reason_missing`,
+  `tests/hermes_cli/test_goals.py::TestJudgeDrivenWait::test_judge_repark_on_same_session_dedupes_notice`,
+  `tests/hermes_cli/test_goals.py::TestJudgeDrivenWait::test_judge_repark_on_same_timed_wait_dedupes_notice`,
+  `tests/hermes_cli/test_goals.py::TestJudgeDrivenWait::test_judge_repark_change_target_or_reason_reannounces`,
+  `tests/hermes_cli/test_goals.py::TestJudgeDrivenWait::test_judge_repark_after_continue_reannounces`,
+  `tests/hermes_cli/test_loops.py::TestTickLifecycle::test_loop_reply_rules_keep_goal_silence_but_not_goal_evidence`,
+  `tests/hermes_cli/test_loops.py::TestTickLifecycle::test_every_stored_wakeup_wording_is_still_a_quiet_wakeup`,
+  `tests/hermes_cli/test_loops.py::TestTickLifecycle::test_wakeup_prompt_allows_quiet_no_change_reply`,
+  `tests/hermes_cli/test_loops.py::TestTickLifecycle::test_until_wakeup_prompt_no_longer_demands_evidence_every_tick`,
+  `tests/hermes_cli/test_loops.py::TestTickLifecycle::test_until_judge_is_not_called_for_a_silent_tick`,
+  `tests/hermes_cli/test_loops.py::TestSelfPacedBackoff::test_backoff_treats_consecutive_silent_wakeups_as_unchanged`,
+  `tests/hermes_cli/test_loops.py::TestSelfPacedBackoff::test_backoff_treats_every_silence_marker_form_as_unchanged`
+
 Fail-before evidence: the new footer assertion failed against the base footer, the spoof cases failed against relaxed prefix matching, and the parked-goal regression observed two callback registrations for two unchanged waits. The focused post-fix suite passed:
 
 - `scripts/run_tests.sh tests/gateway/test_goal_status_notice.py tests/gateway/test_goal_verdict_send.py tests/gateway/test_internal_notification_marker.py tests/gateway/test_background_process_notifications.py tests/gateway/test_completion_delivery.py -q` — 102 passed.

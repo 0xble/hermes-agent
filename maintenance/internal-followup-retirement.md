@@ -64,6 +64,11 @@ remains unavailable is retained for at most 7 days, then deleted with
 
 ## Verification
 
+Contract tests: `tests/gateway/test_shutdown_followup_restart.py`,
+  `tests/gateway/test_proxy_mode.py::TestRunAgentProxyDispatch::test_recovered_proxy_turn_persists_assistant_row_to_local_session_db`,
+  `tests/gateway/test_proxy_mode.py::TestRunAgentProxyDispatch::test_legacy_idless_proxy_recovery_does_not_use_session_key_as_message_id`,
+  `tests/gateway/test_proxy_mode.py::TestRunAgentProxyDispatch::test_recovered_followup_is_persisted_before_proxy_and_not_duplicated`
+
 Focused restart-recovery tests cover id-less durability, recovery-id stamping
 for every id-less spool, legacy duplicate-content decline and quarantine (also with a resume_pending marker),
 in-scope notice translation, spool

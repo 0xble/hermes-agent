@@ -97,6 +97,14 @@ and the existing 24-hour outcome expiry bounds retries.
 
 ## Proof surface
 
+Contract tests: `tests/gateway/test_top_level_delegation_context.py`,
+  `tests/gateway/test_telegram_retire.py`,
+  `tests/gateway/test_telegram_retire_context.py`,
+  `tests/gateway/test_telegram_retire_finalize.py`,
+  `tests/gateway/test_telegram_retire_prepare.py`,
+  `tests/gateway/test_telegram_retire_work.py`,
+  `tests/gateway/test_telegram_topic_owner_routing.py`
+
 ### Telegram Topic Retirement
 
 **Fork patch identity:** `telegram-topic-retire`. `telegram_topic`'s

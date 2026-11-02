@@ -15,4 +15,9 @@ A topic the first turn has not bound yet is bound to the `/title` session before
 
 ## Verification and retirement
 
+Contract tests: `tests/gateway/test_telegram_topic_icon_lane.py`,
+  `tests/gateway/test_title_command.py::TestHandleTitleCommand::test_topic_collision_reports_stored_alias_and_actual_rename`,
+  `tests/agent/test_title_generator.py::test_pick_topic_icon_accepts_only_catalog_icons`,
+  `tests/hermes_state/test_hermes_state.py::TestSchemaInit::test_telegram_topic_claim_if_unbound_keeps_the_existing_owner`
+
 Run `scripts/run_tests.sh -j 6 tests/gateway/test_title_command.py tests/gateway/test_session_title_rename_lane.py tests/gateway/test_telegram_topic_icon_lane.py tests/agent/test_title_generator.py tests/hermes_state/test_hermes_state.py -q`; check Ruff and `scripts/check_fork_patches.py --source-only --repo .`. Retire when a released upstream baseline preserves both unique aliases and truthful explicit rename receipts with equivalent tests. Roll back the explicit command and rename helper together while preserving the existing lineage setter and unique index.

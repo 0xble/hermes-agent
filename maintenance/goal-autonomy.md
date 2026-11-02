@@ -146,6 +146,13 @@ recipients. No upstream contribution or moving-main synchronization is included.
 
 ## Verification And Activation Boundary
 
+Contract tests: `tests/hermes_cli/test_goal_autonomy.py`,
+  `tests/agent/test_synthetic_prompt_legacy_goals.py`,
+  `tests/agent/test_quiet_goal_receipts.py`,
+  `tests/gateway/test_lifecycle_cards_hidden.py`,
+  `tests/gateway/test_goal_notices_config.py`,
+  `tests/gateway/test_quiet_goal_control_recovery.py`
+
 Run the complete goal and session-control test inventory with the canonical
 `scripts/run_tests.sh` through the machine-wide heavy-work queue. Regressions in
 `tests/hermes_cli/test_goal_autonomy.py` exercise evidence completion, inherited

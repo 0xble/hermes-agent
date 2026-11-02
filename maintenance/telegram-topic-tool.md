@@ -46,6 +46,13 @@ The reproduced failure was a relay-style `title\nobjective\n---` envelope, which
 
 ## Verification
 
+Contract tests: `tests/gateway/test_topic_icon_recovery.py`,
+  `tests/gateway/test_telegram_topic_briefs.py`,
+  `tests/gateway/test_telegram_topic_tool.py`,
+  `tests/gateway/test_topic_model_readback.py`,
+  `tests/gateway/test_telegram_topic_edit.py`,
+  `tests/gateway/test_session_reasoning_override_persistence.py`
+
 `scripts/run_tests.sh tests/gateway/test_telegram_topic_briefs.py tests/gateway/test_telegram_topic_tool.py tests/gateway/test_topic_model_readback.py tests/gateway/test_telegram_topic_mode.py tests/gateway/test_telegram_topic_edit.py tests/gateway/test_telegram_rich_messages.py tests/gateway/test_session_reasoning_override_persistence.py tests/gateway/test_model_command_reasoning_flag.py tests/hermes_cli/test_tools_config.py`.
 
 The topic-tool tests drive a real `SessionStore` and `SessionDB` and fake only Telegram and model resolution. They cover the restart path: a fresh runner over the same store rehydrates the chosen model and reasoning.

@@ -22,3 +22,15 @@ Load this unit when changing Telegram typing refresh cadence or the post-send ty
 ## Retirement
 
 Remove this unit when released upstream provides an equivalent adapter-specific typing cadence and deferred, coalescing post-send re-arm with final-turn cancellation.
+
+## Contract tests
+
+Contract tests: `tests/gateway/test_typing_refresh_interval.py`,
+  `tests/gateway/test_telegram_typing_retrigger.py::test_zero_interval_still_collapses_a_burst_behind_the_inflight_rearm`,
+  `tests/gateway/test_telegram_typing_retrigger.py::test_zero_interval_rearms_each_spaced_send`,
+  `tests/gateway/test_telegram_typing_retrigger.py::test_cancel_retrigger_survives_concurrent_inserts`,
+  `tests/gateway/test_telegram_typing_retrigger.py::test_request_during_inflight_trailing_send_schedules_another_rearm`,
+  `tests/gateway/test_telegram_typing_retrigger.py::test_final_reply_in_one_topic_keeps_other_topic_rearm`,
+  `tests/gateway/test_telegram_typing_retrigger.py::test_pause_before_edit_only_finalize_cancels_trailing_rearm`,
+  `tests/gateway/test_telegram_typing_retrigger.py::test_streaming_burst_defers_one_trailing_rearm`,
+  `tests/gateway/test_telegram_typing_retrigger.py::test_final_reply_cancels_pending_trailing_rearm`

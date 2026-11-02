@@ -93,6 +93,9 @@ result/transcript evidence for conservative recovery through the durable retry e
 
 ## Tests
 
+Contract tests: `tests/tools/test_async_delegation_checkpoint_completion.py`,
+  `tests/tools/test_async_delegation_restart_cut.py`
+
 `tests/tools/test_async_delegation_checkpoint_completion.py` exercises public
 batch/scalar runner exceptions with and without shutdown, grouped/mixed indexes,
 late checkpoint writes, lifecycle/fallback commit-then-raise paths, deferred

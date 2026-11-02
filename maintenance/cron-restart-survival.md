@@ -87,6 +87,33 @@ and the zero-drain policy remain authoritative.
 
 ## Proof and limitation
 
+Contract tests: `tests/agent/test_worker_owner_restart.py`,
+  `tests/cron/test_detached_owner_restart.py`,
+  `tests/agent/test_worker_discovery_recovery.py`,
+  `tests/cron/test_canonical_detached_survival.py`,
+  `tests/cron/test_bounded_worker_recovery.py`,
+  `tests/cron/test_hard_wall_real_path.py`,
+  `tests/cron/test_double_fork_sweep.py`,
+  `tests/cron/test_hard_wall_completion_race.py`,
+  `tests/cron/test_job_wall_timeout.py`,
+  `tests/cron/test_immutable_worker_real.py`,
+  `tests/cron/test_restart_safe_worker.py::test_launchd_gateway_dispatches_cron_in_detached_session`,
+  `tests/cron/test_restart_safe_worker.py::test_degraded_worker_reaps_before_projecting_terminal_row`,
+  `tests/cron/test_restart_safe_worker.py::test_live_external_worker_keeps_claim_until_process_exit`,
+  `tests/cron/test_restart_safe_worker.py::test_stale_sweep_of_exited_worker_does_not_wedge_successor`,
+  `tests/cron/test_restart_safe_worker.py::test_stale_sweep_keeps_live_detached_worker_claim_after_waiter_error`,
+  `tests/cron/test_restart_safe_worker.py::test_post_handoff_waiter_error_keeps_claim_until_worker_exit`,
+  `tests/cron/test_restart_safe_worker.py::test_stale_waiter_cleanup_does_not_erase_successor_metadata`,
+  `tests/cron/test_restart_safe_worker.py::test_detached_worker_exit_releases_its_in_process_claim`,
+  `tests/cron/test_delivery_queue.py::test_pruning_preserves_projected_tombstone`,
+  `tests/cron/test_delivery_queue.py::test_gated_missing_execution_expires_without_sending_and_uses_one_ledger_read`,
+  `tests/cron/test_delivery_queue.py::test_gated_failure_notice_preserves_pre_timeout_failure_text`,
+  `tests/cron/test_delivery_queue.py::test_execution_delivery_transition_matrix`,
+  `tests/cron/test_delivery_queue.py::test_stale_delivering_cannot_replace_projected_unknown`,
+  `tests/cron/test_delivery_queue.py::test_stale_enqueue_pending_cannot_replace_projected_terminal_receipt`,
+  `tests/cron/test_delivery_queue.py::test_terminal_receipt_reconciles_unknown_commit_gap`,
+  `tests/cron/test_delivery_queue.py::test_terminal_projection_retries_after_execution_ledger_failure`
+
 `tests/cron/test_canonical_detached_survival.py` additionally exercises real
 canonical RPC and an actual loopback-provider agent tool in a disposable macOS
 profile with a fake `ai.hermes-test.*` identity. Its process-ancestry witness must
