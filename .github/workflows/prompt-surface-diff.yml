@@ -51,6 +51,9 @@ jobs:
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0 # need history for the merge base
+          # Keep complete ancestry without downloading every historical artifact blob.
+          # Checkout and git archive hydrate only the head tree and base snapshot we read.
+          filter: blob:none
           persist-credentials: false
 
       - name: Summarise the snapshot diff
