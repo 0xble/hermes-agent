@@ -514,6 +514,17 @@ descendants. It mocks the pane and needs no tmux, so it lives outside
 Retire these driver adaptations when upstream supplies equivalent bounded,
 condition-based synchronization and output capture.
 
+Scripted CLI homes also persist `sessions.auto_prune: false`. An undecided
+preference lets hosted free-disk pressure introduce a synchronous startup
+question once a prior launch has cached its reclaim estimate, before resume
+recap or the composer. Runs 41272803389 and 41264196401 captured that offer at
+6.7 GB free of 71.6 GB while the unchanged 120-second resume-ready wait expired.
+The preference answers unrelated onboarding without enabling deletion or
+changing production startup. Keep both home factories decided; preserve every
+tmux journey, assertion and deadline. Retire this fixture choice only when the
+accepted upstream scripted homes have equivalent startup isolation.
+Contract tests: `tests/ci/test_tmux_home_startup_offers.py`.
+
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
 complete-suite gap or proves an installed runtime.
