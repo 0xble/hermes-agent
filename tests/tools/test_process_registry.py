@@ -85,7 +85,6 @@ def test_bounded_kill_after_deadline_still_leaves_cut_receipt(registry, tmp_path
 
     def slow_signal(*_args, **_kwargs):
         time.sleep(0.03)
-        return None
 
     monkeypatch.setattr(registry, "_signal_kill", slow_signal)
     monkeypatch.setattr(registry, "_stop_scope", lambda *_args, **_kwargs: True)
@@ -806,7 +805,7 @@ def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
         f"p.with_suffix(\\'.tmp\\').write_text(str(os.getpid())); p.with_suffix(\\'.tmp\\').replace(p); time.sleep(60)']); "
         f"signal.signal(signal.SIGTERM, signal.SIG_DFL); time.sleep(60)\""
     )
-    session = registry.spawn_local(command, task_id="descendant-test")
+    registry.spawn_local(command, task_id="descendant-test")
     try:
         # Atomic publication makes existence a complete PID readiness signal.
         assert _wait_until(lambda: os.path.exists(pidfile))
@@ -1894,7 +1893,7 @@ class TestFinishedHandleRelease:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
-    def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
+    def test_spawn_local_strips_blocked_vars_from_background_env(self, registry, tmp_path):
         captured = {}
 
         def fake_popen(cmd, **kwargs):
@@ -1911,6 +1910,7 @@ class TestSpawnEnvSanitization:
         with patch.dict(os.environ, {
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
+            "HERMES_HOME": str(tmp_path),
             "USER": "tester",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "FIRECRAWL_API_KEY": "fc-secret",
@@ -2254,7 +2254,9 @@ class TestCheckpoint:
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
-            assert recovered == 0
+            assert recovered == 1
+            assert registry.poll("proc_dead")["exit_code"] is None
+            assert registry.completion_queue.get_nowait()["session_id"] == "proc_dead"
 
     def test_recover_dead_wrapper_retries_unreaped_systemd_scope(
         self, registry, tmp_path, monkeypatch
@@ -2299,7 +2301,7 @@ class TestCheckpoint:
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), patch(
             "tools.process_registry._stop_systemd_unit", return_value=True
         ) as stop_unit:
-            assert registry.recover_from_checkpoint() == 0
+            assert registry.recover_from_checkpoint() == 1
 
         stop_unit.assert_called_once_with(entry["systemd_unit"])
         assert json.loads(checkpoint.read_text(encoding="utf-8-sig")) == []
@@ -3370,7 +3372,8 @@ class TestSystemdCgroupIsolation:
 
         argv = captured["argv"]
         # No systemd-run wrapping — direct shell invocation.
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv[:2] == ["/bin/bash", "-lic"], argv
+        assert argv[2].startswith("set +m; (\necho hello\n) > "), argv
         assert captured["start_new_session"] is True
 
     def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
@@ -3396,7 +3399,8 @@ class TestSystemdCgroupIsolation:
             registry.spawn_local("echo hello", cwd="/tmp")
 
         argv = captured["argv"]
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv[:2] == ["/bin/bash", "-lic"], argv
+        assert argv[2].startswith("set +m; (\necho hello\n) > "), argv
         assert captured["start_new_session"] is True
 
     @pytest.mark.parametrize("use_pty", [False, True])
@@ -3438,9 +3442,8 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
-                "/bin/bash", "-lic", "set +m; echo hello",
-            ]
+            assert captured["argv"][:2] == ["/bin/bash", "-lic"]
+            assert captured["argv"][2].startswith("set +m; (\necho hello\n) > ")
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""
@@ -3489,9 +3492,8 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
-                "/bin/bash", "-lic", "set +m; echo hello",
-            ]
+            assert captured["argv"][:2] == ["/bin/bash", "-lic"]
+            assert captured["argv"][2].startswith("set +m; (\necho hello\n) > ")
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""

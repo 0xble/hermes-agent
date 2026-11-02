@@ -67,7 +67,10 @@ def record_exit_command(log: Path, command: str) -> str:
     that adopts the process after the spawner exited has no Popen to wait on."""
     import shlex
     target = shlex.quote(_exit_path(log).as_posix())
-    return f"__hermes_exit_file={target}; trap 'printf \"%s\\n\" \"$?\" > \"$__hermes_exit_file\"' EXIT\n{command}"
+    return (f"__hermes_exit_file={target}; "
+            "trap '__hermes_rc=$?; printf \"%s\\n\" \"$__hermes_rc\" > \"$__hermes_exit_file.tmp\"; "
+            "mv -f -- \"$__hermes_exit_file.tmp\" \"$__hermes_exit_file\"' EXIT\n"
+            f"{command}")
 
 
 def recorded_exit_code(log) -> Optional[int]:
