@@ -21,8 +21,9 @@ busy_acceptance = ContextVar('busy_acceptance', default=None)
 # commit task, which command barriers and /restart wait on): ``busy_acceptance`` may already resolve
 # once the input's FIFO position is fixed behind an earlier input of its chat still capturing.
 busy_commit = ContextVar('busy_commit', default=None)
-# Set by a messaging caller to run synchronously once its committed row is still ``queued`` (not yet
-# claimed by a drain), so work it starts is visible before the turn's own preprocessing can run.
+# Set by a messaging caller to run synchronously, with the admission id, once its committed row is
+# still ``queued`` (not yet claimed by a drain), so work it starts is visible before the turn's own
+# preprocessing can run. A redelivery reconciled onto an existing row passes that row's id again.
 admitted_queued = ContextVar('admitted_queued', default=None)
 # ``_validate_native`` clauses about the message's own content, safe to name to the sender's chat.
 _CONTENT_CLAUSES = frozenset({
@@ -92,7 +93,7 @@ async def admit_message(authority, event):
         return (None if status == 'terminal' or internal_input(event)
                 else pause_notice(authority, receipt.ref, 'unknown_execution'))
     if on_queued is not None and status == 'queued':
-        on_queued()
+        on_queued(receipt.admission_id)
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
