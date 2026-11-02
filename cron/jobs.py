@@ -34,6 +34,7 @@ from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron.scheduler_detached_worker import normalize_hard_wall_timeout
+from cron.missed_windows import normalize_max_catch_up_lateness
 from cron.review import apply_review_update, normalize_review, validate_review_delivery
 from cron import store_health
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
@@ -1959,6 +1960,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "review": normalize_review,
     "interpreter": _normalize_job_optional_text,
     "hard_wall_timeout_seconds": normalize_hard_wall_timeout,
+    "max_catch_up_lateness_seconds": normalize_max_catch_up_lateness,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1971,6 +1973,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "reasoning_effort": _normalize_reasoning_effort,
     "review": normalize_review,
     "hard_wall_timeout_seconds": normalize_hard_wall_timeout,
+    "max_catch_up_lateness_seconds": normalize_max_catch_up_lateness,
     "keep_pinned_lane": bool,
 }
 
@@ -2027,6 +2030,7 @@ def create_job(
     pinned: bool = False,
     interpreter: Optional[str] = None,
     hard_wall_timeout_seconds: Optional[float] = None,
+    max_catch_up_lateness_seconds: Optional[float | str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -2037,7 +2041,8 @@ def create_job(
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
-    (a venv can be rebuilt or moved after creation)."""
+    (a venv can be rebuilt or moved after creation). max_catch_up_lateness_seconds: recurring
+    occurrence expiration deadline; unset is unlimited, 0 permits no lateness."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     job_timezone = normalize_job_timezone(job_timezone)
@@ -2132,6 +2137,7 @@ def create_job(
         ("review", f["review"]), ("output_local_only", True if f["review"] else None),
         ("interpreter", f["interpreter"]),
         ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),
+        ("max_catch_up_lateness_seconds", f["max_catch_up_lateness_seconds"]),
     ):
         if value is not None:
             job[key] = value
@@ -3001,7 +3007,18 @@ def claim_job_for_fire(
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
-        instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
+        from cron.missed_windows import expired_occurrence, record_missed_window
+        from cron.occurrences import unclaimed_pending_slot
+
+        slot = job.get("next_run_at")
+        if job.get("max_catch_up_lateness_seconds") is not None:
+            slot = unclaimed_pending_slot(job, now) or slot
+        instant = None if manual_fire else scheduled_instant(slot)
+        missed = expired_occurrence(job, slot, now, manual=manual_fire)
+        if missed is not None:
+            record_missed_window(job, missed, now)
+            save_jobs(jobs)
+            return False
         # A scheduled tick only ever fires when now >= next_run_at
         # (_evaluate_due_job returns False while the stored occurrence is still
         # in the future), so a claim arriving BEFORE the stored next occurrence
@@ -3541,6 +3558,19 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
     job["_scheduled_instant"] = None if manual_run else scheduled_instant(job.get("next_run_at"))
+
+    # Enforce opt-in deadlines before coalescing/re-anchoring destroys the due slot.
+    from cron.missed_windows import expired_occurrence, record_missed_window
+    missed = expired_occurrence(job, next_run, now, manual=manual_run)
+    if missed is not None:
+        if _claim_is_live(job.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS):
+            return False
+        record = scan.find(job["id"])
+        if record is None:
+            return False
+        record_missed_window(record, missed, now)
+        scan.needs_save = True
+        return False
 
     if not manual_run and kind == "cron" and _reanchor_stale_cron(d):
         return False

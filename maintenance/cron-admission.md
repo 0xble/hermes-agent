@@ -1,6 +1,6 @@
 # Cron Admission
 
-**Patch identity:** `cron-protected-admission`.
+**Patch identities:** `cron-protected-admission`, `cron-max-catch-up-lateness`.
 
 This unit extends the [fork contract](../MAINTENANCE.md). Load it for cron
 completion rearming, built-in ticker waits, or executor admission changes.
@@ -48,6 +48,45 @@ Do not replace it with a higher general cap, a second reservation, job-specific
 identity matching, or an execution-terminal release shortcut. Retire it only
 when the selected upstream baseline preserves the same admission and timing
 contract under general-pool saturation.
+
+## Maximum catch-up lateness
+
+Recurring jobs can opt into `max_catch_up_lateness_seconds`, a finite,
+nonnegative number of elapsed seconds after their scheduled occurrence. Unset
+or null retains the historical unlimited/coalesced catch-up behavior; `0` is
+strict zero lateness, and equality remains eligible. This is an expiration
+policy, not the recurring backlog grace or the one-shot grace. Manual Run now
+is not a delayed scheduled occurrence. One-shot behavior is unchanged.
+
+Enforce expiration before catch-up rewrites the original due slot, on external
+provider admission, and again at executor/detached-worker entry. Compare UTC
+instants, not local wall clocks. A missed occurrence never launches a script or
+agent, consumes no repeat budget, and does not pretend to have executed. Persist
+`last_status=skipped`, a structured `last_missed_window` result, the diagnostic
+output, and the next future slot. Release only the attempt's own claim and
+pending slot.
+
+Commit one owner failure notice to the existing durable cron delivery outbox
+before advancing the job. Key it by job and canonical scheduled instant so
+repeated scans, queue retries, and a restart between outbox and job-store commits
+cannot duplicate an attempted send. Owner notices bypass local-only normal or
+failure output lanes and use the existing origin/home/incident failure route.
+If queue admission fails, do not run or discard the expired occurrence.
+
+Expose the policy through cron create/update tools and CLI, and always return
+it in create/update/list tool responses (including `0` and unset/null). An empty
+string clears it through the tool; CLI edit supports an explicit clear flag.
+No live job or runtime configuration is part of this source-only patch.
+
+Contract tests: `tests/cron/test_catch_up_lateness.py` and
+`tests/tools/test_cronjob_catch_up_lateness.py`; qualification also covers all
+`tests/cron/` and existing cron tool tests. Retire this patch when the selected
+upstream release preserves both admission/start deadlines and the durable,
+local-lane-independent owner notice. Rollback reverts these source hooks and
+interfaces; an unset field is already backward-compatible. Coordinate the
+owner-alert helper with the separate one-shot-retirement patch: it was not on
+`origin/main` at this patch's base, and both use the same delivery outbox and
+failure-routing contract rather than introducing a transport.
 
 ## Dispatch Diagnostics
 
