@@ -52,6 +52,17 @@ async def _stop_exec_tree(proc) -> None:
         await asyncio.wait_for(proc.wait(), timeout=5)
 
 
+async def _stop_exec_spawn(spawn_task) -> None:
+    """Drain creation before cleanup, even if cancellation arrived before a Process was returned."""
+    try:
+        proc = await spawn_task
+    except Exception:
+        # The caller is already cancelled. Observe the spawn failure without replacing cancellation.
+        logger.debug("Exec quick command spawn failed during cleanup", exc_info=True)
+        return
+    await _stop_exec_tree(proc)
+
+
 class GatewayInboundHooksMixin:
     """Hook, quick-command and plugin-command dispatch for ``GatewayInboundMixin``."""
 
@@ -190,16 +201,18 @@ class GatewayInboundHooksMixin:
         (the gateway process has every API key in os.environ), redacted output, its process tree
         killed after 30 s or when the awaiting task is cancelled (gateway shutdown).
         ``cwd`` is a local session's folder; None keeps the gateway's own (messaging)."""
-        proc = None
+        spawn_task = None
         try:
             from tools.environments.local import build_subprocess_env
-            proc = await asyncio.create_subprocess_shell(
+            # Retain ownership while asyncio connects the pipes: the shell may already be running.
+            spawn_task = asyncio.create_task(asyncio.create_subprocess_shell(
                 exec_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env=build_subprocess_env(), cwd=cwd,
                 # Its own process group, so cleanup can reach what the shell started (POSIX;
                 # Windows ignores it and _stop_exec_tree walks the tree with taskkill /T).
                 start_new_session=True,
-            )
+            ))
+            proc = await asyncio.shield(spawn_task)
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_EXEC_QUICK_COMMAND_TIMEOUT)
             output = (stdout or stderr).decode().strip()
             if output:
@@ -208,8 +221,8 @@ class GatewayInboundHooksMixin:
             return output or t("gateway.quick_command.no_output")
         except (TimeoutError, asyncio.CancelledError) as stopped:
             # One cleanup for both: a cancelled await must not leave the command running either.
-            if proc is not None:
-                await asyncio.shield(_stop_exec_tree(proc))
+            if spawn_task is not None:
+                await asyncio.shield(_stop_exec_spawn(spawn_task))
             if isinstance(stopped, asyncio.CancelledError):
                 raise
             return t("gateway.quick_command.timed_out")

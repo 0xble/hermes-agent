@@ -43,6 +43,23 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   paused, matching the other busy and retry cards (`agent/conversation_loop.py`
   `_compression_deferred_result`). Upstream still renders the bare text. Retire by upstreaming.
 
+## Exec Quick-Command Spawn Cancellation
+
+- Follow-up patch identity: `quickexec-spawn-cancel`.
+- Required behavior: cancellation during subprocess creation retains and drains the creation
+  task before the existing whole-tree cleanup. Cancellation still propagates, normal spawn
+  failures keep their error reply, and a spawn failure concurrent with cancellation does not
+  replace cancellation. Sanitized environment, output redaction, local cwd and timeout behavior
+  are unchanged.
+- Upstream source: `49df49a5e122f` introduced process-tree cleanup after creation. Both fork
+  `e169810be1581` and upstream `6696c7b0a404a` still lose ownership during creation.
+- Proof surface: `tests/gateway/test_exec_quick_command_tree.py` gates real transport readiness
+  with an Event and verifies the original shell and child identities stop within 10 s, alongside
+  after-creation cancellation, timeout and genuine spawn-error controls. Fixture cleanup owns
+  failure-path survivors independently of the production cleanup.
+- Retire when upstream drains creation ownership through cancellation with equivalent process
+  cleanup. Roll back by reverting the commit carrying this identity.
+
 ## Verification
 
 `tests/gateway/test_telegram_voice_v0_regressions.py` asserts the ⏳ queue reply.
