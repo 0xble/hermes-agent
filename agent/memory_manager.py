@@ -797,9 +797,15 @@ class MemoryManager:
             return
         if not self._owner_allows("on_session_end"):
             return
+        # Builtin and Hindsight inherit the no-op hook. Scrubbing their entire
+        # transcript has no egress consumer and can monopolize a shutdown worker.
+        consumers = [p for p in self._providers if callable(getattr(p, "on_session_end", None))
+                     and getattr(p.on_session_end, "__func__", None) is not MemoryProvider.on_session_end]
+        if not consumers:
+            return
         messages = _redact_messages_for_egress(messages or [])
         self._each_provider("on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
-                            exc_info=True)
+                            exc_info=True, providers=consumers)
 
     def commit_session_boundary_async(self, messages: list[dict[str, Any]], *, new_session_id: str,
                                       parent_session_id: str = "", reason: str = "new_session") -> None:
