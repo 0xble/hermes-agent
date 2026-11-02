@@ -10,7 +10,10 @@ formatting-stripped accessibility fallback. Larger content uses the existing
 renderer. Unmarked replies and action-needed failures remain normal size.
 Other platforms retain their existing content and metadata. Presentation must
 not change notice visibility, privacy, persistence, or suppression policy.
-Context notices never finalize a foreground stream.
+Context notices never finalize a foreground stream. Native Slack finalization
+also requires the consumer's existing draft identity in `metadata["_draft_id"]`
+to match the open stream. Equal text, thread routing and `notify=True` do not
+authorize a background or stale turn to commit a foreground stream.
 
 Classification belongs to producers through `ContextNotice` or the existing
 notice's `notice_style` field, carried by `notice_metadata`. Never infer it from
@@ -36,7 +39,7 @@ agent producers never load the gateway package
 | Display/busy settings, `gateway/slash_commands.py` | Saved verbose, busy and footer receipts, retaining busy's `EphemeralReply` contract | Status, usage, unknown values, disabled controls and failed saves |
 | Command producers, `gateway/slash_commands_model.py` | Model/reasoning/fast/personality/runtime setting confirmations | Invalid selections, failed saves, guard/approval prompts |
 | Resume producer, `gateway/slash_commands_session.py` | Successful resume/already-current confirmations | Missing or disallowed target and empty selection lists |
-| Background task producer, `gateway/slash_commands.py`, `gateway/run_turn.py` | Start and successful completion receipt | Actual result body, execution errors |
+| Background task producer, `gateway/slash_commands.py`, `gateway/run_turn.py` | Start receipt | Completion attribution and actual result in one send, execution errors |
 | Cron-store transition producer, `gateway/cron_store_notices.py` | Recovered/writable-again receipt within the owning profile's language, home-channel route and warning opt-out | Unwritable/degraded warning. Scheduled-job reports remain real content |
 | Startup/update producers, `gateway/run_notifications.py` | Online, restart complete, operation progress and successful update receipt | Failed updates and restart resend/recovery decisions |
 | Moved-out-of-core producers, `hermes_cli/left_core_migration.py`, `hermes_cli/memory_provider_migration.py` | Successful installation receipts | Installation failures |
@@ -72,6 +75,13 @@ callback, and actual Slack payloads. The producer marks only the recoverable
 working-default notice. Tests preserve diagnostic suppression, session isolation,
 repeat-boundary deduplication, unchanged Telegram text, and full-size unmarked
 credentials, login, and model-access prompts.
+
+`tests/gateway/test_background_attribution_delivery.py` forces concurrent
+completions and rejected sends through the actual background producer, requiring
+one attributed payload per result. `tests/gateway/test_slack_native_streaming.py`
+rejects equal-text finalization without the owning draft identity, including a
+stale turn. Its real stream-consumer fixture posts an equal background body
+without touching the foreground stream, then commits the owning final in place.
 
 `tests/gateway/test_telegram_ingress_nonblocking.py` drives busy acknowledgements
 through the native ingress-consumer boundary with a real `MessageEvent` and
