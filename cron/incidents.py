@@ -129,8 +129,12 @@ def _redact_error(error: str) -> str:
 
 
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _DURATION_RE.sub("#s", _normalize_error(error))[:_MAX_SIGNATURE_ERROR_CHARS]
+    """Dedup key: stable for same job + cause. Durations and scheduled instants vary per occurrence."""
+    normalized = _DURATION_RE.sub("#s", _normalize_error(error))
+    normalized = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})\b",
+        "<scheduled>", normalized,
+    )[:_MAX_SIGNATURE_ERROR_CHARS]
     return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 

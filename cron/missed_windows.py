@@ -37,9 +37,10 @@ def claim_slot(job: dict, now, *, manual: bool = False) -> tuple:
                else unclaimed_pending_slot(job, now))
     if pending:
         return pending, False
-    # Without a pending occurrence, a late hosted redelivery must not fire the
-    # future slot to which expiration advanced the job. Preserve the usual skew.
-    too_early = (job.get("last_missed_window") and slot
+    # The marker names only the slot expiration advanced to. Once that slot
+    # advances, the historical miss must not reject unrelated early fires.
+    advanced_to = (job.get("last_missed_window") or {}).get("advanced_to")
+    too_early = (advanced_to == slot and slot
                  and jobs._ensure_aware(datetime.fromisoformat(slot)) > now
                  + timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS))
     return slot, bool(too_early)
@@ -85,7 +86,8 @@ def record_missed_window(job: dict, result: dict, now) -> str:
     queue_owner_failure(
         job, f"missed-window:{job['id']}:{result['scheduled_at']}", message,
         output_file=output)
-    job.update(last_status="skipped", last_error=message, last_missed_window=result,
+    job.update(last_status="skipped", last_error=message,
+               last_missed_window={**result, "advanced_to": next_run},
                next_run_at=next_run, state="scheduled")
     job.pop("pending_slot", None)
     job.pop("fire_claim", None)
@@ -93,7 +95,7 @@ def record_missed_window(job: dict, result: dict, now) -> str:
     return message
 
 
-def skip_before_start(snapshot: dict) -> str | None:
+def skip_before_start(snapshot: dict, *, owns_claim: bool = True) -> str | None:
     """Recheck a queued/detached occurrence under its claim fence using current job policy.
 
     A stale worker may decline its own execution but must never clear a newer
@@ -107,8 +109,10 @@ def skip_before_start(snapshot: dict) -> str | None:
     if not instant:
         return None
     expected = (snapshot.get("fire_claim") or {}).get("by")
+    missed_window_saved = False
 
     def apply(records, _i, job):
+        nonlocal missed_window_saved
         if not job.get("enabled", True) or jobs._has_pause_marker(job) or job.get("state") == "completed":
             return None  # Existing cancellation/terminal controls own these transitions.
         now = jobs._hermes_now()
@@ -116,6 +120,10 @@ def skip_before_start(snapshot: dict) -> str | None:
         if result is None:
             return None
         message = missed_window_message(job, result)
+        # A due-scan snapshot can copy another owner's claim; it never owns it.
+        if not owns_claim and jobs._claim_is_live(
+                job.get("fire_claim"), now, jobs.FIRE_CLAIM_TTL_SECONDS):
+            return None
         current = (job.get("fire_claim") or {}).get("by")
         if expected != current:
             return message  # No mutations/alerts for a stale claimant.
@@ -129,7 +137,12 @@ def skip_before_start(snapshot: dict) -> str | None:
                 return message
         record_missed_window(job, result, now)
         jobs.save_jobs(records)
+        missed_window_saved = True
         return message
 
-    return jobs._under_fire_fence(
+    result = jobs._under_fire_fence(
         snapshot["id"], lambda: jobs._with_job(snapshot["id"], apply, None))
+    if missed_window_saved:
+        from cron.scheduler import _notify_provider_jobs_changed
+        _notify_provider_jobs_changed()
+    return result

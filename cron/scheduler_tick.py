@@ -39,7 +39,7 @@ def process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     note_dispatch_stage(job, "fire_claim_enter")
     try:
         from cron.missed_windows import skip_before_start
-        skipped = skip_before_start(job)
+        skipped = skip_before_start(job, owns_claim=False)
         if skipped:
             _sched.finish_execution(job["execution_id"], success=False, error=skipped, output=skipped)
             return True

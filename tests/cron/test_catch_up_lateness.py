@@ -177,6 +177,89 @@ def test_expiration_is_retryable_and_alert_receipt_survives_restart(store, monke
     assert jobs.get_job(job["id"])["last_status"] == "skipped"
 
 
+def test_provider_rearms_after_miss_and_runs_next_occurrence(store, monkeypatch, make_cron_provider):
+    job = recurring(3600)
+    jobs.save_jobs([job])
+    provider = make_cron_provider()
+    fire_at = {job["id"]: job["next_run_at"]}
+
+    def reconcile():
+        fire_at.update({j["id"]: j["next_run_at"] for j in jobs.load_jobs()})
+
+    monkeypatch.setattr(provider, "on_jobs_changed", reconcile)
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: provider)
+    # The hosted scheduler consumes its one-shot before calling the admission endpoint.
+    fire_at.pop(job["id"])
+    assert provider.claim_fire(job["id"]) is None
+    next_slot = jobs.get_job(job["id"])["next_run_at"]
+    assert fire_at.get(job["id"]) == next_slot
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: datetime.fromisoformat(next_slot))
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+    run = Mock(return_value=(True, "next occurrence ran", "next occurrence ran", None))
+    monkeypatch.setattr(scheduler, "run_job", run)
+    assert provider.fire_due(job["id"])
+    run.assert_called_once()
+    assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
+
+
+def test_preclaim_tick_never_releases_foreign_live_claim(store, monkeypatch):
+    job = recurring(299)
+    job["fire_claim"] = {"by": "foreign:123:live-token",
+                         "at": (NOW - timedelta(seconds=30)).isoformat()}
+    jobs.save_jobs([job])
+    due = jobs.get_due_jobs()[0]
+    jobs.advance_next_runs([job["id"]])
+    before = jobs.get_job(job["id"])
+    due["execution_id"] = executions.create_execution(job["id"], source="test")["id"]
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: NOW + timedelta(seconds=2))
+    launch = Mock(return_value=True)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
+    process_due_job(due, None, None, False)
+    assert jobs.get_job(job["id"]) == before
+    launch.assert_not_called()
+    assert scheduler.drain_delivery_queue({}, None) == 0
+
+
+def test_later_normal_run_restores_early_webhook_behavior(store, monkeypatch, make_cron_provider):
+    job = recurring(3600)
+    jobs.save_jobs([job])
+    provider = make_cron_provider()
+    assert provider.claim_fire(job["id"]) is None
+    # A retry for the just-expired slot must still be refused.
+    assert provider.claim_fire(job["id"]) is None
+    next_slot = jobs.get_job(job["id"])["next_run_at"]
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: datetime.fromisoformat(next_slot))
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+    monkeypatch.setattr(scheduler, "run_job", Mock(return_value=(True, "ran", "ran", None)))
+    assert provider.fire_due(job["id"])
+    assert jobs.get_job(job["id"])["repeat"]["completed"] == 1
+    # The next slot is an hour away; ordinary early webhooks are occurrence-free.
+    early = provider.claim_fire(job["id"])
+    assert early is not None
+    assert early["_scheduled_instant"] is None
+
+
+def test_repeated_misses_share_one_incident_but_keep_occurrence_notices(store, monkeypatch):
+    from cron import incidents
+
+    job = recurring(3600)
+    jobs.save_jobs([job])
+    assert jobs.get_due_jobs() == []
+    first = incidents.list_incidents()
+    assert len(first) == 1
+    next_slot = jobs.get_job(job["id"])["next_run_at"]
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: datetime.fromisoformat(next_slot)
+                        + timedelta(seconds=301))
+    assert jobs.get_due_jobs() == []
+    grouped = incidents.list_incidents()
+    assert len(grouped) == 1
+    assert grouped[0]["id"] == first[0]["id"]
+    assert next_slot in grouped[0]["error"]
+    with patch("cron.scheduler_delivery._deliver_standalone") as send:
+        assert scheduler.drain_delivery_queue({}, None) == 2
+    assert send.call_count == 2
+
+
 def test_policy_round_trip_and_clear(store):
     job = jobs.create_job("run", "every 1h", **{FIELD: 0})
     assert jobs.get_job(job["id"])[FIELD] == 0

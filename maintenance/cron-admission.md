@@ -64,14 +64,21 @@ instants, not local wall clocks. A missed occurrence never launches a script or
 agent, consumes no repeat budget, and does not pretend to have executed. Persist
 `last_status=skipped`, a structured `last_missed_window` result, the diagnostic
 output, and the next future slot. Release only the attempt's own claim and
-pending slot.
+pending slot. A pre-claim tick snapshot never owns a copied live claim; leave
+that owner's stored record untouched. After a missed-window store commit,
+notify the external provider outside the store/firing locks so it can arm the
+next occurrence. Reject skipped-slot redeliveries only while `next_run_at`
+still matches the miss's `advanced_to` slot, not for the job's whole lifetime.
 
 Commit one owner failure notice to the existing durable cron delivery outbox
 before advancing the job. Key it by job and canonical scheduled instant so
 repeated scans, queue retries, and a restart between outbox and job-store commits
 cannot duplicate an attempted send. Owner notices bypass local-only normal or
 failure output lanes and use the existing origin/home/incident failure route.
-If queue admission fails, do not run or discard the expired occurrence.
+If queue admission fails, do not run or discard the expired occurrence. Group
+repeated missed windows under the same job-and-cause incident by normalizing
+both elapsed durations and the scheduled instant, while retaining an outbox
+notice and the latest diagnostic for each distinct occurrence.
 
 Expose the policy through cron create/update tools and CLI, and always return
 it in create/update/list tool responses (including `0` and unset/null). An empty

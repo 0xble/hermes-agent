@@ -2991,7 +2991,10 @@ def claim_job_for_fire(
     ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    missed_window_saved = False
+
     def apply(jobs, _i, job):
+        nonlocal missed_window_saved
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
         # Both enabled and pause markers must clear — a half-paused record must not claim. ``force``
@@ -3017,6 +3020,7 @@ def claim_job_for_fire(
         if missed is not None:
             record_missed_window(job, missed, now)
             save_jobs(jobs)
+            missed_window_saved = True
             return False
         # A scheduled tick only ever fires when now >= next_run_at
         # (_evaluate_due_job returns False while the stored occurrence is still
@@ -3055,7 +3059,11 @@ def claim_job_for_fire(
         save_jobs(jobs)
         return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
 
-    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    result = _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    if missed_window_saved:
+        from cron.scheduler import _notify_provider_jobs_changed
+        _notify_provider_jobs_changed()
+    return result
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
