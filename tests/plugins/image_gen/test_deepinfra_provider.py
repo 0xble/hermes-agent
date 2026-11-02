@@ -67,6 +67,9 @@ def test_list_models_filters_by_image_gen_tag(monkeypatch):
 def test_generate_calls_openai_sdk_with_deepinfra_base_url(monkeypatch):
     """Happy path: pinned model → openai SDK called with DeepInfra
     base_url + Bearer key → b64 saved to cache."""
+    # generate() fetches the catalog even for a pinned model; SDK wiring must
+    # not depend on DeepInfra's inventory or network availability.
+    monkeypatch.setattr(deepinfra_plugin, "_live_models", list)
     monkeypatch.setenv("DEEPINFRA_IMAGE_MODEL", "vendor/test-img")
     captured: dict = {}
 
