@@ -757,6 +757,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
+    try:
+        from tools.computer_use.cua_driver_lifetime import sweep_on_startup
+        sweep_on_startup()
+    except Exception:
+        pass
     _start_gateway_resolve_terminal_cwd()
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
