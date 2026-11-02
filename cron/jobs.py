@@ -2752,7 +2752,9 @@ def mark_job_run(
 
 
 def _write_oneshot_diagnostic(job: dict[str, Any], text: str, what: str) -> bool:
-    """Best-effort operator-visible trace in the job's output dir; never breaks the caller."""
+    """Durably queue the owner failure before retirement; save the local trace best-effort."""
+    from cron.oneshot_retirement import queue_retirement_alert
+    queue_retirement_alert(job, text, what, now=_hermes_now())
     try:
         save_job_output(job.get("id", ""), text)
         return True
@@ -2765,11 +2767,8 @@ def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
     """Trace for a wedged one-shot removal: dispatch was claimed but mark_job_run never ran
     (interrupted mid-run); removing it silently would leave no output, error, or record.
 
-    A finite one-shot whose dispatch was claimed (``repeat.completed`` >= ``repeat.times``) but which never
-    reached ``mark_job_run`` (``last_run_at`` is null) was interrupted mid-run — scheduler restart, gateway
-    kill, or a non-Exception escape (#73973). The recovery guards remove such jobs so they stop appearing
-    due, but a silent removal leaves the user with no output, no error, and no job record. Write a small
-    diagnostic file into the job's output directory so the removal is observable and debuggable.
+    A spent dispatch without ``last_run_at`` may have partial effects. Leave an alert
+    and local trace when recovery retires it, rather than replaying it (#73973).
     """
     if job.get("last_run_at") is not None:
         return  # a prior run was recorded — normal completion race, not a wedge
@@ -2796,23 +2795,26 @@ def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
             job.get("name", job.get("id", "?")))
 
 
-def _write_missed_oneshot_diagnostic(job: dict[str, Any], next_run: str) -> None:
-    """Trace for a never-ran one-shot retired outside the grace window (else it would just vanish).
-    """
+def _write_retired_oneshot_diagnostic(
+    job: dict[str, Any], next_run: str, *, dispatch_limit: bool = False,
+) -> None:
+    """Route both retirement gates through the same interrupted-versus-unrun diagnostic."""
+    if (job.get("repeat") or {}).get("completed", 0) > 0 and job.get("last_run_at") is None:
+        # A consumed, unfinished dispatch may already have side effects.
+        _write_wedged_oneshot_diagnostic(job)
+        return
+    reason = "dispatch limit reached" if dispatch_limit else "run time outside grace window"
     _write_oneshot_diagnostic(
         job,
-        "# Cron job removed before firing (run time outside grace window)\n\n"
+        f"# Cron job removed before firing ({reason})\n\n"
         f"- job id: {job.get('id')}\n"
         f"- name: {job.get('name')}\n"
         f"- scheduled run time: {next_run}\n"
         f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
         f"- removed at: {_hermes_now().isoformat()}\n\n"
-        "This one-shot's run time is more than the grace window in the "
-        "past (scheduler down past the window, host asleep, or jobs.json "
-        "edited), which is outside the 'will never fire' contract "
-        "enforced at create/update/resume time. The job was removed "
-        "without running; recreate it (or use the Run button) to "
-        "schedule it again.\n",
+        f"This one-shot was removed without running: {reason}. "
+        "A re-armed record may have consumed its dispatch budget on a prior run. "
+        "Recreate it (or use the Run button) to schedule it again.\n",
         "missed-oneshot")
 
 
@@ -2820,12 +2822,10 @@ def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot dispatch BEFORE execution: ``repeat.completed`` is bumped
     and persisted under the jobs lock so a tick dying mid-execution cannot lose the dispatch
     (*at-most-times* instead of *at-least-once*). True if the caller may run the job; False when
-    the limit is already reached. Only ``kind == "once"`` with ``repeat.times > 0`` is claimed.
+    the limit is reached (including a retirement pending alert retry). Only finite one-shots are claimed.
 
-    Increments ``repeat.completed`` under the cross-process jobs lock and persists the claim immediately, so
-    that if the tick dies mid-execution (gateway kill, OOM, segfault, hard-timeout) the dispatch is not
-    lost. This converts finite one-shot jobs from *at-least-once* to *at-most-times* semantics — a job that
-    self-destructs fires at most ``repeat.times`` times instead of infinitely (issue #38758).
+    The durable claim converts finite one-shots to *at-most-times* across a mid-execution
+    crash: a self-destructing job fires at most ``repeat.times`` times (#38758).
     """
     def apply(jobs, i, job):
         repeat = job.get("repeat") or {}
@@ -2848,10 +2848,15 @@ def claim_dispatch(job_id: str) -> bool:
                 return False
             # A prior tick claimed the dispatch then died — a genuinely wedged claim. Remove it so
             # it stops appearing due, leaving an operator-visible diagnostic.
+            try:
+                _write_wedged_oneshot_diagnostic(job)
+            except Exception:
+                # Alert admission is not a run failure: leave last_run_at and the due slot alone.
+                logger.warning("Job %s: retirement alert pending; keeping job for retry", job_id, exc_info=True)
+                return False
             jobs.pop(i)
             # See #73973.
             save_jobs(jobs, removed_ids={job_id})
-            _write_wedged_oneshot_diagnostic(job)
             logger.info(
                 "Job '%s': dispatch limit reached (%d/%d) — removing", label, completed, times)
             return False
@@ -3422,7 +3427,7 @@ def _retire_expired_oneshot(d: _DueJob) -> bool:
     if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
         return False
     if not (claim or d.job.get("fire_claim")):
-        _write_missed_oneshot_diagnostic(d.job, d.next_run)
+        _write_retired_oneshot_diagnostic(d.job, d.next_run)
         d.scan.retire(d.job["id"])
         d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
     return True
@@ -3464,9 +3469,9 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
         logger.info(
             "Job '%s': one-shot dispatch limit reached (%d/%d) — removing stale due entry",
             name, completed, times)
+    # Queue before mutating the scan: enqueue failure must not retire the job.
+    _write_retired_oneshot_diagnostic(job, job.get("next_run_at") or "unknown", dispatch_limit=True)
     scan.retire(job["id"])
-    # The claimed run never completed here by definition — leave an operator-visible diagnostic.
-    _write_wedged_oneshot_diagnostic(job)
     return True
 
 

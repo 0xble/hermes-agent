@@ -1,6 +1,42 @@
 # Cron restart survival on macOS
 
-Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`.
+Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`, `cron-oneshot-retirement-alert`.
+
+## One-shot retirement notices
+
+A time-sensitive one-shot can expire while the host or scheduler is down. Never
+execute it late by default. Before retiring a never-completed one-shot outside
+its grace window or with a spent dispatch claim, commit one failure notice to
+the existing cron delivery outbox under a stable per-job identity. Preserve an
+explicit non-local `failure_deliver` or `deliver` target. For local or review-only
+output lanes, resolve its creator origin, then the ordinary configured-home
+fallback. Keep the failure incident sink and ordinary failure-notification policy. A
+failed queue commit keeps the job for retry and compare-clears only the rejected
+attempt's run/fire claims; a successor's claim is never released. Both in-grace
+spent-budget and past-grace retirement share diagnostic routing, including
+re-armed records with a prior completion. A restart between queueing and
+removal reuses the outbox receipt, including its terminal tombstone. Keep the
+local diagnostic and removal. An interrupted dispatch may have partial effects;
+do not claim that it certainly never ran or automatically replay it.
+
+Retirement queues the alert in `cron/deliveries.db`; only a gateway drains that
+outbox. Desktop-only and `hermes cron tick` setups receive the chat alert when a
+gateway next runs. The failure incident and local output file are recorded
+immediately during retirement; queueing does not mean chat delivery has happened.
+
+The notice names the job id/name, scheduled instant, lateness, reason and manual
+recreation action. Single-profile and multiplex startup capture the previous
+heartbeat before replacing it, so the alert can report known startup/heartbeat
+instants without inventing an exact downtime onset. This extends the existing
+retirement/delivery boundary; no new service, transport, or inference run.
+
+Contract tests: `tests/cron/test_oneshot_retirement_alert.py`. Exercise the full
+`tests/cron/` suite for in-grace, recurring, recovery, and delivery compatibility.
+Retire `cron-oneshot-retirement-alert` when a released upstream provides the
+same local-lane-independent, crash-idempotent owner alert without late firing.
+Upstream proposals #122765 and #138153 were inspected: they primarily widen or
+opt into catch-up and do not establish this safe-default owner alert contract.
+Rollback by reverting this logical patch; no live jobs or policy need mutation.
 
 ## Contract
 
