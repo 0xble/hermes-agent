@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from pathlib import Path
 import os
 import plistlib
@@ -28,17 +29,28 @@ def stop_requested(home: Path) -> bool:
         return False
 
 
-def login_bootstrap(home: Path, gateway_plist: Path, *, runner=None, log=None) -> None:
+@contextmanager
+def lifetime_lock(home: Path, *, blocking: bool = True):
+    """Shared with CLI/guardian; keep stdlib-only for the isolated login entry point."""
     import fcntl
+    path = home / "logs/launchd-lifetime.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def login_bootstrap(home: Path, gateway_plist: Path, *, runner=None, log=None) -> None:
     if log is None:
         from datetime import UTC, datetime
         def timestamped_log(message):
             print(f"{datetime.now(UTC).isoformat()} {message}", flush=True)
         log = timestamped_log
-    lock_path = home / "logs/launchd-lifetime.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with lifetime_lock(home):
         _login_bootstrap(home, gateway_plist, runner=runner, log=log)
 
 

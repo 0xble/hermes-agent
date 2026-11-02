@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from contextlib import contextmanager
 import plistlib
 import subprocess
 from xml.parsers.expat import ExpatError
+
+from hermes_cli.gateway_launchd_login import lifetime_lock
 
 
 SESSION_TYPES = {"user": "Background", "gui": "Aqua"}
@@ -17,20 +18,6 @@ def _uid() -> int:
     if uid is None:
         raise RuntimeError("launchd requires a POSIX user")
     return uid()
-
-
-@contextmanager
-def lifetime_lock(home: Path, *, blocking: bool = True):
-    import fcntl
-    path = home / "logs/launchd-lifetime.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-        except BlockingIOError:
-            yield False
-            return
-        yield True
 
 
 def configured_launchd_domain(label: str | None = None) -> str | None:
@@ -192,11 +179,10 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
     from hermes_cli.gateway_launchd_login import login_plist
     bodies = {path: body, login_path: login_plist(home, path, label) if mode == "user" else None}
     if originals[guardian_path] is not None:
-        bodies[guardian_path] = guardian_plist(home, path, label, domain=target)
-    lock_path = home / "logs/launchd-lifetime.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        bodies[guardian_path] = guardian_plist(home, path, label, domain=target, explicit=True)
+    with lifetime_lock(home, blocking=False) as acquired:
+        if not acquired:
+            raise BlockingIOError("launchd lifetime operation is busy; retry shortly")
         if any((p.read_bytes() if p.exists() else None) != b for p, b in originals.items()):
             raise RuntimeError("launchd definitions changed during migration preflight; retry")
         labels = {path: label, guardian_path: GUARDIAN_LABEL, login_path: login_label}

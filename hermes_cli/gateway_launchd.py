@@ -211,7 +211,7 @@ def _launchctl_supervised_pid(label: str, *, timeout: float = 10, strict: bool =
             from hermes_cli.gateway_launchd_lifetime import _state
             return _state(subprocess.run, domain, label, timeout=timeout)[1]
         result = subprocess.run(["launchctl", "list", label], check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
-    except (subprocess.TimeoutExpired, OSError) as exc:
+    except (subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
         if strict:
             raise RuntimeError(f'cannot probe launchd supervised PID for {label}: {exc}') from exc
         return None
@@ -810,7 +810,13 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     configured = configured_launchd_domain()
     selected = domain if domain is not None else (configured.split("/", 1)[0] if configured else None)
     if selected is not None:
-        migrate_launchd_domain(selected, start_now=start_now)
+        from hermes_cli.gateway_command_errors import GatewayInstallError
+        try:
+            migrate_launchd_domain(selected, start_now=start_now)
+        except BlockingIOError as exc:
+            raise GatewayInstallError("Launchd lifetime operation is busy; retry shortly.") from exc
+        except RuntimeError as exc:
+            raise GatewayInstallError(f"Could not install gateway launchd service: {exc}") from exc
         return
     if start_now:
         from hermes_cli.gateway_guardian import set_intent
@@ -884,8 +890,10 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
 
 
 def launchd_uninstall():
+    from hermes_cli.gateway_launchd_login import _login_trigger_label
+    trigger = _login_trigger_label(_gw().get_launchd_label())
     if (configured_launchd_domain() is not None or
-            _gw().get_launchd_plist_path().with_name(f"{_gw().get_launchd_label()}-login.plist").exists()):
+            _gw().get_launchd_plist_path().with_name(f"{trigger}.plist").exists()):
         uninstall_launchd_lifetime()
         return
     gateway_service_owner.refuse_foreign_launchd_plist("uninstall")

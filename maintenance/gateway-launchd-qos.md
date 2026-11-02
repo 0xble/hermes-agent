@@ -21,7 +21,9 @@ Fork patch identities: `gateway-launchd-qos`, `gateway-session-independent-launc
 Contract tests: `tests/hermes_cli/test_launchd_session_lifetime.py`,
   `tests/hermes_cli/test_launchd_login_trigger.py`,
   `tests/hermes_cli/test_launchd_login_identity.py`,
-  `tests/hermes_cli/test_launchd_lifetime_safety.py`.
+  `tests/hermes_cli/test_launchd_lifetime_safety.py`,
+  `tests/hermes_cli/test_launchd_lifetime_review.py`,
+  `tests/hermes_cli/test_guardian_automatic_reinstall.py`.
 
 ## Explicit lifetime selection
 

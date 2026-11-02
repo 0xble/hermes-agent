@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import sys
 
+from hermes_cli.gateway_command_errors import GatewayInstallError
+
 
 def launchd_options(args, *, backend, system, run_as_user) -> dict:
     mode = getattr(args, "launchd_domain", None)
     if mode is None:
         return {}
     if backend != "launchd" or system or run_as_user:
-        raise ValueError("--launchd-domain is a macOS per-user option; do not combine with --system/--run-as-user")
+        raise GatewayInstallError("--launchd-domain is a macOS per-user option; do not combine with --system/--run-as-user")
     if getattr(args, "start_on_login", None) is False:
-        raise ValueError("--launchd-domain owns login registration; --no-start-on-login is not supported")
+        raise GatewayInstallError("--launchd-domain owns login registration; --no-start-on-login is not supported")
     return {"domain": mode}
 
 

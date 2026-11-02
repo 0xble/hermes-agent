@@ -615,13 +615,18 @@ def _run_once_locked(home: Path, plist: Path, label: str, *, grace: float | None
             return "alert"
 
 
-def guardian_plist(home: Path, gateway_plist: Path, label: str, *, domain: str) -> bytes:
+def guardian_plist(home: Path, gateway_plist: Path, label: str, *, domain: str,
+                   explicit: bool | None = None) -> bytes:
     mode = domain.split("/", 1)[0]
     if mode not in {"gui", "user"}:
         raise ValueError("guardian launchd domain must be gui or user")
     python = home / "current/.venv/bin/python"
-    return plistlib.dumps({"LimitLoadToSessionType": "Background" if mode == "user" else "Aqua",
-                           "Label": GUARDIAN_LABEL, "RunAtLoad": True, "StartInterval": INTERVAL,
+    if explicit is None:
+        session_type = (plistlib.loads(gateway_plist.read_bytes()).get("LimitLoadToSessionType")
+                        if gateway_plist.is_file() else None)
+        explicit = mode == "user" or session_type in ("Aqua", "Background")
+    session = {"LimitLoadToSessionType": "Background" if mode == "user" else "Aqua"} if explicit else {}
+    return plistlib.dumps({**session, "Label": GUARDIAN_LABEL, "RunAtLoad": True, "StartInterval": INTERVAL,
                            "ProgramArguments": [str(python), "-m", "hermes_cli.gateway_guardian", "run",
                                                 "--gateway-plist", str(gateway_plist), "--gateway-label", label,
                                                 "--domain", domain],
