@@ -77,6 +77,9 @@ def test_expired_occurrence_skips_and_alerts_owner_once(store, monkeypatch, path
     assert not saved.get("pending_slot") and not saved.get("fire_claim")
     assert saved["repeat"]["completed"] == 0 and saved["last_run_at"] is None
     assert list((store / "cron/output" / job["id"]).glob("*.md"))
+    if path == "provider":
+        # A late hosted retry must not execute the newly advanced future slot early.
+        assert make_cron_provider().claim_fire(job["id"]) is None
     with patch("cron.scheduler_delivery._deliver_standalone") as send:
         assert scheduler.drain_delivery_queue({}, None) == 1
         assert send.call_count == 1
@@ -107,11 +110,14 @@ def test_eligible_and_unbounded_jobs_still_dispatch(store, monkeypatch, age, lim
     assert scheduler.drain_delivery_queue({}, None) == 0
 
 
-def test_within_limit_reaches_worker_execution(store):
+def test_within_limit_reaches_worker_execution(store, monkeypatch):
     job = recurring(299)
+    job["last_missed_window"] = {"scheduled_at": (NOW - timedelta(days=1)).isoformat()}
     jobs.save_jobs([job])
     due = jobs.get_due_jobs()[0]
     jobs.advance_next_runs([due["id"]])
+    # The tick's real worker is already registered as running while its pending slot is queued.
+    monkeypatch.setattr(jobs, "_job_running_in_this_process", lambda _job_id: True)
     due["execution_id"] = executions.create_execution(due["id"], source="test")["id"]
     with patch.object(scheduler, "run_one_job", return_value=True) as run:
         assert process_due_job(due, adapters={}, loop=None, verbose=False)

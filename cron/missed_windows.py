@@ -21,6 +21,30 @@ def normalize_max_catch_up_lateness(value) -> float | None:
     return limit
 
 
+def claim_slot(job: dict, now, *, manual: bool = False) -> tuple:
+    """Keep a queued occurrence claimable, but reject a retry of an already-skipped fire."""
+    from datetime import datetime, timedelta
+    from cron import jobs
+    from cron.constants import FIRE_CLAIM_SKEW_SECONDS
+    from cron.occurrences import unclaimed_pending_slot
+
+    slot = job.get("next_run_at")
+    if (manual or job.get(FIELD) is None
+            or (job.get("schedule") or {}).get("kind") not in {"cron", "interval"}):
+        return slot, False
+    stamp = job.get("pending_slot") or {}
+    pending = (stamp.get("scheduled_at") if stamp.get("by") == jobs._machine_id()
+               else unclaimed_pending_slot(job, now))
+    if pending:
+        return pending, False
+    # Without a pending occurrence, a late hosted redelivery must not fire the
+    # future slot to which expiration advanced the job. Preserve the usual skew.
+    too_early = (job.get("last_missed_window") and slot
+                 and jobs._ensure_aware(datetime.fromisoformat(slot)) > now
+                 + timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS))
+    return slot, bool(too_early)
+
+
 def expired_occurrence(job: dict, instant, now, *, manual: bool = False) -> dict | None:
     """Describe a missed scheduled window without rewriting the original due slot."""
     from datetime import UTC, datetime

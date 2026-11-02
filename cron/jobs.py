@@ -3007,12 +3007,11 @@ def claim_job_for_fire(
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
-        from cron.missed_windows import expired_occurrence, record_missed_window
-        from cron.occurrences import unclaimed_pending_slot
+        from cron.missed_windows import claim_slot, expired_occurrence, record_missed_window
 
-        slot = job.get("next_run_at")
-        if job.get("max_catch_up_lateness_seconds") is not None:
-            slot = unclaimed_pending_slot(job, now) or slot
+        slot, skipped_retry = claim_slot(job, now, manual=manual_fire)
+        if skipped_retry:
+            return False
         instant = None if manual_fire else scheduled_instant(slot)
         missed = expired_occurrence(job, slot, now, manual=manual_fire)
         if missed is not None:
