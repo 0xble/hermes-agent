@@ -2795,27 +2795,26 @@ def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
             job.get("name", job.get("id", "?")))
 
 
-def _write_missed_oneshot_diagnostic(job: dict[str, Any], next_run: str) -> None:
-    """Trace for a never-ran one-shot retired outside the grace window (else it would just vanish).
-    """
+def _write_retired_oneshot_diagnostic(
+    job: dict[str, Any], next_run: str, *, dispatch_limit: bool = False,
+) -> None:
+    """Route both retirement gates through the same interrupted-versus-unrun diagnostic."""
     if (job.get("repeat") or {}).get("completed", 0) > 0 and job.get("last_run_at") is None:
         # A consumed, unfinished dispatch may already have side effects.
         _write_wedged_oneshot_diagnostic(job)
         return
+    reason = "dispatch limit reached" if dispatch_limit else "run time outside grace window"
     _write_oneshot_diagnostic(
         job,
-        "# Cron job removed before firing (run time outside grace window)\n\n"
+        f"# Cron job removed before firing ({reason})\n\n"
         f"- job id: {job.get('id')}\n"
         f"- name: {job.get('name')}\n"
         f"- scheduled run time: {next_run}\n"
         f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
         f"- removed at: {_hermes_now().isoformat()}\n\n"
-        "This one-shot's run time is more than the grace window in the "
-        "past (scheduler down past the window, host asleep, or jobs.json "
-        "edited), which is outside the 'will never fire' contract "
-        "enforced at create/update/resume time. The job was removed "
-        "without running; recreate it (or use the Run button) to "
-        "schedule it again.\n",
+        f"This one-shot was removed without running: {reason}. "
+        "A re-armed record may have consumed its dispatch budget on a prior run. "
+        "Recreate it (or use the Run button) to schedule it again.\n",
         "missed-oneshot")
 
 
@@ -3428,7 +3427,7 @@ def _retire_expired_oneshot(d: _DueJob) -> bool:
     if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
         return False
     if not (claim or d.job.get("fire_claim")):
-        _write_missed_oneshot_diagnostic(d.job, d.next_run)
+        _write_retired_oneshot_diagnostic(d.job, d.next_run)
         d.scan.retire(d.job["id"])
         d.scan.on_saved.append(lambda job=d.job: record_cron_missed(job))
     return True
@@ -3471,7 +3470,7 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
             "Job '%s': one-shot dispatch limit reached (%d/%d) — removing stale due entry",
             name, completed, times)
     # Queue before mutating the scan: enqueue failure must not retire the job.
-    _write_wedged_oneshot_diagnostic(job)
+    _write_retired_oneshot_diagnostic(job, job.get("next_run_at") or "unknown", dispatch_limit=True)
     scan.retire(job["id"])
     return True
 

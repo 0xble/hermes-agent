@@ -171,8 +171,11 @@ def test_runnable_jobs_do_not_emit_retirement_notices(store, kind):
     assert scheduler.drain_delivery_queue({}, None) == 0
 
 
-def test_rearmed_expired_oneshot_keeps_a_queued_alert_and_local_trace(store):
+@pytest.mark.parametrize("lateness", [60, 297])
+def test_rearmed_oneshot_keeps_a_queued_alert_and_local_trace(store, lateness):
     job = oneshot()
+    job["next_run_at"] = (NOW - timedelta(seconds=lateness)).isoformat()
+    job["schedule"]["run_at"] = job["next_run_at"]
     job["repeat"]["completed"] = 1
     job["last_run_at"] = (NOW - timedelta(days=1)).isoformat()
     jobs.save_jobs([job])
@@ -189,8 +192,16 @@ def test_rearmed_expired_oneshot_keeps_a_queued_alert_and_local_trace(store):
 
 def test_run_body_outbox_failure_preserves_retirement_for_retry(store, monkeypatch):
     job = oneshot()
-    job["repeat"]["completed"] = 1
+    job["next_run_at"] = (NOW - timedelta(seconds=60)).isoformat()
+    job["schedule"]["run_at"] = job["next_run_at"]
     jobs.save_jobs([job])
+    due, = jobs.get_due_jobs()
+    assert due["run_claim"]
+    # A dispatch was consumed after the scan, before this worker checked its budget.
+    assert jobs.claim_dispatch(job["id"])
+    job = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(job, dict)
+    assert job["fire_claim"] and job["run_claim"]
     with patch.object(scheduler, "run_job") as run, patch.object(
         scheduler, "_deliver_crash_failure", return_value=(None, "suppressed")) as crash_notice:
         with monkeypatch.context() as m:
@@ -204,9 +215,12 @@ def test_run_body_outbox_failure_preserves_retirement_for_retry(store, monkeypat
         assert retained["state"] == "scheduled"
         assert retained["repeat"]["completed"] == 1
         assert retained["next_run_at"] == job["next_run_at"]
+        assert retained["run_claim"] is None
+        assert retained["fire_claim"] is None
         run.assert_not_called()
         crash_notice.assert_not_called()
     assert delivery_queue.get_status(f"oneshot-retired:{job['id']}") is None
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: NOW + timedelta(days=3))
     assert jobs.get_due_jobs() == []
     assert jobs.get_job(job["id"]) is None
     receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
@@ -219,6 +233,18 @@ def test_run_body_outbox_failure_preserves_retirement_for_retry(store, monkeypat
         assert scheduler.drain_delivery_queue({}, None) == 0
         assert send.call_count == 1
         assert "outbox unavailable" not in send.call_args.args[1]
+    # A late rejected attempt must not release a successor's claims.
+    newer = dict(job, id="newer-claim", execution_id=None)
+    newer["run_claim"] = dict(job["run_claim"], at=(NOW + timedelta(seconds=1)).isoformat())
+    newer["fire_claim"] = dict(job["fire_claim"], by="successor-token")
+    jobs.save_jobs([newer])
+    stale = dict(job, id=newer["id"], execution_id=None)
+    with patch.object(delivery_queue, "enqueue", side_effect=OSError("outbox unavailable")):
+        assert scheduler._run_one_job_body(stale)
+    current = jobs.get_job(newer["id"])
+    assert current is not None
+    assert current["run_claim"] == newer["run_claim"]
+    assert current["fire_claim"] == newer["fire_claim"]
 
 
 @pytest.mark.parametrize("lanes,expected", [

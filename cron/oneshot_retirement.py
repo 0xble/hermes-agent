@@ -9,6 +9,27 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 
+def release_retirement_claims(attempt: dict) -> None:
+    """An alert retry is not an in-flight run; release only this rejected attempt's claims."""
+    from cron import jobs
+
+    def apply(records, _index, current):
+        changed = False
+        for field in ("run_claim", "fire_claim"):
+            expected = attempt.get(field)
+            current_claim = current.get(field)
+            matches = (current_claim == expected if field == "run_claim" else
+                       isinstance(current_claim, dict) and isinstance(expected, dict)
+                       and current_claim.get("by") == expected.get("by"))
+            if expected and matches:
+                current[field] = None
+                changed = True
+        if changed:
+            jobs.save_jobs(records)
+
+    jobs._with_job(attempt["id"], apply)
+
+
 def record_ticker_start() -> None:
     """Capture startup evidence before the first heartbeat overwrites the previous stamp."""
     from cron.jobs import _hermes_now, _read_marker_fields, _write_marker
@@ -49,7 +70,8 @@ def queue_retirement_alert(job: dict, diagnostic: str, reason: str, *, now: date
     notice = dict(job)
     for field in ("review", "output_local_only", "execution_id"):
         notice.pop(field, None)
-    if _normalize_deliver_value(notice.get("failure_deliver")).strip().lower() == "local":
+    if (not notice.get("failure_deliver")
+            or _normalize_deliver_value(notice["failure_deliver"]).strip().lower() == "local"):
         notice.pop("failure_deliver", None)
     if _normalize_deliver_value(notice.get("deliver")).strip().lower() == "local":
         notice["deliver"] = "origin"

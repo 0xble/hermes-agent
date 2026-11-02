@@ -11,7 +11,10 @@ the existing cron delivery outbox under a stable per-job identity. Preserve an
 explicit non-local `failure_deliver` or `deliver` target. For local or review-only
 output lanes, resolve its creator origin, then the ordinary configured-home
 fallback. Keep the failure incident sink and ordinary failure-notification policy. A
-failed queue commit keeps the job for retry; a restart between queueing and
+failed queue commit keeps the job for retry and compare-clears only the rejected
+attempt's run/fire claims; a successor's claim is never released. Both in-grace
+spent-budget and past-grace retirement share diagnostic routing, including
+re-armed records with a prior completion. A restart between queueing and
 removal reuses the outbox receipt, including its terminal tombstone. Keep the
 local diagnostic and removal. An interrupted dispatch may have partial effects;
 do not claim that it certainly never ran or automatically replay it.
