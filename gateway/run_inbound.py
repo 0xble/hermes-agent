@@ -23,6 +23,7 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+from agent.attachment_context import CHANNEL_MESSAGE_BOUNDARY
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.cron_review import is_review_event
@@ -2171,7 +2172,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             message_text = f"[{_safe_user_name}] {message_text}"
         # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
         if getattr(event, "channel_context", None):
-            message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
+            message_text = event.channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY + message_text
         return message_text
 
     @staticmethod
