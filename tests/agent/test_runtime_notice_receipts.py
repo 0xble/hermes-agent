@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -283,7 +284,7 @@ def test_redirect_composes_pending_guidance_before_persistence(tmp_path, prior_n
                 assert stored["api_content"] == sent["content"]
                 assert stored["content"] == f"{host}\n\n{human}"
                 assert human_prompt_text(stored["content"], display_kind=stored.get("display_kind")) == human
-            for previous, following in zip(requests[1:], requests[2:]):
+            for previous, following in pairwise(requests[1:]):
                 assert following[:len(previous)] == previous
             assert next(row for row in rebuilt if row["role"] == "tool")["content"] == receipt
             assert json.loads(next(row for row in rebuilt if row["role"] == "tool")["content"])["exit_code"] == 0
@@ -297,12 +298,137 @@ def test_redirect_composes_pending_guidance_before_persistence(tmp_path, prior_n
             db.close()
 
 
-def test_deferred_continuation_preserves_steer_transfer_ticket():
-    from agent.turn_iteration_prep import _inject_steer_after_newest_tool_result
+@pytest.mark.parametrize("scaffold", ["snapshot", "restatement"])
+@pytest.mark.parametrize("with_steer", [False, True])
+def test_post_tool_scaffolding_delivers_controls_on_immediate_request_without_rewriting_prefix(tmp_path, with_steer, scaffold):
+    from agent.conversation_compression import _fold_todo_snapshot
+    from agent.turn_preflight import PostToolCompressionVerdict
+    from tools.todo_tool import TODO_INJECTION_HEADER
 
     agent = _agent("terminal")
+    db = _attach_real_session_db(agent, tmp_path / "state.db", "notice-snapshot")
+    requests = _script(agent, _response(tool_call_id="probe", tool_name="terminal"),
+                       _response("done"), _response("next done"))
+    snapshot = f"{TODO_INJECTION_HEADER}\n1. Continue the task"
+    # A completed receipt is cache-stable across the next turn. Interrupted
+    # receipts deliberately become UNKNOWN during replay in the test above.
+    receipt = json.dumps({"output": "complete", "exit_code": 0})
+    frozen, durable = [], []
+
+    def post_tool_snapshot(_agent, **state):
+        # Publish each producer's post-tool shape without an external summarizer.
+        # The complete compressor path is exercised by the regression below.
+        messages = state["messages"]
+        if scaffold == "snapshot":
+            _fold_todo_snapshot(agent, messages)
+            assert messages[-1].get("_todo_snapshot_synthetic") is True
+        else:
+            from agent.context_compressor import _INFLIGHT_TASK_REPLAY_HEADER
+            from agent.message_metadata import mark_inflight_restatement
+
+            replay = {"role": "user", "content": f"{_INFLIGHT_TASK_REPLAY_HEADER}\nrun"}
+            mark_inflight_restatement(replay)
+            messages.append(replay)
+        agent._flush_messages_to_session_db(messages, state["conversation_history"])
+        frozen.extend(copy.deepcopy(messages))
+        durable.extend(db.get_messages_as_conversation("notice-snapshot"))
+        return PostToolCompressionVerdict(
+            end_turn=False, messages=messages, active_system_prompt=state["active_system_prompt"],
+            conversation_history=state["conversation_history"], compression_attempts=1,
+            final_response=state["final_response"], turn_exit_reason=state["turn_exit_reason"],
+            current_turn_user_idx=state["current_turn_user_idx"],
+        )
+
+    def tool(*_args, **_kwargs):
+        queue_plugin_notice(agent, "pacing", NOTE)
+        if with_steer:
+            assert agent.steer("Use the other branch", ticket="snapshot-transfer")
+        return receipt
+
+    with (
+        patch.object(vars(agent)["_todo_store"], "format_for_injection", return_value=snapshot),
+        patch("agent.turn_tool_round.compress_after_tool_results", side_effect=post_tool_snapshot),
+        patch("model_tools.handle_function_call", side_effect=tool),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.steer_delivery.report_steer_delivered") as delivered,
+    ):
+        try:
+            first = agent.run_conversation("run")
+            sent = requests[1]
+            assert sum(NOTE in str(row.get("content")) for row in sent) == 1
+            assert NOTE in sent[-1]["content"]
+            assert next(row for row in sent if row["role"] == "tool")["content"] == receipt
+            assert first["messages"][:len(frozen)] == frozen
+            stored = db.get_messages_as_conversation("notice-snapshot")
+            assert stored[:len(durable)] == durable
+            assert [row["role"] for row in stored[len(durable):]][:2] == ["assistant", "user"]
+            assert stored[len(durable)]["display_kind"] == "hidden"
+            assert delivered.call_count == int(with_steer)
+            assert agent.withdraw_steer("snapshot-transfer") is False
+            assert first.get("pending_steer") is None
+            if with_steer:
+                assert "Use the other branch" in sent[-1]["content"]
+            agent.run_conversation("next", conversation_history=first["messages"])
+            assert requests[-1][:len(sent)] == sent
+            assert sum(NOTE in str(row.get("content")) for row in requests[-1]) == 1
+        finally:
+            db.close()
+
+
+@pytest.mark.parametrize("with_steer", [False, True])
+def test_real_compressor_restatement_keeps_controls_on_its_next_continuation(with_steer):
+    from agent.message_metadata import INFLIGHT_TASK_RESTATEMENT
+    from agent.plugin_live_notes import append_continuation_notice, pop_plugin_notices
+    from agent.turn_iteration_prep import _inject_steer_after_newest_tool_result
+    from tests.agent.test_cron_inflight_prompt_reappend import _compress, _cron_transcript
+
+    source = _cron_transcript()
+    receipt = json.dumps({"output": "complete receipt", "exit_code": 0})
+    source[-1]["content"] = receipt
+    messages = _compress(source)
+    assert messages[-1].get("display_metadata", {}).get(INFLIGHT_TASK_RESTATEMENT) is True
+    assert next(row for row in reversed(messages) if row["role"] == "tool")["content"] == receipt
+    frozen = copy.deepcopy(messages)
+    agent = _agent("terminal")
+    queue_plugin_notice(agent, "pacing", NOTE)
+    if with_steer:
+        assert agent.steer("Use the other branch", ticket="restatement-transfer")
+    with patch("agent.steer_delivery.report_steer_delivered") as delivered:
+        _inject_steer_after_newest_tool_result(agent, messages, agent._drain_pending_steer())
+    assert messages[:len(frozen)] == frozen
+    assert messages[-1]["role"] == "user" and NOTE in messages[-1]["content"]
+    assert messages[-2]["role"] == "assistant" and messages[-2]["display_kind"] == "hidden"
+    assert delivered.call_count == int(with_steer)
+    assert agent.withdraw_steer("restatement-transfer") is False
+    assert agent._drain_pending_steer() is None and pop_plugin_notices(agent) == ""
+    if with_steer:
+        assert "Use the other branch" in messages[-1]["content"]
+    assert not append_continuation_notice(agent, messages)
+
+
+@pytest.mark.parametrize("tail_kind", ["human", "pasted-restatement", "merged-handoff"])
+def test_deferred_continuation_preserves_steer_transfer_ticket(tail_kind):
+    from agent.context_compressor import (
+        _INFLIGHT_TASK_REPLAY_HEADER, _SUMMARY_END_MARKER, SUMMARY_PREFIX, user_originated_turn_view,
+    )
+    from agent.plugin_live_notes import pop_plugin_notices
+    from agent.turn_iteration_prep import _inject_steer_after_newest_tool_result
+
+    tail: dict = {"role": "user", "content": "run"}
+    if tail_kind == "pasted-restatement":
+        tail["content"] = f"{_INFLIGHT_TASK_REPLAY_HEADER}\nrun"
+    elif tail_kind == "merged-handoff":
+        tail.update(content=f"{SUMMARY_PREFIX}\nhistory\n{_SUMMARY_END_MARKER}\nrun",
+                    _compressed_summary=True, display_kind="hidden")
+    assert user_originated_turn_view(tail) is not None
+    agent = _agent("terminal")
+    queue_plugin_notice(agent, "pacing", NOTE)
     assert agent.steer("not yet deliverable", ticket="transfer")
     steer = agent._drain_pending_steer()
-    _inject_steer_after_newest_tool_result(agent, [{"role": "user", "content": "run"}], steer)
+    messages = [copy.deepcopy(tail)]
+    _inject_steer_after_newest_tool_result(agent, messages, steer)
+    assert messages == [tail]
     assert agent.withdraw_steer("transfer") is True
     assert agent._drain_pending_steer() is None
+    assert pop_plugin_notices(agent) == NOTE

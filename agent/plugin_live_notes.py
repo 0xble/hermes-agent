@@ -89,10 +89,23 @@ def append_continuation_notice(agent: Any, messages: list[dict], steer_text: str
     A separate row preserves every result byte, including JSON and multimodal
     parts. Combining an optional steer in this NEW row avoids a later
     consecutive-user repair rewriting an already flushed notice or steer.
-    False leaves notices queued and the caller responsible for requeuing steer.
+    Generated compression scaffolding may follow the batch, but human intent
+    still owns its next request. False leaves controls queued for the caller.
     """
-    if not messages or messages[-1].get("role") != "tool":
+    if not messages:
         return False
+    tail_role = messages[-1].get("role")
+    if tail_role != "tool":
+        from agent.context_compressor import user_originated_turn_view
+        from agent.message_metadata import INFLIGHT_TASK_RESTATEMENT
+
+        # A standalone compressor replay retains human authority, but is not
+        # new inbound input. Only its producer flag authorizes this exception,
+        # never pasted header text or a handoff carrying a new human request.
+        metadata = messages[-1].get("display_metadata")
+        restatement = isinstance(metadata, dict) and metadata.get(INFLIGHT_TASK_RESTATEMENT) is True
+        if tail_role != "user" or (not restatement and user_originated_turn_view(messages[-1]) is not None):
+            return False
     from agent.prompt_builder import steer_user_row
 
     row = steer_user_row(steer_text) if steer_text else {
@@ -100,6 +113,10 @@ def append_continuation_notice(agent: Any, messages: list[dict], steer_text: str
     row = with_plugin_notices(agent, row)
     if not row["content"]:
         return False
+    if tail_role == "user":
+        from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholder_row
+
+        messages.append(hidden_interrupt_placeholder_row())
     messages.append(row)
     if steer_text:
         from agent.steer_delivery import report_steer_delivered
