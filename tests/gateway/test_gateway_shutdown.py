@@ -1,6 +1,8 @@
 import asyncio
 import time
 import subprocess
+import threading
+from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -98,6 +100,14 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner, adapter = make_restart_runner()
+    # The fake store represents an empty routing index, not arbitrary MagicMock origins.
+    runner.session_store.lookup_by_session_key.return_value = None
+    runner.session_store.lookup_by_session_id.return_value = None
+    runner.session_store.list_sessions.return_value = []
+    runner._completion_delivery_lock = threading.Lock()
+    runner._completion_deliveries_inflight = set()
+    runner._completion_deliveries_delivered = OrderedDict()
+    runner._completion_delivery_retention = 2048
     runner._completion_notification_batch_window = 3600
     runner._session_state("telegram:dm:123456:u1").conversation.last_turn_started_at = time.time()
     event = {
@@ -124,11 +134,19 @@ async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect(t
 
     runner._cancel_process_completion_batch_tasks = _tracked_cancel
     adapter.disconnect = _disconnect
+    batch_scheduled = asyncio.Event()
+    original_schedule = runner._schedule_batch_flush
+
+    def _tracked_schedule(*args, **kwargs):
+        original_schedule(*args, **kwargs)
+        batch_scheduled.set()
+
+    monkeypatch.setattr(runner, "_schedule_batch_flush", _tracked_schedule)
     pending = asyncio.create_task(
         runner._enqueue_process_completion_notification("completion", event)
     )
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    # Source resolution crosses a worker thread. Loop yields do not wait for that worker.
+    await asyncio.wait_for(batch_scheduled.wait(), timeout=10.0)
     assert runner._completion_notification_batch_flush_tasks
 
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
