@@ -37,17 +37,22 @@ def queue_retirement_alert(job: dict, diagnostic: str, reason: str, *, now: date
     outcome = ("Dispatch was interrupted without a completion record; partial effects may have "
                "occurred. Not rerun; inspect effects before you recreate to run."
                if interrupted else "Job not run; recreate to run.")
+    timing_label = "Elapsed since scheduled" if interrupted else "Late by"
     content = (
         f"[CRON_FAILURE]\nOne-shot retired: {job.get('name') or job['id']}\n"
         f"Job id: {job['id']}\nScheduled time: {scheduled or 'unknown'}\n"
-        f"Late by: {lateness} at {now.isoformat()}\n{outcome}\n{context}\n\n{diagnostic}"
+        f"{timing_label}: {lateness} at {now.isoformat()}\n{outcome}\n{context}\n\n{diagnostic}"
     )
-    # A retirement notice is not a successful report: never inherit review/local-only
-    # output policy or a pinned success/failure lane that can hide it from its owner.
+    # A retirement is a failure, not a reviewed report. Preserve owner-chosen
+    # non-local lanes; only local-only output needs the origin -> home fallback.
+    from cron.scheduler_delivery import _normalize_deliver_value
     notice = dict(job)
-    for field in ("review", "output_local_only", "failure_deliver", "execution_id"):
+    for field in ("review", "output_local_only", "execution_id"):
         notice.pop(field, None)
-    notice["deliver"] = "origin"
+    if _normalize_deliver_value(notice.get("failure_deliver")).strip().lower() == "local":
+        notice.pop("failure_deliver", None)
+    if _normalize_deliver_value(notice.get("deliver")).strip().lower() == "local":
+        notice["deliver"] = "origin"
     # Retain the normal incident sink even on profiles with no configured chat.
     # Keep the signature stable when a retirement retries after a restart.
     from cron.scheduler import _upsert_incident_for_failure

@@ -2767,11 +2767,8 @@ def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
     """Trace for a wedged one-shot removal: dispatch was claimed but mark_job_run never ran
     (interrupted mid-run); removing it silently would leave no output, error, or record.
 
-    A finite one-shot whose dispatch was claimed (``repeat.completed`` >= ``repeat.times``) but which never
-    reached ``mark_job_run`` (``last_run_at`` is null) was interrupted mid-run — scheduler restart, gateway
-    kill, or a non-Exception escape (#73973). The recovery guards remove such jobs so they stop appearing
-    due, but a silent removal leaves the user with no output, no error, and no job record. Write a small
-    diagnostic file into the job's output directory so the removal is observable and debuggable.
+    A spent dispatch without ``last_run_at`` may have partial effects. Leave an alert
+    and local trace when recovery retires it, rather than replaying it (#73973).
     """
     if job.get("last_run_at") is not None:
         return  # a prior run was recorded — normal completion race, not a wedge
@@ -2801,8 +2798,8 @@ def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
 def _write_missed_oneshot_diagnostic(job: dict[str, Any], next_run: str) -> None:
     """Trace for a never-ran one-shot retired outside the grace window (else it would just vanish).
     """
-    if (job.get("repeat") or {}).get("completed", 0) > 0:
-        # A consumed dispatch is not proof that no side effects occurred.
+    if (job.get("repeat") or {}).get("completed", 0) > 0 and job.get("last_run_at") is None:
+        # A consumed, unfinished dispatch may already have side effects.
         _write_wedged_oneshot_diagnostic(job)
         return
     _write_oneshot_diagnostic(
@@ -2826,12 +2823,10 @@ def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot dispatch BEFORE execution: ``repeat.completed`` is bumped
     and persisted under the jobs lock so a tick dying mid-execution cannot lose the dispatch
     (*at-most-times* instead of *at-least-once*). True if the caller may run the job; False when
-    the limit is already reached. Only ``kind == "once"`` with ``repeat.times > 0`` is claimed.
+    the limit is reached (including a retirement pending alert retry). Only finite one-shots are claimed.
 
-    Increments ``repeat.completed`` under the cross-process jobs lock and persists the claim immediately, so
-    that if the tick dies mid-execution (gateway kill, OOM, segfault, hard-timeout) the dispatch is not
-    lost. This converts finite one-shot jobs from *at-least-once* to *at-most-times* semantics — a job that
-    self-destructs fires at most ``repeat.times`` times instead of infinitely (issue #38758).
+    The durable claim converts finite one-shots to *at-most-times* across a mid-execution
+    crash: a self-destructing job fires at most ``repeat.times`` times (#38758).
     """
     def apply(jobs, i, job):
         repeat = job.get("repeat") or {}
@@ -2854,7 +2849,12 @@ def claim_dispatch(job_id: str) -> bool:
                 return False
             # A prior tick claimed the dispatch then died — a genuinely wedged claim. Remove it so
             # it stops appearing due, leaving an operator-visible diagnostic.
-            _write_wedged_oneshot_diagnostic(job)
+            try:
+                _write_wedged_oneshot_diagnostic(job)
+            except Exception:
+                # Alert admission is not a run failure: leave last_run_at and the due slot alone.
+                logger.warning("Job %s: retirement alert pending; keeping job for retry", job_id, exc_info=True)
+                return False
             jobs.pop(i)
             # See #73973.
             save_jobs(jobs, removed_ids={job_id})

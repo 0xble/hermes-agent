@@ -7,14 +7,19 @@ Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached
 A time-sensitive one-shot can expire while the host or scheduler is down. Never
 execute it late by default. Before retiring a never-completed one-shot outside
 its grace window or with a spent dispatch claim, commit one failure notice to
-the existing cron delivery outbox under a stable per-job identity. Resolve its
-creator origin, then the ordinary configured-home fallback and failure incident
-sink, regardless of local
-output or pinned delivery lanes. Keep ordinary failure-notification policy. A
+the existing cron delivery outbox under a stable per-job identity. Preserve an
+explicit non-local `failure_deliver` or `deliver` target. For local or review-only
+output lanes, resolve its creator origin, then the ordinary configured-home
+fallback. Keep the failure incident sink and ordinary failure-notification policy. A
 failed queue commit keeps the job for retry; a restart between queueing and
 removal reuses the outbox receipt, including its terminal tombstone. Keep the
 local diagnostic and removal. An interrupted dispatch may have partial effects;
 do not claim that it certainly never ran or automatically replay it.
+
+Retirement queues the alert in `cron/deliveries.db`; only a gateway drains that
+outbox. Desktop-only and `hermes cron tick` setups receive the chat alert when a
+gateway next runs. The failure incident and local output file are recorded
+immediately during retirement; queueing does not mean chat delivery has happened.
 
 The notice names the job id/name, scheduled instant, lateness, reason and manual
 recreation action. Single-profile and multiplex startup capture the previous

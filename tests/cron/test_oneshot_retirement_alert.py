@@ -19,6 +19,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "_hermes_now", lambda: NOW)
     monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "cron/deliveries.db")
     monkeypatch.setattr("cron.incidents.EXECUTIONS_FILE", tmp_path / "cron/executions.db")
+    monkeypatch.setattr("cron.executions.EXECUTIONS_FILE", tmp_path / "cron/executions.db")
     config = GatewayConfig()
     config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=True)
     monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
@@ -84,6 +85,8 @@ def test_retirement_queues_one_owner_failure_even_across_removal_crash(store, mo
             assert "outside" in content and "not run" in content
         else:
             assert "interrupted" in content and "partial effects" in content
+            assert "Elapsed since scheduled: 297s" in content
+            assert "Late by:" not in content
         action()
         assert jobs.get_job(job["id"]) is None
         assert list((store / "cron/output" / job["id"]).glob("*.md"))
@@ -107,8 +110,7 @@ def test_outbox_failure_preserves_job_until_retry(store, monkeypatch, path):
             raise OSError("outbox unavailable")
         m.setattr(delivery_queue, "enqueue", fail)
         if path == "wedged-claim":
-            with pytest.raises(OSError, match="outbox unavailable"):
-                action()
+            assert action() is False
         else:
             assert action() == []
     assert jobs.get_job(job["id"]) is not None
@@ -141,7 +143,8 @@ def test_startup_context_survives_heartbeat_replacement(store):
     record_ticker_start()
     jobs.record_ticker_heartbeat()
     job = oneshot()
-    job.update(execution_id="dead-run", failure_deliver="local", output_local_only=True)
+    job.update(execution_id="dead-run", failure_deliver="local", output_local_only=True,
+               review={"session_id": "review-only"})
     jobs.save_jobs([job])
     assert jobs.get_due_jobs() == []
     with patch("cron.scheduler_delivery._deliver_standalone") as send:
@@ -166,3 +169,73 @@ def test_runnable_jobs_do_not_emit_retirement_notices(store, kind):
     assert [row["id"] for row in jobs.get_due_jobs()] == [job["id"]]
     assert jobs.get_job(job["id"]) is not None
     assert scheduler.drain_delivery_queue({}, None) == 0
+
+
+def test_rearmed_expired_oneshot_keeps_a_queued_alert_and_local_trace(store):
+    job = oneshot()
+    job["repeat"]["completed"] = 1
+    job["last_run_at"] = (NOW - timedelta(days=1)).isoformat()
+    jobs.save_jobs([job])
+
+    assert jobs.get_due_jobs() == []
+    assert jobs.get_job(job["id"]) is None
+    receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
+    assert receipt is not None, "retired re-armed job vanished without an owner alert"
+    assert receipt["status"] == "pending"
+    assert "Job not run; recreate to run" in receipt["content"]
+    outputs = list((store / "cron/output" / job["id"]).glob("*.md"))
+    assert outputs and "removed before firing" in outputs[0].read_text()
+
+
+def test_run_body_outbox_failure_preserves_retirement_for_retry(store, monkeypatch):
+    job = oneshot()
+    job["repeat"]["completed"] = 1
+    jobs.save_jobs([job])
+    with patch.object(scheduler, "run_job") as run, patch.object(
+        scheduler, "_deliver_crash_failure", return_value=(None, "suppressed")) as crash_notice:
+        with monkeypatch.context() as m:
+            def fail(*args, **kwargs):
+                raise OSError("outbox unavailable")
+            m.setattr(delivery_queue, "enqueue", fail)
+            scheduler._run_one_job_body(job)
+        retained = jobs.get_job(job["id"])
+        assert retained is not None
+        assert retained["last_run_at"] is None, "alert admission was mistaken for a completed run"
+        assert retained["state"] == "scheduled"
+        assert retained["repeat"]["completed"] == 1
+        assert retained["next_run_at"] == job["next_run_at"]
+        run.assert_not_called()
+        crash_notice.assert_not_called()
+    assert delivery_queue.get_status(f"oneshot-retired:{job['id']}") is None
+    assert jobs.get_due_jobs() == []
+    assert jobs.get_job(job["id"]) is None
+    receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
+    assert receipt is not None
+    assert receipt["status"] == "pending"
+    assert "partial effects" in receipt["content"]
+    assert list((store / "cron/output" / job["id"]).glob("*.md"))
+    with patch("cron.scheduler_delivery._deliver_standalone") as send:
+        assert scheduler.drain_delivery_queue({}, None) == 1
+        assert scheduler.drain_delivery_queue({}, None) == 0
+        assert send.call_count == 1
+        assert "outbox unavailable" not in send.call_args.args[1]
+
+
+@pytest.mark.parametrize("lanes,expected", [
+    ({"deliver": "telegram:-1001:17"}, ("-1001", "17")),
+    ({"deliver": "local", "failure_deliver": "telegram:-1002:29"},
+     ("-1002", "29")),
+    ({"deliver": "telegram:-1001:17",
+      "failure_deliver": "telegram:-1002:29"}, ("-1002", "29")),
+])
+def test_retirement_preserves_explicit_nonlocal_targets(store, lanes, expected):
+    job = dict(oneshot(), **lanes)
+    jobs.save_jobs([job])
+    assert jobs.get_due_jobs() == []
+    receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
+    assert receipt is not None and receipt["status"] == "pending"
+    with patch("cron.scheduler_delivery._deliver_standalone") as send:
+        assert scheduler.drain_delivery_queue({}, None) == 1
+        assert send.call_count == 1
+        target = send.call_args.args[0]
+        assert (target.chat_id, target.thread_id) == expected
