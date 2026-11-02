@@ -49,6 +49,29 @@ identity matching, or an execution-terminal release shortcut. Retire it only
 when the selected upstream baseline preserves the same admission and timing
 contract under general-pool saturation.
 
+## Missed One-Shots
+
+Retain the 120-second grace for ordinary catch-up. A persisted ticker heartbeat
+contains an epoch and PID. A beat from this process at or before the job's grace
+deadline means the delayed scan has not had an opportunity to retire that slot:
+allow it once, including jobs that became due during the stall. A different PID,
+a missing/malformed beat, or a startup beat after the deadline does not establish
+continuity. Those expired one-shots must not fire hours late after downtime.
+This continuity rule cannot distinguish host suspension from a stalled ticker
+inside the same surviving process.
+
+Before removing an unclaimed miss, persist a terminal failed execution with the
+scheduled instant and original scan time in its missed reason, plus an incident.
+If either store fails, keep the job for retry. Reuse the failed missed execution
+when a later jobs save retries. Only after the removal save succeeds, deliver
+through the existing failure route outside the jobs lock, retaining the active
+ticker's adapters and loop. Keep claimed and on-time behavior unchanged. The
+implementation belongs in `cron/jobs_oneshot.py`, not the jobs facade.
+
+`tests/cron/test_oneshot_missed.py` covers same-process stalls, startup/downtime,
+on-time grace, and incident/save failure retries through the real temp-home
+stores. No execution-status migration or live-store change is needed.
+
 ## Dispatch Diagnostics
 
 Local `cron.scheduler_diagnostics` INFO events name the execution, job, profile
