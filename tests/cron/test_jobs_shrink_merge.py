@@ -48,8 +48,8 @@ def test_stale_empty_save_preserves_concurrent_no_agent_create(hermes_env):
     )
     assert [j["id"] for j in load_jobs()] == [job["id"]]
 
-    # Simulate a degraded-lock writer that still holds an empty snapshot from
-    # before the create (the filed incident: jobs.json rewritten empty).
+    # A stale writer can acquire the lock with an empty snapshot from before
+    # the create (the filed incident: jobs.json rewritten empty).
     save_jobs([])
 
     remaining = load_jobs()
