@@ -170,8 +170,9 @@ async def _drain_background(runner, timeout=10.0):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hold_bookkeeping", [False, True])
 async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, hold_bookkeeping
 ):
     """A watermark-fenced worker keeps its commit admission at turn-hold
     expiry; its late summary is ADOPTED (committed), not discarded — while
@@ -182,8 +183,19 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     committed = threading.Event()
     cleanup_done = threading.Event()
     worker_gave_up = threading.Event()
+    reset_started = threading.Event()
+    release_reset = threading.Event()
+    reset_finished = threading.Event()
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
+
+    def reset_streak(*args):
+        reset_started.set()
+        if hold_bookkeeping:
+            assert release_reset.wait(5), "test never released the durable streak reset"
+        reset_finished.set()
+
+    fake_db.reset_hygiene_failure_streak.side_effect = reset_streak
 
     class FencedStreamingAgent:
         last_instance = None
@@ -243,6 +255,14 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
 
     adapter = _CaptureAdapter()
     runner = _build_runner(gateway_run, adapter, fake_db)
+    cleanup_futures = []
+    defer_cleanup = runner._defer_agent_cleanup_until_future_done
+
+    def capture_cleanup(future, agent, **kwargs):
+        cleanup_futures.append(future)
+        defer_cleanup(future, agent, **kwargs)
+
+    monkeypatch.setattr(runner, "_defer_agent_cleanup_until_future_done", capture_cleanup)
 
     # Generous outer bound only, kept under the 60s hygiene timeout so that path cannot pass for
     # this one: the release is proven by ordering below, not by wall-clock speed.
@@ -279,8 +299,18 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     # rows above the watermark survive the compaction).
     assert fake_db.archive_and_compact.call_args.kwargs.get("watermark") == 6
 
+    if hold_bookkeeping:
+        try:
+            assert await asyncio.to_thread(reset_started.wait, 5)
+            assert cleanup_futures and not cleanup_futures[-1].done(), (
+                "deferred cleanup must wait for durable adoption, not just the compressor"
+            )
+            assert not cleanup_done.is_set()
+        finally:
+            release_reset.set()
     await _drain_deferred(runner)
     await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
+    assert reset_finished.is_set()
     FencedStreamingAgent.last_instance.close.assert_called_once()
     await _drain_background(runner)
 

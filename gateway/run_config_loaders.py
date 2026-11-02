@@ -387,13 +387,13 @@ class GatewayConfigLoadersMixin:
         from agent.fast_mode import STATIC_TIERS
         if not clear and service_tier in STATIC_TIERS:
             if expiry_seconds is None:
-                loader = getattr(self, "_load_fast_expiry_seconds", None)
+                loader = getattr(self, "_load_service_tier_expiry_seconds", None)
                 if not callable(loader):
-                    loader = type(self)._load_fast_expiry_seconds if hasattr(type(self), "_load_fast_expiry_seconds") else None
+                    loader = type(self)._load_service_tier_expiry_seconds if hasattr(type(self), "_load_service_tier_expiry_seconds") else None
                 if not callable(loader):
                     from gateway.run_config_loaders import GatewayConfigLoadersMixin
-                    loader = GatewayConfigLoadersMixin._load_fast_expiry_seconds
-                seconds = float(cast(float, loader()))
+                    loader = GatewayConfigLoadersMixin._load_service_tier_expiry_seconds
+                seconds = float(cast(float, loader(service_tier)))
             else:
                 seconds = expiry_seconds
             if seconds > 0:
@@ -401,10 +401,13 @@ class GatewayConfigLoadersMixin:
                 conversation.service_tier_override_expiry_seconds = seconds
 
     @classmethod
-    def _load_fast_expiry_seconds(cls) -> float:
-        """Read the gateway-only Fast expiry; invalid values warn and disable it."""
+    def _load_service_tier_expiry_seconds(cls, service_tier: str) -> float:
+        """Read a static tier's gateway expiry; invalid values warn and disable it."""
         from gateway.run import _load_gateway_config
-        raw = cfg_get(_load_gateway_config(), "agent", "fast_expiry_seconds", default=0)
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        key = {"priority": "fast_expiry_seconds", "ultrafast": "ultrafast_expiry_seconds"}[service_tier]
+        raw = cfg_get(_load_gateway_config(), "agent", key, default=DEFAULT_CONFIG["agent"][key])
         try:
             if isinstance(raw, bool):
                 raise ValueError(raw)
@@ -412,7 +415,7 @@ class GatewayConfigLoadersMixin:
             if value < 0 or not math.isfinite(value):
                 raise ValueError(raw)
         except (TypeError, ValueError, OverflowError):
-            logger.warning("agent.fast_expiry_seconds=%r is not a non-negative finite number; using 0", raw)
+            logger.warning("agent.%s=%r is not a non-negative finite number; using 0", key, raw)
             return 0.0
         return value
 
