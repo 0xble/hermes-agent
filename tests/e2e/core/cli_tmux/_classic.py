@@ -266,6 +266,8 @@ class Pane:
     def __init__(self, ch: ClassicHome) -> None:
         self.ch = ch
         self.sock = f"hermes-e2e-classic-{uuid.uuid4().hex[:8]}"
+        from hermes_cli.test_artifact_lifetime import register_tmux_server
+        register_tmux_server(listener=self.sock)
         # Scrollback snapshot taken just before the latest input: what `wait` must see grow.
         self.baseline = ""
 

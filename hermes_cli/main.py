@@ -51,6 +51,13 @@ import itertools
 # before the first reader — otherwise it resolves against cwd and scaffolds <cwd>/~/.hermes.
 _startup_fast.normalize_hermes_home_env()
 
+# Pytest artifacts must die with their owner and after a hard lifetime, including
+# when this process has already detached. No-op unless HERMES_HOME is a test dir.
+from hermes_cli.test_artifact_lifetime import arm_test_artifact_lifetime
+
+if "pytest" not in sys.modules:
+    arm_test_artifact_lifetime()
+
 # Startup-liveness watchdog: for gateway runs, arm BEFORE the heavy import
 # graph below — an import-time deadlock (native-extension init, contended
 # import lock) is exactly the "wedged before the event loop, no logs, live
