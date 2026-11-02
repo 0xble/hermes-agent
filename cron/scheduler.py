@@ -2914,6 +2914,12 @@ def run_one_job(
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
+    # Recheck after executor wait AND inside the detached process, before any job code.
+    from cron.missed_windows import skip_before_start
+    skipped = skip_before_start(job)
+    if skipped:
+        finish_execution(execution_id, success=False, error=skipped, output=skipped)
+        return True
     note_cron_execution(job)
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     from cron.scheduler_control import register_control
