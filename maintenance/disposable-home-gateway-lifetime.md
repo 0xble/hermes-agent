@@ -8,7 +8,11 @@ A finite CLI client (`-z`, `-Q`, stream-json and noninteractive `-q`) that
 actually auto-starts an unmanaged owner holds a private lifetime pipe. Closing
 the connection or exiting the client closes the pipe. Client SIGTERM/SIGKILL
 also produces EOF. The gateway watches before heavyweight startup and requests
-shutdown, with a three-second hard self-exit bound if shutdown wedges. Only the
+shutdown, with a three-second hard self-exit bound if shutdown wedges. Before
+signaling, reuse only the gateway process's already-loaded foreground/background
+tool registries to kill its own detached tool children (no host-wide PID scan).
+The session-only startup retains the ordinary bounded MCP-discovery barrier so
+the first finite turn does not lose eager MCP tools. Only the
 creating client's Popen handles confer cleanup authority; discovered owners and
 installed services are never stopped. Interactive sessions keep the existing
 reusable idle-exit behavior.

@@ -23,6 +23,8 @@ async def test_client_owned_bootstrap_does_not_start_daemon_services(monkeypatch
     monkeypatch.setattr(facade.GatewayRunner, "_start_finish_wiring", post_connect)
     monkeypatch.setattr(facade.GatewayRunner, "_start_spawn_background_watchers", watchers)
     monkeypatch.setattr(run_runtime, "wait_gateway_runtime", AsyncMock())
+    mcp_ready = AsyncMock()
+    monkeypatch.setattr(facade.GatewayRunner, '_await_mcp_discovery', mcp_ready)
     # Production marks the runner before start(), not a global inherited by other homes.
     import inspect
     kwargs = {"client_owned": True} if "client_owned" in inspect.signature(run_bootstrap.start_gateway).parameters else {}
@@ -32,6 +34,7 @@ async def test_client_owned_bootstrap_does_not_start_daemon_services(monkeypatch
     watchers.assert_not_called()
     recovery.assert_not_called()
     hosted.assert_not_called()
+    mcp_ready.assert_awaited_once()
 
 
 @pytest.mark.asyncio

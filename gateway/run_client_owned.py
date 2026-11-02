@@ -25,6 +25,7 @@ async def start_client_owned_runner(runner) -> bool:
     runner._startup_restore_queue = []
     runner._startup_restore_tasks = []
     runner._start_mcp_discovery()
+    await runner._await_mcp_discovery()  # first/only turn must see the normal bounded tool snapshot
     from hermes_startup_watchdog import disarm_startup_watchdog
     disarm_startup_watchdog()
     runner._suppress_clean_shutdown_receipt = False
