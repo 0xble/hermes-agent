@@ -87,6 +87,19 @@ offline. Otherwise its daemon can outlive the test, resolve a later test's pool,
 and send an earlier key into that test's HTTP recorder. Host and exact-key
 assertions remain unchanged. Dedicated usage tests still exercise real workers.
 
+The OpenRouter image-provider catalog ownership test supplies fixture HTTP
+responses and explicit runtime endpoints instead of reading OpenRouter's live
+inventory. Every curated Image API id must still appear for OpenRouter and none
+for Nous. Recorded requests also prove the live parsing path ran rather than its
+offline snapshot fallback, and that Nous never queried `/images/models`.
+Upstream catalog churn must not turn this routing contract into a change detector.
+Production continues to prefer live inventory and use curated metadata as the
+offline snapshot; catalog absence alone does not prove a model's generation
+endpoint or existing explicit overrides are unsupported. Related SDK-wiring,
+accounting and plugin-only resolution tests stub the DeepInfra inventory,
+OpenRouter pricing catalog and models.dev provider catalog respectively, without
+replacing the behavior each test actually asserts.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind
