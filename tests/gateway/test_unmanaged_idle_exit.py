@@ -38,7 +38,7 @@ def _runner(tmp_path, monkeypatch, *, window=0.2):
         session_runtime_descriptor={"state": "ready", "capabilities": ["x"]}, _exit_reason=None,
         _active_work_count=lambda: 0, _scale_to_zero_has_live_background_work=lambda: False, stop=stop)
     monkeypatch.setattr(run_idle_exit, "idle_exit_seconds", lambda r: window)
-    monkeypatch.setattr("gateway.run._cron_tick_profile_homes", lambda config: [("default", home)])
+    monkeypatch.setattr(run_idle_exit, "_served_homes", lambda runner: [home])
     monkeypatch.setattr(run_idle_exit, "_kanban_busy", lambda: None)
     monkeypatch.setattr(run_idle_exit, "_store_gates_busy", lambda homes: None)
     run_idle_exit.note_client_activity(runner)

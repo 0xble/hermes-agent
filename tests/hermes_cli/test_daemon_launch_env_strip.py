@@ -17,10 +17,13 @@ LEAKS = {'HERMES_ACCEPT_HOOKS': '1', 'HERMES_KANBAN_TASK': 't_1', 'HERMES_KANBAN
          'HERMES_SESSION_ID': 'launching-turn', 'HERMES_SESSION_KEY': 'agent:main:tui:x',
          'HERMES_SESSION_PLATFORM': 'tui', 'HERMES_SESSION_CHAT_ID': 'c1', 'HERMES_CRON_SESSION': '1',
          # A terminal running under a systemd service: not the daemon's own supervisor.
-         'INVOCATION_ID': 'terminal-scope', 'JOURNAL_STREAM': '8:1'}
+         'INVOCATION_ID': 'terminal-scope', 'JOURNAL_STREAM': '8:1',
+         'XPC_SERVICE_NAME': 'ai.hermes.gateway', 'LAUNCHD_SOCKET': '/unused/Listeners',
+         'HERMES_LAUNCHD_LABEL': 'ai.hermes.gateway', 'HERMES_DESKTOP_MANAGED': '1',
+         'HERMES_GATEWAY_EXTERNAL_SUPERVISOR': '1', 'HERMES_SUPERVISED_CHILD': '1'}
 
 
-@pytest.mark.platforms("linux")
+@pytest.mark.platforms("posix")
 @pytest.mark.spawns_gateway_lookalike  # stub interpreter records env then exits; reaped below
 def test_daemon_does_not_inherit_hook_consent_or_worker_pins(tmp_path, monkeypatch):
     from hermes_cli import gateway_runtime_start as start

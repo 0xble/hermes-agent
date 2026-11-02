@@ -29,6 +29,11 @@ DAEMON_STRIPPED_ENV = (
     # A terminal's shell under a systemd service (gnome-terminal-server, a user unit) carries these; the
     # unmanaged daemon would then identify as "systemd" and maintenance would refuse it as supervised.
     "INVOCATION_ID", "JOURNAL_STREAM",
+    # A launchd/Desktop/external supervisor owns the caller, never this detached
+    # daemon. Inheriting its markers disarms --idle-exit for every throwaway home.
+    # Keep HERMES_S6_SUPERVISED_CHILD: it prevents redirecting this run to s6.
+    "XPC_SERVICE_NAME", "LAUNCHD_SOCKET", "HERMES_LAUNCHD_LABEL", "HERMES_DESKTOP_MANAGED",
+    "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "HERMES_SUPERVISED_CHILD",
 )
 
 
