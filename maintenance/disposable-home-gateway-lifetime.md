@@ -41,6 +41,9 @@ an equivalent upstream lifetime and daemon-service fence ships.
 
 Contract tests: `tests/hermes_cli/test_gateway_client_lifetime.py`
 Contract tests: `tests/gateway/test_client_owned_bootstrap.py`
+Integration: `tests/e2e/core/parity/test_entrypoint_parity.py` now requires finite
+client exit alone to release the owner; operator stop is failure cleanup only.
+The existing first-turn MCP/hook parity and zero-MCP-orphan assertions remain.
 
 Run through `scripts/run_tests.sh` with checkout-owned test dependencies and temp
 homes only. The subprocess regression drives the real connect/ensure/Popen path,
