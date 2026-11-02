@@ -17,6 +17,9 @@ Scenarios run concurrently (one fake + one hermetic home each) in a module fixtu
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
@@ -35,6 +38,7 @@ from tests.e2e.core.providers._native_helpers import (
     messages,
     run_chat,
     tool_calls_of,
+    wait_until,
 )
 from tests.fakes.providers.vertex import (
     PROJECT,
@@ -84,6 +88,36 @@ def _fake(tmp: Path, name: str, script: list[Any]) -> FakeVertex:
     return fake
 
 
+@contextmanager
+def _serving_gateway(nh: NativeHome, env: dict[str, str]):
+    """Cross-client token reuse requires an explicitly owned daemon, not a finite auto-start.
+
+    Keep the wire assertions unchanged: both classic clients must borrow this same serving
+    process. Only this harness-created Popen handle has teardown authority.
+    """
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+
+    with (nh.root / "gateway.log").open("wb") as log:
+        child = subprocess.Popen(
+            [sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--quiet"],
+            cwd=nh.project, env=nh.env({**env, "HERMES_GATEWAY_LOCK_DIR": str(nh.root / "locks")}),
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+    try:
+        wait_until(lambda: child.poll() is not None or
+                   discover_gateway_endpoint(nh.hermes_home, timeout=0.5).state == "ready",
+                   60, "explicit Vertex serving gateway ready")
+        assert child.poll() is None, (nh.root / "gateway.log").read_text(errors="replace")[-4000:]
+        yield child
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        try:
+            child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            child.kill()  # exact harness-owned child only
+            child.wait(timeout=10)
+
+
 def run_session(tmp: Path) -> dict[str, Any]:
     fake = _fake(tmp, "session", [
         Call([("read_file", {"path": "note1.txt"})]), Say(FINAL_1),
@@ -91,11 +125,14 @@ def run_session(tmp: Path) -> dict[str, Any]:
     ])
     nh = _home(tmp, "session", fake)
     args = (*FILE_ONLY, "--reasoning", "high")
-    turn1 = run_chat(nh, "Read note1.txt and tell me what it says.", env=fake.child_env(), args=args)
-    boundary = len(fake.requests)
-    tokens_after_turn1 = len(fake.token_requests)
-    sid = latest_session(nh) if turn1.returncode == 0 else None
-    turn2 = run_chat(nh, "Now read note2.txt.", env=fake.child_env(), args=args, resume=sid) if sid else None
+    with _serving_gateway(nh, fake.child_env()) as gateway:
+        turn1 = run_chat(nh, "Read note1.txt and tell me what it says.", env=fake.child_env(), args=args)
+        assert gateway.poll() is None, "finite client stopped the borrowed serving gateway"
+        boundary = len(fake.requests)
+        tokens_after_turn1 = len(fake.token_requests)
+        sid = latest_session(nh) if turn1.returncode == 0 else None
+        turn2 = run_chat(nh, "Now read note2.txt.", env=fake.child_env(), args=args, resume=sid) if sid else None
+        assert gateway.poll() is None, "resumed finite client stopped the borrowed serving gateway"
     return {"fake": fake, "nh": nh, "turn1": turn1, "turn2": turn2, "boundary": boundary,
             "tokens_after_turn1": tokens_after_turn1, "sid": sid}
 

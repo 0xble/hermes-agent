@@ -43,7 +43,9 @@ an equivalent upstream lifetime and daemon-service fence ships.
 ## Scope audit
 
 All 25 original changed files remain necessary; the classic-client extension
-adds only `hermes_cli/gateway_connection.py`. No protected gate files change.
+adds `hermes_cli/gateway_connection.py` and the borrowed-owner Vertex fixture
+in `tests/e2e/core/providers/test_native_vertex_tools.py` (27 files total).
+No protected gate files change.
 
 | File | Kept lifetime-bound responsibility |
 | --- | --- |
@@ -66,6 +68,7 @@ adds only `hermes_cli/gateway_connection.py`. No protected gate files change.
 | `maintenance/disposable-home-gateway-lifetime.md` | Contract, fork ownership, verification and retirement. |
 | `tests/e2e/core/parity/_drive_cli.py` | Client exit alone releases finite gateways; operator stop is failure cleanup. |
 | `tests/e2e/core/parity/test_entrypoint_parity.py` | Document client-exit teardown without weakening MCP/tool parity assertions. |
+| `tests/e2e/core/providers/test_native_vertex_tools.py` | Explicitly own the persistent serving fixture for unchanged cross-client token-reuse assertions; prove finite clients do not stop that borrowed owner. |
 | `tests/gateway/test_client_lifetime.py` | Real EOF and wedged-shutdown bound, including an active tool child. |
 | `tests/gateway/test_client_owned_bootstrap.py` | No daemon services/restarts; first-turn MCP readiness retained. |
 | `tests/hermes_cli/test_gateway_chat.py` | Finite/interactive transport ownership and mock keyword contract. |
@@ -84,6 +87,14 @@ Regressions are executable in
 `test_owner_eof_forces_exit_when_shutdown_signal_is_ignored[True]` and
 `test_client_owned_bootstrap_does_not_start_daemon_services` (await-once), plus
 the unchanged first-turn MCP/hook and zero-orphan parity assertions.
+Hosted qualification of the classic extension exposed the Vertex fixture's
+implicit daemon assumption: it expected one process-local token cache across two
+finite clients, but correctly observed two mints once their auto-starts ended.
+The fixture now explicitly starts/owns its persistent serving daemon for that
+scenario. Its one-mint and wire assertions are unchanged, with new assertions
+that both finite clients leave the borrowed process alive; teardown uses only
+the fixture's exact Popen handle. This is not an unrelated timing-flake rerun.
+
 No whole-file cuts were justified. The inherited docstring narrowing parity to
 `-z` was dropped because finite classic clients now have the same contract.
 
@@ -115,8 +126,12 @@ classic normal/SIGTERM/SIGKILL regressions, exact ownership, daemon isolation,
 runtime/discovery/service, idle-exit, launchd, shutdown, connection/reconnect and
 classic agent/session-store tests. All eight strict entrypoint parity cases are
 Linux `/proc` tests, so hosted Linux qualification must execute them rather than
-counting their macOS skips as passes.
-
+counting their macOS skips as passes. Hosted run `41407145828` executed all eight
+strict parity cases successfully at `75bb6e3cd26cb006ec62d681b3fdc35e1a74d4ae`,
+then found the relevant Vertex persistent-fixture assumption above. After the
+explicit borrowed-owner fixture change, the urgent heavy-slot follow-up passed
+16 tests across three files (zero failed; one existing Vertex default-toolset
+xfail), including five Vertex wire tests and both lifetime/lease modules.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.
