@@ -24,4 +24,8 @@ After workspace authentication, connect schedules a background sweep of recorded
 
 The behavior contract is `tests/plugins/platforms/slack/test_task_card_cleanup.py`, with the native task-card cases in `tests/gateway/test_slack.py` and `tests/gateway/test_task_card_destination_preflight.py`.
 
-Retire this patch only when upstream offers equivalent end-of-turn removal and durable restart/retry recovery. Revert the owned files to roll back, or set the config key to `false` without a code change.
+Retire this patch only when upstream offers equivalent end-of-turn removal and durable restart/retry recovery.
+
+An explicit `display.platforms.slack.tool_progress: off` (or `false`) disables the card lane in `_run_agent_display_settings` (`gateway/run_turn.py`), so `_native_slack_task_cards` stays false, so no card starts, nothing is recorded, and the connect sweep finds an empty ledger. If Slack progress is retired for good on every instance, drop this patch instead, together with the card-retry half of [Slack progress card recovery](slack-progress-card-recovery.md). That half edits `task_cards.start_stream`, so the two leave together.
+
+Revert the owned files to roll back, or set the config key to `false` without a code change.
