@@ -90,7 +90,9 @@ assertions remain unchanged. Dedicated usage tests still exercise real workers.
 The OpenRouter image-provider catalog ownership test supplies fixture HTTP
 responses and explicit runtime endpoints instead of reading OpenRouter's live
 inventory. Every curated Image API id must still appear for OpenRouter and none
-for Nous. Recorded requests also prove the live parsing path ran rather than its
+for Nous. A separate catalog-failure test builds the Image-API-enabled provider
+and preserves that same snapshot/isolation contract when HTTP raises.
+Recorded requests also prove the live parsing path ran rather than its
 offline snapshot fallback, and that Nous never queried `/images/models`.
 Upstream catalog churn must not turn this routing contract into a change detector.
 Production continues to prefer live inventory and use curated metadata as the

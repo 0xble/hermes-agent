@@ -816,6 +816,27 @@ class TestImageApiSurface:
         assert result["error_type"] == "auth_error"
         assert "_retryable" not in result
 
+    def test_image_api_catalog_failure_keeps_snapshot_only_for_openrouter(self):
+        from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
+
+        # _build_providers enables supports_image_api for OpenRouter, unlike
+        # the chat-only _openrouter() helper. Both live catalogs must fail for
+        # the snapshot branch to run; preserve Nous isolation in the same case.
+        by_name = {p.name: p for p in _build_providers()}
+        with patch(_RUNTIME, return_value=_runtime_ok()), patch(
+            "requests.get", side_effect=OSError("catalog unavailable")
+        ) as get:
+            openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
+            nous_ids = {m["id"] for m in by_name["nous"].list_models()}
+
+        assert set(_IMAGE_API_MODELS) <= openrouter_ids
+        assert not (set(_IMAGE_API_MODELS) & nous_ids)
+        assert [call.args[0] for call in get.call_args_list] == [
+            "https://openrouter.ai/api/v1/images/models",
+            "https://openrouter.ai/api/v1/models",
+            "https://openrouter.ai/api/v1/models",
+        ]
+
     def test_catalog_models_are_offered_only_by_openrouter(self, image_api_catalog):
         from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
 
