@@ -3104,9 +3104,13 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             return False
 
     @snapshot_control
-    def clear(self) -> None:
+    def clear(self, *, reason: str = "", actor: str = "user", authority: str = "") -> None:
         def _apply(state):
             if state is not None:
+                if reason:
+                    state.last_reason = reason
+                    state.revisions.append({"at": time.time(), "kind": "clear", "reason": reason,
+                                            "actor": actor, "authority": authority})
                 state.status = "cleared"
         self._mutate_current(_apply, discard_corrupt=True)
         if self._state is not None:
