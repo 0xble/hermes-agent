@@ -19,7 +19,8 @@ CLIENT_EXIT_GRACE_SECONDS = 3.0
 
 def arm_client_lifetime() -> None:
     """On lease loss request ordinary shutdown, then force our OWN process out."""
-    stream = os.fdopen(os.dup(0), "rb", buffering=0)
+    read_fd = os.dup(0)
+    stream = os.fdopen(read_fd, "rb", buffering=0)
     thread = threading.Thread(target=_watch_client, args=(stream,), daemon=True,
                               name="gateway-client-lifetime")
     thread.start()
