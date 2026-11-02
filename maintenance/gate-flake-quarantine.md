@@ -10,7 +10,7 @@ Fork patch identity: `ci-gate-flake-quarantine`.
 
 Confirmed evidence from Repository gate runs:
 
-- `tests/gateway/test_generation_transfer_runner.py`: run `36627699252` failed two drain-cap race assertions; runs `36953199648` and `36955974020` failed the overlap-draining assertion. The unchanged file passed in run `37164377815` on the current equivalent main line. The failures are scheduling-sensitive transfer/drain races, so the file moves to the existing `nightly-only-e2e` path lane until the lifecycle synchronization is deterministic.
+- Retired: `tests/gateway/test_generation_transfer_runner.py` (run `36627699252` failed two drain-cap race assertions; runs `36953199648` and `36955974020` failed the overlap-draining assertion). The overlap generation transfer it tested was withdrawn with the file in `e26135fcb0` (2026-10-06, "withdraw overlap and forward-only handover"), so its quarantine entry is gone too.
 
 Not quarantined because the failures were real regressions or had a quick repair:
 
@@ -21,4 +21,4 @@ Not quarantined because the failures were real regressions or had a quick repair
 
 ## Verification and retirement
 
-Run the quarantined file on every nightly with `scripts/run_tests.sh --file-retries 0`. Remove it from `NIGHTLY_ONLY_TESTS` and this record only after the transfer/drain race has a deterministic fix and repeated exact-SHA gate evidence passes.
+Run each quarantined file on every nightly with `scripts/run_tests.sh --file-retries 0`. Remove it from `NIGHTLY_ONLY_TESTS` and this record only after its race has a deterministic fix and repeated exact-SHA gate evidence passes, or when the file is retired with its feature. The retired transfer-runner path stayed in `NIGHTLY_ONLY_TESTS` until 2026-10-31, where the runner answered "No test files to run" and passed.

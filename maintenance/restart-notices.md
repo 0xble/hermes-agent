@@ -17,6 +17,11 @@ The observed gateway log on September 26 recorded multiple active-topic sends to
 
 ## Verification
 
+Contract tests: `tests/gateway/test_restart_resume_pending.py::test_shutdown_notice_suppresses_only_unthreaded_private_parent_broadcast`,
+  `tests/gateway/test_restart_resume_pending.py::test_shutdown_private_topics_remain_distinct_and_failed_delivery_keeps_home`,
+  `tests/gateway/test_restart_resume_pending.py::test_shutdown_advisories_are_interim_and_match_continuation_policy`,
+  `tests/gateway/test_restart_notification.py::test_shutdown_notifications_have_one_aggregate_deadline`
+
 `scripts/run_tests.sh -j 6 tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_notification.py tests/gateway/test_gateway_shutdown.py tests/gateway/test_interim_send_lanes.py tests/gateway/test_stream_final_contract.py`; also run the affected gateway directory, ruff on changed Python files, `git diff --check`, and `scripts/check_fork_patches.py --source-only --repo .`.
 
 ## Retirement and rollback

@@ -49,3 +49,9 @@ shared per-chat slot and flood window (see [Telegram delivery](telegram-delivery
 
 **Retire** when an upstream release passes all three regressions without this patch.
 **Roll back** by reverting the logical patch. No configuration or persistent state.
+
+## Contract tests
+
+Contract tests: `tests/gateway/test_run_progress_topics.py::test_flood_refused_overflow_edit_keeps_progress_in_bubbles`,
+  `tests/gateway/test_run_progress_topics.py::test_uneditable_progress_bubble_continues_in_a_fresh_bubble`,
+  `tests/gateway/test_run_progress_topics.py::test_persistent_flood_does_not_retry_per_line_or_flush_oversized`

@@ -185,6 +185,17 @@ schema is introduced.
 
 ## Verification
 
+Contract tests: `tests/gateway/test_restart_loop_guard.py`,
+  `tests/gateway/test_restart_resume_real_adapter.py`,
+  `tests/gateway/test_shutdown_followup_restart.py`,
+  `tests/gateway/test_restart_recovery_outcomes.py`,
+  `tests/gateway/test_restart_resume_admission_identity.py`,
+  `tests/tools/test_routine_stop_notifications.py`,
+  `tests/hermes_cli/test_cli_delegation_stop_notice.py`,
+  `tests/gateway/test_stop_resume_marker_generation.py`,
+  `tests/gateway/test_crash_left_reply_media.py`,
+  `tests/gateway/test_final_marker_after_attachments.py`
+
 `scripts/run_tests.sh tests/gateway/test_restart_resume_policy.py
 tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_notification.py
 tests/gateway/test_multiplex_pending_recovery.py tests/gateway/test_shutdown_flush.py`.

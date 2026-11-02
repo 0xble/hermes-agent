@@ -18,6 +18,13 @@ Ported/adapted from archived HERMES-086 and HERMES-096 (gateway-delivery unit), 
 
 ## Verification
 
+Contract tests: `tests/gateway/test_turn_bubble_cleanup.py`,
+  `tests/gateway/test_drain_post_delivery_cleanup.py`,
+  `tests/gateway/test_post_delivery_callback_chaining.py::test_queued_generation_preserves_both_callbacks`,
+  `tests/gateway/test_post_delivery_callback_chaining.py::test_queued_handoff_fires_each_generation`,
+  `tests/gateway/test_run_cleanup_progress.py::test_queued_turn_waits_for_progress_deletion`,
+  `tests/gateway/test_run_cleanup_progress.py::test_failed_delivery_keeps_queued_turn_and_progress`
+
 Both current fork main and current upstream main failed the queued-handoff callback and queued-progress-deletion regressions before this patch: the former fired only the newer callback; the latter started turn two with zero deletions. `scripts/run_tests.sh tests/gateway/test_post_delivery_callback_chaining.py tests/gateway/test_run_cleanup_progress.py tests/gateway/test_status_command.py tests/gateway/test_run_progress_topics.py tests/gateway/test_active_session_text_merge.py -j 6 -q` exercises callback ownership, deletion order, and existing gateway progress behavior.
 
 `scripts/run_tests.sh tests/gateway/test_turn_bubble_cleanup.py tests/gateway/test_drain_post_delivery_cleanup.py` is the behaviour contract for every turn path: the adapter lifecycle, busy follow-ups, producer wakes the drain delivers, a waiter that stopped waiting, a waiter released before its turn ended, /stop cancelling the adapter task, a shutdown release, an unknown settlement, a late waiter, a superseded turn, a newer turn's sweep during a slow reply, and the queued follow-up's busy acknowledgement. Every test also fails on a double fire. Before the busy-follow-up fix (2026-10-31) the follow-up's cleanup never fired, which left its tool cards in the chat.

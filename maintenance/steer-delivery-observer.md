@@ -26,6 +26,8 @@ adapter-owned acceptance hook; that is not equivalent to actual row delivery.
 
 ## Proof
 
+Contract tests: `tests/agent/test_steer_delivered_hook.py`
+
 Run `scripts/run_tests.sh tests/agent/test_steer_delivered_hook.py
  tests/agent/test_steer.py tests/agent/test_compression_busy_steer_anchor.py
  tests/agent/test_lock_fallback_base_semantics.py

@@ -200,8 +200,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   so the updater correctly took the in-gateway self-restart branch and three
   tests failed. The fixture now pins both probes, and the enclosing-gateway
   branch has its own test.
-- Guard: `tests/hermes_cli/test_update_launchd_restart_verification.py`
-  (`test_restart_handed_to_the_enclosing_gateway_skips_verification`).
+- Guard: the fixture pin in `tests/hermes_cli/test_update_launchd_restart_verification.py`.
+  The fork's enclosing-gateway test was removed in `d389ff3baa` (2026-10-20) once upstream
+  carried the branch (#100179, #119597); its proof is now
+  `tests/hermes_cli/test_fleet_matrix_self_restart_pending.py::test_restart_phase_records_accepted_self_restart_and_verify_exits_clean`.
 
 ## /update never reports its result
 
@@ -558,8 +560,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   mutation). The fixture now stubs `install_specs`; upgrade tests still override it. The eviction test's
   250ms wall-clock bound is replaced by a poll count.
 - Regression coverage: `test_hindsight_provider.py`
-  (`test_disabled_provider_makes_no_network_calls`, `test_shutdown_unregisters_the_atexit_callback`,
-  `test_default_fixture_never_installs_for_an_outdated_sdk`).
+  (`test_disabled_provider_makes_no_network_calls`, `test_shutdown_unregisters_the_atexit_callback`).
+  `test_default_fixture_never_installs_for_an_outdated_sdk` left in the 2026-10-02 pm checkpoint
+  (#283), which removed the provider's install path, so there is no upgrade left to stub.
 
 ## Hindsight shared-loop startup race and stale parent on session switch
 

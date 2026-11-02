@@ -77,6 +77,11 @@ promotion), `gateway/run_inbound.py` (preclaim promotion), `gateway/config.py` a
 
 ## Verification
 
+Contract tests: `tests/gateway/test_background_turn_fairness.py`,
+  `tests/gateway/test_background_turn_admission.py`,
+  `tests/gateway/test_replay_scheduler.py`,
+  `tests/gateway/test_restart_resume_admission_identity.py`
+
 `scripts/run_tests.sh tests/gateway/test_background_turn_fairness.py tests/gateway/test_background_turn_admission.py tests/gateway/test_replay_scheduler.py tests/gateway/test_restart_resume_admission_identity.py`
 
 ## Provenance

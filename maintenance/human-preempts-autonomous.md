@@ -31,6 +31,8 @@ in `_handle_active_session_busy_message` and `_resolve_busy_steer_or_redirect`.
 
 ## Verification
 
+Contract tests: `tests/gateway/test_busy_human_preempts_autonomous.py`
+
 `scripts/run_tests.sh tests/gateway/test_busy_human_preempts_autonomous.py`
 
 ## Provenance

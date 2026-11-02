@@ -69,3 +69,7 @@ releases share the store unchanged.
 
 **Retirement:** Retire with the outbox itself, or when redelivery moves to a
 scheduler that owns one timer per store.
+
+## Contract tests
+
+Contract tests: `tests/gateway/test_outbox_coalesced_sweep.py`

@@ -35,6 +35,8 @@ the runtime epoch writer. Do not turn that staging step into an owner startup.
 
 ## Regression And Retirement
 
+Contract tests: `tests/hermes_state/test_runtime_epoch_ownership.py`
+
 The ownership regression is `tests/hermes_state/test_runtime_epoch_ownership.py`.
 Its unreserved custom-home cases reproduce both absent and existing epoch rows
 with test markers cleared. The same file exercises gateway worker-thread

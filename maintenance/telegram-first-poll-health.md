@@ -61,3 +61,7 @@ state, schema or configuration change.
 **Retirement:** Retire when upstream proves polling health without waiting out an idle long poll,
 or when PTB exposes a per-call first-poll timeout. Review on any PTB 23+ upgrade, because the
 rewrite depends on PTB 22.x's private `RequestParameter`.
+
+## Contract tests
+
+Contract tests: `tests/plugins/test_telegram_first_poll_fast_ptb.py`

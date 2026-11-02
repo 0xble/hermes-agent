@@ -106,6 +106,10 @@ that regression. Keep only the fork-only auto-resume hops.
 ## Follow-up race fix
 
 The completion pre-flight marks a claim settled before awaiting a terminal `drop` or transient
-`release`. The delivery `finally` block skips that primary claim, so cancellation while the
-worker-thread settle is blocked cannot issue a competing `release` and strand the completion.
-The regression `test_cancelled_preflight_settle_is_not_released_again` covers both dispositions.
+deferral. The delivery `finally` block skips that primary claim, so cancellation while the
+worker-thread settle is blocked cannot issue a competing settle and strand the completion.
+The v0.21.7 sync (#586) moved the transient branch from `release` to `defer` and renamed the
+regression, which still covers both dispositions.
+
+Contract tests: `tests/gateway/test_completion_delivery.py::test_cancelled_preflight_settle_is_not_duplicated`,
+  `tests/gateway/test_completion_delivery.py::test_cancelled_primary_claim_is_refunded_not_released`

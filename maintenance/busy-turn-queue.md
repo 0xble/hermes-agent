@@ -55,6 +55,11 @@ and the declined or possible-duplicate recovery paths.
 
 ## Proof And Retirement
 
+Contract tests: `tests/gateway/test_turn_lease_queue.py`,
+  `tests/gateway/test_shutdown_followup_restart.py`,
+  `tests/gateway/test_turn_lease.py::test_lease_wait_preserves_input_without_loading_transcript_or_goal_hook`,
+  `tests/gateway/test_queued_followup_processing_hooks.py::test_recovered_in_band_followup_reports_outcome`
+
 `tests/gateway/test_turn_lease_queue.py` covers same-key and aliased-key dispatch,
 FIFO across the deadline, user cancellation versus shutdown, capacity pressure,
 failed spool writes, bounded waits, busy-ack deduplication, media and id-less

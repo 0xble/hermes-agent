@@ -1,6 +1,6 @@
 # Same-session compression recovery
 
-**Status:** design only. The current gateway still resets the conversation after compression exhaustion. This record describes a proposed lossless recovery boundary and is not proof that the named runtime behavior or verification files exist on `main`.
+**Status:** design only. The current gateway still resets the conversation after compression exhaustion. This record describes a proposed lossless recovery boundary and is not proof that the named runtime behavior or verification files exist on `main`. The implementation and its seven named test files ran live from release `e9b89a945ac0` (2026-10-14) on `fix/goal-judge-degraded-state`, but never merged: #613 was closed on 2026-10-17 after its landable parts reached main (#626, #627, #602), and the remaining tree is open as #546. The compression-pool saturation that triggered the 2026-10-14 resets is deferred instead by `compression-pool-saturation` (#683). Pin contract tests here only when an implementation lands.
 
 Load this unit when changing hard-window recovery, preflight input admission,
 archive-backed request projection or the gateway exhaustion boundary.

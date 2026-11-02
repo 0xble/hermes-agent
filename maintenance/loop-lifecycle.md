@@ -110,6 +110,13 @@ budget.
 
 ## Proof Surface
 
+Contract tests: `tests/hermes_cli/test_loop_settlement.py`,
+  `tests/hermes_cli/test_loop_control_atomic.py`,
+  `tests/hermes_cli/test_loop_autonomy.py`,
+  `tests/gateway/test_loop_interruption_recovery.py`,
+  `tests/gateway/test_loop_tick_native_settlement.py`,
+  `tests/gateway/test_loop_tick_reset.py`
+
 Focused tests cover LoopState compatibility and versioning, authority branches, cadence re-anchoring, preservation of ticks/route/created_at, replacement, status and wakeup text, receipt registry behavior, and stale-manager survival through CLI/TUI completion paths. `tests/hermes_cli/test_loop_settlement.py` covers continue/done/blocked races, stale revisions, legacy entry checks, no-op and commit-edge conflicts, pause/resume ABA, claim cleanup races, same-manager commands after a revision, settlement or claim commit, persistence failures, and ephemeral operation with the real SessionDB. `tests/hermes_cli/test_loop_control_atomic.py` covers stale user controls and revisions against every newer lifecycle, write failures, and cursor-owned claims, settlements and revisions. `tests/hermes_cli/test_loop_autonomy.py` covers autonomous revise and replace inside the floors, replacement keeping the tick budget and cadence, agent pause and resume waiting out the interval, the pause, resume and finish controls, refusal to lift or end a user, quoted, Ctrl+C or tick-budget pause (including a quoted pause whose reason imitates the agent), and default-off quote authority. `tests/gateway/test_loop_interruption_recovery.py` puts `finish` under the execution fence. Run the affected tests through `scripts/run_tests.sh`; run the repository's canonical gate before publication.
 
 `tests/gateway/test_loop_tick_native_settlement.py` exercises real scheduler admission and

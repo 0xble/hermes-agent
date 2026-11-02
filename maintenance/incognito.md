@@ -93,6 +93,14 @@ not only the command reply.
 
 ## Proof And Retirement
 
+Contract tests: `tests/agent/test_incognito.py`,
+  `tests/agent/test_incognito_main_sinks.py`,
+  `tests/hermes_cli/test_incognito_plugins.py`,
+  `tests/plugins/platforms/telegram/test_incognito_ingress.py`,
+  `tests/tools/test_delegate_tool.py`,
+  `tests/gateway/test_incognito_turn_e2e.py`,
+  `tests/hermes_state/test_incognito_off_regression.py`
+
 The focused proof surfaces are `tests/agent/test_incognito.py`,
 `tests/agent/test_incognito_main_sinks.py`, the
 `tests/gateway/test_incognito*` tests, `tests/hermes_state/test_incognito*`,

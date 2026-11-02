@@ -44,6 +44,8 @@ prompts. None is released as of 2026-09-25.
 
 ## Verification
 
+Contract tests: `tests/gateway/test_telegram_rich_message_ingress.py`
+
 `scripts/run_tests.sh tests/gateway/test_telegram_rich_message_ingress.py`
 (RED on base: 12 failed; GREEN: 13 passed, 1 skipped because the gateway test
 harness mocks python-telegram-bot). The real-PTB path is proven separately by

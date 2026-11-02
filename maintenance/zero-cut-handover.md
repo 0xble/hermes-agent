@@ -77,6 +77,9 @@ exactly-once guarantee.
 
 ### Source Evidence And Regression
 
+Contract tests: `tests/plugins/test_received_handover.py`,
+  `tests/gateway/test_zero_cut_handover_verb.py`
+
 On frozen fork base `9c465b1d10085f3d57ce33599f58ca84096be1c2`, a real PTB
 Application queue/processor plus real Telegram batching, `handle_message` and runner
 admission returns `draining_maintenance` for the original message during polling
