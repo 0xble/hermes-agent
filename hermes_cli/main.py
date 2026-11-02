@@ -1588,8 +1588,8 @@ def _warn_retired_xai_models() -> None:
         pass
 
 
-def _start_chat_background_prefetch() -> None:
-    """Kick off the update-check/banner prefetch and the bundled-skills sync.
+def _start_chat_background_prefetch(*, prefetch_banner: bool = True) -> None:
+    """Sync skills and warm banner probes only where displayed, not in TUI launchers.
 
     Update check is opt-in on Termux (it imports rich/prompt_toolkit in the
     foreground and competes for CPU on single-core devices). The skills sync
@@ -1600,7 +1600,7 @@ def _start_chat_background_prefetch() -> None:
     on the very first launch), so the first run syncs in the foreground and
     drops the banner's skills cache.
     """
-    if _termux_should_prefetch_update_check():
+    if prefetch_banner and _termux_should_prefetch_update_check():
         try:
             from hermes_cli.banner import prefetch_banner_data, prefetch_update_check
 
@@ -1707,7 +1707,7 @@ def cmd_chat(args):
         _first_run_setup_guard(args)
         return
 
-    _start_chat_background_prefetch()
+    _start_chat_background_prefetch(prefetch_banner=not use_tui)
 
     # --yolo: bypass all dangerous command approvals. main() also sets this
     # before _prepare_agent_startup() — the authoritative site, since it runs
