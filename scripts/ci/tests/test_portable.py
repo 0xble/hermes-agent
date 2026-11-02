@@ -576,6 +576,8 @@ try {
             local.mkdir()
             venv = root / '.venv'
             stack.enter_context(patch.object(ci, 'ROOT', root))
+            # Disk admission has its own tests; this one exercises venv isolation.
+            stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=ci.free_space_floor_bytes() + 1))
             stack.enter_context(patch.object(ci, 'require_tools'))
             stack.enter_context(patch.object(ci, 'provision_npm'))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
@@ -638,6 +640,8 @@ try {
                     npm_bin.parent.mkdir(parents=True, exist_ok=True)
                     write_executable(npm_bin, ci.PINS['npm'])
 
+            # Disk admission has its own tests; this one exercises npm provisioning.
+            stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=ci.free_space_floor_bytes() + 1))
             stack.enter_context(patch.object(ci, 'run', side_effect=install))
             stack.enter_context(patch.object(ci, 'provision_rg'))
             ci.setup(env)
