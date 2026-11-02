@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import contextvars
 import functools
+import inspect
 import json
 import os
 import time
@@ -33,6 +34,16 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
     from gateway.run_turn_runner import TurnRunner
+
+
+def _call_with_steer_delivery(method, text: str, on_delivered=None) -> bool:
+    """Native controls report insertion. Legacy controls expose acceptance only."""
+    if on_delivered is not None and "on_delivered" in inspect.signature(method).parameters:
+        return bool(method(text, on_delivered=on_delivered))
+    accepted = bool(method(text))
+    if accepted and on_delivered is not None:
+        on_delivered()
+    return accepted
 
 
 def approval_input_words(input_key: str) -> tuple[str, ...]:
@@ -331,10 +342,10 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
+    def _steer_running_agent(self, running_agent: Any, text: str, *, on_delivered=None) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
+        accepted = _call_with_steer_delivery(running_agent.steer, text, on_delivered)
         return bool(self._steer_active_subagents(running_agent, text)) or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
@@ -787,9 +798,7 @@ class GatewayBusySessionMixin:
                 steered = self._try_agent_verb(
                     running_agent, "steer", steer_text, session_key, event=event
                 )
-            if steered:
-                self._fold_into_running_turn(running_agent, session_key, event)
-            elif not redirected:
+            if not steered and not redirected:
                 effective_mode = "queue"
         elif (
             effective_mode == "interrupt" and plain_text and agent_live
@@ -815,9 +824,13 @@ class GatewayBusySessionMixin:
         """Call ``running_agent.<verb>(text)`` (steer/redirect); False + warning on failure."""
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
+            on_delivered = (
+                functools.partial(self._fold_into_running_turn, running_agent, session_key, event)
+                if event is not None else None
+            )
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text)
-            return bool(getattr(running_agent, verb)(call_text))
+                return self._steer_running_agent(running_agent, call_text, on_delivered=on_delivered)
+            return _call_with_steer_delivery(getattr(running_agent, verb), call_text, on_delivered)
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -832,8 +845,8 @@ class GatewayBusySessionMixin:
         """
         if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
             return False
-        turn = self._fold_into_running_turn(running_agent, session_key, event)
-        if turn is None:
+        turn = self._session_state(session_key).turn
+        if turn.agent is not running_agent:
             return True  # a newer turn already owns the slot; never re-anchor it
         anchor = self._reply_anchor_for_event(event)
         inbound_id = str(event.message_id) if event.message_id else None
@@ -1499,20 +1512,20 @@ class GatewayBusySessionMixin:
             return await _queue_fallback(t("gateway.steer.queued_starting"))
         if not running_agent or not hasattr(running_agent, "steer"):
             return await _queue_fallback(t("gateway.steer.queued_no_agent"))
+        # Normalize before submission: insertion can happen on the worker before steer() returns.
+        silent_relay = is_agent_origin_text(steer_text) and event.reply_expected is not True
+        if silent_relay:
+            event.reply_expected = False
         try:
-            accepted = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
+            accepted = self._steer_running_agent(
+                running_agent, self._steer_text_with_origin(steer_text, event),
+                on_delivered=functools.partial(self._fold_into_running_turn, running_agent, quick_key, event),
+            )
         except Exception as exc:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)
         if not accepted:
             return t("gateway.steer.rejected_empty")
-        # Admission saw "/steer <header>", so mark agent origin on the stripped text before the
-        # fold; otherwise absorbing an unknown expectation resets a relay turn's False to None.
-        # An explicitly addressed relay (True) keeps its expectation and its ack.
-        silent_relay = is_agent_origin_text(steer_text) and event.reply_expected is not True
-        if silent_relay:
-            event.reply_expected = False
-        self._fold_into_running_turn(running_agent, quick_key, event)
         if silent_relay:
             return None
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
