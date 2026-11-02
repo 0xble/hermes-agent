@@ -82,7 +82,8 @@ All 25 original changed files remain necessary; the classic-client extension
 adds `hermes_cli/gateway_connection.py` and the borrowed-owner Vertex fixture
 in `tests/e2e/core/providers/test_native_vertex_tools.py`. The review adds the
 real same-home competing-client and daemon-recovery regressions below and
-extends the existing status merge schema (30 files total). No protected gate
+extends the existing status merge schema and preserves the cross-process OAuth
+lock fixture (31 files total). No protected gate
 files change.
 
 | File | Kept lifetime-bound responsibility |
@@ -108,6 +109,7 @@ files change.
 | `tests/e2e/core/parity/_drive_cli.py` | Client exit alone releases finite gateways; operator stop is failure cleanup. |
 | `tests/e2e/core/parity/test_entrypoint_parity.py` | Document client-exit teardown without weakening MCP/tool parity assertions. |
 | `tests/e2e/core/providers/test_native_vertex_tools.py` | Explicitly own the persistent serving fixture for unchanged cross-client token-reuse assertions; prove finite clients do not stop that borrowed owner. |
+| `tests/e2e/core/providers/test_oauth_shared_pool.py` | Two production-resolver/AIAgent subprocesses still race the same auth.json lock; a common gateway would erase the cross-process property. |
 | `tests/gateway/test_client_lifetime.py` | Real EOF and wedged-shutdown bound, including an active tool child. |
 | `tests/gateway/test_client_owned_bootstrap.py` | No daemon services/restarts; first-turn MCP readiness retained. |
 | `tests/gateway/test_client_owned_recovery.py` | Preserve prior daemon receipts, counters and interrupted turn through finite startup/exit; next daemon takes unclean recovery. |
@@ -191,6 +193,16 @@ entrypoint parity cases remain Linux-only; their execution is a hosted gate duty
 not a claimed macOS pass. The review delta code-health check against
 `2996d712414d820a88333a781907eab7378e7325` has zero blockers/advisories.
 `git diff --check` and the source-only Fork-Patch ownership check pass.
+
+The first hosted review-fix run (`41492463206`, head `32a3f147c49d`) passed
+static/Node, eight Python shards and strict parity (eight cases), but exposed the
+OAuth fixture's reliance on concurrent same-home finite clients. That fixture now
+launches two production provider-resolver/AIAgent child processes against the same
+auth store (distinct PIDs asserted), preserving every refresh/401/wire assertion
+without a shared gateway or parallel profile-store semantics. The canonical
+runner passed its Linux/container execution (one test, zero failures) and its
+delta code-health check has no findings. The separate image-catalog assertion
+in shard 7 is unrelated and was not treated as a rerunnable timing flake.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.
