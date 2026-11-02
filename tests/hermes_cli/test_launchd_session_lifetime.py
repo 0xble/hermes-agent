@@ -120,7 +120,7 @@ def test_domain_migration_never_overlaps_and_rolls_back(tmp_path, monkeypatch, f
     else:
         gateway_launchd.migrate_launchd_domain("user", start_now=True, runner=run)
         assert set(loaded) == {(new, label), (new, guard)}
-        shim = path.with_name("ai.hermes.gateway-login.plist")
+        shim = path.with_name("ai.hermes.login-bootstrap.plist")
         shim_body = plistlib.loads(shim.read_bytes())
         assert shim_body["RunAtLoad"] is True
         assert shim_body["LimitLoadToSessionType"] == "Aqua"

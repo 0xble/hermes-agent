@@ -20,6 +20,7 @@ Fork patch identities: `gateway-launchd-qos`, `gateway-session-independent-launc
 
 Contract tests: `tests/hermes_cli/test_launchd_session_lifetime.py`,
   `tests/hermes_cli/test_launchd_login_trigger.py`,
+  `tests/hermes_cli/test_launchd_login_identity.py`,
   `tests/hermes_cli/test_launchd_lifetime_safety.py`.
 
 ## Explicit lifetime selection
@@ -74,7 +75,9 @@ all three labels only in gui/<uid>, reversing the heartbeat dotfiles policy.
 Retire lifetime support only when upstream provides an equivalent opt-in,
 profile-safe migration and exact-domain status surface.
 
-A separate unprivileged `ai.hermes.gateway-login` Aqua LaunchAgent is a login
+A separate unprivileged `ai.hermes.login-bootstrap` Aqua LaunchAgent (or
+`ai.hermes.login-bootstrap-<profile>` with the gateway's existing profile/hash
+suffix) is a login
 trigger only. Background-only home plists are not assumed to be discovered by
 the GUI loader. At the next natural autologin it registers gateway and guardian
 in user/<uid> only if absent; it never executes a gateway or kickstarts it.
@@ -86,8 +89,17 @@ probes; pending old helpers block migration rather than relaunching a second cop
 Migration writes but does not execute this RunAtLoad trigger during the window;
 GUI rollback and uninstall remove it and any registration. The heartbeat needs
 the equivalent dotfiles-owned trigger, described only in the activation runbook.
-First-natural-reboot verification is outstanding, not inferred from the
-disposable-label result.
+It stays outside `ai.hermes.gateway*`: fleet restart/pause and supervised-PID
+scans must not treat an exited one-shot as a gateway or collide with a profile
+named `login`. Explicit lifetime migration, rollback and uninstall use its exact
+label; full application uninstall also sweeps the login-bootstrap namespace.
+Gateway status/doctor and install-home discovery still inspect the actual
+gateway definitions, not a separate one-shot's transient PID.
+
+### Open activation checklist
+
+- [ ] **Last-logout survival:** separately authorized observation of gateway and guardian in the user domain, connected adapters, advancing cron markers and independent heartbeat after all GUI/SSH sessions end. Not tested by this patch.
+- [ ] **First natural reboot:** observe natural autologin, fresh login-trigger logs, all three Background registrations and intended code identity. Do not induce a logout or reboot during source verification.
 
 ## Evidence
 

@@ -91,6 +91,12 @@ def _login_bootstrap(home: Path, gateway_plist: Path, *, runner=None, log=print)
         log(f"{label}: loaded")
 
 
+def _login_trigger_label(label: str) -> str:
+    """Login bootstrap outside ``ai.hermes.gateway*`` and every profile suffix."""
+    suffix = label.removeprefix("ai.hermes.gateway")
+    return f"ai.hermes.login-bootstrap{suffix}"
+
+
 def login_plist(home: Path, gateway_plist: Path, label: str) -> bytes:
     from hermes_cli import gateway as gw
     python = home / "current/.venv/bin/python"
@@ -104,7 +110,7 @@ def login_plist(home: Path, gateway_plist: Path, label: str) -> bytes:
         arguments = installation_command(gw.PROJECT_ROOT, options, module="hermes_cli.gateway_launchd_login",
                                          python=interpreter, home=home)
     return plistlib.dumps({
-        "Label": f"{label}-login", "RunAtLoad": True, "LimitLoadToSessionType": "Aqua",
+        "Label": _login_trigger_label(label), "RunAtLoad": True, "LimitLoadToSessionType": "Aqua",
         "ProgramArguments": arguments,
         "WorkingDirectory": str(home), "EnvironmentVariables": {"HERMES_HOME": str(home)},
         "StandardOutPath": str(home / "logs/launchd-login.log"),

@@ -171,7 +171,9 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
     from gateway.status import get_running_pid
     home, path, label = gw.get_hermes_home(), gw.get_launchd_plist_path(), gw.get_launchd_label()
     guardian_path = path.with_name(f"{GUARDIAN_LABEL}.plist")
-    login_label = f"{label}-login"
+    from hermes_cli.gateway_launchd_login import _login_trigger_label
+
+    login_label = _login_trigger_label(label)
     login_path = path.with_name(f"{login_label}.plist")
     run = runner or subprocess.run
     domains = (f"gui/{_uid()}", f"user/{_uid()}")
@@ -259,7 +261,9 @@ def uninstall_launchd_lifetime(*, runner=None) -> None:
     run = runner or subprocess.run
     home, path = gw.get_hermes_home(), gw.get_launchd_plist_path()
     label = gw.get_launchd_label()
-    labels = (f"{label}-login", GUARDIAN_LABEL, label)
+    from hermes_cli.gateway_launchd_login import _login_trigger_label
+
+    labels = (_login_trigger_label(label), GUARDIAN_LABEL, label)
     with lifetime_lock(home):
         for name in labels:
             original = _owned_definition(path.with_name(f"{name}.plist"), home, name)
