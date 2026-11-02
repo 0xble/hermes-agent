@@ -108,6 +108,7 @@ async def test_status_command_reads_token_totals_from_session_db():
 
     # 1000 + 250 + 500 + 100 + 50 = 1,900
     assert "**Lifetime tokens billed:** 1,900" in result
+    assert "**Incognito:** OFF" in result
 
 
 @pytest.mark.asyncio

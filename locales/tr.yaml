@@ -468,6 +468,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**Oturum kimliği:** `{session_id}`"
+    incognito: "**Gizli mod:** {state}"
     title: "**Başlık:** {title}"
     created: "**Oluşturuldu:** {timestamp}"
     last_activity: "**Son etkinlik:** {timestamp}"

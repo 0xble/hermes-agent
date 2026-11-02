@@ -468,6 +468,7 @@ gateway:
     matrix_scope_mode: "  نطاق الجلسة: {scope}"
     matrix_scope_key: "  مفتاح الجلسة: {session_key}"
     session_id: "**معرّف الجلسة:** `{session_id}`"
+    incognito: "**وضع التصفح المتخفي:** {state}"
     title: "**العنوان:** {title}"
     created: "**أُنشئت:** {timestamp}"
     last_activity: "**آخر نشاط:** {timestamp}"

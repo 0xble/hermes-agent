@@ -468,6 +468,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**ID сесії:** `{session_id}`"
+    incognito: "**Інкогніто:** {state}"
     title: "**Назва:** {title}"
     created: "**Створено:** {timestamp}"
     last_activity: "**Остання активність:** {timestamp}"
