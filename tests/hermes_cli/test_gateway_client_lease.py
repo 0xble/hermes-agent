@@ -88,3 +88,32 @@ async def test_every_attach_failure_releases_spawned_lease(monkeypatch, tmp_path
             pytest.fail('failed attach yielded a client')
     child.stdin.close.assert_called_once()
     child.wait.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('finite', [False, True])
+async def test_classic_connection_leases_only_finite_single_query_clients(monkeypatch, finite):
+    from contextlib import asynccontextmanager
+    from hermes_cli import gateway_connection
+
+    if finite:
+        monkeypatch.setenv('HERMES_SINGLE_QUERY_SESSION', '1')
+    else:
+        monkeypatch.delenv('HERMES_SINGLE_QUERY_SESSION', raising=False)
+    calls = []
+
+    @asynccontextmanager
+    async def connect(**kwargs):
+        calls.append(kwargs)
+        yield Mock()
+
+    connection = gateway_connection.GatewayConnection()
+
+    async def pump(_client):
+        assert connection._stop is not None
+        connection._stop.set()
+
+    monkeypatch.setattr('hermes_cli.gateway_client.connect_gateway', connect)
+    monkeypatch.setattr(connection, '_pump', pump)
+    await connection._main()
+    assert calls == [{'one_shot': finite}]

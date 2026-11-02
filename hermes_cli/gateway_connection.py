@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
 import threading
 import time
+from functools import partial
 
 from hermes_cli.gateway_client import DEFAULT_RPC_TIMEOUT, RESUME_KEY_MISMATCH, GatewayClientError, GatewayRPCError
 
@@ -265,7 +267,8 @@ class GatewayConnection:
         connect = self._connect
         if connect is None:
             from hermes_cli.gateway_client import connect_gateway
-            connect = connect_gateway
+            # HermesCLI marks finite -q/-Q before its first gateway claim; interactive clients borrow.
+            connect = partial(connect_gateway, one_shot=os.environ.get("HERMES_SINGLE_QUERY_SESSION") == "1")
         try:
             async with connect() as client:
                 if self.epoch:

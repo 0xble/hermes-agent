@@ -69,7 +69,20 @@ async def run():
             (home / 'attached').touch()
             if sys.argv[1] != 'exit':
                 await asyncio.Future()
-asyncio.run(run())
+if sys.argv[2] == 'classic':
+    # HermesCLI sets this marker before claiming its finite -q/-Q session.
+    os.environ['HERMES_SINGLE_QUERY_SESSION'] = '1'
+    from hermes_cli.gateway_connection import GatewayConnection
+    with patch('websockets.asyncio.client.connect', connect):
+        connection = GatewayConnection.shared()
+        connection.start(timeout=15)
+        (home / 'attached').touch()
+        if sys.argv[1] == 'exit':
+            connection.close()
+        else:
+            threading.Event().wait(60)
+else:
+    asyncio.run(run())
 '''
 
 
@@ -82,7 +95,8 @@ def _alive(pid):
 
 @pytest.mark.platforms("posix")
 @pytest.mark.live_system_guard_bypass  # real signals to exact test-created, now-orphaned grandchildren
-def test_parallel_finite_clients_leave_no_live_gateways(tmp_path):
+@pytest.mark.parametrize("entrypoint", ["transport", "classic"])
+def test_parallel_finite_clients_leave_no_live_gateways(tmp_path, entrypoint):
     children = []
     gateway_pids = []
     try:
@@ -90,7 +104,7 @@ def test_parallel_finite_clients_leave_no_live_gateways(tmp_path):
             home = tmp_path / mode
             home.mkdir(mode=0o700)
             env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd())}
-            child = subprocess.Popen([sys.executable, "-c", CLIENT, mode], env=env,
+            child = subprocess.Popen([sys.executable, "-c", CLIENT, mode, entrypoint], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             children.append((child, home, mode))
         for child, home, mode in children:

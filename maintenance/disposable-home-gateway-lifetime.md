@@ -15,7 +15,10 @@ The session-only startup retains the ordinary bounded MCP-discovery barrier so
 the first finite turn does not lose eager MCP tools. Only the
 creating client's Popen handles confer cleanup authority; discovered owners and
 installed services are never stopped. Interactive sessions keep the existing
-reusable idle-exit behavior.
+reusable idle-exit behavior. The classic `HermesCLI` route forwards its existing
+`HERMES_SINGLE_QUERY_SESSION` marker at `GatewayConnection`'s lazy dial, so finite
+`chat -q`/`-Q` uses the same lease as `-z`; no new configuration or lifecycle
+manager is introduced. Injected connection factories are unchanged.
 
 The finite-client owner serves local sessions only. It must not dispatch cron,
 restore heartbeat/loop/recovered work, connect messaging adapters, or start
@@ -37,6 +40,58 @@ not ownership. Neither eliminates the detached lifetime after successful client
 exit. No equivalent caller-death fence found. Intentional fork divergence until
 an equivalent upstream lifetime and daemon-service fence ships.
 
+## Scope audit
+
+All 25 original changed files remain necessary; the classic-client extension
+adds only `hermes_cli/gateway_connection.py`. No protected gate files change.
+
+| File | Kept lifetime-bound responsibility |
+| --- | --- |
+| `gateway/client_lifetime.py` | Early EOF watcher, three-second self-exit, exact tracked tool-child cleanup. |
+| `gateway/run.py` | Thread client-owned mode into the runner entry point. |
+| `gateway/run_bootstrap.py` | Select finite session-only startup, not daemon enrollment. |
+| `gateway/run_client_owned.py` | Preserve providers/plugins/MCP while excluding daemon startup. |
+| `gateway/run_runtime.py` | Skip bot recovery and READY-hosted daemon coordinators. |
+| `gateway/run_shutdown.py` | Refuse restart helpers/replacements that could escape the lease. |
+| `gateway/run_startup.py` | Dispatch finite mode before ordinary daemon startup. |
+| `hermes_cli/gateway.py` | Forward the internal finite-owner marker. |
+| `hermes_cli/gateway_chat.py` | Pass finite transport-chat intent into the lease path. |
+| `hermes_cli/gateway_client.py` | Lease across discovery, attach and every failure. |
+| `hermes_cli/gateway_client_lifetime.py` | Close/reap only exact Popen children, including late spawns. |
+| `hermes_cli/gateway_connection.py` | Forward classic finite-client intent at the lazy connection dial. |
+| `hermes_cli/gateway_runtime.py` | Pass ownership only to a new unmanaged spawn; borrow existing owners. |
+| `hermes_cli/gateway_runtime_start.py` | Private stdin pipe, detached session and closed inherited descriptors. |
+| `hermes_cli/main.py` | Arm the parent-death fence before heavyweight gateway imports. |
+| `hermes_cli/subcommands/gateway.py` | Parse the internal client-owned marker. |
+| `maintenance/disposable-home-gateway-lifetime.md` | Contract, fork ownership, verification and retirement. |
+| `tests/e2e/core/parity/_drive_cli.py` | Client exit alone releases finite gateways; operator stop is failure cleanup. |
+| `tests/e2e/core/parity/test_entrypoint_parity.py` | Document client-exit teardown without weakening MCP/tool parity assertions. |
+| `tests/gateway/test_client_lifetime.py` | Real EOF and wedged-shutdown bound, including an active tool child. |
+| `tests/gateway/test_client_owned_bootstrap.py` | No daemon services/restarts; first-turn MCP readiness retained. |
+| `tests/hermes_cli/test_gateway_chat.py` | Finite/interactive transport ownership and mock keyword contract. |
+| `tests/hermes_cli/test_gateway_client_lease.py` | Exact-child lease, cancellation/failures/borrowing and classic finite dial. |
+| `tests/hermes_cli/test_gateway_client_lifetime.py` | Concurrent real normal/SIGTERM/SIGKILL exit for transport and classic clients. |
+| `tests/hermes_cli/test_gateway_startup_validation.py` | Assert finite mode takes the correct startup validation boundary. |
+| `tests/hermes_cli/test_stream_json.py` | Preserve existing JSONL protocol coverage with the new connect keyword. |
+
+Tracked tool cleanup is not generic process hardening: execution review found
+that `os._exit` bypasses ordinary drain-before-kill while foreground tools use
+`start_new_session=True`, leaving live tool children after owner death. MCP
+readiness preservation addresses the same review's missing finite first-turn
+discovery barrier; session-only startup must not regress its only tool snapshot.
+Both findings were recorded in execution review of the initial patch.
+Regressions are executable in
+`test_owner_eof_forces_exit_when_shutdown_signal_is_ignored[True]` and
+`test_client_owned_bootstrap_does_not_start_daemon_services` (await-once), plus
+the unchanged first-turn MCP/hook and zero-orphan parity assertions.
+No whole-file cuts were justified. The inherited docstring narrowing parity to
+`-z` was dropped because finite classic clients now have the same contract.
+
+Upstream guidance was rechecked at
+`4d26e0cceaed0a08ede833caec0ec6d6ca77a4b8` (root/subsystem AGENTS and
+CONTRIBUTING). Open/closed PR searches for gateway one-shot lifetime and issue
+searches for gateway idle-exit found no equivalent ownership fence.
+
 ## Verification and retirement
 
 Contract tests: `tests/hermes_cli/test_gateway_client_lifetime.py`
@@ -51,6 +106,17 @@ with a fake provider/gateway boundary, for concurrent normal exit, SIGTERM and
 SIGKILL. It asserts process death and canonical runtime absence within seconds.
 Existing runtime discovery/service, idle-exit and gateway startup tests preserve
 interactive and supervised behavior.
+
+Classic extension RED: before forwarding the finite marker, the real-process
+classic case failed after seven seconds with its owners still alive (one failed,
+one deselected). Afterward the urgent heavy-slot canonical run passed 311 tests
+across 31 files, zero failed, 47 platform skips. That includes both transport and
+classic normal/SIGTERM/SIGKILL regressions, exact ownership, daemon isolation,
+runtime/discovery/service, idle-exit, launchd, shutdown, connection/reconnect and
+classic agent/session-store tests. All eight strict entrypoint parity cases are
+Linux `/proc` tests, so hosted Linux qualification must execute them rather than
+counting their macOS skips as passes.
+
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.
