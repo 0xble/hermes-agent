@@ -34,7 +34,6 @@ from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
 from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
-from agent import plugin_live_notes
 from agent.lsp import deferred as lsp_deferred
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
@@ -1158,10 +1157,9 @@ def _commit_tool_result(
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
-    # A plugin that went live during this turn, and late LSP verdicts on this session's earlier edits,
-    # are told on this new row (outside any untrusted-data wrapper).
+    # Queue late LSP verdicts on this session's earlier edits. Host notices drain
+    # separately at the next continuation, never into this tool result.
     lsp_deferred.forward_to_agent(agent)
-    plugin_live_notes.attach_to_tool_message(agent, tool_message)
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
     prepare_metadata = getattr(agent, "tool_result_metadata_callback", None)
@@ -1222,16 +1220,14 @@ def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: s
 
 
 def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tools: int, budget: BudgetConfig) -> None:
-    """Per-turn aggregate budget enforcement, then /steer injection — in that order, so the
-    steer marker is never truncated/discarded when enforcement replaces a result."""
+    """Enforce the aggregate result budget. Notices and steer drain before the next request,
+    outside the complete tool batch, so budget enforcement cannot spill their text."""
     if num_tools <= 0:
         return
     batch = messages[-num_tools:]
     contents_before = [message.get("content") for message in batch]
     enforce_turn_budget(batch, env=get_active_env(effective_task_id), config=budget)
-    plugin_live_notes.keep_after_turn_budget(agent, batch)
     record_tool_batch(agent, batch, contents_before)
-    agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
 def _tool_progress_enabled(agent) -> bool:
@@ -1940,7 +1936,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
     """Execute a mixed batch as ordered parallel/sequential segments (the ``(kind, calls)``
     plan from ``_plan_tool_batch_segments``), preserving per-call result order and barrier
-    boundaries exactly as fully-sequential execution. Turn-end work (budget + /steer) runs
+    boundaries exactly as fully-sequential execution. Turn-budget enforcement runs
     once here (segments run with ``finalize=False``); each segment executor checks the
     interrupt flag up front, so an interrupt drains later segments with one result per call."""
     from types import SimpleNamespace
