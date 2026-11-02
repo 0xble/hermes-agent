@@ -99,6 +99,7 @@ def build_gateway_parser(
     # Internal: set only by a client that auto-starts its own gateway (chat, TUI, cron/kanban
     # clients). Never in service units, Desktop's `gateway ensure` start or a hand-run gateway.
     _flag(gateway_run, "--idle-exit", help=argparse.SUPPRESS)
+    _flag(gateway_run, "--client-owned", help=argparse.SUPPRESS)
     add_accept_hooks_flag(gateway_run)
     add_accept_hooks_flag(gateway_parser)
 

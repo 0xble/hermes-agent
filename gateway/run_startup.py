@@ -2126,6 +2126,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
     async def _start_impl(self) -> bool:
         logger.info("Starting Hermes Gateway...")
+        if getattr(self, "_client_owned", False):
+            from gateway.run_client_owned import start_client_owned_runner
+            return await start_client_owned_runner(self)
         # Until the previous-run recovery decision completes, shutdown must not write a fresh
         # clean receipt: an abort during adapter startup would otherwise turn an unclean boot into
         # a clean one on the next restart.
