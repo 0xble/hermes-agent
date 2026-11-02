@@ -22,6 +22,11 @@ first persistence. Human guidance stays ordered before the newer correction.
 The same host-frame composer handles both ordinary tool continuations and
 redirects, including repeated redirects after an existing continuation row.
 Deferred steer delivery returns transfer tickets through the native queue owner.
+Generated post-tool snapshots and producer-marked standalone task restatements
+also permit this continuation. A restatement still carries the original human
+instruction, but is not new inbound input. Ordinary human tails, pasted replay
+headers, and summary carriers with new human input continue to defer delivery.
+The separator and control row are appended without changing the scaffold.
 
 Producer-owned `display_metadata.runtime_notice` stays off the provider wire but
 survives replay and compaction. It prevents timestamp injection from changing
