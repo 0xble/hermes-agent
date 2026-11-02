@@ -190,6 +190,7 @@ def ingress_fingerprint(payload, raw=None):
     re-captures them under a fresh staging name (``reconcile_native_retry``)."""
     envelope = {**payload['native_text_v1']}
     envelope.pop('ingress_sha256', None)
+    envelope.pop('attended_activity', None)
     if 'media' in envelope:
         envelope['media'] = [[media['sha256'], media['size']] for media in envelope['media']]
     received = {**payload, 'native_text_v1': envelope}
