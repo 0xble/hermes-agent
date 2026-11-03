@@ -104,7 +104,7 @@ class PythonScratchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'scripts').mkdir()
-            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh'):
+            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh', '_setup_guard.sh'):
                 shutil.copy2(ROOT / 'scripts' / name, root / 'scripts' / name)
             (root / 'scripts/ci').mkdir()
             shutil.copy2(ROOT / 'scripts/ci/list_os_marked_tests.py', root / 'scripts/ci/list_os_marked_tests.py')
@@ -143,7 +143,7 @@ if __name__ == '__main__':
         with tempfile.TemporaryDirectory() as directory:
             primary = Path(directory) / 'primary'
             (primary / 'scripts').mkdir(parents=True)
-            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh'):
+            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh', '_setup_guard.sh'):
                 shutil.copy2(ROOT / 'scripts' / name, primary / 'scripts' / name)
             (primary / 'scripts/ci').mkdir()
             shutil.copy2(ROOT / 'scripts/ci/list_os_marked_tests.py', primary / 'scripts/ci/list_os_marked_tests.py')
