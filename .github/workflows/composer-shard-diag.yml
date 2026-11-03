@@ -1,0 +1,102 @@
+name: Disposable boundary diagnostic
+on:
+  push:
+    branches: ['diag/composer-boundary-134818d4']
+permissions:
+  contents: read
+jobs:
+  composer-shard:
+    name: Composer boundary (diagnostic only)
+    runs-on: ubuntu-latest
+    container:
+      image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
+      options: --init
+    steps:
+      - name: Install Git for checkout
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y ca-certificates git
+      - name: Configure Git safe directory
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Assert checked-out diagnostic head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
+      - name: Install pinned Linux toolchain and platform libraries
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev tmux unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
+          python3 ci/install-linux-tools.py amd64
+          echo /opt/ci/rust/bin >> "$GITHUB_PATH"
+          uv python install 3.14.7
+          npm install --global npm@12.0.0
+      - name: Verify tmux for e2e coverage
+        shell: bash
+        run: tmux -V
+      # gate.yml python-shard has no explicit timeout-minutes: preserve omission.
+      - name: One restored original shard (no retry)
+        shell: bash
+        env:
+          # Original job-step flag is intentionally dropped by portable.environment.
+          HERMES_E2E_REQUIRE_TUI: "1"
+        run: |
+          useradd --uid 1001 --create-home --shell /bin/bash ci
+          mkdir -p .ci/composer-shard
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
+          runuser -u ci -- env HOME="$HOME" python3 - '${{ github.sha }}' > .ci/composer-shard/runner.log 2>&1 <<'PY'
+          import hashlib
+          import runpy
+          import sys
+          from pathlib import Path
+
+          ci = runpy.run_path("scripts/ci/portable.py")
+          manifest = Path("scripts/ci/composer_shard_manifest.txt").read_bytes()
+          assert hashlib.sha256(manifest).hexdigest() == "d8312a296a25aba3d14684176963261a6c95ab7b911f018046b14cbc0439a718"
+          files = manifest.decode().splitlines()
+          assert len(files) == len(set(files)) == 725
+          assert files[200] == "tests/e2e/core/cli_tmux/test_classic_cli_main_parity.py"
+          assert sorted(files)[133] == files[200]
+          ci["assert_exact_checkout"](sys.argv[1])
+          ci["STATE"].mkdir(exist_ok=True)
+          with ci["checkout_lock"](), ci["external_temporary_directory"]("hermes-ci-home-") as home, ci["source_unchanged"]():
+              env = ci["resolve_local_toolchain"](ci["environment"](home))
+              assert "HERMES_E2E_REQUIRE_TUI" not in env
+              assert not (ci["ROOT"] / ".venv").exists(), "Refuse an existing environment; do not retry"
+              ci["setup"](env)
+              ci["assert_exact_checkout"](sys.argv[1])
+              retained = (ci["ROOT"] / ".ci/composer-shard/retained").resolve()
+              assert not retained.exists(), "Refuse retained state from any earlier run"
+              assert not retained.is_relative_to(home.resolve())
+              assert not retained.is_relative_to(Path.home().resolve() / ".hermes")
+              # Do not recompute size-weighted shards after adding observation source.
+              # python_tests supplies -j 4 and --file-retries 0 exactly as before.
+              ci["python_tests"](env, files, 4, pytest_args=[
+                  # Explicit passthrough: the runner's bare-flag validator does
+                  # not load this plugin's custom option (runner lines 1083-1112).
+                  "--", "-p", "scripts.ci.composer_shard",
+                  "--composer-shard-diagnostic=failure-boundary-10a52eee",
+              ])
+          ci["assert_exact_checkout"](sys.argv[1])
+          PY
+      - name: Export retained target facts after runner exit
+        if: always()
+        shell: bash
+        run: python3 scripts/ci/composer_export.py
+      - name: Upload isolated composer facts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: composer-boundary-134818d4
+          path: |
+            .ci/composer-shard/artifacts/
+            .ci/composer-shard/runner.log
+          retention-days: 3
+          if-no-files-found: error
+          include-hidden-files: false

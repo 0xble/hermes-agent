@@ -445,7 +445,7 @@ class CLITuiRuntimeMixin:
             # Vi editing mode when display.vim_mode is on.
             # EMACS is prompt_toolkit's own default, so non-opted-in behaviour is unchanged.
             extra_kw["editing_mode"] = EditingMode.VI if self._vim_mode else EditingMode.EMACS
-        return Application(
+        app = Application(
             layout=layout,
             key_bindings=kb,
             style=style,
@@ -463,6 +463,11 @@ class CLITuiRuntimeMixin:
             erase_when_done=True,
             **extra_kw,
         )
+        if output := os.environ.get("HERMES_DIAG_COMPOSER_SNAPSHOT"):
+            from hermes_cli._diag_composer_capture import observe_composer
+            app.pre_run_callables.append(
+                lambda: app.create_background_task(observe_composer(self, app, output)))
+        return app
 
     def _tui_install_signal_handlers(self):
         """SIGTERM/SIGHUP -> graceful shutdown; Windows absorbs SIGINT (see body)."""
