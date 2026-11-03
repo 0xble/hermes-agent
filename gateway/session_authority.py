@@ -1567,7 +1567,7 @@ async def _claim_epoch(authority, *, successor=False):
     from gateway.session_local_recovery import release_handed_off_receipts
     await asyncio.to_thread(release_handed_off_receipts, db, epoch=epoch)
     from gateway.session_bot import release_superseded_bot_chat_at_boot
-    await asyncio.to_thread(release_superseded_bot_chat_at_boot, db, runner.session_store)
+    await asyncio.to_thread(release_superseded_bot_chat_at_boot, db, authority.runner.session_store)
     authority.epoch = epoch
     # A receipt's compression catch-up (#140060) writes: it commits off the loop too, before the
     # authority is published, so the recovery below only reads.

@@ -72,7 +72,8 @@ def test_preflight_rejection_archives_input_without_growing_model_history(
     """A failed admission retains the user's bytes through both persistence owners (#7100)."""
     from agent.runtime_session_store import RuntimeSessionStore
     from agent.turn_context import PreflightCompressionTimedOut
-    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+    from tests.fakes.runtime_owner import begin_runtime_epoch
+    from hermes_state_runtime import mutate_worker_execution, register_worker_execution
     from tests.e2e.core.compaction._helpers import db_rows
 
     sc = make_scenario("good")
