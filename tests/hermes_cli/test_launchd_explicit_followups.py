@@ -177,20 +177,25 @@ def test_missing_gateway_ignores_untrusted_login_trigger(layout, body):
     assert lifetime.configured_launchd_domain() is None
 
 
+@pytest.mark.parametrize("operation", ["install", "uninstall"])
 @pytest.mark.parametrize("body", [b"not a plist", plistlib.dumps([]), plistlib.dumps({"EnvironmentVariables": []})])
-def test_malformed_guardian_is_cli_guidance(layout, monkeypatch, capsys, body):
+def test_malformed_guardian_is_cli_guidance(layout, monkeypatch, capsys, body, operation):
     from types import SimpleNamespace
     home, path, label, _, _, _, calls, _ = layout
     path.write_bytes(definition(home, label, "Background"))
     shared = path.with_name(f"{guardian.GUARDIAN_LABEL}.plist")
     shared.write_bytes(body)
-    monkeypatch.setattr(gw, "_gateway_command_inner", lambda args: launchd.launchd_install(domain="gui"))
+    monkeypatch.setattr(gw, "_gateway_command_inner", lambda args:
+                        launchd.launchd_install(domain="gui") if operation == "install" else launchd.launchd_uninstall())
     with pytest.raises(SystemExit) as exc:
-        gw.gateway_command(SimpleNamespace(gateway_command="install"))
+        gw.gateway_command(SimpleNamespace(gateway_command=operation))
     assert exc.value.code == 1
     output = capsys.readouterr().out
     assert "cannot prove guardian ownership" in output
     assert "hermes gateway status --deep" in output
+    assert "Traceback" not in output
+    assert path.read_bytes() == definition(home, label, "Background")
+    assert shared.read_bytes() == body
     assert not any(call[1] in {"bootout", "bootstrap"} for call in calls)
 
 
