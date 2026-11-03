@@ -37,10 +37,11 @@ def remaining(deadline: float) -> float:
 def service_suffix(home: Path) -> str:
     """Host-service suffix for the REQUESTED home, never the initiating client's env.
 
-    Same rule as ``hermes_cli.gateway._profile_suffix``: only the platform-native
-    default home owns the bare unit name; ``<root>/profiles/<name>`` yields the
-    profile name; any other root (Docker, a temp harness) yields a path hash so a
-    custom root can never resolve to the production ``hermes-gateway`` unit.
+    Same root rule as ``hermes_cli.gateway._profile_suffix``: only the native
+    default home owns the bare unit name. A direct ``profiles/<name>`` child of
+    that root yields the profile name; deeper nested layouts yield a path hash.
+    Outside the native home, ``<root>/profiles/<name>`` uses its custom root.
+    Other custom homes use a path hash, never the production bare service.
     """
     from hermes_constants import account_default_hermes_home
     from hermes_cli.gateway import _profile_name_from_home

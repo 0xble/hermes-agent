@@ -19,6 +19,7 @@ from functools import wraps
 from telegram import Update
 from telegram.ext import Application, ApplicationHandlerStop, ConversationHandler, SimpleUpdateProcessor
 
+from agent.incognito import is_incognito
 from gateway.platforms._shared import coerce_port
 from gateway.platforms.helpers import bounded_put
 from utils import atomic_json_write
@@ -66,7 +67,12 @@ def _load_receipts(adapter, bot_id) -> None:
 
 
 def _record_receipt(adapter, key: str) -> None:
-    bounded_put(adapter._seen_update_ids, key, time.time(), _SEEN_CAP)
+    # Membership still deduplicates private updates, but a later public flush must
+    # never serialize their IDs. The writer already admits only float timestamps.
+    private = is_incognito()
+    bounded_put(adapter._seen_update_ids, key, None if private else time.time(), _SEEN_CAP)
+    if private:
+        return
     adapter._update_receipts_dirty.add(key.split(":", 1)[0])
     task = adapter._update_receipt_flush
     if task is None or task.done():

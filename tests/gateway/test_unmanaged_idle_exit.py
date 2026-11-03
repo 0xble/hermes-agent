@@ -16,7 +16,8 @@ from gateway.config import Platform
 from gateway.runtime_bootstrap import TicketStore
 from gateway.session_authorities import SessionAuthorities
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch, cancel_session_input
+from hermes_state_runtime import admit_session_input, cancel_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def _runner(tmp_path, monkeypatch, *, window=0.2):

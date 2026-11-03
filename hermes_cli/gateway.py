@@ -4748,7 +4748,7 @@ async def _acknowledge_release_when_running(*, poll_seconds: float = 1.0) -> Non
             except (OSError, RuntimeError, ValueError):
                 logger.warning("Pending release reload could not be acknowledged", exc_info=True)
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False,
-                idle_exit: bool = False):
+                idle_exit: bool = False, client_owned: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
@@ -4778,7 +4778,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     # Refresh the systemd unit on every boot so restart settings stay current even after an
     # exit-code-75 respawn (stale-code or /restart), which bypasses `hermes gateway restart`.
-    if supports_systemd_services():
+    if not client_owned and supports_systemd_services():
         try:
             refresh_systemd_unit_if_needed(system=False)
         except Exception:
@@ -4829,7 +4829,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     success = False
     try:
         success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity,
-                                            idle_exit=idle_exit))
+                                            idle_exit=idle_exit, **({"client_owned": True} if client_owned else {})))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
@@ -5255,11 +5255,8 @@ def _cmd_run(args):
     _refuse_forward_only_leftovers(retry_on_inspection_error=True)
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
-    run_gateway(
-        getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
-        replace=getattr(args, "replace", False), force=getattr(args, "force", False),
-        idle_exit=getattr(args, "idle_exit", False),
-    )
+    from hermes_cli.gateway_runtime_cli import run_options
+    run_gateway(getattr(args, "verbose", 0), **run_options(args))
 
 
 def _cmd_setup(args):
@@ -5373,31 +5370,8 @@ def _handle_no_backend(subcommand: str, *, wsl: bool, s6: bool) -> None:
 
 
 def _install_systemd_from_cli(args, *, force: bool, system: bool, run_as_user) -> None:
-    if is_wsl():
-        print_warning("WSL detected — systemd services may not survive WSL restarts.")
-        _print_info_lines(
-            "  Consider running in foreground instead: hermes gateway run",
-            "  Or use tmux/screen for persistence: tmux new -s hermes 'hermes gateway run'",
-        )
-        print()
-    # Honor --start-now/--start-on-login; else prompt on a TTY, default True headless.
-    non_interactive = not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
-
-    def _flag(name: str, question: str) -> bool:
-        value = getattr(args, name, None)
-        if value is not None:
-            return value
-        return prompt_yes_no(question, True) if not non_interactive else True
-
-    start_now = _flag("start_now", "Start the gateway now after installing the service?")
-    start_on_login = _flag("start_on_login", "Start the gateway automatically on login/boot with systemd?")
-    systemd_install(
-        force=force, system=system, run_as_user=run_as_user,
-        enable_on_startup=start_on_login, non_interactive=non_interactive,
-        force_unit_path=getattr(args, "force_unit_path", False),
-    )
-    if start_now:
-        systemd_start(system=system)
+    from hermes_cli.gateway_install_cli import install_systemd
+    install_systemd(args, force=force, system=system, run_as_user=run_as_user)
 
 
 def _cmd_install(args):
@@ -5418,13 +5392,15 @@ def _cmd_install(args):
     if _service_mgmt_blocked():
         _no_backend_exit("install", "termux")
     backend = _service_backend()
+    from hermes_cli.gateway_install_cli import launchd_options
+    options = launchd_options(args, backend=backend, system=system, run_as_user=run_as_user)
     if backend == "systemd":
         if refuses_container_user_scope_install(system):
             sys.exit(1)
         _install_systemd_from_cli(args, force=force, system=system, run_as_user=run_as_user)
     elif backend == "launchd":
         launchd_install(force, start_now=getattr(args, "start_now", None) is not False,
-                        force_unit_path=getattr(args, "force_unit_path", False))
+                        force_unit_path=getattr(args, "force_unit_path", False), **options)
     elif backend == "windows":
         _gw_windows().install(
             force=force,

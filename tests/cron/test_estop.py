@@ -18,6 +18,7 @@ import json
 import pytest
 
 from agent import estop
+from gateway.config import Platform
 
 
 @pytest.fixture
@@ -145,7 +146,8 @@ def test_kanban_dispatch_blocked_when_engaged(hermes_home):
 
 
 class _FakeSource:
-    platform = None
+    platform = Platform.TELEGRAM
+    thread_id = None
     chat_id = "c1"
     user_id = "u1"
     user_name = "user"

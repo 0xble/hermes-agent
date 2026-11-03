@@ -9,7 +9,8 @@ from gateway.session import SessionStore
 from gateway.session_authority import SessionAuthority
 from gateway.config import GatewayConfig
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch, claim_session_input, settle_session_input
+from hermes_state_runtime import claim_session_input, settle_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def test_lost_ack_reconciles_frozen_delivery_once(tmp_path, monkeypatch):

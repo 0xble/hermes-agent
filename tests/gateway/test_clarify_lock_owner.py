@@ -122,7 +122,7 @@ def test_cli_turn_batch_answered_by_clarify_lock_from_a_second_viewer_end_to_end
     home.mkdir()
     state.mkdir()
     repo = Path(__file__).resolve().parents[2]
-    env = {key: os.environ[key] for key in ('PATH', 'LANG', 'TZ') if key in os.environ}
+    env = {key: os.environ[key] for key in ('HERMES_TEST_ISOLATION', 'PATH', 'LANG', 'TZ') if key in os.environ}
     env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state), PYTHONPATH=str(repo))
     result = subprocess.run(
         [sys.executable, str(Path(__file__).parent / 'fixtures' / 'authority_clarify_lock_peer.py')],

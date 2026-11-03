@@ -99,6 +99,7 @@ def build_gateway_parser(
     # Internal: set only by a client that auto-starts its own gateway (chat, TUI, cron/kanban
     # clients). Never in service units, Desktop's `gateway ensure` start or a hand-run gateway.
     _flag(gateway_run, "--idle-exit", help=argparse.SUPPRESS)
+    _flag(gateway_run, "--client-owned", help=argparse.SUPPRESS)
     add_accept_hooks_flag(gateway_run)
     add_accept_hooks_flag(gateway_parser)
 
@@ -162,6 +163,8 @@ def build_gateway_parser(
         help="Force reinstall, and install even when the default multiplexer already serves this profile")
     _flag(gateway_install, "--system",
         help="Install as a Linux system-level service (starts at boot)")
+    gateway_install.add_argument("--launchd-domain", choices=("gui", "user"),
+        help="macOS only: explicit Aqua or logout-independent Background lifetime; stop before migrating")
     gateway_install.add_argument("--run-as-user", dest="run_as_user",
         help="User account the Linux system service should run as")
     _flag(gateway_install, "--start-now", dest="start_now", default=None,

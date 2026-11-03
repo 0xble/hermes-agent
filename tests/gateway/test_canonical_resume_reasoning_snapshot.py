@@ -14,7 +14,7 @@ async def test_lazy_session_info_reports_frozen_reasoning_and_tier(tmp_path, mon
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
 
     home = tmp_path / 'home'

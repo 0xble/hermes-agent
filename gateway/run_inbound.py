@@ -256,11 +256,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if notifier.first_time(platform_name, source.user_id) and getattr(self, "config", None) is not None:
             await notifier.notify(self, source, hint)
 
-    async def _hm_admit_event(
-        self, event: MessageEvent
-    ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
-        """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
-        (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+    def _hm_preflight_event(self, event: MessageEvent) -> bool:
+        """Apply content-free identity/channel gates before privacy or session lookup."""
         from gateway.run import _is_slack_ignored_channel
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
@@ -287,7 +284,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             with suppress(Exception):
                 _intake = self._intake_adapter_for(source)
             drop_rejected_route(_intake, source)  # a parked target is also refused to the sender
-            return None
+            return False
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
 
@@ -306,12 +303,23 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             and _is_slack_ignored_channel(_config, _chat_id, _slack_adapter)
         ):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
+            return False
+        return True
+
+    async def _hm_admit_event(
+        self, event: MessageEvent
+    ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
+        """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
+        (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+        if not self._hm_preflight_event(event):
             return None
+        source = event.source
+        is_internal = bool(getattr(event, "internal", False))
 
         # Capture before any admission buffer can park input for shutdown spooling,
         # including restore gates, compression deferral, and orphan FIFO rescue.
-        if is_genuine_user_message(event) and getattr(event, "_attended_activity_received_at", None) is None:
-            setattr(event, "_attended_activity_received_at", time.time())
+        from gateway.reply_latency import record_received, stamp_received
+        stamp_received(event)
 
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
         startup_restore_keys = getattr(self, "_startup_restore_keys", None)
@@ -347,6 +355,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             await _admit_outbox_event(self, event, source)
             return event, source, True
         if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress
+            record_received(event)
             return event, source, False
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
@@ -395,6 +404,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if not self._admit_bot_message_for_source(source):
                 return None
             event._bot_loop_admitted = True
+        record_received(event)
         await _admit_outbox_event(self, event, source)
         return event, source, False
 
@@ -1025,6 +1035,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if await self._route_plaintext_approval_while_busy(event, _quick_key):
                 return None
             self._preserve_drain_event(_quick_key, event)
+            return None
+        if event.internal and not event.get_command():
+            # Shared busy dispatch skips the adapter's internal FIFO guard. Completions must
+            # never interrupt or steer a running turn, regardless of human busy policy.
+            self._queue_or_replace_pending_event(_quick_key, event)
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if not _handled:
@@ -1722,17 +1737,27 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
             return event, source, is_internal
 
-    def _schedule_attended_user_activity(self, event, source, session_key: str):
-        """Keep receipt-time bookkeeping alive without delaying busy input or commands."""
+    def _schedule_attended_user_activity(self, event, source, session_key: str, *, profile_scope=None):
+        """Keep receipt-time bookkeeping alive without delaying busy input or commands.
+
+        ``profile_scope`` is a zero-argument factory for an async profile scope, entered inside
+        the background task. Callers on a receive loop that hold no scope use it, so secret
+        hydration never runs before the input returns."""
         if not is_genuine_user_message(event) or getattr(event, "_attended_activity_marked", False):
             return
         if getattr(event, "_attended_activity_task", None) is not None:
             return
-        if getattr(event, "_attended_activity_received_at", None) is None:
-            event._attended_activity_received_at = time.time()
-        task = asyncio.create_task(self._mark_attended_user_activity(
-            event, source, session_key, retry_on_failure=True,
-        ))
+        from gateway.reply_latency import record_received
+        record_received(event)
+        mark = self._mark_attended_user_activity
+        if profile_scope is None:
+            work = mark(event, source, session_key, retry_on_failure=True)
+        else:
+            async def scoped():
+                async with profile_scope():
+                    return await mark(event, source, session_key, retry_on_failure=True)
+            work = scoped()
+        task = asyncio.create_task(work)
         event._attended_activity_task = task
         self._retain_background_task(task)
 
@@ -1755,9 +1780,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 logger.debug("attended-model receipt task failed", exc_info=True)
             if getattr(event, "_attended_activity_marked", False):
                 return True
-        stamp = getattr(event, "_attended_activity_received_at", None)
-        if stamp is None:
-            stamp = event._attended_activity_received_at = time.time()
+        from gateway.reply_latency import record_received
+        record_received(event)
+        stamp = event._attended_activity_received_at
         try:
             from datetime import datetime
             from gateway.run import _load_gateway_config
@@ -1799,23 +1824,36 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         from agent.delegation_context import top_level_delegation_context
+        from gateway.incognito import event_scope, transition_pending, slash_refusal
         from gateway.outbox import scoped_turn_entry, restore_turn, store_for
-        token = scoped_turn_entry()
-        result = None
-        try:
-            with top_level_delegation_context():
-                result = await self._handle_admitted_message(event)
-            return result
-        finally:
-            turn_id = getattr(event, "_outbox_turn_id", None)
-            try:
-                if (turn_id and not getattr(event, "_outbox_duplicate", False)
-                        and not getattr(event, "_gateway_compression_deferred", False)):
-                    await asyncio.to_thread(
-                        store_for(event._outbox_home).finish_admission,
-                        turn_id, "completed" if result is not None else "empty")
-            finally:
-                restore_turn(token)
+        # Preflight resets the task's session identity for this fresh turn, so it runs
+        # inside the scope that restores an inline caller's identity afterward.
+        with top_level_delegation_context():
+            if not self._hm_preflight_event(event):
+                return None
+            async with event_scope(self, event):
+                refusal = slash_refusal(event)
+                if refusal is not None:
+                    return refusal
+                key_for = getattr(self, "_session_key_for_source", None)
+                key = key_for(event.source) if callable(key_for) else None
+                if isinstance(key, str) and transition_pending(key):
+                    return "Incognito is switching. Retry this message after the confirmation."
+                token = scoped_turn_entry()
+                result = None
+                try:
+                    result = await self._handle_admitted_message(event)
+                    return result
+                finally:
+                    turn_id = getattr(event, "_outbox_turn_id", None)
+                    try:
+                        if (turn_id and not getattr(event, "_outbox_duplicate", False)
+                                and not getattr(event, "_gateway_compression_deferred", False)):
+                            await asyncio.to_thread(
+                                store_for(event._outbox_home).finish_admission,
+                                turn_id, "completed" if result is not None else "empty")
+                    finally:
+                        restore_turn(token)
 
     async def _hm_busy_preempt(self, event: MessageEvent, source: SessionSource, _quick_key: str) -> bool:
         """busy_input_mode for a follow-up the durable FIFO is about to admit, through main's own busy
@@ -1843,9 +1881,14 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         (preempted, plugin-consumed or admitted to its durable FIFO); ``(False, None)`` to continue
         on the in-process path. Raises ``RuntimeStoreError('profile_mismatch')`` for a scope this
         process does not serve."""
+        # Durable admission stores the full input envelope. Private lanes retain the
+        # normal in-process serialization and RAM session/outbox owners instead.
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return False, None
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
-        from gateway.session_ingress import admit_message, executing_admission
+        from gateway.session_ingress import admit_message, admitted_queued, executing_admission
         authority = active_authority(self)
         if authority is not None and not event.get_command() and not is_internal:
             if not executing_admission.get():
@@ -1856,7 +1899,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
                 # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
                 # A turn a slash command produced (``/queue yes``) is never live typing.
-                if self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False) and (
+                _busy = self._is_session_running(_quick_key)
+                if _busy and not getattr(event, "_fifo_only", False) and (
                         await self._route_plaintext_approval_while_busy(event, _quick_key)
                         or await self._hm_busy_preempt(event, source, _quick_key)):
                     return True, None
@@ -1867,7 +1911,16 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     return True, None  # a /stop or /new came after its command, as it clears the slot
                 # A failed admit stays the authority's answer (refusal notice or turn error), never a
                 # pending legacy turn: that would run unadmitted, outside the FIFO's order.
-                return True, await admit_message(authority, event)
+                # Voice queued behind the running turn starts STT once its row is durably queued, so
+                # its transcript echoes now; the claimed turn adopts it (queued-voice-eager-stt).
+                if not (_busy and self._pending_event_audio_paths(event)):
+                    return True, await admit_message(authority, event)
+                _token = admitted_queued.set(lambda: self._prefetch_admitted_voice(event))
+                try:
+                    return True, await admit_message(authority, event)
+                finally:
+                    admitted_queued.reset(_token)
+                    self._forget_admitted_voice(event)
         if (authority is None and not is_internal and not event.get_command()
                 and getattr(self, 'session_authority', None) is not None):
             # Scoped to a home this process does not serve: never fall back to the launch ledger.
@@ -2014,6 +2067,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         _claim_state.turn.started_ts = _claim_state.conversation.last_turn_started_at = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
+        from gateway.reply_latency import bind_agent_start
+        bind_agent_start(event)
         self._persist_active_agents()
         # The admission context is set by the durable executor, not by direct legacy dispatch.
         from gateway.session_ingress import executing_admission
@@ -2381,6 +2436,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         @ references behave the same. Side effect: buffers per-session native image paths when the
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
         rehome_inbound_media(event)  # before any consumer (vision, STT, document notes) reads media_urls
+        await self._adopt_admitted_voice(event)
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""
         # Prefer the caller's resolved session key so this write key matches the consume key at the
@@ -2777,6 +2833,65 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         await self._echo_stt_transcripts(
             adapter, source, transcripts[already_echoed:], event=event, metadata=metadata, log_context=log_context,
         )
+
+    @staticmethod
+    def _admitted_voice_key(event) -> Optional[tuple[str, str, str]]:
+        """Transport identity shared by a live event and the event a durable claim restores from it."""
+        source, message_id = getattr(event, "source", None), getattr(event, "message_id", None)
+        if source is None or source.platform is None or not message_id:
+            return None
+        return source.platform.value, str(source.chat_id), str(message_id)
+
+    def _prefetch_admitted_voice(self, event) -> None:
+        """Start STT for a voice message the durable FIFO queued behind a running turn.
+
+        The claimed turn runs a NEW event restored from the committed row, so the live event's
+        in-flight STT is published under its transport identity for that turn to adopt
+        (``_adopt_admitted_voice``) instead of transcribing and echoing a second time."""
+        try:
+            key = self._admitted_voice_key(event)
+            if key is None:
+                return
+            self._prefetch_queued_voice_transcript(event, self._delivery_adapter_for(event.source))
+            # Steer fallback and interrupt mode already transcribed (and echoed) it: publish that too.
+            if (getattr(event, "_gateway_pending_stt_prefetch", None) is not None
+                    or hasattr(event, "_gateway_pending_stt_text")):
+                self.__dict__.setdefault("_admitted_voice_prefetches", {})[key] = event
+        except Exception:
+            logger.warning("Queued voice prefetch could not start; the turn will transcribe", exc_info=True)
+
+    def _forget_admitted_voice(self, event) -> None:
+        key = self._admitted_voice_key(event)
+        registry = self.__dict__.get("_admitted_voice_prefetches")
+        if key is not None and registry and registry.get(key) is event:
+            del registry[key]
+
+    async def _adopt_admitted_voice(self, event) -> None:
+        """Give a claimed turn the STT result (and echo ledger) its queued live event already started."""
+        registry = self.__dict__.get("_admitted_voice_prefetches")
+        key = self._admitted_voice_key(event) if registry else None
+        live = registry.get(key) if key is not None else None
+        if live is None or live is event or hasattr(event, "_gateway_pending_stt_text"):
+            return
+        # Restored media is the committed copy (``<sha256>/<name>``) of the same clip.
+        if [os.path.basename(p) for p in self._pending_event_audio_paths(live)] != [
+                os.path.basename(p) for p in self._pending_event_audio_paths(event)]:
+            return
+        del registry[key]
+        prefetch = getattr(live, "_gateway_pending_stt_prefetch", None)
+        if prefetch is not None:
+            try:
+                await asyncio.shield(prefetch)
+            except asyncio.CancelledError:
+                if not prefetch.cancelled():
+                    raise  # this turn was cancelled, not the prefetch
+            except Exception:
+                return
+        if not hasattr(live, "_gateway_pending_stt_text"):
+            return  # STT failed or was cancelled: the turn transcribes as before
+        event._gateway_pending_stt_text = live._gateway_pending_stt_text
+        event._gateway_pending_stt_transcripts = list(getattr(live, "_gateway_pending_stt_transcripts", []) or [])
+        event._gateway_pending_stt_echoed = int(getattr(live, "_gateway_pending_stt_echoed", 0) or 0)
 
     async def _transcribe_and_echo_pending_voice(
         self, event, adapter, source, text: str, *, log_context: str, metadata=_UNSET

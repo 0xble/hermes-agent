@@ -55,7 +55,7 @@ async def test_non_streaming_gateway_delivery_strips_loop_complete_but_detection
     source = SimpleNamespace(chat_id="chat-1", platform=SimpleNamespace(value="telegram"))
     response, intentional, _ = await runner._hmwa_shape_agent_response(
         {"final_response": "Done.\nLOOP_COMPLETE", "messages": [], "api_calls": 1},
-        source, history=[], session_entry=SimpleNamespace(session_id="session-1"), session_key=None,
+        source, history=[], session_entry=SimpleNamespace(session_id="session-1", incognito=False), session_key=None,
         _quick_key=None, run_generation=0, _run_start_session_id="session-1",
         _platform_name="telegram", _msg_start_time=0.0,
     )
@@ -71,7 +71,7 @@ async def test_non_streaming_gateway_delivery_strips_trailing_marker(monkeypatch
     source = SimpleNamespace(chat_id="chat-1", platform=SimpleNamespace(value="telegram"))
     response, intentional, _ = await runner._hmwa_shape_agent_response(
         {"final_response": "Done.\n\nNO_REPLY", "messages": [], "api_calls": 1},
-        source, history=[], session_entry=SimpleNamespace(session_id="session-1"), session_key=None,
+        source, history=[], session_entry=SimpleNamespace(session_id="session-1", incognito=False), session_key=None,
         _quick_key=None, run_generation=0, _run_start_session_id="session-1",
         _platform_name="telegram", _msg_start_time=0.0,
     )
@@ -176,7 +176,7 @@ async def test_non_streaming_gateway_delivery_strips_marker_beside_prose(monkeyp
     source = SimpleNamespace(chat_id="chat-1", platform=SimpleNamespace(value="telegram"))
     response, intentional, _ = await runner._hmwa_shape_agent_response(
         {"final_response": final, "messages": [], "api_calls": 1},
-        source, history=[], session_entry=SimpleNamespace(session_id="session-1"), session_key=None,
+        source, history=[], session_entry=SimpleNamespace(session_id="session-1", incognito=False), session_key=None,
         _quick_key=None, run_generation=0, _run_start_session_id="session-1",
         _platform_name="telegram", _msg_start_time=0.0,
     )

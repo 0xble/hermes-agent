@@ -320,6 +320,13 @@ _YIELDED_NOTE = (
 )
 
 
+_HEAVY_SLOT_YIELDED_NOTE = (
+    "This command is still queued for a heavy slot and has moved to the background "
+    "with the same shell and ticket. You will be notified when it exits "
+    "(notify_on_complete). Do NOT re-run it."
+)
+
+
 def yield_to_background_handler(
     *, command: str, env_type: str, cwd: Optional[str], effective_task_id: str,
     task_id: Optional[str], session_key: str,

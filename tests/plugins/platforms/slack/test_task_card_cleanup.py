@@ -323,7 +323,7 @@ async def test_connect_sweeps_only_ledger_cards_and_preserves_live_streams(
 
     client.api_call.side_effect = api_call
     monkeypatch.setattr(slack_module, "SLACK_AVAILABLE", True)
-    monkeypatch.setattr(slack_module, "_get_scoped_secret", lambda _: "xapp-fake")
+    monkeypatch.setattr(slack_module, "_get_scoped_secret", lambda key, default=None: "xapp-fake" if key == "SLACK_APP_TOKEN" else default)
     monkeypatch.setattr(slack_module, "_resolve_slack_proxy_url", lambda: None)
     monkeypatch.setattr(slack_module, "AsyncApp", lambda **_: SimpleNamespace(client=client))
     monkeypatch.setattr(adapter, "_new_web_client", lambda *args: client)

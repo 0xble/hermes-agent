@@ -14,11 +14,14 @@ import threading
 import time
 import weakref
 from contextlib import suppress
+from contextvars import Context, copy_context
+from functools import wraps
 from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
 from agent.delegation_context import is_dispatcher_owned_worker_context
+from agent.incognito import incognito_scope, is_incognito
 from agent.message_content import flatten_message_text
 
 logger = logging.getLogger(__name__)
@@ -238,8 +241,7 @@ def _title_preferences() -> dict:
         max_words = max(1, min(12, int(cfg.get("max_words", 7))))
     except (TypeError, ValueError):
         max_words = 7
-    if min_words > max_words:
-        min_words = max_words
+    min_words = min(min_words, max_words)
     case_style = str(cfg.get("case_style", "sentence_case")).strip().lower()
     if case_style not in {"sentence_case", "title_case"}:
         case_style = "sentence_case"
@@ -263,8 +265,10 @@ def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = 
                  "Sentence case: capitalize only the first word and proper nouns; this is the only capitalization rule.")
     avoid = [str(t).strip() for t in (recent_titles or []) if str(t).strip()][:20]
     avoid_block = "Avoid these recent session titles; do not copy them:\n" + "\n".join(f"- {t}" for t in avoid) if avoid else ""
-    instruction_block = f"Trusted operator guidance (follow literally): {prefs['instructions']}" if prefs["instructions"] else ""
     task_style = title_style == "verb_first"
+    # Global noun-title conventions can contradict the platform's task-title contract.
+    instruction_block = (f"Trusted operator guidance (follow literally): {prefs['instructions']}"
+                         if prefs["instructions"] and not task_style else "")
     pairs = _TASK_PROMPT_PAIRS if task_style else _PROMPT_PAIRS[prefs["case_style"]]
     examples = "".join(f'Bad: {{"title": "{bad}"}}\nGood: {{"title": "{good}"}}\n' for bad, good in pairs)
     word_rule = (f"{prefs['min_words']} to {prefs['max_words']} words. Use the fewest words that still "
@@ -677,6 +681,8 @@ def _clean_title(text: str) -> Optional[str]:
 
 def _safe_callback(callback: Optional[Callable], args: tuple, log_fmt: str, label: str) -> None:
     """Invoke an optional consumer callback, never raising."""
+    if is_incognito():
+        return
     try:
         if callback is not None:
             callback(*args)
@@ -699,7 +705,7 @@ def _notify_title(
 ) -> None:
     """Notify title consumers, preserving compatibility with two-argument callbacks. Keyword
     extras (``display_title``, ``icon``) are passed only when the callback's signature binds them."""
-    if title_callback is None:
+    if title_callback is None or is_incognito():
         return
     try:
         extras = {k: v for k, v in (("display_title", display_title), ("icon", icon)) if v is not None}
@@ -1021,6 +1027,18 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
         return _set(deduped)
 
 
+def _title_session_boundary(method):
+    """Bind live session privacy before title history, auxiliaries or callbacks."""
+    @wraps(method)
+    def wrapped(session_db, session_id, *args, **kwargs):
+        with incognito_scope(False, session_id):
+            if is_incognito():
+                return None
+            return method(session_db, session_id, *args, **kwargs)
+    return wrapped
+
+
+@_title_session_boundary
 def apply_subagent_title(session_db, session_id: str, goal: str) -> Optional[str]:
     """Title a delegate run ``Subagent: <goal's first line>`` at ``derived`` authority. No model call:
     runs fan out in bulk, and the prefix alone is what tells them apart from conversations wherever
@@ -1033,6 +1051,7 @@ def apply_subagent_title(session_db, session_id: str, goal: str) -> Optional[str
         return None
 
 
+@_title_session_boundary
 def apply_instant_title(
     session_db, session_id: str, user_message: str, title_callback: Optional[TitleCallback] = None,
     title_preview: str | None = None,
@@ -1056,6 +1075,7 @@ def apply_instant_title(
         return None
 
 
+@_title_session_boundary
 def auto_title_session(
     session_db,
     session_id: str,
@@ -1119,6 +1139,8 @@ def auto_title_session(
                 runtime_validator=runtime_validator, recent_titles=recent_titles, title_preview=title_preview,
                 link_context=link_context, reply_excerpt=reply_excerpt, **icon_kwargs,
             )
+        if is_incognito(session_id):
+            return
         source = "llm"
         # The prompt's recent-name sample is not a uniqueness check: older topics still exist.
         duplicate = False
@@ -1250,6 +1272,22 @@ def defer_title_completion_retry(
     Eager attempts can abstain even when the opener passes the cheap subject heuristic.
     Wait off the turn's critical path for that attempt, then reuse the completed reply.
     """
+    if is_incognito(session_id):
+        return None
+    origin = getattr(upgrade, "_hermes_title_context", None)
+    if isinstance(origin, Context):
+        return origin.copy().run(
+            _defer_title_completion_retry, upgrade, session_db, session_id, user_message, **title_kwargs,
+        )
+    with incognito_scope(False, session_id):
+        return _defer_title_completion_retry(upgrade, session_db, session_id, user_message, **title_kwargs)
+
+
+def _defer_title_completion_retry(
+    upgrade: threading.Thread, session_db, session_id: str, user_message: str, **title_kwargs,
+) -> Optional[threading.Thread]:
+    if is_incognito(session_id):
+        return None
     if upgrade.ident is None:
         return upgrade
     history = title_kwargs.get("conversation_history")
@@ -1257,16 +1295,20 @@ def defer_title_completion_retry(
         return None
 
     def retry_with_reply():
-        upgrade.join()
-        if _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
-            return
-        logger.info("Retrying opening title after reply: session=%s", session_id)
-        auto_title_session(session_db, session_id, user_message, **title_kwargs)
+        with incognito_scope(False, session_id):
+            if is_incognito():
+                return
+            upgrade.join()
+            if is_incognito() or _has_upgraded_title(session_db, session_id) or not _latest_assistant_excerpt(history):
+                return
+            logger.info("Retrying opening title after reply: session=%s", session_id)
+            auto_title_session(session_db, session_id, user_message, **title_kwargs)
 
     from agent.memory_provider import spawn_context_thread
     return spawn_context_thread(retry_with_reply, name="auto-title-reply")
 
 
+@_title_session_boundary
 def maybe_auto_title(
     session_db,
     session_id: str,
@@ -1333,6 +1375,9 @@ def maybe_auto_title(
         args=(session_db, session_id, user_message),
         kwargs={**upgrade_kwargs, "icon_context": icon_context},
     )
+    # The original and its completion retry belong to the same initiating work,
+    # even if retry construction happens after an entire private interval.
+    upgrade._hermes_title_context = copy_context()
     # A self-hosted endpoint still waits for the turn. Otherwise only an opener that names no
     # subject waits, so a clear request is titled immediately and a link or image can use the reply.
     if title_upgrade_must_wait_for_turn(main_runtime) or (

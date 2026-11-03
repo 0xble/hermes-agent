@@ -162,6 +162,12 @@ class SessionTranscriptMixin:
         store is NOT skipped: the write is queued and counted like any other failed append, so a
         dead/unopenable state.db escalates and spools instead of dropping turns silently
         (#114266)."""
+        private = self._private_history(session_id)
+        if private is not None:
+            from copy import deepcopy
+            with self._get_transcript_drain_lock():
+                private.append(deepcopy(message))
+            return
         if skip_db:
             return
         with self._get_transcript_drain_lock():
@@ -557,6 +563,11 @@ class SessionTranscriptMixin:
         or there is no DB, False on failure — callers committing a destructive change on top
         (/compress repointing) must check it. ``reject_active_turn_lease`` is for user-initiated
         rewrites that do not own the cross-process turn lease."""
+        private = self._private_history(session_id)
+        if private is not None:
+            from copy import deepcopy
+            private[:] = deepcopy(messages)
+            return True
         db = self._db_for_session_id(session_id)
         if not db:
             return True
@@ -640,6 +651,13 @@ class SessionTranscriptMixin:
             raise TranscriptReadError(session_id) from e
 
     def load_transcript(self, session_id: str) -> list[dict[str, Any]]:
+        from copy import deepcopy
+        private = self._private_history(session_id)
+        if private is not None:
+            return deepcopy(private)
+        return self._load_saved_transcript(session_id)
+
+    def _load_saved_transcript(self, session_id: str) -> list[dict[str, Any]]:
         """Load all messages from a session's transcript (state.db is canonical). Reads follow the
         same routing writes use — the in-memory reroute map, then the durable compression tip —
         otherwise the transcript "vanishes" while every message sits under the child."""

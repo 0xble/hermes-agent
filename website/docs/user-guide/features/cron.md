@@ -1184,7 +1184,41 @@ hours) is re-anchored to its next future occurrence without firing now. The skip
 logged. Jobs inside grace and explicit manual triggers still run normally; if the
 next occurrence cannot be computed, the existing run-once fallback is preserved.
 This does not change one-shot expiry, resume behavior, or the hosted-provider sweep
-below. There is no per-job override.
+below. There is no per-job override of `catch_up_missed`.
+
+### Per-job catch-up deadline
+
+For a window-bound recurring job, set `max_catch_up_lateness_seconds` on
+`cronjob_manage` with `action: "create"` or `action: "update"`. For example, `300`
+permits a scheduled occurrence to start up to five minutes late. The create,
+update, and list tool responses include this field so you can verify the stored
+policy.
+
+The CLI exposes the same policy:
+
+```bash
+hermes cron create "0 3 * * *" "Run the maintenance checks" \
+  --max-catch-up-lateness-seconds 300
+hermes cron edit <job-id> --max-catch-up-lateness-seconds 600
+hermes cron edit <job-id> --clear-max-catch-up-lateness
+```
+
+The value must be a finite, nonnegative number of seconds. Unset/null preserves
+the existing unlimited catch-up behavior; `0` allows no lateness. A start exactly
+at the limit is still eligible. To clear the field through the update tool,
+pass an empty string.
+
+Hermes checks the original scheduled instant both before admission and again
+when the worker starts, including after a wait for capacity or detached-worker
+startup. An expired occurrence does not execute or consume its repeat budget.
+Instead, Hermes records `last_status: "skipped"`, a `skipped: missed window`
+diagnostic and a structured `last_missed_window` result, then advances to the
+next future occurrence. It queues one owner notice through the cron failure
+route even when normal or failure delivery is `local`.
+
+This deadline is independent of the backlog grace window and applies to both
+interval and cron schedules. One-shots and an explicit manual Run now are
+unchanged. Leaving it unset on other jobs does not change their behavior.
 
 ### Misfire catch-up
 

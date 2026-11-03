@@ -1050,6 +1050,9 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    # Who paused it: "agent", "user" or "system". With goals.autonomy the agent may resume only
+    # its own pause. Never inferred from paused_reason text. Legacy rows load as "".
+    paused_by: str = ""
     # Tracked for diagnostics only; judge outages fail open and never pause a goal.
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
@@ -1125,6 +1128,7 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
+            paused_by=str(data.get("paused_by") or ""),
             subgoals=contract_items("subgoals", raw_subgoals),
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_pid_live_at_park=(
@@ -2965,6 +2969,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         self._state.clear_wait()
         self._state.status = "paused"
         self._state.paused_reason = reason
+        self._state.paused_by = "system"
         self._save()
 
     def _pause_decision(self, paused_reason: str, verdict: str, reason: str, message: str) -> dict[str, Any]:
@@ -3025,12 +3030,13 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         return self._mutate_current(_apply)
 
     @snapshot_control
-    def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
+    def pause(self, reason: str = "user-paused", *, by: str = "user") -> Optional[GoalState]:
         def _apply(state):
             if state is None or state.status == "cleared":
                 return None   # a concurrent /goal clear stays cleared
             state.status = "paused"
             state.paused_reason = reason
+            state.paused_by = by
             state.clear_wait()   # a wait barrier is meaningless once paused
             state.consecutive_no_progress = 0
             state.backoff_level = 0
@@ -3038,10 +3044,15 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         return self._mutate_current(_apply)
 
     @snapshot_control
-    def resume(self, *, reset_budget: bool = True, user_override: bool = True) -> Optional[GoalState]:
-        """Resume through a live-row mutation, optionally recording a user override."""
+    def resume(self, *, reset_budget: bool = True, user_override: bool = True,
+               by: str = "user") -> Optional[GoalState]:
+        """Resume through a live-row mutation, optionally recording a user override.
+
+        ``by="agent"`` lifts only the agent's own pause, never a user or system pause."""
         def _apply(state):
             if state is None or state.status == "cleared":
+                return None
+            if by == "agent" and not (state.status == "paused" and state.paused_by == "agent"):
                 return None
             prior_block_reason = state.last_reason or state.paused_reason or "unknown blocker"
             record_override = user_override and (
@@ -3063,6 +3074,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
     def _resume_state(state: GoalState, *, reset_budget: bool) -> None:
         state.status = "active"
         state.paused_reason = None
+        state.paused_by = ""
         state.consecutive_no_progress = 0
         state.backoff_level = 0
         state.clear_wait()
@@ -3532,6 +3544,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         external_event: bool = False,
+        turn_started_at: Optional[float] = None,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
@@ -3540,18 +3553,20 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
         ``external_event`` marks a watched-process/delegation notification. These
         events are allowed to pierce a timed continuation gap because they carry
-        new evidence; ordinary continuation-only turns are throttled.
+        new evidence; ordinary continuation-only turns are throttled. A wait armed
+        during this turn survives its own input when ``turn_started_at`` is supplied.
         """
         from hermes_cli.goals_evaluation import evaluate_goal_snapshot
         return evaluate_goal_snapshot(
             self, last_response, user_initiated=user_initiated, external_event=external_event,
             background_processes=background_processes, active_delegations=active_delegations,
-            evidence_session_id=evidence_session_id,
+            evidence_session_id=evidence_session_id, turn_started_at=turn_started_at,
         )
 
     def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         external_event: bool = False,
+        turn_started_at: Optional[float] = None,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
@@ -3578,11 +3593,16 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         new_eligible_non_read_only = (
             evidence_scan_truncated_for_turn or not _evidence_only_read_only_status(turn_evidence)
         )
+        # Only input newer than the wait may pierce it. The agent can park again in
+        # response to that input, so the current turn must not undo its own wait.
+        pierce_wait = (user_initiated or external_event) and (
+            turn_started_at is None or state.waiting_since < turn_started_at
+        )
         if state.waiting_on_pid is not None or state.waiting_on_session is not None or getattr(state, "waiting_on_user_message", False):
             holds, age_notice, pause_reason = self._stage_live_barrier()
             # A real user message or delivered external event is fresh evidence: it pierces
-            # every wait kind and re-judges now. Synthetic continuation wakes do not.
-            if user_initiated or external_event:
+            # every older wait kind. Synthetic continuation wakes do not.
+            if pierce_wait:
                 state.clear_wait(preserve_notice_key=True)
                 holds, age_notice, pause_reason = False, None, None
             elif getattr(state, "waiting_on_user_message", False):
@@ -3595,8 +3615,8 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         elif state.waiting_until:
             if self._barrier_holds():
                 # A real user message or delivered external event is fresh evidence and re-judges
-                # a waiting goal immediately. Synthetic continuation wakes do not pierce it.
-                if user_initiated or external_event:
+                # an older waiting goal immediately, never a wait armed during this turn.
+                if pierce_wait:
                     state.clear_wait(preserve_notice_key=True)
                 else:
                     return self._waiting_decision(state)

@@ -447,6 +447,8 @@ class InProcessCronScheduler(CronScheduler):
         from cron.scheduler_ownership import register_ticked_homes
         from hermes_constants import get_process_hermes_home
 
+        from cron.oneshot_retirement import record_ticker_start
+
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
 
         # Multiplex: tick EACH profile's store every cycle, heartbeats/recovery scoped per profile.
@@ -470,6 +472,7 @@ class InProcessCronScheduler(CronScheduler):
         # store here must not take the whole ticker thread down (#111010) — the loop's own
         # per-tick handling logs, persists the reason and keeps the thread alive.
         try:
+            record_ticker_start()
             recovered = self.recover_interrupted()
             if recovered:
                 logger.warning(
@@ -583,6 +586,8 @@ class InProcessCronScheduler(CronScheduler):
             _, home = _profile_entry(entry)
             try:
                 with _profile_cron_scope(home):
+                    from cron.oneshot_retirement import record_ticker_start
+                    record_ticker_start()
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(

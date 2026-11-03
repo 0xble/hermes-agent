@@ -1,4 +1,5 @@
 """Shared mutation publication and live-state coordination."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from types import SimpleNamespace
 import asyncio
 import pytest
@@ -12,7 +13,7 @@ import hermes_state_runtime as rt
 async def test_metadata_mutation_publishes_once_while_work_is_queued(tmp_path):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('s', source='test')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id='owned', instance_id='owner', db=db, epoch=epoch)
         live = authority.sessions['s'] = LiveSession(None, 'route')
         owner = AuthorityConnection(authority, object(), {'user_id': 'human'})
@@ -38,7 +39,7 @@ async def test_rewind_refuses_live_task_even_before_admission_claim(tmp_path):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('s', source='test')
         db.append_message('s', role='user', content='keep')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         authority = SessionAuthority(SimpleNamespace(_draining=False, _evict_cached_agent=lambda route: None),
                                      profile_id='owned', instance_id='owner', db=db, epoch=epoch)
         authority.sessions['s'] = LiveSession(None, 'route')

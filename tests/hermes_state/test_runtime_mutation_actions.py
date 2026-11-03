@@ -1,4 +1,5 @@
 """Action-specific mutations share the canonical receipt transaction."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 import pytest
 from hermes_state import SessionDB
@@ -8,7 +9,7 @@ import hermes_state_runtime as rt
 def test_sidebar_edit_is_atomic_and_revision_fenced(tmp_path):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('s', source='test')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='edit',
                     expected_revision=0, operation='sidebar',
                     payload={'title': 'Title', 'pinned': True, 'hidden': True, 'unread': True})

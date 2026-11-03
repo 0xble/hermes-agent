@@ -63,7 +63,7 @@ async def _start_a(monkeypatch, mode=None, *, agent=True):
     ran from the in-process slot inside the running turn. Without ``agent`` A stays on the
     pending sentinel (an agent still being built)."""
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress import executing_admission
     from gateway.session_results import execution_result
 
@@ -144,7 +144,8 @@ async def test_idle_rewrite_waits_behind_a_queued_row(monkeypatch, command):
     """Between turns (slot released, the drain has not claimed B yet), a slash command rewritten
     into a turn is admitted behind B instead of running in-process ahead of it."""
     from gateway.platforms.event import MessageEvent, MessageType
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import SessionRef
     from gateway.session_ingress import admit_message, executing_admission
     from gateway.session_ingress_context import native_callback
@@ -363,7 +364,7 @@ async def test_reset_during_an_idle_skill_rewrite_drops_it(monkeypatch, reset):
     import threading
     import agent.skill_commands as skills
     from gateway.platforms.event import MessageEvent, MessageType
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress import executing_admission
     from gateway.session_results import execution_result
 

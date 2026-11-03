@@ -4,6 +4,7 @@ The channel picked that release, the user did not ask to go back: ``hermes updat
 the build is newer than the release and holds there, exiting 0, instead of refusing the
 downgrade on every attempt. An explicit ``--branch`` to a pre-runtime commit is still refused.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import argparse
 from contextlib import closing
 from copy import deepcopy
@@ -79,7 +80,7 @@ def source(tmp_path, monkeypatch):
 
 def _ledgered(home):
     with closing(SessionDB(home / "state.db")) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
         db.create_session("s", source="cli")
         rt.admit_session_input(db, epoch=epoch, principal_id="p", session_id="s", request_id="r",
                                payload={"text": "x"})

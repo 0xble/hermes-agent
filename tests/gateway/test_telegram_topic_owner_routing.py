@@ -9,7 +9,9 @@ from hermes_state import SessionDB
 from tests.gateway.conftest import _ensure_telegram_mock
 
 _ensure_telegram_mock()
-from gateway.config import PlatformConfig  # noqa: E402
+from gateway.config import GatewayConfig, Platform, PlatformConfig  # noqa: E402
+from gateway.delivery import DeliveryRouter, DeliveryTarget
+from gateway.platforms.base import SendResult
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
@@ -270,6 +272,53 @@ def _two_owned_threads(db):
         db.reserve_telegram_topic_owner(chat_id="123", owner_key=owner_key, topic_name="X")
         db.set_telegram_topic_owner_active(
             chat_id="123", owner_key=owner_key, thread_id=thread_id, topic_name="X")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_owner", [False, True])
+async def test_cron_numeric_target_is_not_its_historical_owned_lane(db, explicit_owner):
+    _two_owned_threads(db)
+    adapter = _adapter(db)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="42"))
+    config = GatewayConfig(platforms={Platform.TELEGRAM: adapter.config})
+    router = DeliveryRouter(config, {Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:123:200")
+    metadata = {"job_id": "first", "thread_id": "200"}
+    if explicit_owner:
+        metadata["telegram_topic_owner_key"] = "cron:first"
+        with pytest.raises(RuntimeError, match="refusing reroute"):
+            await router._deliver_to_platform(target, "report", metadata)
+        adapter.send.assert_not_awaited()
+    else:
+        result = await router._deliver_to_platform(target, "report", metadata)
+        assert isinstance(result, SendResult) and result.success is True
+        adapter.send.assert_awaited_once()
+        sent = adapter.send.await_args
+        assert sent is not None
+        assert sent.kwargs["metadata"]["thread_id"] == "200"
+    # Sending into another live topic must not change either lane's ownership.
+    assert db.get_telegram_topic_owner(chat_id="123", owner_key="cron:first")["thread_id"] == "100"
+    assert db.get_telegram_topic_owner(chat_id="123", owner_key="cron:third")["thread_id"] == "200"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["missing", "ended", "archived", "hidden", "other-profile"])
+async def test_cron_numeric_target_still_requires_live_matching_profile(db, state):
+    adapter = _adapter(db)
+    if state != "missing":
+        _live_session(db, "target-session", "Target", 200)
+        if state == "ended":
+            db.end_session("target-session", "test")
+        else:
+            db._write_sql(
+                "UPDATE sessions SET " + ("profile_name = ?" if state == "other-profile" else state + " = ?")
+                + " WHERE id = ?", ("other" if state == "other-profile" else 1, "target-session"))
+    adapter.send = AsyncMock()
+    router = DeliveryRouter(GatewayConfig(platforms={Platform.TELEGRAM: adapter.config}), {Platform.TELEGRAM: adapter})
+    with pytest.raises(RuntimeError, match="no live Hermes"):
+        await router._deliver_to_platform(
+            DeliveryTarget.parse("telegram:123:200"), "report", {"job_id": "first", "thread_id": "200"})
+    adapter.send.assert_not_awaited()
 
 
 def test_shared_owner_is_refused_on_thread_held_by_another_owner(db):

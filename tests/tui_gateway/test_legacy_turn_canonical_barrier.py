@@ -4,10 +4,8 @@ durable ledger: an ``unknown`` admission is never replayed, queued input runs in
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_runtime import (
-    admit_session_input, begin_runtime_epoch, claim_session_input, list_session_admissions,
-    recover_session_inputs, resolve_unknown_session_input,
-)
+from hermes_state_runtime import admit_session_input, claim_session_input, list_session_admissions, recover_session_inputs, resolve_unknown_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tui_gateway import server
 
 

@@ -12,6 +12,7 @@ from hermes_state_common import (
     escape_like as _escape_like, emit_session_deleted,
 )
 from hermes_startup_watchdog import report_startup_progress
+from hermes_state_deletion import finish_pending_deletes, stage_delete, visible_session_sql
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -131,7 +132,7 @@ class SessionMaintenanceMixin:
             if ids:
                 self._delete_unreferenced_system_prompts(conn)
             return ids
-        removed_ids = self._execute_write(_do) or []
+        removed_ids = self._execute_write(_do, skip_result=0) or []
         emit_session_deleted(self, removed_ids, reason="ghost_prune", sessions_dir=sessions_dir)
         from hermes_state_media import collect_retired_media
         collect_retired_media(self)
@@ -223,7 +224,7 @@ class SessionMaintenanceMixin:
                 f" WHERE id IN ({_placeholders(victims)}) AND ended_at IS NULL{scope_sql}",
                 (time.time(), *victims, *scope_params))
             return victims
-        return self._execute_write(_do) or []
+        return self._execute_write(_do, skip_result=[]) or []
 
     @staticmethod
     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
@@ -239,6 +240,7 @@ class SessionMaintenanceMixin:
             raise TypeError("SessionMaintenanceMixin._prune_filter_where() got an unexpected "
                             f"keyword argument {min(unknown)!r}")
         clauses = [] if include_open else ["s.ended_at IS NOT NULL"]
+        clauses.append(visible_session_sql("s.id"))
         if lineage_tips_only:
             clauses.append("COALESCE(s.end_reason, '') <> 'compression'")
         params: list = []
@@ -347,6 +349,7 @@ class SessionMaintenanceMixin:
         ancestor is deleted only together with every continuation after it (``whole_lineages``)."""
         if filters.get("include_open"):
             raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
+        finish_pending_deletes(self)
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
         removed_ids: list[str] = []
         # Select outside the write transaction.  The old implementation selected and deleted every
@@ -402,23 +405,19 @@ class SessionMaintenanceMixin:
                     }
                     session_ids = [sid for sid in session_ids if sid not in guarded_roots]
                 from hermes_state_mutation_retirement import prune_retired_tombstones, retire_prunable
-                session_ids = retire_prunable(conn, sorted(session_ids))
+                session_ids = retire_prunable(conn, sorted(session_ids), defer_messages=True)
                 prune_retired_tombstones(conn)
                 if not session_ids:
                     return []
-                ph = _placeholders(session_ids)
-                conn.execute(
-                    f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})",
-                    session_ids)
-                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", session_ids)
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", session_ids)
+                stage_delete(conn, session_ids, sessions_dir)
                 removed_ids.extend(session_ids)
                 return session_ids
 
-            batch_removed = self._execute_write(_do) or []
+            batch_removed = self._execute_write(_do, skip_result=0) or []
             removed_count += len(batch_removed)
             if batch_removed:
                 emit_session_deleted(self, batch_removed, reason="prune", sessions_dir=sessions_dir)
+            finish_pending_deletes(self, required_ids=batch_removed)
             for sid in batch_removed:
                 self._remove_session_files(sessions_dir, sid)
             if batch_index + 1 < len(batches):
@@ -427,7 +426,7 @@ class SessionMaintenanceMixin:
         if removed_count:
             while True:
                 deleted_prompts = self._execute_write(
-                    lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100))
+                    lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100), skip_result=0)
                 if not deleted_prompts or deleted_prompts < 100:
                     break
         if removed_count:

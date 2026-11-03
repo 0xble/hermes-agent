@@ -133,7 +133,7 @@ async def test_config_get_reports_the_reasoning_display_the_session_streams(tmp_
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     home = tmp_path / 'home'
     home.mkdir()

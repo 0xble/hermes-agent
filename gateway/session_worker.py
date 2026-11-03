@@ -17,12 +17,17 @@ _SCOPE = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birt
 
 
 def _claim(connection, ref, params):
-    import psutil
     authority = connection.authority
     if params.get('profile_id') != authority.profile_id or connection.actor.profile_id != authority.profile_id:
         raise RuntimeStoreError('profile_mismatch')
     if not connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
+    return worker_identity_claim(authority, params, connection.actor.subject)
+
+
+def worker_identity_claim(authority, params, subject):
+    """The same live producer claim at RPC admission and private worker discovery."""
+    import psutil
     pid, birth = params.get('pid'), params.get('birth')
     secret = params.get('secret')
     if (type(pid) is not int or pid <= 0 or pid == os.getpid()
@@ -42,12 +47,15 @@ def _claim(connection, ref, params):
     from hermes_state_worker_compression import worker_claim_origin
     origin = worker_claim_origin(authority.db, params)
     return admission_fingerprint(canonical_target=origin, payload={
-        key: params[key] for key in _SCOPE} | {'session_id': origin, 'principal': connection.actor.subject})
+        key: params[key] for key in _SCOPE} | {'session_id': origin, 'principal': subject})
 
 
 def _verify(connection, ref, params, claim):
+    return verify_worker_identity_claim(connection.authority, params, claim)
+
+
+def verify_worker_identity_claim(authority, params, claim, *, live_only=False):
     from hermes_state_worker_compression import worker_retry_target
-    authority = connection.authority
     target = worker_retry_target(authority.db, params)
     with authority.db._read_ctx() as conn:
         row = conn.execute('SELECT * FROM worker_executions WHERE execution_id=?',
@@ -59,6 +67,8 @@ def _verify(connection, ref, params, claim):
         if type(params['generation']) is not int or row['generation'] != params['generation']:
             raise RuntimeStoreError('stale_generation')
         if not hmac.compare_digest(row['adoption_digest'], _secret_digest(claim)):
+            raise RuntimeStoreError('permission_denied')
+        if live_only and row['status'] == 'terminal':
             raise RuntimeStoreError('permission_denied')
 
 

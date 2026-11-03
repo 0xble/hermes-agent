@@ -444,6 +444,9 @@ def write_hermes_home(
         "  context_length: 128000\n"
         "agent:\n"
         "  api_max_retries: 1\n"
+        # A cached low-disk estimate must not introduce an interactive startup question.
+        "sessions:\n"
+        "  auto_prune: false\n"
         # Answered at the current offer version, so an interactive chat never stops on the
         # shared-metrics offer (a "No thanks" without offer_version is re-asked).
         "telemetry:\n"

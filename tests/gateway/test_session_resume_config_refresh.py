@@ -65,7 +65,7 @@ def _view(policy):
 async def test_resume_after_restart_rereads_config_derived_fields_and_keeps_picks(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     home = _home(monkeypatch)
     store = SessionStore(home / 'sessions', GatewayConfig())
@@ -125,7 +125,7 @@ async def test_resume_after_restart_rereads_config_derived_fields_and_keeps_pick
 async def test_resume_never_changes_a_running_turns_policy(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Submission
     from gateway.session_controls import AuthorityConnection
     import hermes_state_runtime as rt
@@ -193,7 +193,7 @@ class _Frames:
 async def _owner_authority(home, instance='only'):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     store = SessionStore(home / 'sessions', GatewayConfig())
     assert store._db.db_path.parent.resolve() == home.resolve()
     return store, await initialize_session_authority(_runner(store), profile_id=str(home), instance_id=instance)

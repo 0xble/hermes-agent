@@ -486,7 +486,7 @@ def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
     return cleaned or None
 
 
-def sanitize_reasoning_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def sanitize_reasoning_override(override: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Canonical ``/reasoning`` session pick (``{"enabled": False}`` or ``{"enabled": True, "effort": str}``),
     or ``None`` when the value is not a recognizable reasoning config."""
     if not isinstance(override, dict):
@@ -551,7 +551,7 @@ class SessionEntry:
     restart_note_reconcile_attempts: int = 0
     # Append-only durable note records. A session can be interrupted more than once before a
     # resumed answer finishes; each marker owns its own visible note, which is never reconciled away.
-    restart_notes: list[Dict[str, Any]] = field(default_factory=list)
+    restart_notes: list[dict[str, Any]] = field(default_factory=list)
     last_resume_marked_at: Optional[datetime] = None
     # Durable marker of the executing turn; CAS-cleared on normal unwind, left behind by
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
@@ -563,9 +563,9 @@ class SessionEntry:
     active_turn_owner_slot: Optional[str] = None
     # Session-scoped /model override (route and optional expiry, never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
-    model_override: Optional[Dict[str, str]] = None
+    model_override: Optional[dict[str, str]] = None
     # Session-scoped /reasoning pick, persisted like model_override so a restart keeps the effort.
-    reasoning_override: Optional[Dict[str, Any]] = None
+    reasoning_override: Optional[dict[str, Any]] = None
     # Profile owning the bot that received this lane's traffic (``RoutingIdentity.transport_profile``,
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
     # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
@@ -593,6 +593,8 @@ class SessionEntry:
     model_role: Optional[str] = None
     attended_pinned: bool = False
     attended_pin_until: Optional[float] = None
+    incognito: bool = False
+    _incognito_persisted: Optional[dict[str, Any]] = field(default=None, repr=False)
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -611,6 +613,9 @@ class SessionEntry:
     )
 
     def to_dict(self) -> dict[str, Any]:
+        if self.incognito:
+            from copy import deepcopy
+            return deepcopy(self._incognito_persisted)
         result = {
             "session_key": self.session_key, "session_id": self.session_id,
             "created_at": self.created_at.isoformat(), "updated_at": _local_iso(self.updated_at),
@@ -906,8 +911,11 @@ class AsyncSessionStore:
         return _offloaded
 
 
+from gateway.session_incognito import SessionIncognitoMixin
+
+
 class SessionStore(
-    SessionPersistenceMixin, SessionRecoveryMixin, SessionLifecycleMixin, SessionTranscriptMixin,
+    SessionIncognitoMixin, SessionPersistenceMixin, SessionRecoveryMixin, SessionLifecycleMixin, SessionTranscriptMixin,
     SessionPromptPinMixin, SessionAttendedMixin,
 ):
     """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
@@ -919,7 +927,7 @@ class SessionStore(
         self._loaded = False
         # A fallback-only initial load is reconciled with state.db once the handle recovers.
         self._routing_db_loaded = False
-        self._routing_fallback_baseline: Optional[Dict[str, Any]] = None
+        self._routing_fallback_baseline: Optional[dict[str, Any]] = None
         # Guards _entries / _loaded, and is held across the state.db write of a turn marker or
         # routing save, so the event loop must never wait on it (see hermes_loop_guard).
         self._lock = LoopGuardedLock("session-store lock")
@@ -1117,6 +1125,10 @@ class SessionStore(
         with self._lock:
             self._ensure_loaded_locked()
             observed = self._entries.get(session_key)
+        if observed is not None and observed.incognito and not force_new:
+            return observed  # private compression and activity never rotate the durable prefix
+        if observed is not None and observed.incognito and force_new:
+            self.set_incognito(session_key, False)
         # Phase 1b (no lock): compression tip + stale check + explicit suspension.
         checks = None
         if not force_new and observed is not None:
@@ -1291,6 +1303,10 @@ class SessionStore(
                 (cleaned is None or entry.model_override_scope == resolved_scope)
             ):
                 return
+            if entry.incognito:
+                entry.model_override = cleaned
+                entry.model_override_scope = resolved_scope if cleaned else "session"
+                return
             # Publish only after persistence so a failed clear remains retryable.
             data, generation = self._snapshot_routing_locked()
             # Snapshot reconciliation may replace the entry after database recovery.
@@ -1323,7 +1339,7 @@ class SessionStore(
             return getattr(entry, "model_override_scope", "session") if entry else "session"
 
     def set_reasoning_override(
-        self, session_key: str, override: Optional[Dict[str, Any]], *, scope: Optional[str] = None,
+        self, session_key: str, override: Optional[dict[str, Any]], *, scope: Optional[str] = None,
     ) -> None:
         """Persist (or clear, with ``None``) the session's /reasoning pick."""
         from dataclasses import replace
@@ -1347,7 +1363,7 @@ class SessionStore(
             entry.reasoning_override = cleaned
             entry.reasoning_override_scope = resolved_scope if cleaned else "session"
 
-    def get_reasoning_override(self, session_key: str) -> Optional[Dict[str, Any]]:
+    def get_reasoning_override(self, session_key: str) -> Optional[dict[str, Any]]:
         """Return the persisted /reasoning pick for *session_key*, if any."""
         with self._lock:
             entry = self._entry_locked(session_key)
@@ -1422,6 +1438,12 @@ class SessionStore(
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
+        if self.incognito_enabled(session_key):
+            self.set_incognito(session_key, False)
+            from agent.incognito import is_incognito
+            if is_incognito():
+                from contextvars import Context
+                return Context().run(self.reset_session, session_key)
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:

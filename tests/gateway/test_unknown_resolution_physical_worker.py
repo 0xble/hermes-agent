@@ -1,4 +1,5 @@
 """Resolving an unknown admission must also retire its physical worker assignment."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from contextlib import closing
 import os
 from pathlib import Path
@@ -46,7 +47,7 @@ def _local_reset(db, epoch, logical, child):
 def test_resolve_unknown_retires_the_physical_worker_row(tmp_path):
     from gateway.session_worker_reservation import reserve_admission_worker
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         logical = _local_reset(db, epoch, 'logical', 'physical')
         rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id=logical,
                                request_id='first', payload={'text': 'first'})
@@ -64,7 +65,7 @@ def test_resolve_unknown_retires_the_physical_worker_row(tmp_path):
             child.kill()
             child.wait(timeout=5)
         # Owner restart: the started admission and its worker become unknown.
-        epoch = rt.begin_runtime_epoch(db, instance_id='restarted')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='restarted')
         rt.recover_session_inputs(db, epoch=epoch)
         assert db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
         settled = rt.resolve_unknown_session_input(db, epoch=epoch, admission_id=row['admission_id'],

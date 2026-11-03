@@ -493,7 +493,7 @@ platforms:
 | `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message, then upgrades them once to a generated task title. |
 | `platforms.slack.extra.channel_thread_titles` | `false` | When `true`, channel threads get the same generated task title as their session title, shown as the bold first line of thread roots Hermes may edit. See [Channel Thread Titles](#channel-thread-titles). |
 | `platforms.slack.extra.allow_bots` | `"none"` | Controls messages from other Slack bots: `"none"` ignores them, `"mentions"` accepts a bot message only when **that message itself** @mentions Hermes, and `"all"` accepts all of them. Use `"mentions"` for the safest bot-to-bot collaboration mode. See [Accepting messages from other bots](#accepting-messages-from-other-bots-allow_bots). |
-| `platforms.slack.extra.api_human_users` | `[]` | Slack user IDs whose **Web-API (user-token) posts count as human**. Such posts carry the posting `app_id` and no `client_msg_id`, so by default they are dropped as app traffic; allowlist your own front-end's users here instead of `allow_bots: all`. See [Treating your own app's user-token posts as human](#treating-your-own-apps-user-token-posts-as-human-api_human_users). |
+| `platforms.slack.extra.api_human_users` | `[]` | Slack user IDs whose **Web-API (user-token) posts count as human**. Such posts carry the posting app's `bot_id`/`app_id` and no `client_msg_id`, so by default they are dropped as app traffic; allowlist your own front-end's users here instead of `allow_bots: all`. See [Treating your own app's user-token posts as human](#treating-your-own-apps-user-token-posts-as-human-api_human_users). |
 | `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |
 
 The equivalent environment variable is `SLACK_ALLOW_BOTS=none|mentions|all`.
@@ -791,11 +791,11 @@ For strict multi-bot deployments, pair with `require_mention: true` and `strict_
 ### Treating your own app's user-token posts as human (`api_human_users`)
 
 A message posted through the Web API with a **user token** (`xoxp-`) is
-authored by a real person, but it arrives with the posting `app_id` and no
-`client_msg_id` — the same signature Hermes uses to recognise app posts — so it
-is dropped as bot traffic. This blocks a common pattern: a custom front-end (an
-internal dashboard, a mobile shell, a kiosk) that sends messages to Hermes *as*
-the logged-in user.
+authored by a real person, but it arrives stamped with the posting app's
+`bot_id` and `app_id` and no `client_msg_id` — the same signature Hermes uses to
+recognise app posts — so it is dropped as bot traffic. This blocks a common
+pattern: a custom front-end (an internal dashboard, a mobile shell, a kiosk)
+that sends messages to Hermes *as* the logged-in user.
 
 `allow_bots: all` would let those posts through, but it opens the door to every
 bot in the channel and weakens the loop protections. Instead, allowlist just
@@ -815,8 +815,10 @@ Scope and safety:
 - The allowlist is **users only**. There is deliberately no app-ID variant: a
   modern bot token (`xoxb-`) posts with the same `user` + `app_id` shape, so
   trusting an app would also admit its own bot posts and defeat the loop guard.
-- Events carrying `bot_id` or `subtype: bot_message`, or no `user` at all, are
-  always treated as bot posts regardless of the allowlist.
+- An allowlisted user's post counts as human even though it carries the app's
+  `bot_id`, `bot_profile` or `app_id`. Events with `subtype: bot_message`, a bot
+  user profile, or no `user` at all are always bot posts, and Hermes's own bot user is never
+  treated as human even if listed.
 - The rest of the pipeline is unchanged: mention gating, `allowed_channels`,
   and `SLACK_ALLOWED_USERS` still apply to the (now human) sender.
 

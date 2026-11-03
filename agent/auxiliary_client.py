@@ -3170,6 +3170,16 @@ _AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
 _aux_unhealthy_until: dict[Any, float] = {}
 _aux_unhealthy_logged_at: dict[Any, float] = {}
 _aux_unhealthy_reason: dict[Any, str] = {}
+
+
+def _local_health_caches() -> tuple[dict[Any, float], dict[Any, float], dict[Any, str]]:
+    from agent.incognito import private_state
+    private = private_state("auxiliary_client_health")
+    if private is None:
+        return _aux_unhealthy_until, _aux_unhealthy_logged_at, _aux_unhealthy_reason
+    return (private.setdefault("until", {}), private.setdefault("logged", {}),
+            private.setdefault("reasons", {}))
+
 # resolved_provider / explicit-config names → chain labels.
 _AUX_UNHEALTHY_LABEL_ALIASES = {
     "openrouter": "openrouter", "nous": "nous", "custom": "local/custom",
@@ -3223,6 +3233,7 @@ def _mark_provider_unhealthy(
     advances even when the shared optimization is unavailable. Task or parser failures the store
     refuses to share are local-only for the same reason.
     """
+    unhealthy_until, _unhealthy_logged_at, unhealthy_reason = _local_health_caches()
     label = _normalize_chain_label(provider)
     if not label:
         return
@@ -3234,18 +3245,18 @@ def _mark_provider_unhealthy(
         )
     except OSError as exc:
         expires_at = time.time() + ttl
-        _aux_unhealthy_until[key] = expires_at
-        _aux_unhealthy_reason[key] = reason
+        unhealthy_until[key] = expires_at
+        unhealthy_reason[key] = reason
         logger.warning("Auxiliary: could not persist unhealthy state for %s: %s", label, exc)
         return
     if record is None:
         expires_at = time.time() + ttl
-        _aux_unhealthy_until[key] = expires_at
-        _aux_unhealthy_reason[key] = reason
+        unhealthy_until[key] = expires_at
+        unhealthy_reason[key] = reason
     else:
         expires_at = record.expires_at
-        _aux_unhealthy_until[key] = expires_at
-        _aux_unhealthy_reason[key] = record.reason
+        unhealthy_until[key] = expires_at
+        unhealthy_reason[key] = record.reason
     logger.log(
         level,
         "Auxiliary: marking %s unhealthy for %ds (%s). "
@@ -3255,9 +3266,10 @@ def _mark_provider_unhealthy(
 
 
 def _clear_local_health(key: Any) -> None:
-    _aux_unhealthy_until.pop(key, None)
-    _aux_unhealthy_logged_at.pop(key, None)
-    _aux_unhealthy_reason.pop(key, None)
+    unhealthy_until, unhealthy_logged_at, unhealthy_reason = _local_health_caches()
+    unhealthy_until.pop(key, None)
+    unhealthy_logged_at.pop(key, None)
+    unhealthy_reason.pop(key, None)
 
 
 def _health_route_candidates(
@@ -3298,12 +3310,13 @@ def _is_provider_unhealthy(
     label: str, base_url: Optional[str] = None, model: Optional[str] = None,
 ) -> bool:
     """True iff this auxiliary route is unhealthy and unexpired."""
+    unhealthy_until, _unhealthy_logged_at, unhealthy_reason = _local_health_caches()
     if not label:
         return False
     now = time.time()
     candidates = _health_route_candidates(label, base_url, model)
     for _candidate_model, key, identity in candidates:
-        local_until = _aux_unhealthy_until.get(key)
+        local_until = unhealthy_until.get(key)
         if local_until is not None and now < local_until:
             return True
         record = _health_store_call("read route", _read_auxiliary_health, identity,
@@ -3314,8 +3327,8 @@ def _is_provider_unhealthy(
             # A provider-wide local hold may still follow the exact model candidate.
             continue
         if record is not None:
-            _aux_unhealthy_until[key] = record.expires_at
-            _aux_unhealthy_reason[key] = record.reason
+            unhealthy_until[key] = record.expires_at
+            unhealthy_reason[key] = record.reason
             return True
         if local_until is not None:
             _clear_local_health(key)
@@ -3362,8 +3375,9 @@ def _claim_notice_for(
     label: str, base_url: Optional[str], model: Optional[str] = None, *, allow_missing: bool = False,
 ) -> bool:
     """True when this caller should log the route's notice; one claim per health epoch."""
+    unhealthy_until, _unhealthy_logged_at, unhealthy_reason = _local_health_caches()
     for candidate_model, key, identity in _health_route_candidates(label, base_url, model):
-        known_locally = key in _aux_unhealthy_until or key in _aux_unhealthy_reason
+        known_locally = key in unhealthy_until or key in unhealthy_reason
         record = _health_store_call("read route", _read_auxiliary_health, identity,
                                     default=_HEALTH_STORE_UNAVAILABLE)
         if record is _HEALTH_STORE_UNAVAILABLE:
@@ -3386,21 +3400,22 @@ def _log_skip_unhealthy(
     model: Optional[str] = None,
 ) -> None:
     """Log a skipped unhealthy provider at most once per minute per route and once per epoch."""
+    unhealthy_until, unhealthy_logged_at, unhealthy_reason = _local_health_caches()
     now = time.time()
     candidates = _health_route_candidates(label, base_url, model)
     key = next(
         (candidate_key for _candidate_model, candidate_key, _identity in candidates
-         if candidate_key in _aux_unhealthy_until or candidate_key in _aux_unhealthy_reason),
+         if candidate_key in unhealthy_until or candidate_key in unhealthy_reason),
         candidates[0][1],
     )
-    if now - _aux_unhealthy_logged_at.get(key, 0.0) >= 60:
+    if now - unhealthy_logged_at.get(key, 0.0) >= 60:
         if not _claim_notice_for(label, base_url, model):
             return
-        _aux_unhealthy_logged_at[key] = now
-        expires_at = _aux_unhealthy_until.get(key, now)
+        unhealthy_logged_at[key] = now
+        expires_at = unhealthy_until.get(key, now)
         logger.info(
             "Auxiliary %s: skipping %s (%s, retry in %ds)",
-            task or "call", label, _aux_unhealthy_reason.get(key, _AUX_UNHEALTHY_PAYMENT_REASON),
+            task or "call", label, unhealthy_reason.get(key, _AUX_UNHEALTHY_PAYMENT_REASON),
             max(0, int(expires_at - now)),
         )
 
@@ -3425,9 +3440,10 @@ def _warn_auxiliary_route_once(
 
 def _reset_aux_unhealthy_cache() -> None:
     """Clear auxiliary health state (tests / explicit user reset)."""
-    _aux_unhealthy_until.clear()
-    _aux_unhealthy_logged_at.clear()
-    _aux_unhealthy_reason.clear()
+    unhealthy_until, unhealthy_logged_at, unhealthy_reason = _local_health_caches()
+    unhealthy_until.clear()
+    unhealthy_logged_at.clear()
+    unhealthy_reason.clear()
     _health_store_call("reset route health", _reset_auxiliary_health)
 
 

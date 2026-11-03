@@ -9,7 +9,7 @@ def mount_authority(app, adapter):
         nonlocal authority
         from gateway.config import Platform
         from gateway.run import GatewayRunner
-        from gateway.session_authority import initialize_session_authority
+        from tests.fakes.runtime_owner import initialize_session_authority
         from gateway.session import SessionStore
         from hermes_constants import get_hermes_home
         runner = GatewayRunner()

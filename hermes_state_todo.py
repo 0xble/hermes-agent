@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+from hermes_state_deletion import visible_session_sql
+
 
 class SessionTodoResultMixin:
     """Latest visible, paired and valid Todo tool result of a session's lineage."""
@@ -30,7 +32,7 @@ class SessionTodoResultMixin:
                 while True:
                     rows = conn.execute(
                         "SELECT id, content, tool_call_id FROM messages INDEXED BY idx_messages_session_id "
-                        "WHERE session_id = ? AND id < ? AND role = 'tool' "
+                        f"WHERE {visible_session_sql('session_id')} AND session_id = ? AND id < ? AND role = 'tool' "
                         "AND tool_name IN ('todo_list', 'todo') AND (active = 1 OR compacted = 1) "
                         "AND length(content) <= ? ORDER BY id DESC LIMIT 100",
                         (sid, before_id, max_chars),
@@ -43,7 +45,7 @@ class SessionTodoResultMixin:
                             continue
                         prior = conn.execute(
                             "SELECT role, tool_calls FROM messages INDEXED BY idx_messages_session_id "
-                            "WHERE session_id = ? AND id < ? AND role IN ('assistant', 'user', 'system') "
+                            f"WHERE {visible_session_sql('session_id')} AND session_id = ? AND id < ? AND role IN ('assistant', 'user', 'system') "
                             "AND (active = 1 OR compacted = 1) ORDER BY id DESC LIMIT 1",
                             (sid, row["id"]),
                         ).fetchone()

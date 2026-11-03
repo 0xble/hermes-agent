@@ -8,10 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
-from hermes_state_runtime import (
-    begin_runtime_epoch, claim_session_input, find_session_admission, list_session_admissions,
-    recover_session_inputs,
-)
+from hermes_state_runtime import claim_session_input, find_session_admission, list_session_admissions, recover_session_inputs
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
 
 

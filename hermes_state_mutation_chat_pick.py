@@ -64,4 +64,4 @@ def commit_chat_pick(db, *, epoch, key, digest, session_id, params, result):
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
                      (key, _json({'digest': digest, 'result': committed})))
         return committed
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(session_id, params, result,), skip_result={})

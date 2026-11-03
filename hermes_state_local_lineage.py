@@ -161,7 +161,7 @@ def adopt_untracked_compression(db, *, epoch, session_id, expected):
         receipt['lineage'] = [*receipt.get('lineage', [session_id]), *children]
         validate_local_lineage(conn, receipt)
         _commit_local_target(conn, receipt, dict(routed, session_id=children[-1]))
-    db._execute_write(write)
+    db._execute_write(write, session_ids=(session_id, expected,), skip_result=None)
 
 
 def reset_local_target(db, *, epoch, parent_session_id, entry):
@@ -190,4 +190,4 @@ def reset_local_target(db, *, epoch, parent_session_id, entry):
         db._bump_conversation_generation(conn, parent_session_id, 'session_reset')
         advance_local_target(conn, parent_session_id, entry['session_id'], entry=entry)
         conn.execute('UPDATE sessions SET runtime_generation=runtime_generation+1 WHERE id=?', (logical_id,))
-    db._execute_write(write)
+    db._execute_write(write, session_ids=(parent_session_id, entry,), skip_result=None)

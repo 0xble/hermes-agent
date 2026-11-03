@@ -25,7 +25,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextvars import Context, copy_context
+from contextvars import Context, ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Tuple, cast
@@ -1887,6 +1887,8 @@ def _profile_runtime_scope(
         home_token = set_hermes_home_override(str(profile_home))
         if prepared_secret_scope is not None:
             secrets = prepared_secret_scope
+        elif (prepared := _PREPARED_AUTHORIZATION_SCOPE.get()) is not None and prepared[0] == _home_key(profile_home):
+            secrets = prepared[1]  # this ingress task already loaded this profile off the loop
         elif hydrate_secrets:
             secrets = _load_profile_secret_scope(Path(profile_home))
         else:
@@ -1913,6 +1915,43 @@ async def _async_profile_runtime_scope(profile_home: Path):
     secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(profile_home))
     with _profile_runtime_scope(Path(profile_home), secrets):
         yield
+
+
+# One authorization home's secrets, loaded off the loop for the synchronous gates awaited inside
+# ``prepared_authorization_scope`` (``GatewayRunner._under_authorization_profile`` reads it).
+_PREPARED_AUTHORIZATION_SCOPE: ContextVar[Optional[tuple[str, dict]]] = ContextVar(
+    "_PREPARED_AUTHORIZATION_SCOPE", default=None)
+
+
+@_asynccontextmanager
+async def prepared_authorization_scope(runner, source):
+    """Hydrate *source*'s authorization-profile secrets off the event loop for the auth and bot
+    budget checks awaited inside, so a receive path never loads them inline. The checks still
+    enter that profile's scope; they only skip the load."""
+    home = runner._authorization_home_for_source(source)
+    if home is None:
+        yield
+        return
+    secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(home))
+    token = _PREPARED_AUTHORIZATION_SCOPE.set((_home_key(home), secrets))
+    try:
+        yield
+    finally:
+        _PREPARED_AUTHORIZATION_SCOPE.reset(token)
+
+
+def _home_key(home) -> str:
+    from hermes_constants import hermes_home_key
+    return hermes_home_key(home)
+
+
+def without_prepared_authorization_scope():
+    """A copy of the current context with no prepared authorization secrets, for a task that
+    outlives ingress (a session drain): its turns load the profile afresh, so a failed secret
+    source is still retried."""
+    context = copy_context()
+    context.run(_PREPARED_AUTHORIZATION_SCOPE.set, None)
+    return context
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -3238,20 +3277,12 @@ def _normalize_empty_agent_response(
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if agent_result.get("interrupted"):
-        # Interrupted with api_calls > 0 = deliberately stopped/steered; silence is intentional (queued
-        # messages arrive via the recursive drain). ZERO api_calls = never processed (stale /stop flag).
-        # An interrupted run that did work (api_calls > 0) is the drain of a run the user deliberately
-        # stopped or steered — its silence is intentional, and any queued/interrupting message is delivered
-        # by the recursive drain inside _run_agent before this result is seen. An interrupted run with ZERO
-        # api_calls never processed the user's message at all: it was killed at the top of the tool loop by
-        # an interrupt flag left over from a recent /stop (#44212). Pure silence there swallows a real user
-        # message, so surface it.
-        # api_calls == 0, not failed, not interrupted: the agent never ran for this turn. This is the
-        # post-/stop generation-race pattern where the gateway would otherwise silently drop the turn
-        # (response=0 chars) and the user sees no reply at all. Surface a short retry hint so the message
-        # isn't lost in silence. (#31884)
+        # api_calls > 0: deliberately stopped/steered work; silence is intentional (queued messages arrive
+        # via the recursive drain). ZERO api_calls: the message was never processed (#44212), so the reply
+        # names the recorded cause; a restart's unstarted native turn is replayed, not answered.
         if api_calls == 0:
-            return t("gateway.errors.interrupted_before_start")
+            from gateway.run_interrupt_cause import interrupted_before_start_key
+            return t(interrupted_before_start_key(agent_result))
         return response
     from gateway.response_filters import reaction_answered
     if reaction_answered(agent_result):
@@ -3469,6 +3500,7 @@ class GatewayRunner(
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
+    _client_owned: bool = False  # finite local lease, never a daemon/restart enrollment
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -4909,6 +4941,9 @@ def _start_gateway_housekeeping(
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner), False))
     if runner is not None and loop is not None:
         chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop), False))
+    if runner is not None:
+        from gateway.session_epoch_watch import check_runtime_epochs
+        chores.append((1, "Runtime epoch watch", lambda: check_runtime_epochs(runner), False))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop), False),
         (60, "Media cache cleanup", _housekeeping_media_caches, False),
@@ -5354,7 +5389,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             return snapshot_shutdown_context(received_signal)
 
         planned_takeover = bool(_best_effort(_takeover, "Takeover marker check failed: %s"))
-        planned_stop = received_signal == signal.SIGINT or (
+        planned_stop = getattr(runner, "_client_owned", False) or received_signal == signal.SIGINT or (
             not planned_takeover and bool(_best_effort(_planned_stop, "Planned stop marker check failed: %s")))
         # `hermes gateway stop` writes the marker, THEN signals: the planned-stop watcher can consume
         # the marker in between, and the CLI's own SIGTERM must not then read as an external kill.
@@ -5380,7 +5415,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = True
             logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
 
-        if _shutdown_ctx is not None:
+        if _shutdown_ctx is not None and not getattr(runner, "_client_owned", False):
             def _log_context() -> None:
                 # The most useful line for "gateway keeps dying" tickets.
                 from gateway.shutdown_forensics import format_context_for_log
@@ -5749,31 +5784,18 @@ async def _start_gateway_start_control_socket(runner):
             spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
-        def _identify_runtime():
-            from gateway.drain_control import RESTART_WAIT_REASON
-            payload = build_identify_payload()
-            descriptor = getattr(runner, "session_runtime_descriptor", {})
-            payload.update({key: descriptor[key] for key in (
-                "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
-            if getattr(runner, "_draining", False):
-                payload.update(state="draining")
-                # The restart's after-turn wait still owns its turns, so the endpoint stays dialable.
-                if descriptor.get("drain_reason") != RESTART_WAIT_REASON:
-                    payload["capabilities"] = []
-            if payload.get("state") == "draining" and descriptor.get("drain_reason"):
-                payload["drain_reason"] = descriptor["drain_reason"]
-            payload["supervisor"] = {"manual": "none", "desktop": "none"}.get(
-                payload.get("supervisor"), payload.get("supervisor", "none"))
-            return payload
+        from gateway.run_control_identity import make_runtime_identify
+        _identify_runtime = make_runtime_identify(runner, build_identify_payload)
 
         from gateway.cron_review import CronReviewControl
+        from gateway.session_snapshot import make_session_snapshot_handler
         from gateway import zero_cut_standby as zcs
         from gateway.zero_cut_handover_drain import request_handover, status as handover_status
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
-            verb_handlers={"identify": _identify_runtime,
+            verb_handlers={"session-snapshot": make_session_snapshot_handler(runner, _main_loop),
+                           "identify": _identify_runtime,
                            "cron-review": _cron_review_control.submit,
                            "cron-review-result": _cron_review_control.result,
                            "pause-for-update": _pause_for_update_handler,
@@ -5788,6 +5810,8 @@ async def _start_gateway_start_control_socket(runner):
                            "handover": lambda: request_handover(runner, _main_loop),
                            "handover-status": lambda: handover_status(runner)})
         _control_server.ticket_store = runner.session_ticket_store
+        from gateway.session_worker_discovery import worker_discovery_handler
+        _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5923,9 +5947,12 @@ async def _start_gateway_shutdown_tail(
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
+                        client_owned: bool = False) -> bool:
     """Run the maintained bootstrap lifecycle through the public runner facade."""
     from gateway.run_bootstrap import start_gateway as bootstrap
+    if client_owned:
+        return await bootstrap(config, replace, verbosity, force, idle_exit, client_owned=True)
     return await bootstrap(config, replace, verbosity, force, idle_exit)
 
 

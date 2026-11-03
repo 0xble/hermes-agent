@@ -136,6 +136,9 @@ def _is_within(root: Path, path: Path) -> bool:
 
 def _store_blob(data: bytes) -> str:
     """Write *data* keyed by sha256 (existing blob left alone). Returns the hash."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return ""
     digest = hashlib.sha256(data).hexdigest()
     dest = blobs_dir() / digest
     if not dest.exists():
@@ -300,6 +303,9 @@ def append_entry(
     after: Optional[list[dict[str, str]]] = None, actor: Optional[str] = None,
     evidence: Optional[dict[str, Any]] = None) -> Optional[str]:
     """Append one entry -> id, or None when disabled / write failed (never raises)."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return None
     if not ledger_enabled():
         return None
     try:

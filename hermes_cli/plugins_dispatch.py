@@ -21,6 +21,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
+from hermes_cli.plugins_incognito import (
+    callback_allowed, declared_dispatch_allowed, private_dispatch, _warning as _privacy_warning,
+)
 
 logger = logging.getLogger("hermes_cli.plugins")
 
@@ -302,6 +305,7 @@ class PluginSystemPromptSection:
     position: str
     max_chars: int
     plugin: str
+    incognito_safe: bool = False
 
 
 @dataclass(frozen=True)
@@ -320,6 +324,7 @@ class _EventSubscription:
 
     owner: str
     callback: Callable
+    incognito_safe: bool = False
 
 
 @dataclass(frozen=True)
@@ -456,6 +461,8 @@ class PluginDispatchMixin:
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._hooks.get(hook_name, []) if _callbacks is None else _callbacks:
+            if not callback_allowed(self, cb, kwargs):
+                continue
             cb_timeout, cb_fail_closed = timeout, fail_closed
             try:
                 spec = getattr(cb, "hermes_shell_hook_spec", None)
@@ -504,6 +511,9 @@ class PluginDispatchMixin:
         truncates the message so a hook that embeds tool args in its error cannot grow the set
         per call; the set is cleared on unload alongside the timeout-suppression map.
         """
+        if private_dispatch(kwargs) is not False:
+            _privacy_warning("Plugin content callback failed: incognito diagnostic suppressed")
+            return
         callback_name = _callback_identity(cb)
         key = (hook_name, getattr(cb, "__module__", ""), getattr(cb, "__qualname__", callback_name),
                type(exc).__name__, str(exc)[:200])
@@ -568,9 +578,14 @@ class PluginDispatchMixin:
                         if not abandoned:
                             self._hook_abandoned.pop(suppression_key, None)
 
+        def _invoke_private_aware():
+            if callback_allowed(self, cb, kwargs):
+                return self._invoke_hook_callback(cb, kwargs)
+            return None
+
         def _runner() -> None:
             try:
-                outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
+                outcome["value"] = context.run(_invoke_private_aware)
             except BaseException as exc:
                 failure["exc"] = exc
             finally:
@@ -603,12 +618,14 @@ class PluginDispatchMixin:
             raise failure["exc"]
         return outcome.get("value")
 
-    def _subscribe_event(self, owner: str, event: str, callback: Callable) -> None:
+    def _subscribe_event(self, owner: str, event: str, callback: Callable,
+                         *, incognito_safe: bool = False) -> None:
         """Add an owner-tagged event subscription in registration order."""
         if not callable(callback):
             raise TypeError("Event subscriber callback must be callable")
         with self._event_lock:
-            self._subscriptions.setdefault(event, []).append(_EventSubscription(owner, callback))
+            self._subscriptions.setdefault(event, []).append(
+                _EventSubscription(owner, callback, incognito_safe=incognito_safe))
 
     def _remove_plugin_subscriptions(self, owner: str) -> int:
         """Remove every subscription owned by *owner*; return the count. Queued envelopes re-check
@@ -676,6 +693,9 @@ class PluginDispatchMixin:
                     if not any(cur is subscription for cur in self._subscriptions.get(item.event, [])):
                         continue
                 callback = subscription.callback
+                if not item.context.copy().run(
+                    declared_dispatch_allowed, subscription.incognito_safe, item.payload):
+                    continue
                 try:
                     # Fresh deep copy per subscriber: no callback can mutate what the next sees.
                     resolve_plugin_command_result(
@@ -704,7 +724,9 @@ class PluginDispatchMixin:
             return 0
         budget_msg = "Event bus pending budget (%d) exhausted while dispatching '%s' — dropping this emit"
         with self._event_lock:
-            subscriptions = tuple(self._subscriptions.get(event, []))
+            subscriptions = tuple(
+                entry for entry in self._subscriptions.get(event, [])
+                if declared_dispatch_allowed(entry.incognito_safe, payload))
             if not subscriptions:
                 return 0
             generation = self._event_generation
@@ -754,6 +776,8 @@ class PluginDispatchMixin:
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         callbacks = self._hooks.get(hook_name, []) if _callbacks is None else _callbacks
         for cb in callbacks:
+            if not callback_allowed(self, cb, kwargs):
+                continue
             callback_name = getattr(cb, "__name__", repr(cb))
             try:
                 ret = cb(**self._hook_callback_kwargs(cb, kwargs))
@@ -793,6 +817,8 @@ class PluginDispatchMixin:
         rendered: list[RenderedPluginSystemPromptSection] = []
         total_chars = len(PLUGIN_SECTIONS_START) + len(PLUGIN_SECTIONS_END) + 2
         for _section_id, section in sorted(self._system_prompt_sections.items()):
+            if not declared_dispatch_allowed(section.incognito_safe, session_info):
+                continue
             if len(rendered) >= MAX_SYSTEM_PROMPT_SECTIONS:
                 logger.warning(
                     "Plugin system prompt section %s exceeded the section-count "
@@ -871,6 +897,8 @@ class PluginDispatchMixin:
             return []
         results: list[Any] = []
         for cb in self._middleware.get(kind, []):
+            if not callback_allowed(self, cb, kwargs):
+                continue
             call_kwargs = kwargs
             if _payload_key:
                 original_key = "original_" + _payload_key

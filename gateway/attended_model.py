@@ -130,6 +130,8 @@ class AttendedConfig:
     idle_revert_minutes: float = 15.0
     compact_before_switch_tokens: int = 80000
     start_new_sessions: bool = True
+    # The "Switched to ..." and switch-back cards. Off keeps attended switching silent.
+    notices: bool = True
 
 
 @dataclass(frozen=True)
@@ -225,6 +227,10 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
     if not isinstance(start_new_sessions, bool):
         logger.warning("model.attended.start_new_sessions=%r must be a boolean; using true", start_new_sessions)
         start_new_sessions = True
+    notices = attended_raw.get("notices", True)
+    if not isinstance(notices, bool):
+        logger.warning("model.attended.notices=%r must be a boolean; using true", notices)
+        notices = True
     return AttendedConfig(
         enabled=enabled,
         model=model,
@@ -238,6 +244,7 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
             key="compact_before_switch_tokens",
         ),
         start_new_sessions=start_new_sessions,
+        notices=notices,
     )
 
 

@@ -200,23 +200,34 @@ async def test_slack_thread_hydration_reads_and_advances_watermark_off_the_loop(
 
 
 @pytest.mark.asyncio
-async def test_delivery_validates_automation_topic_owner_off_the_loop(tmp_path):
+@pytest.mark.parametrize(
+    ("metadata", "checked", "skipped"),
+    [
+        # A cron job's configured numeric topic is validated as a live destination.
+        ({"job_id": "j1"}, "validate_existing_telegram_topic", "ensure_existing_telegram_topic_owner"),
+        # An explicit owner key still claims and validates lane ownership.
+        ({"job_id": "j1", "telegram_topic_owner_key": "cron:j1"},
+         "ensure_existing_telegram_topic_owner", "validate_existing_telegram_topic"),
+    ],
+)
+async def test_delivery_validates_automation_topic_off_the_loop(tmp_path, metadata, checked, skipped):
     from gateway.delivery import DeliveryRouter, DeliveryTarget
 
-    owner = _Probe()
+    probes = {checked: _Probe(), skipped: _Probe()}
 
     async def send(*_args, **_kwargs):
         return SimpleNamespace(success=True, message_id="1", error=None)
 
-    adapter = SimpleNamespace(ensure_existing_telegram_topic_owner=owner, send=send)
+    adapter = SimpleNamespace(send=send, **probes)
     router = DeliveryRouter(GatewayConfig(sessions_dir=tmp_path), adapters={Platform.TELEGRAM: adapter})
     target = DeliveryTarget(platform=Platform.TELEGRAM, chat_id="2027045491", thread_id="150")
     loop_thread = _arm()
     with pytest.raises(RuntimeError, match="telegram_reply_to_message_id"):
-        # The numeric private-topic send then refuses for want of a reply anchor; the owner
-        # check before it is the step under test.
-        await router._deliver_to_platform(target, "body", metadata={"job_id": "j1"})
-    assert owner.off_loop(loop_thread)
+        # The numeric private-topic send then refuses for want of a reply anchor; the
+        # state.db-backed topic check before it is the step under test.
+        await router._deliver_to_platform(target, "body", metadata=metadata)
+    assert probes[checked].off_loop(loop_thread)
+    assert probes[skipped].threads == []
     await asyncio.sleep(0)
 
 

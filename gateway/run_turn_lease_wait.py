@@ -52,9 +52,12 @@ async def lease_wait_notice(runner, session_key, event):
     if adapter is not None:
         from agent.i18n import t
 
-        await runner._send_busy_ack_reply(event, adapter, t(
+        from agent.notice_style import ContextNotice
+        notice = ContextNotice(t(
             "gateway.busy.ack", head=t("gateway.busy.queued_head"), detail="",
             tail=t("gateway.busy.queued_tail")))
+        notice._temporary = True
+        await runner._send_busy_ack_reply(event, adapter, notice)
 
 
 async def preserve_lease_wait_async(runner, session_key, session_id, event):

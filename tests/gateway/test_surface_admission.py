@@ -17,7 +17,8 @@ from tests.gateway.fixtures.local_recovery_probe import Model, child_env, daemon
 async def _authority(tmp_path, monkeypatch, answer):
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
-    from gateway.session_authority import LiveSession, initialize_session_authority
+    from gateway.session_authority import LiveSession
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())

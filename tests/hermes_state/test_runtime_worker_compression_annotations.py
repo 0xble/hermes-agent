@@ -3,7 +3,8 @@ import pytest
 
 from agent.runtime_session_store import RuntimeSessionStore
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+from hermes_state_runtime import mutate_worker_execution, register_worker_execution
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.mark.parametrize('rotate', [False, True])

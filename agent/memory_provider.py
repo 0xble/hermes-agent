@@ -59,6 +59,8 @@ class RecallStatus:
     provider_label: str
     count: int
     glyph: str = INDICATOR_GLYPH
+    # Replaces the recalled-count wording, e.g. when recall was refused rather than empty.
+    detail: str | None = None
 
 
 # Prompts with no semantic signal; single source of truth for the core prefetch gate and
@@ -153,6 +155,42 @@ class MemoryProvider(ABC):
     keywords name the same profile the instance is bound to; they are not a reason to rebind. Core
     cannot see inside a provider: one that keeps a process-wide binding still breaks this contract.
     """
+
+    @property
+    def read_only(self) -> bool:
+        from agent.incognito import is_incognito
+        return getattr(self, "_read_only", False) or is_incognito(getattr(self, "_session_id", None))
+
+    @read_only.setter
+    def read_only(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        previous = getattr(self, "_read_only", False)
+        self._read_only = enabled
+        if previous != enabled:
+            self._privacy_epoch = getattr(self, "_privacy_epoch", 0) + 1
+            self._privacy_changed()
+
+    def _privacy_changed(self) -> None:
+        """Providers may drop buffered writes at a privacy boundary."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        from functools import wraps
+        # Central lifecycle gate applies to every provider, including forked
+        # curators and callers that bypass MemoryManager. Recall stays enabled.
+        for name in ("sync_turn", "on_turn_start", "on_turn_end", "on_memory_write",
+                     "on_pre_compress", "on_session_end", "on_delegation"):
+            method = cls.__dict__.get(name)
+            if method is None:
+                continue
+            def protect(method):
+                @wraps(method)
+                def guarded(self, *args, **kw):
+                    if self.read_only:
+                        return None
+                    return method(self, *args, **kw)
+                return guarded
+            setattr(cls, name, protect(method))
 
     # Providers that durably checkpoint every successful on_pre_compress() set this to
     # PRE_COMPRESS_CHECKPOINT_API_VERSION; 1 = best-effort legacy.

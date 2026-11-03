@@ -67,6 +67,15 @@ but, on failure, reports per-profile request counts, heartbeat/success age, and
 canary job state (no prompts or keys) so the next missed fire can be attributed
 to enumeration, ticker liveness, claim, or execution instead of an opaque timeout.
 
+Prompt-surface review keeps full commit ancestry for the merge-base comparison,
+but its checkout uses Git's `blob:none` partial-clone filter. Fetching every
+historical blob exhausted the job's 5-minute budget before review could run,
+even though the review reads only the head tree and the merge-base snapshot.
+Checkout and base `git archive` hydrate the content actually read. A real local
+Git regression leaves an unrelated historical artifact missing while rendering
+the base-to-head prompt diff. The job timeout, staleness test, committed
+snapshots, qualification requirement, and core-approval path are unchanged.
+
 The nightly fetches upstream CalVer release tags before its historical upgrade E2E:
 `actions/checkout` sees only fork tags (latest `v2026.8.3`), otherwise the test's
 `git describe HEAD~1` stages an obsolete updater instead of the previous release.
@@ -86,6 +95,21 @@ The Codex host-binding catalog test keeps unrelated account-usage refreshes
 offline. Otherwise its daemon can outlive the test, resolve a later test's pool,
 and send an earlier key into that test's HTTP recorder. Host and exact-key
 assertions remain unchanged. Dedicated usage tests still exercise real workers.
+
+The OpenRouter image-provider catalog ownership test supplies fixture HTTP
+responses and explicit runtime endpoints instead of reading OpenRouter's live
+inventory. Every curated Image API id must still appear for OpenRouter and none
+for Nous. A separate catalog-failure test builds the Image-API-enabled provider
+and preserves that same snapshot/isolation contract when HTTP raises.
+Recorded requests also prove the live parsing path ran rather than its
+offline snapshot fallback, and that Nous never queried `/images/models`.
+Upstream catalog churn must not turn this routing contract into a change detector.
+Production continues to prefer live inventory and use curated metadata as the
+offline snapshot; catalog absence alone does not prove a model's generation
+endpoint or existing explicit overrides are unsupported. Related SDK-wiring,
+accounting and plugin-only resolution tests stub the DeepInfra inventory,
+OpenRouter pricing catalog and models.dev provider catalog respectively, without
+replacing the behavior each test actually asserts.
 
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
@@ -163,11 +187,13 @@ updates cannot discover the host gateway. No runtime safety guard is disabled.
 The desktop installer-ownership fixtures wait for a readiness message from their real
 Python children before checking process arguments or native update ownership. Full
 platform concurrency left a shell wrapper running beyond its former 40 x 25ms
-polling window. The managed-launcher fixture subscribes before launch to the atomic
-terminal-status publication rather than assuming completion within 100 x 25ms.
+polling window. The managed-launcher fixture polls the atomic terminal-status file
+within the existing test budget. macOS directory watches can coalesce changes
+without naming that file, even after it exists, so events alone cannot prove
+publication. Waiting on the file also covers publication before exec returns.
 The existing finite Vitest budgets and all argv, log, status, mode and native-ownership
 assertions remain intact. Three-second startup/update injection reproduces both
-former failures and passes with event-based synchronization, without retries.
+former failures and passes with condition-based synchronization, without retries.
 The bundled gateway-ticket fixture links the selected Python's base interpreter,
 not its venv executable. A copied venv binary depends on its adjacent `pyvenv.cfg`
 to find the standard library, which is absent in the fake payload. With a copied
@@ -496,6 +522,17 @@ descendants. It mocks the pane and needs no tmux, so it lives outside
 `tests/e2e/core/cli_tmux`, where every suite must call `require_tmux()`.
 Retire these driver adaptations when upstream supplies equivalent bounded,
 condition-based synchronization and output capture.
+
+Scripted CLI homes also persist `sessions.auto_prune: false`. An undecided
+preference lets hosted free-disk pressure introduce a synchronous startup
+question once a prior launch has cached its reclaim estimate, before resume
+recap or the composer. Runs 41272803389 and 41264196401 captured that offer at
+6.7 GB free of 71.6 GB while the unchanged 120-second resume-ready wait expired.
+The preference answers unrelated onboarding without enabling deletion or
+changing production startup. Keep both home factories decided; preserve every
+tmux journey, assertion and deadline. Retire this fixture choice only when the
+accepted upstream scripted homes have equivalent startup isolation.
+Contract tests: `tests/ci/test_tmux_home_startup_offers.py`.
 
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a

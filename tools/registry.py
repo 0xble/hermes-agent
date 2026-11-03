@@ -233,6 +233,8 @@ class ToolEntry:
     # explicitly defer an eager tool by name.
     eager: bool = False
     execution_timeout: float | None = None
+    # Plugin tools share their manifest's content-observation privacy admission.
+    incognito_safe: bool = True
 
 
 class _PluginOverridePolicy:
@@ -719,7 +721,7 @@ class ToolRegistry:
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: float | None = None,
         dynamic_schema_overrides: Callable | None = None, override: bool = False,
-        scope: Optional[str] = None, eager: bool = False, execution_timeout: float | None = None):
+        scope: Optional[str] = None, eager: bool = False, execution_timeout: float | None = None, incognito_safe: bool | None = None):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
@@ -785,6 +787,7 @@ class ToolRegistry:
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides, eager=bool(eager),
+                incognito_safe=(owner is None if incognito_safe is None else incognito_safe is True),
                 execution_timeout=execution_timeout)
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
@@ -956,9 +959,17 @@ class ToolRegistry:
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
         results normalized, every exception returned as ``{"error": ...}``."""
+        from agent.incognito import tool_refusal
+        refusal = tool_refusal(name, args)
+        if refusal:
+            return tool_error(refusal)
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        if not entry.incognito_safe:
+            from agent.incognito import is_incognito
+            if is_incognito(kwargs.get("session_id")):
+                return tool_error("This plugin tool is unavailable in incognito mode.")
         try:
             # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``

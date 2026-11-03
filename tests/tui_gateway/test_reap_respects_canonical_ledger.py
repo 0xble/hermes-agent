@@ -10,7 +10,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
+from hermes_state_runtime import admit_session_input, claim_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tui_gateway.server import _teardown_session
 
 
@@ -84,7 +85,7 @@ async def test_reap_of_a_segment_of_an_adopted_conversation_respects_the_owner_l
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local_recovery import reopen_local_session
     from gateway.session_local_title import resolve_titled_session

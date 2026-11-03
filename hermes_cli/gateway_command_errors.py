@@ -1,8 +1,8 @@
-"""User-facing copy for ``hermes gateway start/stop/restart`` failures on systemd hosts.
+"""User-facing copy for ``hermes gateway`` service failures.
 
 ``hermes_cli/gateway.py`` is a facade; this sibling owns the small exception -> guidance table so
-the most common Linux service failures (``systemctl`` exited non-zero, or there is no ``systemctl``
-at all) end as a next step instead of a traceback.
+expected systemd failures and explicit launchd inspection refusals end as a next step
+instead of a traceback. Unexpected runtime errors remain visible.
 """
 
 from __future__ import annotations
@@ -39,9 +39,18 @@ def _verb_for(exc: subprocess.CalledProcessError) -> str:
     return "start"
 
 
+class LaunchdServiceError(RuntimeError):
+    """An inspectable launchd refusal; CLI callers show guidance rather than a traceback."""
+
+
+class GatewayInstallError(RuntimeError):
+    """An expected install refusal that the gateway CLI can present without a traceback."""
+
+
 def explain_service_failure(exc: BaseException) -> list[str] | None:
-    """Lines to print for a systemd service failure escaping the gateway command, or None
-    when *exc* is not one this module knows how to explain (callers re-raise)."""
+    """Lines for known service/install failures; None preserves unexpected exceptions."""
+    if isinstance(exc, (GatewayInstallError, LaunchdServiceError)):
+        return [str(exc)]
     if isinstance(exc, SystemctlUnavailableError):
         return list(_NO_SYSTEMCTL_LINES)
     if isinstance(exc, subprocess.CalledProcessError):

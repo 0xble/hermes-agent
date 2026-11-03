@@ -2914,6 +2914,12 @@ def run_one_job(
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
+    # Recheck after executor wait AND inside the detached process, before any job code.
+    from cron.missed_windows import skip_before_start
+    skipped = skip_before_start(job)
+    if skipped:
+        finish_execution(execution_id, success=False, error=skipped, output=skipped)
+        return True
     note_cron_execution(job)
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     from cron.scheduler_control import register_control
@@ -3220,7 +3226,7 @@ def _run_delivery_outcome(d: _RunDelivery) -> str:
 
 
 def _save_compose_deliver(
-    d: _RunDelivery, fence: _FireOwnership, final_response: str, output: str, *,
+    d: _RunDelivery, fence: _FireOwnership, final_response: str, output: Optional[str], *,
     adapters, loop, verbose: bool, execution_token, commit_result=None,
 ) -> None:
     """Save output, compose the notice and deliver it (both side effects run under the fire-claim
@@ -3231,7 +3237,7 @@ def _save_compose_deliver(
             raise _FireClaimLostDuringSideEffect
         # remove_job() already deleted this job's output dir; saving would re-create an orphan.
         output_file = (
-            None if self_removal_delivery_allowed(job["id"])
+            None if output is None or self_removal_delivery_allowed(job["id"])
             else save_job_output(job["id"], output))
     if verbose and output_file is not None:
         logger.info("Output saved to: %s", output_file)
@@ -3425,6 +3431,8 @@ def _finish_completed_run(
         # If the drain completed before this run's bookkeeping, now that the
         # canonical completion id is stored, settle the job record as well.
         settle_quietly(job["id"], execution_id)
+    from cron.scheduler_authority import retire_completed_journal
+    retire_completed_journal(job['id'], execution_id)
     return True
 
 
@@ -3572,9 +3580,9 @@ def _run_one_job_body(
         _fire_scope_tokens = _install_fire_secret_scope()
         # Commit a finite one-shot's dispatch BEFORE its side effect so a tick dying mid-run cannot
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
-        # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
-        # fire_due) get at-most-times semantics. See #38758.
         if not claim_dispatch(job["id"]):
+            from cron.oneshot_retirement import release_retirement_claims
+            release_retirement_claims(job)
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]))

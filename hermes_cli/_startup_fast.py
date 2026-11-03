@@ -29,6 +29,7 @@ import sys
 
 __all__ = [
     "active_profile_may_override_home",
+    "argv_is_gateway_run",
     "container_mode_may_be_active",
     "ensure_project_root_on_path",
     "is_container_startup_environment",
@@ -55,6 +56,12 @@ def _read_text(path: str) -> str | None:
 def project_root_str() -> str:
     """Repo root as a str — the single source for main.py's PROJECT_ROOT."""
     return os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+
+def argv_is_gateway_run(argv: list) -> bool:
+    """Require the adjacent gateway/run pair, not unrelated argv occurrences."""
+    from itertools import pairwise
+    return any(a == "gateway" and b == "run" for a, b in pairwise(argv))
 
 
 def normalize_hermes_home_env() -> None:

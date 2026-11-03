@@ -83,7 +83,7 @@ def main():
         result = asyncio.run(run_command(shlex.join(sys.argv[1:])))
         print(json.dumps(result, ensure_ascii=False))
         return 1 if result.get("error") or (result.get("value") or {}).get("ok") is False else 0
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

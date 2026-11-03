@@ -145,7 +145,7 @@ _LIVE_LEDGER_SQL = """SELECT 1 FROM session_admissions WHERE target_session_id=?
     UNION ALL SELECT 1 FROM worker_executions WHERE session_id=? AND status IN ('registered','running','unknown') LIMIT 1"""
 
 
-def retire_sessions(conn, session_ids, *, expiring=()):
+def retire_sessions(conn, session_ids, *, expiring=(), defer_messages=False):
     """The complete deletion fence for ids that are being deleted in this transaction.
 
     Terminal receipts alone are not enough: without the ``RETIRED_PREFIX`` marker an exact
@@ -155,7 +155,8 @@ def retire_sessions(conn, session_ids, *, expiring=()):
     ``delete_session*``, prunes and sweeps) must publish the whole fence, so it lives here once.
     The marker of an id in *expiring* (a housekeeping sweep's) ages out at the retry horizon."""
     from hermes_state_media import retire_spillover
-    retire_spillover(conn, session_ids)  # before the caller's DELETEs take the pointers away
+    if not defer_messages:
+        retire_spillover(conn, session_ids)  # before the caller's DELETEs take the pointers away
     retire_terminal_receipts(conn, session_ids)
     retire_mutation_receipts(conn, session_ids)
     retire_routes(conn, session_ids, expiring=expiring)
@@ -233,7 +234,7 @@ def _derived_api_sessions(conn, session_ids):
         (json.dumps(list(session_ids)),))}
 
 
-def retire_prunable(conn, session_ids):
+def retire_prunable(conn, session_ids, *, defer_messages=False):
     """Sweep variant of :func:`retire_sessions`: fence the idle sessions and return only those ids.
     A session with live or unknown work is skipped, so one busy row cannot abort a whole
     prune/empty-session sweep (explicit deletes still refuse with ``session_busy``). A local
@@ -254,7 +255,7 @@ def retire_prunable(conn, session_ids):
         return swept.issuperset(whole) and not any(conn.execute(_LIVE_LEDGER_SQL, (x, x)).fetchone() for x in whole)
     quiet = [sid for sid in session_ids if removable(sid)]
     derived |= _derived_api_sessions(conn, quiet)
-    retire_sessions(conn, quiet, expiring=[sid for sid in quiet if sid not in derived])
+    retire_sessions(conn, quiet, expiring=[sid for sid in quiet if sid not in derived], defer_messages=defer_messages)
     return quiet
 
 
@@ -262,13 +263,11 @@ def delete_in_transaction(db, conn, session_id, payload):
     from hermes_state_mutation_guards import require_idle, delete_targets
     targets = delete_targets(conn, session_id)
     require_idle(db, conn, targets)
-    retire_sessions(conn, targets)
+    retire_sessions(conn, targets, defer_messages=True)
     for sid in targets:
         db._bump_conversation_generation(conn, sid, 'session_reset')
-        conn.execute('UPDATE sessions SET parent_session_id=NULL, runtime_revision=runtime_revision+1 WHERE parent_session_id=?', (sid,))
-        conn.execute('DELETE FROM messages WHERE session_id=?', (sid,))
-    conn.executemany('DELETE FROM sessions WHERE id=?', [(sid,) for sid in targets])
-    db._delete_unreferenced_system_prompts(conn)
+    from hermes_state_deletion import stage_delete
+    stage_delete(conn, targets)
     return set(), {'deleted_ids': targets}
 
 
@@ -290,6 +289,11 @@ def _mark_retired(conn, key, *, expires, **fields):
     # A permanent marker without ``own`` (an earlier release's, maybe another profile's shared
     # fence) stays unscoped: it is the only fence of that profile's route. An earlier release's
     # sweep marker came only from this store's own sweep, so it is replaced as written.
+    if conn.execute("SELECT 1 FROM state_meta WHERE key=? AND json_valid(value) "
+                    "AND json_type(value, '$.cleanup')='object'", (key,)).fetchone():
+        if not expires:
+            conn.execute("UPDATE state_meta SET value=json_remove(value, '$.expires') WHERE key=?", (key,))
+        return  # another sweep must not erase unfinished physical reclamation
     value = {'retired_at': time.time(), **fields}
     if expires:
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE '
@@ -405,7 +409,8 @@ _EXPIRED = "json_valid(value) AND json_extract(value, '$.retired_at') < ?"
 
 def _reclaim_expired(conn, prefix, cutoff):
     """Drop the sweep (``expires``) markers under *prefix* retired before *cutoff*."""
-    conn.execute(f"DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED} AND json_extract(value, '$.expires')",
+    conn.execute(f"DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED} AND json_extract(value, '$.expires') "
+                 "AND json_type(value, '$.cleanup') IS NULL",
                  (prefix + '*', cutoff))
 
 

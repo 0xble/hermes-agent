@@ -46,7 +46,7 @@ def test_config_credentials_recover_only_exact_source(tmp_path, monkeypatch):
 async def test_config_creation_retry_does_not_rebind_current_credentials(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from gateway import run

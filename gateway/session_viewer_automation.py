@@ -96,6 +96,7 @@ def _special(mgr, kind, target, call, args, kwargs):
         except Exception:  # health: allow BLE001 -- the judge degrades to no background block, as main's hook did
             processes, delegations = None, 0
         return mgr.evaluate_after_turn(str((args or [""])[0] or ""), user_initiated=True,
+                                       turn_started_at=kwargs.get("turn_started_at"),
                                        background_processes=processes, active_delegations=delegations)
     if kind == "goal" and call in {"set", "replace"} and isinstance(kwargs.get("contract"), dict):
         from hermes_cli.goals import GoalContract

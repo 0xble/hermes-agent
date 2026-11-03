@@ -6,6 +6,7 @@ reads its preview; the owner deletes through ``session.prune`` with the housekee
 path, which keeps a retained reset child's logical owner. A REAL foreign process holds the store,
 as the gateway does; the owner end is the production ``AuthorityConnection`` dispatch.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import subprocess
 import sys
 import time
@@ -49,7 +50,7 @@ def _connection(authority, *, operator, native=True):
 def owned_store(monkeypatch, tmp_path):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     db = SessionDB(db_path=tmp_path / 'state.db')
-    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
     retired = []
     runner = SimpleNamespace(_draining=False, session_store=SimpleNamespace(retire_runtime_sessions=retired.extend))
     authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='owner', db=db, epoch=epoch)

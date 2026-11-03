@@ -2,10 +2,8 @@
 from types import SimpleNamespace
 
 from hermes_state import SessionDB
-from hermes_state_runtime import (
-    admit_session_input, begin_runtime_epoch, claim_session_input,
-    recover_session_inputs,
-)
+from hermes_state_runtime import admit_session_input, claim_session_input, recover_session_inputs
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from gateway.session_results import retain_result
 from gateway.session_bot import _result
 

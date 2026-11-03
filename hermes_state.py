@@ -998,7 +998,7 @@ class SessionDB(
         self._close_read_conn(conn)
 
     @contextmanager
-    def _read_ctx(self, *, reopen: bool = True) -> Iterator[sqlite3.Connection]:
+    def _read_ctx(self, *, reopen: bool = True, resident_only: bool = False) -> Iterator[sqlite3.Connection]:
         """Yield a connection for read-only statements: a pooled read-only
         connection with NO lock under WAL; otherwise (non-WAL, open failure,
         ceiling reached) the writer connection under self._lock — deliberate
@@ -1006,6 +1006,16 @@ class SessionDB(
         scope overrides that fallback for all of its reads, including hydration.
         ``reopen=False``: a read after ``close()`` raises instead of reopening the
         writer (an optional reader must not hold a home that is being deleted)."""
+        if resident_only:
+            if not self._lock.acquire(blocking=False):
+                raise RuntimeError("Resident session read unavailable")
+            try:
+                if self._conn is None:
+                    raise RuntimeError("Resident session read unavailable")
+                yield self._conn
+            finally:
+                self._lock.release()
+            return
         from hermes_state_search_runtime import current_search
         operation = current_search(self)
         if operation is not None:
@@ -1073,20 +1083,26 @@ class SessionDB(
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
         *, session_id: Optional[str] = None, input_rows: Optional[int] = None,
+        session_ids: Any = (), skip_result: Any = None,
     ) -> T:
         """Run *fn(conn)* in a write transaction; see :meth:`_execute_write_marked`."""
         with _storage_write_in_progress(), measure_write():
-            return self._execute_write_marked(fn, patience_s, session_id=session_id, input_rows=input_rows)
+            return self._execute_write_marked(
+                fn, patience_s, session_ids=session_ids, skip_result=skip_result, session_id=session_id, input_rows=input_rows)
 
     def _execute_write_marked(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
         *, session_id: Optional[str] = None, input_rows: Optional[int] = None,
+        session_ids: Any = (), skip_result: Any = None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
         immediately; on locked/busy the Python lock is released, a jitter slept,
         and the WHOLE callback retried — *fn* must stay idempotent under retry."""
+        # Metrics and privacy share the same session identity. Transcript transactions
+        # pass the singular form, while batches pass session_ids.
+        session_ids = (session_ids, session_id)
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
@@ -1098,7 +1114,10 @@ class SessionDB(
         # settlement unknown and must propagate — this helper owns non-idempotent transcript/counter
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
+        from hermes_state_incognito import private_write, write_admission
         while True:
+            if private_write(session_ids):
+                return cast(T, skip_result)
             self._raise_if_db_corrupt(storage=True)
             # NOTE: the AUTHORITATIVE replaced/generation probe runs INSIDE the lock below.
             # close() mutates _conn and _db_sidecar_identity under that same lock, ending the
@@ -1115,11 +1134,15 @@ class SessionDB(
             fn_started = False
             try:
                 acquisition_started = time.monotonic()
-                with state_lock(self._lock, db_path=self.db_path, deadline=deadline):
+                with state_lock(self._lock, db_path=self.db_path, deadline=deadline), write_admission(session_ids) as admitted:
+                    if not admitted:
+                        return cast(T, skip_result)
                     if generation_clean:
                         self._raise_if_db_generation_flagged()
                     else:
                         self._raise_if_db_replaced()
+                    if private_write(session_ids):
+                        return cast(T, skip_result)
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     conn = cast(sqlite3.Connection, self._conn)  # reopen succeeded under the writer guard
@@ -1203,13 +1226,15 @@ class SessionDB(
 
     def _write_sql(
         self, sql: str, params: Any = (), *, many: bool = False, patience_s: Optional[float] = None,
+        session_ids: Any = (),
     ) -> None:
         """Run one INSERT/UPDATE/DELETE through ``_execute_write``."""
         def _do(conn):
             (conn.executemany if many else conn.execute)(sql, params)
-        self._execute_write(_do, patience_s=patience_s)
+        self._execute_write(_do, patience_s=patience_s, session_ids=(session_ids, params,))
 
-    def _write_rowcount(self, sql: str, params: Any = (), *, patience_s: Optional[float] = None) -> int:
+    def _write_rowcount(self, sql: str, params: Any = (), *, patience_s: Optional[float] = None,
+                        session_ids: Any = ()) -> int:
         """Run one UPDATE/DELETE through ``_execute_write``; return rows changed
         (``SELECT changes()`` when the driver reports None / negative)."""
         def _do(conn):
@@ -1217,7 +1242,7 @@ class SessionDB(
             if rowcount is None or rowcount < 0:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
             return rowcount
-        return self._execute_write(_do, patience_s=patience_s)
+        return self._execute_write(_do, patience_s=patience_s, session_ids=(session_ids, params,), skip_result=0)
 
     def _read_one(self, sql: str, params: Any = ()) -> Optional[sqlite3.Row]:
         """``fetchone()`` of one read-only statement via ``_read_ctx``."""
@@ -1811,6 +1836,9 @@ class SessionDB(
     def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:
         """Upsert state_meta[key]; with ``cursor`` the write is inline (the caller already holds a
         transaction — nesting BEGIN IMMEDIATE would deadlock)."""
+        from hermes_state_incognito import private_write
+        if private_write((key, value)):
+            return
         sql = (
             "INSERT INTO state_meta (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
@@ -1841,7 +1869,7 @@ class SessionDB(
             retagged = cursor.rowcount or 0
             self.set_meta(gate, "1", cursor=cursor)
             return retagged
-        return self._execute_write(_do)
+        return self._execute_write(_do, skip_result=0)
 
     def is_kanban_owned_session(self, session_id: str) -> bool:
         """True when this session — or any segment of the compression lineage a resume would

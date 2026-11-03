@@ -6,14 +6,16 @@ import sys
 
 import psutil
 
+from agent import runtime_session_store
 from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC
+from hermes_state_errors import GatewayOwnerRestartError
 from tests.gateway.fixtures.agent_persistence_worker import writable_fds
 
 
 def _publish(path, text):
     """Create the receipt by rename: the parent polls for EXISTENCE, then reads it at once."""
     tmp = Path(str(path) + '.tmp')
-    tmp.write_text(text)
+    tmp.write_text(text, encoding='utf-8')
     os.replace(tmp, path)
 
 
@@ -58,15 +60,22 @@ def main():
         if command.get('restart'):
             _publish(command['ready'], json.dumps(dict(session_id=agent.session_id, epoch=store.scope['epoch'])))
             assert sys.stdin.readline().strip() == 'outage'
+            # The parent waits for exhaustion before starting the replacement owner.
+            patience = runtime_session_store.OWNER_RESTART_TIMEOUT
+            runtime_session_store.OWNER_RESTART_TIMEOUT = 2.0
             try:
                 store.touch_session_activity(agent.session_id, description='surviving rotated worker')
-                raise AssertionError('owner outage accepted a mutation')
-            except Exception:
+            except GatewayOwnerRestartError:
                 assert len(store.journal['pending']) == 1
+            else:
+                raise AssertionError('owner outage accepted a mutation')
+            finally:
+                runtime_session_store.OWNER_RESTART_TIMEOUT = patience
             _publish(command['outage'], 'pending')
             assert sys.stdin.readline().strip() == 'adopt'
             try:
-                store.retry_pending()
+                # Test the owner's fence directly: the store now authenticates adoption itself.
+                rpc('worker.persist', **store.scope, **store.journal['pending'][0])
                 raise AssertionError('new owner accepted old epoch')
             except Exception as exc:
                 assert 'stale_epoch' in str(exc), exc

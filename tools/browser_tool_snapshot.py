@@ -38,6 +38,9 @@ def _store_full_snapshot(snapshot_text: str) -> Optional[str]:
     backend. The stored copy is force-redacted (page-rendered secrets must not
     hit disk unmasked) and named by content hash so identical snapshots dedupe.
     """
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return None
     try:
         import hashlib
         from hermes_constants import get_hermes_dir

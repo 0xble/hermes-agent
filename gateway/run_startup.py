@@ -1233,6 +1233,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 write_runtime_status,
                 gateway_state="starting",
                 exit_reason=None,
+                # A previous run's lost epoch is not this one's: this start begins its own.
+                runtime_epoch={"status": "ok"},
                 clear_profile_platforms=True,
                 reload_existing=True,
                 wait_timeout=2.0,
@@ -2099,7 +2101,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         """Start the gateway and all configured platform adapters."""
         startup_succeeded = False
         try:
-            result = await self._start_impl()
+            from gateway.run_client_owned import start_runner_for_owner
+            result = await start_runner_for_owner(self)
             startup_succeeded = bool(result and getattr(self, "_running", False))
             return result
         except Exception:
@@ -2123,7 +2126,6 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             await self._start_flush_runtime_status()
 
     async def _start_impl(self) -> bool:
-        logger.info("Starting Hermes Gateway...")
         # Until the previous-run recovery decision completes, shutdown must not write a fresh
         # clean receipt: an abort during adapter startup would otherwise turn an unclean boot into
         # a clean one on the next restart.

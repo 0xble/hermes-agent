@@ -22,7 +22,7 @@ async def test_relayed_modal_admitted_only_with_reader_proof(tmp_path, monkeypat
     from gateway.platforms.base import SendResult
     from gateway.relay.adapter import RelayAdapter
     from gateway.relay.ws_transport import WebSocketRelayTransport, _passthrough_from_wire
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from tests.gateway.relay.test_relay_passthrough import _desc
     from tests.waiting import async_wait_until
 

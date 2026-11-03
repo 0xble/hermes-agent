@@ -248,6 +248,9 @@ def create_live_transcripts(
     same resolved root, so pinned homes clean their own stale dirs.
     """
     n = len(task_list)
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return None, [None] * n, []
     prune_stale_live_dirs(root=live_transcript_root(home))  # best-effort; never raises
     with _best_effort("creation"):
         # Same id shape as async_delegation's so the dir name matches the handle.

@@ -141,40 +141,6 @@ class TestForegroundTimeoutCap:
         assert "error" not in result or result["error"] is None
 
 
-class TestHeavySlotExpiryPromotion:
-    def test_single_heavy_command_is_resumed_in_background_without_retry(self):
-        """A bounded not-started result preserves the command instead of asking the model to re-run it."""
-        from tools.terminal_tool import terminal_tool
-
-        mock_env = MagicMock()
-        mock_env.execute.return_value = {"output": "not started", "returncode": 75}
-        wrapped = []
-        background = json.dumps({
-            "output": "Background process started", "exit_code": None, "error": None,
-            "session_id": "proc_heavy", "notify_on_complete": True,
-        })
-
-        def fake_wrap(command, **kwargs):
-            wrapped.append((command, kwargs.get("max_wait_seconds")))
-            return f"wrapped-{len(wrapped)}"
-
-        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
-             patch("tools.terminal_tool._start_cleanup_thread"), \
-             patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-             patch("tools.terminal_tool._last_activity", {"default": 0}), \
-             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
-             patch("tools.terminal_tool.can_promote_expired_wait", return_value=True), \
-             patch("tools.terminal_tool.wrap_heavy_command", side_effect=fake_wrap), \
-             patch("tools.terminal_tool.spawn_background_process", return_value=background) as spawn:
-            result = json.loads(terminal_tool(command="pytest -q tests", timeout=180))
-
-        assert result["error"] is None
-        assert result["promoted_from_heavy_slot"].startswith("The foreground heavy-slot wait expired")
-        assert wrapped == [("pytest -q tests", 60), ("pytest -q tests", None)]
-        assert spawn.call_args.kwargs["command"] == "wrapped-2"
-        assert spawn.call_args.kwargs["notify_on_complete"] is True
-
-
 class TestPromotionKeepsTheDetachmentGuard:
     def test_over_cap_timeout_with_shell_backgrounding_is_still_refused(self):
         """Independent-review witness: a promoted `cmd &` started a tracked shell that exited at once

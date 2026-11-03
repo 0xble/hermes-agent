@@ -29,7 +29,9 @@ def state(tmp_path, monkeypatch):
 
 def _runner(state, *, target_route=True, request_success=True, send_success=True, send_error=None,
             send_retryable=True, injection_result=True, target_origin=True):
+    from gateway.run import GatewayRunner
     from gateway.run_session_controls import GatewaySessionControlsMixin
+    from gateway.run_inbound import GatewayInboundMixin
     from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
     from gateway.run_goals import GatewayGoalsMixin
     from gateway.run_plugin_injection import GatewayPluginInjectionMixin
@@ -63,6 +65,11 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
 
     class Runner(GatewaySessionControlsMixin, GatewayGoalsMixin, GatewayPluginInjectionMixin,
                  GatewayBackgroundAdmissionMixin):
+        _hm_preflight_event = GatewayInboundMixin._hm_preflight_event
+        _sessions_map = GatewayRunner._sessions_map
+        _session_state = GatewayRunner._session_state
+        _peek_session_state = GatewayRunner._peek_session_state
+
         session_store = SimpleNamespace(
             lookup_by_session_id=lambda sid: {"target": target, "requester": requester}.get(sid)
         )
@@ -727,7 +734,7 @@ async def test_autonomous_goal_outbox_attributes_both_notices_to_autonomy(
     manager = GoalManager("target")
     manager.set("old objective")
     if action == "resume":
-        manager.pause()
+        manager.pause(by="agent")  # the agent's own pause: an autonomous resume never lifts a user one
     result = session_controls.apply_control(
         "goal", action, "target", requester_sid="requester", reason="wait for tests",
         payload={"goal": "new objective"} if action == "replace" else None,
@@ -750,8 +757,13 @@ async def test_autonomous_goal_outbox_attributes_both_notices_to_autonomy(
     assert len(runner.adapter.sends) == len(runner.injections) == 1
     target = runner.adapter.sends[0][1]
     requester = runner.injections[0]["content"]
-    assert "(applied autonomously without approval)" in target
-    assert "was applied autonomously without approval." in requester
+    if action == "pause":
+        expected = "Goal waiting 15 min (autonomous timed wait, no approval); still active"
+        assert expected in target and expected in requester
+        assert "paused" not in target + requester
+    else:
+        assert "(applied autonomously without approval)" in target
+        assert "was applied autonomously without approval." in requester
     assert "Telegram" not in target + requester
     assert "your words" not in target + requester
     assert runner.adapter.requests == []
@@ -761,6 +773,48 @@ async def test_autonomous_goal_outbox_attributes_both_notices_to_autonomy(
     if action == "replace":
         assert "Affected: goal: old objective\nProposed goal: new objective" in target
         assert "Affected: goal: old objective\nProposed goal: new objective" in requester
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quoted", [False, True])
+async def test_goal_pause_notices_follow_committed_outcome_after_reload(state, quoted):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    GoalManager("target").set("watch the build")
+    quote = "Pause the target goal."
+    if quoted:
+        state.append_message("requester", "user", quote)
+    result = session_controls.apply_control(
+        "goal", "pause", "target", requester_sid="requester",
+        user_quote=quote if quoted else "", reason="wait for tests",
+    )
+    assert result["ok"] and result["status"] == "applied"
+    # Drain the durable outbox rather than rendering the in-memory return value.
+    runner = _runner(state)
+    await runner._drain_session_controls()
+    await runner._drain_session_controls()
+    assert len(runner.adapter.sends) == len(runner.injections) == 1
+    target, requester = runner.adapter.sends[0][1], runner.injections[0]["content"]
+    durable = load_goal("target")
+    if quoted:
+        assert durable.status == "paused" and not durable.waiting_until
+        assert target == '⊘ Goal paused by Untitled session (requester) (your words: "Pause the target goal.")'
+        assert requester == (
+            "✓ Your request to goal pause in Untitled session (target) "
+            "was applied using your quoted words."
+        )
+    else:
+        assert durable.status == "active" and durable.waiting_seconds == 900
+        assert durable.paused_reason is None
+        notice = "Goal waiting 15 min (autonomous timed wait, no approval); still active"
+        assert target == f"◷ {notice}. Requested by Untitled session (requester)."
+        assert requester == f"✓ {notice} in Untitled session (target)."
+        assert "paused" not in target + requester
+        assert "Telegram" not in target + requester
+    assert session_controls.pending_outbox() == []
 
 
 @pytest.mark.parametrize("authority", [{}, {"via": "future-authority"}])

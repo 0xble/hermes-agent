@@ -1,6 +1,7 @@
 """A deleted session's admission tombstones age out after the retry horizon; the receipts and
 pointers that name them do not. None of them may turn into ``storage_unavailable``: a Bot receipt
 re-read at every owner start would otherwise abort the gateway on every boot."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import asyncio
 import time
 from types import SimpleNamespace
@@ -30,7 +31,7 @@ def _delete(db, epoch, session_id, *, days_ago):
 
 def _receipt_then_deleted(tmp_path, *, status, days_ago, **fields):
     db = SessionDB(tmp_path / "state.db")
-    epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+    epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
     db.create_session("botchat", source="cli")
     admission = rt.admit_session_input(db, epoch=epoch, principal_id="owner", session_id="botchat",
                                        request_id="bot:" + KEY, payload={"text": "ping"})

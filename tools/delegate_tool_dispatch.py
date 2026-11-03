@@ -211,7 +211,9 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
         results.extend(batch.refused)
         results.sort(key=lambda r: r["task_index"])
     update_manifest_statuses(batch.live_deleg_id, results, home=batch.live_home)
-    finish_delegation_unit(batch.task_list, results, background=not honor_parent_interrupt)
+    from agent.incognito import is_incognito
+    if getattr(batch.parent_agent, "incognito", False) is not True and not is_incognito():
+        finish_delegation_unit(batch.task_list, results, background=not honor_parent_interrupt)
 
     combined: dict[str, Any] = {"results": results, "total_duration_seconds": total_duration}
     # Runtime truth about children's background processes, as prose the parent can't miss inside the JSON.
@@ -508,7 +510,7 @@ def _dispatch_background(batch: _Batch) -> str:
 
     units = [replace(unit, refused=[]) for unit in _units_of(batch)]
     dispatched: list[tuple[_Batch, str]] = []
-    queued: List[tuple[_Batch, str]] = []
+    queued: list[tuple[_Batch, str]] = []
     inline_results: list[dict] = []
     # Reserve one capacity identity for the whole call before the first unit is
     # admitted. This keeps a queued call's later units in the same bounded slot
@@ -605,9 +607,11 @@ def _run_batch(batch: _Batch, background: bool) -> str:
     if not background and (rejection := _reject_inline_recovery(batch)):
         return rejection
     # Every unit of this call shares task_list, so its last joined unit emits the call's one row.
-    begin_delegation_run(
-        batch.task_list, subagents=len(batch.children), depth=getattr(batch.parent_agent, "_delegate_depth", 0) + 1,
-    )
+    from agent.incognito import is_incognito
+    if getattr(batch.parent_agent, "incognito", False) is not True and not is_incognito():
+        begin_delegation_run(
+            batch.task_list, subagents=len(batch.children), depth=getattr(batch.parent_agent, "_delegate_depth", 0) + 1,
+        )
     if background:
         return _dispatch_background(batch)
     return json.dumps(_execute_and_aggregate(batch), ensure_ascii=False)

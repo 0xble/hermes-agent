@@ -18,7 +18,7 @@ def test_messaging_then_authenticated_ws_reuses_live_agent(tmp_path):
     state.mkdir()
     # A fresh interpreter keeps import-time profile caches and background workers
     # away from both the user's state and pytest's process-global fixtures.
-    env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "LANG", "TZ") if key in os.environ}
+    env = {key: os.environ[key] for key in ("HERMES_TEST_ISOLATION", "PATH", "SYSTEMROOT", "LANG", "TZ") if key in os.environ}
     env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state),
                PYTHONPATH=str(repo), PYTHONUNBUFFERED="1")
     result = subprocess.run(
@@ -40,7 +40,7 @@ def test_native_queue_survives_owner_kill_without_replaying_unknown(tmp_path):
     home, state = tmp_path / 'home', tmp_path / 'state'
     home.mkdir()
     state.mkdir()
-    env = {key: os.environ[key] for key in ('PATH', 'LANG', 'TZ') if key in os.environ}
+    env = {key: os.environ[key] for key in ('HERMES_TEST_ISOLATION', 'PATH', 'LANG', 'TZ') if key in os.environ}
     env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state),
                PYTHONPATH=str(repo), PYTHONUNBUFFERED='1', AUTHORITY_PROBE_MODE='crash')
     command = [sys.executable, str(Path(__file__).parent / 'fixtures' / 'shared_authority_peer.py')]

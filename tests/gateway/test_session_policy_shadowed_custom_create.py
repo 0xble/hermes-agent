@@ -22,7 +22,7 @@ async def test_session_create_with_the_entrys_bare_pick_freezes_its_custom_route
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_state_local import local_receipt
 
     for var in ('DEEPSEEK_API_KEY', 'OPENAI_API_KEY'):
@@ -67,7 +67,7 @@ async def test_only_the_held_entrys_own_key_keeps_its_route(tmp_path, monkeypatc
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_state_local import local_receipt
 
     for var in ('DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY', 'OPENAI_API_KEY'):

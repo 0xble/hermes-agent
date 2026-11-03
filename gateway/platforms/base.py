@@ -1890,19 +1890,19 @@ def _record_absorbed_pending_event(existing: MessageEvent, event: MessageEvent) 
     absorbed = getattr(existing, "_hermes_absorbed_events", None)
     if not isinstance(absorbed, list):
         absorbed = []
-        setattr(existing, "_hermes_absorbed_events", absorbed)
+        existing._hermes_absorbed_events = absorbed
     for candidate in (event, *getattr(event, "_hermes_absorbed_events", ())):
         if candidate is not existing and not any(item is candidate for item in absorbed):
             absorbed.append(candidate)
         if candidate is not existing:
             # Recovery may be watching an absorbed event while the successor persists the
             # merged slot. Keep the live successor reachable for its durability probe.
-            setattr(candidate, "_hermes_absorbed_into", existing)
+            candidate._hermes_absorbed_into = existing
     recovery_id = getattr(event, "_hermes_recovery_id", None)
     if recovery_id is not None and getattr(existing, "_hermes_recovery_id", None) is None:
         # A recovered event may be consumed by this pending successor. Carry only the
         # persistence/durability key; event.message_id and source.message_id remain transport ids.
-        setattr(existing, "_hermes_recovery_id", recovery_id)
+        existing._hermes_recovery_id = recovery_id
 
 
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
@@ -2002,6 +2002,58 @@ def resolve_channel_skills(
     return None
 
 
+def track_temporary_notice(event: Any, adapter: Any, result: Any) -> None:
+    """Remember a status notice sent about ``event`` (a busy ack) for deletion once the event's own
+    turn has delivered its reply. A receipt that arrives after that is deleted right away."""
+    message_id = getattr(result, "message_id", None) if getattr(result, "success", False) else None
+    if not message_id:
+        return
+    notice = (adapter, event.source.chat_id, str(message_id))
+    if getattr(event, "_temporary_notices_released", False):
+        task = asyncio.get_running_loop().create_task(_delete_temporary_notices([notice]))
+        _TEMPORARY_NOTICE_TASKS.add(task)
+        task.add_done_callback(_TEMPORARY_NOTICE_TASKS.discard)
+        return
+    notices = getattr(event, "_temporary_notices", None)
+    if notices is None:
+        notices = event._temporary_notices = []
+    notices.append(notice)
+
+
+async def release_temporary_notices(event: Any) -> None:
+    """Delete the status notices sent about ``event``: its own turn is over and its reply delivered."""
+    event._temporary_notices_released = True
+    notices = getattr(event, "_temporary_notices", None) or []
+    event._temporary_notices = []
+    await _delete_temporary_notices(notices)
+
+
+_TEMPORARY_NOTICE_TASKS: set = set()
+
+
+async def _delete_temporary_notices(notices) -> None:
+    for adapter, chat_id, message_id in notices:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(adapter.delete_message(chat_id, message_id), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+
+
+def temporary_cleanups(callback: Any) -> list:
+    """The parts of a (possibly chained or wrapped) post-delivery callback that only delete a turn's
+    temporary messages (marked ``_temporary_cleanup``). A superseded turn runs these and drops the
+    rest: its deferred notices describe a result nobody will see, but its cards must still go."""
+    if not callable(callback):
+        return []
+    if getattr(callback, "_temporary_cleanup", False):
+        return [callback]
+    parts = getattr(callback, "_post_delivery_parts", None)
+    if parts is not None:
+        return [found for part in parts for found in temporary_cleanups(part)]
+    wrapped = getattr(callback, "__wrapped__", None)
+    if wrapped is not None and getattr(wrapped, "_temporary_cleanup", False):
+        return [callback]  # keep the wrapper: it restores the context the cleanup runs under
+    return temporary_cleanups(wrapped)
+
+
 def _split_post_delivery_entry(entry: Any) -> tuple[Optional[int], Any]:
     """``(generation, callback)`` from a post-delivery slot; legacy bare callbacks have no
     generation."""
@@ -2091,11 +2143,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         # Commands accepted while a turn is active but requiring a committed session boundary.
         # Kept separate from ordinary follow-up text so a deferred mutation cannot be merged into
         # or displaced by the one-slot prompt queue.
-        self._deferred_commands: Dict[str, List[tuple[str, int, MessageEvent]]] = {}
+        self._deferred_commands: dict[str, list[tuple[str, int, MessageEvent]]] = {}
         # Monotonic identity for the committed session represented by each session key. A
         # deferred event from an older incarnation must never run after /new, /reset, /stop,
         # shutdown, or any other teardown/replacement path reuses the key.
-        self._session_generations: Dict[str, int] = {}
+        self._session_generations: dict[str, int] = {}
 
         # Consecutive in-band drains per session of the just-dispatched event bouncing straight
         # back into the queue (session busy elsewhere); drives the drain back-off (#123229).
@@ -2119,7 +2171,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: dict[str, Any] = {}
-        self._post_delivery_callbacks_by_generation: Dict[Tuple[str, int], Callable] = {}
+        self._post_delivery_callbacks_by_generation: dict[tuple[str, int], Callable] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
@@ -2155,8 +2207,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if len(queue) >= self._MAX_DEFERRED_COMMANDS_PER_SESSION:
             return None
         generation = self._session_generations.setdefault(session_key, 0)
-        setattr(event, "_deferred_session_key", session_key)
-        setattr(event, "_deferred_generation", generation)
+        event._deferred_session_key = session_key
+        event._deferred_generation = generation
         queue.append((session_key, generation, event))
         return len(queue)
 
@@ -2194,7 +2246,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if (getattr(event, "_deferred_session_key", None) != session_key
                 or getattr(event, "_deferred_generation", None) != generation):
             return
-        setattr(event, "_deferred_parked", True)
+        event._deferred_parked = True
         self._deferred_commands.setdefault(session_key, []).insert(0, (session_key, generation, event))
 
     def resume_deferred_commands(self, session_key: str) -> None:
@@ -2205,7 +2257,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             return
         for _session, _generation, event in queue:
             if getattr(event, "_deferred_parked", False):
-                setattr(event, "_deferred_parked", False)
+                event._deferred_parked = False
         if session_key in self._active_sessions:
             return
         deferred = self._pop_deferred_command(session_key)
@@ -2787,6 +2839,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
+    from gateway.incognito import private_ingress as _private_text_ingress
+
+    @_private_text_ingress
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
@@ -2992,10 +3047,10 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """
         return False
 
-    async def delete_messages(self, chat_id: str, message_ids: List[str]) -> Dict[str, bool]:
+    async def delete_messages(self, chat_id: str, message_ids: list[str]) -> dict[str, bool]:
         """Delete several sent messages; ``{message_id: deleted}``. The default deletes one by one;
         platforms with a batch API override it so cleanup spends one request instead of N."""
-        results: Dict[str, bool] = {}
+        results: dict[str, bool] = {}
         for message_id in message_ids:
             results[str(message_id)] = await self.delete_message(chat_id, message_id)
         return results
@@ -3165,7 +3220,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
 
     async def send_control_request(
         self, chat_id: str, text: str, request_id: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         """Send a session-control approval request; non-button adapters use text fallback."""
         return await self.send(
@@ -3795,6 +3850,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         else:
             owned[(session_key, generation)] = callback
 
+    def claim_post_delivery(self, session_key: str, generation: int | None) -> None:
+        """A deliverer will fire this generation's callback once its reply is sent, so a newer
+        generation's stale sweep must leave it alone until then."""
+        if session_key and generation is not None:
+            _lazy_attr(self, "_post_delivery_claims", set).add((session_key, int(generation)))
+
     @staticmethod
     def _chain_callbacks(*callbacks: Callable) -> Callable[[], Awaitable[None]]:
         """Async wrapper running ``callbacks`` in order with per-callback exception isolation;
@@ -3807,6 +3868,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                         await _result
                 except Exception:
                     logger.debug("Post-delivery callback failed", exc_info=True)
+        _chained._post_delivery_parts = callbacks
         return _chained
 
     def pop_post_delivery_callback(
@@ -4488,6 +4550,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    from gateway.incognito import private_ingress as _private_ingress
+
+    @_private_ingress
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
@@ -4507,6 +4572,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
+        from gateway.incognito import slash_refusal
+        refusal = slash_refusal(event)
+        if refusal is not None:
+            await self.send(event.source.chat_id, refusal, reply_to=event.message_id,
+                            metadata={"thread_id": event.source.thread_id})
+            return
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
@@ -4518,7 +4589,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             from gateway.outbox import store_for, event_kind, transport_id, local_admission_turn
             event_id = transport_id(event)
             if event_id:
-                home = getattr(self.gateway_runner, "_resolve_profile_home_for_source")(event.source)
+                home = self.gateway_runner._resolve_profile_home_for_source(event.source)
                 original = await asyncio.to_thread(
                     store_for(home).lookup, str(event.source.profile or "default"),
                     "telegram", event_id, event_kind(event))
@@ -4795,7 +4866,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
-        metadata: Optional[Dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
+        metadata: Optional[dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None. ``outbox_refused`` ledgers an outbox-covered final after the adapter refused it
@@ -4956,7 +5027,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         record_delivery(result)
 
     async def send_final_ledgered(
-        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
+        self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False, release_marker: bool = True,
         on_refused: Optional[Callable[["SendResult", "BasePlatformAdapter"], Awaitable[None]]] = None,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
@@ -4985,6 +5056,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         try:
             result = await delivery_adapter._send_with_retry(
                 chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+            from gateway.reply_latency import record_first_reply
+            record_first_reply(getattr(event, "_terminal_reply_latency_receipt",
+                                       getattr(event, "_reply_latency_receipt", None)), text_content, result)
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
         # Let records_delivery count the captured result before cancellation propagates,
@@ -5063,55 +5137,19 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
     async def _send_copy_blocks(
-        self, event: MessageEvent, session_key: str, copy_blocks: list[str], metadata: Dict[str, Any],
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], metadata: dict[str, Any],
         record_delivery: Callable, *, attachments_pending: bool = False,
         is_ephemeral_response: bool = False, ephemeral_ttl: int = 0,
     ) -> None:
-        """Deliver copy blocks in source order through the final delivery ledger, without pacing."""
-        previous_send_started = None
-        for index, block in enumerate(copy_blocks):
-            send_started = time.monotonic()
-            if previous_send_started is not None:
-                logger.debug(
-                    "[%s] Copy block %d/%d inter-message start gap: %.3fs",
-                    self.name, index, len(copy_blocks), send_started - previous_send_started)
-            previous_send_started = send_started
-            copy_metadata = dict(metadata)
-            copy_metadata["copy_block"] = True
-            copy_metadata["copy_block_index"] = index
-            copy_metadata["plain"] = True
-            deferred: list = []
-
-            async def _defer_rest(refused, refusing_adapter, _index=index, _metadata=copy_metadata):
-                # A later block must never overtake an undelivered earlier one: the rest wait
-                # in the ledger behind the refused block, and redelivery keeps their order.
-                deferred.extend(await self._defer_copy_blocks(
-                    event, session_key, copy_blocks, _index + 1, _metadata, refusing_adapter,
-                    str(refused.error or "send failed"), is_ephemeral_response=is_ephemeral_response))
-
-            result, delivery_adapter = await self.send_final_ledgered(
-                event, session_key, block, copy_metadata,
-                reply_to=_reply_anchor_for_event(event),
-                is_ephemeral_response=is_ephemeral_response,
-                release_marker=(index == len(copy_blocks) - 1 and not attachments_pending),
-                on_refused=_defer_rest,
-            )
-            record_delivery(result)
-            if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
-                delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
-            if not getattr(result, "success", False):
-                logger.error(
-                    "[%s] Copy block %d/%d failed for %s: %s",
-                    self.name, index + 1, len(copy_blocks), event.source.chat_id,
-                    result.error or "unknown delivery error",
-                )
-                for held in deferred:
-                    record_delivery(held)
-                return
+        from gateway.platforms.base_copy_delivery import _send_copy_blocks
+        await _send_copy_blocks(
+            self, event, session_key, copy_blocks, metadata, record_delivery,
+            attachments_pending=attachments_pending,
+            is_ephemeral_response=is_ephemeral_response, ephemeral_ttl=ephemeral_ttl)
 
     async def _defer_copy_blocks(
         self, event: MessageEvent, session_key: str, copy_blocks: list[str], start: int,
-        metadata: Dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
+        metadata: dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
         *, is_ephemeral_response: bool,
     ) -> list:
         """Ledger blocks ``start..`` as failed, in order, without sending them; one result each."""
@@ -5267,13 +5305,26 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     async def _fire_post_delivery_callback(
         self, session_key: str, generation: int | None,
     ) -> None:
-        """Run the one-shot callback for the generation captured after this handler returned."""
-        _post_cb = self.pop_post_delivery_callback(session_key, generation=generation)
-        if callable(_post_cb):
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                _post_result = _post_cb()
-                if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        """Run the one-shot callback for the generation captured after this handler returned, after
+        any older generation's callback for the session that nothing fired: that turn is over, and its
+        callback (temporary progress cleanup above all) would otherwise be held forever. An older
+        generation a deliverer has claimed (``claim_post_delivery``) is not over: its reply may still
+        be sending, and its own deliverer fires it after that send."""
+        callbacks = []
+        if generation is not None:
+            claims = _lazy_attr(self, "_post_delivery_claims", set)
+            claims.discard((session_key, int(generation)))
+            owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
+            stale = sorted(k for k in owned
+                           if k[0] == session_key and k[1] < int(generation) and k not in claims)
+            callbacks.extend(owned.pop(k) for k in stale)
+        callbacks.append(self.pop_post_delivery_callback(session_key, generation=generation))
+        for _post_cb in callbacks:
+            if callable(_post_cb):
+                with contextlib.suppress(asyncio.TimeoutError, Exception):
+                    _post_result = _post_cb()
+                    if inspect.isawaitable(_post_result):
+                        await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
@@ -5360,7 +5411,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             # Restart recovery follows session-task successors. Keep the event that each shared
             # background task actually consumes so a merged pending-slot event can report its
             # terminal result back to the parked recovery observer.
-            setattr(current_task, "_hermes_event", event)
+            current_task._hermes_event = event
         deferred_session = getattr(event, "_deferred_session_key", None)
         if deferred_session is not None:
             current_generation = self._session_generations.get(session_key, 0)
@@ -5525,7 +5576,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
             if not (self._pending_messages.get(session_key) is event
                     and getattr(event, "_gateway_compression_deferred", False)):
-                await self._fire_post_delivery_callback(session_key, delivery_generation)
+                # A FIFO-run turn names its exact owner and generation; the interrupt event's
+                # generation is the fallback for in-process turns.
+                from gateway.session_ingress import fire_turn_post_delivery
+                if not await fire_turn_post_delivery(event):
+                    await self._fire_post_delivery_callback(session_key, delivery_generation)
+                await release_temporary_notices(event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)

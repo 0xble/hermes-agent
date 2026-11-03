@@ -6,7 +6,8 @@ import pytest
 
 from gateway.session_ingress_media import _media_root, capture_native_media, release_admission_media
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch, cancel_session_input
+from hermes_state_runtime import admit_session_input, cancel_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 PNG = b'\x89PNG\r\n\x1a\n' + b'\x00' * 8
 

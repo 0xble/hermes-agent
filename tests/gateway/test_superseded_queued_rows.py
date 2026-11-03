@@ -44,7 +44,7 @@ def _rows(authority, sid):
 @pytest.mark.asyncio
 async def test_new_before_startup_recovery_cancels_the_routes_queued_rows(monkeypatch):
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback
     from hermes_constants import get_hermes_home
 
@@ -66,7 +66,7 @@ async def test_new_before_startup_recovery_cancels_the_routes_queued_rows(monkey
 
 @pytest.mark.asyncio
 async def test_a_superseded_sessions_queued_rows_can_be_cancelled_then_deleted(monkeypatch):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal, SessionRef
 
     runner, adapter = _setup(monkeypatch)

@@ -19,6 +19,9 @@ logger = logging.getLogger("run_agent")
 class TurnFacadeMixin:
     """run_conversation()/chat() (see module docstring)."""
 
+    from agent.incognito_agent import private_turn
+
+    @private_turn
     def run_conversation(
         self, user_message: Any, system_message: str | None=None,
         conversation_history: list[dict[str, Any]] | None=None, task_id: str | None=None,

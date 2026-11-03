@@ -77,7 +77,7 @@ def commit_local_session(db, *, epoch, receipt):
             on_create.publish()  # before the row is visible, so no reader lazy-loads around it
         return receipt
     try:
-        return db._execute_write(write)
+        return db._execute_write(write, session_ids=(receipt,), skip_result={})
     except BaseException:
         if on_create is not None:
             on_create.withdraw()  # only this attempt's own snapshot, never another winner's
@@ -279,4 +279,4 @@ def end_idle_local_session(db, *, epoch, session_id, target_id, reason):
             return 0
         return db._end_and_bump(conn, 'UPDATE sessions SET ended_at=?, end_reason=? WHERE id=? AND ended_at IS NULL',
                                 (time.time(), reason, target_id), target_id, reason)
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(session_id, target_id,), skip_result=False)

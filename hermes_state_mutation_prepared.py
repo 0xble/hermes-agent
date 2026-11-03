@@ -144,4 +144,4 @@ def commit_refreshed_policy(db, *, epoch, session_id, old, new, generation):
         if snapshot['receipt']['policy'] != old or current is None or current[0] != generation:
             raise RuntimeStoreError('revision_conflict')
         return _commit_policy(db, conn, session_id, {'snapshot': snapshot, 'policy': new})[1]
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(session_id, old, new,), skip_result=None)

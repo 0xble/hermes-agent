@@ -9,7 +9,7 @@ async def test_cold_restore_keeps_the_persisted_yolo_toggle_and_untoggled_follow
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from gateway.session_managed_worker import _session_yolo

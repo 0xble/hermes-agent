@@ -56,4 +56,4 @@ class SessionDetachedResultsMixin:
             self._bump_session_counters(conn, session_id, 1, 0, unit=True)
             return msg_id
 
-        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S, session_ids=(session_id,), skip_result=0)

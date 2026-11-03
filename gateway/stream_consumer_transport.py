@@ -32,6 +32,12 @@ class StreamTransportMixin:
 
     _MIN_NEW_MSG_CHARS = 4
 
+    def _record_first_reply(self, text, result=None):
+        from gateway.reply_latency import record_first_reply
+        if self.cfg.cursor:
+            text = text.replace(self.cfg.cursor, "")
+        record_first_reply(getattr(self, "_reply_latency_receipt", None), text, result)
+
     async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
         """Edit via the adapter, passing routing metadata when supported."""
         # Contract: adapters must accept finalize= even when False (test-guarded).
@@ -45,7 +51,9 @@ class StreamTransportMixin:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        result = await self.adapter.edit_message(**kwargs)
+        self._record_first_reply(content, result)
+        return result
 
     async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
         """Open a native stream with an empty seed frame (typing indicator before any token) as a
@@ -182,6 +190,7 @@ class StreamTransportMixin:
             logger.debug("send_draft raised, disabling draft transport for this run: %s", e)
         else:
             if getattr(result, "success", False):
+                self._record_first_reply(text, result)
                 self._last_sent_text = text  # parity with the edit-based no-op skip
                 return True
             # P5(b): an AUTHORIZATION decline is terminal for the whole run, not
@@ -303,6 +312,7 @@ class StreamTransportMixin:
         if not getattr(result, "success", False):
             await self._journal_preview(self._last_sent_text, self._message_id, force=True)
             return False
+        self._record_first_reply(text, result)
         new_message_id = getattr(result, "message_id", None)
         # Journal the replacement before deleting what the old row points at.
         await self._journal_preview(text, new_message_id, force=True)
@@ -421,6 +431,8 @@ class StreamTransportMixin:
             self._mark_final_delivered(record=text)  # recorded: stale frame can't suppress
         if await self._try_frame(self._send_frame(text, finalize=finalize),
                                  "send_stream_frame raised, disabling native streaming: %s"):
+            # Native-frame success is confirmed delivery, unlike the optimistic finalize above.
+            self._record_first_reply(text)
             self._already_sent = True
             self._adopted_unconfirmed = None  # a landed frame supersedes any adopted text
             self._last_sent_text = text
@@ -523,6 +535,7 @@ class StreamTransportMixin:
             await self._journal_preview("")
             self._edit_supported = False
             return False
+        self._record_first_reply(text, result)
         if result.message_id:
             # The write-ahead row already holds (text, None): only a new ID is worth a write.
             await self._journal_preview(text, result.message_id)

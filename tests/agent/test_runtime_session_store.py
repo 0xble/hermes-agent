@@ -121,7 +121,8 @@ def test_worker_store_persists_and_restores_the_tools_prefix_pin(tmp_path):
     and a config flip between turns silently forks the cached tools[] prefix."""
     from types import SimpleNamespace
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+    from hermes_state_runtime import mutate_worker_execution, register_worker_execution
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tools.mcp_tool_agent import persist_agent_tool_names
     db = SessionDB(tmp_path / 'state.db')
     try:

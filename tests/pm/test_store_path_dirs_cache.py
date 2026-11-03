@@ -76,6 +76,10 @@ def test_terminal_run_envs_share_one_composition(tmp_path, monkeypatch):
     from tools.environments.local import _user_tools_first
 
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
+    # Freeze just before a 30s bucket. A real monotonic read can roll the
+    # bucket between these two builds and recompose; the cache clock is the
+    # seam tests already patch. The bucket stays the TTL.
+    monkeypatch.setattr(pm.install, "_clock", lambda: pm.install._STORE_PATH_DIRS_TTL_S - 1e-9)
     calls = _counting_compositions(monkeypatch)
 
     assert _user_tools_first("/usr/bin") == _user_tools_first("/usr/bin")

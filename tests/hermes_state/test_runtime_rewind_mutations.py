@@ -1,4 +1,5 @@
 """Rewind fences the generation and preserves archived history."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import pytest
 from hermes_state import SessionDB
 import hermes_state_runtime as rt
@@ -9,7 +10,7 @@ def test_rewind_has_existing_semantics_with_atomic_retry(tmp_path):
         db.create_session('s', source='test')
         db.append_messages_batch('s', [{'role': 'user', 'content': 'first'}, {'role': 'assistant', 'content': 'reply'}, {'role': 'user', 'content': 'again'}])
         target = db.get_messages('s')[-1]['id']
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='rewind',
             expected_revision=0, expected_generation=0, operation='rewind', payload={'target_message_id': target})
         receipt = rt.mutate_runtime_session(db, **args)
@@ -53,7 +54,7 @@ def test_rewind_refuses_invalid_targets_without_changing_later_work(tmp_path, en
             {'role': 'assistant', 'content': 'second reply'},
         ])
         archived = db.get_messages('s')[-2]['id']
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='s',
             request_id='first-rewind', expected_revision=0, expected_generation=0,
             operation='rewind', payload={'target_message_id': archived})
@@ -88,7 +89,7 @@ def test_rewind_refuses_queued_work(tmp_path):
         db.create_session('s', source='test')
         db.append_message('s', role='user', content='keep')
         target = db.get_messages('s')[0]['id']
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s', request_id='input', payload={'text': 'queued'})
         with pytest.raises(rt.RuntimeStoreError, match='session_busy'):
             rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='s', request_id='rewind',
@@ -105,7 +106,7 @@ def _compacted_session(db):
                                  {'role': 'assistant', 'content': 'ok, continuing'}])
     db.append_messages_batch('s', [{'role': 'user', 'content': 'Q3'}, {'role': 'assistant', 'content': 'A3'}])
     shown = {m['content']: m['id'] for m in db.get_messages('s', include_compacted=True)}
-    return shown, rt.begin_runtime_epoch(db, instance_id='owner')
+    return shown, _begin_owned_runtime_epoch(db, instance_id='owner')
 
 
 def _rewind_to(db, epoch, target, request_id='rewind'):
@@ -148,7 +149,7 @@ def test_rewind_refuses_a_row_a_compression_archived(tmp_path):
         db.archive_and_compact('s', [{'role': 'user', 'content': '[CONTEXT COMPACTION] earlier turns'}])
         db.append_messages_batch('s', [{'role': 'user', 'content': 'live'}, {'role': 'assistant', 'content': 'answer'}])
         live = [m['content'] for m in db.get_messages('s')]
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         with pytest.raises(rt.RuntimeStoreError, match='invalid_params'):
             rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='s', request_id='rewind',
                 expected_revision=0, expected_generation=0, operation='rewind', payload={'target_message_id': archived})
@@ -189,6 +190,6 @@ def test_a_turn_a_rotating_compression_left_on_the_parent_carries_the_marker(tmp
                                        {'role': 'user', 'content': 'live'}, {'role': 'assistant', 'content': 'ok'}])
         db.create_session('elsewhere', source='test')
         foreign = db.append_message('elsewhere', 'user', 'not this chat')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         assert _refusal(db, epoch, old, 'parent').startswith('compacted:')
         assert not _refusal(db, epoch, foreign, 'foreign').startswith('compacted:')

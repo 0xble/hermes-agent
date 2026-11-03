@@ -47,7 +47,7 @@ async def test_quiet_online_autonomy_settles_notices_and_keeps_progress(state, a
     manager = GoalManager("target")
     manager.set("old objective")
     if action == "resume":
-        manager.pause()
+        manager.pause(by="agent")  # the agent's own pause: an autonomous resume never lifts a user one
     result = controls.apply_control("goal", action, "target", requester_sid="requester",
                                     payload={"goal": "new objective"} if action == "replace" else None,
                                     user_quote=user_quote)
@@ -76,7 +76,7 @@ async def test_quiet_offline_control_recovers_progress_without_cosmetic_retries(
     manager = GoalManager("target")
     manager.set("old objective")
     if action == "resume":
-        manager.pause()
+        manager.pause(by="agent")  # the agent's own pause: an autonomous resume never lifts a user one
     result = controls.apply_control("goal", action, "target", requester_sid="requester",
                                     payload={"goal": "new objective"} if action == "replace" else None)
     assert result["status"] == "applied"

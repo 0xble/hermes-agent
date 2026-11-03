@@ -1,3 +1,4 @@
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 
 import pytest
@@ -16,12 +17,12 @@ def test_explicit_worker_adoption_preserves_claim_without_reexecution(tmp_path, 
     db = SessionDB(db_path=tmp_path / 'state.db')
     try:
         db.create_session('s', source='test')
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         accepted = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s', request_id='input', payload={'text': 'work'})
         claim = rt.claim_session_input(db, epoch=epoch, session_id='s')
         assignment = dict(execution_id='compute', session_id='s', generation=claim['generation'])
         rt.register_worker_execution(db, epoch=epoch, **assignment, kind='compute', adoption_secret='private')
-        new_epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
+        new_epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
         if recover_first:
             rt.recover_session_inputs(db, epoch=new_epoch)
         rt.adopt_worker_execution(db, epoch=new_epoch, **assignment, adoption_secret='private')
@@ -48,13 +49,13 @@ def test_unknown_resolution_atomically_revokes_worker_before_unblocking(tmp_path
     db = SessionDB(db_path=tmp_path / 'state.db')
     try:
         db.create_session('s', source='test')
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         first = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s', request_id='first', payload={})
         claim = rt.claim_session_input(db, epoch=epoch, session_id='s')
         assignment = dict(execution_id='worker', session_id='s', generation=claim['generation'])
         rt.register_worker_execution(db, epoch=epoch, **assignment, kind='compute', adoption_secret='private')
         follower = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='s', request_id='next', payload={})
-        epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
         rt.recover_session_inputs(db, epoch=epoch)
         args = dict(epoch=epoch, admission_id=first['admission_id'], generation=claim['generation'])
         before = db.get_session('s')

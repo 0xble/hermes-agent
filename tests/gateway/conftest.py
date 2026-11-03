@@ -652,7 +652,7 @@ def owner(tmp_path):
     from gateway.session import SessionStore
     from gateway.session_authority import SessionAuthority
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     db = SessionDB(tmp_path / 'state.db')
     store = SessionStore(config=GatewayConfig(), sessions_dir=tmp_path / 'sessions')
@@ -690,7 +690,7 @@ def hosted_owner(tmp_path, monkeypatch):
 
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway import run, session_policy
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}})

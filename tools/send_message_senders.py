@@ -388,9 +388,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         int_chat_id = normalize_telegram_chat_id(chat_id)
         thread_kwargs = _telegram_thread_kwargs(thread_id)
 
-        # Rich Messages are text-only. Eligibility, normalization, and the 32,768-character
-        # cap intentionally mirror TelegramAdapter._should_attempt_rich().
-        if not media_files and not copy_block:
+        # Text and attachments are separate payloads on the live adapter too.
+        # An image must not switch a rich report to a legacy caption or chunks.
+        rich_result = None
+        if not copy_block:
             rich_adapter = _telegram_rich_adapter(
                 message, bot, rich_messages, allow_cjk_rich_messages=allow_cjk_rich_messages)
             if rich_adapter is not None:
@@ -400,7 +401,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     bot, chat_id, rich_content, thread_kwargs,
                     disable_link_previews=disable_link_previews, adapter=rich_adapter)
                 if rich_result is not None:
-                    return rich_result
+                    if not rich_result.get("success") or not media_files:
+                        return rich_result
+                    # Accepted text must not be resent as legacy text or a caption,
+                    # even if every subsequent attachment is missing or fails.
+                    message = ""
                 # Permanent/capability rejection leaves the existing MarkdownV2 path in charge.
 
         if copy_block:
@@ -451,9 +456,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             except Exception as e:
                 warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
                 logger.error(warnings[-1])
-        if last_msg is None:
+        message_id = str(last_msg.message_id) if last_msg is not None else (rich_result or {}).get("message_id")
+        if message_id is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
-        return _success("telegram", chat_id, warnings, message_id=str(last_msg.message_id))
+        return _success("telegram", chat_id, warnings, message_id=message_id)
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: "
                 f"{install_hint('telegram')}"}

@@ -123,6 +123,35 @@ def _mock_models_response(entries):
     return resp
 
 
+@pytest.fixture
+def image_api_catalog():
+    """Exercise real catalog parsing without credentials or OpenRouter's changing inventory."""
+    from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _KNOWN_MODEL_META
+
+    catalogs = {
+        "https://openrouter.invalid/api/v1/images/models": [
+            *({"id": model_id} for model_id in _IMAGE_API_MODELS),
+            {"id": "fixture/image-api-only"},
+        ],
+        **{
+            f"https://{provider}.invalid/api/v1/models": [
+                {"id": model_id, "architecture": {"output_modalities": ["image"]}}
+                for model_id in _KNOWN_MODEL_META
+            ]
+            for provider in ("openrouter", "nous")
+        },
+    }
+
+    def runtime(*, requested):
+        return _runtime_ok(provider=requested, base_url=f"https://{requested}.invalid/api/v1")
+
+    def get_catalog(url, **kwargs):
+        return _mock_models_response(catalogs[url])
+
+    with patch(_RUNTIME, side_effect=runtime), patch("requests.get", side_effect=get_catalog) as get:
+        yield get
+
+
 class TestLiveCatalog:
     def test_live_catalog_lists_all_image_output_models(self):
         """Every image-output model on the endpoint is selectable — including
@@ -693,12 +722,15 @@ class TestImageApiSurface:
         ("chat", "openai/gpt-5.4-image-2", _USAGE, False),  # billed HTTP 200 with text but no image
         ("images", "krea/krea-2-medium", _USAGE, False),     # billed HTTP 200 with empty ``data``
     ])
-    def test_token_usage_reaches_session_accounting(self, surface, model, usage, images):
+    def test_token_usage_reaches_session_accounting(self, surface, model, usage, images, monkeypatch):
         """A response carrying token usage records one ``image_generation`` row on the ambient
         session — also when it carries no image (the provider billed the tokens anyway); a body
         without usage records nothing."""
         from agent import aux_accounting
 
+        # Preserve real token accounting without consulting OpenRouter's live
+        # pricing catalog, whose contents are unrelated to this contract.
+        monkeypatch.setattr("agent.usage_pricing.fetch_model_metadata", lambda *args, **kwargs: {})
         recorded = []
 
         class _DB:
@@ -784,7 +816,28 @@ class TestImageApiSurface:
         assert result["error_type"] == "auth_error"
         assert "_retryable" not in result
 
-    def test_catalog_models_are_offered_only_by_openrouter(self):
+    def test_image_api_catalog_failure_keeps_snapshot_only_for_openrouter(self):
+        from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
+
+        # _build_providers enables supports_image_api for OpenRouter, unlike
+        # the chat-only _openrouter() helper. Both live catalogs must fail for
+        # the snapshot branch to run; preserve Nous isolation in the same case.
+        by_name = {p.name: p for p in _build_providers()}
+        with patch(_RUNTIME, return_value=_runtime_ok()), patch(
+            "requests.get", side_effect=OSError("catalog unavailable")
+        ) as get:
+            openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
+            nous_ids = {m["id"] for m in by_name["nous"].list_models()}
+
+        assert set(_IMAGE_API_MODELS) <= openrouter_ids
+        assert not (set(_IMAGE_API_MODELS) & nous_ids)
+        assert [call.args[0] for call in get.call_args_list] == [
+            "https://openrouter.ai/api/v1/images/models",
+            "https://openrouter.ai/api/v1/models",
+            "https://openrouter.ai/api/v1/models",
+        ]
+
+    def test_catalog_models_are_offered_only_by_openrouter(self, image_api_catalog):
         from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
 
         by_name = {p.name: p for p in _build_providers()}
@@ -792,6 +845,15 @@ class TestImageApiSurface:
         nous_ids = {m["id"] for m in by_name["nous"].list_models()}
         assert set(_IMAGE_API_MODELS) <= openrouter_ids
         assert not (set(_IMAGE_API_MODELS) & nous_ids)
+        # A fixture-only id proves we parsed the response, not the fallback.
+        assert "fixture/image-api-only" in openrouter_ids
+        assert "fixture/image-api-only" not in nous_ids
+        # Never ask Nous for /images/models, even with usable credentials.
+        assert [call.args[0] for call in image_api_catalog.call_args_list] == [
+            "https://openrouter.invalid/api/v1/images/models",
+            "https://openrouter.invalid/api/v1/models",
+            "https://nous.invalid/api/v1/models",
+        ]
 
 
 

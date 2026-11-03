@@ -71,7 +71,7 @@ async def test_bundled_provider_issuer_subject_owns_durable_receipts(tmp_path, m
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local import create_local_session
     from gateway.session_contract import Principal
     from hermes_cli.web_server_sessions import _session_mutation_context
@@ -137,7 +137,7 @@ async def test_private_native_subject_preserves_existing_creation_and_mutation_r
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session

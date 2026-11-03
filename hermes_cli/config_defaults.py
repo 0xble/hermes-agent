@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
     # attended routing stays disabled; see website/docs/user-guide/configuration.md.
     # model.attended.start_new_sessions defaults true when that opt-in block is present.
     "model": "",
+    # Optional per-topic private route. Empty keeps the current model.
+    "incognito": {"model": ""},
     "providers": {},
     "fallback_providers": [],
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
@@ -1471,7 +1473,9 @@ DEFAULT_CONFIG = {
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
-        "notices": True,  # False hides automatic lifecycle output, not queries, errors or approvals.
+        # True shows every goal card. False hides automatic lifecycle output, not queries or
+        # approvals. "hidden" also hides approval cards and control receipts (hermes_cli/goal_notices.py).
+        "notices": True,
         "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
         # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
@@ -1495,6 +1499,13 @@ DEFAULT_CONFIG = {
         "min_interval_seconds": 30,  # smallest fixed interval; tighter cadences raised to it
         "max_ticks": 100,  # auto-pause after this many wakeups unless --times set; 0 = unlimited
         "auto_notices": True,  # show agent loop_set receipts (set/revise/replace) to the user
+        # True shows loop outcome cards; False hides them and loop_set receipts; "hidden" also hides
+        # loop approval cards and control receipts (hermes_cli/goal_notices.py).
+        "notices": True,
+        # Agent sets, revises, replaces, pauses, resumes its own pauses, and finishes loops without
+        # a user quote. Clear and resuming a user pause stay user-only; interval floors and
+        # max_ticks still apply.
+        "autonomy": False,
         "self_paced_floor_seconds": 60,  # Self-paced cadence bounds (seconds).
         "self_paced_ceiling_seconds": 24 * 60 * 60,
     },

@@ -283,6 +283,8 @@ def test_extraction_prefers_the_closing_evidence_and_skips_bare_words():
 
 
 def test_prompt_without_citations_is_unchanged(monkeypatch):
+    # Prompt equality must not depend on both calls landing in the same second.
+    monkeypatch.setattr(goals, "safe_strftime", lambda *_args: "fixed current time")
     prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'] * 2)
     goals.judge_goal("Finish the work", "did a thing", timeout=1)
     goals.judge_goal("Finish the work", "did a thing", citations={"cited": [], "unresolved": []}, timeout=1)

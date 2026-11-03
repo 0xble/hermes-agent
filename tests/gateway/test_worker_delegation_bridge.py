@@ -14,7 +14,8 @@ import psutil
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch, register_worker_execution
+from hermes_state_runtime import RuntimeStoreError, register_worker_execution
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from gateway.session_contract import SessionRef
 from gateway.session_worker import _claim
 from tools.async_delegation import _initialize_schema

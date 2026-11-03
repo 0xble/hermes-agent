@@ -183,7 +183,7 @@ def _child_compression_cap_tokens(raw) -> int | None:
     return int(raw)
 
 
-def _max_retry_wait_seconds(routing_cfg: Optional[Dict[str, Any]]) -> Optional[float]:
+def _max_retry_wait_seconds(routing_cfg: Optional[dict[str, Any]]) -> Optional[float]:
     """The route owner's ``max_retry_wait_seconds``: the longest provider cooldown the child sits
     out before failing the attempt so the owner can move to another route. Absent, negative, or
     non-numeric (YAML ``true`` included) means no cap."""
@@ -302,14 +302,16 @@ def _build_child_agent(
             inherit_parent_route=profile_home is None and not override_provider and not override_base_url,
         )
         parent_sid = getattr(parent_agent, "session_id", None)
-        child_session_db = _open_child_session_db(parent_agent)
+        from agent.incognito import is_incognito
+        private = (getattr(parent_agent, "incognito", False) is True) or is_incognito(parent_sid)
+        child_session_db = None if private else _open_child_session_db(parent_agent)
         with delegated_child_context():
             try:
                 child = AIAgent(
                     **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
                     enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
                     ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
-                    side_agent=True,
+                    side_agent=True, **({"incognito": True} if private else {}),
                     skip_context_files=True, skip_memory=True, clarify_callback=None,
                     thinking_callback=(
                         (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
@@ -579,6 +581,10 @@ def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
     return None
 
 
+from agent.incognito_agent import private_delegate
+
+
+@private_delegate
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
@@ -593,6 +599,10 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    from agent.incognito import is_incognito
+    private = (getattr(parent_agent, "incognito", False) is True) or is_incognito(getattr(parent_agent, "session_id", None))
+    if private and (is_truthy_value(background, default=False) or (action or "").strip().lower() == "resume"):
+        return tool_error("Durable async delegation is unavailable in incognito mode.")
     normalized_action = (action or "").strip().lower()
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
@@ -672,11 +682,14 @@ def delegate_task(
     _live_home = _parent_live_home(parent_agent)
 
     from tools.delegation_live_log import create_live_transcripts
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider"),
-        home=_live_home,
-    )
-    if refused:  # settled before anything runs: transcripts and manifest show the refusal (async units skip them)
+    if private:
+        live_deleg_id, live_writers, live_paths = None, [None] * len(task_list), []
+    else:
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context, model=creds.get("model"), provider=creds.get("provider"),
+            home=_live_home,
+        )
+    if refused and not private:
         _settle_refused_transcripts(refused, live_deleg_id, live_writers, _live_home)
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()

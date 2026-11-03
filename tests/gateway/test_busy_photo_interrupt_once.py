@@ -23,7 +23,7 @@ async def _followup_while_running(monkeypatch, event, marker, *, fail_admit=Fals
     The running turn stays inside its tool until the inbound handler returns, so a failed
     admit is visible to the drain. ``fail_admit`` makes that admit refuse (``admission_conflict``).
     """
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from plugins.platforms.discord.adapter import DiscordAdapter
     from tests.waiting import async_wait_until
 

@@ -37,6 +37,10 @@ Hermes homes. The core lineage controls alone do not prove plugin permission.
 ## Required behavior
 
 - Store one audit/outbox record per control under `state_meta` with a 24-hour pending expiry.
+- An autonomous goal pause that becomes a native timed wait records `outcome="timed_wait"`,
+  `wait_seconds`, `waiting_until` and its shared `notice` in that same transaction. Target,
+  requester and tool receipts describe the timed wait, no approval and still-active goal,
+  not a pause. Fresh quoted user pauses retain their existing paused-state wording.
 - Resolve only bare session IDs or `hermes:<current-profile>/<session-id>` targets; reject unknown and cross-profile targets.
 - Treat relay and gateway-authored rows as non-user text. Quotes must be whitespace-normalized, at least 12 characters, present in the latest typed user message after the gateway `[Replying to…: "…"]` pointer is stripped, and drawn from a source message no longer than 4,000 characters.
 - Refuse a quote (`user_quote_negated`) when it contains a negation token (`not`, `don't`, `never`, `no`, `shouldn't`, …) or one appears earlier in the same sentence (only `.`, `!`, `?`, `;` or a newline ends the clause). `stop` is a control verb, not a negation. Also refuse (`user_quote_qualified`) when the latest message anywhere contains a negation, a `?`, or a condition, timing or hedge word (`if`, `only`, `when`, `after`, `how`, `would`, `explain`, …), so a trailing refusal ("Clear the X goal? Not now") or a conditional or informational mention never authorizes. The control must match the quote's whole sentence, not the agent-chosen span, so one sentence naming two actions or both a goal and a loop falls back to Approve/Deny. The sentence must also be a direct instruction: optional courtesy words, the action verb, a noun phrase naming only the target, then only filler (or, for a replacement, `with`/`to` the new objective). "Keep the X goal and clear the Y goal" or "Print the text clear the X goal" never authorize. A replacement objective longer than `REPLACEMENT_MAX_CHARS` (1500) is refused outright, and approval cards show the current and proposed goal as separately bounded lines so Approve never applies text the card hid. A refused quote (stale, paraphrased, relayed, from another session, or negated) never grants quote authority. For a cross-session goal clear or replace without a quote, the session-control authority applies directly instead of creating an approval request.
@@ -44,6 +48,7 @@ Hermes homes. The core lineage controls alone do not prove plugin permission.
 - A fresh direct removal instruction naming the stop condition, such as "Clear the stop condition" or "Please remove this stop condition now", also authorizes a self-targeted replacement that empties only `stop_when`. The instruction must consist of courtesy words, `remove`/`drop`/`delete`/`clear`, optional determiners, `stop condition`, then optional filler. Compare the objective, all other contract fields and any supplied turn budget under the same write lock. Preserve user-added subgoals for any stop-only edit, including button-approved replacements. When both a goal and a loop exist, callers must resolve which stop condition the user means before selecting a control, because this quote path does not infer referents. A removal never authorizes a nonempty replacement restriction or dropping completion criteria or hard limits in other fields. Deictic instructions such as "Remove what says this" remain in Approve/Deny: the existing quote source strips the gateway reply pointer and supplies no verified referent binding, so neither a pronoun nor assistant-authored reply text grants stop-condition authority.
 - Residual risk: quote authority is a verbatim substring matched against deterministic word sets, not an interpretation of intent. It is mitigated by using only the latest typed message, the negation and control-match checks, the full source message shown in the target-topic notice, and Approve/Deny buttons as the fallback.
 - Goal resume applies only to a `paused` goal; done, cleared, and already-active goals return `nothing_to_resume`. Pause, clear, and replace require an active or paused goal.
+- With `goals.autonomy` or `loops.autonomy`, that kind's controls apply immediately under `via: autonomy` and never create a request. Both kinds lift or end only a pause whose `paused_by` is `agent`, refusing others with `user_paused` (see `maintenance/loop-lifecycle.md` and `maintenance/goal-autonomy.md`). Loops finish rather than clear. A current user quote for pause, resume or stop keeps quote authority. With `<kind>s.notices: hidden`, a request that would need a hidden card is refused with `approval_cards_hidden`, and an older unposted request fails with that code. The same watcher pass drains durable stall wakes (`hermes_cli/lifecycle_wakes.py`).
 - Button requests are created only for self-targeted destructive goal changes and other controls that lack a valid quote, and only for targets whose session source has an Approve/Deny surface (Telegram). Cross-session goal clear and replace without a quote never wait for a button. The base adapter's text fallback remains for safety, and the quote path still works for any routable target.
 - A replacement records `actor="user"` with `authority` `quote`, `button`, or `session` (plus `approved_by` for buttons). The latest such revision resets the entire outcome scope: both judge and continuation label every preceding requirement, contract and dropped criterion as superseded audit history, including requirements in older agent revisions. Subsequent ordinary revisions keep earlier requirements in the new scope binding unless specifically user-authorized. Audit data is preserved; the boundary is derived from existing revision kind/authority, not a second persisted field. Replace notices show `old -> new`.
 - Use the existing GoalManager and LoopManager methods for mutations. Goal replacement preserves revision history and refuses without explicit authority.
@@ -94,11 +99,13 @@ and the existing 24-hour outcome expiry bounds retries.
 
 ### Telegram Topic Retirement
 
-**Fork patch identity:** `telegram-topic-retire`. `/retire [topic|now|cancel]`
-and `telegram_topic`'s `retire`/`cancel_retire` actions share the profile-local
-`state_meta` record and executor in `gateway/telegram_retire.py`. Pending
-retirement gates new user work, but accepts cancellation and already-owned
-internal completions. Only an explicit user request to retire or delete this topic
+**Fork patch identity:** `telegram-topic-retire`. `telegram_topic`'s
+`retire`/`cancel_retire` actions own the profile-local `state_meta` record and
+executor in `gateway/telegram_retire.py`. Core registers no `/retire` slash
+command, so a plugin can own that name (plugin registration skips built-in
+names). Pending retirement gates new user work but accepts already-owned
+internal completions. A `failed` or `delete_unresolved` retirement admits the
+user again, so the agent can retry or cancel it through the tool. Only an explicit user request to retire or delete this topic
 authorizes invocation, including a deferred request after its named conditions
 are verified and its result delivered. Finishing, inactivity, splitting or handing
 off never grants permission. `now` requires an explicit interruption request.
@@ -133,8 +140,8 @@ combined. The closing note states the choice, its reason, and continuing owners.
 Receipt IDs, transfer intentions and verified moves persist independently of
 discovery, so a restart cannot forget an item already moved. Receipt IDs are
 saved before polling. `pending`, `posted` and `sent_unconfirmed` keep retirement
-pending after each bounded 60-second check. Existing housekeeping and `/retire`
-resume status reads of that exact receipt, never another handoff send. Only
+pending after each bounded 60-second check. Existing housekeeping and an explicit
+retire request resume status reads of that exact receipt, never another handoff send. Only
 `delivered` or `replied` permits an unaccepted handoff's transfer and closing.
 Destination acceptance is independent delivery proof when the exact keyed task,
 creator, title, kind and destination assignment are verified and its original
@@ -145,7 +152,7 @@ tasks and never sends another handoff for them. Accepted goal/loop handoffs clea
 only the source control atomically with recovery proof. The destination owns its
 successor, which retirement neither overwrites nor arms, and later successor
 progress does not invalidate that proof. A failed retirement admits ordinary
-user messages and explains `/retire` retry and `/retire cancel` recovery.
+user messages and says to ask for a retry or cancellation.
 Keyed native-task lookup reuses the existing task without another add. Its ID,
 key, title and destination creator are read back. Cron/loop/goal task briefs and
 legacy-brief readback share an authored-definition projection: prompt or goal,
@@ -188,8 +195,8 @@ Housekeeping never retries an unresolved destructive request or sends a probe.
 When the user CLI is available, it may passively reconcile exact-topic absence
 under the executor lock and the saved generation-matching closing receipt, then
 finish unbinding. Existing, unknown or incomplete lookup results, disconnected
-transports and invalid receipts leave the record quiet and unchanged. `/retire`
-or `/retire cancel` explicitly probes the exact topic under the same lock.
+transports and invalid receipts leave the record quiet and unchanged. An explicit
+retire or cancel request probes the exact topic under the same lock.
 Confirmed absence only cleans up its binding. Confirmed existence permits
 cancellation or a fresh generation that inventories again and requires a new
 closing receipt. An unknown result never repeats the previous dispatch.

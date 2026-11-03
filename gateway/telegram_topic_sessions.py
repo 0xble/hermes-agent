@@ -488,6 +488,13 @@ async def _topic_exists(runner, dest: SessionSource, thread_id: str) -> bool:
 async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -> dict:
     """Create a DM topic in ``source``'s chat, bind a new session to it with the requested title,
     icon, model and reasoning, and optionally start it with an opening brief."""
+    from gateway.telegram_retire import load as load_retirement
+    retirement = await load_retirement(runner, source)
+    if retirement and retirement.get("phase") in {"pending", "waiting"}:
+        # Retirement hands work to existing topics; a retiring topic spawning new ones is what it
+        # was meant to remove (2026-10-30).
+        raise TopicRequestError("This topic is retiring: hand its work to an existing topic. "
+                                "Creating a new topic is not allowed during retirement.")
     adapter = _adapter(runner, source, "_create_dm_topic")
     root = replace_source(source, thread_id=None, message_id=None)
     name = _clean_name(runner, spec.name)

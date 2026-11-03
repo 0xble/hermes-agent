@@ -9,8 +9,8 @@ import pytest
 
 from agent.runtime_session_store import RuntimeSessionStore
 from hermes_state import SessionDB
-from hermes_state_runtime import (RuntimeStoreError, begin_runtime_epoch, register_worker_execution,
-                                  adopt_worker_execution, mutate_worker_execution)
+from hermes_state_runtime import RuntimeStoreError, register_worker_execution, adopt_worker_execution, mutate_worker_execution
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tools.async_delegation import _initialize_schema
 
 

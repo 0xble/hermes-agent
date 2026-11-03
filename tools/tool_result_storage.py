@@ -199,6 +199,9 @@ def _write_to_spillover(content: str, filename: str):
     a partially-flushed file (quota, ENOSPC race) fails closed to the bounded inline
     truncation instead of referencing an archive that silently lost bytes.
     """
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return None
     data = content.encode("utf-8", errors="replace")
     try:
         spill_dir = get_spillover_dir()
