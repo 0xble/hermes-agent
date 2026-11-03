@@ -1,4 +1,4 @@
-"""Two real ``hermes -z`` processes share one auth.json pool row and hit its expiry at the same moment.
+"""Two real agent processes share one auth.json pool row and hit its expiry at the same moment.
 
 Both processes load the same Anthropic OAuth pool row (single-use refresh
 token) and both get the vendor's 401 for the expired access token. The first to
@@ -16,6 +16,8 @@ is pinned by test_oauth_anthropic_refresh.py.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import threading
 
@@ -26,7 +28,6 @@ from tests.e2e.core.providers._oauth_helpers import (
     OLD_ACCESS,
     Hold,
     credential,
-    run_hermes,
     start_anthropic_rig,
     text,
     wait_until,
@@ -35,6 +36,40 @@ from tests.e2e.core.providers._oauth_helpers import (
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="tagged-tree cleanup uses /proc")
 
 SLOW_TOKEN_ENDPOINT_S = 2.0  # vendor latency window while both processes contend, not synchronization
+
+
+# This property is the auth-store lock across processes, not CLI transport sharing.
+# A -z client now correctly refuses a sibling's finite gateway on the same home;
+# a shared daemon would silently turn this into a same-process lock test instead.
+# Run the production provider resolver + AIAgent in two explicit child processes.
+POOL_AGENT = r'''
+import os, sys
+from hermes_cli.config import load_config
+from hermes_cli.runtime_provider import resolve_runtime_provider
+from run_agent import AIAgent
+cfg = load_config()["model"]
+runtime = resolve_runtime_provider(requested=cfg["provider"], target_model=cfg["default"])
+assert runtime.get("credential_pool") is not None, "must exercise the real OAuth credential pool"
+agent = AIAgent(model=cfg["default"], provider=runtime["provider"],
+                api_key=runtime["api_key"], base_url=runtime["base_url"],
+                api_mode=runtime["api_mode"], credential_pool=runtime["credential_pool"],
+                quiet_mode=True, skip_context_files=True, skip_memory=True,
+                skip_background_review=True)
+try:
+    print(f"POOL_AGENT_PID={os.getpid()}", flush=True)
+    result = agent.run_conversation(sys.argv[1])
+    print(result.get("final_response") or "", flush=True)
+    code = 2 if result.get("failed") else 0
+finally:
+    agent.close()
+raise SystemExit(code)
+'''
+
+
+def run_pool_agent(fh, prompt, child_env):
+    return subprocess.run([sys.executable, "-c", POOL_AGENT, prompt], env=fh.env(child_env),
+                          cwd=fh.root, stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, encoding="utf-8", timeout=150, check=False)
 
 
 def _who(record: dict) -> str:
@@ -71,12 +106,12 @@ def test_concurrent_refresh_across_processes_spends_the_token_once(tmp_path) -> 
 
     rig.tokens.before_refresh_response = slow_token_endpoint
     box: dict = {}
-    thread_a = threading.Thread(target=lambda: box.setdefault("a", run_hermes(
-        rig.fh, ["-z", "PROCESS-ALPHA say hi"], extra_env=rig.child_env, timeout=150)), daemon=True)
+    thread_a = threading.Thread(target=lambda: box.setdefault("a", run_pool_agent(
+        rig.fh, "PROCESS-ALPHA say hi", rig.child_env)), daemon=True)
     try:
         thread_a.start()
         wait_until(lambda: any(_who(r) == "A" for r in rig.messages.main_requests()), 90, "process A's first call")
-        proc_b = run_hermes(rig.fh, ["-z", "PROCESS-BRAVO say hi"], extra_env=rig.child_env, timeout=150)
+        proc_b = run_pool_agent(rig.fh, "PROCESS-BRAVO say hi", rig.child_env)
         thread_a.join(150)
     finally:
         for ev in (b_arrived, both_rejected):
@@ -98,6 +133,10 @@ def test_concurrent_refresh_across_processes_spends_the_token_once(tmp_path) -> 
     new_access, new_refresh = grants[0].issued_access_token, grants[0].issued_refresh_token
     for name, proc in (("A", proc_a), ("B", proc_b)):
         assert proc.returncode == 0 and f"ANSWER-{name}" in proc.stdout, show(name, proc)
+    child_pids = [int(line.split("=", 1)[1]) for proc in (proc_a, proc_b)
+                  for line in proc.stdout.splitlines() if line.startswith("POOL_AGENT_PID=")]
+    assert len(child_pids) == 2 and len(set(child_pids)) == 2
+    assert os.getpid() not in child_pids, "rotation must race two independent agent processes"
     retried = {_who(r): credential(r) for r in rig.messages.main_requests() if credential(r) != OLD_ACCESS}
     assert retried == {"A": new_access, "B": new_access}, f"retries did not use the rotated bearer: {retried}"
     row = rig.pool_row("e1")

@@ -68,7 +68,7 @@ async def test_creation_preserves_advertised_cwd_model_and_toolsets(monkeypatch,
             return {"stored_session_id": "stored"}
 
     @asynccontextmanager
-    async def connected():
+    async def connected(*, one_shot=False):
         yield Peer()
 
     async def rendered(self, query, *, oneshot):
@@ -110,7 +110,8 @@ async def test_finite_runs_create_oneshot_sessions_and_explicit_source_wins(monk
             return {"stored_session_id": "stored"}
 
     @asynccontextmanager
-    async def connected():
+    async def connected(*, one_shot=False):
+        assert one_shot is True  # finite launch must own a newly spawned gateway, not only its session source
         yield Peer()
 
     async def rendered(self, query, *, oneshot):
@@ -215,7 +216,7 @@ async def test_documented_env_opt_ins_ride_the_classic_create_and_bypass_needs_a
             return {"stored_session_id": "stored"}
 
     @asynccontextmanager
-    async def connected():
+    async def connected(*, one_shot=False):
         yield Peer()
 
     async def rendered(self, query, *, oneshot):
@@ -262,7 +263,7 @@ async def test_launch_key_flags_are_never_silently_dropped(monkeypatch, tmp_path
                     "info": {"launch_request": {"source": "cli", "model": "m"}}}
 
     @asynccontextmanager
-    async def connected():
+    async def connected(*, one_shot=False):
         yield Peer()
 
     async def rendered(self, query, *, oneshot):
@@ -329,7 +330,7 @@ async def test_oneshot_z_writes_no_session_lines_to_stderr_like_main(monkeypatch
             return {"stored_session_id": "stored-z"}
 
     @asynccontextmanager
-    async def connected():
+    async def connected(*, one_shot=False):
         yield Peer()
 
     async def rendered(self, query, *, oneshot):

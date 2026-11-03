@@ -1825,10 +1825,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         return suspended
 
     async def _clear_restart_failure_count(self, session_key: str) -> None:
-        """Clear a completed session's restart-failure counter off-loop (atomic_json_write fsyncs)."""
+        """Clear completed daemon counters off-loop; finite clients leave prior recovery state alone."""
         from gateway.stuck_loop_counts import clear_restart_failure_count
         path = self._stuck_loop_counts_path()
-        if not path.exists():
+        if getattr(self, "_client_owned", False) or not path.exists():
             return
         # Load/mutate/save run whole in one worker under the counters lock: a split read-on-loop /
         # write-off-loop let two completing sessions rewrite each other's stale snapshot.
@@ -1936,14 +1936,14 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 )
 
     async def _launch_detached_restart_command(self) -> None:
+        if getattr(self, "_client_owned", False) or self._detached_restart_helper_started:
+            return  # never escape the finite lease or launch a duplicate replacement
         from gateway.run import _resolve_hermes_bin
         import shutil
         import subprocess
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
-            return
-        if self._detached_restart_helper_started:
             return
         self._detached_restart_helper_started = True
         current_pid = os.getpid()
@@ -2190,7 +2190,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False,
                         reason: Optional[str] = None) -> bool:
-        if self._restart_task_started:
+        if getattr(self, "_client_owned", False) or self._restart_task_started:
             return False
         self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
         self._restart_requested = True
@@ -3034,45 +3034,45 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         from utils import atomic_json_write
         if getattr(self, "_startup_cleanup_only", False):  # start never ran: keep startup_failed + crash markers
             return _shutdown_gateway_health_export(self)
-        # Clean-shutdown marker skips crash recovery; timed-out drains leave no marker.
-        if not ctx.timed_out and not getattr(self, "_suppress_clean_shutdown_receipt", False):
-            from gateway.zero_cut_standby import is_standby
-            if not is_standby():
-                with suppress(Exception):
-                    (_hermes_home / ".clean_shutdown").touch()
-        elif not ctx.timed_out:
-            logger.info("Skipping .clean_shutdown marker — startup recovery did not complete")
-        else:
-            logger.info(
-                "Skipping .clean_shutdown marker — drain timed out with interrupted agents; "
-                "next startup will recover their interrupted turns."
-            )
-        # Stuck-loop counter: sessions active across 3 consecutive restarts are auto-suspended next boot.
-        if ctx.active_agents:
-            self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
-        if self._restart_requested:
-            from gateway.zero_cut_standby import is_standby
-            if not is_standby():
-                # Stamp restart intent after the drain.
-                from gateway.restart_loop_guard import record_planned_exit
-                record_planned_exit()
-        if self._restart_requested and self._restart_command_source is None:
-            from gateway.zero_cut_standby import is_standby
-            if not is_standby():
-                with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
-                    atomic_json_write(
-                        _planned_restart_notification_path(),
-                        {
-                            "requested_at": time.time(),
-                            "via_service": bool(self._restart_via_service),
-                            "detached": bool(self._restart_detached),
-                        },
-                        indent=None,
-                    )
-        if self._restart_requested and self._restart_via_service:
-            # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
-            self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
-            self._exit_reason = self._exit_reason or "Gateway restart requested"
+        if not getattr(self, "_client_owned", False):  # Only a daemon recovered prior receipts/counters.
+            if not ctx.timed_out and not getattr(self, "_suppress_clean_shutdown_receipt", False):
+                from gateway.zero_cut_standby import is_standby
+                if not is_standby():
+                    with suppress(Exception):
+                        (_hermes_home / ".clean_shutdown").touch()
+            elif not ctx.timed_out:
+                logger.info("Skipping .clean_shutdown marker — startup recovery did not complete")
+            else:
+                logger.info(
+                    "Skipping .clean_shutdown marker — drain timed out with interrupted agents; "
+                    "next startup will recover their interrupted turns."
+                )
+            # Stuck-loop counter: sessions active across 3 consecutive restarts are auto-suspended next boot.
+            if ctx.active_agents:
+                self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
+            if self._restart_requested:
+                from gateway.zero_cut_standby import is_standby
+                if not is_standby():
+                    # Stamp restart intent after the drain.
+                    from gateway.restart_loop_guard import record_planned_exit
+                    record_planned_exit()
+            if self._restart_requested and self._restart_command_source is None:
+                from gateway.zero_cut_standby import is_standby
+                if not is_standby():
+                    with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
+                        atomic_json_write(
+                            _planned_restart_notification_path(),
+                            {
+                                "requested_at": time.time(),
+                                "via_service": bool(self._restart_via_service),
+                                "detached": bool(self._restart_detached),
+                            },
+                            indent=None,
+                        )
+            if self._restart_requested and self._restart_via_service:
+                # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
+                self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
+                self._exit_reason = self._exit_reason or "Gateway restart requested"
         self._draining = False
         # Terminal gateway_state: "stopped", or "running" on an UNEXPECTED signal (docker restart,
         # OOM) — container_boot.py only auto-starts gateways last seen "running".

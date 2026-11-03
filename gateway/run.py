@@ -3500,6 +3500,7 @@ class GatewayRunner(
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
+    _client_owned: bool = False  # finite local lease, never a daemon/restart enrollment
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -5388,7 +5389,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             return snapshot_shutdown_context(received_signal)
 
         planned_takeover = bool(_best_effort(_takeover, "Takeover marker check failed: %s"))
-        planned_stop = received_signal == signal.SIGINT or (
+        planned_stop = getattr(runner, "_client_owned", False) or received_signal == signal.SIGINT or (
             not planned_takeover and bool(_best_effort(_planned_stop, "Planned stop marker check failed: %s")))
         # `hermes gateway stop` writes the marker, THEN signals: the planned-stop watcher can consume
         # the marker in between, and the CLI's own SIGTERM must not then read as an external kill.
@@ -5414,7 +5415,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = True
             logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
 
-        if _shutdown_ctx is not None:
+        if _shutdown_ctx is not None and not getattr(runner, "_client_owned", False):
             def _log_context() -> None:
                 # The most useful line for "gateway keeps dying" tickets.
                 from gateway.shutdown_forensics import format_context_for_log
@@ -5783,23 +5784,8 @@ async def _start_gateway_start_control_socket(runner):
             spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
-        def _identify_runtime():
-            from gateway.drain_control import RESTART_WAIT_REASON
-            payload = build_identify_payload()
-            descriptor = getattr(runner, "session_runtime_descriptor", {})
-            payload.update({key: descriptor[key] for key in (
-                "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
-            if getattr(runner, "_draining", False):
-                payload.update(state="draining")
-                # The restart's after-turn wait still owns its turns, so the endpoint stays dialable.
-                if descriptor.get("drain_reason") != RESTART_WAIT_REASON:
-                    payload["capabilities"] = []
-            if payload.get("state") == "draining" and descriptor.get("drain_reason"):
-                payload["drain_reason"] = descriptor["drain_reason"]
-            payload["supervisor"] = {"manual": "none", "desktop": "none"}.get(
-                payload.get("supervisor"), payload.get("supervisor", "none"))
-            return payload
+        from gateway.run_control_identity import make_runtime_identify
+        _identify_runtime = make_runtime_identify(runner, build_identify_payload)
 
         from gateway.cron_review import CronReviewControl
         from gateway.session_snapshot import make_session_snapshot_handler
@@ -5824,6 +5810,8 @@ async def _start_gateway_start_control_socket(runner):
                            "handover": lambda: request_handover(runner, _main_loop),
                            "handover-status": lambda: handover_status(runner)})
         _control_server.ticket_store = runner.session_ticket_store
+        from gateway.session_worker_discovery import worker_discovery_handler
+        _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5959,9 +5947,12 @@ async def _start_gateway_shutdown_tail(
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
+                        client_owned: bool = False) -> bool:
     """Run the maintained bootstrap lifecycle through the public runner facade."""
     from gateway.run_bootstrap import start_gateway as bootstrap
+    if client_owned:
+        return await bootstrap(config, replace, verbosity, force, idle_exit, client_owned=True)
     return await bootstrap(config, replace, verbosity, force, idle_exit)
 
 
