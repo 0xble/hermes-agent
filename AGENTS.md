@@ -250,7 +250,10 @@ fresh output outside the checkout, set `HERMES_PYTHON` to its interpreter.
 
 If the checkout environment is missing or stale, `scripts/run_tests.sh` refuses
 to run that setup when the inherited `HERMES_HOME` is a live runtime home, or
-resolves to one. Live means a `current` release pointer, `gateway_state.json`,
+resolves to one. The same check runs inside `hermes_sync` in
+`scripts/_activation.sh`, so sourcing activation and calling `hermes_ensure_env`
+or `hermes_sync` directly cannot bypass it. Both entry points use the single
+read-only guard in `scripts/_setup_guard.sh`. Live means a `current` release pointer, `gateway_state.json`,
 a gateway pid `kill -0` can see (including EPERM), or any path under the OS
 account default. A profile under that default, or under another live root
 (`<root>/profiles/<name>`), is live even when the profile directory itself has

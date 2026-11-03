@@ -17,6 +17,7 @@ def runner(tmp_path):
     scripts.mkdir(parents=True)
     entry = scripts / "run_tests.sh"
     shutil.copy2(ROOT / "scripts/run_tests.sh", entry)
+    shutil.copy2(ROOT / "scripts/_setup_guard.sh", scripts / "_setup_guard.sh")
     log = tmp_path / "events.jsonl"
     scripts.joinpath("_activation.sh").write_text(
         f"printf '%s\\n' '\"activation\"' >> '{log}'\n"

@@ -1,7 +1,8 @@
 # Test-runner live-home guard
 
-Load when changing the stale-environment fallback in `scripts/run_tests.sh`,
-or the setup it reaches through `scripts/run-in-hermes-env`.
+Load when changing `scripts/_setup_guard.sh`, the stale-environment fallback in
+`scripts/run_tests.sh`, or setup reached through `scripts/_activation.sh` and
+`scripts/run-in-hermes-env`.
 
 ## Required behavior
 
@@ -9,8 +10,12 @@ Fork patch identity: `run-tests-live-home-guard`.
 
 When the checkout test environment is missing or stale, `scripts/run_tests.sh`
 refuses to re-exec `run-in-hermes-env` (and therefore refuses `setup-hermes.sh`
-and pm) if the inherited home is a live runtime home. A home is live when any
-of these hold on the home itself or on a root it resolves to. The profiles parent
+and pm) if the inherited home is a live runtime home. `hermes_sync` also calls
+the same `hermes_require_safe_setup` check before invoking setup, so direct
+`hermes_sync` and `hermes_ensure_env` calls cannot bypass the runner's refusal.
+The predicates, canonicalizer and refusal live only in `scripts/_setup_guard.sh`.
+Sourcing that library changes no shell options and performs no writes.
+A home is live when any of these hold on the home itself or on a root it resolves to. The profiles parent
 is lexical. When the lexical and canonical roots differ, either live root counts:
 
 - `$HERMES_HOME/current` is a symlink, including a dangling release pointer

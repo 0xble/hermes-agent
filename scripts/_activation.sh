@@ -24,6 +24,11 @@
 # republishes launchers or shell config. Progress goes to stderr.
 hermes_sync() {
     local repo="$1" test_environment="${2:---test-environment}"
+    # Guard the actual setup entry, not just callers such as run_tests.sh.
+    # A missing/unreadable guard fails closed before setup can write anything.
+    # shellcheck source=scripts/_setup_guard.sh
+    . "$repo/scripts/_setup_guard.sh" || return 1
+    hermes_require_safe_setup || return 1
     (
         unset PYTHONHOME PYTHONPATH VIRTUAL_ENV
         bash "$repo/setup-hermes.sh" --runtime-only "$test_environment"

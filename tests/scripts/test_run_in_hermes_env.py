@@ -62,7 +62,7 @@ def checkout(tmp_path: Path) -> Path:
     (root / "scripts").mkdir(parents=True)
     (root / "pm").mkdir()
     (root / "state").mkdir()
-    for name in (RUNNER.name, "_activation.sh"):
+    for name in (RUNNER.name, "_activation.sh", "_setup_guard.sh"):
         shutil.copy2(REPO_ROOT / "scripts" / name, root / "scripts" / name)
     for name in ACTIVATION_INPUTS:
         (root / name).parent.mkdir(parents=True, exist_ok=True)

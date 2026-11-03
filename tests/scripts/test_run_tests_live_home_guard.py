@@ -37,7 +37,7 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "checkout"
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("run_tests.sh", "run-in-hermes-env", "_activation.sh"):
+    for name in ("run_tests.sh", "run-in-hermes-env", "_activation.sh", "_setup_guard.sh"):
         shutil.copy2(ROOT / "scripts" / name, scripts / name)
     (scripts / "run-in-hermes-env").chmod(0o755)
     setup = root / "setup-hermes.sh"
@@ -72,6 +72,7 @@ def _run(
     extra_env: dict[str, str] | None = None,
     *,
     home_text: str | None = None,
+    activation_entry: str | None = None,
 ):
     env = {
         "PATH": str(commands),
@@ -85,8 +86,14 @@ def _run(
     Path(env["TMPDIR"]).mkdir(exist_ok=True)
     if extra_env:
         env.update(extra_env)
+    argv = ["bash", str(root / "scripts" / "run_tests.sh")]
+    if activation_entry is not None:
+        argv = [
+            "bash", "-c", 'source "$1/scripts/_activation.sh"; "$2" "$1"',
+            "activation", str(root), activation_entry,
+        ]
     return subprocess.run(
-        ["bash", str(root / "scripts" / "run_tests.sh")],
+        argv,
         cwd=root,
         env=env,
         capture_output=True,
@@ -161,12 +168,30 @@ def test_stale_fallback_refuses_live_home_and_writes_nothing(tmp_path, kind):
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("entry", ["hermes_ensure_env", "hermes_sync"])
+@pytest.mark.parametrize("override", [None, "0", "true", "yes"])
+def test_direct_activation_refuses_live_home_without_writing(tmp_path, entry, override):
+    root, commands = _checkout(tmp_path)
+    home = tmp_path / "live-home"
+    _mark(home, "gateway-state")
+    before = _snapshot(home)
+    extra = {} if override is None else {"HERMES_ALLOW_LIVE_HOME_SETUP": override}
+    result = _run(root, commands, home, extra_env=extra, activation_entry=entry)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "refusing" in output, output
+    assert "SETUP_RAN" not in output, output
+    assert _snapshot(home) == before
+
+
+@pytest.mark.platforms("posix")
 @pytest.mark.parametrize("kind", ["scratch", "dead-pid", "not-a-pointer"])
-def test_stale_fallback_still_sets_up_a_non_live_home(tmp_path, kind):
+@pytest.mark.parametrize("entry", [None, "hermes_sync", "hermes_ensure_env"])
+def test_stale_fallback_still_sets_up_a_non_live_home(tmp_path, kind, entry):
     root, commands = _checkout(tmp_path)
     home = tmp_path / "scratch-home"
     _mark(home, kind)
-    result = _run(root, commands, home)
+    result = _run(root, commands, home, activation_entry=entry)
     output = result.stdout + result.stderr
     assert "SETUP_RAN" in output, output
     assert (home / "setup-wrote").read_text(encoding="utf-8") == "setup\n"
@@ -174,11 +199,12 @@ def test_stale_fallback_still_sets_up_a_non_live_home(tmp_path, kind):
 
 
 @pytest.mark.platforms("posix")
-def test_explicit_opt_in_allows_setup_against_a_live_home(tmp_path):
+@pytest.mark.parametrize("entry", [None, "hermes_sync", "hermes_ensure_env"])
+def test_explicit_opt_in_allows_setup_against_a_live_home(tmp_path, entry):
     root, commands = _checkout(tmp_path)
     home = tmp_path / "live-home"
     _mark(home, "gateway-state")
-    result = _run(root, commands, home, extra_env={"HERMES_ALLOW_LIVE_HOME_SETUP": "1"})
+    result = _run(root, commands, home, extra_env={"HERMES_ALLOW_LIVE_HOME_SETUP": "1"}, activation_entry=entry)
     output = result.stdout + result.stderr
     assert "SETUP_RAN" in output, output
     assert (home / "setup-wrote").read_text(encoding="utf-8") == "setup\n"
@@ -529,6 +555,9 @@ GUARD_LAYOUTS = (
     "trailing_slash_under_symlink",
     "spaces",
     "spaces_symlink",
+    "dangling_relative",
+    "dangling_absolute",
+    "relative_missing",
 )
 
 GUARD_MARKERS = ("lexical", "canonical", "neither")
@@ -625,7 +654,7 @@ def _guard_home(base: Path, name: str) -> str:
         quiet.mkdir()
         (quiet / "sub").symlink_to(live)
         return str(quiet / "sub" / "profiles" / "new-profile")
-    if name in {"symlink_ancestor_absolute", "symlink_ancestor_relative", "dotdot_under_symlink", "trailing_slash_under_symlink"}:
+    if name in {"symlink_ancestor_absolute", "symlink_ancestor_relative", "dotdot_under_symlink", "trailing_slash_under_symlink", "relative_missing"}:
         live = base / "live"
         quiet = base / "quiet"
         (live / "profiles").mkdir(parents=True)
@@ -643,6 +672,14 @@ def _guard_home(base: Path, name: str) -> str:
         quiet.mkdir()
         (live / "profiles" / "dev").symlink_to(quiet)
         return str(live / "profiles" / "dev")
+    if name in {"dangling_relative", "dangling_absolute"}:
+        live = base / "live"
+        quiet = base / "quiet"
+        (live / "profiles").mkdir(parents=True)
+        (quiet / "profiles").mkdir(parents=True)
+        target = live / "profiles" / "missing" if name == "dangling_absolute" else Path("../../live/profiles/missing")
+        (quiet / "profiles" / "dev").symlink_to(target)
+        return str(quiet / "profiles" / "dev")
     if name == "spaces":
         (base / "my root" / "profiles").mkdir(parents=True)
         return str(base / "my root" / "profiles" / "new profile")
@@ -669,7 +706,8 @@ def test_resolve_path_matches_python(tmp_path, case):
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("layout", GUARD_LAYOUTS)
 @pytest.mark.parametrize("marker", GUARD_MARKERS)
-def test_guard_matrix_refuses_either_root_and_writes_nothing(tmp_path, layout, marker):
+@pytest.mark.parametrize("entry", [None, "hermes_sync", "hermes_ensure_env"])
+def test_guard_matrix_refuses_either_root_and_writes_nothing(tmp_path, layout, marker, entry):
     """A live marker on the lexical root, the canonical root, or neither."""
     _assert_outside_account_default(tmp_path)
     root, commands = _checkout(tmp_path)
@@ -687,20 +725,24 @@ def test_guard_matrix_refuses_either_root_and_writes_nothing(tmp_path, layout, m
         assert marked.is_dir(), (layout, marker, marked)
         (marked / "gateway_state.json").write_text("{}\n", encoding="utf-8")
     before = _snapshot(base)
-    result = _run(root, commands, Path(home_text), home_text=home_text)
+    if layout == "relative_missing":
+        home_text = os.path.relpath(home_text, root)
+    result = _run(root, commands, Path(home_text), home_text=home_text, activation_entry=entry)
     output = result.stdout + result.stderr
-    assert result.returncode != 0, output
     if marker == "neither":
         assert "SETUP_RAN" in output, output
         assert "refusing" not in output.lower(), output
+        assert (result.returncode == 0) == (entry == "hermes_sync"), output
         return
+    assert result.returncode != 0, output
     assert "refusing" in output.lower(), output
     assert "SETUP_RAN" not in output
     assert _snapshot(base) == before
 
 
 @pytest.mark.platforms("posix")
-def test_symlink_loop_resolution_error_refuses_without_writing(tmp_path):
+@pytest.mark.parametrize("entry", [None, "hermes_sync", "hermes_ensure_env"])
+def test_symlink_loop_resolution_error_refuses_without_writing(tmp_path, entry):
     """A path that cannot be resolved is live, and nothing is written."""
     _assert_outside_account_default(tmp_path)
     root, commands = _checkout(tmp_path)
@@ -709,7 +751,7 @@ def test_symlink_loop_resolution_error_refuses_without_writing(tmp_path):
     (base / "a").symlink_to("b")
     (base / "b").symlink_to("a")
     before = _snapshot(base)
-    result = _run(root, commands, base / "a")
+    result = _run(root, commands, base / "a", activation_entry=entry)
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     assert "refusing" in output.lower(), output
