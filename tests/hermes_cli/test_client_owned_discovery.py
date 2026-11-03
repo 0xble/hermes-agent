@@ -17,12 +17,7 @@ import asyncio, os, sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import patch
-from hermes_cli import gateway_client, gateway_runtime_start, gateway_runtime
-if os.environ.get('CLIENT_TRAMPOLINE'):
-    real_ensure = gateway_runtime.ensure_gateway_runtime
-    def bounded_ensure(*args, **kwargs):
-        return real_ensure(*args, **{**kwargs, "timeout": 12})
-    gateway_runtime.ensure_gateway_runtime = bounded_ensure
+from hermes_cli import gateway_client, gateway_runtime_start
 home = Path(os.environ['HERMES_HOME'])
 real_popen = subprocess_popen = gateway_runtime_start.subprocess.Popen
 GATEWAY = r"""

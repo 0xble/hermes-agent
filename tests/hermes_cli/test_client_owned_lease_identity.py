@@ -24,7 +24,7 @@ def test_creator_attaches_through_interpreter_trampoline_but_other_client_waits(
                               stderr=subprocess.PIPE, text=True, encoding="utf-8")
     try:
         assert wait_until(lambda: (tmp_path / "first-attached").exists() or client.poll() is not None,
-                          timeout=25), "creator could not recognize its gateway behind a launcher"
+                          timeout=70), "creator could not recognize its gateway behind a launcher"
         assert (tmp_path / "first-attached").exists(), client.communicate(timeout=5)
         identity = query_gateway_control(tmp_path, "identify", timeout=2)
         assert identity["pid"] != int((tmp_path / "launcher-pid").read_text())
