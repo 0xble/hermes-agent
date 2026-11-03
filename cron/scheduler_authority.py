@@ -1,9 +1,49 @@
 """Transport-only cron execution; output/delivery remain with the firing scheduler."""
 import asyncio
+import concurrent.futures
+import contextvars
 import hashlib
 import json
+import logging
+import threading
 import time
 import uuid
+
+# One recovery lane for the process, with at most one outstanding pass per home.
+# A slow owner must neither occupy a job worker nor accumulate passes on every tick.
+_recovery_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_recovery_futures: dict[str, concurrent.futures.Future] = {}
+_recovery_lock = threading.Lock()
+
+
+def _observe_recovery_result(future):
+    try:
+        future.result()
+    except BaseException:
+        logging.getLogger(__name__).warning('Cron receipt recovery pass deferred', exc_info=True)
+
+
+def reconcile_pending_background(*, allow_connect=True):
+    """Coalesce ticks without waiting for recovery; journals remain the durable retry queue."""
+    from hermes_constants import get_hermes_home, hermes_home_key, set_hermes_home_override
+
+    global _recovery_pool
+    home = get_hermes_home()
+    key = hermes_home_key(home)
+    with _recovery_lock:
+        for finished in [k for k, f in _recovery_futures.items() if f.done()]:
+            del _recovery_futures[finished]
+        if key in _recovery_futures:
+            return
+        if _recovery_pool is None:
+            _recovery_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='cron-receipt-recovery')
+        context = contextvars.copy_context()
+        # Pin even env-selected homes; another ticker's profile scope must not leak here.
+        context.run(set_hermes_home_override, home)
+        future = _recovery_pool.submit(context.run, reconcile_pending, allow_connect=allow_connect)
+        _recovery_futures[key] = future
+        future.add_done_callback(_observe_recovery_result)
 
 # A submit normally answers in 30s; even two contended SQLite writes take 20s each.
 # Leave room for ordered-admission queueing, and require repeated successful owner reads.
@@ -269,6 +309,26 @@ def _reset_missing_reads(journal):
 
 
 def reconcile_pending(*, allow_connect=True):
+    """Serialize recovery across tickers without holding the due-scan lock.
+
+    The journals, receipt checks and execution-owner fences remain authoritative;
+    this separate nonblocking lock replaces the ticker lock's recovery serialization.
+    """
+    from hermes_constants import get_hermes_home
+    from cron.scheduler import _acquire_tick_lock, _release_tick_lock
+
+    root = get_hermes_home() / 'cron'
+    root.mkdir(parents=True, exist_ok=True)
+    lock_fd = _acquire_tick_lock(root / '.receipt-recovery.lock')
+    if lock_fd is None:
+        return
+    try:
+        _reconcile_pending(allow_connect=allow_connect)
+    finally:
+        _release_tick_lock(lock_fd)
+
+
+def _reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
 
     With allow_connect=False, a headless tick leaves durable receipts for the next

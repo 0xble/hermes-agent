@@ -1,0 +1,62 @@
+# Missed one-shots and delayed-send freshness
+
+Fork patch identity: `cron-missed-oneshot-hold`.
+
+## Contract
+
+Never-started one-shots that miss the 120-second grace remain stored, disabled
+and marked `missed`, with their exact prompt/payload and timing evidence. Admit
+one durable decision notice per occurrence through the existing failure outbox,
+routed to the creating origin (configured-home fallback if absent), before
+committing the hold. The notice offers explicit `cron resume <id> --run-now` or
+`cron remove <id>`. Store-outage coverage explains the miss but never authorizes
+an hours-late send. Consumed/ambiguous dispatches retain their existing distinct
+retirement and partial-effects notice.
+
+Reject malformed declared SHA-256, missing/mismatched payloads and malformed
+structured freshness contracts before create, update or reactivation persists.
+An unrelated disable/pause must still work for malformed historical records.
+The model-tool handler forwards these fields; schema exposure alone is not enough.
+
+Use the common `run_one_job` boundary, including external/detached/manual fires,
+to recheck the deadline and declared freshness without the jobs lock. Recheck
+both time and current occurrence/approval after live reads. A superseded snapshot
+stops without disabling its replacement. A manual rearm remains subject to fresh
+thread/activity evidence; it is not permission to ignore new replies.
+
+The communications edge owns provider semantics: final check-then-transport
+wrapper, approved watermark, exact argv/body digests, live account-bound Slack
+thread/huddle reads and recipient-attendee meetings on scoped sender calendars.
+Do not duplicate account APIs or an exhaustive people-activity service in core.
+Unsupported providers and unavailable scoped signals must be reported explicitly,
+not represented as verified quiet.
+
+## Ticker recovery
+
+Admission-journal recovery can wait 20 seconds per remote receipt. It must not
+run serially before the due scan. Coalesce into one bounded off-tick recovery
+worker, one pending pass per home, with captured home context. Keep journals as
+the durable retry queue and observe/log errors. Headless recovery still cannot
+connect or spawn a gateway. Do not occupy a job-dispatch worker.
+
+## Source and proof
+
+- `cron/jobs.py`, `cron/oneshot_retirement.py`, `cron/scheduled_send.py`,
+  `cron/scheduler.py`, `cron/scheduler_authority.py`, `cron/scheduler_tick.py`.
+- `tools/cronjob_tools.py` public input forwarding and validation.
+- Tests: `test_oneshot_grace_due_scan`, `test_oneshot_retirement_alert`,
+  `test_scheduled_send_hold`, `test_original_scheduled_send_reproductions`,
+  `test_recovery_tick_nonblocking`, and adjacent recovery/store tests.
+- Run via `scripts/run_tests.sh` with scratch `HERMES_HOME` and explicit scratch
+  `HERMES_RUNTIME_DIR`; never exercise imports against a live state database.
+- The original 297-second deletion and 61-character checksum creation are pinned
+  as expected failures against immutable baseline source; candidate equivalents
+  must pass. Source archives may skip only the historical Git-source reproduction.
+
+## Upstream disposition and stack fit
+
+Keep this fork patch until upstream preserves held payloads, durable decisions,
+full shared-runner deadline/freshness boundaries and nonblocking recovery. A fix
+that simply fires missed one-shots after downtime does not satisfy this contract.
+Reuses the existing job store, claim fences, failure outbox, runner and native
+provider CLIs. No new scheduler, service, transport or gateway lifecycle owner.
