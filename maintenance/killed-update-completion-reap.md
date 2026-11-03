@@ -29,6 +29,7 @@ isolation, not a product change.
 ## Verification and retirement
 
 Contract tests: `tests/hermes_cli/test_update_completion_death_watch.py`
+and `tests/e2e/core/upgrade/test_sandbox_isolation.py`.
 
 Retire the reap when POSIX completion children die with a killed updater the
 way the Windows job already does. Retire the lock-dir pin when upgrade e2e no
