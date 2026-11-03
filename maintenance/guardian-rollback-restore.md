@@ -20,9 +20,10 @@ A guardian rollback never leaves the gateway down for a release it cannot start.
   - The target is proven down: parked, unloaded, or no supervised PID. A target that is
     still running gets its own `STARTUP_SECONDS` window first. The test of that
     window must not stub the pre-bootout supervised PID to a live foreign process:
-    `reload_target` reaps that PID before the window starts, and on macOS CI PID
-    123 is a real process whose blocked reap consumes the window. The
-    startup-window path itself does not kill a target that is still starting. If it
+    `reload_target` pins the old incarnation before bootout and reaps it afterward,
+    before bootstrap. On macOS CI PID 123 is a real process whose blocked reap
+    prevents startup. The replacement startup-window path itself does not kill a
+    target that is still starting. If it
     is still running and unhealthy after that window, it is left alone. A probe
     that cannot answer is not proof.
 - The restore re-activates the serving release with the exact plist bytes it last started
