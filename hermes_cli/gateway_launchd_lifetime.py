@@ -138,7 +138,10 @@ def _inspect_layout(run, domains, labels, originals, *, mode, gateway_label):
         if f"{gateway_label}.reload." in listing.stdout:
             raise RuntimeError("pending deferred reload helper; let it finish before lifetime migration")
     extras = set(gw.launchd_gateway_labels_for_install()) | set(gw.legacy_launchd_labels_for_install())
-    for extra in extras - set(labels.values()):
+    # The guardian shares the gateway glob but is not a legacy traffic writer.
+    # Its owning home is handled (or explicitly skipped) in labels above.
+    from hermes_cli.gateway_guardian import GUARDIAN_LABEL
+    for extra in extras - set(labels.values()) - {GUARDIAN_LABEL}:
         if any(_state(run, domain, extra)[0] for domain in domains):
             raise RuntimeError(f"stop and remove legacy/standby label {extra} before domain migration")
     if any(sum(states[(domain, name)][0] for domain in domains) > 1 for name in labels.values()):

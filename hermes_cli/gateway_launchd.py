@@ -817,7 +817,8 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     if selected is not None:
         from hermes_cli.gateway_command_errors import GatewayInstallError
         try:
-            if force and configured == f"{selected}/{os.getuid()}" and _gw().get_launchd_plist_path().exists():
+            from hermes_cli.gateway_launchd_lifetime import _uid
+            if force and configured == f"{selected}/{_uid()}" and _gw().get_launchd_plist_path().exists():
                 from hermes_cli.gateway_launchd_lifetime import lifetime_lock
                 with lifetime_lock(_gw().get_hermes_home(), blocking=False) as acquired:
                     if not acquired:

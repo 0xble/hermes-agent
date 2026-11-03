@@ -66,8 +66,10 @@ def layout(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("operation", ["uninstall", "migrate", "login"])
-def test_profile_lifetime_leaves_shared_guardian_with_its_owner(layout, operation):
+def test_profile_lifetime_leaves_shared_guardian_with_its_owner(layout, monkeypatch, operation):
     home, path, label, gui, user, loaded, calls, run = layout
+    # The real legacy fleet scanner finds the root-owned guardian in its gateway glob.
+    monkeypatch.setattr(gw, "legacy_launchd_labels_for_install", lambda **kw: [guardian.GUARDIAN_LABEL])
     path.write_bytes(definition(home, label, "Background" if operation != "migrate" else "Aqua"))
     shared = path.with_name(f"{guardian.GUARDIAN_LABEL}.plist")
     original = definition(home.parent.parent, guardian.GUARDIAN_LABEL, "Aqua")
