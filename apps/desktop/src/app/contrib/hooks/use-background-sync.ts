@@ -46,7 +46,8 @@ import {
   publishSessionState,
   SESSION_WATCHDOG_TIMEOUT_MS,
   setLiveTurnBackend,
-  setSessionStalled
+  setSessionStalled,
+  settleLiveTurnFromSnapshot
 } from '@/store/session-states'
 import { noteLiveSessionSource } from '@/store/session-unread'
 import { loadArchivedSessions } from '@/store/sidebar-archive'
@@ -813,6 +814,13 @@ export function rehydrateLiveSessionStatuses(
     // (`awaitingResponse && !sawAssistantPayload`); without the same refusal
     // here a poll lands between submit and first token and darkens the row.
     const busy = working || Boolean(existing?.awaitingResponse && !existing.sawAssistantPayload)
+
+    if (session.status === 'idle' && !busy && existing?.turnLive && !existing.needsInput) {
+      settleLiveTurnFromSnapshot(runtimeSessionId)
+      setSessionStalled(storedSessionId, false)
+
+      continue
+    }
 
     // Avoid re-arming the watchdog on every poll. Publish only when the
     // authoritative live snapshot differs from the renderer mirror; normal

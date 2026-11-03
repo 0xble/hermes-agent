@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { $selectedStoredSessionId, $unreadFinishedSessionIds } from '@/store/session'
+import { $activeSessionId, $selectedStoredSessionId, $unreadFinishedSessionIds } from '@/store/session'
 import {
   $sessionStates,
   $workingSessionIds,
   clearAllSessionStates,
   publishSessionState,
-  reconcileBusyStatesOnReconnect
+  reconcileBusyStatesOnReconnect,
+  setLiveTurnBackend
 } from '@/store/session-states'
 
 import { rehydrateLiveSessionStatuses, resetLiveRuntimeTracking } from './use-background-sync'
@@ -149,6 +150,40 @@ describe('rehydrateLiveSessionStatuses — seeding a turn the renderer never saw
 
     expect($workingSessionIds.get()).toContain('stored-new')
     expect($workingSessionIds.get()).not.toContain('stored-old')
+  })
+
+  it('settles a live partial when the snapshot says the turn already ended', async () => {
+    const refresh = vi.fn(async () => undefined)
+    const unregister = setLiveTurnBackend({ request: vi.fn(), refreshTranscript: refresh })
+
+    try {
+      $activeSessionId.set('runtime-ended')
+      publishSessionState('runtime-ended', {
+        ...createClientSessionState('stored-ended'),
+        busy: true,
+        sawAssistantPayload: true,
+        streamId: 'stream-ended',
+        turnLive: true,
+        turnStartedAt: Date.now() - 59_000
+      })
+      rehydrateLiveSessionStatuses(
+        { sessions: [{ id: 'runtime-ended', session_key: 'stored-ended', status: 'idle' }] },
+        Date.now(),
+        'default',
+        $sessionStates.get()
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+
+      const settled = $sessionStates.get()['runtime-ended']
+      expect(settled?.busy).toBe(false)
+      expect(settled?.turnLive).toBe(false)
+      expect(settled?.turnStartedAt).toBeNull()
+      expect(refresh).toHaveBeenCalledWith('runtime-ended', 'stored-ended')
+    } finally {
+      $activeSessionId.set(null)
+      unregister()
+    }
   })
 
   it('leaves a starting session idle — the agent build is not proof of a turn', () => {
