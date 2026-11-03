@@ -211,6 +211,8 @@ def test_loop_cas_validates_entry_and_noop_commit(hermes_home, monkeypatch, oper
         result = manager.complete_tick("[LOOP_COMPLETE]")
     elif operation == "replace":
         source = "Watch the new deployment instead"
+        from tests.hermes_cli.test_loop_revise import _record_quote
+        _record_quote(manager.session_id, source)
         result = manager.replace(prompt=source, reason="New task", user_quote=source, user_messages=[source])
     else:
         result = manager.revise(reason="Fewer checks", times=0 if operation == "noop" else 3)

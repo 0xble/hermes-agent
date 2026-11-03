@@ -151,10 +151,13 @@ async def test_post_turn_completion_does_not_stop_a_loop_revised_during_the_turn
     fired = loops.LoopManager(session_id="sid-gateway-loop")
     assert fired.fire_tick() is not None
     tick = (fired.state.created_at, fired.state.ticks_fired)
+    quote = "Please switch the loop to polling prompt B now"
+    from tests.hermes_cli.test_loop_revise import _record_quote
+    _record_quote("sid-gateway-loop", quote)
     revised = loops.LoopManager(session_id="sid-gateway-loop").revise(
         reason="new target", prompt="poll prompt B",
         user_quote="switch the loop to polling prompt B",
-        user_messages=["Please switch the loop to polling prompt B now"])
+        user_messages=[quote])
     assert revised["ok"] is True, revised
 
     await GatewayRunner._post_turn_loop_completion(
