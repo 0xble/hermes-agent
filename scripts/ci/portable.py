@@ -451,7 +451,12 @@ def environment(home: Path) -> dict[str, str]:
     require_checkout_venv_isolation()
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
-    env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+    # SystemDrive must survive: Common AppData's default is %SystemDrive%\ProgramData.
+    # An isolated env that omits it makes shell components create that literal
+    # relative directory in the checkout. Keep the host system locations; do not
+    # relocate ProgramData into the disposable home.
+    locations = {'PATH', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'PATHEXT', 'PROGRAMDATA', 'ALLUSERSPROFILE'}
+    env = {key.upper(): value for key, value in os.environ.items() if key.upper() in locations}
     if os.name == 'nt':
         # Unset and explicitly empty differ: Windows PowerShell reconstructs
         # the hosted machine's module search path only when this is absent.

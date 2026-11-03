@@ -261,11 +261,16 @@ fi
 # These are location variables, not
 # credentials, so forwarding them keeps the isolation intent intact. Each is
 # only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
+# SystemDrive/ProgramData/ALLUSERSPROFILE are system locations, not per-user
+# AppData. Dropping SystemDrive makes Windows expand Common AppData to a
+# literal %SystemDrive% directory inside the checkout. Git bash is
+# case-sensitive, so both casings must cross this env -i boundary.
 # Portable CI also binds PowerShell's module-analysis cache to its disposable
 # parent home; retain that exact location across the hermetic env boundary.
 WIN_ENV=()
-for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP \
-    ComSpec PATHEXT PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData PSModuleAnalysisCachePath; do
+for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT SystemRoot TEMP TMP \
+    ComSpec PATHEXT PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData ALLUSERSPROFILE \
+    SYSTEMDRIVE SystemDrive PSModuleAnalysisCachePath PSMODULEANALYSISCACHEPATH; do
   if [ -n "${!_win_var:-}" ]; then
     WIN_ENV+=("$_win_var=${!_win_var}")
   fi
