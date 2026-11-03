@@ -2824,28 +2824,6 @@ def _write_retired_oneshot_diagnostic(
         "missed-oneshot")
 
 
-def _write_missed_oneshot_diagnostic(job: dict[str, Any], next_run: str) -> None:
-    """Local trace only. The owner alert is delivered after the jobs save, outside the lock."""
-    text = (
-        "# Cron job removed before firing (run time outside grace window)\n\n"
-        f"- job id: {job.get('id')}\n"
-        f"- name: {job.get('name')}\n"
-        f"- scheduled run time: {next_run}\n"
-        f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
-        f"- removed at: {_hermes_now().isoformat()}\n\n"
-        "This one-shot's run time is more than the grace window in the "
-        "past (scheduler down past the window, host asleep, or jobs.json "
-        "edited), which is outside the 'will never fire' contract "
-        "enforced at create/update/resume time. The job was removed "
-        "without running; recreate it (or use the Run button) to "
-        "schedule it again.\n"
-    )
-    try:
-        save_job_output(job.get("id", ""), text)
-    except Exception as exc:
-        logger.debug("Failed to write missed-oneshot diagnostic for job %r: %s", job.get("id"), exc)
-
-
 def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot dispatch BEFORE execution: ``repeat.completed`` is bumped
     and persisted under the jobs lock so a tick dying mid-execution cannot lose the dispatch
@@ -3175,13 +3153,8 @@ def get_due_jobs(*, adapters=None, loop=None) -> list[dict[str, Any]]:
     This prevents the perpetual-defer loop (#33315) where a job whose runtime exceeds ``interval + grace``
     would be skipped forever.
     """
-    from cron.jobs_oneshot import deliver_misses
-
-    missed = []
     with _jobs_lock():
-        due = _get_due_jobs_locked(missed=missed)
-    deliver_misses(missed, adapters=adapters, loop=loop)
-    return due
+        return _get_due_jobs_locked()
 
 
 @dataclass
@@ -3195,7 +3168,6 @@ class _DueScan:
     # Miss/catch-up metrics, emitted once the save that persists the scan's repairs lands: an
     # unwritable store re-finds the same miss every tick, so counting before the save over-counts.
     on_saved: list[Callable[[], None]] = field(default_factory=list)
-    missed: list[tuple[dict, str]] = field(default_factory=list)
 
     def find(self, job_id: Any) -> Optional[dict[str, Any]]:
         return next((rj for rj in self.raw_jobs if rj["id"] == job_id), None)
@@ -3631,7 +3603,7 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     return True
 
 
-def _get_due_jobs_locked(*, missed=None) -> list[dict[str, Any]]:
+def _get_due_jobs_locked() -> list[dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
     raw_jobs = load_jobs()
     scan = _DueScan(raw_jobs, _hermes_now())
@@ -3675,8 +3647,6 @@ def _get_due_jobs_locked(*, missed=None) -> list[dict[str, Any]]:
     store_health.end_recovery_window(_current_cron_store().cron_dir)
     for emit in scan.on_saved:
         emit()
-    if missed is not None:
-        missed.extend(scan.missed)
     return due
 
 

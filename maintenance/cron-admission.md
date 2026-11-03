@@ -120,9 +120,11 @@ inside the same surviving process.
 Before removing an unclaimed miss, persist a terminal failed execution with the
 scheduled instant and original scan time in its missed reason, plus an incident.
 If either store fails, keep the job for retry. Reuse the failed missed execution
-when a later jobs save retries. Only after the removal save succeeds, deliver
-through the existing failure route outside the jobs lock, retaining the active
-ticker's adapters and loop. Keep claimed and on-time behavior unchanged. The
+when a later jobs save retries. Preserve the existing durable retirement outbox:
+commit its stable owner-notice receipt before removal, then let normal outbox
+draining send outside the jobs lock. Never bypass it with a direct crash-failure
+send. Spent dispatches retain the interrupted/partial-effects diagnostic and
+must not receive the scheduler-stall exemption. Keep claimed and on-time behavior unchanged. The
 implementation belongs in `cron/jobs_oneshot.py`, not the jobs facade.
 
 `tests/cron/test_oneshot_missed.py` covers same-process stalls, startup/downtime,

@@ -45,8 +45,13 @@ def _record_miss(d) -> str:
         if row is None:
             raise RuntimeError("Missed one-shot execution could not be terminalized")
     error = row["error"]
-    # Unlike the delivery helper's best-effort upsert, this must succeed before deletion.
-    incidents.upsert_incident(d.job["id"], error, job_name=d.job.get("name"))
+    # Match the durable retirement outbox's incident signature. Store failure must
+    # keep the job for retry, rather than deleting it with only best-effort visibility.
+    scheduled = (d.job.get("schedule") or {}).get("run_at") or d.next_run
+    incidents.upsert_incident(
+        d.job["id"],
+        f"missed-oneshot: one-shot {d.job['id']} scheduled at {scheduled}; "
+        "Job not run; recreate to run.", job_name=d.job.get("name"))
     return error
 
 
@@ -63,25 +68,22 @@ def retire_expired_oneshot(d) -> bool:
     # The existing interruption stamp keeps a catch-up eligible if dispatch could not start.
     if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
         return False
+    # A consumed dispatch is interrupted, not a never-started scheduler miss.
+    # Preserve main's partial-effects diagnostic and never replay it after a stall.
+    if (d.job.get("repeat") or {}).get("completed", 0) > 0:
+        if not (claim or d.job.get("fire_claim")):
+            jobs._write_retired_oneshot_diagnostic(d.job, d.next_run)
+            d.scan.retire(d.job["id"])
+            d.scan.on_saved.append(lambda job=d.job: jobs.record_cron_missed(job))
+        return True
     if _stall_covers(d):
         return False
     if not (claim or d.job.get("fire_claim")):
         error = _record_miss(d)
-        jobs._write_missed_oneshot_diagnostic(d.job, d.next_run)
+        # The existing outbox commits the owner notice and incident before deletion.
+        # Its durable receipt survives a jobs-save failure without a duplicate send.
+        jobs._write_retired_oneshot_diagnostic(d.job, d.next_run)
         d.scan.retire(d.job["id"])
         d.scan.on_saved.append(lambda job=d.job: jobs.record_cron_missed(job))
-        d.scan.missed.append((d.job, error))
         logger.error("Job %s: %s", d.job["id"], error)
     return True
-
-
-def deliver_misses(missed, *, adapters, loop) -> None:
-    """Use the normal failure route only after the jobs save and outside its lock."""
-    from cron import scheduler
-
-    for job, error in missed:
-        try:
-            scheduler._deliver_crash_failure(job, error, adapters=adapters, loop=loop)
-        except Exception:
-            # The execution and incident remain visible even if notification itself fails.
-            logger.exception("Failed delivering missed one-shot notice for job %s", job["id"])

@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from cron import executions, incidents, jobs, scheduler
+from cron import delivery_queue, executions, incidents, jobs, scheduler
 from cron import scheduler_tick
 
 NOW = datetime(2026, 10, 29, 17, 21, 28, tzinfo=UTC)
@@ -66,14 +66,7 @@ def test_due_scan_accounts_for_miss_or_dispatches(store, monkeypatch, late, hear
     monkeypatch.setattr(jobs, "_jobs_lock", track_lock)
     adapters, loop = object(), object()
 
-    delivery_state = []
-
-    def delivered(job, error, **kwargs):
-        # Delivery errors are contained by production, so observe here and assert afterward.
-        delivery_state.append((locked, jobs.load_jobs(), bool(incidents.list_incidents()), kwargs))
-        return None, "not_configured"
-
-    deliver = Mock(side_effect=delivered)
+    deliver = Mock(return_value=(None, "not_configured"))
     monkeypatch.setattr(scheduler, "_deliver_crash_failure", deliver)
 
     def run(job, **kwargs):
@@ -99,10 +92,14 @@ def test_due_scan_accounts_for_miss_or_dispatches(store, monkeypatch, late, hear
         assert "missed" in row["error"].lower()
         assert due_at in row["error"] and NOW.isoformat() in row["error"]
         assert incidents.list_incidents()[0]["job_id"] == job["id"]
-        deliver.assert_called_once()
-        assert delivery_state == [(False, [], True, {"adapters": adapters, "loop": loop})]
+        # Main's durable outbox owns delivery; never bypass it with a direct send.
+        deliver.assert_not_called()
+        receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
+        assert receipt is not None
+        assert "not run; recreate to run" in receipt["content"]
         jobs.get_due_jobs(adapters=adapters, loop=loop)
-        deliver.assert_called_once()
+        assert delivery_queue.get_status(receipt["execution_id"]) == receipt
+        deliver.assert_not_called()
 
 
 @pytest.mark.parametrize("failed_store", ["incident", "jobs"])
@@ -126,4 +123,6 @@ def test_retirement_requires_durable_accounting_and_save(store, monkeypatch, fai
     assert jobs.get_due_jobs() == jobs.load_jobs() == []
     assert len(executions.list_executions(job_id=job["id"])) == 1
     assert incidents.list_incidents()
-    deliver.assert_called_once()
+    receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
+    assert receipt is not None and receipt["status"] == "pending"
+    deliver.assert_not_called()
