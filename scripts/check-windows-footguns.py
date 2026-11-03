@@ -34,10 +34,12 @@ Suppress an intentional use (e.g. tests or platform-gated code) with:
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import subprocess
 import sys
+import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -468,7 +470,10 @@ FOOTGUNS: list[Footgun] = [
         # Literal /proc/ and /sys/ paths are kernel pseudo-files: Linux
         # generates them, no Windows tool can BOM them, and they do not
         # exist on Windows at all, so plain utf-8 is the honest encoding.
-        post_filter=lambda m, line: _is_read_shaped(line) and not _KERNEL_PSEUDO_FILE.search(line),
+        post_filter=lambda m, line: (
+            not _KERNEL_PSEUDO_FILE.search(line)
+            and any(_is_read_shaped(call) for call in _encoding_calls(m, line))
+        ),
     ),
     Footgun(
         name="write with encoding='utf-8-sig' (emits a BOM)",
@@ -488,7 +493,9 @@ FOOTGUNS: list[Footgun] = [
             "path.write_text(data, encoding='utf-8') / "
             "open(path, 'w', encoding='utf-8')"
         ),
-        post_filter=lambda m, line: _is_write_shaped(line),
+        post_filter=lambda m, line: any(
+            _is_write_shaped(call) for call in _encoding_calls(m, line)
+        ),
     ),
     Footgun(
         name="module-level import of a POSIX-only stdlib module",
@@ -690,6 +697,37 @@ _OPEN_MODE_RES = (
     re.compile(r"""\bfdopen\s*\([^)]*?,\s*['"]([rwaxbtU+]{1,3})['"]"""),
     re.compile(r"""\.open\s*\(\s*['"]([rwaxbtU+]{1,3})['"]"""),
 )
+
+
+def _encoding_calls(match: re.Match, line: str) -> Iterable[str]:
+    """Call-local text for each matching encoding keyword on this line.
+
+    Keep only direct arguments so nested calls cannot donate a direction or
+    mode to their parent. Tokenization keeps quoted parentheses inert and
+    accepts partial lines without requiring a syntactically complete file.
+    """
+    stack: list[list[str]] = []
+    calls: list[list[str]] = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(line).readline):
+            value = token.string
+            if token.type == tokenize.OP and value in ("(", "[", "{"):
+                prefix = re.search(r"\.?\w+\s*$", line[:token.start[1]]) if value == "(" else None
+                if stack:
+                    stack[-1].append("_nested_")
+                stack.append([(prefix.group().strip() if prefix else ""), value])
+            elif token.type == tokenize.OP and value in (")", "]", "}"):
+                if stack:
+                    stack.pop().append(value)
+            elif stack:
+                if token.type == tokenize.NAME and match.re.match(line, token.start[1]):
+                    calls.append(stack[-1])
+                stack[-1].append(value)
+    except tokenize.TokenError:
+        # A call may continue on the next physical line, as in the existing
+        # line-based rules. Keep the arguments available on this line.
+        pass
+    return ("".join(call) for call in calls)
 
 
 def _extract_mode(line: str) -> str | None:
