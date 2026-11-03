@@ -512,18 +512,6 @@ async function recoverEndedLiveTurn(runtimeId: string) {
   markTurnWithoutReply(runtimeId)
 }
 
-/** A fresh idle snapshot is the missing terminal edge after a socket drop.
- * Settle the held state before refreshing: history reconciliation refuses to
- * replace a live partial, even when its sidebar busy flag is already clear. */
-export function settleLiveTurnFromSnapshot(runtimeId: string): void {
-  if (!isLiveTurnAwaitingEvents($sessionStates.get()[runtimeId])) {
-    return
-  }
-
-  settleEndedLiveTurn(runtimeId)
-  void recoverEndedLiveTurn(runtimeId)
-}
-
 /** The silence window ran out: ask the backend. Running keeps the turn and
  *  restarts the clock; no answer (gateway down, request failed, owner unknown)
  *  also keeps it — the stall hint and Stop remain — and asks again next window.

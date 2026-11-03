@@ -21,9 +21,9 @@ object-identity checked.
 
 Canonical replay restores past frames but did not attach the replacement socket
 to future authority events. Resume must precede replay, against the retained
-epoch's owner profile. A fresh idle active-list snapshot also settles a live
-partial and refreshes its persisted transcript; it must not retire a turn with
-newer stream events, a just-submitted prompt, or a still-starting backend.
+epoch's owner profile. Retain the existing renderer settlement path: an idle
+active-list poll is not a substitute for the missing subscription and must not
+retire stream identity while its replay is still in flight.
 
 ## Maintenance boundary
 
@@ -35,10 +35,9 @@ policy merely to satisfy the suite.
 Contract tests: `tests/gateway/test_local_process_completion_admission.py`.
 
 Desktop proof: `canonical-reconnect-replay-owner.test.ts` models a server that
-subscribes only on resume and withholds future frames otherwise;
-`live-status-spinner.test.ts` covers an idle snapshot retaining `turnLive`.
-The real Linux core suite exercises the two transitions with the scripted model,
-packaged Electron build and the unchanged transcript oracle.
+subscribes only on resume and withholds future frames otherwise. The real Linux
+core suite exercises the two transitions with the scripted model, packaged
+Electron build and the unchanged transcript oracle.
 
 Retire this unit when upstream preserves equivalent producer identity,
 subscribe-before-replay and authoritative terminal-state reconciliation. Revert
