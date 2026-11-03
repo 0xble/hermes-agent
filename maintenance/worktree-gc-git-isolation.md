@@ -64,10 +64,11 @@ files. SIGKILL/timeout can leave that reason, `index.lock`, a partial directory
 and the newly created branch behind. Distinguish it from a deliberate foreign
 claim:
 
-- Failed-add cleanup may release this exact reason only on the exact path the
-  failed call just attempted to create. The call owns its unfinished add. The
-  guard runs again before any raw-directory fallback, so another tool's
-  replacement reason still blocks cleanup.
+- Failed-add cleanup may release this exact reason only on the exact empty path
+  the attempt atomically reserved before invoking Git, and only once the holder
+  probe proves its Git checkout is gone. On timeout, the add's whole process group
+  is killed and reaped before cleanup. The guard runs again before any
+  raw-directory fallback, so another tool's replacement reason still blocks cleanup.
 - A sweep may reclaim it only after the existing per-name age tier, with the
   lock itself older than the cutoff and no fresh checkout activity. A live Git
   holding `index.lock` **or working in that checkout** blocks reclamation; an
@@ -95,8 +96,18 @@ Each add attempt atomically creates its empty worktree directory before invoking
 Git. Only that attempt may clean it after failure, including on the local-HEAD
 retry; a concurrent named launch that finds the directory leaves it untouched.
 Cleanup releases a Hermes pid lock only for this process and releases an
-`initializing` lock only after the Git holder is gone. Live/unknown holders and
-another launcher's Hermes lock are preserved.
+`initializing` lock only after the Git holder is gone. On timeout the add's whole
+process group is killed and reaped before cleanup probes holders. Live/unknown
+holders and another launcher's Hermes lock are preserved.
+
+Each attempt records whether its branch already exists. An existing branch
+without a tree is refused with a clear "branch already exists" message, just as
+`_setup_worktree` refuses an existing named tree. Cleanup deletes a branch only
+when it was absent at admission and the reserved checkout's admin HEAD proves
+the add acquired it; a branch-name race that fails before admin creation is
+preserved too. A unique-commit regression covers both normal and HEAD-fallback
+bases. A live slow-smudge regression covers timeout cleanup of the path, admin
+entry, and new branch, no stray checkout descendants, and a same-name retry.
 
 Process-holder targets must be absolute paths. Linux `/proc/<pid>/fd` links also
 name `socket:[...]`, `pipe:[...]`, and `anon_inode:[...]`; resolving those against

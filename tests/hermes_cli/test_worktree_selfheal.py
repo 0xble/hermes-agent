@@ -159,12 +159,76 @@ class TestCleanupFailedWorktreeAdd:
             assert _git(repo, "show", f"{ref}:{name}").stdout == contents
         assert not _git(repo, "ls-tree", f"{ref}^2").stdout, "missing index must archive as empty"
 
+    @pytest.mark.platforms("posix")
+    def test_add_timeout_reaps_checkout_before_cleanup_and_named_retry(self, repo, monkeypatch):
+        import json
+        import psutil
+        from hermes_cli import worktree_ops as ops
+
+        marker = repo.parent / "timed-out-checkout.json"
+        slow_filter = repo.parent / "timeout_filter.py"
+        slow_filter.write_text(
+            "import json, pathlib, psutil, threading\n"
+            "process = psutil.Process()\n"
+            "family = []\n"
+            f"while process is not None and process.pid != {os.getpid()}:\n"
+            "    family.append((process.pid, process.create_time()))\n"
+            "    process = process.parent()\n"
+            f"pathlib.Path({str(marker)!r}).write_text(json.dumps(family))\n"
+            "threading.Event().wait()\n", encoding="utf-8")
+        (repo / ".gitattributes").write_text("f.txt filter=slow\n", encoding="utf-8")
+        _git(repo, "add", ".gitattributes")
+        _git(repo, "commit", "-qm", "slow checkout")
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(slow_filter))}"
+        git = ops._git
+        wt = repo / ".worktrees" / "timeout-retry"
+        branch = "hermes/timeout-retry"
+        admin = repo / ".git" / "worktrees" / wt.name
+
+        def timed_add(args, cwd, **kwargs):
+            if "worktree" in args and "add" in args:
+                args = ["-c", f"filter.slow.smudge={command}", *args]
+                kwargs["timeout"] = 2
+            return git(args, cwd, **kwargs)
+
+        def survivors():
+            live = []
+            for pid, created in json.loads(marker.read_text(encoding="utf-8")):
+                try:
+                    process = psutil.Process(pid)
+                    if process.create_time() == created and process.status() != psutil.STATUS_ZOMBIE:
+                        live.append(process)
+                except psutil.NoSuchProcess:
+                    pass
+            return live
+
+        try:
+            monkeypatch.setattr(ops, "_git", timed_add)
+            assert ops._worktree_add(str(repo), wt, branch, "HEAD", "HEAD") is None
+            assert marker.exists(), "timeout must interrupt the live smudge-filter checkout"
+            assert not wt.exists(), "timeout must clean the partial checkout without a second sweep"
+            assert not admin.exists(), "timeout must release the initializing lock and admin entry"
+            assert not _git(repo, "branch", "--list", branch).stdout.strip()
+            wait_until(lambda: not survivors(), timeout=10, what="timed-out add's whole process tree")
+            monkeypatch.setattr(ops, "_git", git)
+            assert ops._worktree_add(str(repo), wt, branch, "HEAD", "HEAD")
+            assert _git(wt, "status", "--porcelain").stdout == ""
+        finally:
+            # RED must not leak the very checkout descendants this regression detects.
+            if marker.exists():
+                for process in survivors():
+                    try:
+                        process.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                wait_until(lambda: not survivors(), timeout=10, what="test checkout descendants to exit")
+
     def test_worktree_git_uses_c_locale(self, repo, monkeypatch):
         from hermes_cli import worktree_ops as ops
 
         for key in ("LANG", "LC_ALL", "LANGUAGE"):
             monkeypatch.setenv(key, "de_DE.UTF-8")
-        run = subprocess.run
+        popen = subprocess.Popen
         seen = []
 
         def observe(argv, **kwargs):
@@ -173,9 +237,9 @@ class TestCleanupFailedWorktreeAdd:
                 assert env.get("LC_ALL") == "C"
                 assert env.get("LANGUAGE", "C") == "C"
                 seen.append(argv[argv.index("worktree") + 1])
-            return run(argv, **kwargs)
+            return popen(argv, **kwargs)
 
-        monkeypatch.setattr(subprocess, "run", observe)
+        monkeypatch.setattr(subprocess, "Popen", observe)
         wt = repo / ".worktrees" / "hermes-locale"
         assert ops._worktree_add(str(repo), wt, "hermes/locale", "HEAD", "HEAD")
         assert ops._git(["worktree", "lock", "--reason", f"hermes pid={os.getpid()}",
@@ -280,6 +344,30 @@ class TestCleanupFailedWorktreeAdd:
         assert _git(repo, "branch", "--list", branch).stdout.strip()
         if locked:
             assert (repo / ".git" / "worktrees" / wt.name / "locked").read_text().strip() == reason
+
+    @pytest.mark.parametrize("base", ["HEAD", "main"])
+    def test_named_add_preserves_preexisting_branch_commits(self, repo, monkeypatch, base):
+        from hermes_cli import worktree_ops as ops
+
+        branch = "hermes/existing-name"
+        _git(repo, "checkout", "-qb", branch)
+        (repo / "unique.txt").write_text("user's only copy\n", encoding="utf-8")
+        _git(repo, "add", "unique.txt")
+        _git(repo, "commit", "-qm", "unique user commit")
+        original = _git(repo, "rev-parse", branch).stdout.strip()
+        _git(repo, "checkout", "main")
+        wt = repo / ".worktrees" / "existing-name"
+        messages = []
+        monkeypatch.setattr(ops, "_cprint", messages.append)
+
+        result = ops._worktree_add(str(repo), wt, branch, base, base)
+
+        assert _git(repo, "rev-parse", "--verify", branch, check=False).stdout.strip() == original, (
+            "a failed named add must never delete or replace a pre-existing branch")
+        assert result is None, "existing branch names are refused rather than silently reused"
+        assert not wt.exists()
+        assert any("branch already exists" in text.lower() for text in messages)
+        assert _git(repo, "show", f"{branch}:unique.txt").stdout == "user's only copy\n"
 
     def test_noop_when_nothing_exists(self, repo):
         """Fail-soft on an error path where git never created anything."""
