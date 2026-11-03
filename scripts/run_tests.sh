@@ -33,14 +33,18 @@
 #
 # A missing or stale checkout environment is rebuilt by run-in-hermes-env,
 # which runs setup-hermes.sh. That setup writes tool, dependency, and
-# test-env state into the inherited HERMES_HOME. The fallback refuses when
-# that home is a live runtime home: a current release pointer
-# ($HERMES_HOME/current symlink, including a dangling one), gateway_state.json,
-# a running gateway pid (gateway.pid or gateway.b.pid), or the OS account's
-# default Hermes home. The account default comes from the password database,
-# not $HOME — workers pin HOME to scratch. Rebuild the checkout-local venv
-# instead, from the checkout, after stopping anything that is using .venv and
-# removing it if it exists:
+# test-env state into the inherited HERMES_HOME, and PM writes the resolved
+# root's tools/ (hermes_constants._hermes_root_of, pm/environments.store_root).
+# The fallback refuses when that home, or the root it resolves to, is live:
+# a current release pointer (including a dangling one), gateway_state.json,
+# a gateway pid kill -0 can see (including EPERM from another user's gateway),
+# or any path under the OS account default. A home under the account default
+# resolves to that default; otherwise <root>/profiles/<name> resolves to <root>.
+# The account default comes from the password database (getent, dscl, or
+# ~user), never $HOME and never /usr/bin/python3. Workers pin HOME to scratch.
+# If that lookup fails, the home is treated as live. Rebuild the checkout-local
+# venv instead, from the checkout, after stopping anything that is using .venv
+# and removing it if it exists:
 #   python -m pm.build_env --source . --out .venv --group dev --group test
 # Or set HERMES_HOME to a scratch directory that is not a live runtime home.
 # HERMES_ALLOW_LIVE_HOME_SETUP=1 overrides the refusal only when setup against
@@ -51,29 +55,48 @@ set -euo pipefail
 # Predicate for the test-runner fallback. Sourcing this file defines it and
 # returns; it does not run the suite. The runner body below executes only when
 # this file is the program.
-hermes_account_default_home() {
-  local py=""
-  if [ -x /usr/bin/python3 ]; then
-    py=/usr/bin/python3
-  elif command -v python3 >/dev/null 2>&1; then
-    py="$(command -v python3)"
-  else
-    return 1
+hermes_account_passwd_home() {
+  local user home
+  home=""
+  user="$(id -un 2>/dev/null || true)"
+  case "$user" in
+    ""|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  if command -v getent >/dev/null 2>&1; then
+    home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
   fi
-  "$py" -c 'import os, pwd, sys
-from pathlib import Path
-suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
-try:
-    account = Path(pwd.getpwuid(os.getuid()).pw_dir)
-except Exception:
-    raise SystemExit(1)
-if sys.platform == "win32":
-    local = os.environ.get("LOCALAPPDATA", "").strip()
-    base = Path(local) if local else account / "AppData" / "Local"
-    print(base / ("hermes" + suffix))
-else:
-    print(account / (".hermes" + suffix))
-' || return 1
+  if [ -z "$home" ] && command -v dscl >/dev/null 2>&1; then
+    home="$(dscl . -read "/Users/${user}" NFSHomeDirectory 2>/dev/null \
+      | sed -n 's/^NFSHomeDirectory: *//p' || true)"
+  fi
+  if [ -z "$home" ]; then
+    # ~user reads the password database. ~ alone would follow $HOME.
+    home="$(eval "echo ~${user}")" || return 1
+  fi
+  case "$home" in
+    ""|"~${user}") return 1 ;;
+  esac
+  printf '%s\n' "$home"
+}
+
+hermes_account_default_home() {
+  local account suffix os
+  suffix="${HERMES_DATA_DIR_SUFFIX-}"
+  os="$(uname -s 2>/dev/null || printf '%s' unknown)"
+  case "$os" in
+    MINGW*|MSYS*|CYGWIN*)
+      if [ -n "${LOCALAPPDATA:-}" ]; then
+        printf '%s\n' "${LOCALAPPDATA%/}/hermes${suffix}"
+        return 0
+      fi
+      account="$(hermes_account_passwd_home)" || return 1
+      printf '%s\n' "${account}/AppData/Local/hermes${suffix}"
+      ;;
+    *)
+      account="$(hermes_account_passwd_home)" || return 1
+      printf '%s\n' "${account}/.hermes${suffix}"
+      ;;
+  esac
 }
 
 hermes_canonical_home() {
@@ -106,12 +129,25 @@ hermes_pid_from_file() {
   printf '%s\n' "$pid"
 }
 
+hermes_pid_is_alive() {
+  local pid="$1" err
+  # LC_ALL=C keeps the EPERM text stable. Discarding stderr would hide a
+  # gateway owned by another user: kill -0 then exits 1 for both EPERM and ESRCH.
+  if err="$(LC_ALL=C kill -0 "$pid" 2>&1)"; then
+    return 0
+  fi
+  case "$err" in
+    *"not permitted"*) return 0 ;;
+  esac
+  return 1
+}
+
 hermes_gateway_pid_running() {
   local home="$1" file pid
   for file in "$home/gateway.pid" "$home/gateway.b.pid"; do
     pid="$(hermes_pid_from_file "$file" 2>/dev/null || true)"
     [ -n "$pid" ] || continue
-    if kill -0 "$pid" 2>/dev/null; then
+    if hermes_pid_is_alive "$pid"; then
       return 0
     fi
   done
@@ -131,11 +167,8 @@ hermes_effective_test_home() {
   esac
 }
 
-# Prints why HOME is a live runtime home, or nothing and status 1.
-# The optional second argument is an already-resolved account default.
-hermes_runtime_home_live_reason() {
+hermes_home_marker_reason() {
   local home="$1"
-  local account_default="${2-}"
   [ -n "$home" ] || return 1
   if [ -L "$home/current" ]; then
     printf '%s\n' "current release pointer"
@@ -149,12 +182,72 @@ hermes_runtime_home_live_reason() {
     printf '%s\n' "running gateway pid"
     return 0
   fi
-  if [ -z "$account_default" ]; then
-    account_default="$(hermes_account_default_home 2>/dev/null || true)"
-  fi
-  if [ -n "$account_default" ] && hermes_same_home "$home" "$account_default"; then
-    printf '%s\n' "account default home"
+  return 1
+}
+
+# True when home is root or a descendant. A sibling such as root-extra is not.
+hermes_home_is_under() {
+  local home="$1" root="$2" canon_home canon_root
+  [ -n "$home" ] && [ -n "$root" ] || return 1
+  canon_home="$(hermes_canonical_home "$home")" || return 1
+  canon_root="$(hermes_canonical_home "$root")" || return 1
+  [ "$canon_home" = "$canon_root" ] && return 0
+  case "$canon_home" in
+    "$canon_root"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Same rule as hermes_constants._hermes_root_of.
+hermes_resolved_runtime_root() {
+  local home="$1" native="${2-}" canon_home parent
+  canon_home="$(hermes_canonical_home "$home")" || canon_home="${home%/}"
+  if [ -n "$native" ] && hermes_home_is_under "$canon_home" "$native"; then
+    hermes_canonical_home "$native"
     return 0
+  fi
+  parent="$(dirname "$canon_home")" || return 1
+  case "$parent" in
+    */profiles|profiles)
+      dirname "$parent"
+      return 0
+      ;;
+  esac
+  printf '%s\n' "$canon_home"
+}
+
+# Prints why HOME is a live runtime home, or nothing and status 1.
+# The optional second argument is an already-resolved account default.
+hermes_runtime_home_live_reason() {
+  local home="$1"
+  local account_default="${2-}"
+  local root reason
+  [ -n "$home" ] || return 1
+  reason="$(hermes_home_marker_reason "$home" || true)"
+  if [ -n "$reason" ]; then
+    printf '%s\n' "$reason"
+    return 0
+  fi
+  if [ -z "$account_default" ]; then
+    if ! account_default="$(hermes_account_default_home 2>/dev/null)"; then
+      printf '%s\n' "account default lookup failed"
+      return 0
+    fi
+  fi
+  if hermes_home_is_under "$home" "$account_default"; then
+    printf '%s\n' "under account default home"
+    return 0
+  fi
+  root="$(hermes_resolved_runtime_root "$home" "$account_default")" || {
+    printf '%s\n' "runtime root resolution failed"
+    return 0
+  }
+  if ! hermes_same_home "$root" "$home"; then
+    reason="$(hermes_home_marker_reason "$root" || true)"
+    if [ -n "$reason" ]; then
+      printf '%s\n' "$reason"
+      return 0
+    fi
   fi
   return 1
 }

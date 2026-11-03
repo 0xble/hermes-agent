@@ -249,11 +249,16 @@ clears `PYTHONPATH`, so PM shell activation alone does not supply pytest. For a
 fresh output outside the checkout, set `HERMES_PYTHON` to its interpreter.
 
 If the checkout environment is missing or stale, `scripts/run_tests.sh` refuses
-to run that setup when the inherited `HERMES_HOME` is a live runtime home (a
-`current` release pointer, `gateway_state.json`, a running gateway pid, or the
-OS account default home). Rebuild the checkout venv with the command above, or
-set `HERMES_HOME` to a scratch directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1`
-overrides the refusal only when setup against that home is deliberate.
+to run that setup when the inherited `HERMES_HOME` is a live runtime home, or
+resolves to one. Live means a `current` release pointer, `gateway_state.json`,
+a gateway pid `kill -0` can see (including EPERM), or any path under the OS
+account default. A profile under that default, or under another live root
+(`<root>/profiles/<name>`), is live even when the profile directory itself has
+no markers. The account-default lookup uses the password database, not
+`/usr/bin/python3`; if it fails, the home is treated as live. Rebuild the
+checkout venv with the command above, or set `HERMES_HOME` to a scratch
+directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1` overrides the refusal only when
+setup against that home is deliberate.
 
 ```bash
 scripts/run_tests.sh                                    # full suite

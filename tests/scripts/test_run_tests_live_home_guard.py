@@ -52,7 +52,13 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     setup.chmod(0o755)
     commands = tmp_path / "bin"
     commands.mkdir()
-    for name in ("bash", "dirname", "env", "sed", "head", "uname", "mkdir"):
+    # id/dscl/getent are the account-default lookup. python3 is intentionally
+    # absent: the lookup must not fall back to the macOS Command Line Tools stub.
+    for name in ("bash", "dirname", "env", "sed", "head", "uname", "mkdir", "id", "cut"):
+        source = shutil.which(name)
+        if source:
+            commands.joinpath(name).symlink_to(source)
+    for name in ("getent", "dscl"):
         source = shutil.which(name)
         if source:
             commands.joinpath(name).symlink_to(source)
@@ -96,7 +102,7 @@ def _mark(home: Path, kind: str) -> None:
         (home / "gateway_state.json").write_text("{}\n", encoding="utf-8")
     elif kind == "running-pid":
         proc = subprocess.Popen(["sleep", "60"])
-        (home / "gateway.pid").write_text('{"pid": %d}\n' % proc.pid, encoding="utf-8")
+        (home / "gateway.pid").write_text(f'{{"pid": {proc.pid}}}\n', encoding="utf-8")
         home.joinpath(".sleep-pid").write_text(str(proc.pid), encoding="utf-8")
     elif kind == "bare-pid":
         proc = subprocess.Popen(["sleep", "60"])
@@ -106,7 +112,7 @@ def _mark(home: Path, kind: str) -> None:
         proc = subprocess.Popen(["sleep", "60"])
         proc.kill()
         proc.wait(timeout=5)
-        (home / "gateway.pid").write_text('{"pid": %d}\n' % proc.pid, encoding="utf-8")
+        (home / "gateway.pid").write_text(f'{{"pid": {proc.pid}}}\n', encoding="utf-8")
     elif kind == "not-a-pointer":
         (home / "current").write_text("not a release pointer\n", encoding="utf-8")
     elif kind == "scratch":
@@ -198,3 +204,197 @@ def test_account_default_match_is_live_without_touching_that_home(tmp_path):
     )
     assert probe.returncode == 0, probe.stdout + probe.stderr
     assert probe.stdout.splitlines() == ["MATCH", "OTHER_SCRATCH"]
+
+
+def _source(script: Path, body: str, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", body, "probe", str(script), *args],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env=env,
+    )
+
+
+@pytest.mark.platforms("posix")
+def test_profile_under_live_custom_root_refuses_and_writes_nothing(tmp_path):
+    """PM resolves <root>/profiles/<name> to <root> and writes <root>/tools."""
+    root, commands = _checkout(tmp_path)
+    custom = tmp_path / "custom-root"
+    _mark(custom, "gateway-state")
+    profile = custom / "profiles" / "dev"
+    _mark(profile, "scratch")
+    before_root = _snapshot(custom)
+    before_profile = _snapshot(profile)
+    result = _run(root, commands, profile)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "refusing" in output.lower(), output
+    assert "SETUP_RAN" not in output
+    assert REBUILD in output
+    assert _snapshot(custom) == before_root
+    assert _snapshot(profile) == before_profile
+
+
+@pytest.mark.platforms("posix")
+def test_profile_under_quiet_custom_root_still_sets_up(tmp_path):
+    root, commands = _checkout(tmp_path)
+    custom = tmp_path / "quiet-root"
+    _mark(custom, "scratch")
+    profile = custom / "profiles" / "dev"
+    _mark(profile, "scratch")
+    result = _run(root, commands, profile)
+    output = result.stdout + result.stderr
+    assert "SETUP_RAN" in output, output
+    assert (profile / "setup-wrote").read_text(encoding="utf-8") == "setup\n"
+    assert not (custom / "setup-wrote").exists()
+
+
+@pytest.mark.platforms("posix")
+def test_descendant_of_account_default_is_live_without_markers(tmp_path):
+    """A profile under the account-default root is live even with no markers of its own."""
+    script = ROOT / "scripts" / "run_tests.sh"
+    account = tmp_path / "account-default"
+    profile = account / "profiles" / "dev"
+    sibling = tmp_path / "account-default-extra" / "profiles" / "dev"
+    profile.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    probe = _source(
+        script,
+        "source \"$1\"\n"
+        "if hermes_runtime_home_is_live \"$2\" \"$4\"; then echo PROFILE_LIVE; else echo PROFILE_SCRATCH; fi\n"
+        "if hermes_runtime_home_is_live \"$3\" \"$4\"; then echo SIBLING_LIVE; else echo SIBLING_SCRATCH; fi\n",
+        str(profile),
+        str(sibling),
+        str(account),
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "pinned-home")},
+    )
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert probe.stdout.splitlines() == ["PROFILE_LIVE", "SIBLING_SCRATCH"]
+    assert not (tmp_path / "pinned-home").exists()
+
+
+@pytest.mark.platforms("posix")
+def test_gateway_pid_eperm_counts_as_alive_and_esrch_does_not(tmp_path):
+    script = ROOT / "scripts" / "run_tests.sh"
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "gateway.pid").write_text("4242\n", encoding="utf-8")
+    denied = _source(
+        script,
+        "set -euo pipefail\n"
+        "source \"$1\"\n"
+        "kill() { printf '%s\\n' \"kill: ($2) - Operation not permitted\" >&2; return 1; }\n"
+        "if hermes_gateway_pid_running \"$2\"; then echo ALIVE; else echo DEAD; fi\n",
+        str(home),
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "pinned-home")},
+    )
+    missing = _source(
+        script,
+        "set -euo pipefail\n"
+        "source \"$1\"\n"
+        "kill() { printf '%s\\n' \"kill: ($2) - No such process\" >&2; return 1; }\n"
+        "if hermes_gateway_pid_running \"$2\"; then echo ALIVE; else echo DEAD; fi\n",
+        str(home),
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "pinned-home")},
+    )
+    assert denied.returncode == 0, denied.stdout + denied.stderr
+    assert denied.stdout.strip() == "ALIVE", denied.stdout + denied.stderr
+    assert missing.returncode == 0, missing.stdout + missing.stderr
+    assert missing.stdout.strip() == "DEAD", missing.stdout + missing.stderr
+
+
+def _passwd_account_home() -> Path:
+    """The password-database home, not the scripts-suite installer-home patch.
+
+    tests/scripts/conftest.py patches in-process pwd.getpwuid to a disposable
+    installer home. The sourced shell cannot see that patch, and must not: the
+    production lookup reads the password database. A fresh interpreter does.
+    """
+    probe = subprocess.run(
+        [sys.executable, "-c", "import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent-home-pin"},
+    )
+    assert probe.returncode == 0, probe.stderr
+    return Path(probe.stdout.strip())
+
+
+@pytest.mark.platforms("posix")
+def test_account_default_home_matches_passwd_lookup_and_suffix(tmp_path):
+    """The printed path comes from the password database, never $HOME, and is not created."""
+    script = ROOT / "scripts" / "run_tests.sh"
+    account = _passwd_account_home()
+    pinned = tmp_path / "pinned-home"
+    env = {"PATH": os.environ["PATH"], "HOME": str(pinned)}
+    plain = _source(script, "source \"$1\"; hermes_account_default_home", env=env)
+    assert plain.returncode == 0, plain.stdout + plain.stderr
+    assert plain.stdout.strip() == str(account / ".hermes")
+    suffixed = _source(
+        script,
+        "source \"$1\"; hermes_account_default_home",
+        env={**env, "HERMES_DATA_DIR_SUFFIX": "-probe"},
+    )
+    assert suffixed.returncode == 0, suffixed.stdout + suffixed.stderr
+    assert suffixed.stdout.strip() == str(account / ".hermes-probe")
+    assert not pinned.exists()
+    assert not (account / ".hermes-probe").exists()
+
+
+@pytest.mark.platforms("posix")
+def test_account_default_tilde_fallback_ignores_pinned_home(tmp_path):
+    """Without getent or dscl, ~user still comes from the password database."""
+    script = ROOT / "scripts" / "run_tests.sh"
+    account = _passwd_account_home()
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    for name in ("id", "uname", "bash"):
+        source = shutil.which(name)
+        assert source
+        (commands / name).symlink_to(source)
+    pinned = tmp_path / "pinned-home"
+    probe = _source(
+        script,
+        "source \"$1\"; hermes_account_default_home",
+        env={"PATH": str(commands), "HOME": str(pinned)},
+    )
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert probe.stdout.strip() == str(account / ".hermes")
+    assert not pinned.exists()
+
+
+@pytest.mark.platforms("posix")
+def test_account_default_lookup_does_not_invoke_usr_bin_python3():
+    script = ROOT / "scripts" / "run_tests.sh"
+    probe = subprocess.run(
+        ["bash", "-x", "-c", "source \"$1\"; hermes_account_default_home >/dev/null", "probe", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert "/usr/bin/python3" not in probe.stderr
+
+
+@pytest.mark.platforms("posix")
+def test_account_default_lookup_failure_refuses_without_writing(tmp_path):
+    """A failed lookup is live. The restricted PATH has no id, dscl, getent, or python3."""
+    root, commands = _checkout(tmp_path)
+    for name in ("id", "getent", "dscl", "cut", "python3"):
+        link = commands / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+    home = tmp_path / "scratch-home"
+    _mark(home, "scratch")
+    before = _snapshot(home)
+    result = _run(root, commands, home)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "refusing" in output.lower(), output
+    assert "SETUP_RAN" not in output
+    assert _snapshot(home) == before

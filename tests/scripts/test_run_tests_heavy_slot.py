@@ -41,8 +41,14 @@ def runner(tmp_path):
     python.chmod(0o755)
     # Supply only the shell tools used by the runner. In particular, host shell
     # functions and the installed heavy-slot cannot affect the absent-tool case.
-    for name in ("bash", "dirname", "env", "sed", "head"):
+    # id/dscl/getent let the live-home guard resolve the account default. A
+    # missing lookup is itself live, which would hide the admission behavior.
+    for name in ("bash", "dirname", "env", "sed", "head", "id", "cut", "uname"):
         commands.joinpath(name).symlink_to(shutil.which(name))
+    for name in ("getent", "dscl"):
+        source = shutil.which(name)
+        if source:
+            commands.joinpath(name).symlink_to(source)
     commands.joinpath("git").write_text("#!/bin/bash\nexit 0\n")
     commands.joinpath("git").chmod(0o755)
     env = {"PATH": str(commands), "HOME": str(tmp_path), "HERMES_PYTHON": str(python)}

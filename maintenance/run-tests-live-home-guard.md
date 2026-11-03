@@ -10,14 +10,21 @@ Fork patch identity: `run-tests-live-home-guard`.
 When the checkout test environment is missing or stale, `scripts/run_tests.sh`
 refuses to re-exec `run-in-hermes-env` (and therefore refuses `setup-hermes.sh`
 and pm) if the inherited home is a live runtime home. A home is live when any
-of these hold:
+of these hold on the home itself or on the root it resolves to:
 
 - `$HERMES_HOME/current` is a symlink, including a dangling release pointer
 - `gateway_state.json` exists
-- `gateway.pid` or `gateway.b.pid` names a running process
-- the home is the OS account default (`pwd`, not `$HOME`)
+- `gateway.pid` or `gateway.b.pid` names a process `kill -0` can see, including
+  EPERM from another user's gateway
+- the home is the OS account default, or any path under it
 
-The refusal writes nothing to that home. It tells the caller to rebuild the
+Resolution matches `hermes_constants._hermes_root_of`: a home under the account
+default resolves to that default; otherwise `<root>/profiles/<name>` resolves
+to `<root>`. PM writes that root's `tools/` (`pm/environments.store_root`).
+The account default comes from the password database (`getent`, `dscl`, or
+`~user`), not `$HOME` and not `/usr/bin/python3`. A failed lookup is live.
+
+The refusal writes nothing to that home or its resolved root. It tells the caller to rebuild the
 checkout-local venv with
 `python -m pm.build_env --source . --out .venv --group dev --group test`,
 or to set `HERMES_HOME` to a scratch directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1`
