@@ -105,10 +105,10 @@ def _quiet(fn: Callable[[], Any], default: Any, log_prefix: str = "") -> Any:
     return default
 
 
-def _lazy_call(module: str, name: str, default: Any, log_prefix: str) -> Any:
+def _lazy_call(module: str, name: str, default: Any, log_prefix: str, **kwargs) -> Any:
     """Call ``module.name()`` resolved at call time (tests stub the module / patch the
     attribute); on any failure log ``log_prefix`` and return ``default``."""
-    return _quiet(lambda: getattr(importlib.import_module(module), name)(), default, log_prefix)
+    return _quiet(lambda: getattr(importlib.import_module(module), name)(**kwargs), default, log_prefix)
 
 
 def _camofox_active(context: str = "") -> bool:
@@ -945,7 +945,9 @@ def _description_header() -> str:
     if _lazy_call("tools.browser_tool_lightpanda_fallback", "lightpanda_engine_status", (False, ""),
                   "lightpanda engine status unavailable")[0]:  # no screenshots, whatever the model sees
         return _HEADER_BASE + _HEADER_TEXT_ONLY + _HEADER_LIGHTPANDA
-    vision = _lazy_call("tools.vision_tools", "_should_use_native_vision_fast_path", False, "")
+    # Descriptions are frozen at session creation. Optional capability discovery
+    # must not hold startup behind catalog DNS or a background refresh lock.
+    vision = _lazy_call("tools.vision_tools", "_should_use_native_vision_fast_path", False, "", allow_network=False)
     return _HEADER_BASE + (_HEADER_VISION if vision else _HEADER_TEXT_ONLY)
 
 

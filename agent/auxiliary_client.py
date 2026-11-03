@@ -5845,7 +5845,10 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     except ImportError:
         return True
     try:
-        supports = _lookup_supports_vision(provider, model, load_config_readonly())
+        # Availability probes run while building session tool schemas. The
+        # optional catalog must not wait on DNS or its background refresh lock.
+        extra = {"allow_network": False} if _aux_probe_active() else {}
+        supports = _lookup_supports_vision(provider, model, load_config_readonly(), **extra)
     except Exception:  # pragma: no cover - defensive
         return True
     return True if supports is None else bool(supports)
