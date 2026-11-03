@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ Worktree hat nicht gepushte Commits, wird behalten: {path}"
     uncommitted_keeping: "⚠ Worktree hat nicht committete Änderungen, wird behalten: {path}"
     kept_reason: "⚠ Worktree wird behalten ({reason}): {path}"
+    lock_unverifiable_reason: "Sperre aktiv oder nicht überprüfbar"
     clean_up_manually: "Manuell aufräumen mit: git worktree remove --force {path}"
     cleaned_up: "✓ Worktree aufgeräumt: {path}"
     exit_question_dirty: "Dieser Worktree hat nicht committete Änderungen: {path}"

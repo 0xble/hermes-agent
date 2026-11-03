@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ Werkboom het ongestootte commits, word behou: {path}"
     uncommitted_keeping: "⚠ Werkboom het ongecommitte veranderinge, word behou: {path}"
     kept_reason: "⚠ Werkboom word behou ({reason}): {path}"
+    lock_unverifiable_reason: "slot gehou of nie verifieerbaar nie"
     clean_up_manually: "Om met die hand op te ruim: git worktree remove --force {path}"
     cleaned_up: "✓ Werkboom opgeruim: {path}"
     exit_question_dirty: "Hierdie werkboom het ongecommitte veranderinge: {path}"

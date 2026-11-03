@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ 工作树有未推送的提交，保留：{path}"
     uncommitted_keeping: "⚠ 工作树有未提交的更改，保留：{path}"
     kept_reason: "⚠ 保留工作树（{reason}）：{path}"
+    lock_unverifiable_reason: "锁被占用或无法验证"
     clean_up_manually: "手动清理：git worktree remove --force {path}"
     cleaned_up: "✓ 工作树已清理：{path}"
     exit_question_dirty: "此工作树有未提交的更改：{path}"

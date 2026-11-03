@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ Worktree'de push edilmemiş commit'ler var, korunuyor: {path}"
     uncommitted_keeping: "⚠ Worktree'de commit edilmemiş değişiklikler var, korunuyor: {path}"
     kept_reason: "⚠ Worktree tutuluyor ({reason}): {path}"
+    lock_unverifiable_reason: "kilit tutuluyor veya doğrulanamıyor"
     clean_up_manually: "Elle temizlemek için: git worktree remove --force {path}"
     cleaned_up: "✓ Worktree temizlendi: {path}"
     exit_question_dirty: "Bu worktree'de commit edilmemiş değişiklikler var: {path}"

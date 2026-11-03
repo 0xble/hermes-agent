@@ -3404,6 +3404,7 @@ cli:
     unpushed_keeping: "⚠ A worktree-ben feltöltetlen commitok vannak, megtartva: {path}"
     uncommitted_keeping: "⚠ A worktree-ben nem commitolt változások vannak, megtartva: {path}"
     kept_reason: "⚠ Worktree megtartva ({reason}): {path}"
+    lock_unverifiable_reason: "aktív vagy nem ellenőrizhető zárolás"
     clean_up_manually: "Kézi takarításhoz: git worktree remove --force {path}"
     cleaned_up: "✓ Worktree eltakarítva: {path}"
     exit_question_dirty: "Ebben a worktree-ben nem commitolt változások vannak: {path}"

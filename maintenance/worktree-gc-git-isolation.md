@@ -36,9 +36,57 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   both `hermes worktree prune` and the startup/cron pruner. A 15-30s timeout
   killed removals mid-delete on a saturated volume and left registered,
   half-deleted trees that every later prune keeps as dirty.
+- A lock with a reason belonging to another tool or person is always live: the
+  tree is never unlocked or removed, at any age. Upstream treated a foreign lock
+  as a leftover, and the sweep deleted another topic's locked eval candidate
+  twice (launch-time sweeps ignore the deletion window).
+- Every unlock checks ownership immediately before mutation, including frozen
+  sweep/audit execution, post-snapshot removal, clean exit, discard, retention and
+  failed-add cleanup (including its directory-removal fallback). Unattended
+  reclaim refreshes Hermes-lock liveness. Bare, malformed, foreign and unreadable
+  locks fail closed. Git's own exact `initializing` reason is the narrow exception
+  described below, never a general foreign-lock override.
 - `hermes worktree prune --dry-run` reports, per tree and in total, how much
   would be copied to the archive. It sizes only those paths, never whole trees;
   the rest of each tree is freed.
+
+## Git's in-progress-add lock
+
+Internal repository Git pins `LC_ALL=C` and `LANGUAGE=C`; worktree lifecycle
+wrappers do the same for add/lock/re-lock, including dashboard adds. Git translates
+the persistent in-progress lock reason, so normalizing the writer keeps recovery
+exact without treating translated foreign lock strings as ours. Unrelated
+interactive Git output retains the caller's locale.
+
+Git writes the exact reason `initializing` while `git worktree add` checks out
+files. SIGKILL/timeout can leave that reason, `index.lock`, a partial directory
+and the newly created branch behind. Distinguish it from a deliberate foreign
+claim:
+
+- Failed-add cleanup may release this exact reason only on the exact path the
+  failed call just attempted to create. The call owns its unfinished add. The
+  guard runs again before any raw-directory fallback, so another tool's
+  replacement reason still blocks cleanup.
+- A sweep may reclaim it only after the existing per-name age tier, with the
+  lock itself older than the cutoff and no fresh checkout activity. A live Git
+  holding `index.lock` **or working in that checkout** blocks reclamation; an
+  unavailable/incomplete holder probe fails closed. Recheck those proofs at
+  execution rather than trusting a frozen plan.
+- Ordinary exit/cleanup has no blanket right to release an in-progress add.
+  `initializing` with extra text is foreign, like any other unrecognized reason.
+
+The self-healing regression pauses a real checkout in its smudge filter, checks
+that Git has written both locks, then SIGKILLs the process group and waits for the
+holder probe to confirm its dying descendants have released the checkout. Locale
+regressions assert subprocess envs and exercise cleanup, HEAD-fallback retry and
+aged sweep with an actually translated Git locale; only those real-locale cases
+skip when translations are unavailable. Cleanup must
+remove the directory, admin entry and branch and permit the identical retry.
+Sweep coverage keeps live and young wreckage before reclaiming the aged
+abandoned add; foreign-takeover coverage remains mandatory. An add killed before
+its index is installed snapshots an empty staged index (Git's actual state), not
+HEAD; otherwise the post-snapshot index comparison falsely reports a concurrent
+edit and refuses every reclamation. The archive still holds all partial files.
 
 ## Provenance and patches
 
@@ -52,7 +100,11 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   parsing; review reproduced silent loss of a quoted filename followed by a
   full reclaim, and a later review found ignored-directory symlinks archived as
   regular files. Neither revision was adopted here.
-- Surfaces: `hermes_cli/worktree_gc.py`, `hermes_cli/worktree_ops.py` (remove timeout), `tests/hermes_cli/test_worktree_gc.py`.
+- Surfaces: `hermes_cli/worktree_gc.py`, `hermes_cli/worktree_ops.py` (remove timeout,
+  foreign-lock liveness and ownership-aware unlock), `hermes_cli/worktree_sweep.py`,
+  `hermes_cli/worktree_exit.py`, `hermes_cli/worktree_archive.py` (missing index),
+  `cli.py`, `locales/*.yaml` (lock-retention reason), `tests/hermes_cli/test_worktree_gc.py`,
+  `tests/hermes_cli/test_worktree.py` (lock reaping).
 
 ## Verification
 
@@ -65,6 +117,12 @@ go with the tree while an ignored `.env` (including one inside a tracked `script
 an untracked `dist/` file and an ignored parent holding a cache are archived, a tree with only
 regenerable dirt must reap with no archive, and a dry run must report archive size without
 sizing a whole tree.
+
+`scripts/run_tests.sh tests/hermes_cli/test_worktree*.py` also covers foreign locks
+through startup/classic sweeps, frozen plans/verdicts/audits, ownership changing
+during the archive, exit cleanup/discard, retention and failed-add cleanup. The
+tree's contents and exact foreign lock must survive each path; existing tests keep
+dead-Hermes-lock reclamation and clean exit working.
 
 ## Retirement and rollback
 

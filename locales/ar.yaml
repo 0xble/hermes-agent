@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ يحتوي worktree على إيداعات غير مدفوعة، سيُحتفظ به: {path}"
     uncommitted_keeping: "⚠ يحتوي worktree على تغييرات غير مودعة، سيُحتفظ به: {path}"
     kept_reason: "⚠ سيُحتفظ بالـ worktree ({reason}): {path}"
+    lock_unverifiable_reason: "القفل محجوز أو يتعذر التحقق منه"
     clean_up_manually: "للتنظيف يدويًا: git worktree remove --force {path}"
     cleaned_up: "✓ تم تنظيف worktree: {path}"
     exit_question_dirty: "يحتوي هذا الـ worktree على تغييرات غير مودعة: {path}"

@@ -12,8 +12,16 @@ Two behaviors:
    threshold; no-op below it.
 """
 
+import os
+import shlex
+import signal
 import subprocess
+import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
+
+from tests.waiting import wait_until
 
 import pytest
 
@@ -37,19 +45,48 @@ def repo(tmp_path):
     return root
 
 
+@contextmanager
+def _in_progress_add(repo, env=None, expected_reason="initializing"):
+    """Pause a real checkout in its smudge filter, while git holds index.lock."""
+    marker = repo.parent / "checkout-started"
+    slow_filter = repo.parent / "slow_filter.py"
+    slow_filter.write_text(
+        "import pathlib, sys, threading\n"
+        f"pathlib.Path({str(marker)!r}).touch()\n"
+        "threading.Event().wait()\n"
+        "sys.stdout.buffer.write(sys.stdin.buffer.read())\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text("f.txt filter=slow\n", encoding="utf-8")
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-qm", "slow checkout")
+    wt = repo / ".worktrees" / "hermes-dead00"
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(slow_filter))}"
+    proc = subprocess.Popen(
+        ["git", "-c", f"filter.slow.smudge={command}", "worktree", "add", str(wt),
+         "-b", "hermes/hermes-dead00"], cwd=repo, start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    admin = repo / ".git" / "worktrees" / wt.name
+    try:
+        wait_until(marker.exists, timeout=20, what="git checkout smudge filter")
+        if expected_reason is not None:
+            assert (admin / "locked").read_text().strip() == expected_reason
+        assert (admin / "index.lock").exists()
+        yield wt, admin, proc
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        # Reaping git alone does not reap its smudge-filter process group. The
+        # holder probe can still see those dying descendants under parallel load.
+        from hermes_cli._early_recovery import _held_open
+        wait_until(lambda: _held_open(admin / "index.lock", wt, any_git=True) is False,
+                   timeout=10, what="killed checkout process group to release its holders")
+
+
+@pytest.mark.platforms("posix")
 class TestCleanupFailedWorktreeAdd:
     def _simulate_timed_out_add(self, repo):
-        """Reproduce git's post-timeout wreckage: partial dir + LOCKED admin
-        entry + branch. Built from a real add then re-locking + damaging it,
-        which yields the same on-disk shape as a killed `worktree add`."""
-        wt = repo / ".worktrees" / "hermes-dead00"
-        _git(repo, "worktree", "add", str(wt), "-b", "hermes/hermes-dead00")
-        # Live-pid lock, exactly what `hermes -w` writes before the checkout.
-        _git(repo, "worktree", "lock", str(wt), "--reason", "hermes pid=999999")
-        # Partial materialization: gut the checkout but keep the dir + .git file.
-        for child in wt.iterdir():
-            if child.name != ".git":
-                child.unlink()
+        with _in_progress_add(repo) as (wt, _admin, _proc):
+            pass  # SIGKILL, not a synthetic Hermes lock or a post-checkout hook.
         return wt
 
     def test_sweeps_dir_admin_entry_and_branch(self, repo):
@@ -77,6 +114,136 @@ class TestCleanupFailedWorktreeAdd:
             repo, "worktree", "add", str(wt), "-b", "hermes/hermes-dead00", check=False
         )
         assert result.returncode == 0, f"retry failed: {result.stderr}"
+
+    def test_abandoned_initializing_add_is_swept_only_when_idle_and_old(self, repo):
+        from hermes_cli.worktree_sweep import execute_plan, plan_sweep
+
+        settings = {"archive_dirty": True, "archive_max_file_mb": 50,
+                    "archive_retention_days": 30, "max_total_gb": 0}
+
+        def age(wt, admin):
+            stamp = time.time() - 100 * 3600
+            for item in [*wt.rglob("*"), *admin.rglob("*"), wt]:
+                os.utime(item, (stamp, stamp))
+
+        with _in_progress_add(repo) as (wt, admin, _proc):
+            age(wt, admin)
+            execute_plan(str(repo), plan_sweep(str(repo), settings=settings), settings)
+            assert wt.exists(), "even an aged initializing tree with live git must survive"
+            assert (admin / "locked").read_text().strip() == "initializing"
+
+        # The process is dead, but the ordinary young-tree gate still applies.
+        wt.touch()
+        execute_plan(str(repo), plan_sweep(str(repo), settings=settings), settings)
+        assert wt.exists(), "a fresh initializing tree must survive"
+
+        age(wt, admin)
+        (admin / "locked").touch()
+        execute_plan(str(repo), plan_sweep(str(repo), settings=settings), settings)
+        assert wt.exists(), "a freshly restarted add in an old directory must survive"
+
+        age(wt, admin)
+        present = {str(p.relative_to(wt)): p.read_text() for p in wt.rglob("*")
+                   if p.is_file() and p.name != ".git"}
+        execute_plan(str(repo), plan_sweep(str(repo), settings=settings), settings)
+        assert not wt.exists(), "an aged abandoned git initializing tree must be reclaimed"
+        assert not admin.exists()
+        assert not _git(repo, "branch", "--list", "hermes/hermes-dead00").stdout.strip()
+        ref = "refs/hermes/archive/hermes-dead00"
+        for name, contents in present.items():
+            assert _git(repo, "show", f"{ref}:{name}").stdout == contents
+        assert not _git(repo, "ls-tree", f"{ref}^2").stdout, "missing index must archive as empty"
+
+    def test_worktree_git_uses_c_locale(self, repo, monkeypatch):
+        from hermes_cli import worktree_ops as ops
+
+        for key in ("LANG", "LC_ALL", "LANGUAGE"):
+            monkeypatch.setenv(key, "de_DE.UTF-8")
+        run = subprocess.run
+        seen = []
+
+        def observe(argv, **kwargs):
+            if "worktree" in argv and any(op in argv for op in ("add", "lock", "unlock")):
+                env = kwargs.get("env") or os.environ
+                assert env.get("LC_ALL") == "C"
+                assert env.get("LANGUAGE", "C") == "C"
+                seen.append(argv[argv.index("worktree") + 1])
+            return run(argv, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", observe)
+        wt = repo / ".worktrees" / "hermes-locale"
+        assert ops._worktree_add(str(repo), wt, "hermes/locale", "HEAD", "HEAD")
+        assert ops._git(["worktree", "lock", "--reason", f"hermes pid={os.getpid()}",
+                         str(wt)], str(repo)).returncode == 0
+        assert ops._retain_worktree_for_session(str(repo), str(wt), "session", repo / "state.db")
+        from hermes_cli import web_git
+        web_wt = repo / ".worktrees" / "web-locale"
+        code, _, error = web_git._git(str(repo), ["worktree", "add", "-b", "web/locale", str(web_wt)])
+        assert code == 0, error
+        assert seen == ["add", "lock", "unlock", "lock", "add"]
+        assert os.environ["LC_ALL"] == "de_DE.UTF-8", "do not mutate the caller's locale"
+
+    @pytest.mark.parametrize("action", ["cleanup", "retry", "sweep"])
+    def test_translated_locale_killed_add_is_reclaimed(self, repo, monkeypatch, action):
+        from hermes_cli._subprocess_compat import noninteractive_repo_git_env
+        from hermes_cli import worktree_ops as ops
+        from hermes_cli.worktree_sweep import execute_plan, plan_sweep
+
+        # Availability means git actually translates, not merely that locale -a lists it.
+        baseline = {**os.environ, "LC_ALL": "C", "LANGUAGE": "C"}
+        english = subprocess.run(["git", "worktree", "-h"], cwd=repo, env=baseline,
+                                 capture_output=True, text=True).stdout
+        for candidate in ("de_DE.UTF-8", "fr_FR.UTF-8", "es_ES.UTF-8", "zh_CN.UTF-8"):
+            env = {**os.environ, "LC_ALL": candidate, "LANG": candidate,
+                   "LANGUAGE": candidate.split("_")[0]}
+            translated = subprocess.run(["git", "worktree", "-h"], cwd=repo, env=env,
+                                        capture_output=True, text=True).stdout
+            if translated and translated != english:
+                break
+        else:
+            pytest.skip("git has no available translated locale")
+        for key in ("LANG", "LC_ALL", "LANGUAGE"):
+            monkeypatch.setenv(key, env[key])
+        wt = repo / ".worktrees" / "hermes-dead00"
+        branch = "hermes/hermes-dead00"
+        reasons = []
+
+        def killed_add(add_env):
+            with _in_progress_add(repo, add_env, expected_reason=None) as (_, admin, _):
+                reasons.append((admin / "locked").read_text().strip())
+            return admin
+
+        if action == "retry":
+            git = ops._git
+            attempts = []
+
+            def interrupt_first(args, cwd, **kwargs):
+                if "add" in args and "worktree" in args:
+                    attempts.append(args[-1])
+                    if len(attempts) == 1:
+                        killed_add(kwargs["env"])
+                        return subprocess.CompletedProcess(args, -9, "", "killed checkout")
+                return git(args, cwd, **kwargs)
+
+            monkeypatch.setattr(ops, "_git", interrupt_first)
+            assert ops._worktree_add(str(repo), wt, branch, "main", "main")
+            assert attempts == ["main", "HEAD"]
+            assert _git(wt, "status", "--porcelain").returncode == 0
+        else:
+            admin = killed_add(noninteractive_repo_git_env(repo))
+            if action == "cleanup":
+                ops._cleanup_failed_worktree_add(str(repo), wt, branch)
+            else:
+                stamp = time.time() - 100 * 3600
+                for item in [*wt.rglob("*"), *admin.rglob("*"), wt]:
+                    os.utime(item, (stamp, stamp))
+                settings = {"archive_dirty": True, "archive_max_file_mb": 50,
+                            "archive_retention_days": 30, "max_total_gb": 0}
+                execute_plan(str(repo), plan_sweep(str(repo), settings=settings), settings)
+            assert not wt.exists(), "killed add must not leave a locale-dependent lock"
+            assert not admin.exists()
+            assert not _git(repo, "branch", "--list", branch).stdout.strip()
+        assert reasons == ["initializing"]
 
     def test_noop_when_nothing_exists(self, repo):
         """Fail-soft on an error path where git never created anything."""
