@@ -112,6 +112,24 @@ class PortableGateTests(unittest.TestCase):
         self.assertNotIn('GITHUB_ACTIONS=true', profile['run'])
         self.assertIn('chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"', profile['run'])
 
+    def test_linux_desktop_builds_install_x11_headers(self):
+        """The HUD modifier monitor compiles in the node lane and desktop core E2E.
+        Without these headers the Linux helper is omitted and packaging continues."""
+        workflows = Path(__file__).resolve().parents[3] / '.github' / 'workflows'
+        for name in ('nightly.yml', 'gate.yml'):
+            text = (workflows / name).read_text(encoding='utf-8-sig')
+            # Python shards also install build-essential, and they install tmux.
+            # The linux job is the one that compiles the desktop native monitor.
+            installs = [line for line in text.splitlines()
+                        if 'apt-get install' in line and 'build-essential' in line and 'tmux' not in line]
+            self.assertEqual(len(installs), 1, name)
+            for package in ('libx11-dev', 'libxi-dev'):
+                self.assertIn(package, installs[0].split(), f'{name} linux job')
+        desktop = (workflows / 'e2e-desktop-core.yml').read_text(encoding='utf-8-sig')
+        install = desktop.split('apt-get install', 1)[1].split('- name:', 1)[0]
+        for package in ('libx11-dev', 'libxi-dev'):
+            self.assertIn(package, install.split(), 'e2e-desktop-core.yml')
+
     def test_local_toolchain_preserves_argv0_dispatching_node_shim(self):
         with tempfile.TemporaryDirectory() as directory:
             tools = Path(directory)
