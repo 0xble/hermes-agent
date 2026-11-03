@@ -32,6 +32,12 @@ def _cprint(text: str) -> None:
 
 def _git(args, cwd, timeout: float = 10, **kwargs):
     """Run ``git *args`` in *cwd* capturing UTF-8 text; raises like ``subprocess.run``."""
+    if args[:1] == ["worktree"]:
+        # Match add's repository env for lock/unlock and session re-lock calls,
+        # without changing unrelated user-facing Git output or the caller's env.
+        env = dict(os.environ if kwargs.get("env") is None else kwargs["env"])
+        env.update(LC_ALL="C", LANGUAGE="C")
+        kwargs["env"] = env
     return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8",  # noqa: PLW1510 -- forwarding wrapper: callers pass subprocess kwargs via **kwargs (check may arrive through it); an explicit check=False would raise TypeError
                           errors="replace", timeout=timeout, cwd=cwd, **kwargs)
 
@@ -95,7 +101,7 @@ def release_lsp_clients(wt_path: str) -> None:
 def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str) -> None:
     """Sweep the leftovers of a failed/timed-out ``git worktree add`` (fail-soft).
 
-    ``worktree add`` is not transactional: killed mid-checkout it leaves the partial dir, a
+    ``worktree add`` is not transactional: killed mid-checkout it leaves the partial dir, an
     admin entry locked by Git's own exact ``initializing`` reason, an index.lock and
     sometimes the branch, so any retry of the same name fails.
     """
