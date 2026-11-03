@@ -375,6 +375,8 @@ DEFAULT_CONFIG = {
         # ["/home/user/.hermes/cache/documents:/output"]. For gateway MEDIA delivery, write to
         # /output/... inside Docker and emit the host-visible path in MEDIA:, not the container one.
         "docker_volumes": [],
+        # Read-only credential, skills and cache mounts. Disable to skip automatic collection.
+        "docker_auto_mount_host_state": True,
         "docker_mount_cwd_to_workspace": False,  # mount host cwd at /workspace (weakens isolation)
         "docker_network": True,  # false = --network=none, no network access from commands
         "docker_extra_args": [],        # Extra flags passed verbatim to docker run

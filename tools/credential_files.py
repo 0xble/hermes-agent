@@ -312,12 +312,22 @@ def _remap_cache_path(path: str, container_base: str, src: str, dst: str, join: 
     return None
 
 
+def _docker_cache_mounts_disabled() -> bool:
+    from tools.terminal_scope import terminal_env
+
+    return (_terminal_backend() == "docker" and
+            terminal_env("TERMINAL_DOCKER_AUTO_MOUNT_HOST_STATE", "true").lower() not in {"true", "1", "yes"})
+
+
 def map_cache_path_to_container(host_path: str, container_base: str = "/root/.hermes") -> Optional[str]:
     """POSIX container path for a host path under an auto-mounted cache dir, else None.
 
     Also matches through symlinks: ``@file:`` expansion hands over RESOLVED paths while the mount roots keep
     HERMES_HOME's configured spelling, so a symlinked home (``~/.hermes`` -> dotfiles, macOS ``/var`` ->
     ``/private/var``) left a staged attachment's host path in front of the sandboxed agent (#103147)."""
+    if _docker_cache_mounts_disabled():
+        return None
+
     def join(root: str, rel: Path) -> str:
         return posixpath.join(root, rel.as_posix())
 
@@ -337,7 +347,7 @@ def map_cache_path_to_container(host_path: str, container_base: str = "/root/.he
 
 def from_agent_visible_cache_path(container_path: str, container_base: str = "/root/.hermes") -> str:
     """Inverse of :func:`to_agent_visible_cache_path`; unchanged unless Docker + cache dir."""
-    if _terminal_backend() != "docker":
+    if _terminal_backend() != "docker" or _docker_cache_mounts_disabled():
         return container_path
     mapped = _remap_cache_path(container_path, container_base, "container_path", "host_path", lambda root, rel: str(Path(root) / rel))
     return mapped if mapped is not None else container_path
@@ -355,13 +365,16 @@ def _terminal_backend() -> str:
     return (terminal_env("TERMINAL_ENV") or "local").strip().lower()
 
 
-def to_agent_visible_cache_path(host_path: str, container_base: str = "/root/.hermes") -> str:
+def to_agent_visible_cache_path(
+    host_path: str, container_base: str = "/root/.hermes", *, fallback_to_host: bool = True,
+) -> Optional[str]:
     """Translate a host cache path to where the active backend (TERMINAL_ENV) sees it.
 
     Mirrors ``_agent_cache_base_for_env`` in tools/image_generation_tool.py: docker/modal mount at
     ``/root/.hermes``; ssh/daytona/vercel_sandbox under ``~/.hermes``; plugin backends declare
     ``cache_path_base`` (None = host paths stay correct, e.g. the singularity plugin); local/unknown
-    unchanged.
+    unchanged. Set ``fallback_to_host=False`` for read_file hints: an unmounted remote cache
+    then returns None instead of advertising an unreadable host path.
 
     * docker / modal — bind-mounted (docker) or per-file-synced (modal) at ``/root/.hermes`` (the
     *container_base* default). * ssh / daytona / vercel_sandbox — file-synced under the remote user's home;
@@ -383,7 +396,7 @@ def to_agent_visible_cache_path(host_path: str, container_base: str = "/root/.he
         container_base = str(plugin_base)
 
     mapped = map_cache_path_to_container(host_path, container_base=container_base)
-    return mapped if mapped is not None else host_path
+    return mapped if mapped is not None else (host_path if fallback_to_host else None)
 
 
 def iter_cache_files(container_base: str = "/root/.hermes") -> list[dict[str, str]]:

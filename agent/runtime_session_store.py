@@ -360,6 +360,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.journal = candidate
             self.failure = None
 
+    def append_message(self, session_id, role, content=None, *, archived=False,
+                       compression_lock_holder=None, turn_lease_holder=None,
+                       turn_lease_ttl_seconds=300.0, **metadata):
+        self._session(session_id)
+        payload = dict(metadata, role=role, content=content, archived=archived,
+            compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+        return self._apply('transcript.append_one', payload)['row_id']
+
     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
         self._session(session_id)

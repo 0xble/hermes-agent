@@ -82,7 +82,7 @@ def _truncate_snapshot(snapshot_text: str, max_chars: Optional[int] = None) -> s
     if stored_path:
         # Agent-visible path: read_file runs inside the active backend (#72389).
         from tools.credential_files import to_agent_visible_cache_path
-        stored_path = to_agent_visible_cache_path(stored_path)
+        stored_path = to_agent_visible_cache_path(stored_path, fallback_to_host=False)
 
     lines = snapshot_text.split('\n')
     result: list[str] = []

@@ -14,6 +14,8 @@ A turn rejected before its first provider request retains the original user inpu
 
 The deterministic seed-23 provider-overflow case failed identically at fork main `907525949f2fa` and sync candidate `0408203171be`: turn 9's new input `U23x9xfa0dbc` never reached persistence because preflight rejected before the normal turn-start flush. No previously persisted message was deleted. This is inherited rejected-input loss, not an upstream compaction deletion regression.
 
-Run `tests/e2e/core/compaction/`, `tests/agent/test_preflight_compression_timeout_fail_closed.py`, `tests/agent/test_export_current_turn_boundary.py`, and the SessionDB message/lease tests. The focused rejection test repeats the same ask twice and asserts recoverable archived rows, empty model replay, unchanged failure envelopes, and zero provider calls.
+Run `tests/e2e/core/compaction/`, `tests/agent/test_preflight_compression_timeout_fail_closed.py`, `tests/agent/test_export_current_turn_boundary.py`, `tests/hermes_state/test_worker_message_archive.py`, and the SessionDB message/lease tests. The focused rejection test repeats the same ask twice and asserts recoverable archived rows, unchanged model replay, unchanged failure envelopes, and zero provider calls.
+
+Managed workers use `RuntimeSessionStore.append_message` through the closed `transcript.append_one` owner operation. Share the single-row serializer and transaction-level insertion with `SessionDB.append_message`, never call a self-committing writer inside a worker receipt or archive row IDs returned by batch adoption. Exact sequence replay returns the original row ID. Keep session assignment, generation, epoch, turn-lease and closed-parent fences, while preserving ordinary append during an active compression watermark lock.
 
 Retire when upstream retains rejected input durably without increasing model history and passes these tests with the write guards unchanged.

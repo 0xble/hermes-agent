@@ -425,23 +425,14 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         that keeps the message as a live dict already stamped on it (``stamp_message_uid``); minted when
         absent, but then only the row carries it. ``archived`` retains display/search history without
         adding the row to model replay, atomically under the same transcript write guards."""
+        from hermes_state_message_insert import prepare_single_message, insert_single_message
         msg = dict(locals())  # every keyword above is a message-dict field of the same name
-        # Encode outside the write txn (display metadata first: log-order parity).
-        msg["display_metadata"] = self._encode_display_metadata(display_metadata)
-        tool_calls = _parse_tool_calls(tool_calls)
-        message_timestamp = _coerce_timestamp(timestamp, time.time())
-        stamp_message_uid(msg)  # a fresh occurrence: mint its durable id
-        self._stamp_tool_call_uids(msg, tool_calls, {})
-        params = self._message_row_params(
-            session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=True)
+        # Preserve encoding outside the write transaction for ordinary callers.
+        params, tool_count = prepare_single_message(self, session_id, msg)
         def _do(conn):
-            self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
+            return insert_single_message(self, conn, session_id, params, tool_count,
+                archived=archived, compression_lock_holder=compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
-            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
-            if archived:
-                conn.execute("UPDATE messages SET active = 0, compacted = 1 WHERE id = ?", (msg_id,))
-            self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
-            return msg_id
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
         # holding the lock for seconds (VACUUM, checkpoint) can't kill it.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)

@@ -927,6 +927,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
                                              worker_tail_role, worker_tool_names)
     from hermes_state_worker_compression import WORKER_COMPRESSION_HANDLERS
     from hermes_state_worker_lifecycle import WORKER_LIFECYCLE_HANDLERS
+    from hermes_state_worker_messages import worker_append_message
     handlers = {
         **WORKER_LIFECYCLE_HANDLERS,
         **WORKER_COMPRESSION_HANDLERS,
@@ -937,6 +938,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
         'session.tail_role': worker_tail_role,
         'session.row_role': worker_row_role,
         'transcript.append': _worker_append,
+        'transcript.append_one': worker_append_message,
         'execution.finish': _worker_finish,
         'usage.main': _worker_usage,
         'usage.auxiliary': lambda db, conn, sid, p: _worker_usage(db, conn, sid, p, auxiliary=True),
