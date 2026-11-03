@@ -55,8 +55,9 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
 Internal repository Git pins `LC_ALL=C` and `LANGUAGE=C`; worktree lifecycle
 wrappers do the same for add/lock/re-lock, including dashboard adds. Git translates
 the persistent in-progress lock reason, so normalizing the writer keeps recovery
-exact without treating translated foreign lock strings as ours. Unrelated
-interactive Git output retains the caller's locale.
+exact without treating translated foreign lock strings as ours. This also makes
+Hermes' worktree Git stderr English, including diagnostics returned in
+`why_kept` and `ArchiveError` messages; the caller's environment is not mutated.
 
 Git writes the exact reason `initializing` while `git worktree add` checks out
 files. SIGKILL/timeout can leave that reason, `index.lock`, a partial directory
@@ -87,6 +88,20 @@ abandoned add; foreign-takeover coverage remains mandatory. An add killed before
 its index is installed snapshots an empty staged index (Git's actual state), not
 HEAD; otherwise the post-snapshot index comparison falsely reports a concurrent
 edit and refuses every reclamation. The archive still holds all partial files.
+
+## Failed-add ownership and process paths
+
+Each add attempt atomically creates its empty worktree directory before invoking
+Git. Only that attempt may clean it after failure, including on the local-HEAD
+retry; a concurrent named launch that finds the directory leaves it untouched.
+Cleanup releases a Hermes pid lock only for this process and releases an
+`initializing` lock only after the Git holder is gone. Live/unknown holders and
+another launcher's Hermes lock are preserved.
+
+Process-holder targets must be absolute paths. Linux `/proc/<pid>/fd` links also
+name `socket:[...]`, `pipe:[...]`, and `anon_inode:[...]`; resolving those against
+the sweeper's cwd would falsely keep an exit-archived tree even when the exiting
+process is excluded.
 
 ## Provenance and patches
 

@@ -27,9 +27,12 @@ import pytest
 
 
 def _git(cwd, *args, check=True):
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check
+    result = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False
     )
+    if check:
+        assert result.returncode == 0, f"git {args}: {result.stderr}"
+    return result
 
 
 @pytest.fixture
@@ -82,13 +85,13 @@ def _in_progress_add(repo, env=None, expected_reason="initializing"):
                    timeout=10, what="killed checkout process group to release its holders")
 
 
-@pytest.mark.platforms("posix")
 class TestCleanupFailedWorktreeAdd:
     def _simulate_timed_out_add(self, repo):
         with _in_progress_add(repo) as (wt, _admin, _proc):
             pass  # SIGKILL, not a synthetic Hermes lock or a post-checkout hook.
         return wt
 
+    @pytest.mark.platforms("posix")
     def test_sweeps_dir_admin_entry_and_branch(self, repo):
         from hermes_cli.worktree_ops import _cleanup_failed_worktree_add
 
@@ -103,6 +106,7 @@ class TestCleanupFailedWorktreeAdd:
         branches = _git(repo, "branch", "--list", "hermes/hermes-dead00").stdout
         assert branches.strip() == "", "orphaned branch must be deleted"
 
+    @pytest.mark.platforms("posix")
     def test_retry_succeeds_after_cleanup(self, repo):
         """The whole point: the same worktree name is creatable again."""
         from hermes_cli.worktree_ops import _cleanup_failed_worktree_add
@@ -115,6 +119,7 @@ class TestCleanupFailedWorktreeAdd:
         )
         assert result.returncode == 0, f"retry failed: {result.stderr}"
 
+    @pytest.mark.platforms("posix")
     def test_abandoned_initializing_add_is_swept_only_when_idle_and_old(self, repo):
         from hermes_cli.worktree_sweep import execute_plan, plan_sweep
 
@@ -184,6 +189,7 @@ class TestCleanupFailedWorktreeAdd:
         assert os.environ["LC_ALL"] == "de_DE.UTF-8", "do not mutate the caller's locale"
 
     @pytest.mark.parametrize("action", ["cleanup", "retry", "sweep"])
+    @pytest.mark.platforms("posix")
     def test_translated_locale_killed_add_is_reclaimed(self, repo, monkeypatch, action):
         from hermes_cli._subprocess_compat import noninteractive_repo_git_env
         from hermes_cli import worktree_ops as ops
@@ -244,6 +250,36 @@ class TestCleanupFailedWorktreeAdd:
             assert not admin.exists()
             assert not _git(repo, "branch", "--list", branch).stdout.strip()
         assert reasons == ["initializing"]
+
+    @pytest.mark.platforms("posix")
+    def test_failed_add_keeps_another_launchers_initializing_checkout(self, repo):
+        from hermes_cli import worktree_ops as ops
+
+        with _in_progress_add(repo) as (wt, admin, _proc):
+            ops._cleanup_failed_worktree_add(str(repo), wt, "hermes/hermes-dead00")
+            assert wt.exists(), "the losing launch must not remove the winner's checkout"
+            assert (admin / "locked").read_text().strip() == "initializing"
+            assert (admin / "index.lock").exists()
+
+    @pytest.mark.parametrize("locked", [False, True])
+    def test_failed_add_keeps_another_launchers_completed_checkout(self, repo, locked):
+        from hermes_cli import worktree_ops as ops
+
+        wt = repo / ".worktrees" / "shared-name"
+        branch = "hermes/shared-name"
+        _git(repo, "worktree", "add", str(wt), "-b", branch)
+        note = wt / "winner.txt"
+        note.write_text("winner's work\n", encoding="utf-8")
+        reason = f"hermes pid={os.getppid()}"
+        if locked:
+            _git(repo, "worktree", "lock", "--reason", reason, str(wt))
+            # Direct error cleanup must respect the holder as well as admission.
+            ops._cleanup_failed_worktree_add(str(repo), wt, branch)
+        assert ops._worktree_add(str(repo), wt, branch, "main", "main") is None
+        assert note.read_text(encoding="utf-8") == "winner's work\n"
+        assert _git(repo, "branch", "--list", branch).stdout.strip()
+        if locked:
+            assert (repo / ".git" / "worktrees" / wt.name / "locked").read_text().strip() == reason
 
     def test_noop_when_nothing_exists(self, repo):
         """Fail-soft on an error path where git never created anything."""

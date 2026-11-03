@@ -386,7 +386,9 @@ def _copy_worktree_includes(repo_root: str, wt_path: Path) -> None:
 def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str, base_label: str):
     """``git worktree add`` with a local-HEAD retry -> ``(base_ref, base_label)``, or None on failure.
 
-    Every failed attempt is swept with ``_cleanup_failed_worktree_add`` so the retry is not poisoned.
+    Reserve each attempt's empty directory before invoking Git. Only a reserved
+    attempt is swept with ``_cleanup_failed_worktree_add`` so retries are not poisoned
+    and concurrent named launches cannot clean each other's checkouts.
     """
     from hermes_cli._subprocess_compat import noninteractive_repo_git_env
 
@@ -396,7 +398,15 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
         _cprint("\033[31m✗ Failed to create worktree: could not read the repository's filter config\033[0m")
         return None
 
+    owns_path = False
+
     def _add(cfg):
+        nonlocal owns_path
+        # Atomically reserve even the unlocked interval before Git installs its
+        # initializing lock. A losing named launch must never clean this path.
+        owns_path = False
+        wt_path.mkdir(parents=True)
+        owns_path = True
         # 120s: on a multi-agent box the ~10k-file checkout contends for disk (113s measured under load).
         return _git([*cfg, "worktree", "add", str(wt_path), "-b", branch_name, base_ref], repo_root,
                     timeout=120, stdin=subprocess.DEVNULL, env=env)
@@ -409,15 +419,18 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
                 # A partial fetch can leave the remote ref unusable; never hard-fail on a sync hiccup.
                 logger.warning("worktree add from %s failed (%s); retrying from local HEAD",
                                base_ref, result.stderr.strip())
-                _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
+                if owns_path:
+                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
                 base_ref, base_label = "HEAD", "HEAD (fallback — remote base failed)"
                 result = _add([])
             if result.returncode != 0:
-                _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
+                if owns_path:
+                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
                 _cprint(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
                 return None
     except Exception as e:
-        _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
+        if owns_path:
+            _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
         _cprint(f"\033[31m✗ Failed to create worktree: {e}\033[0m")
         return None
     return base_ref, base_label
@@ -991,8 +1004,9 @@ def _unlock_owned_worktree(repo_root: str, worktree_path: str, timeout: int = 10
 
     Refresh ownership at the mutation boundary, not from an earlier sweep/audit verdict.
     Unattended reclaim also requires the Hermes owner to be dead; session exit may release
-    its own live lock. Only the failed add's exact path or an aged sweep candidate may
-    release Git's exact ``initializing`` lock; the sweep must prove no live Git owns it.
+    its own live lock. Failed-add cleanup accepts only this process's Hermes pid lock.
+    Both a failed add's reserved path and an aged sweep candidate must prove no live
+    Git owns the exact ``initializing`` lock before releasing it.
     Bare, foreign, malformed and unreadable locks all fail closed.
     """
     try:
@@ -1000,11 +1014,14 @@ def _unlock_owned_worktree(repo_root: str, worktree_path: str, timeout: int = 10
         if not found or reason is None:
             return True
         if reason == "initializing" and failed_add:
-            pass  # This failed add owns exactly the path it just attempted to create.
+            if not _initializing_worktree_is_dead(worktree_path):
+                return False
         elif reason == "initializing" and initializing_before is not None:
             if not _initializing_worktree_is_dead(worktree_path, initializing_before):
                 return False
         elif _HERMES_LOCK_RE.fullmatch(reason) is None:
+            return False
+        elif failed_add and reason.split(" ", 2)[1] != f"pid={os.getpid()}":
             return False
         elif dead_only and _worktree_lock_is_live(repo_root, worktree_path, timeout) != "dead":
             return False

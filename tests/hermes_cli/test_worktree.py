@@ -227,7 +227,10 @@ class TestWorktreeLockReaping:
         # Ownership is the guard under test, not the developer's live process table.
         monkeypatch.setattr(worktree_sweep, "live_process_pids", lambda *args, **kwargs: {})
 
-        wt = self._mk(cli, git_repo, "eval-candidate", pid=999999, age_h=240)
+        # Failed-add cleanup may release only its own pid lock; other paths
+        # start from dead-Hermes work before a foreign tool takes ownership.
+        pid = os.getpid() if operation == "failed-add-remove" else 999999
+        wt = self._mk(cli, git_repo, "eval-candidate", pid=pid, age_h=240)
         root, path = str(git_repo), str(wt)
         info = {"repo_root": root, "path": path, "branch": "hermes/eval-candidate"}
         settings = worktree_sweep.sweep_settings()
