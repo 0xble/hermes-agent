@@ -9,6 +9,23 @@ import pytest
 from tests.waiting import wait_until
 
 
+@pytest.mark.parametrize("argv,expected", [
+    (["hermes", "gateway", "run", "--client-owned"], True),
+    (["hermes", "-p", "fixture", "gateway", "run", "--client-owned"], True),
+    (["hermes", "gateway", "run"], False),
+    (["hermes", "chat", "--client-owned"], False),
+    (["hermes", "gateway", "status", "run", "--client-owned"], False),
+    (["hermes", "--client-owned"], False),
+])
+def test_early_argv_fence_only_arms_for_client_owned_gateway(monkeypatch, argv, expected):
+    from unittest.mock import Mock
+    from gateway import client_lifetime
+    arm = Mock()
+    monkeypatch.setattr(client_lifetime, "arm_client_lifetime", arm)
+    client_lifetime.arm_client_lifetime_for_argv(argv)
+    assert arm.call_count == int(expected)
+
+
 @pytest.mark.platforms("posix")
 @pytest.mark.live_system_guard_bypass  # only the exact foreground CLI under a disposable HOME is exercised
 @pytest.mark.parametrize("stdin_kind", ["null", "tty"])

@@ -26,7 +26,7 @@ def detached_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(async_delegation_worker, 'bind_worker_delegation_store', lambda store: None)
     monkeypatch.setattr(detached_authority, 'owns_detached_execution', lambda *args: True)
     monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
-                        lambda *args, **kwargs: SimpleNamespace(state='absent', endpoint=None))
+                        lambda *args, **kwargs: SimpleNamespace(state='absent', endpoint=None, reason_code=None))
     real_dial = worker.WorkerRPC._dial
 
     class Link:
@@ -227,7 +227,7 @@ def test_detached_receipt_replay_is_exactly_once(tmp_path, monkeypatch, fault):
             endpoint = SimpleNamespace(api_origin=f'http://127.0.0.1:{server.socket.getsockname()[1]}',
                                        control_home=None)
             monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
-                                lambda *args, **kwargs: SimpleNamespace(state='ready', endpoint=endpoint))
+                                lambda *args, **kwargs: SimpleNamespace(state='ready', endpoint=endpoint, reason_code=None))
             monkeypatch.setattr(discovery, 'query_identify', lambda *args, **kwargs: {'pid': -1})
             monkeypatch.setattr(gateway_client, '_session_ticket', lambda *args, **kwargs: 'test-ticket')
             try:

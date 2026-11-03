@@ -20,6 +20,13 @@ CLIENT_EXIT_GRACE_SECONDS = 3.0
 CLIENT_LIFETIME_FORCED_EXIT_CODE = 74
 
 
+def arm_client_lifetime_for_argv(argv) -> None:
+    """Fence only the private finite-client gateway launch, before heavy imports."""
+    if "--client-owned" in argv and any(
+            argv[i:i + 2] == ["gateway", "run"] for i in range(1, len(argv) - 1)):
+        arm_client_lifetime()
+
+
 def arm_client_lifetime() -> None:
     """On lease loss request ordinary shutdown, then force our OWN process out."""
     try:

@@ -75,7 +75,7 @@ async def held(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_live_delivery, 'authority_delivery', rpc('bot_relay.deliver'))
     monkeypatch.setattr(bot_live_delivery, 'authority_settle', rpc('bot_relay.settle'))
     monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint', lambda home, timeout: SimpleNamespace(
-        state='ready', endpoint=SimpleNamespace(instance_id='fixture')))
+        state='ready', endpoint=SimpleNamespace(instance_id='fixture'), reason_code=None))
     dm_dir = tmp_path / 'dm'
     dm_dir.mkdir(mode=0o700)
     monkeypatch.setattr(bot_mode_dm, '_dm_dir', lambda: dm_dir)

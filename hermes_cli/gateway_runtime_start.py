@@ -10,6 +10,14 @@ from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, _WINDOWS_
 from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
 
 
+def unmanaged_spawn_options(deadline, idle_exit, client_lease) -> dict:
+    """Only finite clients add a private lease to the existing spawn contract."""
+    options = {"deadline": deadline, "idle_exit": idle_exit}
+    if client_lease is not None:
+        options["client_lease"] = client_lease
+    return options
+
+
 def retirement_wait(observed, finite_owner):
     """One wait policy for expiring finite owners and normally retiring daemons."""
     from hermes_cli.gateway_runtime import GatewayDiscovery, _RETIRING

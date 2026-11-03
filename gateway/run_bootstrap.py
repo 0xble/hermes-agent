@@ -735,7 +735,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     unmanaged idle exit (``gateway.run_idle_exit``) for a client-started daemon."""
     from gateway.run import (
         GatewayRunner,
-        _best_effort,
         _enable_multiplex_log_routing,
         _ensure_windows_gateway_venv_imports,
         _gateway_loop_exception_handler,
@@ -777,11 +776,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Config verdicts come before the duplicate-instance guard: `--replace` must not stop a healthy
     # gateway for a launch that cannot start.
     resolved_config = config if config is not None else load_gateway_config_for_runner()
-    if client_owned:
-        # A finite local owner is not a daemon enrollment, even with copied config.
-        import copy
-        resolved_config = copy.deepcopy(resolved_config)
-        resolved_config.platforms = {}
+    from gateway.run_client_owned import config_for_owner
+    resolved_config = config_for_owner(resolved_config, client_owned)
     # The first turn's prompt needs the host toolchain probe (five subprocess calls); start it now
     # so it runs beside the boot imports instead of serially inside the pre-READY warm-up.
     _start_gateway_early_environment_probe()
@@ -909,22 +905,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         from gateway.run_runtime import start_gateway_runtime_api
         await start_gateway_runtime_api(runner)
 
-        def _lifecycle_record_startup() -> Optional[dict]:
-            # Report if the previous life died uncleanly (SIGKILL / OOM / VM death), then claim the
-            # sentinel for this life. After the PID-file claim so a --replace loser can't clobber it.
-            # The store scan that report used to run here is deferred: see below.
-            from gateway.lifecycle_ledger import record_startup
-            return record_startup()
-
-        def _start_keepalive() -> None:
-            from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
-            start_nous_auth_keepalive()
-
-        # The lifecycle sentinel belongs to the authoritative gateway, never a standby.
-        _unclean_exit = (None if is_standby() or client_owned else
-                         _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s"))
-        if not client_owned:
-            _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
+        # After the PID claim: a losing replacement must not clobber crash evidence.
+        from gateway.run_client_owned import start_daemon_lifecycle
+        _unclean_exit = start_daemon_lifecycle(client_owned=client_owned, standby=is_standby())
         _ensure_windows_gateway_venv_imports()
 
         _early_verdict = await _start_gateway_run_runner(runner, _signal_initiated_shutdown)
@@ -944,15 +927,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 publish_gateway_runtime_ready(runner)
             mark_ready()
             runner._start_systemd_watchdog()
-            if idle_exit:
-                from gateway.run_idle_exit import arm_unmanaged_idle_exit
-                arm_unmanaged_idle_exit(runner)
-            elif not client_owned:
-                # A supervised/explicit gateway serves Desktop and the dashboard SPA, which call the
-                # dashboard routes right away: mount them now, after READY. A client's own idle-exit
-                # gateway (chat -q, TUI) only uses the native WebSocket; it mounts on first request.
-                from gateway.run_api import warm_gateway_dashboard
-                warm_gateway_dashboard(runner)
+            from gateway.run_client_owned import arm_owner_ready_services
+            arm_owner_ready_services(runner, idle_exit=idle_exit, client_owned=client_owned)
             await wait_gateway_runtime(runner)
         finally:
             try:

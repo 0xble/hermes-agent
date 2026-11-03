@@ -1936,16 +1936,14 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 )
 
     async def _launch_detached_restart_command(self) -> None:
-        if getattr(self, "_client_owned", False):
-            return  # never escape the finite client lease into a detached replacement
+        if getattr(self, "_client_owned", False) or self._detached_restart_helper_started:
+            return  # never escape the finite lease or launch a duplicate replacement
         from gateway.run import _resolve_hermes_bin
         import shutil
         import subprocess
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
-            return
-        if self._detached_restart_helper_started:
             return
         self._detached_restart_helper_started = True
         current_pid = os.getpid()

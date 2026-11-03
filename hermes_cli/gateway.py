@@ -5255,12 +5255,8 @@ def _cmd_run(args):
     _refuse_forward_only_leftovers(retry_on_inspection_error=True)
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
-    run_gateway(
-        getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
-        replace=getattr(args, "replace", False), force=getattr(args, "force", False),
-        idle_exit=getattr(args, "idle_exit", False),
-        **({"client_owned": True} if getattr(args, "client_owned", False) else {}),
-    )
+    from hermes_cli.gateway_runtime_cli import run_options
+    run_gateway(getattr(args, "verbose", 0), **run_options(args))
 
 
 def _cmd_setup(args):

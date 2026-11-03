@@ -112,14 +112,10 @@ def _endpoint(payload: dict, home: Path, control_home: Path | None = None,
     # A finite owner serves its creator's live Popen and its reserved workers.
     # Only private discovery after durable adoption proof sets _worker_authorized;
     # public clients wait in ensure rather than borrowing or competing with it.
-    client_owned = payload.get("client_owned", False)
-    if type(client_owned) is not bool:
-        return GatewayDiscovery("inaccessible", reason_code="invalid_client_ownership")
-    if client_owned and not _worker_authorized and (
-            client_pid is None or type(payload.get("pid")) is not int or payload["pid"] != client_pid):
-        return GatewayDiscovery("conflict", reason_code="client_owned",
-                                detail="another finite client owns this gateway; retry after it exits "
-                                       "or use a separate HERMES_HOME")
+    from hermes_cli.gateway_runtime_discovery import client_owner_refusal
+    refusal = client_owner_refusal(payload, client_pid, _worker_authorized)
+    if refusal is not None:
+        return refusal
     state = payload.get("state")
     # A graceful restart's after-turn wait still owns its in-flight turns (#139041): it stays
     # ``draining`` (exit 6, never a fresh-start target) but carries its endpoint, so an interactive
@@ -512,12 +508,11 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                 if service is not None:
                     start_existing_gateway_service(service, deadline=deadline)
                 else:
-                    from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway, stdio_log_size
+                    from hermes_cli.gateway_runtime_start import (
+                        spawn_unmanaged_gateway, stdio_log_size, unmanaged_spawn_options,
+                    )
                     child_home, child_offset = target, stdio_log_size(target)
-                    spawn_kwargs = {"deadline": deadline, "idle_exit": idle_exit}
-                    if client_lease is not None:
-                        spawn_kwargs["client_lease"] = client_lease
-                    child = spawn_unmanaged_gateway(target, **spawn_kwargs)
+                    child = spawn_unmanaged_gateway(target, **unmanaged_spawn_options(deadline, idle_exit, client_lease))
                 requested = True
             time.sleep(min(delay, remaining(deadline)))
             # Capped low: each probe is a lock-file read or one local identify, and READY is noticed

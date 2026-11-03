@@ -39,12 +39,8 @@ import os
 import re
 import sys
 
-# Before config/provider imports, fence an unmanaged finite client's private gateway.
-# The spawner supplies a private stdin pipe; no service or interactive launch uses this.
-if "--client-owned" in sys.argv and any(
-        sys.argv[i:i + 2] == ["gateway", "run"] for i in range(1, len(sys.argv) - 1)):
-    from gateway.client_lifetime import arm_client_lifetime
-    arm_client_lifetime()
+from gateway.client_lifetime import arm_client_lifetime_for_argv
+arm_client_lifetime_for_argv(sys.argv)
 
 # Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
 # is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
@@ -52,7 +48,6 @@ _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pa
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 from hermes_cli import _startup_fast
-import itertools
 
 # A literal ``~``/``$VAR`` in HERMES_HOME (fish, or any quoted value) must become absolute
 # before the first reader — otherwise it resolves against cwd and scaffolds <cwd>/~/.hermes.
@@ -67,11 +62,7 @@ _startup_fast.normalize_hermes_home_env()
 # mentioning both words never arm a 300s hard-exit timer. Foreground runs arm
 # too — a pre-loop wedge is just as dead without a supervisor; GatewayRunner
 # disarms once the event loop is live.
-def _argv_is_gateway_run(argv: list) -> bool:
-    return any(a == "gateway" and b == "run" for a, b in itertools.pairwise(argv))
-
-
-if _argv_is_gateway_run(sys.argv[1:]):
+if _startup_fast.argv_is_gateway_run(sys.argv[1:]):
     try:
         from hermes_startup_watchdog import arm_startup_watchdog as _arm_sw
 

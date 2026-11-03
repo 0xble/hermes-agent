@@ -137,6 +137,9 @@ files change.
 | `tests/hermes_cli/test_gateway_client_lifetime.py` | Concurrent real normal/SIGTERM/SIGKILL exit for transport and classic clients. |
 | `tests/hermes_cli/test_gateway_startup_validation.py` | Assert finite mode takes the correct startup validation boundary. |
 | `tests/hermes_cli/test_stream_json.py` | Preserve existing JSONL protocol coverage with the new connect keyword. |
+| `tests/cron/test_detached_owner_restart.py` | Complete absent/ready discovery mocks through detached owner retry and receipt replay. |
+| `tests/gateway/test_goal_peer_rpc.py`, `tests/gateway/test_bot_dm_held_by_session_writer.py`, `tests/tools/test_bot_live_owner_delivery.py` | Keep all sibling discovery doubles aligned with the real reason-code field. |
+| `hermes_cli/_startup_fast.py`, `hermes_cli/gateway_runtime_cli.py`, `hermes_cli/gateway_runtime_discovery.py` | Own argv detection, run options and finite-owner refusal policy without growing capped entrypoints. |
 
 Tracked tool cleanup is not generic process hardening: execution review found
 that `os._exit` bypasses ordinary drain-before-kill while foreground tools use
@@ -247,6 +250,44 @@ passed **835 tests**, zero failures, 11 skips, and the delta health check agains
 fixtures now include the real `GatewayDiscovery.reason_code` field; production
 uses the typed field directly, without a compatibility fallback for incomplete
 mocks. No assertions or health gates were weakened.
+
+Hosted run `41553886065` at `cf6d517b` exposed two remaining discovery doubles
+in `tests/cron/test_detached_owner_restart.py` that omitted `reason_code`.
+Both absent/ready cases and all sibling `SimpleNamespace` discovery doubles
+across `tests/` now provide `reason_code=None`, including goal-peer and bot
+fixtures. The original cron file reproduces six failures before the correction.
+Production's typed field access is unchanged.
+
+Session-end triage ran the complete `test_session_end_delegations.py` file five
+times each at original head `cf6d517b63941f7883df353914503f3c80833e12` and fresh
+base `bb638f20d6383e3d59c4b47130115064a7977a73`: all ten invocations passed all
+13 tests with retries disabled. The hosted failure occurs during the fixture's
+initial SessionStore database open (zero-byte quarantine/schema race), before
+any finite-client bootstrap or worker discovery. Its test, SessionStore,
+SessionDB, fake ownership initializer, delegation implementation and test
+teardown are identical on base and head. No session-end change is justified by
+this evidence; the observed database-creation flake remains separate from the
+reproduced discovery-mock regression.
+
+Rebase qualification also hit code-health caps tightened on fresh main. The
+added lifetime argv probe, config/lifecycle/READY enrollment policy, owner refusal
+and unmanaged-spawn options now live in their existing topical siblings rather
+than growing already oversized entrypoints. This is a responsibility extraction;
+no cap, protected gate file or assertion was changed.
+
+The full local cron/gateway/agent plus prior-target run exercised 3,201 files:
+35,087 passed, 46 failed. Its default developer environment lacked messaging and
+hindsight extras. Rerunning all 12 failed files with the hosted CI extra matrix
+cleared dependency failures and transient cron/outbox failures. Exactly three
+failures remained, identically on head and clean base `bb638f20`: both
+`test_async_token_accounting.py::TestDurability` garbage-collection tests and the
+`test_session_listener_lazy_dashboard.py` dashboard HTTP timeout. These are
+recorded base failures, not a claimed all-green local suite. The 177-file
+prior-target/entrypoint verification passed 1,851 tests in 177 files after the
+final rebase to `002f8807dbdef3b9aa450980baa501c6e9920f58`, with retries disabled.
+Delta code health reports zero blocking findings (one existing early-watchdog
+thread advisory), source-only Fork-Patch reports zero problems, and diff check
+passes.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.
