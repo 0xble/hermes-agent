@@ -7,6 +7,10 @@ checks an existing setup. `bin/ci list` describes the seven default lanes.
 `bin/ci check --lane node` is explicitly partial evidence, never a full pass.
 
 The desktop E2E workflow installs the same Python 3.14.7 it selects for sync.
+The Linux node lane, the gate's Linux job, and desktop core E2E also install
+`libx11-dev` and `libxi-dev` so `hud-modifier-monitor-x11.c` compiles. Without
+those headers the build warns and omits the Linux helper. Python shards do not
+build that monitor and do not install the headers.
 Desktop typechecking includes test sources, so native filesystem test helpers
 must import the operations they call even when the test runs only on Linux.
 Update receipt tests bind ContextVars through their scope and isolate ownership
