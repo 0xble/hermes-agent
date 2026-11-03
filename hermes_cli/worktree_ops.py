@@ -136,7 +136,7 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
         if not branch_existed:
             from hermes_cli._early_recovery import _git_dir
             try:
-                branch_created = (_git_dir(wt_path) / "HEAD").read_text(encoding="utf-8").strip() == f"ref: refs/heads/{branch_name}"
+                branch_created = (_git_dir(wt_path) / "HEAD").read_text(encoding="utf-8-sig").strip() == f"ref: refs/heads/{branch_name}"
             except OSError:
                 pass
         _git_quiet(["worktree", "remove", "--force", str(wt_path)], repo_root, timeout=15)
