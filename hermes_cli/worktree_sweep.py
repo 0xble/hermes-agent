@@ -81,6 +81,10 @@ def classic_mode(settings: dict) -> bool:
 
 
 def _inside(target: str, roots: list[str]) -> Optional[str]:
+    # /proc fd symlinks also name sockets/pipes/anon_inodes, not filesystem paths.
+    # Resolving those relative names against our cwd invents a holder in that tree.
+    if not os.path.isabs(target):
+        return None
     target = os.path.normcase(os.path.abspath(target))
     for root in roots:
         if target == root or target.startswith(root + os.sep):
