@@ -50,7 +50,7 @@ _OWNER_DEATH_WATCH = (
 
 
 def _owner_death_watch():
-    """Watch the next POSIX child; return ``(announce, dismiss)`` or None.
+    """Watch the next POSIX child; return ``(announce, dismiss)``.
 
     ``announce`` is the child's ``preexec_fn``. ``dismiss`` tells the watcher the
     parent is still alive. Parent death closes the pipe and the watcher kills the
@@ -66,7 +66,9 @@ def _owner_death_watch():
             start_new_session=True)
     except OSError:
         os.close(write_end)
-        return None
+        # Never launch an unfenced completion. The caller records the committed
+        # update's tail as owed, so a subsequent launch can recover safely.
+        raise
     finally:
         os.close(read_end)
     parent = os.getpid()
