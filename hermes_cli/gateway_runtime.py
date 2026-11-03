@@ -96,7 +96,7 @@ def _overlay_owner_home(home: Path) -> Path:
 
 
 def _endpoint(payload: dict, home: Path, control_home: Path | None = None,
-              *, client_pid: int | None = None) -> GatewayDiscovery:
+              *, client_pid: int | None = None, _worker_authorized: bool = False) -> GatewayDiscovery:
     if type(payload.get("runtime_protocol")) is not int or payload["runtime_protocol"] != 1:
         return GatewayDiscovery("incompatible", reason_code="runtime_protocol")
     profiles = payload.get("served_profiles")
@@ -109,13 +109,14 @@ def _endpoint(payload: dict, home: Path, control_home: Path | None = None,
                and isinstance(p.get("home"), str) and _canonical_home(p["home"]) == wanted]
     if len(matches) != 1 or not isinstance(matches[0].get("profile_id"), str) or not matches[0]["profile_id"]:
         return GatewayDiscovery("inaccessible", reason_code="profile_mismatch")
-    # A finite gateway dies with its creator. Only that invocation's live Popen may use
-    # its endpoint; every other caller gets a terminal refusal under the per-home owner lock.
+    # A finite owner serves its creator's live Popen and its reserved workers.
+    # Only private discovery after durable adoption proof sets _worker_authorized;
+    # public clients wait in ensure rather than borrowing or competing with it.
     client_owned = payload.get("client_owned", False)
     if type(client_owned) is not bool:
         return GatewayDiscovery("inaccessible", reason_code="invalid_client_ownership")
-    if client_owned and (client_pid is None or type(payload.get("pid")) is not int
-                         or payload["pid"] != client_pid):
+    if client_owned and not _worker_authorized and (
+            client_pid is None or type(payload.get("pid")) is not int or payload["pid"] != client_pid):
         return GatewayDiscovery("conflict", reason_code="client_owned",
                                 detail="another finite client owns this gateway; retry after it exits "
                                        "or use a separate HERMES_HOME")
@@ -431,6 +432,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     """
     import time
     from hermes_cli.gateway_client_lifetime import live_client_child
+    from hermes_cli.gateway_runtime_start import deadline_verdict, retirement_wait
     from hermes_cli.gateway_runtime_service import (
         RuntimeStartError, discover_existing_gateway_service, remaining,
         start_existing_gateway_service,
@@ -450,6 +452,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     retiring = False
     replaced: set[Path] = set()
     delay = 0.025
+    finite_owner = None
     try:
         while True:
             # The install-root marker also covers profiles.
@@ -461,8 +464,11 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             own_child = live_client_child(child, client_lease, status)
             observed = _observe_replacing_stale(home, deadline, replaced, **own_child)
             if observed.reason_code == "control_timeout":
-                return GatewayDiscovery("starting", reason_code="deadline")
-            if observed.state == "draining" and observed.reason_code in _RETIRING:
+                return deadline_verdict(finite_owner)
+            # Never borrow or compete with a finite owner. Its exit and an idle
+            # daemon's retirement share this ensure's existing startup budget.
+            wait_for_exit, finite_owner = retirement_wait(observed, finite_owner)
+            if wait_for_exit:
                 retiring, requested, child = True, False, None
                 time.sleep(min(0.1, remaining(deadline)))
                 continue
@@ -479,6 +485,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                 requested = True
             if observed.state == "absent":
                 retiring = False
+                finite_owner = None
             reserved = _starting_multiplexer_root(home) if observed.state == "absent" and not requested else None
             if reserved is not None and (reason := _standalone_multiplexer_reason(reserved)):
                 return GatewayDiscovery("inaccessible", reason_code="profile_parked", detail=reason)
@@ -517,7 +524,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # within ~50 ms instead of up to 250 ms later on every cold start.
             delay = min(delay * 1.5, 0.05)
     except TimeoutError:
-        return GatewayDiscovery("starting", reason_code="deadline")
+        return deadline_verdict(finite_owner)
     except RuntimeStartError as exc:
         return GatewayDiscovery(exc.state, reason_code=exc.reason)
     except PermissionError:

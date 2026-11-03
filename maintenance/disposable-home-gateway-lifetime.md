@@ -46,12 +46,28 @@ The runtime has one writer per canonical home: `gateway/runtime_ownership.py`
 uses nonblocking exclusive reservations of `gateway.lock`, and
 `gateway/run_bootstrap.py` reserves profiles and claims the PID file before
 opening session authorities. Two active gateways cannot safely coexist on one
-home. A competing client therefore gets an immediate `conflict: client_owned`
-with a retry-after-owner-exit remedy; it neither borrows the short-lived owner
-nor replaces it. The live descriptor and runtime status identify client-owned
-mode. Only the ensure invocation holding the exact live Popen child can accept
-that private endpoint; ordinary discovery stays non-attachable for finite,
-interactive, TUI, cron, kanban and ACP callers alike.
+home. A competing client therefore waits within its existing ensure/startup
+deadline for the finite owner to exit, then starts or discovers normally. It
+neither borrows the short-lived owner nor replaces it. Deadline expiry reports
+`conflict: client_owned` with the remedies: wait for that client to finish and
+retry, or use a separate `HERMES_HOME` for parallel clients. The live descriptor
+and runtime status identify client-owned mode. Only the ensure invocation
+holding the exact live Popen child accepts that private endpoint through ordinary
+discovery; arbitrary finite, interactive, TUI, cron, kanban and ACP clients remain
+non-attachable.
+
+The owner's managed compute workers and delegated child stores are not arbitrary
+clients. They prove their existing durable adoption claim through the private
+`worker-identify` control verb: the owner-issued secret is bound to the session,
+execution, generation, live same-user PID/birth, profile and authenticated socket
+principal. The same verifier used by `worker.adopt` checks the claim, and terminal
+assignments are refused. Only this authenticated response bypasses the public
+client-owned refusal; the WebSocket adoption still independently rechecks it.
+Creator PIDs and same-user socket access alone confer no worker authorization.
+
+`gateway run --client-owned` requires a pipe on stdin. TTY and `/dev/null` fail
+before startup with an explicit instruction to omit the flag for a persistent
+gateway. This makes the lifetime fence mandatory rather than silently detaching.
 
 A finite runner never performs daemon crash recovery, so it must also leave the
 previous daemon's `.clean_shutdown` receipt and restart-failure counters exactly
@@ -88,7 +104,7 @@ files change.
 
 | File | Kept lifetime-bound responsibility |
 | --- | --- |
-| `gateway/client_lifetime.py` | Early EOF watcher, three-second self-exit, exact tracked tool-child cleanup. |
+| `gateway/client_lifetime.py` | Require pipe stdin, early EOF watcher, three-second self-exit, exact tracked tool-child cleanup. |
 | `gateway/run.py` | Thread client-owned mode into the runner entry point. |
 | `gateway/run_bootstrap.py` | Select finite session-only startup, not daemon enrollment. |
 | `gateway/run_client_owned.py` | Preserve providers/plugins/MCP while excluding daemon startup. |
@@ -113,7 +129,9 @@ files change.
 | `tests/gateway/test_client_lifetime.py` | Real EOF and wedged-shutdown bound, including an active tool child. |
 | `tests/gateway/test_client_owned_bootstrap.py` | No daemon services/restarts; first-turn MCP readiness retained. |
 | `tests/gateway/test_client_owned_recovery.py` | Preserve prior daemon receipts, counters and interrupted turn through finite startup/exit; next daemon takes unclean recovery. |
-| `tests/hermes_cli/test_client_owned_discovery.py` | Real bootstrap/control status marks finite ownership and refuses a second same-home client before the creator exits. |
+| `tests/hermes_cli/test_client_owned_discovery.py` | Real bootstrap/control status marks finite ownership; second same-home client waits without attaching, has a bounded timeout remedy, then owns its successor gateway. |
+| `gateway/session_worker_discovery.py`, `hermes_cli/gateway_worker_discovery.py` | Private discovery using the existing durable worker-adoption claim. |
+| `tests/hermes_cli/test_finite_managed_workers.py` | Real finite safe-mode and delegated-child turns; reject claim tampering and terminal assignments. |
 | `tests/hermes_cli/test_gateway_chat.py` | Finite/interactive transport ownership and mock keyword contract. |
 | `tests/hermes_cli/test_gateway_client_lease.py` | Exact-child lease, cancellation/failures/borrowing and classic finite dial. |
 | `tests/hermes_cli/test_gateway_client_lifetime.py` | Concurrent real normal/SIGTERM/SIGKILL exit for transport and classic clients. |
@@ -150,6 +168,9 @@ searches for gateway idle-exit found no equivalent ownership fence.
 
 Contract tests: `tests/hermes_cli/test_gateway_client_lifetime.py`
 Contract tests: `tests/gateway/test_client_owned_bootstrap.py`
+Contract tests: `tests/hermes_cli/test_finite_managed_workers.py`
+Contract tests: `tests/hermes_cli/test_client_owned_discovery.py`
+Contract tests: `tests/gateway/test_client_lifetime.py`
 Integration: `tests/e2e/core/parity/test_entrypoint_parity.py` now requires finite
 client exit alone to release the owner; operator stop is failure cleanup only.
 The existing first-turn MCP/hook parity and zero-MCP-orphan assertions remain.
@@ -203,6 +224,29 @@ without a shared gateway or parallel profile-store semantics. The canonical
 runner passed its Linux/container execution (one test, zero failures) and its
 delta code-health check has no findings. The separate image-catalog assertion
 in shard 7 is unrelated and was not treated as a rerunnable timing flake.
+
+The worker-authorization/bounded-wait follow-up was RED against `66342d1c`:
+both real finite CLI variants (`-z --safe-mode` and a managed turn that delegates)
+reached the 65-second subprocess deadline; the competing finite client failed
+immediately; and TTY/null stdin failed the expected early explanatory refusal.
+The source archive's failure-cleanup stop command also returned nonzero after
+the CLI timeouts; the original `TimeoutExpired` exceptions remain in its log.
+
+Follow-up GREEN: the urgent heavy-slot canonical runner (`--file-retries 0`)
+passed **1706 tests across 171 files**, zero failures, 199 platform skips. It
+includes the managed-worker and runtime-session-store suite, full core provider
+and parity collections, lifetime/bootstrap/discovery/recovery, client/runtime,
+idle/launchd/shutdown, and UTF-8 contracts. Strict Linux/Windows skips still
+require hosted execution. After moving the unchanged legacy control identity
+closure into `gateway/run_control_identity.py` to respect the facade cap, the
+11-file control/bootstrap/ensure/CLI follow-up passed **109 tests**, zero failures,
+23 skips. After factoring the shared retirement/deadline decision into
+`hermes_cli/gateway_runtime_start.py`, the final six-file ensure/CLI/UTF-8 run
+passed **835 tests**, zero failures, 11 skips, and the delta health check against
+`66342d1c` has **zero blockers and zero advisories**. The four old WorkerRPC
+fixtures now include the real `GatewayDiscovery.reason_code` field; production
+uses the typed field directly, without a compatibility fallback for incomplete
+mocks. No assertions or health gates were weakened.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.

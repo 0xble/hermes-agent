@@ -61,7 +61,7 @@ def test_append_survives_mid_identify_close_and_adopts_successor(tmp_path, monke
 
     def discover(home, timeout):
         state.discoveries.append(endpoint.instance_id)
-        return SimpleNamespace(state='ready', endpoint=endpoint)
+        return SimpleNamespace(state='ready', endpoint=endpoint, reason_code=None)
 
     def ticket(home, endpoint, *, purpose, timeout=5):
         assert purpose == 'worker-adoption'
@@ -146,7 +146,7 @@ def test_absent_owner_deadline_preserves_journal_and_explains_cause(tmp_path, mo
     def discover(home, timeout):
         calls.append(timeout)
         state = failure if failure in ('owner_unavailable', 'draining') else 'ready'
-        return SimpleNamespace(state=state, endpoint=endpoint if state == 'ready' else None)
+        return SimpleNamespace(state=state, endpoint=endpoint if state == 'ready' else None, reason_code=None)
 
     def identify(home, timeout):
         if failure.startswith('ticket_'):

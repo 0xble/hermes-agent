@@ -5784,23 +5784,8 @@ async def _start_gateway_start_control_socket(runner):
             spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
-        def _identify_runtime():
-            from gateway.drain_control import RESTART_WAIT_REASON
-            payload = build_identify_payload()
-            descriptor = getattr(runner, "session_runtime_descriptor", {})
-            payload.update({key: descriptor[key] for key in (
-                "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities", "client_owned") if key in descriptor})
-            if getattr(runner, "_draining", False):
-                payload.update(state="draining")
-                # The restart's after-turn wait still owns its turns, so the endpoint stays dialable.
-                if descriptor.get("drain_reason") != RESTART_WAIT_REASON:
-                    payload["capabilities"] = []
-            if payload.get("state") == "draining" and descriptor.get("drain_reason"):
-                payload["drain_reason"] = descriptor["drain_reason"]
-            payload["supervisor"] = {"manual": "none", "desktop": "none"}.get(
-                payload.get("supervisor"), payload.get("supervisor", "none"))
-            return payload
+        from gateway.run_control_identity import make_runtime_identify
+        _identify_runtime = make_runtime_identify(runner, build_identify_payload)
 
         from gateway.cron_review import CronReviewControl
         from gateway.session_snapshot import make_session_snapshot_handler
@@ -5825,6 +5810,8 @@ async def _start_gateway_start_control_socket(runner):
                            "handover": lambda: request_handover(runner, _main_loop),
                            "handover-status": lambda: handover_status(runner)})
         _control_server.ticket_store = runner.session_ticket_store
+        from gateway.session_worker_discovery import worker_discovery_handler
+        _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)
         if not await _control_server.start():
             _control_server = None
         else:

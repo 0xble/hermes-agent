@@ -44,9 +44,10 @@ class WS:
 async def connect(*args, **kwargs):
     yield WS()
 async def main():
+    (home / (os.environ.get('CLIENT_MARKER', 'first') + '-started')).touch()
     with patch.object(gateway_runtime_start.subprocess, 'Popen', spawn), patch('websockets.asyncio.client.connect', connect):
         async with gateway_client.connect_gateway(one_shot=True):
-            (home / 'first-attached').touch()
+            (home / (os.environ.get('CLIENT_MARKER', 'first') + '-attached')).touch()
             await asyncio.to_thread(sys.stdin.buffer.read)
 asyncio.run(main())
 '''
@@ -78,8 +79,8 @@ def test_multiplexer_discovery_requires_the_creators_live_child(tmp_path, monkey
 
 
 @pytest.mark.platforms("posix")
-def test_second_finite_client_on_same_home_is_refused_before_owner_exit(tmp_path, monkeypatch):
-    from hermes_cli.gateway_client import connect_gateway, GatewayUnavailableError
+def test_second_finite_client_waits_then_owns_its_gateway(tmp_path, monkeypatch):
+    from hermes_cli.gateway_runtime import ensure_gateway_runtime
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -95,14 +96,19 @@ def test_second_finite_client_on_same_home_is_refused_before_owner_exit(tmp_path
             out, err = first.communicate(timeout=5)
             pytest.fail(f"first finite client failed: {out}\n{err}")
 
-        async def second():
-            # The second finite client's ordinary bootstrap must refuse clearly,
-            # not attach, spawn a competing store owner, or stop the first owner.
-            with pytest.raises(GatewayUnavailableError, match="client_owned") as refused:
-                async with connect_gateway(one_shot=True):
-                    pytest.fail("second finite client attached to the first client's gateway")
-            assert refused.value.state == "conflict"
-        asyncio.run(second())
+        second = subprocess.Popen([sys.executable, "-c", FIRST_CLIENT], env={**env, "CLIENT_MARKER": "second"},
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, encoding="utf-8")
+        assert wait_until(lambda: (tmp_path / "second-started").exists(), timeout=20)
+        # A bounded third observer supplies a positive synchronization barrier while
+        # the second is pending; neither may attach to or stop the finite owner.
+        verdict = ensure_gateway_runtime(tmp_path, timeout=2)
+        assert verdict.reason_code == "client_owned"
+        assert verdict.endpoint is None
+        assert "separate HERMES_HOME" in verdict.detail
+        assert "wait" in verdict.detail.lower()
+        assert second.poll() is None
+        assert not (tmp_path / "second-attached").exists()
         from hermes_cli.gateway_runtime import discover_gateway_endpoint
         from gateway.control_socket import query_gateway_control
         identity = query_gateway_control(tmp_path, "identify", timeout=2)
@@ -114,8 +120,23 @@ def test_second_finite_client_on_same_home_is_refused_before_owner_exit(tmp_path
         assert observed.reason_code == "client_owned"
         assert observed.endpoint is None
         assert first.poll() is None
-    finally:
         first.stdin.close()
         first.stdin = None
+        assert first.wait(timeout=15) == 0
+        assert wait_until(lambda: (tmp_path / "second-attached").exists() or second.poll() is not None,
+                          timeout=60)
+        assert (tmp_path / "second-attached").exists(), second.communicate(timeout=5)
+        next_identity = query_gateway_control(tmp_path, "identify", timeout=2)
+        assert next_identity["instance_id"] != identity["instance_id"]
+        assert next_identity["client_owned"] is True
+    finally:
+        if "second" in locals():
+            second.stdin.close()
+            second.stdin = None
+            second_out, second_err = second.communicate(timeout=15)
+            assert second.returncode == 0, (second_out, second_err)
+        if first.stdin is not None:
+            first.stdin.close()
+            first.stdin = None
         out, err = first.communicate(timeout=15)
         assert first.returncode == 0, (out, err)

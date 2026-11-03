@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import signal
+import stat
 import sys
 import threading
 import time
@@ -21,6 +22,13 @@ CLIENT_LIFETIME_FORCED_EXIT_CODE = 74
 
 def arm_client_lifetime() -> None:
     """On lease loss request ordinary shutdown, then force our OWN process out."""
+    try:
+        is_pipe = stat.S_ISFIFO(os.fstat(0).st_mode)
+    except OSError:
+        is_pipe = False
+    if not is_pipe:
+        raise SystemExit("--client-owned requires stdin to be a pipe owned by its finite client; "
+                         "omit --client-owned to run a persistent gateway")
     read_fd = os.dup(0)
     stream = os.fdopen(read_fd, "rb", buffering=0)
     thread = threading.Thread(target=_watch_client, args=(stream,), daemon=True,

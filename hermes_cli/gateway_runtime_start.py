@@ -10,6 +10,22 @@ from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, _WINDOWS_
 from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
 
 
+def retirement_wait(observed, finite_owner):
+    """One wait policy for expiring finite owners and normally retiring daemons."""
+    from hermes_cli.gateway_runtime import GatewayDiscovery, _RETIRING
+    if observed.reason_code == "client_owned":
+        return True, GatewayDiscovery("conflict", reason_code="client_owned",
+            detail="timed out waiting for another finite client to exit; wait for that client "
+                   "to finish and retry, or use a separate HERMES_HOME for parallel clients")
+    return observed.state == "draining" and observed.reason_code in _RETIRING, finite_owner
+
+
+def deadline_verdict(finite_owner):
+    """Retain the finite-owner wait remedy when its startup budget expires."""
+    from hermes_cli.gateway_runtime import GatewayDiscovery
+    return finite_owner or GatewayDiscovery("starting", reason_code="deadline")
+
+
 # One launch's policy and pins, never the shared daemon's: hook consent would become daemon-lifetime
 # auto-approval for messaging/cron, and a Kanban worker's or terminal's pins would retarget every later
 # session's board, cwd and source. The behaviour values main's CLI read per process (ephemeral prompt,

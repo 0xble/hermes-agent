@@ -364,6 +364,8 @@ async def _start_gateway_start_control_socket(runner):
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
                            "reload-plugins": reload_plugins_verb(runner, _main_loop)})
         _control_server.ticket_store = runner.session_ticket_store
+        from gateway.session_worker_discovery import worker_discovery_handler
+        _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)
         if not await _control_server.start():
             _control_server = None
         else:
