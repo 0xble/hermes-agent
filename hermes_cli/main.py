@@ -39,14 +39,15 @@ import os
 import re
 import sys
 
-from gateway.client_lifetime import arm_client_lifetime_for_argv
-arm_client_lifetime_for_argv(sys.argv)
-
 # Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
 # is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
+
+from gateway.client_lifetime import arm_client_lifetime_for_argv
+arm_client_lifetime_for_argv(sys.argv)
+
 from hermes_cli import _startup_fast
 
 # A literal ``~``/``$VAR`` in HERMES_HOME (fish, or any quoted value) must become absolute

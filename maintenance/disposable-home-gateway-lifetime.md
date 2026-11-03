@@ -322,13 +322,39 @@ head after the fix was **10.402/10.833/15.869 s**. Post-final reap medians were
 startup regression. Head left **zero** live children versus **37** on base;
 only those exact recorded base fixture processes were cleaned after census.
 
-The 183-file follow-up exposed a requested-service naming discrepancy when a
-custom root itself lies below the account's native Hermes home: its named
-`profiles/worker` got a path hash instead of the installer's `worker` suffix.
-Derive named-profile roots from the requested home consistently even in that
-nested layout, without borrowing the caller's environment or a bare service.
-The existing named-root regression was RED; a new explicit nested-native-home
-case makes the layout deterministic rather than depending on scratch placement.
+The 183-file follow-up exposed a test-environment mismatch: the named-root
+fixture patched `Path.home()` but retained the real OS account home. When
+scratch itself lived below that account's Hermes home, installer and runtime
+therefore used different native roots. Pin the fixture's simulated account
+alongside `Path.home()` rather than changing production service identities.
+The installer-consistency regression was RED when a nested custom profile
+incorrectly got `worker`; restoring the native-root containment rule makes it
+use the installer's path hash. The contract also covers a direct named profile
+and custom roots outside the native home, comparing both launchd and systemd
+names without patching `Path.home()`. The original broad-case failure is covered
+with the corrected fixture. Client-lifetime arming follows the bootstrap path
+insert and still precedes startup and other heavy imports.
+
+Review-correction verification (checkout-local Python 3.14.7; all test entry
+points pin scratch HOME/HERMES_HOME/HERMES_RUNTIME_DIR and use urgent heavy-slot):
+new consistency contract RED on `e2dba09a` (`worker` versus installer hash), then
+7 passed/1 platform skip after the fix. Restored production naming separately
+reproduced the old named-fixture failure before the account-home fixture fix.
+The unchanged 183-file selection is GREEN: **1,879 passed, 0 failed, 200 platform
+skips**, retries disabled, 510.2 s. A script-mode bootstrap-prefix probe is RED
+before moving lifetime arming and GREEN afterward; ordinary script `--version`
+also succeeds. Delta health has zero blockers and the existing early-watchdog
+thread advisory; source-only Fork-Patch and whitespace checks pass.
+
+One repeated paired canonical catalog timing passed **39/39 children in each
+lane**. Starting/running/total medians are **18.656/18.923/23.908 s** on baseline
+`eed51855`, **17.900/18.932/25.848 s** on this correction. The full file took
+128.2 s versus 122.6 s. This loaded-machine repeat does not reproduce the earlier
+8.7-second startup-median improvement; starting is slightly earlier but running
+is effectively level and total median is slower, so do not claim that magnitude
+from this run. Fresh-receipt identity suppression remains independently GREEN.
+Head again leaves **zero** live children; base leaves **27**, all exact recorded
+fixture children cleaned afterward. Final-output-to-exit medians are 0.127/0.404 s.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.
