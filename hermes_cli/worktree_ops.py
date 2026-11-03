@@ -96,16 +96,16 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
     """Sweep the leftovers of a failed/timed-out ``git worktree add`` (fail-soft).
 
     ``worktree add`` is not transactional: killed mid-checkout it leaves the partial dir, a
-    LOCKED admin entry naming the *live* pid (immune to the pruner's dead-pid unlock) and
+    admin entry locked by Git's own exact ``initializing`` reason, an index.lock and
     sometimes the branch, so any retry of the same name fails.
     """
     try:
         # Unlock first: `worktree remove --force` refuses a locked tree.
-        if not _unlock_owned_worktree(repo_root, str(wt_path), timeout=15):
+        if not _unlock_owned_worktree(repo_root, str(wt_path), timeout=15, failed_add=True):
             return  # Another owner may have claimed this path after the failed add.
         _git_quiet(["worktree", "remove", "--force", str(wt_path)], repo_root, timeout=15)
         if wt_path.exists():
-            if not _unlock_owned_worktree(repo_root, str(wt_path), timeout=15):
+            if not _unlock_owned_worktree(repo_root, str(wt_path), timeout=15, failed_add=True):
                 return  # Git may have refused removal because another tool just locked it.
             shutil.rmtree(wt_path, ignore_errors=True)
         # `remove` needs the dir; `prune` drops the admin entry when it is already gone.
@@ -960,20 +960,50 @@ def _worktree_lock_reason(repo_root: str, worktree_path: str, timeout: int):
         return True, None
 
 
-def _unlock_owned_worktree(repo_root: str, worktree_path: str, timeout: int = 10, *, dead_only: bool = False) -> bool:
+def _initializing_worktree_is_dead(worktree_path: str, before: Optional[float] = None) -> bool:
+    """Git's in-progress add is abandoned only with positive holder evidence.
+
+    Call after validating the exact reason and repository identity. A sweep supplies its
+    existing age cutoff; failed-add cleanup separately owns its exact in-progress add.
+    """
+    try:
+        from hermes_cli._early_recovery import _git_dir, _held_open
+        root = Path(worktree_path)
+        admin = _git_dir(root).resolve()
+        if before is not None and (admin / "locked").stat().st_mtime > before:
+            return False
+        # Windows cannot prove absence through this POSIX probe. Fail closed.
+        return os.name != "nt" and _held_open(admin / "index.lock", root, any_git=True) is False
+    except Exception:
+        return False
+
+
+def _unlock_owned_worktree(repo_root: str, worktree_path: str, timeout: int = 10, *,
+                           dead_only: bool = False, failed_add: bool = False,
+                           initializing_before: Optional[float] = None) -> bool:
     """Allow removal/relocking only when unlocked or holding a recognized Hermes lock.
 
     Refresh ownership at the mutation boundary, not from an earlier sweep/audit verdict.
     Unattended reclaim also requires the Hermes owner to be dead; session exit may release
-    its own live lock. Bare, foreign, malformed and unreadable locks all fail closed.
+    its own live lock. Only the failed add's exact path or an aged sweep candidate may
+    release Git's exact ``initializing`` lock; the sweep must prove no live Git owns it.
+    Bare, foreign, malformed and unreadable locks all fail closed.
     """
     try:
         found, reason = _worktree_lock_reason(repo_root, worktree_path, timeout)
         if not found or reason is None:
             return True
-        if _HERMES_LOCK_RE.fullmatch(reason) is None:
+        if reason == "initializing" and failed_add:
+            pass  # This failed add owns exactly the path it just attempted to create.
+        elif reason == "initializing" and initializing_before is not None:
+            if not _initializing_worktree_is_dead(worktree_path, initializing_before):
+                return False
+        elif _HERMES_LOCK_RE.fullmatch(reason) is None:
             return False
-        if dead_only and _worktree_lock_is_live(repo_root, worktree_path, timeout) != "dead":
+        elif dead_only and _worktree_lock_is_live(repo_root, worktree_path, timeout) != "dead":
+            return False
+        # The holder probe may take time; a foreign takeover must still win.
+        if _worktree_lock_reason(repo_root, worktree_path, timeout) != (found, reason):
             return False
         return _git(["worktree", "unlock", worktree_path], repo_root, timeout=timeout).returncode == 0
     except Exception as exc:
@@ -981,7 +1011,8 @@ def _unlock_owned_worktree(repo_root: str, worktree_path: str, timeout: int = 10
         return False
 
 
-def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10):
+def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10, *,
+                           initializing_before: Optional[float] = None):
     """Lock state: ``"live"`` (owning pid runs / a resumable session works in the tree, or
     another tool holds the lock), ``"dead"`` (Hermes pid and sessions gone), None (unlocked).
 
@@ -993,7 +1024,8 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
     and a reaped clean one is recreated on resume. Fails SAFE toward "live", including a
     ``hermes`` reason this version cannot parse. A lock Hermes did not write belongs to
     another tool or person, which git's lock contract says to leave alone, so it is always
-    ``"live"``: only Hermes' own locks can be judged dead and unlocked.
+    ``"live"``. The sole exception is Git's exact ``initializing`` reason when a sweep
+    supplies its age cutoff and the holder probe proves the add abandoned.
     """
     try:
         found, reason = _worktree_lock_reason(repo_root, worktree_path, timeout)
@@ -1001,6 +1033,8 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
         return "live"
     if not found or reason is None:
         return None
+    if reason == "initializing" and initializing_before is not None:
+        return "dead" if _initializing_worktree_is_dead(worktree_path, initializing_before) else "live"
     if not reason.startswith("hermes "):
         return "live"
     lock = _HERMES_LOCK_RE.fullmatch(reason)
@@ -1053,7 +1087,8 @@ def _prune_candidates(worktrees_dir: Path, max_age_hours: int, now: float) -> li
     return candidates
 
 
-def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
+def _classify_prune_candidates(repo_root: str, candidates: list, max_age_hours: float = 24,
+                                now: Optional[float] = None) -> list:
     """Phase 2, parallel read-only classification -> ``[(entry, mtime, force, verdict, lock_state)]``.
 
     verdict in ``dirty`` / ``unpushed`` / ``locked-live`` / ``reap`` / ``reap-keep-branch``. Each
@@ -1097,7 +1132,9 @@ def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
             keep_branch = not merged
 
         # Live lock = running hermes; a dead lock is unlocked in phase 3.
-        lock_state = _worktree_lock_is_live(repo_root, str(entry), timeout=5)
+        lock_state = _worktree_lock_is_live(
+            repo_root, str(entry), timeout=5,
+            initializing_before=(now or time.time()) - prune_tier_hours(entry.name, max_age_hours) * 3600)
         if lock_state == "live":
             return (entry, mtime, force, "locked-live", None)
         return (entry, mtime, force, "reap-keep-branch" if keep_branch else "reap", lock_state)
@@ -1138,7 +1175,8 @@ def removal_blocked(path: str) -> Optional[tuple[str, str]]:
     return removal_blocker(path)
 
 
-def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: float) -> tuple[list, set]:
+def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: float, *,
+                         max_age_hours: float = 24, initializing_before: Optional[float] = None) -> tuple[list, set]:
     """Phase 3, serial unlock / remove / branch -D -> ``(preserved_stale, kept_branches)``.
 
     *kept_branches* must survive the orphaned-branch pass. Branch deletion is gated on
@@ -1160,7 +1198,9 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
             preserved_stale.append(f"{entry.name} ({blocked[1]})")
             continue
 
-        if not _unlock_owned_worktree(repo_root, str(entry), dead_only=True):
+        cutoff = (initializing_before if initializing_before is not None else
+                  time.time() - prune_tier_hours(entry.name, max_age_hours) * 3600)
+        if not _unlock_owned_worktree(repo_root, str(entry), dead_only=True, initializing_before=cutoff):
             preserved_stale.append(f"{entry.name} (lock held or unverifiable)")
             continue
 
@@ -1240,8 +1280,9 @@ def _prune_stale_worktree_trees(repo_root: str, max_age_hours: int) -> None:
         _prune_orphaned_branches(repo_root)
         return
 
-    verdicts = _classify_prune_candidates(repo_root, candidates)
-    preserved_stale, kept_branches = _reap_prune_verdicts(repo_root, verdicts, now - (7 * 24 * 3600))
+    verdicts = _classify_prune_candidates(repo_root, candidates, max_age_hours, now)
+    preserved_stale, kept_branches = _reap_prune_verdicts(
+        repo_root, verdicts, now - (7 * 24 * 3600), max_age_hours=max_age_hours)
 
     if preserved_stale:
         logger.warning("Preserving %d worktree(s) older than 7 days with unmerged work "

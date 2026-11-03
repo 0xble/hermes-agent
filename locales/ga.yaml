@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ Tá tiomantais gan bhrú sa worktree, á choinneáil: {path}"
     uncommitted_keeping: "⚠ Tá athruithe gan tiomantas sa worktree, á choinneáil: {path}"
     kept_reason: "⚠ Worktree á choinneáil ({reason}): {path}"
+    lock_unverifiable_reason: "glas gníomhach nó nach féidir a fhíorú"
     clean_up_manually: "Chun glanadh de láimh: git worktree remove --force {path}"
     cleaned_up: "✓ Worktree glanta: {path}"
     exit_question_dirty: "Tá athruithe gan tiomantas sa worktree seo: {path}"

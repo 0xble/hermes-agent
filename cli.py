@@ -585,7 +585,7 @@ def _cleanup_worktree(info: dict[str, str] | None = None) -> None:
 
     release_lsp_clients(wt_path)
     if not _unlock_owned_worktree(repo_root, wt_path):
-        _cprint(f"\n\033[33m{_t('cli.worktree.kept_reason', path=wt_path, reason='lock held or unverifiable')}\033[0m")
+        _cprint(f"\n\033[33m{_t('cli.worktree.kept_reason', path=wt_path, reason=_t('cli.worktree.lock_unverifiable_reason'))}\033[0m")
         return
     _git_quiet(["worktree", "remove", wt_path, "--force"], repo_root, timeout=15, log="Failed to remove worktree")
     _git_quiet(["branch", "-D", branch], repo_root, log=f"Failed to delete branch {branch}")

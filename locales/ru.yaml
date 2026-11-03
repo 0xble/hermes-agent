@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ В worktree есть неотправленные коммиты, оставляю: {path}"
     uncommitted_keeping: "⚠ В worktree есть незакоммиченные изменения, оставляю: {path}"
     kept_reason: "⚠ Worktree сохранён ({reason}): {path}"
+    lock_unverifiable_reason: "блокировка активна или не поддаётся проверке"
     clean_up_manually: "Чтобы очистить вручную: git worktree remove --force {path}"
     cleaned_up: "✓ Worktree очищен: {path}"
     exit_question_dirty: "В этом worktree есть незакоммиченные изменения: {path}"

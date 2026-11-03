@@ -111,7 +111,7 @@ def apply_exit_choice(info: dict, echo) -> bool:
     from hermes_cli.worktree_ops import _git_quiet, _unlock_owned_worktree, release_lsp_clients
     release_lsp_clients(path)
     if not _unlock_owned_worktree(repo_root, path):
-        echo(t("cli.worktree.kept_reason", path=path, reason="lock held or unverifiable"))
+        echo(t("cli.worktree.kept_reason", path=path, reason=t("cli.worktree.lock_unverifiable_reason")))
         return True
     _git_quiet(["worktree", "remove", path, "--force"], repo_root, timeout=60, log="Failed to remove worktree")
     if branch and not os.path.isdir(path):

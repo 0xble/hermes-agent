@@ -216,7 +216,13 @@ class TestWorktreeLockReaping:
     ])
     def test_foreign_locked_clean_stale_survives_and_stays_locked(self, git_repo, monkeypatch, operation):
         import cli
+        from agent.i18n import t
         from hermes_cli import worktree_archive, worktree_exit, worktree_gc, worktree_sweep
+
+        messages = []
+        monkeypatch.setattr(cli, "_cprint", messages.append)
+        monkeypatch.setattr(cli, "_t", lambda key, **kwargs: t(key, lang="de", **kwargs))
+        monkeypatch.setattr(worktree_exit, "t", lambda key, **kwargs: t(key, lang="de", **kwargs))
 
         # Ownership is the guard under test, not the developer's live process table.
         monkeypatch.setattr(worktree_sweep, "live_process_pids", lambda *args, **kwargs: {})
@@ -278,7 +284,7 @@ class TestWorktreeLockReaping:
                 "gc-audit": lambda: worktree_gc.reclaim_worktrees(root, records=records),
                 "exit-cleanup": lambda: cli._cleanup_worktree(info),
                 "discard": lambda: worktree_exit.apply_exit_choice(
-                    {**info, "exit_choice": worktree_exit.DISCARD}, lambda _: None),
+                    {**info, "exit_choice": worktree_exit.DISCARD}, messages.append),
                 "retain": lambda: worktree_ops._retain_worktree_for_session(
                     root, path, "retained-session", git_repo / "state.db"),
                 "failed-add": lambda: worktree_ops._cleanup_failed_worktree_add(root, wt, info["branch"]),
@@ -291,6 +297,9 @@ class TestWorktreeLockReaping:
                                  capture_output=True, text=True, check=True).stdout
         block = next(b for b in listing.split("\n\n") if str(wt.resolve()) in b or path in b)
         assert "locked eval candidate; owner another tool" in block, "its lock must be left in place"
+        if operation in ("exit-cleanup", "discard"):
+            assert "Sperre aktiv oder nicht überprüfbar" in "\n".join(messages)
+            assert "lock held or unverifiable" not in "\n".join(messages)
 
     def test_dead_locked_dirty_survives(self, git_repo):
         import cli
@@ -317,21 +326,26 @@ class TestWorktreeLockReaping:
         assert wt.exists(), "dirty worktree must survive even past the 72h tier"
 
 
-def test_process_scan_compares_reported_cwd_without_resolving_foreign_paths(monkeypatch):
+def test_process_scan_normalizes_reported_cwd_like_worktree_roots(monkeypatch, tmp_path):
     import sys
     from types import SimpleNamespace
     from hermes_cli import worktree_sweep
 
-    processes = [SimpleNamespace(pid=10, cwd=lambda: "/owned/tree/nested"),
-                 SimpleNamespace(pid=11, cwd=lambda: "/another/tool/private")]
+    tree = tmp_path / "tree"
+    (tree / "nested").mkdir(parents=True)
+    # Exercise Windows-style case normalization without requiring a Windows host.
+    monkeypatch.setattr(worktree_sweep.os.path, "normcase", lambda path: path.casefold())
+    root = os.path.normcase(os.path.realpath(str(tree)))
+    processes = [SimpleNamespace(pid=10, cwd=lambda: str(tree / "nested").upper()),
+                 SimpleNamespace(pid=11, cwd=lambda: str(tmp_path / "another-tree"))]
     monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(
         process_iter=lambda _: processes, Error=OSError))
 
     def refuse_probe(*_args, **_kwargs):
-        raise AssertionError("process scanning must not walk other owners' directories")
+        raise AssertionError("process scanning must not stat another owner's cwd")
 
     monkeypatch.setattr(worktree_sweep.os.path, "realpath", refuse_probe)
-    assert worktree_sweep._psutil_live_pids(["/owned/tree"], frozenset()) == {"/owned/tree": [10]}
+    assert worktree_sweep._psutil_live_pids([root], frozenset()) == {root: [10]}
 
 
 class TestWorktreeLockPredicate:
@@ -363,11 +377,13 @@ class TestWorktreeLockPredicate:
         assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) is None
 
 
-    @pytest.mark.parametrize("reason", ["some other tool", "", "initializing", "hermes another-tool"])
+    @pytest.mark.parametrize("reason", ["some other tool", "", "initializing another-tool", "hermes another-tool"])
     def test_foreign_lock_reason_returns_live(self, git_repo, reason):
         # Another tool's lock is that tool's claim; Hermes never judges it dead.
         p = self._mk_locked(git_repo, "hermes-foreign", reason)
         assert worktree_ops._worktree_lock_is_live(str(git_repo), str(p)) == "live"
+        assert worktree_ops._worktree_lock_is_live(
+            str(git_repo), str(p), initializing_before=p.stat().st_mtime) == "live"
 
     def test_unparseable_hermes_lock_reason_fails_safe_to_live(self, git_repo):
         # N5: a hermes lock this version cannot read is never evidence that its owner is gone.

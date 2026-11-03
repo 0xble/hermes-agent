@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ ワークツリーに未プッシュのコミットがあるため保持します: {path}"
     uncommitted_keeping: "⚠ ワークツリーに未コミットの変更があるため保持します: {path}"
     kept_reason: "⚠ ワークツリーを保持します ({reason}): {path}"
+    lock_unverifiable_reason: "ロックが保持されているか検証できません"
     clean_up_manually: "手動でクリーンアップするには: git worktree remove --force {path}"
     cleaned_up: "✓ ワークツリーをクリーンアップしました: {path}"
     exit_question_dirty: "このワークツリーには未コミットの変更があります: {path}"

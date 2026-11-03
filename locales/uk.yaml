@@ -3387,6 +3387,7 @@ cli:
     unpushed_keeping: "⚠ У робочому дереві є невідправлені коміти, залишаємо: {path}"
     uncommitted_keeping: "⚠ У робочому дереві є незафіксовані зміни, залишаємо: {path}"
     kept_reason: "⚠ Робоче дерево збережено ({reason}): {path}"
+    lock_unverifiable_reason: "блокування активне або його неможливо перевірити"
     clean_up_manually: "Щоб очистити вручну: git worktree remove --force {path}"
     cleaned_up: "✓ Робоче дерево очищено: {path}"
     exit_question_dirty: "У цьому робочому дереві є незафіксовані зміни: {path}"

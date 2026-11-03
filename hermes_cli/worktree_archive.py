@@ -280,7 +280,10 @@ def snapshot_worktree(repo_root: str, wt_path, *, reason: str, max_untracked_mb:
         if (git_dir / "index").is_file():
             shutil.copyfile(git_dir / "index", tmp_index)
         else:
-            _ok(["read-tree", head], wt, tenv)
+            # A killed initial checkout has no index yet. Git reads that as an empty
+            # index, not HEAD: preserve its real staged state so the post-capture
+            # comparison does not mistake it for a concurrent edit and keep it forever.
+            _ok(["read-tree", "--empty"], wt, tenv)
         staged = _digest_index(wt, tenv)
         # Staged state first (fails on an unmerged index: a conflicted tree is never archived).
         index_tree = _ok(["write-tree"], wt, tenv).strip()
