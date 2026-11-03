@@ -46,10 +46,11 @@ def test_close_only_requested_tab_and_read_back(camofox, explicit):
 
 
 @pytest.mark.parametrize("refusal", ["unbound", "sibling", "account", "unknown", "profile", "server",
-                                     "adopted", "protected", "live_protection", "unreadable_protection", "lease", "shared_owner"])
+                                     "adopted", "protected", "live_protection", "unreadable_protection", "lease", "shared_owner",
+                                     "handoff_kept"])
 def test_close_refuses_unowned_scope_without_mutation(camofox, monkeypatch, refusal, tmp_path):
     c = camofox
-    target = _open(c)
+    target = _open(c, account="brianle" if refusal == "handoff_kept" else None)
     task = "owner"
     args = {}
     if refusal == "unbound":
@@ -76,14 +77,33 @@ def test_close_refuses_unowned_scope_without_mutation(camofox, monkeypatch, refu
         monkeypatch.setattr(leases, "claim", lambda *args: False)
     elif refusal == "shared_owner":
         c.cf._sessions["sibling"] = dict(c.cf._sessions["owner"], task_id="sibling")
+    elif refusal == "handoff_kept":
+        c.server.open_tab_ids.append(target)
+        handoff = _dispatch("browser_handoff", {"account": "brianle"}, "owner")
+        assert handoff["success"] is True and handoff["tabId"] == target, handoff
+        record = next(record for key, record in c.cf._owned_tabs.items() if key[-1] == target)
+        assert record.get("kept") is True
+        assert record.get("session_key") != c.cf.SHARED_IDENTITY_GROUP
+        assert not c.cf._handoffs_in_flight
     c.server.calls.clear()
 
     result = _dispatch("browser_close", args, task)
 
     assert result.get("success") is False, result
     assert not result.get("closed"), result
+    assert not any(method == "DELETE" for method, _path, _query in c.server.calls)
     assert not c.server.calls
     assert c.cf._sessions["owner"]["tab_id"] == target
+    if refusal == "handoff_kept":
+        assert "shown to the user" in result["error"]
+        released = _dispatch("browser_handoff", {"account": "brianle", "release": True}, "owner")
+        assert released["success"] is True, released
+        assert c.cf._sessions["owner"]["tab_id"] == target
+        c.server.calls.clear()
+        closed = _dispatch("browser_close", {}, "owner")
+        assert closed.get("success") is True and closed.get("closed") is True, closed
+        assert any(method == "DELETE" and target in path for method, path, _query in c.server.calls)
+        assert not any(tab["tabId"] == target for tabs in c.server.tabs.values() for tab in tabs)
 
 
 @pytest.mark.parametrize("failure", ["ignored_delete", "delete_error", "read_error", "malformed"])

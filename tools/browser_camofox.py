@@ -18,7 +18,7 @@ import os
 import re
 import threading
 import uuid
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
@@ -1291,6 +1291,8 @@ def camofox_close_tab(task_id: Optional[str] = None, tab_id: Optional[str] = Non
         key = _owned_tab_key(task, target)
         record = _owned_tabs.get(key)
         server = key[2]
+        if record is not None and record.get("kept"):
+            return tool_error("Tab is shown to the user; release the handoff first", success=False, closed=False)
         if (record is None or record["user_id"] != session["user_id"]
                 or record.get("session_key") == SHARED_IDENTITY_GROUP
                 or record["user_id"] in _handoffs_in_flight
