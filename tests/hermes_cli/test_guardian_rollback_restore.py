@@ -140,6 +140,28 @@ def _failing_rollback(home, a, *, raise_after_bootout=False):
     return rollback
 
 
+def _supervised_pid_absent_then_starting(monkeypatch):
+    """The PID being replaced is gone. After bootstrap, launchd still reports a
+    supervised PID so the new target is not judged down.
+
+    That later PID must not be the pre-bootout PID. ``reload_target`` reaps the
+    process it finds before bootout, and a hardcoded live PID (123 is a real
+    process on macOS CI) makes that reap hit the live-system guard. The guard's
+    ``RuntimeError`` is caught as a failed rollback and consumes the startup
+    window the test is proving, so the target is treated as not given its own
+    window. The startup-window path itself does not kill a target that is still
+    starting.
+    """
+    from hermes_cli import gateway_launchd
+    calls = {"n": 0}
+
+    def supervised(name, **_):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else 123
+
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", supervised)
+
+
 def _record_activations(monkeypatch, home):
     activations = []
 
@@ -169,8 +191,7 @@ def test_exception_after_bootout_restores_the_serving_release(tmp_path, monkeypa
 def test_slow_rollback_target_gets_its_own_startup_window(tmp_path, monkeypatch):
     """A rollback target still starting when the run deadline ends is not booted out."""
     home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
-    from hermes_cli import gateway_launchd
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
+    _supervised_pid_absent_then_starting(monkeypatch)
     monkeypatch.setattr(guardian, "rollback", _failing_rollback(home, a))
     activations = _record_activations(monkeypatch, home)
     window = {"open": False}
@@ -193,8 +214,7 @@ def test_slow_rollback_target_gets_its_own_startup_window(tmp_path, monkeypatch)
 @pytest.mark.platforms("macos")
 def test_running_but_unhealthy_target_is_not_replaced(tmp_path, monkeypatch):
     home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
-    from hermes_cli import gateway_launchd
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
+    _supervised_pid_absent_then_starting(monkeypatch)
     monkeypatch.setattr(guardian, "rollback", _failing_rollback(home, a))
     activations = _record_activations(monkeypatch, home)
     monkeypatch.setattr(guardian, "healthy", lambda home_, label_, release, *rest: release == b)

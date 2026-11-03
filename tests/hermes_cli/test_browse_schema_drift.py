@@ -605,6 +605,45 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     assert "last_read_at" not in _session_columns(path)
 
 
+def test_browse_budget_interrupts_when_the_progress_handler_does_not(tmp_path):
+    """Schema DDL under the slow stand-in is ~14s of progress-handler sleeps if
+    sqlite never honors the handler's interrupt request. Boot only waits the
+    budget plus 2s, so that hold becomes ``OwnershipConflict``. A second
+    interrupt, from another thread at the same deadline, must still cut the
+    statement off."""
+    import threading
+    import time
+
+    import hermes_state_reconcile as reconcile
+
+    path = tmp_path / "state.db"
+    conn = sqlite3.connect(path)
+    budget = reconcile._Budget(0.25)
+    budget.arm(conn)
+    # A host that ignores the handler return still runs the callback. Returning
+    # 0 here is that host: only ``Connection.interrupt`` can stop the statement.
+    conn.set_progress_handler(lambda: time.sleep(0.05) or 0, 50)
+
+    def backstop():
+        time.sleep(1.5)
+        try:
+            conn.interrupt()
+        except Exception:
+            return
+
+    threading.Thread(target=backstop, daemon=True).start()
+    started = time.monotonic()
+    with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+        conn.execute(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 2000000) "
+            "SELECT sum(x) FROM c"
+        ).fetchone()
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"budget watchdog did not interrupt ({elapsed:.2f}s); the test backstop did"
+    assert budget.expired
+    conn.close()
+
+
 def test_equal_cardinality_corrupt_index_plus_drift_is_not_written(tmp_path):
     """R2-3: quick_check does not compare index keys with the table, so two equal-size indexes
     with swapped root pages pass it. Browse must still refuse as corrupt and write nothing."""
