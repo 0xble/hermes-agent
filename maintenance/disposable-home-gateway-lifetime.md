@@ -131,6 +131,8 @@ files change.
 | `hermes_cli/gateway_runtime.py` | Pass ownership only to a new unmanaged spawn; borrow reusable daemon owners, refuse other finite owners. |
 | `hermes_cli/gateway_runtime_start.py` | Private stdin pipe, detached session and closed inherited descriptors. |
 | `hermes_cli/main.py` | Arm the parent-death fence before heavyweight gateway imports. |
+| `hermes_cli/update_cmd_fleet.py` | Avoid redundant Git-history identity resolution when a fresh finite-client home has no update receipt. |
+| `tests/hermes_cli/test_fresh_home_startup_identity.py` | A missing receipt never resolves checkout identity; nonempty receipt reconciliation remains covered by existing update tests. |
 | `hermes_cli/subcommands/gateway.py` | Parse the internal client-owned marker. |
 | `maintenance/disposable-home-gateway-lifetime.md` | Contract, fork ownership, verification and retirement. |
 | `tests/e2e/core/parity/_drive_cli.py` | Client exit alone releases finite gateways; operator stop is failure cleanup. |
@@ -299,6 +301,19 @@ final rebase to `002f8807dbdef3b9aa450980baa501c6e9920f58`, with retries disable
 Delta code health reports zero blocking findings (one existing early-watchdog
 thread advisory), source-only Fork-Patch reports zero problems, and diff check
 passes.
+
+Round-three startup profiling ruled out a lease handshake/backoff and an extra
+interpreter hop. In eight-child paired traces, spawn/ensure itself took under
+0.4 seconds before polling the child. The pre-readiness hotspot was instead
+`_recover_update_debts_on_startup -> _receipt_reports_stale_runtime({}) ->
+_current_checkout_sha -> get_code_identity(refresh=True)`: even an empty receipt
+walked source Git history in both the finite client and the gateway. Instrumented
+runs spent 9.7 seconds there on base versus 14.8–15.2 seconds on head, including
+multiple three-second Git-probe deadlines. Import timing showed no corresponding
+multi-second added lifetime import. A missing receipt now returns before identity
+resolution; real nonempty receipt/restart reconciliation is unchanged. The new
+regression asserted zero identity resolutions, failed before the fix (one call),
+and passed afterward alongside immutable-release and external-runtime coverage.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.
