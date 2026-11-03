@@ -48,9 +48,7 @@ def service_suffix(home: Path) -> str:
     home = home.resolve()
     if home == default:
         return ""
-    root = default
-    if not home.is_relative_to(default):
-        root = home.parent.parent if home.parent.name == "profiles" else home
+    root = home.parent.parent if home.parent.name == "profiles" else home
     if home != root:
         name = _profile_name_from_home(home, root)
         if name:

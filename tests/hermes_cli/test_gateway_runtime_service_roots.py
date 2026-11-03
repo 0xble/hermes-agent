@@ -22,6 +22,18 @@ def test_requested_service_name_does_not_borrow_callers_home(tmp_path, monkeypat
     assert service_suffix(requested) == installed
 
 
+def test_named_custom_root_nested_under_account_home_keeps_profile_name(tmp_path, monkeypatch):
+    from hermes_cli.gateway_runtime_service import service_suffix
+
+    native = tmp_path / "account-home"
+    requested = native / "cache" / "custom" / "profiles" / "worker"
+    requested.mkdir(parents=True)
+    monkeypatch.setattr("hermes_constants.account_default_hermes_home", lambda: native)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "unrelated-caller"))
+
+    assert service_suffix(requested) == "worker"
+
+
 @pytest.mark.platforms("linux")
 def test_service_start_does_not_decode_irrelevant_supervisor_output():
     from hermes_cli.gateway_runtime_service import ExistingService, start_existing_gateway_service

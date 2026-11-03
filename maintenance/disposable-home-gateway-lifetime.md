@@ -130,6 +130,7 @@ files change.
 | `hermes_cli/gateway_connection.py` | Forward classic finite-client intent at the lazy connection dial. |
 | `hermes_cli/gateway_runtime.py` | Pass ownership only to a new unmanaged spawn; borrow reusable daemon owners, refuse other finite owners. |
 | `hermes_cli/gateway_runtime_start.py` | Private stdin pipe, detached session and closed inherited descriptors. |
+| `hermes_cli/gateway_runtime_service.py`, `tests/hermes_cli/test_gateway_runtime_service_roots.py` | Requested-root naming and startup validation stay consistent for named custom roots, including under the native account home. |
 | `hermes_cli/main.py` | Arm the parent-death fence before heavyweight gateway imports. |
 | `hermes_cli/update_cmd_fleet.py` | Avoid redundant Git-history identity resolution when a fresh finite-client home has no update receipt. |
 | `tests/hermes_cli/test_fresh_home_startup_identity.py` | A missing receipt never resolves checkout identity; nonempty receipt reconciliation remains covered by existing update tests. |
@@ -314,6 +315,20 @@ multi-second added lifetime import. A missing receipt now returns before identit
 resolution; real nonempty receipt/restart reconciliation is unchanged. The new
 regression asserted zero identity resolutions, failed before the fix (one call),
 and passed afterward alongside immutable-release and external-runtime coverage.
+Paired canonical catalog runs passed all 39 children in both lanes: base
+`eed51855` starting/running/total medians were **19.066/19.292/24.198 s**;
+head after the fix was **10.402/10.833/15.869 s**. Post-final reap medians were
+0.076 s versus 0.354 s, confirming the retained teardown bound is not the
+startup regression. Head left **zero** live children versus **37** on base;
+only those exact recorded base fixture processes were cleaned after census.
+
+The 183-file follow-up exposed a requested-service naming discrepancy when a
+custom root itself lies below the account's native Hermes home: its named
+`profiles/worker` got a path hash instead of the installer's `worker` suffix.
+Derive named-profile roots from the requested home consistently even in that
+nested layout, without borrowing the caller's environment or a bare service.
+The existing named-root regression was RED; a new explicit nested-native-home
+case makes the layout deterministic rather than depending on scratch placement.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.
