@@ -2914,6 +2914,11 @@ def run_one_job(
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
+    from cron.jobs import hold_stale_person_send
+    if hold_stale_person_send(job):
+        finish_execution(execution_id, success=False, error="stale send held; payload kept",
+                         output="stale send held; payload kept")
+        return True
     # Recheck after executor wait AND inside the detached process, before any job code.
     from cron.missed_windows import skip_before_start
     skipped = skip_before_start(job)
