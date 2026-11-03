@@ -27,6 +27,7 @@ class ProcessSurvivalMixin:
 
     def _spawn_local_survivor(
         self, session: ProcessSession, safe_command: str, env_vars: dict | None, *, restart_safe: bool = True,
+        unit_suffix: str | None = None,
     ) -> ProcessSession:
         """Launch a local command whose stdout/stderr never pass through a gateway pipe.
 
@@ -62,7 +63,7 @@ class ProcessSurvivalMixin:
                 session.systemd_unit = f"hermes-worker-{session.id}.scope"
             spawn_argv, scoped = dispatch.argv, dispatch.mode == "scoped"
         else:
-            spawn_argv = self._scope_argv(session, wrapped, session.id, "Local")
+            spawn_argv = self._scope_argv(session, wrapped, unit_suffix or session.id, "Local")
             scoped = bool(session.systemd_unit)
         spawn_env = self._spawn_env(env_vars)
         if scoped:

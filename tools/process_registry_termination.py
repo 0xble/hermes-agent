@@ -112,6 +112,13 @@ class ProcessTerminationMixin:
         if not _deadline_active():
             return
 
+        # A file-backed wrapper waits in a subshell which may spawn more children
+        # during the parent's grace window. Capture them BEFORE terminating that
+        # subshell: its exit would reparent them and hide them from the final scan.
+        with suppress(*gone):
+            if cls._proc_alive(parent):
+                known = {proc.pid for proc in descendants}
+                descendants.extend(p for p in parent.children(recursive=True) if p.pid not in known)
         # The snapshot is an anti-orphan guarantee: only descendants still alive
         # after the parent had its chance are asked to terminate themselves.
         remaining = descendants if grace <= 0 else [

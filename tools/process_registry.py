@@ -1268,10 +1268,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                     session.systemd_unit = ""
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
-        if not _IS_WINDOWS and log is None:
-            # A failed PTY request is now an ordinary non-interactive job too.
-            return self._spawn_local_survivor(session, safe_command, env_vars, restart_safe=False)
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
+        if not _IS_WINDOWS and log is None:
+            # Keep the failed PTY scope's name distinct even for file-backed fallback.
+            return self._spawn_local_survivor(
+                session, safe_command, env_vars, restart_safe=False, unit_suffix=unit_suffix)
+
         spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
                                       unit_suffix, "Local")
         spawn_env = self._spawn_env(env_vars)

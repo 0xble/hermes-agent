@@ -3280,12 +3280,11 @@ class TestSystemdCgroupIsolation:
 
         return fake_popen, captured
 
-    @pytest.mark.platforms("linux")
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
         self, registry, monkeypatch, _gateway_identity
     ):
-        """Under a supervisor with systemd-run available, the spawn argv is
-        wrapped in ``systemd-run --user --scope --unit=hermes-worker-<id>``."""
+        """The fully mocked Linux dispatch is testable on every POSIX host."""
+        monkeypatch.setattr("tools.process_registry._IS_LINUX", True)
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
@@ -3337,7 +3336,11 @@ class TestSystemdCgroupIsolation:
         assert "--" in argv, "systemd-run argv must use -- to separate command"
         sep_idx = argv.index("--")
         assert "/bin/bash" in argv[sep_idx:]
-        assert "set +m; echo hello" in argv[sep_idx:]
+        # The recoverable wrapper retains both the exact command and its status.
+        wrapper = argv[-1]
+        assert wrapper.startswith("set +m; (\necho hello\n) > ")
+        assert session.log_path in wrapper and session.exit_path in wrapper
+        assert 'exit "$rc"' in wrapper
         # systemd-run --scope gives the worker a new cgroup but NOT a new
         # session (#70716 regression: start_new_session was False, so the
         # worker kept the parent's session + controlling terminal → SIGTTIN/
@@ -3565,11 +3568,11 @@ class TestSystemdCgroupIsolation:
         assert argv[-3:] == ["/bin/bash", "-lic", "set +m; codex"]
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
-    @pytest.mark.platforms("linux")
     def test_pty_spawn_failure_reaps_scope_before_distinct_pipe_fallback(
         self, registry, monkeypatch, _gateway_identity
     ):
-        """A failed PTY scope must not collide with the pipe fallback scope."""
+        """A failed PTY scope must not collide with the file-backed fallback scope."""
+        monkeypatch.setattr("tools.process_registry._IS_LINUX", True)
         from ptyprocess import PtyProcess
 
         events = []
