@@ -22,6 +22,10 @@ _tick_scans = threading.local()
 _SLOT_WAKE_CHECK_SECONDS = 0.25
 
 
+class AgentAdmissionRequired(Exception):
+    """The persisted fire requires agent capacity, not the script-only lane."""
+
+
 def reserved_job_id(jobs: list[dict], home) -> str | None:
     """Select in store order, not due order, so a later deadline cannot steal the reservation."""
     from cron.jobs import is_job_runnable, is_terminal_job

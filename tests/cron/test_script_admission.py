@@ -106,6 +106,70 @@ def test_due_script_runs_while_general_and_protected_detached_workers_wait(home,
             process.communicate(timeout=10)
 
 
+def test_queued_script_edited_to_agent_waits_for_agent_admission(home, monkeypatch):
+    path, now = home
+    real_pool = scheduler._get_parallel_pool
+
+    def scoped_pool(workers):
+        assert hermes_home_key(scheduler._get_hermes_home()) == hermes_home_key(path)
+        return real_pool(workers)
+
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", scoped_pool)
+    release_agent, release_script, release_changed = (threading.Event() for _ in range(3))
+    agent_started, script_started, changed_started, tail_done = (threading.Event() for _ in range(4))
+    starts = []
+    monkeypatch.setattr(scheduler, "_resolve_max_parallel_workers", lambda: 1)
+    agent = due_job(now)
+    first = due_job(now, no_agent=True)
+    changed, tail = {}, {}
+
+    def run(item, **kwargs):
+        starts.append((item["id"], item.get("no_agent"), threading.current_thread().name))
+        if item["id"] == agent["id"]:
+            agent_started.set()
+            assert release_agent.wait(10)
+        elif item["id"] == first["id"]:
+            script_started.set()
+            assert release_script.wait(10)
+        elif item["id"] == changed["id"]:
+            changed_started.set()
+            assert release_changed.wait(10)
+        elif item["id"] == tail["id"]:
+            tail_done.set()
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+    try:
+        assert scheduler.tick(sync=False) == 2
+        assert agent_started.wait(5) and script_started.wait(5)
+        changed, tail = due_job(now, no_agent=True), due_job(now, no_agent=True)
+        assert scheduler.tick(sync=False) == 2
+        execution = executions.latest_execution(changed["id"])
+        jobs.update_job(changed["id"], {"no_agent": False})
+        release_script.set()
+        assert tail_done.wait(5), "mode-changed job occupied the script lane with agent work"
+        assert not changed_started.is_set(), "agent work bypassed the full general admission pool"
+        assert scheduler.is_job_running(changed["id"]), "reroute dropped the in-flight dedup owner"
+        persisted = jobs.get_job(changed["id"])
+        assert persisted is not None
+        assert not persisted.get("fire_claim"), "lease started before agent admission"
+        with scheduler._running_lock:
+            assert not scheduler._running_futures[scheduler._inflight_key(changed["id"])].done()
+        release_agent.set()
+        assert changed_started.wait(5)
+        release_changed.set()
+        assert wait_until(lambda: not scheduler.is_job_running(changed["id"]), timeout=5)
+        changed_starts = [entry for entry in starts if entry[0] == changed["id"]]
+        assert len(changed_starts) == 1
+        assert changed_starts[0][1] is False
+        assert not changed_starts[0][2].startswith("cron-script")
+        assert executions.latest_execution(changed["id"])["id"] == execution["id"]
+    finally:
+        release_agent.set()
+        release_script.set()
+        release_changed.set()
+
+
 def test_script_fifo_is_serial_scoped_and_does_not_take_protected_reservation(home, tmp_path):
     path, now = home
     release, first_started, protected_started = (threading.Event() for _ in range(3))
