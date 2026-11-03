@@ -29,18 +29,33 @@ def stop_requested(home: Path) -> bool:
         return False
 
 
+def foreign_guardian(path: Path, home: Path, label: str) -> bool:
+    """The guardian is account-shared; only its owning Hermes home may manage it."""
+    if not path.exists():
+        return False  # An unowned loaded label must still fail closed during preflight.
+    body = plistlib.loads(path.read_bytes())
+    owner = body.get("EnvironmentVariables", {}).get("HERMES_HOME")
+    if body.get("Label") != label or not owner:
+        raise RuntimeError(f"cannot prove guardian ownership: {path}")
+    return Path(owner).resolve() != home.resolve()
+
+
 @contextmanager
-def lifetime_lock(home: Path, *, blocking: bool = True):
+def lifetime_lock(home: Path, *, blocking: bool = True, announce_wait: bool = False):
     """Shared with CLI/guardian; keep stdlib-only for the isolated login entry point."""
     import fcntl
     path = home / "logs/launchd-lifetime.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            yield False
-            return
+            if not blocking:
+                yield False
+                return
+            if announce_wait:
+                print(f"Waiting for lifetime lock: {path}", flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
         yield True
 
 
@@ -67,6 +82,9 @@ def _login_bootstrap(home: Path, gateway_plist: Path, *, runner=None, log=print)
     domain = f"user/{uid}"
     for path, expected_label in definitions:
         if not path.exists():
+            continue
+        if expected_label == GUARDIAN_LABEL and foreign_guardian(path, home, GUARDIAN_LABEL):
+            log(f"{GUARDIAN_LABEL}: skipped: owned by another Hermes home")
             continue
         definition = plistlib.loads(path.read_bytes())
         label = definition["Label"]

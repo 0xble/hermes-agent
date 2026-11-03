@@ -23,6 +23,7 @@ Contract tests: `tests/hermes_cli/test_launchd_session_lifetime.py`,
   `tests/hermes_cli/test_launchd_login_identity.py`,
   `tests/hermes_cli/test_launchd_lifetime_safety.py`,
   `tests/hermes_cli/test_launchd_lifetime_review.py`,
+  `tests/hermes_cli/test_launchd_explicit_followups.py`,
   `tests/hermes_cli/test_guardian_automatic_reinstall.py`.
 
 ## Explicit lifetime selection
@@ -55,8 +56,20 @@ unloads guardian before gateway, waits for their PIDs to exit, then writes and
 loads at most one replacement. Failed bootstrap restores original definitions
 and registrations after removing replacements; ambiguous drain stays stopped
 rather than risking two writers. `--no-start-now` retains stopped intent.
-Explicit-mode uninstall drains both domains and removes guardian too. Unknown
-domain errors never degrade an explicit install to an unsupervised process.
+Explicit-mode uninstall drains both domains and removes only its own guardian.
+The guardian's account-shared label/plist may belong to a different profile;
+migration, uninstall and the login trigger must neither query nor manage that
+other home's guardian. Missing gateway plists infer user-domain intent from the
+owned login trigger before regeneration. A forced refresh within the same explicit
+domain follows the ordinary in-place reload path under the lifetime lock, without
+requiring a running gateway to undergo a domain migration. Start/stop announce
+lock contention. Unexpected launchctl probe codes are CLI guidance, not tracebacks.
+A partially failed retire retains stopped intent and reports exactly which prior
+registrations are unloaded, still loaded or uninspectable, with the command to
+repair the prior domain after writer drain is verified. Deferred reloads render
+the fail-closed drain-timeout branch from an explicit parameter, not a textual
+replacement in the generated shell. Unknown domain errors never degrade an
+explicit install to an unsupervised process.
 
 A disposable label `ai.hermes.test-session-independent.4bac0cd2296d` ran through
 osascript in user/501 (PID 23543, Background ASID 100053); its per-service GUI

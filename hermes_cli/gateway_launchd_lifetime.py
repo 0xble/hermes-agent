@@ -7,7 +7,8 @@ import plistlib
 import subprocess
 from xml.parsers.expat import ExpatError
 
-from hermes_cli.gateway_launchd_login import lifetime_lock
+from hermes_cli.gateway_launchd_login import foreign_guardian, lifetime_lock
+from hermes_cli.gateway_command_errors import LaunchdServiceError
 
 
 SESSION_TYPES = {"user": "Background", "gui": "Aqua"}
@@ -26,6 +27,14 @@ def configured_launchd_domain(label: str | None = None) -> str | None:
     if label is not None:
         path = path.with_name(f"{label}.plist")
     if not path.exists():
+        # A successful user-domain install leaves an owned Aqua registration trigger.
+        # Manual removal of the gateway plist must not silently revert it to automatic.
+        from hermes_cli.gateway_launchd_login import _login_trigger_label
+        trigger_label = _login_trigger_label(path.stem)
+        trigger_path = path.with_name(f"{trigger_label}.plist")
+        if trigger_path.exists():
+            _owned_definition(trigger_path, gw.get_hermes_home(), trigger_label)
+            return f"user/{_uid()}"
         return None
     try:
         body = plistlib.loads(path.read_bytes())
@@ -50,7 +59,7 @@ def _state(run, domain: str, label: str, *, timeout: float = 10) -> tuple[bool, 
             and "Could not find domain for user gui:" in result.stderr):
         return False, None
     if result.returncode not in {3, 113}:
-        raise RuntimeError(f"cannot inspect {domain}/{label}: {result.stderr}")
+        raise LaunchdServiceError(f"cannot inspect launchd target {domain}/{label}: {result.stderr}")
     return False, None
 
 
@@ -149,6 +158,29 @@ def _restore_definitions(run, originals, labels, states, *, gateway_label, stopp
                               for (_, name), (_, pid) in states.items())
 
 
+def _retirement_failure(run, states, gateway_label: str) -> str:
+    """Report partial retirement without reloading beside a possibly undrained writer."""
+    unloaded, loaded, unknown = [], [], []
+    for (domain, name), (was_loaded, _) in states.items():
+        if not was_loaded:
+            continue
+        target = f"{domain}/{name}"
+        try:
+            (loaded if _state(run, domain, name)[0] else unloaded).append(target)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            unknown.append(target)
+    prior = next((d for (d, n), (present, _) in states.items() if n == gateway_label and present),
+                 f"gui/{_uid()}").split("/", 1)[0]
+    return (f"Unloaded: {', '.join(unloaded) or 'none'}. "
+            f"Still loaded: {', '.join(loaded) or 'none'}. "
+            f"Unknown: {', '.join(unknown) or 'none'}. "
+            "Stopped intent retained; any unregistered writer may still be draining. "
+            "Repair: verify all writers have exited with `hermes gateway stop` and "
+            "`hermes gateway status --deep`, then run "
+            f"`hermes gateway install --launchd-domain {prior} --no-start-now` "
+            "and `hermes gateway start`.")
+
+
 def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
     import fcntl  # POSIX-only path; importing gateway CLI remains safe on Windows.
     if mode not in SESSION_TYPES:
@@ -165,9 +197,10 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
     run = runner or subprocess.run
     domains = (f"gui/{_uid()}", f"user/{_uid()}")
     target = f"{mode}/{_uid()}"
-    originals = {path: _owned_definition(path, home, label),
-                 guardian_path: _owned_definition(guardian_path, home, GUARDIAN_LABEL),
-                 login_path: _owned_definition(login_path, home, login_label)}
+    labels = {login_path: login_label, path: label}
+    if not foreign_guardian(guardian_path, home, GUARDIAN_LABEL):
+        labels[guardian_path] = GUARDIAN_LABEL
+    originals = {p: _owned_definition(p, home, name) for p, name in labels.items()}
     # Validate/render before stopping anything. A foreign guardian must never be adopted.
     from hermes_cli.immutable_releases import resolved_release
     release = resolved_release(home)
@@ -178,14 +211,13 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
         raise RuntimeError("refusing temporary-home service install")
     from hermes_cli.gateway_launchd_login import login_plist
     bodies = {path: body, login_path: login_plist(home, path, label) if mode == "user" else None}
-    if originals[guardian_path] is not None:
+    if originals.get(guardian_path) is not None:
         bodies[guardian_path] = guardian_plist(home, path, label, domain=target, explicit=True)
     with lifetime_lock(home, blocking=False) as acquired:
         if not acquired:
             raise BlockingIOError("launchd lifetime operation is busy; retry shortly")
         if any((p.read_bytes() if p.exists() else None) != b for p, b in originals.items()):
             raise RuntimeError("launchd definitions changed during migration preflight; retry")
-        labels = {path: label, guardian_path: GUARDIAN_LABEL, login_path: login_label}
         states = _inspect_layout(run, domains, labels, originals, mode=mode, gateway_label=label)
         correct = all(originals[p] == b for p, b in bodies.items())
         placed = all(not loaded or domain == (domains[0] if name == login_label else target)
@@ -204,10 +236,14 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
         from hermes_cli.gateway_launchd_login import stop_requested
         stopped = stop_requested(home)
         set_intent(home, stopped=True)
+        names = [name for name in (login_label, GUARDIAN_LABEL, label) if name in labels.values()]
         changed = False
         try:
             # Freeze repair before retiring either gateway definition.
-            _retire_copies(run, home, domains, (login_label, GUARDIAN_LABEL, label), gateway_label=label)
+            try:
+                _retire_copies(run, home, domains, names, gateway_label=label)
+            except Exception as exc:
+                raise RuntimeError(f"{exc}. {_retirement_failure(run, states, label)}") from exc
             changed = True
             from gateway.status import live_gateway_pid_for_home
             if live_gateway_pid_for_home(home) is not None:
@@ -228,7 +264,7 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
             # Unknown drain state must remain stopped; never restore a second copy beside it.
             set_intent(home, stopped=True)
             if changed:
-                _retire_copies(run, home, domains, (login_label, GUARDIAN_LABEL, label), gateway_label=label)
+                _retire_copies(run, home, domains, names, gateway_label=label)
                 from gateway.status import live_gateway_pid_for_home
                 if live_gateway_pid_for_home(home) is not None:
                     raise RuntimeError("replacement writer remains alive; rollback stays stopped")
@@ -249,8 +285,10 @@ def uninstall_launchd_lifetime(*, runner=None) -> None:
     label = gw.get_launchd_label()
     from hermes_cli.gateway_launchd_login import _login_trigger_label
 
-    labels = (_login_trigger_label(label), GUARDIAN_LABEL, label)
-    with lifetime_lock(home):
+    labels = [_login_trigger_label(label), label]
+    with lifetime_lock(home, announce_wait=True):
+        if not foreign_guardian(path.with_name(f"{GUARDIAN_LABEL}.plist"), home, GUARDIAN_LABEL):
+            labels.insert(1, GUARDIAN_LABEL)
         for name in labels:
             original = _owned_definition(path.with_name(f"{name}.plist"), home, name)
             if original is None and any(_state(run, domain, name)[0]
@@ -266,4 +304,4 @@ def uninstall_launchd_lifetime(*, runner=None) -> None:
                     raise RuntimeError("gateway writer still alive; uninstall remains stopped and retains definition")
             path.with_name(f"{name}.plist").unlink(missing_ok=True)
     gw._resolved_launchd_domain = None
-    print("Gateway and guardian uninstalled")
+    print("Gateway uninstalled" + (" with its guardian" if GUARDIAN_LABEL in labels else "; shared guardian preserved"))
