@@ -16,11 +16,11 @@ kills the child's session when the updater dies. A normal exit dismisses the
 watch and does not kill a child the parent is already reaping.
 
 Upgrade e2e sandboxes keep a private `HERMES_GATEWAY_LOCK_DIR` under the
-sandbox root. The host-gateway record is per OS user (`Path.home()`, not
-`$HOME`). Without the private dir, `hermes gateway run` in the sandbox attaches
-to the live host's `default` profile or to a sibling test's gateway and exits
-without becoming running. Each sandbox home is already unique; the lock dir is
-what makes that home a separate host-gateway tenant.
+sandbox root. The host-gateway record is cross-profile, not keyed by
+`HERMES_HOME`; its fallback is `$XDG_STATE_HOME` or `$HOME/.local/state`.
+An explicit lock namespace prevents inherited defaults or sibling gateways
+from claiming the sandbox's `default` profile. Both the home and rendezvous
+namespace are private to the sandbox.
 
 Upstream has no equivalent parent-death fence on the POSIX completion child
 (the Windows job is the intended contract). The private lock dir is test
