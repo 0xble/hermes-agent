@@ -27,7 +27,9 @@ is lexical. When the lexical and canonical roots differ, either live root counts
 Resolution matches `hermes_constants._hermes_root_of`: a home under the account
 default resolves to that default; otherwise the profiles parent is lexical, so
 `<root>/profiles/<name>` resolves to `<root>` even when that profile directory
-is a symlink. Canonicalization matches Python `Path.resolve(strict=False)`,
+is a symlink. Match `Path(home)` before reading that parent: discard empty and
+`.` components but preserve lexical `..`. Canonicalization matches Python
+`Path.resolve(strict=False)`,
 including a missing suffix under a symlinked ancestor. If that names a
 different root, the home is live when either root is. A resolution error is
 live. PM writes the lexical root's `tools/`

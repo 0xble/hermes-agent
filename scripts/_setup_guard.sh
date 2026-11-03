@@ -221,9 +221,22 @@ hermes_home_is_under() {
 # the native home, but keep the profiles parent lexical. Canonicalizing first
 # follows a symlink at <root>/profiles/<name> and loses <root>.
 hermes_resolved_runtime_root() {
-  local home="$1" native="${2-}" lexical parent under
-  lexical="${home%/}"
-  [ -n "$lexical" ] || return 1
+  local home="$1" native="${2-}" lexical="" parent under rest part
+  [ -n "$home" ] || return 1
+  # Path(home) removes empty and '.' components before _hermes_root_of reads
+  # parent.name. Keep '..' lexical: collapsing it would follow symlinks early.
+  case "$home" in /*) lexical=/ ;; esac
+  rest="$home"
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+    case "$part" in ''|.) continue ;; esac
+    case "$lexical" in
+      ''|/) lexical="${lexical}${part}" ;;
+      *) lexical="${lexical}/${part}" ;;
+    esac
+  done
+  [ -n "$lexical" ] || lexical=.
   if [ -n "$native" ]; then
     under=0
     hermes_home_is_under "$lexical" "$native" || under=$?

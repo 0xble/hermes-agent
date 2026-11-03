@@ -258,7 +258,8 @@ a gateway pid `kill -0` can see (including EPERM), or any path under the OS
 account default. A profile under that default, or under another live root
 (`<root>/profiles/<name>`), is live even when the profile directory itself has
 no markers. That profiles parent is lexical, including when the profile
-directory is a symlink. Canonicalization matches Python
+directory is a symlink. As with `Path(home)`, empty and `.` components are
+removed before reading that parent; `..` remains lexical. Canonicalization matches Python
 `Path.resolve(strict=False)`, including a missing suffix under a symlinked
 ancestor. If that canonical root differs from the lexical root, either live
 root refuses. A resolution error is live. The account-default lookup uses the password

@@ -555,6 +555,9 @@ GUARD_LAYOUTS = (
     "trailing_slash_under_symlink",
     "spaces",
     "spaces_symlink",
+    "dot_in_symlinked_profile",
+    "dot_after_symlinked_profile",
+    "slashes_after_symlinked_profile",
     "dangling_relative",
     "dangling_absolute",
     "relative_missing",
@@ -665,13 +668,18 @@ def _guard_home(base: Path, name: str) -> str:
             return str(quiet / "profiles" / ".." / "profiles" / "new-profile")
         home = str(quiet / "profiles" / "new-profile")
         return home + "/" if name == "trailing_slash_under_symlink" else home
-    if name == "symlinked_profile_dir":
+    if name in {"symlinked_profile_dir", "dot_in_symlinked_profile", "dot_after_symlinked_profile", "slashes_after_symlinked_profile"}:
         live = base / "live"
         quiet = base / "quiet-profile"
         (live / "profiles").mkdir(parents=True)
         quiet.mkdir()
         (live / "profiles" / "dev").symlink_to(quiet)
-        return str(live / "profiles" / "dev")
+        if name == "dot_in_symlinked_profile":
+            return str(live / "profiles") + "/./dev"
+        home = str(live / "profiles" / "dev")
+        if name == "dot_after_symlinked_profile":
+            return home + "/."
+        return home + "///" if name == "slashes_after_symlinked_profile" else home
     if name in {"dangling_relative", "dangling_absolute"}:
         live = base / "live"
         quiet = base / "quiet"
