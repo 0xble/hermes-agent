@@ -18,6 +18,9 @@ from contextlib import suppress
 CLIENT_EXIT_GRACE_SECONDS = 3.0
 # Forced teardown is not a clean gateway exit; keep it distinct from restart/config codes.
 CLIENT_LIFETIME_FORCED_EXIT_CODE = 74
+# Launch-only secret: inherited across interpreter relaunches, never written to disk.
+CLIENT_LEASE_TOKEN_ENV = "_HERMES_CLIENT_LEASE_TOKEN"
+_client_lease_token = None
 
 
 def arm_client_lifetime_for_argv(argv) -> None:
@@ -36,11 +39,18 @@ def arm_client_lifetime() -> None:
     if not is_pipe:
         raise SystemExit("--client-owned requires stdin to be a pipe owned by its finite client; "
                          "omit --client-owned to run a persistent gateway")
+    global _client_lease_token
+    _client_lease_token = os.environ.pop(CLIENT_LEASE_TOKEN_ENV, None)
     read_fd = os.dup(0)
     stream = os.fdopen(read_fd, "rb", buffering=0)
     thread = threading.Thread(target=_watch_client, args=(stream,), daemon=True,
                               name="gateway-client-lifetime")
     thread.start()
+
+
+def client_lease_token() -> str | None:
+    """Only private control identity may expose this in-memory creator credential."""
+    return _client_lease_token
 
 
 def _watch_client(stream) -> None:
@@ -58,6 +68,10 @@ def _watch_client(stream) -> None:
                             args=(CLIENT_LIFETIME_FORCED_EXIT_CODE,))
     timer.daemon = True
     timer.start()
+    # Once installed, ordinary shutdown gets the full grace budget in parallel.
+    shutdown_handler = os.name != "nt" and callable(signal.getsignal(signal.SIGTERM))
+    if shutdown_handler:
+        os.kill(os.getpid(), signal.SIGTERM)
     # Reuse only this process's already-loaded ownership registries, never a host
     # scan or a cold tool import. Detached terminal process groups otherwise outlive
     # the hard exit while normal daemon shutdown is still draining active work.
@@ -70,4 +84,9 @@ def _watch_client(stream) -> None:
     if registry is not None:
         with suppress(Exception):
             registry.kill_all(source="gateway_shutdown", deadline=time.monotonic() + 0.5)
-    os.kill(os.getpid(), signal.SIGTERM)
+    if not shutdown_handler:
+        # During early startup SIGTERM's default action exits immediately; on
+        # Windows os.kill(SIGTERM) uses TerminateProcess even with a handler.
+        # Both would strand detached tools. Clean them first; the timer already
+        # bounds cleanup and the registry gets only 0.5 s of its 3 s budget.
+        os.kill(os.getpid(), signal.SIGTERM)

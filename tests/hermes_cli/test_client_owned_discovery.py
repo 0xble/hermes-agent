@@ -17,7 +17,12 @@ import asyncio, os, sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import patch
-from hermes_cli import gateway_client, gateway_runtime_start
+from hermes_cli import gateway_client, gateway_runtime_start, gateway_runtime
+if os.environ.get('CLIENT_TRAMPOLINE'):
+    real_ensure = gateway_runtime.ensure_gateway_runtime
+    def bounded_ensure(*args, **kwargs):
+        return real_ensure(*args, **{**kwargs, "timeout": 12})
+    gateway_runtime.ensure_gateway_runtime = bounded_ensure
 home = Path(os.environ['HERMES_HOME'])
 real_popen = subprocess_popen = gateway_runtime_start.subprocess.Popen
 GATEWAY = r"""
@@ -31,8 +36,13 @@ from gateway.run_bootstrap import start_gateway
 with patch.object(GatewayRunner, '_start_mcp_discovery'), patch.object(GatewayRunner, '_await_mcp_discovery', AsyncMock()):
     asyncio.run(start_gateway(GatewayConfig(), client_owned=True))
 """
+TRAMPOLINE = "import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', sys.argv[1]], stdin=sys.stdin); sys.exit(child.wait())"
 def spawn(argv, **kwargs):
     if 'hermes_cli.main' in argv:
+        if os.environ.get('CLIENT_TRAMPOLINE'):
+            child = real_popen([sys.executable, '-c', TRAMPOLINE, GATEWAY], **kwargs)
+            (home / 'launcher-pid').write_text(str(child.pid))
+            return child
         return real_popen([sys.executable, '-c', GATEWAY], **kwargs)
     return real_popen(argv, **kwargs)
 class WS:
@@ -53,13 +63,13 @@ asyncio.run(main())
 '''
 
 
-@pytest.mark.parametrize("client_pid", [None, 99, 123])
-def test_multiplexer_discovery_requires_the_creators_live_child(tmp_path, monkeypatch, client_pid):
+@pytest.mark.parametrize("client_lease_token", [None, "other-lease", "creator-lease"])
+def test_multiplexer_discovery_requires_the_creators_lease(tmp_path, monkeypatch, client_lease_token):
     from hermes_cli import gateway_runtime as runtime
 
     home = tmp_path / "profiles" / "child"
     home.mkdir(parents=True, mode=0o700)
-    payload = {"runtime_protocol": 1, "pid": 123, "client_owned": True, "supervisor": "none",
+    payload = {"runtime_protocol": 1, "pid": 123, "client_owned": True, "client_lease_token": "creator-lease", "supervisor": "none",
                "state": "ready", "instance_id": "finite", "authority_epoch": 1,
                "api_origin": "http://127.0.0.1:41817",
                "served_profiles": [{"profile_id": str(home), "home": str(home)}],
@@ -67,8 +77,8 @@ def test_multiplexer_discovery_requires_the_creators_live_child(tmp_path, monkey
     from hermes_cli import gateway_runtime_multiplex, gateway_runtime_discovery
     monkeypatch.setattr(gateway_runtime_multiplex, "multiplexer_root_for", lambda _home: tmp_path)
     monkeypatch.setattr(gateway_runtime_discovery, "query_identify", lambda *_a, **_kw: payload)
-    observed = runtime.discover_gateway_endpoint(home, client_pid=client_pid)
-    if client_pid == 123:
+    observed = runtime.discover_gateway_endpoint(home, client_lease_token=client_lease_token)
+    if client_lease_token == "creator-lease":
         assert observed.state == "ready"
         assert observed.endpoint is not None
         assert observed.endpoint.control_home == str(tmp_path)

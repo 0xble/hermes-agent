@@ -34,14 +34,15 @@ class DiscoveryError(ValueError):
         return cause + notice
 
 
-def client_owner_refusal(payload: dict, client_pid: int | None, worker_authorized: bool):
+def client_owner_refusal(payload: dict, client_lease_token: str | None, worker_authorized: bool):
     """Only the creator or a privately authenticated adopted worker may attach."""
     from hermes_cli.gateway_runtime import GatewayDiscovery
     client_owned = payload.get("client_owned", False)
     if type(client_owned) is not bool:
         return GatewayDiscovery("inaccessible", reason_code="invalid_client_ownership")
     if client_owned and not worker_authorized and (
-            client_pid is None or type(payload.get("pid")) is not int or payload["pid"] != client_pid):
+            not client_lease_token or not isinstance(payload.get("client_lease_token"), str) or
+            payload["client_lease_token"] != client_lease_token):
         return GatewayDiscovery("conflict", reason_code="client_owned",
                                 detail="another finite client owns this gateway; retry after it exits "
                                        "or use a separate HERMES_HOME")

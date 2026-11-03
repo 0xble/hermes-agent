@@ -10,6 +10,7 @@ def test_late_spawn_after_cancelled_client_immediately_loses_lease():
     child = Mock()
     lease.own(child)
     child.stdin.close.assert_called_once()
+    child.wait.assert_called_once_with(timeout=5)
     child.kill.assert_not_called()
 
 

@@ -52,9 +52,13 @@ neither borrows the short-lived owner nor replaces it. Deadline expiry reports
 `conflict: client_owned` with the remedies: wait for that client to finish and
 retry, or use a separate `HERMES_HOME` for parallel clients. The live descriptor
 and runtime status identify client-owned mode. Only the ensure invocation
-holding the exact live Popen child accepts that private endpoint through ordinary
-discovery; arbitrary finite, interactive, TUI, cron, kanban and ACP clients remain
-non-attachable.
+holding the live Popen child and its per-invocation random lease token accepts
+that private endpoint through ordinary discovery; arbitrary finite, interactive,
+TUI, cron, kanban and ACP clients remain non-attachable. The PID is not identity:
+Windows venv redirectors and bootstrap relaunches insert interpreter hops. The
+token travels only in the private launch environment, survives those hops, and
+is consumed before workers/tools inherit it. It is returned only over same-user
+private control identify, never persisted in status or logs.
 
 The owner's managed compute workers and delegated child stores are not arbitrary
 clients. They prove their existing durable adoption claim through the private
@@ -80,7 +84,14 @@ not masquerade as successful graceful shutdown. The creator still blocks while
 reaping its exact child. This deliberately adds about **three seconds typical**
 exit latency when hard teardown is needed, and up to **ten seconds worst case**
 (two five-second waits with an intervening kill) if the early watcher never
-started. This no-orphan trade-off is retained; the review changes no reap timing.
+started. This no-orphan trade-off is retained; the review changes no reap timing. A spawn
+that completes after lease closure performs the same bounded wait/kill/wait.
+After a Python SIGTERM handler is installed, EOF requests ordinary shutdown
+before registry cleanup so that handler gets the full three-second budget.
+Before handler installation, cleanup must precede default SIGTERM (which exits
+immediately and would strand detached tools). Windows also retains cleanup-first
+because os.kill(SIGTERM) is TerminateProcess even with a Python handler. The
+registry is bounded to 0.5 s and the hard-exit timer already runs in both cases.
 
 Review preflight: upstream guidance was rechecked at
 `717447e4217ecd9d520f60c6a06c63ec448e601b` (root and subsystem AGENTS,

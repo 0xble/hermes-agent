@@ -295,6 +295,9 @@ async def _start_gateway_start_control_socket(runner):
             payload.update({key: descriptor[key] for key in (
                 "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
                 "served_profiles", "parked_profiles", "capabilities", "client_owned") if key in descriptor})
+            if descriptor.get("client_owned"):
+                from gateway.client_lifetime import client_lease_token
+                payload["client_lease_token"] = client_lease_token()
             if getattr(runner, '_draining', False):
                 payload.update(state='draining')
                 # The restart's after-turn wait still owns its turns: clients reach it to answer a

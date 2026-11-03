@@ -95,6 +95,10 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     from gateway.session_context import _VAR_MAP  # the launching turn's session identity, too
     for key in (*DAEMON_STRIPPED_ENV, *_VAR_MAP):
         env.pop(key, None)
+    from gateway.client_lifetime import CLIENT_LEASE_TOKEN_ENV
+    env.pop(CLIENT_LEASE_TOKEN_ENV, None)
+    if client_lease is not None:
+        env[CLIENT_LEASE_TOKEN_ENV] = client_lease.token
     remaining(deadline)
     logs = home / "logs"
     logs.mkdir(parents=True, exist_ok=True)
