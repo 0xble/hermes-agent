@@ -39,7 +39,10 @@
 # a current release pointer (including a dangling one), gateway_state.json,
 # a gateway pid kill -0 can see (including EPERM from another user's gateway),
 # or any path under the OS account default. A home under the account default
-# resolves to that default; otherwise <root>/profiles/<name> resolves to <root>.
+# resolves to that default. Otherwise the profiles parent is lexical, matching
+# hermes_constants._hermes_root_of: <root>/profiles/<name> resolves to <root>
+# even when that profile directory is a symlink. If canonicalizing the home
+# names a different root, refuse when either root is live.
 # The account default comes from the password database (getent, dscl, or
 # ~user), never $HOME and never /usr/bin/python3. Workers pin HOME to scratch.
 # If that lookup fails, the home is treated as live. Rebuild the checkout-local
@@ -198,22 +201,33 @@ hermes_home_is_under() {
   return 1
 }
 
-# Same rule as hermes_constants._hermes_root_of.
+# Same rule as hermes_constants._hermes_root_of: compare the resolved path with
+# the native home, but keep the profiles parent lexical. Canonicalizing first
+# follows a symlink at <root>/profiles/<name> and loses <root>.
 hermes_resolved_runtime_root() {
-  local home="$1" native="${2-}" canon_home parent
-  canon_home="$(hermes_canonical_home "$home")" || canon_home="${home%/}"
-  if [ -n "$native" ] && hermes_home_is_under "$canon_home" "$native"; then
-    hermes_canonical_home "$native"
+  local home="$1" native="${2-}" lexical parent
+  lexical="${home%/}"
+  [ -n "$lexical" ] || return 1
+  if [ -n "$native" ] && hermes_home_is_under "$lexical" "$native"; then
+    hermes_canonical_home "$native" || printf '%s\n' "${native%/}"
     return 0
   fi
-  parent="$(dirname "$canon_home")" || return 1
-  case "$parent" in
-    */profiles|profiles)
+  parent="$(dirname "$lexical")" || return 1
+  case "${parent##*/}" in
+    profiles)
       dirname "$parent"
       return 0
       ;;
   esac
-  printf '%s\n' "$canon_home"
+  printf '%s\n' "$lexical"
+}
+
+# The same rule applied to the canonical path. Used only so a disagreement
+# with hermes_resolved_runtime_root can fail safe.
+hermes_canonical_runtime_root() {
+  local home="$1" native="${2-}" canon
+  canon="$(hermes_canonical_home "$home")" || canon="${home%/}"
+  hermes_resolved_runtime_root "$canon" "$native"
 }
 
 # Prints why HOME is a live runtime home, or nothing and status 1.
@@ -221,7 +235,7 @@ hermes_resolved_runtime_root() {
 hermes_runtime_home_live_reason() {
   local home="$1"
   local account_default="${2-}"
-  local root reason
+  local root canon_root candidate reason
   [ -n "$home" ] || return 1
   reason="$(hermes_home_marker_reason "$home" || true)"
   if [ -n "$reason" ]; then
@@ -242,13 +256,26 @@ hermes_runtime_home_live_reason() {
     printf '%s\n' "runtime root resolution failed"
     return 0
   }
-  if ! hermes_same_home "$root" "$home"; then
-    reason="$(hermes_home_marker_reason "$root" || true)"
+  canon_root="$(hermes_canonical_runtime_root "$home" "$account_default")" || {
+    printf '%s\n' "runtime root resolution failed"
+    return 0
+  }
+  # PM writes the lexical root. If canonicalizing names a different root,
+  # setup can still follow the symlink, so either live root refuses.
+  for candidate in "$root" "$canon_root"; do
+    if hermes_same_home "$candidate" "$home"; then
+      continue
+    fi
+    reason="$(hermes_home_marker_reason "$candidate" || true)"
     if [ -n "$reason" ]; then
       printf '%s\n' "$reason"
       return 0
     fi
-  fi
+    if hermes_home_is_under "$candidate" "$account_default"; then
+      printf '%s\n' "under account default home"
+      return 0
+    fi
+  done
   return 1
 }
 

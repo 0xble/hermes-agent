@@ -10,7 +10,8 @@ Fork patch identity: `run-tests-live-home-guard`.
 When the checkout test environment is missing or stale, `scripts/run_tests.sh`
 refuses to re-exec `run-in-hermes-env` (and therefore refuses `setup-hermes.sh`
 and pm) if the inherited home is a live runtime home. A home is live when any
-of these hold on the home itself or on the root it resolves to:
+of these hold on the home itself or on a root it resolves to. The profiles parent
+is lexical. When the lexical and canonical roots differ, either live root counts:
 
 - `$HERMES_HOME/current` is a symlink, including a dangling release pointer
 - `gateway_state.json` exists
@@ -19,8 +20,11 @@ of these hold on the home itself or on the root it resolves to:
 - the home is the OS account default, or any path under it
 
 Resolution matches `hermes_constants._hermes_root_of`: a home under the account
-default resolves to that default; otherwise `<root>/profiles/<name>` resolves
-to `<root>`. PM writes that root's `tools/` (`pm/environments.store_root`).
+default resolves to that default; otherwise the profiles parent is lexical, so
+`<root>/profiles/<name>` resolves to `<root>` even when that profile directory
+is a symlink. If canonicalizing the home names a different root, the home is
+live when either root is. PM writes the lexical root's `tools/`
+(`pm/environments.store_root`).
 The account default comes from the password database (`getent`, `dscl`, or
 `~user`), not `$HOME` and not `/usr/bin/python3`. A failed lookup is live.
 

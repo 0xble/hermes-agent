@@ -238,6 +238,70 @@ def test_profile_under_live_custom_root_refuses_and_writes_nothing(tmp_path):
 
 
 @pytest.mark.platforms("posix")
+def test_symlinked_profile_under_live_root_refuses_and_writes_nothing(tmp_path):
+    """A profile symlink keeps the lexical profiles parent, matching Python.
+
+    ``hermes_constants._hermes_root_of`` does not canonicalize before that
+    check. ``<live-root>/profiles/dev`` pointing at a quiet directory outside
+    the root still resolves to ``<live-root>``. Canonicalizing first would
+    treat the quiet target as scratch and let setup write through the symlink.
+    """
+    root, commands = _checkout(tmp_path)
+    live = tmp_path / "live-root"
+    quiet = tmp_path / "quiet-profile"
+    _mark(live, "gateway-state")
+    _mark(quiet, "scratch")
+    link = live / "profiles" / "dev"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(quiet)
+    before_live = _snapshot(live)
+    before_quiet = _snapshot(quiet)
+    result = _run(root, commands, link)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "refusing" in output.lower(), output
+    assert "SETUP_RAN" not in output
+    assert REBUILD in output
+    assert _snapshot(live) == before_live
+    assert _snapshot(quiet) == before_quiet
+    assert not (quiet / "setup-wrote").exists()
+    assert not (live / "setup-wrote").exists()
+
+
+@pytest.mark.platforms("posix")
+def test_diverging_canonical_root_refuses_when_either_interpretation_is_live(tmp_path):
+    """If lexical and canonical roots differ, either live root refuses.
+
+    ``quiet-root/profiles`` pointing at ``live-root/profiles`` makes the
+    lexical root quiet and the canonical root live. Setup would follow that
+    symlink into the live tree, so the guard must refuse and write nothing.
+    """
+    root, commands = _checkout(tmp_path)
+    live = tmp_path / "live-root"
+    quiet_root = tmp_path / "quiet-root"
+    _mark(live, "gateway-state")
+    profile = live / "profiles" / "dev"
+    profile.mkdir(parents=True)
+    (profile / "keep.txt").write_text("unchanged\n", encoding="utf-8")
+    quiet_root.mkdir()
+    (quiet_root / "keep.txt").write_text("unchanged\n", encoding="utf-8")
+    (quiet_root / "profiles").symlink_to(live / "profiles")
+    home = quiet_root / "profiles" / "dev"
+    before_live = _snapshot(live)
+    before_quiet = _snapshot(quiet_root)
+    result = _run(root, commands, home)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "refusing" in output.lower(), output
+    assert "SETUP_RAN" not in output
+    assert REBUILD in output
+    assert _snapshot(live) == before_live
+    assert _snapshot(quiet_root) == before_quiet
+    assert not (profile / "setup-wrote").exists()
+    assert not (quiet_root / "setup-wrote").exists()
+
+
+@pytest.mark.platforms("posix")
 def test_profile_under_quiet_custom_root_still_sets_up(tmp_path):
     root, commands = _checkout(tmp_path)
     custom = tmp_path / "quiet-root"
