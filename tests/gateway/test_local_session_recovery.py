@@ -9,7 +9,7 @@ import pytest
 async def test_local_create_receipt_survives_cold_authority_atomically(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from gateway import run
@@ -80,7 +80,7 @@ def test_messaging_session_history_follows_the_compression_tip(tmp_path, monkeyp
     from gateway.session_contract import SessionRef
     from gateway.session_local_recovery import local_history
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('root', source='telegram', session_key='agent:telegram:dm:1')
@@ -114,7 +114,7 @@ async def test_branch_and_local_entries_keep_the_routing_prune_sweep_running(tmp
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
     from gateway.session_api import bind_api_session
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from gateway.session_mutations import mutate_session
@@ -150,7 +150,7 @@ async def test_delete_retires_owner_receipts_and_never_resurrects_the_id(tmp_pat
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_api import bind_api_session
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from gateway.session_mutations import mutate_session

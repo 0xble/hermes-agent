@@ -6,7 +6,7 @@ import pytest
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_controls import AuthorityConnection
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.mark.asyncio

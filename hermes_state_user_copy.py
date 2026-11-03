@@ -86,6 +86,12 @@ _STORAGE_FAILURES: dict[str, tuple[str, str, str]] = {
         "another Hermes process took over this session",
         "Wait for it to finish, then send your message again.",
     ),
+    "owner_restart": (
+        "storage_owner_restart",
+        "the Hermes gateway restarted or became unavailable and did not return before the retry deadline",
+        "Pending worker writes remain in the local journal for explicit retry or authenticated adoption. "
+        "Do not resend the turn.",
+    ),
     "unknown": (
         "storage_unavailable",
         "the session database could not be opened",

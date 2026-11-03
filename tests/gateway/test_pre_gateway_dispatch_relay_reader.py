@@ -40,7 +40,8 @@ async def _relay(tmp_path, monkeypatch, media=None):
     from gateway.relay.media import RelayMediaClient
     from gateway.relay.ws_transport import WebSocketRelayTransport
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     monkeypatch.setattr(SessionAuthority, "_schedule", lambda self, ref: None)  # rows stay queued
     outgoing, ready, admissions = [], asyncio.Queue(), []

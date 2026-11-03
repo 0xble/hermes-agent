@@ -8,11 +8,8 @@ import pytest
 from gateway.session_bot import _migrate, recover_bot_deliveries
 from gateway.session_results import retain_result
 from hermes_state import SessionDB
-from hermes_state_runtime import (
-    admit_session_input,
-    begin_runtime_epoch,
-    claim_session_input,
-)
+from hermes_state_runtime import admit_session_input, claim_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tools.bot_live_delivery import _locked, _read, _write
 
 

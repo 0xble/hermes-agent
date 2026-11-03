@@ -90,7 +90,7 @@ class BackgroundTurnGate:
             return wait
         return None if self.load() < self.limit else 1.0
 
-    def grant(self, item: "ReplayItem") -> None:
+    def grant(self, item: ReplayItem) -> None:
         self._reserve(item.session_key or ("item", item.sequence))
         self._next_grant_at = time.monotonic() + self._spacing_s
 
@@ -201,10 +201,15 @@ class ReplayScheduler:
         return ReplayHandle(item)
 
     def _ensure_workers(self) -> None:
-        while len(self._workers) < self.concurrency:
+        from agent.incognito import shared_worker_context
+
+        def create_worker() -> None:
             worker = asyncio.get_running_loop().create_task(self._worker())
             self._workers.add(worker)
             worker.add_done_callback(self._worker_done)
+
+        while len(self._workers) < self.concurrency:
+            shared_worker_context().run(create_worker)
 
     def _wake_workers(self) -> None:
         async def _notify() -> None:

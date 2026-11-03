@@ -17,7 +17,7 @@ from tests.waiting import async_wait_until
 async def test_only_the_viewers_own_turn_skips_the_whole_script_gate(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_automation import admit_route_wake
     from gateway.session_context import clear_session_vars, set_session_vars
     from gateway.session_contract import Principal, Submission

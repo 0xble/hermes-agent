@@ -125,6 +125,9 @@ class HookRegistry:
     async def emit_collect(self, event_type: str, context: Optional[dict[str, Any]] = None) -> list[Any]:
         """Fire handlers and return their non-None return values in order (decision-style
         hooks, e.g. ``command:<name>`` policies).  A failing handler is logged, not fatal."""
+        from agent.incognito import is_incognito
+        if is_incognito((context or {}).get("session_id")):
+            return []  # arbitrary user hook handlers cannot retain private turn content
         if context is None:
             context = {}
         results: list[Any] = []

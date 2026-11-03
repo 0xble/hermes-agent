@@ -12,7 +12,8 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
-from gateway.session_authority import SessionAuthority, initialize_session_authority
+from gateway.session_authority import SessionAuthority
+from tests.fakes.runtime_owner import initialize_session_authority
 from gateway.session_contract import SessionRef
 from gateway.session_ingress_context import native_callback
 from hermes_constants import get_hermes_home

@@ -215,6 +215,10 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    from agent.incognito import is_incognito
+    if is_incognito():
+        from gateway.incognito import ram_connect
+        return ram_connect("delivery:" + str(_db_path()), _initialize_schema)
     from hermes_cli.sqlite_util import open_db
 
     # Shared state.db: SessionDB owns the durable PRAGMA set; this opener keeps the plain-tuple rows
@@ -390,14 +394,14 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
             (*values, session_key, content, since))
 
 
-def recorded_contents_since(session_key: str, since: float) -> Dict[str, int]:
+def recorded_contents_since(session_key: str, since: float) -> dict[str, int]:
     """How many obligations with each content were recorded for *session_key* since *since*, any
     state. A count, not a set: two copy parts with the same body are two distinct messages."""
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             "SELECT content FROM delivery_obligations WHERE session_key = ? AND created_at >= ?",
             (session_key, since)).fetchall()
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for (content,) in rows:
         counts[content] = counts.get(content, 0) + 1
     return counts

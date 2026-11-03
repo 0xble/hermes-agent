@@ -5373,31 +5373,8 @@ def _handle_no_backend(subcommand: str, *, wsl: bool, s6: bool) -> None:
 
 
 def _install_systemd_from_cli(args, *, force: bool, system: bool, run_as_user) -> None:
-    if is_wsl():
-        print_warning("WSL detected — systemd services may not survive WSL restarts.")
-        _print_info_lines(
-            "  Consider running in foreground instead: hermes gateway run",
-            "  Or use tmux/screen for persistence: tmux new -s hermes 'hermes gateway run'",
-        )
-        print()
-    # Honor --start-now/--start-on-login; else prompt on a TTY, default True headless.
-    non_interactive = not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
-
-    def _flag(name: str, question: str) -> bool:
-        value = getattr(args, name, None)
-        if value is not None:
-            return value
-        return prompt_yes_no(question, True) if not non_interactive else True
-
-    start_now = _flag("start_now", "Start the gateway now after installing the service?")
-    start_on_login = _flag("start_on_login", "Start the gateway automatically on login/boot with systemd?")
-    systemd_install(
-        force=force, system=system, run_as_user=run_as_user,
-        enable_on_startup=start_on_login, non_interactive=non_interactive,
-        force_unit_path=getattr(args, "force_unit_path", False),
-    )
-    if start_now:
-        systemd_start(system=system)
+    from hermes_cli.gateway_install_cli import install_systemd
+    install_systemd(args, force=force, system=system, run_as_user=run_as_user)
 
 
 def _cmd_install(args):
@@ -5418,13 +5395,15 @@ def _cmd_install(args):
     if _service_mgmt_blocked():
         _no_backend_exit("install", "termux")
     backend = _service_backend()
+    from hermes_cli.gateway_install_cli import launchd_options
+    options = launchd_options(args, backend=backend, system=system, run_as_user=run_as_user)
     if backend == "systemd":
         if refuses_container_user_scope_install(system):
             sys.exit(1)
         _install_systemd_from_cli(args, force=force, system=system, run_as_user=run_as_user)
     elif backend == "launchd":
         launchd_install(force, start_now=getattr(args, "start_now", None) is not False,
-                        force_unit_path=getattr(args, "force_unit_path", False))
+                        force_unit_path=getattr(args, "force_unit_path", False), **options)
     elif backend == "windows":
         _gw_windows().install(
             force=force,

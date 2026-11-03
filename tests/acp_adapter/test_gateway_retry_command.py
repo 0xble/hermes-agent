@@ -14,7 +14,7 @@ import pytest
 from acp_adapter.gateway_server import GatewayACPAgent
 from gateway.config import GatewayConfig
 from gateway.session import SessionStore
-from gateway.session_authority import initialize_session_authority
+from tests.fakes.runtime_owner import initialize_session_authority
 from gateway.session_controls import AuthorityConnection
 from hermes_cli.gateway_client import GatewayClientError
 from tests.acp_adapter.test_gateway_unacked_slash import SlashWire

@@ -10,7 +10,6 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
 
 import pytest
 
@@ -28,7 +27,7 @@ from plugins.platforms.telegram.adapter import TelegramAdapter
 async def test_approval_and_clarify_cards_are_receipted_once(tmp_path):
     adapter = _fake_adapter(True, [])
     adapter._reply_to_message_id_for_send = lambda *a, **kw: None
-    adapter._link_preview_kwargs = lambda: {}
+    adapter._link_preview_kwargs = dict
     adapter._thread_kwargs_for_send = lambda *a, **kw: {}
     sent = []
 
@@ -61,7 +60,7 @@ async def test_attachment_is_snapshotted_before_dispatch_and_not_resent(tmp_path
     dispatched = []
 
     async def send_file(label, path, *args):
-        dispatched.append((path, open(path, "rb").read()))
+        dispatched.append((path, await asyncio.to_thread(Path(path).read_bytes)))
         return SendResult(success=True, message_id="file-1")
 
     adapter._send_local_file = send_file
@@ -105,7 +104,10 @@ def _die_before_dispatch(home):
             os._exit(0)
 
     runner = CrashingRunner.__new__(CrashingRunner)
-    asyncio.run(runner._handle_message(SimpleNamespace(_outbox_turn_id="turn", _outbox_home=home)))
+    event = _final_event()
+    event._outbox_turn_id = "turn"
+    event._outbox_home = home
+    asyncio.run(runner._handle_message(event))
 
 
 
@@ -304,10 +306,9 @@ async def test_reentrant_inbound_preserves_outer_turn(tmp_path):
     class Runner(GatewayInboundMixin):
         async def _handle_admitted_message(self, event):
             assert active_turn() is None
-            return None
     bind_turn(tmp_path, "outer")
     try:
-        assert await Runner()._handle_message(cast(Any, SimpleNamespace())) is None
+        assert await Runner()._handle_message(_final_event()) is None
         assert active_turn() == (tmp_path, "outer")
     finally:
         clear_turn()
@@ -596,7 +597,7 @@ async def test_runner_to_adapter_final_has_exactly_one_outbox_receipt(tmp_path):
 
 
 def _crash_final_before_ack(home):
-    import gateway.outbox as outbox
+    from gateway import outbox
     adapter = _final_fixture(home, [])
     def exit_after_enqueue(store, row):
         os._exit(0)
@@ -1008,7 +1009,7 @@ def test_prune_bounds_expired_ambiguous_and_unfinished_admissions(tmp_path):
     assert store.original_result(unfinished) is None
 
 def test_prune_unlinks_media_only_after_row_deletion_is_committed(tmp_path, monkeypatch):
-    import gateway.outbox as outbox
+    from gateway import outbox
     store = Outbox(tmp_path)
     media = tmp_path / "gateway-outbox-media" / "copy.txt"
     media.parent.mkdir()

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 import json
 import os
 from pathlib import Path
@@ -218,7 +218,13 @@ class GatewayClient:
         try:
             await self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
             budget = DEFAULT_RPC_TIMEOUT if _timeout is None else _timeout
-            return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+            try:
+                return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+            except TimeoutError as exc:
+                identity = " ".join(f"{key}={params[key]}" for key in
+                                    ("job_id", "request_id", "admission_id", "session_id", "execution_id")
+                                    if key in params)
+                raise TimeoutError(f"{method} phase=answer timeout={budget}s {identity}") from exc
         finally:
             self.pending.pop(rid, None)
 
@@ -241,13 +247,15 @@ def private_control_query(home: Path, request: bytes, timeout: float = 5) -> byt
                 raise GatewayClientError("Gateway bootstrap timed out")
             peer.settimeout(budget)
             chunk = peer.recv(4096)
-            if not chunk or len(data) + len(chunk) > 65536:
+            if not chunk:
+                raise GatewayClientError("incomplete_control_response")
+            if len(data) + len(chunk) > 65536:
                 raise GatewayClientError("Invalid gateway bootstrap response")
             data.extend(chunk)
     return bytes(data)
 
 
-def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, subject=None) -> str:
+def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, subject=None, timeout=5) -> str:
     from hermes_cli.gateway_runtime import control_home_for
     from hermes_cli.gateway_runtime_discovery import _identify_response
     # A served secondary's ticket is minted by the multiplexer's socket, bound to the secondary.
@@ -258,7 +266,7 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
         "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id, "purpose": purpose,
         **({"scope": scope} if scope else {}), **({"subject": subject} if subject else {}),
     }}).encode() + b"\n"
-    grant = _identify_response(private_control_query(home, request))
+    grant = _identify_response(private_control_query(home, request, timeout=timeout))
     if any(grant.get(k) != v for k, v in {
         "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id, "runtime_protocol": 1,
     }.items()) or not isinstance(grant.get("ticket"), str) or not grant["ticket"]:
@@ -306,17 +314,15 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
         endpoint = result.endpoint
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
-    try:
-        # The gateway is a loopback (or explicitly named) peer, never something to route through the
-        # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
-        # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
-        async with connect(url, subprotocols=protocols, open_timeout=10, max_size=max_size,
-                           proxy=None) as ws:
-            if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
-                raise GatewayClientError("Gateway protocol mismatch; update/restart required")
-            async with GatewayClient(ws) as client:
-                yield client
-    except GatewayClientError:
-        raise
-    except (OSError, TimeoutError) as exc:
-        raise GatewayClientError("Gateway connection failed; no local fallback") from exc
+    async with AsyncExitStack() as stack:
+        try:
+            # A loopback peer must not be routed through the user's HTTP(S) proxy.
+            ws = await stack.enter_async_context(connect(
+                url, subprotocols=protocols, open_timeout=10, max_size=max_size, proxy=None))
+        except (OSError, TimeoutError) as exc:
+            raise GatewayClientError("Gateway connection failed; no local fallback") from exc
+        if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
+            raise GatewayClientError("Gateway protocol mismatch; update/restart required")
+        async with GatewayClient(ws) as client:
+            # Caller I/O and RPC receipt failures are not connection-establishment failures.
+            yield client

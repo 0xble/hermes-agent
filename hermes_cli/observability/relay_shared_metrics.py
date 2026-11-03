@@ -1369,6 +1369,9 @@ def _reconcile_store_consent(store: SharedMetricsStore, send_enabled: bool) -> N
 
 def _collection_enabled() -> bool:
     """Read consent without runtime teardown, including on the Relay subscriber thread."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return False
     try:
         config: Any = _raw_config()
     except Exception:

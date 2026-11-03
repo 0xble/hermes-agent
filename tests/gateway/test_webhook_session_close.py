@@ -5,7 +5,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.platforms.webhook import WebhookAdapter
 from gateway.run import GatewayRunner
-from gateway.session_authority import initialize_session_authority
+from tests.fakes.runtime_owner import initialize_session_authority
 from hermes_state_runtime import admit_session_input, claim_session_input, settle_session_input
 
 

@@ -4,6 +4,7 @@ before answering True, and the shutdown close gate counts it before closing stat
 Each case drives the real verb against a real state.db; as its write starts, a second connection
 takes the writer (another process holding state.db) until after the join or the gate decided.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import asyncio
 import importlib
 import logging
@@ -33,7 +34,7 @@ def _owner(tmp_path, monkeypatch):
                              _resolve_session_agent_runtime=lambda **k: ('frozen', {}))
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
+                                 epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
     runner.session_authority = authority
     return store, authority, AuthorityConnection(authority, object(), {'user_id': 'human'})
 

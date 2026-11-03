@@ -1134,7 +1134,7 @@ def test_real_lock_api_internal_errors_fail_closed_skips_compression(
     parent_sid = "ERRORING_LOCK_TEST"
     db.create_session(parent_sid, source="discord")
 
-    def _fail_lock_write(_fn):
+    def _fail_lock_write(_fn, *, session_ids=(), skip_result=None):
         raise error
 
     monkeypatch.setattr(db, "_execute_write", _fail_lock_write)
@@ -2002,9 +2002,9 @@ def test_exact_cooldown_restore_tolerates_deletion_before_verification(
     snapshot = db.get_compression_failure_cooldown_row(session_id)
     real_execute_write = db._execute_write
 
-    def _restore_then_delete(callback):
+    def _restore_then_delete(callback, *, session_ids=()):
         monkeypatch.setattr(db, "_execute_write", real_execute_write)
-        result = real_execute_write(callback)
+        result = real_execute_write(callback, session_ids=session_ids)
         assert db.delete_session(session_id) is True
         return result
 
@@ -2071,7 +2071,7 @@ def test_exact_cooldown_restore_api_propagates_sqlite_write_failure(
     session_id = "RAW_COOLDOWN_WRITE_FAILURE"
     db.create_session(session_id, source="test")
 
-    def _write_fails(_callback) -> None:
+    def _write_fails(_callback, *, session_ids=()) -> None:
         raise sqlite3.OperationalError("forced low-level write failure")
 
     monkeypatch.setattr(db, "_execute_write", _write_fails)

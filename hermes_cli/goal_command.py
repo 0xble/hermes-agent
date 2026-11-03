@@ -11,7 +11,7 @@ import logging
 from typing import Callable
 
 from hermes_cli import goals
-from hermes_cli.goal_notices import goal_notices_enabled
+from hermes_cli.goal_notices import goal_command_replies_hidden
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +142,7 @@ _EXACT_HANDLERS = {
 # clear/stop/done stay out — guessing wrong would end a goal the user meant to keep.
 _BARE_CONTROL_VERBS = frozenset({"resume", "continue", "unpause", "pause", "status", "show", "unwait"})
 # First words that make a command goal control (the gateway busy path dispatches these).
-_CONTROL_FIRST_WORDS = _BARE_CONTROL_VERBS | {"wait", "gate", "replace", "remove"}
+_CONTROL_FIRST_WORDS = _BARE_CONTROL_VERBS | {"wait", "peer", "gate", "replace", "remove"}
 
 
 def _bare_control(mgr, verb, rest, render):
@@ -175,7 +175,7 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
     if drafting:
         if not arg:
             return GoalCommandResult("Usage: /goal draft <objective in plain language>", error=True)
-        if progress is not None and goal_notices_enabled():
+        if progress is not None and not goal_command_replies_hidden():
             progress("Drafting completion contract…")
         try:
             contract = goals.draft_contract(arg)
@@ -250,7 +250,7 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
                    "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.")
     if authoring_findings:
         output += "\n" + goals.format_goal_authoring_warning(authoring_findings)
-    output = output if goal_notices_enabled() else ""
+    output = "" if goal_command_replies_hidden() else output
     return GoalCommandResult(ContextNotice(output) if output and not authoring_findings else output,
                              goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
 
@@ -292,6 +292,9 @@ def dispatch_goal_command(
         if verb == "remove":
             prefix = "/goal remove"
             return _remove(mgr, rest, render)
+        if verb == "peer":
+            from hermes_cli.goal_peer_command import dispatch_peer_command
+            return dispatch_peer_command(mgr, rest)
         if verb == "wait":
             prefix = "/goal wait"
             return _wait(mgr, rest)

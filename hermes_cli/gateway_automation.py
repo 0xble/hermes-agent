@@ -179,6 +179,12 @@ class GatewayGoalManager(_Remote):
     def clear_gates(self):
         return self._rpc("clear_gates")
 
+    def wait_on_peer(self, peer, ref, requested_result, *, expected_instance):
+        return self._rpc("wait_on_peer", peer, ref, requested_result, expected_instance=expected_instance)
+
+    def resolve_peer(self, peer, ref, evidence, *, expected_instance):
+        return self._rpc("resolve_peer", peer, ref, evidence, expected_instance=expected_instance)
+
     def wait_on(self, pid, reason=""):
         return self._rpc("wait_on", int(pid), reason=reason)
 
@@ -208,10 +214,10 @@ class GatewayGoalManager(_Remote):
         return GoalCommandResult(**{k: v for k, v in result.items() if k in GoalCommandResult.__dataclass_fields__})
 
     def evaluate_after_turn(self, last_response, *, user_initiated=True, background_processes=None,
-                            active_delegations=0):
+                            active_delegations=0, turn_started_at=None):
         """The judge runs in the gateway (``auxiliary.goal_judge``), with the gateway's background
         processes and delegations; the decision dict is main's."""
-        decision = self._rpc("evaluate_after_turn", last_response or "")
+        decision = self._rpc("evaluate_after_turn", last_response or "", turn_started_at=turn_started_at)
         if not isinstance(decision, dict):
             return {"status": None, "should_continue": False, "continuation_prompt": None,
                     "verdict": "inactive", "reason": "gateway unavailable", "message": ""}

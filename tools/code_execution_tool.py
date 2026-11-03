@@ -84,6 +84,9 @@ def _spill_full_stdout(stdout_text: str) -> Optional[str]:
     """Write full stdout to cache/exec; return its path (None on failure — best-effort,
     the truncated inline output is still returned). Keyed by content digest so identical
     reruns coalesce; the dir rides the cache/web remote bind-mount list (credential_files)."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return None
     try:
         import hashlib
         from hermes_constants import get_hermes_dir
@@ -637,7 +640,8 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
             args=(env, f"{sandbox_dir}/rpc", effective_task_id, tool_call_log, tool_call_counter,
-                  max_tool_calls, sandbox_tools, stop_event, rpc_token))
+                  max_tool_calls, sandbox_tools, stop_event, rpc_token),
+            kwargs={"deadline": time.monotonic() + timeout if timeout else None})
         rpc_thread.start()
         # The token travels in a sourced env file, never in argv. No umask on
         # the launch command: the 700 dirs + explicit 0600 writes cover Hermes'
@@ -736,6 +740,9 @@ def execute_code(
     the security envelope (env scrubbing, tool whitelist + call budget, output redaction), not an
     isolation jail: default `project` mode runs in the session's cwd with the project venv.
     ``enabled_tools`` ∩ SANDBOX_ALLOWED_TOOLS; ``reset`` kills the existing kernel first."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return tool_error("File-backed Python kernels are unavailable in incognito mode. Use foreground terminal instead.")
     if not SANDBOX_AVAILABLE:
         return tool_error("execute_code sandbox is unavailable in this environment. "
                           "Use normal tool calls (terminal, read_file, write_file, ...) instead.")

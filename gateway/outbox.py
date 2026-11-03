@@ -33,7 +33,7 @@ _CURRENT_TURN: contextvars.ContextVar[tuple[Path, str, asyncio.Task | None] | No
     "gateway_outbox_turn", default=None)
 _BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("gateway_outbox_transport", default=False)
 _TURN_LOCKS: weakref.WeakValueDictionary[tuple[Path, str], asyncio.Lock] = weakref.WeakValueDictionary()
-_STORES: dict[Path, "Outbox"] = {}
+_STORES: dict[str, Outbox] = {}
 _STORES_LOCK = threading.Lock()
 # One coalesced deferred sweep per (store, platform, profile): a multi-hour flood penalty gives
 # every deferred row the same deadline, and a task per row woke hundreds of full recover() passes
@@ -41,7 +41,7 @@ _STORES_LOCK = threading.Lock()
 _SWEEPS: dict[tuple, tuple[asyncio.Task, asyncio.Event]] = {}
 # recover() is serialized per store within each event loop; a held row is logged once per process,
 # and a row this process is dispatching right now is in flight, not held.
-_RECOVER_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[Path, asyncio.Lock]]" = (
+_RECOVER_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[Path, asyncio.Lock]] = (
     weakref.WeakKeyDictionary())
 _IN_FLIGHT: set[tuple[Path, str]] = set()
 _HELD_LOGGED: set[tuple[Path, str]] = set()
@@ -53,11 +53,14 @@ _SWEEP_ERROR_BACKOFF_SECS = (5.0, 15.0, 30.0, 60.0)
 _DESCRIPTOR_ERRNOS = {errno.EMFILE, errno.ENFILE}
 
 
-def store_for(home: Path) -> "Outbox":
-    key = Path(home).resolve()
+def store_for(home: Path) -> Outbox:
+    from agent.incognito import is_incognito
+    private = is_incognito()
+    from gateway.incognito import private_topic
+    key = str(Path(home).resolve()) + ((":incognito:" + (private_topic() or "unbound")) if private else "")
     with _STORES_LOCK:
         if key not in _STORES:
-            _STORES[key] = Outbox(key)
+            _STORES[key] = Outbox(home, private=private)
         return _STORES[key]
 
 
@@ -199,7 +202,7 @@ def durable_egress(kind: str):
             payload.update(bound.arguments.get("kwargs", {}))
             return await deliver(self, kind, payload, lambda p: method(self, **p))
 
-        setattr(wrapped, "_durable_outbox", True)
+        wrapped._durable_outbox = True
         return wrapped
     return decorate
 
@@ -345,7 +348,7 @@ async def _store_io_retry(operation, *args, **kwargs):
             await asyncio.sleep(delay)
 
 
-async def _write_receipt(store: "Outbox", row: "OutboxRow", **kwargs) -> bool | None:
+async def _write_receipt(store: Outbox, row: OutboxRow, **kwargs) -> bool | None:
     """Record a send's known outcome; ``None`` when the store stayed unwritable (the row then
     stays held, never resent, and is reported once)."""
     try:
@@ -371,7 +374,7 @@ async def _store_io(operation, *args, **kwargs):
         raise
 
 
-async def open_outbox(home: Path) -> "Outbox":
+async def open_outbox(home: Path) -> Outbox:
     """Construct and migrate the store off the gateway event loop."""
     return await _store_io(Outbox, home)
 
@@ -429,7 +432,7 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
             return SendResult(success=False, error="outbox payload has an uncertain prior dispatch", held=True)
         if not await _store_io_retry(store.begin_send, row):
             return SendResult(success=False, error="earlier outbox row is unresolved", held=True)
-        flight = (store.path, row.idempotency_key)
+        flight = (store.identity, row.idempotency_key)
         _IN_FLIGHT.add(flight)
         try:
             try:
@@ -477,11 +480,11 @@ def _current_retry_adapter(adapter, profile: str | None):
     return adapters.get(adapter.platform)
 
 
-async def _schedule_retry(store: "Outbox", adapter) -> None:
+async def _schedule_retry(store: Outbox, adapter) -> None:
     """Ensure one coalesced deferred sweep for this store and adapter identity, without blocking
     ingress. A sweep that is already parked is woken to re-read the earliest deadline."""
     profile = _retry_profile(adapter)
-    key = (store.path, getattr(adapter, "platform", None), profile)
+    key = (store.identity, getattr(adapter, "platform", None), profile)
     existing = _SWEEPS.get(key)
     if existing is not None and not existing[0].done():
         existing[1].set()
@@ -495,7 +498,7 @@ async def _schedule_retry(store: "Outbox", adapter) -> None:
     _SWEEPS[key] = (task, wake)
 
 
-async def _deferred_sweep(store: "Outbox", adapter, profile: str | None, key: tuple,
+async def _deferred_sweep(store: Outbox, adapter, profile: str | None, key: tuple,
                           wake: asyncio.Event) -> None:
     """Sleep to the store's earliest retry deadline, run one serialized recover(), repeat until
     no deferred row remains. A failed pass backs off instead of ending the sweep or spinning."""
@@ -542,20 +545,20 @@ async def _deferred_sweep(store: "Outbox", adapter, profile: str | None, key: tu
             _SWEEPS.pop(key, None)
 
 
-def _recover_lock(store: "Outbox") -> asyncio.Lock:
+def _recover_lock(store: Outbox) -> asyncio.Lock:
     locks = _RECOVER_LOCKS.setdefault(asyncio.get_running_loop(), {})
-    return locks.setdefault(store.path, asyncio.Lock())
+    return locks.setdefault(store.identity, asyncio.Lock())
 
 
-def _report_held(store: "Outbox", ambiguous: list["OutboxRow"]) -> int:
+def _report_held(store: Outbox, ambiguous: list[OutboxRow]) -> int:
     """Log each held row once per process; rows this process is dispatching are in flight."""
-    held = [row for row in ambiguous if (store.path, row.idempotency_key) not in _IN_FLIGHT]
-    keys = {(store.path, row.idempotency_key) for row in held}
+    held = [row for row in ambiguous if (store.identity, row.idempotency_key) not in _IN_FLIGHT]
+    keys = {(store.identity, row.idempotency_key) for row in held}
     for row in held:
-        if (store.path, row.idempotency_key) not in _HELD_LOGGED:
+        if (store.identity, row.idempotency_key) not in _HELD_LOGGED:
             logger.error("Held ambiguous outbox dispatch: turn=%s sequence=%s key=%s",
                          row.turn_id, row.sequence, row.idempotency_key)
-    _HELD_LOGGED.difference_update({k for k in _HELD_LOGGED if k[0] == store.path} - keys)
+    _HELD_LOGGED.difference_update({k for k in _HELD_LOGGED if k[0] == store.identity} - keys)
     _HELD_LOGGED.update(keys)
     return len(held)
 
@@ -604,7 +607,7 @@ async def recover_gateway_destinations(runner) -> None:
                 logger.info("Gateway outbox recovery for %s: sent=%s held=%s", home, sent, held)
 
 
-async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[int, int]:
+async def recover(store: Outbox, adapter, *, startup: bool = True) -> tuple[int, int]:
     """Replay proven-unsent rows; only boot replays fresh unclaimed rows. Serialized per store."""
     async with _recover_lock(store):
         sent, held = await _recover_locked(store, adapter, startup=startup)
@@ -612,7 +615,7 @@ async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[in
     return sent, held
 
 
-async def _recover_locked(store: "Outbox", adapter, *, startup: bool) -> tuple[int, int]:
+async def _recover_locked(store: Outbox, adapter, *, startup: bool) -> tuple[int, int]:
     sent = 0
     while True:
         pending = await _store_io(store.pending, startup=startup)
@@ -627,7 +630,7 @@ async def _recover_locked(store: "Outbox", adapter, *, startup: bool) -> tuple[i
                 continue
             if not await _store_io_retry(store.begin_send, row):
                 continue
-            flight = (store.path, row.idempotency_key)
+            flight = (store.identity, row.idempotency_key)
             _IN_FLIGHT.add(flight)
             try:
                 from gateway.platforms.base import outbound_class
@@ -695,8 +698,14 @@ class OutboxRow:
 
 
 class Outbox:
-    def __init__(self, home: Path):
+    def __init__(self, home: Path, *, private: bool = False):
+        self._private = private
+        from gateway.incognito import private_topic
+        self._private_topic = private_topic() if private else None
         self.path = Path(home) / "gateway-outbox.db"
+        # A private RAM store shares the public path only as its namespace. Process-wide
+        # sweep, recovery and in-flight registries key on identity to keep the stores apart.
+        self.identity: Any = ("private", self._private_topic, self.path) if private else self.path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.executescript("""
@@ -768,6 +777,11 @@ class Outbox:
             yield db
 
     def _connect(self) -> sqlite3.Connection:
+        if self._private:
+            from gateway.incognito import ram_connect
+            db = ram_connect("outbox:" + str(self.path), topic=self._private_topic)
+            db.row_factory = sqlite3.Row
+            return db
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         db.execute("PRAGMA busy_timeout=5000")
         # SQLite's journal-mode switch may report BUSY immediately even with a

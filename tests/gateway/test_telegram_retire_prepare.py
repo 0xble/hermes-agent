@@ -37,8 +37,8 @@ async def test_preparation_is_silent_pinned_deduplicated_and_readmitted_after_re
     event = r.adapter.handle_message.await_args.args[0]
     assert event.internal and event.reply_expected is False
     assert event.source.message_id is None
-    assert event.metadata == {"gateway_session_id": "old", "gateway_session_strict": True,
-                              "retirement_generation": "gen"}
+    assert event.metadata == {"gateway_session_id": "old", "gateway_session_key": "old-key",
+                              "gateway_session_strict": True, "retirement_generation": "gen"}
     assert "loop" in event.text
     assert not await queue_preparation(r.runner, r.source, r.state, items)
     assert r.adapter.handle_message.await_count == 1
@@ -82,6 +82,22 @@ async def test_preparation_rearms_for_changed_decisions_not_inventory_order(runt
     assert not await queue_preparation(r.runner, r.source, r.state, items, busy=busy)
     assert r.adapter.handle_message.await_count == 2
     r.adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preparation_passes_real_strict_session_admission(runtime):
+    from gateway.run_turn import GatewayTurnMixin
+
+    class StrictRunner(SimpleNamespace):
+        _strict_session_pin_holds = GatewayTurnMixin._strict_session_pin_holds
+
+    r = runtime
+    store = SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=SimpleNamespace(session_id="old")))
+    runner = StrictRunner(**vars(r.runner), async_session_store=store)
+    r.adapter.gateway_runner = runner
+    assert not await queue_preparation(runner, r.source, r.state, [])
+    store.lookup_by_session_key.assert_awaited_once_with("old-key")
+    assert r.adapter.handle_message.await_count == 1
 
 
 @pytest.mark.asyncio

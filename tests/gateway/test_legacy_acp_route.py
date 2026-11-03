@@ -17,7 +17,7 @@ async def test_adopted_acp_thread_keeps_its_saved_route_and_workspace(tmp_path, 
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local_migration import bind_native_transport, resolve_local_target
     from hermes_state_local import local_receipt
 
@@ -56,7 +56,7 @@ async def test_adopted_legacy_tui_session_keeps_saved_route_and_runtime_settings
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local_migration import bind_native_transport, resolve_local_target
     from hermes_state_local import local_receipt
 

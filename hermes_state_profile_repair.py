@@ -180,7 +180,7 @@ class SessionProfileRepairMixin:
                         "UPDATE sessions SET profile_name = ? WHERE id = ? AND profile_name IS NOT ?",
                         (target, session_id, target)).rowcount
             return changed
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(ids,), skip_result=0)
 
     def sever_crossed_parents(self, ids: Iterable[str]) -> int:
         """Detach children from a parent keyed under another profile. Only ``parent_session_id`` is
@@ -203,7 +203,7 @@ class SessionProfileRepairMixin:
                         severed += conn.execute(
                             "UPDATE sessions SET parent_session_id = NULL WHERE id = ?", (session_id,)).rowcount
             return severed
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(ids,), skip_result=0)
 
     # ── cross-store move ──────────────────────────────────────────────────────
 
@@ -266,7 +266,7 @@ class SessionProfileRepairMixin:
             for usage in payload.get("usage") or []:
                 self._insert_row(conn, "session_model_usage", {**usage, "session_id": session_id}, skip=frozenset())
             return "imported"
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(payload,), skip_result='')
 
     @staticmethod
     def _insert_row(conn, table: str, values: dict[str, Any], *, skip: frozenset) -> None:
@@ -288,7 +288,7 @@ class SessionProfileRepairMixin:
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
             return True
-        deleted = self._execute_write(_do)
+        deleted = self._execute_write(_do, session_ids=(session_id,), skip_result=False)
         if deleted:
             emit_session_deleted(self, [session_id], reason="profile_repair")
         return bool(deleted)
@@ -313,7 +313,7 @@ class SessionProfileRepairMixin:
                     f"WHERE id IN ({_session_ids_placeholders(chunk)}) AND substr(session_key, 1, 11) = 'agent:main:'",
                     (new_ns, profile, *chunk)).rowcount
             return changed
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(ids,), skip_result=0)
 
     def delete_gateway_routing_rows(self, rows: Iterable[tuple[str, str]]) -> int:
         wanted = list(rows)
@@ -324,7 +324,7 @@ class SessionProfileRepairMixin:
             return sum(conn.execute(
                 "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", (scope, key)).rowcount
                 for scope, key in wanted)
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(rows,), skip_result=0)
 
     def insert_gateway_routing_rows_if_absent(self, rows: Iterable[tuple[str, str, str, float]]) -> int:
         """Adopt ``(scope, session_key, entry_json, updated_at)`` rows another store held for this
@@ -337,7 +337,7 @@ class SessionProfileRepairMixin:
             return sum(conn.execute(
                 "INSERT OR IGNORE INTO gateway_routing (scope, session_key, entry_json, updated_at) "
                 "VALUES (?, ?, ?, ?)", row).rowcount for row in wanted)
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(rows,), skip_result=0)
 
     # ── telegram topic tables ─────────────────────────────────────────────────
 
@@ -375,7 +375,7 @@ class SessionProfileRepairMixin:
                         "UPDATE telegram_dm_topic_mode SET profile_name = ? WHERE profile_name = 'default' "
                         "AND chat_id = ?", (target, chat_id)).rowcount
             return counts
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(rows,), skip_result={})
 
     # ── evidence for JSON-file repairs ────────────────────────────────────────
 

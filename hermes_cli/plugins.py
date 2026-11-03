@@ -495,6 +495,7 @@ class PluginContext(PluginCapabilityCtxMixin):
             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
             override=override, scope=scope, eager=eager,
+            incognito_safe=self.manifest.incognito_safe is True,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         handle = None
@@ -958,6 +959,9 @@ class PluginContext(PluginCapabilityCtxMixin):
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
         """Register behavior-changing middleware (request kinds rewrite the payload, execution kinds
         wrap the callback). Unknown kinds warn but are stored."""
+        from hermes_cli.plugins_incognito import protect_execution_callback
+        if kind in {"llm_execution", "tool_execution"}:
+            callback = protect_execution_callback(self.manifest, callback)
         return self._track_callback(
             "middleware", kind, callback, self._manager._middleware, VALID_MIDDLEWARE
         )
@@ -971,7 +975,10 @@ class PluginContext(PluginCapabilityCtxMixin):
             logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                            key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
-        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
+        from hermes_cli.plugins_incognito import track_callback
+        release = track_callback(self._manager, self.manifest, callback,
+                                 lambda: self._manager._remove_callback(mapping, key, callback))
+        handle = self._track(kind, key, release)
         logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
 
@@ -997,6 +1004,7 @@ class PluginContext(PluginCapabilityCtxMixin):
             raise ValueError(f"system prompt section {id!r} is already registered by plugin {existing.plugin!r}")
         section = PluginSystemPromptSection(
             id=id, content=content, position=position, max_chars=max_chars, plugin=self.plugin_id,
+            incognito_safe=self.manifest.incognito_safe is True,
         )
         return self._register_entry("system_prompt_section", id, self._manager._system_prompt_sections,
                                     section, "Plugin %s registered system prompt section: %s", id,
@@ -1028,7 +1036,8 @@ class PluginContext(PluginCapabilityCtxMixin):
         emitting is namespace-gated). Owner-tagged so unload removes zombie callbacks."""
         if not event or not isinstance(event, str):
             raise ValueError(f"Plugin '{self.manifest.name}' subscribe() requires a non-empty event name")
-        self._manager._subscribe_event(self.plugin_id, event, callback)
+        self._manager._subscribe_event(self.plugin_id, event, callback,
+                                       incognito_safe=self.manifest.incognito_safe is True)
         logger.debug("Plugin %s subscribed to event: %s", self.manifest.name, event)
 
     from hermes_cli.plugins_content import register_automation_blueprint, register_skill
@@ -1125,6 +1134,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # Fallback hooks registered by a memory provider before general discovery.
         self._memory_hook_registrations: dict[tuple[str, str], list[PluginRegistration]] = {}
         self._middleware: dict[str, list[Callable]] = {}
+        self._incognito_callback_manifests: dict[int, list[tuple[Any, PluginManifest]]] = {}
         self._plugin_tool_names: set[str] = set()
         self._plugin_platform_names: set[str] = set()
         self._cli_commands: dict[str, dict] = {}
@@ -1799,7 +1809,7 @@ def get_portable_mcp_server_names_nowait() -> set[str]:
     return _nowait_plugin_set("portable_mcp", lambda m: set(m.get_portable_mcp_servers()))
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """Invoke hooks, waiting for policy discovery; loop observers snapshot current callbacks."""
     from agent.safe_worker_policy import safe_worker_enabled
     if safe_worker_enabled():
@@ -1811,7 +1821,7 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
 
 
-async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+async def ainvoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:
     """Await cold/reloading discovery off-loop, preserving inline ready-registry ordering."""
     manager, callbacks = await _async_delivery_snapshot(hook_name)
     return await manager.ainvoke_hook(hook_name, _callbacks=callbacks, **kwargs)
@@ -1935,8 +1945,8 @@ def _get_pre_tool_call_directive_details(
         # Dispatchers may swallow hook exceptions; unavailable policy must be a veto.
         logger.warning("pre_tool_call policy delivery failed for %s", tool_name, exc_info=True)
         return _PreToolCallDirective(action="block", message="BLOCKED: plugin discovery or pre_tool_call policy unavailable")
-    modified_args: Optional[Dict[str, Any]] = None
-    first_approve: Optional[Tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
+    modified_args: Optional[dict[str, Any]] = None
+    first_approve: Optional[tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
     for result in hook_results:
         if not isinstance(result, dict):
             continue

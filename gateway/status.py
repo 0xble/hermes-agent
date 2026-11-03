@@ -1073,6 +1073,14 @@ def _apply_set_fields(target: dict[str, Any], fields) -> None:
             target[key] = coerce(value) if coerce is not None else value
 
 
+def _coerce_runtime_epoch(value: Any) -> dict[str, Any]:
+    """``{"status": "ok"}``, or ``lost`` with the epoch this owner holds and the store's current one."""
+    value = value if isinstance(value, dict) else {}
+    if value.get("status") != "lost":
+        return {"status": "ok"}
+    return {"status": "lost", **{key: int(value[key]) for key in ("held", "store") if isinstance(value.get(key), int)}}
+
+
 def _coerce_session_store(session_store: Any) -> dict[str, str]:
     state = str(session_store.get("status") or "") if isinstance(session_store, dict) else ""
     return {"status": state if state in {"ok", "unavailable", "retrying"} else "unknown"}
@@ -1083,7 +1091,7 @@ def _prepare_runtime_status_update(
     active_agents: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
-    parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
+    runtime_epoch: Any = _UNSET, parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
@@ -1127,6 +1135,7 @@ def _prepare_runtime_status_update(
             ("parked_profiles", parked_profiles, lambda v: {str(k): str(r) for k, r in dict(v or {}).items()}),
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
             ("session_store", session_store, _coerce_session_store),
+            ("runtime_epoch", runtime_epoch, _coerce_runtime_epoch),
         ))
         if platform is not _UNSET:
             platform_payload = copy.deepcopy(payload["platforms"].get(platform, {}))

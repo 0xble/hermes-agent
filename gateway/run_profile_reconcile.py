@@ -170,6 +170,11 @@ class GatewayProfileReconcileMixin:
         from gateway.run import MultiplexConfigError
         from hermes_cli.profiles import profiles_to_serve
         result: dict[str, Any] = {"added": [], "removed": [], "rescanned": [], "parked": [], "reason": reason}
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            # A standby serves no profile until promotion: building one would begin its epoch
+            # under the serving slot. Promotion's own path serves the deferred profiles.
+            return {**result, "standby": True, "served_profiles": self.served_profile_names()}
         if not self._multiplex_on() and not await self._multiplex_for_added_profile():
             return {**result, "multiplex": False, "served_profiles": self.served_profile_names()}
         if not self._running or self._served_profile_homes is None:
@@ -542,6 +547,9 @@ def _profile_lifecycle_verb(runner, *, serve: bool):
 
     async def apply(name):
         from hermes_cli.profiles import profiles_to_serve, profile_is_parked
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            return {"error": "a zero-cut standby serves no profile until it is promoted"}
         if not runner._multiplex_on() or not runner._running or runner._served_profile_homes is None:
             return {"error": "host multiplexer is not ready"}
         async with runner._reconcile_lock():

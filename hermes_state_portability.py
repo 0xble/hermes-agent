@@ -206,7 +206,7 @@ class SessionPortabilityMixin:
                          (json.dumps({"imported_from": origin}), profile, session_id))
             return {"session_id": session_id, "already_imported": False}
 
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(origin,), skip_result={})
 
     @classmethod
     def _compact_session_cols(cls) -> str:
@@ -837,4 +837,4 @@ class SessionPortabilityMixin:
                 "imported_ids": imported_ids, "skipped_ids": skipped_ids, "errors": [],
             }
 
-        return self._execute_write(_do)
+        return self._execute_write(_do, session_ids=(sessions,), skip_result={})

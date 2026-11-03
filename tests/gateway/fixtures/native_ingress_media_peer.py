@@ -19,7 +19,7 @@ async def probe(mode, peer):
     from gateway.platforms.event import MessageEvent, MessageType
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_envelope import restore_native, snapshot_native
     from hermes_state_runtime import RuntimeStoreError, claim_session_input, list_session_admissions
 

@@ -829,10 +829,12 @@ def _cmd_goal(rid, params, session, name, arg):
             max_turns = 20
         mgr = goals.GoalManager(session_id=sid_key, default_max_turns=max_turns)
         from hermes_cli.goal_command import dispatch_goal_command
-        result = dispatch_goal_command(
-            mgr, arg, authorize_gate=lambda: None,
-            last_user_message=goals.last_user_message_from_db(sid_key),
-        )
+        from gateway.session_context import scoped_current_session_id
+        with scoped_current_session_id(sid_key):
+            result = dispatch_goal_command(
+                mgr, arg, authorize_gate=lambda: None,
+                last_user_message=goals.last_user_message_from_db(sid_key),
+            )
         if result.error:
             return _err(rid, 4004, result.output)
         if not result.prompt:

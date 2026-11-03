@@ -27,25 +27,19 @@ _EVENT_FIELDS = (
 # ``reply_anchor_override`` = '' is Telegram topic transfer's "do not quote the root DM" (#139136).
 _CONTEXT_FIELDS = ('auto_skill', 'channel_prompt', 'channel_context', 'reply_expected', 'reply_anchor_override',
                    'edit_revision')
-# Closed metadata contract: only the keys the Baileys adapter stamps on ordinary inbound
-# (``WhatsAppAdapter._build_message_event``) cross native admission; any other key refuses.
+# Closed metadata contracts for ordinary adapter inputs. Unknown keys refuse admission.
 _WHATSAPP_METADATA = frozenset({'whatsapp_native_type', 'whatsapp_native', 'whatsapp_from_owner'})
 # Top-level ``nativeMetadata`` keys the bridge emits (scripts/whatsapp-bridge/bridge_helpers.js).
 _WHATSAPP_NATIVE_KEYS = frozenset({'video', 'audio', 'sticker', 'location', 'contact', 'contacts',
                                    'reaction', 'poll', 'pollUpdate'})
 _WHATSAPP_NATIVE_MAX_BYTES = 16 * 1024
+_TELEGRAM_RICH_FIELDS = ('block_count', 'block_types', 'source', 'truncated')
 _MEDIA_FIELDS = ('media_urls', 'media_types', 'media_text_inlined')
 
 
-def _native_metadata(event):
-    """JSON projection of the adapter metadata a native replay keeps; ``None`` refuses the event.
+def _whatsapp_metadata(metadata):
+    """Keep the bridge's native projection and size policy unchanged.
     An oversized ``whatsapp_native`` (vCards with photos) is dropped, never refused."""
-    metadata = event.metadata
-    if not metadata:
-        return {}
-    if (not isinstance(metadata, dict) or event.source.platform.value != 'whatsapp'
-            or not set(metadata) <= _WHATSAPP_METADATA):
-        return None
     kind, native = metadata.get('whatsapp_native_type'), metadata.get('whatsapp_native')
     if (kind is not None and not (isinstance(kind, str) and 0 < len(kind) <= 64)
             or metadata.get('whatsapp_from_owner') not in (None, True)
@@ -62,11 +56,52 @@ def _native_metadata(event):
     return projected
 
 
+def _telegram_metadata(metadata):
+    rich = metadata['telegram_rich_message']
+    if not isinstance(rich, dict) or set(rich) != set(_TELEGRAM_RICH_FIELDS):
+        return None
+    count, types, source, truncated = (rich[key] for key in _TELEGRAM_RICH_FIELDS)
+    if (type(count) is not int or count < 0
+            or not isinstance(types, list) or len(types) > 256
+            or not all(isinstance(item, str) and 0 < len(item) <= 64 for item in types)
+            # _inbound_rich_message_payload emits a location label (attribute/api_kwargs), not content.
+            or source is not None and not (isinstance(source, str) and 0 < len(source) <= 64)
+            or type(truncated) is not bool):
+        return None
+    return {'telegram_rich_message': {
+        'block_count': count, 'block_types': list(types), 'source': source, 'truncated': truncated}}
+
+
+_NATIVE_METADATA = {
+    'whatsapp': (_WHATSAPP_METADATA, _whatsapp_metadata),
+    'telegram': (frozenset({'telegram_rich_message'}), _telegram_metadata),
+}
+
+
+def _native_metadata(event):
+    """JSON projection of the adapter metadata a native replay keeps; ``None`` refuses the event."""
+    metadata = event.metadata
+    if not metadata:
+        return {}
+    if not isinstance(metadata, dict):
+        return None
+    contract = _NATIVE_METADATA.get(event.source.platform.value)
+    if contract is None:
+        return None
+    allowed, project = contract
+    if not set(metadata) <= allowed:
+        return None
+    return project(metadata)
+
+
 def _adapter_event(event, **changes):
     """An adapter's event at the envelope boundary: an absent media list (``None``) is no media.
     Any other non-list still reaches ``_validate_native`` and refuses."""
     changes.update({name: [] for name in _MEDIA_FIELDS if getattr(event, name) is None})
     projected = replace(event, **changes) if changes else event
+    for name in ('_attended_activity_received_at', '_attended_activity_marked'):
+        if hasattr(event, name):
+            setattr(projected, name, getattr(event, name))
     from gateway.session_synthetic import is_synthetic, mark_synthetic
     if is_synthetic(event):
         mark_synthetic(projected)
@@ -253,6 +288,11 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                 'route': runner.session_store._generate_session_key(event.source),
                 'event': deepcopy({name: getattr(event, name) for name in _EVENT_FIELDS}),
                 'timestamp': event.timestamp.isoformat()}
+    if (received_at := getattr(event, '_attended_activity_received_at', None)) is not None:
+        # Receipt metadata survives the FIFO, including a restart, but is not delivery identity.
+        envelope['attended_activity'] = {
+            'received_at': received_at, 'marked': bool(getattr(event, '_attended_activity_marked', False)),
+        }
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -296,6 +336,7 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
         if entry is not None:
             legacy = deepcopy(payload)
             legacy['native_text_v1'].pop('provenance')
+            legacy['native_text_v1'].pop('attended_activity', None)
             for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
                 if row['request_id'] == event.message_id and row['payload'] == legacy:
                     return legacy
@@ -330,9 +371,9 @@ def restore_native(payload, runner=None):
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),
                         **deepcopy(envelope['event']))
-    if 'synthetic' in envelope:
-        from gateway.session_synthetic import restore_synthetic
-        restore_synthetic(event, envelope['synthetic'])
+    if activity := envelope.get('attended_activity'):
+        event._attended_activity_received_at = activity['received_at']
+        event._attended_activity_marked = activity['marked']
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):
@@ -342,8 +383,13 @@ def restore_native(payload, runner=None):
         from gateway.session_automation import automation_display_metadata, automation_notification_metadata
         event.metadata.update(automation_notification_metadata(envelope['automation']))
         event.metadata.update(automation_display_metadata(envelope['automation']))
+        from gateway.session_automation import automation_checkin_metadata
+        event.metadata.update(automation_checkin_metadata(envelope['automation']))
         from gateway.session_automation import automation_retry_metadata
         event.metadata.update(automation_retry_metadata(envelope['automation']))
+    if 'synthetic' in envelope:
+        from gateway.session_synthetic import restore_synthetic
+        restore_synthetic(event, envelope['synthetic'])
     return event
 
 

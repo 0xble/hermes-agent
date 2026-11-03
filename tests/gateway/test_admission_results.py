@@ -2,10 +2,8 @@
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_runtime import (
-    RuntimeStoreError, admit_session_input, begin_runtime_epoch,
-    claim_session_input, recover_session_inputs,
-)
+from hermes_state_runtime import RuntimeStoreError, admit_session_input, claim_session_input, recover_session_inputs
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def test_result_survives_restart_without_reexecuting(tmp_path):

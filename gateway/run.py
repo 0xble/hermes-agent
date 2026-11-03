@@ -25,7 +25,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextvars import Context, copy_context
+from contextvars import Context, ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Tuple, cast
@@ -430,7 +430,7 @@ def _ensure_windows_gateway_venv_imports() -> None:
         return
 
     project_root = Path(__file__).resolve().parent.parent
-    from pm.environments import committed_venv
+    from pm.environments import committed_venv, venv_python_version
 
     # A PM install's store Python was already activated onto the committed generation by
     # hermes_bootstrap; overlaying the leftover pre-PM venv loads a foreign ABI (#122183).
@@ -454,6 +454,10 @@ def _ensure_windows_gateway_venv_imports() -> None:
 
         site_packages = resolved_venv / "Lib" / "site-packages"
         if not site_packages.exists():
+            continue
+        # A legacy venv must match this interpreter before any .pth or native module is loaded.
+        if (found := venv_python_version(resolved_venv)) != sys.version_info[:2]:
+            logger.debug("Skipping venv overlay %s: Python %s, gateway %s", resolved_venv, found or "unknown", sys.version_info[:2])
             continue
 
         project_entry = str(project_root)
@@ -1875,6 +1879,8 @@ def _profile_runtime_scope(
         home_token = set_hermes_home_override(str(profile_home))
         if prepared_secret_scope is not None:
             secrets = prepared_secret_scope
+        elif (prepared := _PREPARED_AUTHORIZATION_SCOPE.get()) is not None and prepared[0] == _home_key(profile_home):
+            secrets = prepared[1]  # this ingress task already loaded this profile off the loop
         elif hydrate_secrets:
             secrets = _load_profile_secret_scope(Path(profile_home))
         else:
@@ -1901,6 +1907,43 @@ async def _async_profile_runtime_scope(profile_home: Path):
     secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(profile_home))
     with _profile_runtime_scope(Path(profile_home), secrets):
         yield
+
+
+# One authorization home's secrets, loaded off the loop for the synchronous gates awaited inside
+# ``prepared_authorization_scope`` (``GatewayRunner._under_authorization_profile`` reads it).
+_PREPARED_AUTHORIZATION_SCOPE: ContextVar[Optional[tuple[str, dict]]] = ContextVar(
+    "_PREPARED_AUTHORIZATION_SCOPE", default=None)
+
+
+@_asynccontextmanager
+async def prepared_authorization_scope(runner, source):
+    """Hydrate *source*'s authorization-profile secrets off the event loop for the auth and bot
+    budget checks awaited inside, so a receive path never loads them inline. The checks still
+    enter that profile's scope; they only skip the load."""
+    home = runner._authorization_home_for_source(source)
+    if home is None:
+        yield
+        return
+    secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(home))
+    token = _PREPARED_AUTHORIZATION_SCOPE.set((_home_key(home), secrets))
+    try:
+        yield
+    finally:
+        _PREPARED_AUTHORIZATION_SCOPE.reset(token)
+
+
+def _home_key(home) -> str:
+    from hermes_constants import hermes_home_key
+    return hermes_home_key(home)
+
+
+def without_prepared_authorization_scope():
+    """A copy of the current context with no prepared authorization secrets, for a task that
+    outlives ingress (a session drain): its turns load the profile afresh, so a failed secret
+    source is still retried."""
+    context = copy_context()
+    context.run(_PREPARED_AUTHORIZATION_SCOPE.set, None)
+    return context
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -3224,20 +3267,12 @@ def _normalize_empty_agent_response(
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if agent_result.get("interrupted"):
-        # Interrupted with api_calls > 0 = deliberately stopped/steered; silence is intentional (queued
-        # messages arrive via the recursive drain). ZERO api_calls = never processed (stale /stop flag).
-        # An interrupted run that did work (api_calls > 0) is the drain of a run the user deliberately
-        # stopped or steered — its silence is intentional, and any queued/interrupting message is delivered
-        # by the recursive drain inside _run_agent before this result is seen. An interrupted run with ZERO
-        # api_calls never processed the user's message at all: it was killed at the top of the tool loop by
-        # an interrupt flag left over from a recent /stop (#44212). Pure silence there swallows a real user
-        # message, so surface it.
-        # api_calls == 0, not failed, not interrupted: the agent never ran for this turn. This is the
-        # post-/stop generation-race pattern where the gateway would otherwise silently drop the turn
-        # (response=0 chars) and the user sees no reply at all. Surface a short retry hint so the message
-        # isn't lost in silence. (#31884)
+        # api_calls > 0: deliberately stopped/steered work; silence is intentional (queued messages arrive
+        # via the recursive drain). ZERO api_calls: the message was never processed (#44212), so the reply
+        # names the recorded cause; a restart's unstarted native turn is replayed, not answered.
         if api_calls == 0:
-            return t("gateway.errors.interrupted_before_start")
+            from gateway.run_interrupt_cause import interrupted_before_start_key
+            return t(interrupted_before_start_key(agent_result))
         return response
     from gateway.response_filters import reaction_answered
     if reaction_answered(agent_result):
@@ -4895,6 +4930,9 @@ def _start_gateway_housekeeping(
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner), False))
     if runner is not None and loop is not None:
         chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop), False))
+    if runner is not None:
+        from gateway.session_epoch_watch import check_runtime_epochs
+        chores.append((1, "Runtime epoch watch", lambda: check_runtime_epochs(runner), False))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop), False),
         (60, "Media cache cleanup", _housekeeping_media_caches, False),
@@ -5754,12 +5792,14 @@ async def _start_gateway_start_control_socket(runner):
             return payload
 
         from gateway.cron_review import CronReviewControl
+        from gateway.session_snapshot import make_session_snapshot_handler
         from gateway import zero_cut_standby as zcs
         from gateway.zero_cut_handover_drain import request_handover, status as handover_status
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
-            verb_handlers={"identify": _identify_runtime,
+            verb_handlers={"session-snapshot": make_session_snapshot_handler(runner, _main_loop),
+                           "identify": _identify_runtime,
                            "cron-review": _cron_review_control.submit,
                            "cron-review-result": _cron_review_control.result,
                            "pause-for-update": _pause_for_update_handler,

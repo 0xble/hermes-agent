@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
   buildPosixManagedUpdateLaunch,
@@ -367,6 +367,8 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
     const shell: string = (await exec('command -v bash', { shell: 'bash' })).stdout.trim()
     const launcher: string = path.join(home, 'hermes launcher')
 
+    const statusPath: string = path.join(home, `.update_exit_code.${CORRELATION}`)
+
     try {
       await writeFile(
         launcher,
@@ -385,23 +387,13 @@ test.runIf(process.platform !== 'win32').each([0, 23])(
       )
 
       const { stdout, stderr } = await exec(command, { shell, env: { ...process.env, HOME: home, HERMES_HOME: home } })
-      const statusPath: string = path.join(home, `.update_exit_code.${CORRELATION}`)
+
+      // Directory events can omit the status filename. The detached child may
+      // publish on either side of exec returning, so observe its terminal file.
+      await vi.waitUntil(() => existsSync(statusPath), { interval: 25, timeout: 30_000 })
+
       const logPath: string = path.join(home, 'logs', `desktop-update-${CORRELATION}.log`)
-      let status: string | undefined
-
-      for (let attempt: number = 0; attempt < 100; attempt += 1) {
-        try {
-          status = await readFile(statusPath, 'utf8')
-
-          break
-        } catch (error: unknown) {
-          if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
-            throw error
-          }
-
-          await new Promise<void>(resolve => setTimeout(resolve, 25))
-        }
-      }
+      const status: string = await readFile(statusPath, 'utf8')
       const log: string = await readFile(logPath, 'utf8')
       assert.match(stdout, /MANAGED_UPDATE_STARTED/)
       assert.match(log, /managed-update start pid=/)

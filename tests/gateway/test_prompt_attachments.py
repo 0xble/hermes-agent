@@ -1,4 +1,5 @@
 """Public ``prompt.submit`` attachments: scoped to the profile staging dir, committed as bytes."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from types import SimpleNamespace
 
 import os
@@ -13,7 +14,8 @@ _ONE_PX_PNG = bytes.fromhex(
 async def _authority(tmp_path, monkeypatch, answer):
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
-    from gateway.session_authority import LiveSession, initialize_session_authority
+    from gateway.session_authority import LiveSession
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
@@ -67,7 +69,10 @@ async def test_staged_attachment_reaches_message_event_media(tmp_path, monkeypat
     (path,) = event.media_urls
     assert path != staged, 'execution must read committed bytes, not the mutable staging file'
     assert 'native-inputs' in path
-    # Retained bytes are exact-retry evidence by digest only; settlement releases them.
+    # Retained bytes are exact-retry evidence by digest only; settlement releases them, queued
+    # off the FIFO path.
+    from gateway.session_ingress_media import media_releases_idle
+    await media_releases_idle(authority)
     assert not os.path.exists(path)
 
 
@@ -150,10 +155,12 @@ async def test_discarding_a_lost_image_turn_releases_its_committed_bytes(tmp_pat
     committed = rt.get_session_admission(authority.db, admission_id=receipt.admission_id)[
         'payload']['attachments_v1']['media'][0]['path']
     row = rt.claim_session_input(authority.db, epoch=authority.epoch, session_id='s')
-    authority.epoch = rt.begin_runtime_epoch(authority.db, instance_id='restarted')
+    authority.epoch = _begin_owned_runtime_epoch(authority.db, instance_id='restarted')
     rt.recover_session_inputs(authority.db, epoch=authority.epoch)
     await authority.resolve_unknown(actor, SessionRef('p', 's'), receipt.admission_id, row['generation'])
     assert rt.get_session_admission(authority.db, admission_id=receipt.admission_id)['status'] == 'terminal'
+    from gateway.session_ingress_media import media_releases_idle
+    await media_releases_idle(authority)  # Discard queues the cleanup rather than awaiting its scan
     assert not os.path.exists(committed)
 
 

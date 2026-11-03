@@ -183,10 +183,11 @@ class SessionAuthority:
         # reset while that turn's admission is started, so the drain runs it once the turn settles.
         self.deferred_resets = {}
 
-    def authorize(self, actor, ref, capability):
+    def authorize(self, actor, ref, capability, *, superseded_ok=False):
         """Every handler calls this first, so a later ``self.sessions[ref.session_id]`` is
         safe: a deleted/evicted live entry surfaces here as ``not_found``, not as a KeyError
-        deeper in the handler."""
+        deeper in the handler. ``superseded_ok``: the caller touches only this session's own
+        ledger (a receipt, cancelling its own queued row), never the lane's newer conversation."""
         from gateway.session_authorities import require_serving
         require_serving(self)
         if actor.profile_id != self.profile_id or ref.profile_id != self.profile_id:
@@ -216,7 +217,7 @@ class SessionAuthority:
         if is_history_mount(self.sessions[ref.session_id]):
             require_history_access(self, actor, ref.session_id, capability)
         from gateway.config import Platform
-        if self.sessions[ref.session_id].superseded and capability != 'session:read':
+        if self.sessions[ref.session_id].superseded and capability != 'session:read' and not superseded_ok:
             # One gateway owns every session and never crosses them: the lane's route now belongs to
             # its newer conversation, so a write here would land there. Named, so a viewer can say so.
             raise RuntimeStoreError('session_superseded', field='session_id',
@@ -461,7 +462,9 @@ class SessionAuthority:
         live = self.sessions[ref.session_id]
         live.rescan = True
         if live.task is None or live.task.done():
-            live.task = asyncio.create_task(self._drain(ref))
+            # Admission can schedule this from a busy ingress task; ingress-only state stays there.
+            from gateway.run import without_prepared_authorization_scope
+            live.task = asyncio.create_task(self._drain(ref), context=without_prepared_authorization_scope())
             live.task.add_done_callback(_log_drain_failure)
             from gateway.session_runtime_workers import persist_work_count
             live.task.add_done_callback(lambda task: persist_work_count(self, task))
@@ -493,7 +496,7 @@ class SessionAuthority:
     async def admit_automation(self, adapter, event, identity, replaces=None):
         from gateway.admission_canary import refusal_evidence
         from gateway.session_automation import admit_automation
-        with refusal_evidence('automation'):
+        with refusal_evidence('automation', identity):
             return await admit_automation(self, adapter, event, identity, replaces)
 
     async def admit_native(self, event):
@@ -757,7 +760,9 @@ class SessionAuthority:
                 'Releasing refused attachments of request %s failed', request.request_id)
 
     async def receipt(self, actor, ref, admission_id):
-        self.authorize(actor, ref, 'session:submit')
+        # A superseded session's rows stay readable and cancellable: they can never run (their lane
+        # is the newer conversation's), so cancelling is the only way out and frees the delete.
+        self.authorize(actor, ref, 'session:submit', superseded_ok=True)
         row = get_session_admission(self.db, admission_id=admission_id)
         if row is None or row['target_session_id'] != ref.session_id:
             raise RuntimeStoreError('not_found')
@@ -776,10 +781,11 @@ class SessionAuthority:
         # Write off the shared loop; commit and observer settlement are one tracked task the
         # caller cannot cancel between (an exact retry still pays a left-over obligation).
         row = await asyncio.shield(track_mutation(self, self._commit_cancel(ref, admission_id, before)))
-        # Media collection is its own write txn after the committed, settled cancellation: its
-        # failure surfaces to the caller, and an exact retry collects again without re-settling.
-        from gateway.session_ingress_media import release_admission_media
-        await asyncio.to_thread(release_admission_media, self.db, admission_id)
+        # Media collection is its own write txn after the committed, settled cancellation, queued
+        # rather than awaited: /stop and /new cancel every queued row and must not wait one
+        # transcript scan per row. An exact retry queues it again without re-settling.
+        from gateway.session_ingress_media import release_admission_media_later
+        release_admission_media_later(self, admission_id)
         return self._receipt(row)
 
     async def cancel_or_claimed(self, actor, ref, admission_id):
@@ -888,9 +894,10 @@ class SessionAuthority:
                     _publish_completion(self, live, ref, row, row,
                                         captured['result'].get('final_response') or '', captured)
         # Its own write txn + unlink, so it runs after the resolution commits; a discarded image
-        # would otherwise stay on disk forever (the drain releases only settled turns).
-        from gateway.session_ingress_media import release_admission_media
-        await asyncio.to_thread(release_admission_media, self.db, admission_id)
+        # would otherwise stay on disk forever (the drain releases only settled turns). Queued, not
+        # awaited: the successor below must not wait on its transcript scan.
+        from gateway.session_ingress_media import release_admission_media_later
+        release_admission_media_later(self, admission_id)
         # Before the successor can run: a committed captured answer reaches the chat it was
         # owed to (a turn fenced unknown already released its delivery waiter), exactly once.
         from gateway.session_ingress import deliver_resolved
@@ -1317,6 +1324,9 @@ class SessionAuthority:
                 if outcome == 'settled_unknown':
                     self.deferred_resets.pop(live.route, None)  # no settlement follows, as below
                     continue
+                from gateway.session_settlement_recovery import requeue_shutdown_unstarted
+                if await requeue_shutdown_unstarted(self, ref, live, row):
+                    continue  # the next claim refuses (runtime_draining) and pauses this FIFO
             except BaseException as exc:
                 # No settlement follows (a lost managed worker, a cancelled drain): the turn is never
                 # replayed, so its deferred reset is dropped (the next turn re-detects the overflow),
@@ -1326,6 +1336,7 @@ class SessionAuthority:
                     return
                 raise
             settled = None
+            captured = None
             settlement = {}
             try:
                 # Redaction, encoding and the SQLite write run off-loop: one turn's settlement must
@@ -1402,6 +1413,9 @@ class SessionAuthority:
                 waiter_replies(self).pop(admission_id, None)
                 # Taken on every exit, so a turn that never settled leaves no reset for a later one.
                 reset = self.deferred_resets.pop(live.route, None)
+            if settled is not None:
+                from gateway.run_checkins import record_local_settlement
+                await record_local_settlement(self.runner, live.source, settled, response, captured)
             await self._run_deferred_reset(live.route, reset)
             from gateway.session_ingress import deliver_settled
             await deliver_settled(self, admission_id)
@@ -1473,19 +1487,76 @@ def backfill_compression_created_sources(db):
     return stamped
 
 
-async def initialize_session_authority(runner, *, profile_id, instance_id, db=None, register=True):
+async def initialize_session_authority(runner, *, profile_id, instance_id, db=None, register=True, claim=True):
     """Call after exclusive profile ownership, before connecting adapters/API.
 
     ``register=False`` builds a served secondary's authority without making it the runner's
     launch authority (``runner.session_authority``); the per-home registry owns the lookup.
+
+    ``claim=False`` (a zero-cut standby) builds the authority without beginning a runtime epoch or
+    running startup recovery: the serving slot still owns the store, and a begin here would stale
+    every write it makes and turn its running turns ``unknown``. The authority's epoch stays 0, so
+    any fenced write it attempts is refused, until :func:`claim_session_authority` at promotion.
     """
     if db is None:
         db = getattr(runner._session_db, '_db', runner._session_db)
-    # Resolved off-loop before any state is published: the rest of the bring-up runs without
-    # yielding, so no other task observes a half-registered authority.
+    if db is None:
+        # The runner's store failed to open (the live-DB guard refusing a probe, a locked or corrupt
+        # file); name that cause instead of failing on ``None.db_path`` below.
+        from gateway.run_runtime import _store_open_failure
+        from hermes_constants import get_hermes_home
+        raise RuntimeError(f'session authority has no state.db: {_store_open_failure(runner, get_hermes_home())}')
+    authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db,
+                                 epoch=UNCLAIMED_EPOCH)
+    if claim:
+        # Resolved off-loop before any state is published: the rest of the bring-up runs without
+        # yielding, so no other task observes a half-registered authority.
+        db_key = await _claim_epoch(authority)
+    if register:
+        runner.session_authority = authority
+    from gateway.session_cron import bind_owner
+    bind_owner(authority)
+    if claim:
+        _publish_claimed_epoch(authority, db_key, register=register)
+        authority.epoch_claimed = True
+    return authority
+
+
+#: Epoch of an authority that has not begun one (a zero-cut standby): never a stored epoch, so every
+#: fenced write fails ``stale_epoch``.
+UNCLAIMED_EPOCH = 0
+
+
+async def claim_session_authority(authority, *, successor=False):
+    """Begin the runtime epoch and run the startup recovery a standby's boot skipped (promotion).
+
+    Resumable: a retried promotion after a step raised reuses the epoch it already began and runs
+    every later step again (each is idempotent), so the authority never stays half-claimed with its
+    store's local-reset fence unset. ``epoch_claimed`` is set only once every step finished.
+    """
+    if getattr(authority, 'epoch_claimed', False):
+        if await asyncio.to_thread(_stored_epoch, authority.db) == authority.epoch:
+            return
+        # A rolled-back promotion kept its claim while slot a restarted and began a newer epoch:
+        # serving on the old one would fail every write stale_epoch. Claim again.
+        authority.epoch_claimed = False
+        authority.begun_epoch = None
+    db_key = await _claim_epoch(authority, successor=successor)
+    _publish_claimed_epoch(authority, db_key, register=authority.runner.session_authority is authority)
+    authority.epoch_claimed = True
+
+
+async def _claim_epoch(authority, *, successor=False):
     from pathlib import Path
+    db = authority.db
     db_key = await asyncio.to_thread(Path(db.db_path).resolve)
-    epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
+    epoch = getattr(authority, 'begun_epoch', None)
+    if epoch is not None and await asyncio.to_thread(_stored_epoch, db) != epoch:
+        epoch = None  # another owner began since this half-finished claim: its epoch is gone
+    if epoch is None:
+        epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=authority.instance_id,
+                                        successor=successor)
+        authority.begun_epoch = epoch
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
@@ -1497,23 +1568,28 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     await asyncio.to_thread(release_handed_off_receipts, db, epoch=epoch)
     from gateway.session_bot import release_superseded_bot_chat_at_boot
     await asyncio.to_thread(release_superseded_bot_chat_at_boot, db, runner.session_store)
-    authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)
+    authority.epoch = epoch
     # A receipt's compression catch-up (#140060) writes: it commits off the loop too, before the
     # authority is published, so the recovery below only reads.
     from gateway.session_local_adoption import adopt_local_compressions
     await adopt_local_compressions(authority)
+    return db_key
+
+
+def _stored_epoch(db):
+    with db._read_ctx() as conn:
+        row = conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()
+    return row[0] if row is not None else None
+
+
+def _publish_claimed_epoch(authority, db_key, *, register):
+    store = authority.runner.session_store
     if register:
-        runner.session_authority = authority
-    from gateway.session_cron import bind_owner
-    bind_owner(authority)
-    store = runner.session_store
-    if register:
-        store._local_authority_epoch = epoch
+        store._local_authority_epoch = authority.epoch
     # Local resets write the owning profile's store; the epoch fence must be that store's.
     epochs = getattr(store, '_local_authority_epochs', None)
     if epochs is None:
         epochs = store._local_authority_epochs = {}
-    epochs[db_key] = epoch
+    epochs[db_key] = authority.epoch
     from gateway.session_local_recovery import recover_local_sessions
     recover_local_sessions(authority)
-    return authority

@@ -60,6 +60,9 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
     """Write the full page to cache/web; absolute path or None (best-effort: the truncated content is still
     returned). cache/web is mounted read-only into remote backends (credential_files _CACHE_DIRS) so
     read_file can page the complete text on any backend."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return None
     try:
         import hashlib
         from hermes_constants import get_hermes_dir

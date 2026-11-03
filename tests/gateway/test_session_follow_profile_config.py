@@ -6,6 +6,7 @@ so the frozen request says "follow" and each turn re-reads the profile's model s
 included). Real SessionStore/SessionAuthority and a real config.yaml; ``_load_gateway_config`` is not
 patched.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import pytest
 import json
 
@@ -35,7 +36,7 @@ def _owner(home):
     runner._handle_message = None
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
+                                 epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
     runner.session_authority = authority
     return store, runner, authority, AuthorityConnection(authority, object(), {'user_id': 'human'})
 

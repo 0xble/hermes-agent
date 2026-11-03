@@ -38,6 +38,11 @@ def process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     note_dispatch_stage(job, "fire_claim_enter")
     try:
+        from cron.missed_windows import skip_before_start
+        skipped = skip_before_start(job, owns_claim=False)
+        if skipped:
+            _sched.finish_execution(job["execution_id"], success=False, error=skipped, output=skipped)
+            return True
         claimed = _sched.claim_job_for_fire(job["id"], return_job=True)
         note_dispatch_stage(job, "fire_claim_exit")
     except OSError as exc:

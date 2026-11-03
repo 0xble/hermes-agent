@@ -82,6 +82,9 @@ VALID_BUSY_POLICIES: frozenset[str] = frozenset({"dispatch", "reject", "interrup
 
 COMMAND_REGISTRY: list[CommandDef] = [
     # Session
+    CommandDef("incognito", "Toggle RAM-only private history for this topic", "Session",
+               gateway_only=True, args_hint="[on|off|status]", subcommands=("on", "off", "status"),
+               busy_policy="dispatch", desktop="messaging"),
     CommandDef("start", "Acknowledge platform start pings without a reply", "Session",
                gateway_only=True, busy_policy="dispatch", busy_handler="start"),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
@@ -106,9 +109,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[N]", busy_policy="defer_until_idle"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]", busy_policy="dispatch"),
-    CommandDef("retire", "Hand off open work and retire this Telegram topic", "Session",
-               gateway_only=True, args_hint="[topic|now|cancel]", busy_policy="dispatch",
-               desktop="messaging"),
     CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
                args_hint="<platform>", cli_only=True, argument_mode="options"),
     CommandDef("branch", "Branch the current session (new thread on Discord/Telegram/Slack/Matrix; --here stays here)",

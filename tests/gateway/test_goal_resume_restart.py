@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import queue
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -24,7 +25,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionEntry, SessionSource
 from hermes_cli import goals
 
 
@@ -125,19 +126,24 @@ _GW_SID = "sid-gateway-goal-resume"
 _GW_KEY = "agent:main:discord:channel:goal-resume"
 
 
-class _FakeSessionEntry:
-    session_id = _GW_SID
-
-
 class _FakeSessionStore:
     def __init__(self):
-        self.entry = _FakeSessionEntry()
+        now = datetime.now(timezone.utc)
+        self.entry = SessionEntry(_GW_KEY, _GW_SID, now, now)
 
     def get_or_create_session(self, source, **_kwargs):
+        self.entry.origin = source
         return self.entry
 
     def _generate_session_key(self, source):
         return _GW_KEY
+
+    def lookup_by_session_key(self, key):
+        return self.entry if key == self.entry.session_key else None
+
+    def _db_for_key(self, key):
+        assert key == self.entry.session_key
+        return goals._get_session_db()
 
 
 class _FakeAdapter:

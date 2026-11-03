@@ -25,7 +25,7 @@ _CALLS = {
                        "clear_subgoals", "add_gate", "remove_gate", "clear_gates", "wait_on", "wait_on_session",
                        "wait_for_seconds", "stop_waiting", "is_waiting", "evaluate_after_turn", "command",
                        "resume_for_user_input", "lifted_barrier_prompt", "mark_automatic_continuation_dispatched",
-                       "clear_lifted_wait", "remove_contract_item", "replace"}),
+                       "clear_lifted_wait", "remove_contract_item", "replace", "wait_on_peer", "resolve_peer"}),
     "loop": frozenset({"state", "set", "pause", "resume", "clear", "fire_tick", "abandon_tick", "complete_tick",
                        "goal_blocks_tick"}),
     "heartbeat": frozenset({"state", "set", "pause", "resume", "clear", "due_prompt", "abandon_fire"}),
@@ -99,6 +99,7 @@ def _special(mgr, kind, target, call, args, kwargs):
         except Exception:  # health: allow BLE001 -- the judge degrades to no background block, as main's hook did
             processes, delegations = None, 0
         return mgr.evaluate_after_turn(str((args or [""])[0] or ""), user_initiated=True,
+                                       turn_started_at=kwargs.get("turn_started_at"),
                                        background_processes=processes, active_delegations=delegations)
     if kind == "goal" and call in {"set", "replace"} and isinstance(kwargs.get("contract"), dict):
         from hermes_cli.goals import GoalContract
@@ -162,17 +163,25 @@ async def automation(connection, ref, params):
         from gateway.run import _profile_runtime_scope
         from gateway.session_commands import _session_workspace
         with _profile_runtime_scope(home), _session_workspace(runner, live.source):
-            return invoke(runner, kind, target, call, args, kwargs)
+            from gateway.session_context import scoped_current_session_id
+            with scoped_current_session_id(target):
+                before = authority.db.get_meta(f"goal:{target}") if kind == "goal" else None
+                result = invoke(runner, kind, target, call, args, kwargs)
+                changed = kind == "goal" and authority.db.get_meta(f"goal:{target}") != before
+                return result, changed
     rows = lambda: tuple(authority.db.get_meta(f"{k}:{target}") for k in ("goal", "loop", "heartbeat"))
     # Publish read-side writes if any, but pure barrier checks leave the wait for wake admission.
     before = rows() if call in _READS else None
     # The judge and gates block for seconds: off the loop, with the caller's context (profile scope).
-    result = await asyncio.to_thread(run)
+    result, goal_changed = await asyncio.to_thread(run)
     if kind == "heartbeat" and call in _WATCHDOG_CALLS and (call == "due_prompt" or result.get("value") is not None):
         # The CLI's watchdog runs from these on: from then on the gateway poller leaves the ticks to it.
         if not hasattr(authority, "viewer_heartbeat"):
             authority.viewer_heartbeat = {}
         authority.viewer_heartbeat[ref.session_id] = connection
+    if goal_changed:
+        from gateway.run_checkins import reconcile_turn
+        await reconcile_turn(runner, live.source, live.route)
     if before is None or rows() != before:
         # The classic CLI drives this session's automation: other viewers (Ink, Desktop) repaint from the event.
         from gateway.session_control_actions import publish

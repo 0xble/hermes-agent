@@ -235,6 +235,6 @@ async def replace_queued(connection, ref, params):
             authority._settle_cancelled(ref, old_id)
         elif old['status'] == 'queued':
             authority.cancel_obligations.discard(old_id)  # refused: nothing committed
-    from gateway.session_ingress_media import release_admission_media
-    await asyncio.to_thread(release_admission_media, authority.db, old_id)
+    from gateway.session_ingress_media import release_admission_media_later
+    release_admission_media_later(authority, old_id)  # queued: the edit never waits on its scan
     return asdict(admitted)

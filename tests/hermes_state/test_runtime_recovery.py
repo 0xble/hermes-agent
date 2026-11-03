@@ -1,3 +1,4 @@
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import json
 import sqlite3
 
@@ -35,7 +36,7 @@ def test_frozen_legacy_import_preserves_work_without_branch_theft(tmp_path):
             conn.execute('CREATE TABLE executions(root TEXT PRIMARY KEY, generation INTEGER NOT NULL)')
             conn.execute("INSERT INTO executions VALUES('s', 40)")
         before = source.read_bytes()  # source is closed and drained, not a live database
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         args = dict(epoch=epoch, source_path=source, principal_id='legacy-human', writers_drained=True)
         assert rt.import_legacy_session_admissions(db, **args) == 4
         assert rt.import_legacy_session_admissions(db, **args) == 0
@@ -68,7 +69,7 @@ def test_legacy_import_failure_rolls_back_rows_and_marker(tmp_path):
         db.create_session('s', source='test')
         source = tmp_path / 'prompt-admissions.db'
         legacy(source, [row(1, 's'), row(2, 'missing')])
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         args = dict(epoch=epoch, source_path=source, principal_id='human', writers_drained=True)
         with pytest.raises(rt.RuntimeStoreError, match='invalid_params'):
             rt.import_legacy_session_admissions(db, **(args | {'writers_drained': False}))

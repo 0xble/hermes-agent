@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import asdict
@@ -19,7 +20,40 @@ from gateway.telegram_topic_sessions import TopicRequestError
 
 logger = logging.getLogger(__name__)
 PREFIX = "telegram_retire:"
-NOTICE = "This topic is retiring. Use /retire cancel to keep it."
+NOTICE = "This topic is retiring and no longer accepts new work."
+# Telegram flood waits and timeouts clear on their own. Retry those automatically instead of
+# failing the retirement (2026-10-29: a FLOOD_WAIT during a handoff relay left a topic "failed").
+_TRANSIENT_MARKERS = ("rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror")
+_TRANSIENT_RETRY_LIMIT = 6
+# A failed retirement is still a standing user request. Housekeeping re-runs it with the saved
+# decisions on a doubling backoff (2026-10-30: 28 topics sat "failed" after faults that had cleared
+# or been fixed, because only a new user request ever retried one). Exhausted retries stay failed.
+_AUTO_RETRY_LIMIT = 5
+_AUTO_RETRY_BASE_SECONDS = 600
+_AUTO_RETRY_MAX_SECONDS = 6 * 3600
+
+
+def _transient_delay(exc) -> float | None:
+    """Seconds to wait before retrying a transient failure, or None when it is not transient."""
+    text = str(exc).lower().replace("\\", "").replace(" ", "")
+    if not (isinstance(exc, asyncio.TimeoutError) or any(marker in text for marker in _TRANSIENT_MARKERS)):
+        return None
+    match = re.search(r'retry_after_seconds":(\d+)', text)
+    return float(min(max(int(match.group(1)) + 5 if match else 30, 10), 600))
+
+
+def _schedule_retry(runner, source, delay: float) -> None:
+    async def retry():
+        await asyncio.sleep(delay)
+        async with runner._async_profile_scope_for_source(source):
+            await advance(runner, source)
+
+    tasks = getattr(runner, "_telegram_retire_retries", None)
+    if tasks is None:
+        tasks = runner._telegram_retire_retries = set()
+    task = asyncio.get_running_loop().create_task(retry())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
 
 
 def state_key(source):
@@ -40,7 +74,7 @@ class RetirementSuperseded(Exception):
     """A control request fenced an older executor generation."""
 
 
-async def save(runner, source, state, *, force=False, expected_generation=""):
+async def save(runner, source, state, *, force=False, expected_generation="", retry_of=""):
     locks = getattr(runner, "_telegram_retire_state_locks", None)
     if locks is None:
         locks = runner._telegram_retire_state_locks = {}
@@ -51,10 +85,16 @@ async def save(runner, source, state, *, force=False, expected_generation=""):
             raise TopicRequestError("Retirement preparation was superseded. No topic was changed.")
         if not force and current and current["generation"] != state["generation"]:
             raise RetirementSuperseded
+        # An automatic retry replaces only the failed generation it read, never a cancel or a
+        # user retry that landed while it was being requested.
+        if retry_of and (not current or current["generation"] != retry_of or current["phase"] != "failed"
+                         or current.get("user_active_at")):
+            raise RetirementSuperseded
         await runner._session_db.set_meta(state_key(source), json.dumps(state))
 
 
-async def request(runner, source, *, target=None, now=False, cancel=False, owners=None, reason="", generation="", context=""):
+async def request(runner, source, *, target=None, now=False, cancel=False, owners=None, reason="", generation="", context="",
+                  retry_of="", auto_retries=0):
     if source.platform != Platform.TELEGRAM or not source.thread_id or str(source.thread_id) in {"0", "1"}:
         raise TopicRequestError("Retirement requires a non-General Telegram topic.")
     if runner._session_db is None:
@@ -65,7 +105,7 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
     target = target.strip() if target is not None else None
     reason, context = reason.strip(), context.strip()
     if existing and existing["phase"] == "delete_unresolved":
-        # Only an explicit command retries recovery after a failed dispatch.
+        # Only an explicit request retries recovery after a failed dispatch.
         # Serialize the existence check against an executor already in flight.
         locks = getattr(runner, "_telegram_retire_locks", None)
         if locks is None:
@@ -115,6 +155,11 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
             and selected_context == previous.get("context", "")):
         state = previous
     else:
+        if existing and existing["phase"] == "failed":
+            from gateway.telegram_retire_work import recover_context_receipt
+            # Do not lose the only existing receipt identity when a user retry
+            # replaces the generation and its historical error text.
+            await recover_context_receipt(runner, source, existing)
         state = {
             "generation": uuid.uuid4().hex, "phase": "pending", "session_id": session_id,
             "session_key": session_key, "target": selected_target, "owners": selected_owners,
@@ -126,7 +171,9 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
         # A control generation must fence stale saves without duplicating work.
         if state["handoffs"]:
             state["handoff_generation"] = previous.get("handoff_generation", previous["generation"])
-        await save(runner, source, state, force=True, expected_generation=generation)
+        if auto_retries:
+            state["auto_retries"] = auto_retries
+        await save(runner, source, state, force=True, expected_generation=generation, retry_of=retry_of)
     if now:
         adapter = runner._delivery_adapter_for(source)
         agent = (getattr(runner, "_running_agents", {}) or {}).get(session_key)
@@ -146,15 +193,20 @@ async def intercept(runner, event):
     if event.internal and preparation and (not state or state["generation"] != preparation
                                            or state["phase"] not in {"pending", "waiting"}):
         return ""
-    if not state or state["phase"] in {"cancelled", "done"}:
+    if state and state["phase"] == "failed" and not event.internal and not state.get("user_active_at"):
+        # Working in the topic again after a failure means it stays: no automatic retry.
+        state["user_active_at"] = time.time()
+        try:
+            await save(runner, event.source, state)
+        except RetirementSuperseded:
+            state = await load(runner, event.source)  # an automatic retry won: judge this input against it
+    # A stalled retirement admits the user so the agent's telegram_topic tool can retry or cancel it.
+    if not state or state["phase"] in {"cancelled", "done", "failed", "delete_unresolved"}:
         return None
     if event.internal:
         # Already-owned completion work may settle while retirement waits. The
         # admission fence is for new user work, not a way to discard results.
         return None
-    if event.allow_gateway_control and not event.internal:
-        if event.get_command() == "retire":
-            return None
     return NOTICE
 
 
@@ -221,14 +273,45 @@ async def _unbind(runner, source, state):
         chat_id=str(source.chat_id), thread_id=str(source.thread_id), profile_name=profile)
     if not await asyncio.to_thread(runner.session_store.unbind_session, state["session_key"], state["session_id"]):
         raise RuntimeError("Topic routing changed before unbinding, session was preserved")
+    if not await runner._session_db.unbind_gateway_session_peer(state["session_key"], state["session_id"]):
+        raise RuntimeError("Persisted topic routing changed before unbinding, session was preserved")
     state["phase"] = "done"
     await save(runner, source, state)
 
 
+async def _finalize_absent(runner, source, state, bot):
+    """A failed request can finish quietly after independently confirmed absence."""
+    from gateway.telegram_retire_work import inventory, settle_handoffs
+    key, generation = state["session_key"], state["generation"]
+    if await asyncio.to_thread(runner.session_store.peek_session_id, key) not in {None, state["session_id"]}:
+        return
+    if bot is None or not await _probe_deleted(bot, source, runner=runner, read_only=True):
+        return
+    # No new source-topic turn or closing send is possible. A requested merge
+    # must already have a saved destination and context handoff to reconcile.
+    if state.get("target") and (not state.get("merge_destination") or not any(
+            record.get("item", {}).get("kind") == "context" for record in state["handoffs"].values())):
+        return
+    await settle_handoffs(runner, source, state)
+    if await inventory(runner, source, state):
+        return
+    current = await _current(runner, source, generation)
+    if (not current or current["phase"] != "failed" or runner._is_session_running(key)
+            or await asyncio.to_thread(runner.session_store.peek_session_id, key) not in {None, state["session_id"]}):
+        return
+    # This records observed absence, not a claim that a closing send succeeded.
+    # Historical errors and any real closing receipt remain unchanged.
+    current["disposition"] = {"status": "absent_at_finalization", "generation": generation,
+                              "chat_id": str(source.chat_id), "thread_id": str(source.thread_id),
+                              "observed_at": time.time()}
+    await _unbind(runner, source, current)
+
+
 async def advance(runner, source):
     """Resume persisted retirement only after the active turn relinquishes its lane."""
+    from gateway.telegram_retire_work import HandoffPending
     state = await load(runner, source)
-    if not state or state["phase"] in {"cancelled", "done", "failed"}:
+    if not state or state["phase"] in {"cancelled", "done"}:
         return
     key = state["session_key"]
     adapter = runner._delivery_adapter_for(source)
@@ -246,10 +329,20 @@ async def advance(runner, source):
         return
     async with lock:
         state = await _current(runner, source, state["generation"])
-        if not state or state["phase"] == "failed":
+        if not state:
             return
         generation = state["generation"]
         bot = getattr(adapter, "_bot", None)
+        if state["phase"] == "failed":
+            try:
+                await _finalize_absent(runner, source, state, bot)
+            except Exception:
+                logger.debug("Absent-topic retirement recovery remains blocked for %s", key, exc_info=True)
+            try:
+                await _auto_retry(runner, source, generation)
+            except Exception:
+                logger.warning("Automatic retirement retry could not start for %s", key, exc_info=True)
+            return
         try:
             if bot is None:
                 raise RuntimeError("Telegram bot is disconnected")
@@ -269,9 +362,9 @@ async def advance(runner, source):
                     return
                 if passive:
                     return
-                raise RuntimeError("The previous delete was not confirmed. Use /retire to retry or /retire cancel to keep this topic.")
+                raise RuntimeError("The previous delete was not confirmed.")
             from gateway.telegram_retire_work import prepare
-            # Inventory happens here, after the turn, not when /retire was typed.
+            # Inventory happens here, after the turn, not when retirement was requested.
             if await asyncio.to_thread(runner.session_store.peek_session_id, key) != state["session_id"]:
                 raise RuntimeError("The bound session changed during retirement. Cancel and retry from its current session.")
             if not await prepare(runner, source, state):
@@ -318,21 +411,94 @@ async def advance(runner, source):
             raise
         except RetirementSuperseded:
             return
+        except HandoffPending:
+            # The receipt is durable. Housekeeping rechecks it without
+            # repeating the handoff or treating a busy destination as failure.
+            current = await _current(runner, source, generation)
+            if current:
+                current["phase"] = "pending"
+                await save(runner, source, current)
         except Exception as exc:
             if state and state["phase"] == "delete_unresolved":
                 # A deleted topic cannot receive another user retry. Quietly
                 # reconcile read-only evidence without replaying sends/deletes.
                 logger.debug("Topic retirement reconciliation deferred for %s: %s", key, exc)
                 return
-            logger.warning("Topic retirement failed for %s: %s", key, exc, exc_info=True)
             current = await _current(runner, source, generation)
+            delay = _transient_delay(exc)
+            if (current and delay is not None and current["phase"] not in {"deleting", "delete_unresolved"}
+                    and not current.get("closing_attempt")
+                    and int(current.get("transient_retries") or 0) < _TRANSIENT_RETRY_LIMIT):
+                # Nothing destructive has been attempted yet, so the same phase can simply run again.
+                current["transient_retries"] = int(current.get("transient_retries") or 0) + 1
+                await save(runner, source, current)
+                logger.info("Topic retirement for %s hit a transient error; retry %d in %.0fs: %s",
+                            key, current["transient_retries"], delay, exc)
+                _schedule_retry(runner, source, delay)
+                return
+            logger.warning("Topic retirement failed for %s: %s", key, exc, exc_info=True)
             if current:
                 current["phase"] = "delete_unresolved" if current["phase"] in {"deleting", "delete_unresolved"} else "failed"
                 current["error"] = str(exc)
+                current["failed_at"] = time.time()
                 await save(runner, source, current)
-                recovery = " Use /retire to retry or /retire cancel to keep this topic." if current["phase"] == "delete_unresolved" else ""
+                retries = int(current.get("auto_retries") or 0)
+                retryable = current["phase"] == "failed" and _retryable(current) and await asyncio.to_thread(
+                    runner.session_store.peek_session_id, current["session_key"]) == current["session_id"]
+                if retryable and 0 < retries < _AUTO_RETRY_LIMIT:
+                    return  # An automatic retry failing again stays quiet until the retries run out.
+                if retryable and retries < _AUTO_RETRY_LIMIT:
+                    recovery = (" I'll retry it automatically unless you keep working here. "
+                                "Ask here to cancel it.")
+                elif retryable:
+                    recovery = f" {retries} automatic retries also failed. Ask here to retry or cancel it."
+                else:
+                    recovery = " Ask here to retry or cancel it."
                 await adapter.send(str(source.chat_id), f"Topic retirement failed: {exc}{recovery}",
                                    metadata={"thread_id": str(source.thread_id)})
+
+
+def _retryable(state):
+    """Only failures recorded by this executor retry, and never one whose closing note may already
+    be in the topic: that unresolved send is a person's call."""
+    return bool(state.get("failed_at")) and not state.get("closing_attempt") and not state.get("closing_receipt")
+
+
+async def _auto_retry(runner, source, generation):
+    """Re-request a failed retirement with its saved target, owners, reason and context, as a user
+    retry would, so receipts and handoffs already made are reconciled rather than repeated."""
+    state = await load(runner, source)
+    if not state or state["generation"] != generation or state["phase"] != "failed" or not _retryable(state):
+        return
+    attempts = int(state.get("auto_retries") or 0)
+    if attempts >= _AUTO_RETRY_LIMIT or float(state.get("user_active_at") or 0) >= float(state["failed_at"]):
+        return
+    # The request named this conversation. After /new or /resume the topic holds another one,
+    # and only a new request may retire that.
+    if await asyncio.to_thread(runner.session_store.peek_session_id, state["session_key"]) != state["session_id"]:
+        return
+    delay = min(_AUTO_RETRY_BASE_SECONDS * 2 ** attempts, _AUTO_RETRY_MAX_SECONDS)
+    if time.time() - float(state["failed_at"]) < delay:
+        return
+    try:
+        await request(runner, source, target=state.get("target") or "", owners=state.get("owners") or {},
+                      reason=state.get("reason") or "", context=state.get("context") or "",
+                      retry_of=generation, auto_retries=attempts + 1)
+    except RetirementSuperseded:
+        return  # A cancel, a user retry or the user's own message won.
+    except Exception:
+        # A retry refused before it could start still spends an attempt and waits out the backoff.
+        # Re-read first: the user's activity or a recovered receipt may have landed meanwhile.
+        current = await load(runner, source)
+        if current and current["generation"] == generation and current["phase"] == "failed":
+            current.update(auto_retries=attempts + 1, failed_at=time.time())
+            try:
+                await save(runner, source, current)
+            except RetirementSuperseded:
+                pass
+        raise
+    logger.info("Topic retirement for %s retried automatically (%d of %d)",
+                state_key(source), attempts + 1, _AUTO_RETRY_LIMIT)
 
 
 async def resume_all(runner):
@@ -341,7 +507,7 @@ async def resume_all(runner):
     for _, raw in await runner._session_db.list_meta_prefix(PREFIX):
         try:
             state = json.loads(raw)
-            if state["phase"] not in {"cancelled", "done", "failed"}:
+            if state["phase"] not in {"cancelled", "done"}:
                 source = SessionSource(**{**state["source"], "platform": Platform.TELEGRAM})
                 async with runner._async_profile_scope_for_source(source):
                     await advance(runner, source)

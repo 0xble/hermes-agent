@@ -30,7 +30,7 @@ class _Transport:
 async def _desktop(tmp_path, monkeypatch, turns):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from tui_gateway import server
 
@@ -205,7 +205,7 @@ async def test_start_from_a_secondary_profile_claims_in_the_default_home(tmp_pat
     """Multiplexed host socket on a secondary profile: onboarding runs in ``default``, so the trial claim,
     the provider check and the chat's policy read the default home, never the asking connection's."""
     from gateway.session_authorities import SessionAuthorities
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB

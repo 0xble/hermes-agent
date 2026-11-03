@@ -11,7 +11,8 @@ import pytest
 from gateway import run_runtime
 from gateway.session_authority import LiveSession
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch
+from hermes_state_runtime import admit_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tools.bot_live_delivery import _locked, _write
 
 

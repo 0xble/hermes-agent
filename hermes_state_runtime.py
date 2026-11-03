@@ -64,8 +64,11 @@ def _epoch(conn, epoch):
 
 
 def _session(conn, session_id):
+    from hermes_state_mutation_retirement import retired_in
     row = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
-    if row is None:
+    # Reclamation may lag the retirement commit. Resolve visibility on this
+    # transaction, not a separate preflight read or the physical row alone.
+    if row is None or retired_in(conn, session_id):
         raise RuntimeStoreError('not_found')
     return row
 
@@ -107,14 +110,30 @@ def _row(row):
     return result
 
 
-def begin_runtime_epoch(db, *, instance_id: str) -> int:
-    """Caller MUST hold the profile ownership lock, not merely an endpoint ticket."""
+def begin_runtime_epoch(db, *, instance_id: str, successor: bool = False) -> int:
+    """Caller MUST hold the profile ownership lock, not merely an endpoint ticket.
+
+    Refused while another process holds that lock: the live owner's epoch fences all of its writes,
+    so a foreign bump stales every settlement and admission it makes, and the recovery a begin
+    precedes would turn the owner's running turns ``unknown``. Offline callers must hold the
+    current thread's exclusive-maintenance reservation; an unreserved store is not writable.
+    ``successor`` allows a reserved zero-cut promotion beside its predecessor, not an unowned begin.
+    """
     _text(instance_id)
+    from pathlib import Path
+    from gateway.runtime_ownership import OwnershipConflict, foreign_runtime_owner
+    home = Path(db.db_path).resolve().parent
+    if foreign_runtime_owner(home, successor=successor):
+        raise OwnershipConflict(
+            f'runtime epoch refused for {instance_id!r}: another process owns the gateway runtime '
+            f'of {home}; reserve the profile (or stop that gateway) before beginning an epoch')
     def write(conn):
         conn.execute('''INSERT INTO runtime_epoch(singleton,epoch,instance_id) VALUES(1,1,?)
             ON CONFLICT(singleton) DO UPDATE SET epoch=runtime_epoch.epoch+1, instance_id=excluded.instance_id''', (instance_id,))
         return conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()[0]
-    return db._execute_write(write)
+    from gateway.runtime_ownership import assert_runtime_epoch_owner
+    with assert_runtime_epoch_owner(db.db_path):
+        return db._execute_write(write)
 
 
 # Main's busy-queue cap (GatewayRunner._BUSY_QUEUE_MAX_PENDING): queued inputs one session holds.
@@ -168,7 +187,7 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             VALUES(?,?,?,?,?,?,?,?,'queued',?)''',
             (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
         return _row(_admission(conn, admission_id))
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(session_id, payload,), skip_result={})
 
 
 def get_session_admission(db, *, admission_id: str) -> dict | None:
@@ -233,7 +252,17 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         # tell this turn's own failed-turn boundary from an earlier turn's (#134889 GW-21).
         claimed['transcript_mark'] = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
         return claimed
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(session_id,), skip_result=None)
+
+
+def _incognito_admission_ids(db, admission_id):
+    """Resolve durable input identities before admitting a delayed result transaction."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return ()
+    # Always carry the identity. A session can enter incognito after this
+    # lookup but before _execute_write takes its privacy admission lock.
+    return get_session_admission(db, admission_id=admission_id)
 
 
 def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, outcome: str,
@@ -265,7 +294,7 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
         settle_steer_transfers(conn, epoch=epoch, generation=generation, transfers=_transfers, outcome=outcome)
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id), result,), skip_result={})
 
 
 _CANCEL_QUEUED = "UPDATE session_admissions SET status='terminal',outcome='cancelled' WHERE admission_id=?"
@@ -283,7 +312,7 @@ def cancel_session_input(db, *, epoch: int, admission_id: str) -> dict:
         if row['status'] == 'queued':
             conn.execute(_CANCEL_QUEUED, (admission_id,))
         return _row(_admission(conn, admission_id))
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result={})
 
 
 # A queued admission handed to its FIFO's running claim: terminal (never claimable, outside the queue
@@ -325,7 +354,7 @@ def steer_session_input(db, *, epoch: int, admission_id: str, generation: int) -
         conn.execute("UPDATE session_admissions SET status='terminal',outcome=?,owner_epoch=?,generation=? "
                      "WHERE admission_id=?", (STEERING, epoch, generation, admission_id))
         return _row(_admission(conn, admission_id)), True
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result=({}, False))
 
 
 def settle_steer_transfers(conn, *, epoch: int, generation: int, transfers, outcome: str) -> None:
@@ -347,7 +376,49 @@ def revert_steer_input(db, *, epoch: int, admission_id: str, generation: int) ->
     def write(conn):
         _epoch(conn, epoch)
         return _requeue_transfer(conn, admission_id=admission_id, epoch=epoch, generation=generation)
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result=False)
+
+
+def requeue_unstarted_claim(db, *, epoch: int, admission_id: str, generation: int, transfers=(),
+                            transcript_mark: int | None = None) -> bool:
+    """A claim this owner's own shutdown interrupted before its first model call ran nothing, so it goes
+    back to its FIFO place (``seq``) for the next owner to run once, like an undelivered steer; the
+    steers handed to it go back to theirs. ``recover_session_inputs`` only fences ``started`` rows, so
+    the successor drains it as ordinary committed input. The turn's own transcript rows after
+    ``transcript_mark`` (its user row and the core closer's failed-turn boundary) are archived so the
+    replay writes the input once; any other row there leaves the transcript as it is. False when the
+    claim is no longer this owner's started generation (settled, fenced or discarded meanwhile)."""
+    def write(conn):
+        _epoch(conn, epoch)
+        row = _admission(conn, admission_id)
+        if row['status'] != 'started' or row['owner_epoch'] != epoch or row['generation'] != generation:
+            return False
+        conn.execute("UPDATE session_admissions SET status='queued',outcome=NULL,generation=NULL "
+                     "WHERE admission_id=?", (admission_id,))
+        for transfer in transfers or ():
+            _requeue_transfer(conn, admission_id=transfer, epoch=epoch, generation=generation)
+        if type(transcript_mark) is int:
+            _archive_unstarted_turn(db, conn, row['target_session_id'], transcript_mark)
+        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
+        return True
+    return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result=False)
+
+
+def _archive_unstarted_turn(db, conn, session_id: str, mark: int) -> None:
+    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
+    from hermes_state_local_lineage import local_physical_target
+    from hermes_state_messages import _SET_COUNTERS_SQL
+    target = _canonical_chain(conn, local_physical_target(conn, session_id))[-1]
+    rows = conn.execute("SELECT id, role, display_kind, observed, _compressed_summary FROM messages "
+                        "WHERE session_id=? AND active=1 AND id>? ORDER BY id", (target, mark)).fetchall()
+    # Only the exact shape a turn leaves without a model call: its one input row, then at most the
+    # core closer's boundary. A compaction handoff, a steer or any other row means more happened.
+    if not rows or len(rows) > 2 or rows[0][1] != 'user' or rows[0][3] or rows[0][4] or (
+            len(rows) == 2 and (rows[1][1] != 'assistant' or rows[1][2] != FAILED_TURN_DISPLAY_KIND)):
+        return
+    ids = [r[0] for r in rows]
+    conn.execute(f"UPDATE messages SET active=0 WHERE id IN ({','.join('?' * len(ids))})", ids)
+    conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?", (*db._active_transcript_counts(conn, target), target))
 
 
 REPLACEMENT_PREFIX = 'gateway.queued_replacement.v1.'
@@ -404,7 +475,7 @@ def rehome_queued_inputs(db, *, epoch: int, old_session_id: str, new_session_id:
             for sid in (old_session_id, new_session_id):
                 conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (sid,))
         return [row['admission_id'] for row in rows]
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(old_session_id, new_session_id,), skip_result=[])
 
 
 def retarget_local_automation(db, *, epoch: int, session_id: str, principal_id: str,
@@ -441,7 +512,7 @@ def retarget_local_automation(db, *, epoch: int, session_id: str, principal_id: 
         if moved:
             conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (session_id,))
         return moved
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(session_id, old_targets, new_target,), skip_result=0)
 
 
 def recover_session_inputs(db, *, epoch: int) -> int:
@@ -512,6 +583,10 @@ def mutate_runtime_session(db, *, epoch: int, principal_id: str, session_id: str
         if replay is not None:
             return replay, None
         session = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+        from hermes_state_mutation_retirement import retired_in
+        # Import validates every payload id and reports the named conflict itself.
+        if operation != 'import' and retired_in(conn, session_id):
+            raise RuntimeStoreError('not_found')
         if session is None and operation != 'import':
             raise RuntimeStoreError('not_found')
         revision = session['runtime_revision'] if session else 0
@@ -548,10 +623,13 @@ def mutate_runtime_session(db, *, epoch: int, principal_id: str, session_id: str
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
                      (key, _json({'digest': digest, 'result': result})))
         return result, event
-    result, event = db._execute_write(write)
+    result, event = db._execute_write(write, session_ids=(session_id, payload,), skip_result=({}, None))
     if event is not None:
         from hermes_state_common import emit_session_deleted
         emit_session_deleted(db, event.session_ids, reason=event.reason, primary=session_id)
+    if operation == 'delete':
+        from hermes_state_deletion import finish_pending_deletes
+        finish_pending_deletes(db, required_ids=result['deleted_ids'])
     return result
 
 
@@ -645,7 +723,7 @@ def import_legacy_session_admissions(db, *, epoch: int, source_path, principal_i
                 _import_legacy_row(conn, row, epoch, principal_id)
             conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (_IMPORT_KEY, marker))
             return len(rows)
-        return db._execute_write(write)
+        return db._execute_write(write, session_ids=(rows, executions,), skip_result=0)
 
 
 def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generation: int,
@@ -685,7 +763,7 @@ def resolve_unknown_session_input(db, *, epoch: int, admission_id: str, generati
                      (outcome, admission_id))
         conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
         return _row(_admission(conn, admission_id))
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result={})
 
 
 def _worker_public(row):
@@ -753,7 +831,7 @@ def register_worker_execution(db, *, epoch: int, execution_id: str, session_id: 
         conn.execute("""INSERT INTO worker_executions(execution_id,session_id,kind,owner_epoch,generation,status,adoption_digest)
             VALUES(?,?,?,?,?,'registered',?)""", (execution_id, session_id, kind, epoch, generation, digest))
         return _worker_public(_worker_assignment(conn, execution_id, session_id, generation))
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(session_id,), skip_result={})
 
 
 def adopt_worker_execution(db, *, epoch: int, execution_id: str, session_id: str,
@@ -789,7 +867,7 @@ def adopt_worker_execution(db, *, epoch: int, execution_id: str, session_id: str
         if changed.rowcount != 1:
             raise RuntimeStoreError('stale_generation')
         return _worker_public(_worker_assignment(conn, execution_id, session_id, generation))
-    return db._execute_write(write)
+    return db._execute_write(write, session_ids=(session_id,), skip_result={})
 
 
 _MESSAGE_FIELDS = frozenset({
@@ -1002,4 +1080,4 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             from hermes_state_runtime_workers import compact_terminal_receipts
             compact_terminal_receipts(conn, execution_id)
         return result
-    return db._execute_write(write, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
+    return db._execute_write(write, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S, session_ids=(session_id, payload,), skip_result={})

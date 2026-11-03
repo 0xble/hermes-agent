@@ -1,4 +1,5 @@
 """Deletion removes history but retains exact, scoped terminal evidence."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 from types import SimpleNamespace
 
@@ -17,7 +18,7 @@ def test_used_history_retirement_is_atomic_and_exact(tmp_path, monkeypatch):
     with SessionDB(path) as db:
         db.create_session('used', source='api_server')
         db.append_message('used', 'user', 'physical history')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         args = dict(principal_id='api', session_id='used', request_id='once', payload={'text': 'input'})
         rt.admit_session_input(db, epoch=epoch, **args)
         row = rt.claim_session_input(db, epoch=epoch, session_id='used')
@@ -39,7 +40,7 @@ def test_used_history_retirement_is_atomic_and_exact(tmp_path, monkeypatch):
         db._execute_write(lambda c: c.execute('DROP TRIGGER deny_delete_receipt'))
         receipt = rt.mutate_runtime_session(db, epoch=epoch, **delete)
     with SessionDB(path) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='restart')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='restart')
         rt.recover_session_inputs(db, epoch=epoch)
         assert db.get_session('used') is None and db.get_messages('used') == []
         with db._read_ctx() as c:
@@ -72,12 +73,56 @@ def test_used_history_retirement_is_atomic_and_exact(tmp_path, monkeypatch):
                 generation=row['generation'], sequence=2, operation='transcript.append', payload=worker_append)
 
 
+def test_native_receipt_clock_does_not_change_retired_retry_identity(tmp_path):
+    from copy import deepcopy
+    from gateway.session_ingress_media import reconcile_native_retry
+
+    with SessionDB(tmp_path / 'state.db') as db:
+        db.create_session('native', source='signal')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
+        payload = {'text': 'repeatable', 'native_text_v1': {
+            'attended_activity': {'received_at': 1800000000.0, 'marked': True},
+            'event': {'message_id': 'retry'}, 'context': {'channel_prompt': 'semantic'},
+        }}
+        args = dict(principal_id='native', session_id='native', request_id='retry')
+        original = rt.admit_session_input(db, epoch=epoch, payload=payload, **args)
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id='native')
+        assert isinstance(claimed, dict)
+        rt.settle_session_input(db, epoch=epoch, admission_id=claimed['admission_id'],
+                               generation=claimed['generation'], outcome='completed')
+        snap = db.get_session('native')
+        assert snap is not None
+        rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='native',
+            request_id='delete', operation='delete', payload={},
+            expected_revision=snap['runtime_revision'], expected_generation=snap['runtime_generation'])
+        assert db.get_session('native') is None
+        assert rt.find_session_admission(db, principal_id='native', session_id='native', request_id='retry') is None
+        terminal = rt.get_session_admission(db, admission_id=original['admission_id'])
+        assert terminal is not None
+        assert terminal['payload'] == {}
+        assert terminal['admission_id'] == original['admission_id']
+        assert terminal['status'] == 'terminal' and terminal['outcome'] == 'completed'
+        retry = deepcopy(payload)
+        retry['native_text_v1']['attended_activity'] = {'received_at': 1800003600.0, 'marked': False}
+        resolved = reconcile_native_retry(db, principal_id='native', session_id='native',
+                                         request_id='retry', payload=retry)
+        assert rt.admit_session_input(db, epoch=epoch, payload=resolved, **args) == terminal
+        for change in ('text', 'context', 'intent'):
+            changed = deepcopy(retry)
+            if change == 'text':
+                changed['text'] = 'changed'
+            elif change == 'context':
+                changed['native_text_v1']['context']['channel_prompt'] = 'changed'
+            with pytest.raises(rt.RuntimeStoreError, match='admission_conflict'):
+                rt.admit_session_input(db, epoch=epoch, payload=changed, intent='steer' if change == 'intent' else 'queue', **args)
+
+
 def test_nonterminal_obligations_prevent_any_retirement(tmp_path):
     import hermes_state_mutation_retirement as retirement
     import hermes_state_mutations
     delete_in_transaction = getattr(retirement, 'delete_in_transaction', hermes_state_mutations._delete)
     with SessionDB(tmp_path / 'state.db') as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         for status in ('queued', 'unknown', 'started', 'worker'):
             db.create_session(status, source='api_server')
             if status == 'worker':
@@ -89,7 +134,7 @@ def test_nonterminal_obligations_prevent_any_retirement(tmp_path):
                 if status != 'queued':
                     rt.claim_session_input(db, epoch=epoch, session_id=status)
                 if status == 'unknown':
-                    epoch = rt.begin_runtime_epoch(db, instance_id='next')
+                    epoch = _begin_owned_runtime_epoch(db, instance_id='next')
                     rt.recover_session_inputs(db, epoch=epoch)
             reason = 'unknown_execution' if status == 'unknown' else 'session_busy'
             with pytest.raises(rt.RuntimeStoreError, match=reason):
@@ -106,7 +151,7 @@ def test_late_accounting_backfill_cannot_resurrect_a_retired_session(tmp_path):
     with SessionDB(tmp_path / 'state.db') as db:
         db.create_session('retired', source='cli')
         db.append_message('retired', 'user', 'history')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         snap = db.get_session('retired')
         delete = dict(principal_id='human', session_id='retired', request_id='delete', operation='delete',
                       payload={}, expected_revision=snap['runtime_revision'],
@@ -138,7 +183,7 @@ def test_deletion_tombstone_keeps_only_the_closing_worker_result(tmp_path):
     with SessionDB(tmp_path / 'state.db') as db:
         db.create_session('gone', source='api_server')
         db.append_message('gone', 'user', 'SECRET_HISTORY_LINE')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         rt.register_worker_execution(db, epoch=epoch, execution_id='worker', session_id='gone',
             generation=0, kind='compute', adoption_secret='proof')
         history = rt.mutate_worker_execution(db, epoch=epoch, execution_id='worker', session_id='gone',
@@ -164,7 +209,7 @@ def test_deleting_a_session_drops_transcript_copies_from_its_terminal_results(tm
     exact retry's outcome and usage but no copy of the deleted history."""
     with SessionDB(tmp_path / 'state.db') as db:
         db.create_session('gone', source='api_server')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         history, rows = [], []
         for turn in range(3):
             rt.admit_session_input(db, epoch=epoch, principal_id='api', session_id='gone',
@@ -204,7 +249,7 @@ def test_a_malformed_unrelated_route_or_policy_row_cannot_abort_a_delete(tmp_pat
     find the target's; one unrelated malformed row must not roll back an unrelated delete."""
     import time
     with SessionDB(tmp_path / 'state.db') as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         db.create_session('target', source='api_server')
         db._execute_write(lambda c: c.execute(stray))
         if delete == 'canonical':
@@ -235,7 +280,7 @@ def test_deleted_history_is_not_recoverable_from_worker_or_mutation_receipts(tmp
     from hermes_state_terminal import terminal_worker_receipt
     with SessionDB(tmp_path / 'state.db') as db:
         db.create_session('gone', source='cli')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         db.append_message('gone', 'user', 'first')
         db.append_message('gone', 'assistant', 'a1')
         rewound = db.append_message('gone', 'user', 'SECRET_REWOUND')
@@ -287,7 +332,7 @@ def test_mutation_receipts_naming_a_deleted_physical_target_drop_its_text(tmp_pa
                     expected_generation=snap['runtime_generation'])
 
     with SessionDB(tmp_path / 'state.db') as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         sid = _local_session(db, epoch, tmp_path)
         child = rt.mutate_runtime_session(db, epoch=epoch, **args(db, sid, 'reset', 'reset', {}))['target_session_id']
         db.append_message(child, 'user', 'first')
@@ -314,7 +359,7 @@ def test_retirement_drops_the_turn_user_row_copy(tmp_path):
     """The settled user row as the model saw it is a transcript copy: deletion strips it (N88)."""
     with SessionDB(tmp_path / 'state.db') as db:
         db.create_session('gone', source='api_server')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         rt.admit_session_input(db, epoch=epoch, principal_id='api', session_id='gone', request_id='r1',
                                payload={'text': 'secret ask'})
         row = rt.claim_session_input(db, epoch=epoch, session_id='gone')
@@ -338,7 +383,7 @@ def test_tombstones_past_the_retry_horizon_are_reclaimed_by_the_prune_pass(tmp_p
     import hermes_state_mutation_retirement as retirement
     now = time.time()
     with SessionDB(tmp_path / 'state.db') as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
 
         def settle_and_delete(sid, at):
             db.create_session(sid, source='api_server')

@@ -1066,7 +1066,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         print("📝 Trajectory saving enabled")
     if agent.ephemeral_system_prompt:
         prompt_preview = agent.ephemeral_system_prompt[:60] + "..." if len(agent.ephemeral_system_prompt) > 60 else agent.ephemeral_system_prompt
-        print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
+        agent._safe_print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
     if agent._use_prompt_caching:
         if agent._use_native_cache_layout and agent.provider == "anthropic":
             source = "native Anthropic"
@@ -1101,21 +1101,29 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     agent.session_start = datetime.now()
     agent.session_id = session_id or new_session_id(agent.session_start)
     _publish_session_id(agent.session_id)
+    if agent.incognito:
+        from agent.incognito import register_session
+        register_session(agent.session_id)
 
     # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
     agent.logs_dir = get_hermes_home() / "sessions"
     agent.logs_dir.mkdir(parents=True, exist_ok=True)
     _set_defaults(agent, _SESSION_STATE)
+    agent._persist_disabled = getattr(agent, "incognito", False)
+    if agent.incognito:
+        agent.save_trajectories = False
+        agent.skip_background_review = True
 
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager
     agent._checkpoint_mgr = CheckpointManager(
-        enabled=checkpoints_enabled, max_snapshots=checkpoint_max_snapshots,
+        enabled=checkpoints_enabled and not agent.incognito, max_snapshots=checkpoint_max_snapshots,
         max_total_size_mb=checkpoint_max_total_size_mb,
         max_file_size_mb=checkpoint_max_file_size_mb,
     )
 
-    agent._session_db = session_db  # optional SQLite store (CLI/gateway-provided)
+    agent._incognito_session_db = session_db if agent.incognito else None
+    agent._session_db = None if agent.incognito else session_db  # optional SQLite store
     agent._parent_session_id = parent_session_id
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
@@ -1250,6 +1258,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    read_only=getattr(agent, "incognito", False),
                     memory_enabled=agent._memory_enabled,
                     user_profile_enabled=agent._user_profile_enabled,
                 )
@@ -1261,6 +1270,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
         # A caller that rebuilds the agent per turn (gateway api_server) hands back the session's
         # already-initialized manager: providers keep their prefetch/retain state across turns instead
         # of being re-initialized (#120116). No initialize_all — the providers are already bound.
+        memory_manager.set_read_only(getattr(agent, "incognito", False))
         agent._memory_manager = memory_manager
     elif not skip_memory:
         try:
@@ -1269,6 +1279,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from agent.memory_manager import parse_prefetch_max_age as _parse_prefetch_max_age
                 agent._memory_manager = _MemoryManager(
+                    read_only=getattr(agent, "incognito", False),
                     recall_synthetic_turns=is_truthy_value(mem_config.get("recall_synthetic_turns"), default=False),
                     prefetch_max_age_seconds=_parse_prefetch_max_age(mem_config.get("prefetch_max_age_seconds")),
                 )
@@ -1885,7 +1896,7 @@ def _compressor_max_tokens(agent):
 
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
-    _selected_engine = _select_context_engine(_agent_cfg)
+    _selected_engine = None if getattr(agent, 'incognito', False) else _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex
@@ -1952,7 +1963,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     if cs.prepare_ahead and isinstance(_cc, ContextCompressor):
         from agent.prepared_compaction import PreparedCompaction
         _cc.prepared_compaction = PreparedCompaction()
-    agent.compression_checkpoint_required = cs.checkpoint_required
+    agent.compression_checkpoint_required = cs.checkpoint_required and not getattr(agent, 'incognito', False)
     from agent.conversation_compression_checkpoint import _warn_checkpoint_required_without_capable_provider
     _warn_checkpoint_required_without_capable_provider(agent)
     agent.codex_app_server_auto_compaction = cs.codex_app_server_auto
@@ -2120,6 +2131,10 @@ _USAGE_STATE: dict[str, Any] = {
 }
 
 
+from agent.incognito_agent import private_init
+
+
+@private_init
 def init_agent(
     agent, base_url: str | None = None, api_key: str | None = None, provider: str | None = None, api_mode: str | None = None,
     acp_command: str | None = None, acp_args: list[str] | None = None, command: str | None = None,
@@ -2159,6 +2174,7 @@ def init_agent(
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+    incognito: bool = False,
 ):
     from agent.safe_worker_policy import safe_worker_enabled
 
@@ -2168,6 +2184,8 @@ def init_agent(
         prefill_messages = []
         fallback_model = {}
     _install_safe_stdio()
+    from agent.incognito import is_incognito
+    agent.incognito = bool(incognito) or is_incognito(session_id)
 
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:
@@ -2264,7 +2282,7 @@ def init_agent(
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
         agent, _agent_cfg, base_url
     )
-    _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db)
+    _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, agent._session_db)
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _enforce_minimum_context(agent)
     _warn_nonagentic_hermes_model(agent)

@@ -31,7 +31,7 @@ def silence_recovery_due(runner, response: Any, turn_ctx: "TurnContext", *,
     return bool(
         not (silence_retry or scheduled_heartbeat) and isinstance(response, dict)
         and not response.get("interrupted") and response.get("completed") is not False
-        and not reaction_answered(response)
+        and (turn_ctx.persist_user_display_kind == "supervisor_checkin" or not reaction_answered(response))
         and runner._is_intentional_silence(response, response.get("final_response", ""))
         and not silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected)
         and turn_ctx._run_still_current()
@@ -67,7 +67,8 @@ async def run_silence_followup(runner, response: dict, turn_ctx: "TurnContext") 
         inbound_message_id=turn_ctx.inbound_message_id, channel_prompt=turn_ctx.channel_prompt,
         moa_config=turn_ctx.moa_config, message_type="voice" if turn_ctx.voice_turn else None,
         internal=True, title_user_message="", persist_user_message="",
-        persist_user_display_kind="internal_notification", reply_expected=turn_ctx.reply_expected,
+        persist_user_display_kind=("supervisor_checkin" if turn_ctx.persist_user_display_kind == "supervisor_checkin"
+                                   else "internal_notification"), reply_expected=turn_ctx.reply_expected,
         persist_user_display_metadata=reply_expected_metadata(turn_ctx.reply_expected),
         _post_delivery_adapter=turn_ctx._post_delivery_adapter or adapter, _silence_retry=True,
     )

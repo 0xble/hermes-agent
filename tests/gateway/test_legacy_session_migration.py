@@ -11,7 +11,7 @@ async def test_legacy_history_adoption_is_native_owned_atomic_and_retryable(tmp_
     from gateway import run
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local_title import resolve_titled_session
     from hermes_state_local import local_receipt
@@ -97,7 +97,7 @@ async def test_legacy_adoption_refuses_live_owner_and_foreign_profile_without_wr
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local_title import resolve_titled_session
     from hermes_cli.active_sessions import try_acquire_active_session, release_active_session
@@ -147,7 +147,7 @@ async def test_upgraded_oneshot_and_tool_history_resumes_by_id_and_title_but_sta
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -187,7 +187,7 @@ async def test_upgraded_desktop_history_resumes_by_id(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))

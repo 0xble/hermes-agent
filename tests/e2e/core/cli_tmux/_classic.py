@@ -143,6 +143,9 @@ BASE_CONFIG = f"""model:
   context_length: 128000
 agent:
   api_max_retries: 1
+# Answer unrelated onboarding before a low hosted disk can stop a resume.
+sessions:
+  auto_prune: false
 gateway:
   # Exercise completion delivery, not the fork's 5-minute routine-wake coalescing window.
   completion_notification_batch_window_seconds: 0

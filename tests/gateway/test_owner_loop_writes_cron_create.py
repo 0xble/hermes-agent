@@ -12,7 +12,8 @@ from gateway.config import GatewayConfig
 from gateway.session import SessionStore
 from gateway.session_authority import SessionAuthority
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch, list_session_admissions
+from hermes_state_runtime import list_session_admissions
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def test_cron_submit_creation_commit_waits_off_the_owner_loop(tmp_path, monkeypatch):

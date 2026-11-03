@@ -1,4 +1,5 @@
 """An exact mutation retry reconciles the runtime projection the failed first attempt left behind."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,7 @@ async def test_exact_retry_repairs_runtime_after_post_commit_failure_without_sec
         db.append_message('s', role='user', content='keep')
         db.append_message('s', role='assistant', content='drop')
         db.append_message('s', role='user', content='drop too')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         evictions = []
 
         def evict(route):
@@ -66,7 +67,7 @@ async def test_rewind_replay_never_evicts_a_later_admissions_running_agent(tmp_p
         db.append_message('s', role='user', content='keep')
         db.append_message('s', role='assistant', content='drop')
         db.append_message('s', role='user', content='drop too')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         runner = object.__new__(GatewayRunner)
         runner._agent_cache, runner._agent_cache_lock, runner._running_agents = OrderedDict(), threading.Lock(), {}
         runner._draining = False

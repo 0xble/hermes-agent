@@ -9,14 +9,8 @@ import pytest
 from gateway.session_authority import LiveSession
 from gateway.session_contract import Principal, SessionRef, Submission
 from gateway.session_results import admission_result, finish_result
-from hermes_state_runtime import (
-    RuntimeStoreError,
-    admit_session_input,
-    begin_runtime_epoch,
-    claim_session_input,
-    get_session_admission,
-    recover_session_inputs,
-)
+from hermes_state_runtime import RuntimeStoreError, admit_session_input, claim_session_input, get_session_admission, recover_session_inputs
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.mark.asyncio
@@ -59,6 +53,8 @@ async def test_discard_closure_failure_keeps_unknown_fence_and_retry_is_exact(ow
         claim_session_input(owner.db, epoch=owner.epoch, session_id='s')
     monkeypatch.setattr(session_results, 'close_discarded_turn', close)
     settled = await owner.resolve_unknown(actor, ref, first['admission_id'], claim['generation'])
+    from gateway.session_ingress_media import media_releases_idle
+    await media_releases_idle(owner)  # Discard queues the cleanup rather than awaiting its scan
     assert not Path(references[0]['path']).exists()
     assert owner.db.latest_conversation_role(target) == 'assistant'
     successor = claim_session_input(owner.db, epoch=owner.epoch, session_id='s')

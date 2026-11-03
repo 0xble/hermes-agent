@@ -26,7 +26,7 @@ class Owner:
         from gateway.session_contract import SessionRef
         from gateway.session_controls import AuthorityConnection
         from hermes_state import SessionDB
-        from hermes_state_runtime import begin_runtime_epoch
+        from tests.fakes.runtime_owner import begin_runtime_epoch
         self.loop, self.events, self.running = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
         self.pause, self.gaps, self.turns, self.ref = pause, [], [], SessionRef("owned", "s")
         self.running.set()

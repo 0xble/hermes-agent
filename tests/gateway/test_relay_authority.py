@@ -30,7 +30,7 @@ async def probe(peer):
     from gateway.relay.ws_transport import WebSocketRelayTransport, _event_from_wire
     from gateway.run import GatewayRunner
     from gateway.run_api import start_gateway_api, stop_gateway_api
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import SessionRef
     from gateway.session_envelope import prepare_native, restore_native
     from hermes_cli import web_server

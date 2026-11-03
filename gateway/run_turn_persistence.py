@@ -668,11 +668,3 @@ class GatewayTurnPersistenceMixin:
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
         ), error=local_error)
-
-    def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
-        """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
-        logger.info(
-            "Discarding stale agent result for %s — generation %d is no longer current",
-            _quick_key or "?", run_generation,
-        )
-        self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)

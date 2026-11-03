@@ -396,7 +396,7 @@ class SessionTelegramTopicsMixin:
             result["_reserved"] = bool(cur.rowcount)
             return result
 
-        return self._execute_write(_do)
+        return self._execute_write(_do, skip_result={})
 
     def set_telegram_topic_owner_active(
         self, *, chat_id: str, owner_key: str, thread_id: str, topic_name: str,
@@ -556,7 +556,7 @@ class SessionTelegramTopicsMixin:
                     )
             return deleted
 
-        return self._execute_write(_do)
+        return self._execute_write(_do, skip_result=0)
 
     def bind_telegram_topic(
         self, *, chat_id: str, thread_id: str, user_id: str, session_key: str,
@@ -599,7 +599,7 @@ class SessionTelegramTopicsMixin:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(profile_name, chat_id, thread_id) {on_conflict}
                 """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, now, now))
-        self._execute_write(_do)
+        self._execute_write(_do, session_ids=(session_id,))
 
     def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
         """True if the session is bound to any Telegram DM topic (absent tables → False)."""
@@ -632,7 +632,7 @@ class SessionTelegramTopicsMixin:
                 ).fetchall()
         return [self._rich_row(row) for row in rows]
 
-    def get_telegram_topic_icon_state(self, chat_id: str, thread_id: str, profile_name: str = "default") -> Optional[Dict[str, Any]]:
+    def get_telegram_topic_icon_state(self, chat_id: str, thread_id: str, profile_name: str = "default") -> Optional[dict[str, Any]]:
         row = self._topic_read_one(
             "SELECT custom_emoji_id, emoji, owner, updated_at FROM telegram_topic_icon_state WHERE profile_name=? AND chat_id=? AND thread_id=?",
             (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(thread_id)),
@@ -672,7 +672,7 @@ class SessionTelegramTopicsMixin:
             ),
         )
 
-    def list_recent_telegram_topic_icons(self, chat_id: str, limit: int = TELEGRAM_TOPIC_ICON_HISTORY_LIMIT, profile_name: str = "default") -> List[str]:
+    def list_recent_telegram_topic_icons(self, chat_id: str, limit: int = TELEGRAM_TOPIC_ICON_HISTORY_LIMIT, profile_name: str = "default") -> list[str]:
         try:
             with self._read_ctx() as conn:
                 rows = conn.execute("SELECT emoji FROM telegram_topic_icon_history WHERE profile_name=? AND chat_id=? ORDER BY selected_at DESC, rowid DESC LIMIT ?",

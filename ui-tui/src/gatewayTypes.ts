@@ -1,9 +1,12 @@
 import type { UsageModelData } from '@hermes/shared/billing'
 import type {
+  AdmissionStatus,
+  CanonicalCorrectionAck,
   ConnectionRequestPayload,
   GatewayEvent,
   GatewayEventMap,
   InflightTurn,
+  PromptSubmitStatus,
   TranscriptMessage,
   Usage
 } from '@hermes/shared/gateway-events'
@@ -375,7 +378,7 @@ export interface PromptSubmitResponse {
   target_profile_home?: string
   outcome?: string | null
   ok?: boolean
-  status?: 'dropped' | 'queued' | 'redirected' | 'rejected' | 'steered' | 'streaming'
+  status?:  'rejected' | AdmissionStatus['status'] | CanonicalCorrectionAck['status'] | PromptSubmitStatus
   reason?: string
   message?: string
   /** Set when the submitted text was a bare voice stop phrase consumed

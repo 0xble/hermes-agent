@@ -492,7 +492,7 @@ async def test_goal_continuation_keeps_channel_pin_through_session_authority(tmp
     producer's copy or native admission refuses it as ``not_found``."""
     import gateway.run as gr
     from gateway.platforms.base import SendResult
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
     from tests.waiting import async_wait_until
 

@@ -1,11 +1,12 @@
 """An owner ``rewind`` of a composite compaction carrier keeps its handoff (main parity)."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from agent.context_compressor import HISTORICAL_TASK_HEADING, SUMMARY_PREFIX, _SUMMARY_END_MARKER
 from hermes_state import SessionDB
 import hermes_state_runtime as rt
 
 
 def _rewind(db, target, request_id, **extra):
-    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
     session = db.get_session('s')
     return rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='s', request_id=request_id,
         expected_revision=session.get('runtime_revision') or 0, expected_generation=session['runtime_generation'],

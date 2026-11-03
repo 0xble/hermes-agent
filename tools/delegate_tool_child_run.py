@@ -222,6 +222,9 @@ def _dump_subagent_timeout_diagnostic(
     """Structured diagnostic for a subagent that timed out before any API call (otherwise "timed out with no
     response", 0 API calls, nothing to inspect): ``~/.hermes/logs/subagent-timeout-<sid>-<ts>.log`` with the
     child's config, prompt/schema sizes, activity snapshot and worker stack. Path, or None on failure."""
+    from agent.incognito import is_incognito
+    if getattr(child, "incognito", False) or is_incognito(getattr(child, "session_id", None)):
+        return None
     try:
         from hermes_constants import get_hermes_home
         import datetime as _dt

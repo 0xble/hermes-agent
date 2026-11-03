@@ -101,7 +101,7 @@ class _SourceTask:
         from gateway.hosted_rooms import create_room, local_authority_gateway_id
         from gateway.hosted_room_attachments import HostedRoomAttachmentStore
         from hermes_state import SessionDB
-        from hermes_state_runtime import begin_runtime_epoch
+        from tests.fakes.runtime_owner import begin_runtime_epoch
         import gateway.run
         monkeypatch.setenv('HERMES_HOME', str(tmp_path))
         self.homes = {'other': str(tmp_path / 'profiles' / 'other')}

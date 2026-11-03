@@ -6,7 +6,8 @@ import threading
 import pytest
 
 from gateway.session_contract import Submission
-from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch, get_session_admission
+from hermes_state_runtime import RuntimeStoreError, get_session_admission
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tests.gateway.test_session_authority_cancel_settlement import _authority, ACTOR, REF
 
 
@@ -35,6 +36,9 @@ async def test_commit_then_error_still_releases_terminal_native_media(tmp_path, 
         assert retained.exists()
         await asyncio.wait_for(authority.sessions['s'].task, 5)
         assert get_session_admission(db, admission_id=receipt.admission_id)['status'] == 'terminal'
+        # Terminal media cleanup is queued off the FIFO path; it still runs after a commit-then-error.
+        from gateway.session_ingress_media import media_releases_idle
+        await asyncio.wait_for(media_releases_idle(authority), 5)
         assert not retained.exists(), 'commit-then-error skipped terminal media cleanup'
 
 

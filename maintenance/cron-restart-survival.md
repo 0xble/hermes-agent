@@ -1,6 +1,42 @@
 # Cron restart survival on macOS
 
-Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`.
+Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`, `cron-oneshot-retirement-alert`.
+
+## One-shot retirement notices
+
+A time-sensitive one-shot can expire while the host or scheduler is down. Never
+execute it late by default. Before retiring a never-completed one-shot outside
+its grace window or with a spent dispatch claim, commit one failure notice to
+the existing cron delivery outbox under a stable per-job identity. Preserve an
+explicit non-local `failure_deliver` or `deliver` target. For local or review-only
+output lanes, resolve its creator origin, then the ordinary configured-home
+fallback. Keep the failure incident sink and ordinary failure-notification policy. A
+failed queue commit keeps the job for retry and compare-clears only the rejected
+attempt's run/fire claims; a successor's claim is never released. Both in-grace
+spent-budget and past-grace retirement share diagnostic routing, including
+re-armed records with a prior completion. A restart between queueing and
+removal reuses the outbox receipt, including its terminal tombstone. Keep the
+local diagnostic and removal. An interrupted dispatch may have partial effects;
+do not claim that it certainly never ran or automatically replay it.
+
+Retirement queues the alert in `cron/deliveries.db`; only a gateway drains that
+outbox. Desktop-only and `hermes cron tick` setups receive the chat alert when a
+gateway next runs. The failure incident and local output file are recorded
+immediately during retirement; queueing does not mean chat delivery has happened.
+
+The notice names the job id/name, scheduled instant, lateness, reason and manual
+recreation action. Single-profile and multiplex startup capture the previous
+heartbeat before replacing it, so the alert can report known startup/heartbeat
+instants without inventing an exact downtime onset. This extends the existing
+retirement/delivery boundary; no new service, transport, or inference run.
+
+Contract tests: `tests/cron/test_oneshot_retirement_alert.py`. Exercise the full
+`tests/cron/` suite for in-grace, recurring, recovery, and delivery compatibility.
+Retire `cron-oneshot-retirement-alert` when a released upstream provides the
+same local-lane-independent, crash-idempotent owner alert without late firing.
+Upstream proposals #122765 and #138153 were inspected: they primarily widen or
+opt into catch-up and do not establish this safe-default owner alert contract.
+Rollback by reverting this logical patch; no live jobs or policy need mutation.
 
 ## Contract
 
@@ -19,6 +55,108 @@ for canonical persistence. It never opens the owner's `state.db`. Owner loss
 pauses persistence until authenticated epoch adoption, without replaying inference
 or tools. Explicit cron cancellation uses the admission's durable cancellation
 marker. Gateway shutdown is not that cancellation.
+
+Worker owner discovery and authentication retry pre-send lifecycle failures for
+up to 90 seconds per RPC call, rediscovering the endpoint and minting a fresh ticket after
+owner replacement. Discovery, identify, ticket and WebSocket-open calls use the
+remaining connection budget. The event-loop synchronous-RPC guard still fails
+before discovery or waiting. Permission, protocol and self-RPC refusals remain
+terminal. The existing closed-on-entry send retry stays limited to 1. A chained
+send exception may follow a partial or complete socket write, so it is now
+outcome-unknown, just like a successful send followed by a lost response. Neither
+is automatically resent by WorkerRPC. The connection-reuse regression covers
+both a lost response and a write exception after the owner receives the frame.
+
+RuntimeSessionStore journals the exact operation before sending. An explicit
+`stale_epoch` refusal permits authenticated `worker.adopt`, then retry of that
+same pending sequence and payload. Owner receipt identity remains
+`(execution_id, sequence, payload_digest)`, with epoch and generation fencing.
+Non-adoptable managed workers and retired children remain refused. Exhausted
+connection patience reports `owner_restart`, not disk-full/lock guidance, and
+leaves pending writes in the existing journal for explicit retry or verified
+adoption. This does not claim that a queued operation is canonically committed.
+The detached executor retains its existing pause-until-adoption contract across
+multiple bounded connection windows, including exhaustion while adopting. Its
+outer reconnect wrapper handles escaped ConnectionClosed and receipt timeouts by
+authenticating `worker.adopt`, then replaying only the identical journal entry.
+The owner returns the stored receipt for a matching execution, sequence and
+payload digest, so even a committed write with a lost reply produces only 1
+canonical row and 1 receipt. This does not relax WorkerRPC's inner no-resend guard
+or replay inference or tools. Discovery resets and broken pipes retain the
+interrupted-control-response cause instead of becoming invalid-control-peer
+refusals. Unclassified inaccessible lock state, invalid runtime state and stale
+foreign locks remain retriable while replacement settles. Explicit protocol
+mismatches, malformed peers, authorization failures and assignment refusals remain
+terminal.
+Regression coverage is `tests/agent/test_worker_owner_restart.py`, alongside the
+connection-reuse, outbox-adoption and persistence-explainer suites. Detached
+multi-window and real-owner exactly-once receipt replay coverage is
+`tests/cron/test_detached_owner_restart.py`, including lost replies, double
+closed-on-entry, chained writes and receipt timeouts. Discovery transport,
+transient lock/state and terminal protocol/peer coverage is
+`tests/agent/test_worker_discovery_recovery.py`.
+
+The 2026-10-30 detached `maintain-filesystems` execution failed while its owner
+was exiting: SIGTERM at 2:21:55 AM PT, zero-second drain timeout at 2:21:56 AM PT,
+live writers retained at 2:22:43 AM PT, watchdog at 2:22:53 AM PT, and
+`incomplete_control_response` from append/finalize at 2:22:54 AM PT. A successor
+started at 2:22:57 AM PT. The control-identify EOF preceded the persistence send,
+so waiting for rediscovery is safe. The old classifier instead selected the
+unknown disk/lock explanation. Upstream main
+`92213f976785c3582502d84495cb4e5aad5833c8` and related WorkerRPC PRs were checked,
+including open [#140128](https://github.com/NousResearch/hermes-agent/pull/140128),
+which concerns loop-thread poisoning, not owner-transition patience. Retire this
+extension when a released upstream satisfies the same bounded pre-send retry,
+authenticated adoption, pending-journal and truthful-error contracts.
+
+Ambiguous canonical submission is observed over fresh gateway links with the original
+job/request identity, never by submitting a new fire. Known admissions are reread by their
+exact receipt. Four bounded fresh-link reads wait through a delayed commit; exhausted
+patience retains the admission journal and an unverified pause. One `missing` lookup is a
+snapshot, not proof of non-admission. To avoid an indefinitely paused never-sent fire,
+reconciliation settles a missing submit as failed only after
+`MISSING_SUBMIT_GRACE_SECONDS = 600` and `MISSING_SUBMIT_READS = 2` consecutive successful
+missing owner reads. The journal records `submit_started_at` before sending (legacy journals
+pin their original mtime before the first recovery write); non-missing observations and
+failed/refused reads reset the streak. A saved admission receipt or worker result is never
+aged into a never-committed failure. The failure records the exact grace/count fence, retires
+the journal and lifts only the pause it caused, allowing the next scheduled occurrence.
+
+This is the bounded-age fallback, not a hard epoch fence: existing journals do not bind a
+submit to the owner's epoch, and observing a current epoch separately cannot prove which
+owner received that frame. `cron.submit` is idempotent under the original job/request id;
+the owner's shielded request table retains a received submit even when its socket leaves.
+A read can overtake that task in the admission queue, so repeated missing reads alone are
+not final. Ten minutes is twenty times the 30-second answer deadline and fifteen times
+the combined 20-second SQLite write budgets for session creation and admission, leaving
+ample time for ordered-admission queueing. Admission does not await model/tool execution.
+A pathological owner stalled beyond ten minutes can still commit a late shielded frame:
+this bound is an explicit operational liveness tradeoff, never a cancellation guarantee,
+and no automatic resubmission of the uncertain occurrence is made.
+
+A verified terminal result also lifts its uncertainty pause through the live scheduler's
+tail, not just receipt reconciliation. Journal save, pause read/merge/write, canonical-settled
+stamp and retirement share the existing jobs lock plus atomic replacement. Both the firer
+and recovery observer read the current job under that lock before pausing: an already-paused
+job keeps its original timestamp/reason and grants no pause ownership to this journal.
+Repeated uncertainty preserves an existing ownership token; neither a pre-existing hold
+nor a later operator pause can be overwritten or lifted by an older result. Gateway RPC timeouts preserve
+method, answer phase, timeout cause and stable identifiers instead of becoming connection
+failures. Direct connection/RPC callers were audited: chat, discard, session pruning,
+Kanban, web mutations, worker persistence and RPC-forwarding boundaries already handle
+transport errors or deliberately propagate them to their transport boundary. Goal peer's
+CLI boundary now also catches `OSError` (including `TimeoutError`), emits the original error
+and exits nonzero without a traceback or an untrue "not submitted" claim. Recovery-read
+refusals log the bounded owner reason without reclassifying the original submit failure.
+Detached registration also retries only the same birth/generation/secret-fenced scope;
+a lost register receipt never generates a replacement execution. This is an exception
+owned by the idempotent worker handshake, not a relaxation of WorkerRPC's no-resend guard.
+Proof: `tests/cron/test_ambiguous_admission.py`, `tests/cron/test_cron_recover_pause.py`,
+`tests/cron/test_detached_owner_restart.py`, and
+`tests/hermes_cli/test_gateway_client_failure_phase.py`,
+`tests/cron/test_missing_admission_bound.py`, `tests/cron/test_preexisting_recovery_pause.py`,
+`tests/cron/test_recovery_refusal_diagnostics.py`,
+and `tests/hermes_cli/test_goal_peer_transport_errors.py`.
 
 The existing admission journal captures the worker's result until the canonical
 owner commits the same admission's terminal receipt. Reconciliation imports that

@@ -4,6 +4,7 @@ Older releases also stamp ``schema_version`` 31 and never refuse a newer schema,
 itself has to carry the refusal: their ``sessions delete`` / ``prune`` used to die on the bare
 ``FOREIGN KEY constraint failed`` of the ``ON DELETE RESTRICT`` ledgers (jquesnelle, #106742).
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 from contextlib import closing
 
@@ -45,7 +46,7 @@ def _older_release_delete(path, sid):
 def test_an_older_release_delete_of_a_ledgered_session_is_refused_with_the_way_back(tmp_path):
     path = tmp_path / 'state.db'
     with closing(SessionDB(path)) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         _settled(db, epoch, 'ledgered')
         db.create_session('plain', source='cli')
 
@@ -68,7 +69,7 @@ def test_an_older_release_delete_of_a_ledgered_session_is_refused_with_the_way_b
 def test_an_upgraded_store_gains_the_guard_on_its_next_open(tmp_path):
     path = tmp_path / 'state.db'
     with closing(SessionDB(path)) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         _settled(db, epoch, 's')
     with closing(sqlite3.connect(path)) as conn:
         conn.execute('DROP TRIGGER sessions_runtime_ledger_delete_guard')

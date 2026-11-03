@@ -1,3 +1,4 @@
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sys
 
 import pytest
@@ -51,11 +52,11 @@ def test_sessions_delete_with_unfinished_turn_points_to_discard(tmp_path, monkey
 
     db = SessionDB(tmp_path / 'state.db')
     db.create_session('s1', source='cli')
-    epoch = rt.begin_runtime_epoch(db, instance_id='a')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='a')
     rt.admit_session_input(db, epoch=epoch, principal_id='p', session_id='s1', request_id='r', payload={'text': 'x'})
     if status == 'unknown':
         rt.claim_session_input(db, epoch=epoch, session_id='s1')
-        rt.recover_session_inputs(db, epoch=rt.begin_runtime_epoch(db, instance_id='b'))
+        rt.recover_session_inputs(db, epoch=_begin_owned_runtime_epoch(db, instance_id='b'))
     monkeypatch.setattr(hermes_state, 'SessionDB', lambda *args, **kwargs: db)
     monkeypatch.setattr(sys, 'argv', ['hermes', 'sessions', 'delete', 's1', '--yes'])
     with pytest.raises(SystemExit) as exited:

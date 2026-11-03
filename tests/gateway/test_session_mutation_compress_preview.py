@@ -4,6 +4,7 @@ Review of #106742 (F10): the ACP/CLI canonical path forwarded ``--preview`` as `
 and the authority summarized and prepared replacement history. The shared parser every native
 surface uses must govern the payload, and a preview must not write a receipt, a summary or a revision.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from types import SimpleNamespace
 
 import pytest
@@ -35,7 +36,7 @@ async def test_preview_mutation_reports_without_summarizing_or_writing(tmp_path,
     monkeypatch.setattr(run, '_load_gateway_config', dict)
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db
-    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
     summaries = []
     monkeypatch.setattr(ContextCompressor, '__init__', lambda self, *a, **k: None)
     monkeypatch.setattr(ContextCompressor, 'compress', lambda self, messages, **kw: summaries.append(kw) or messages)
@@ -87,7 +88,7 @@ async def test_canonical_compress_runs_the_live_agents_pre_compress_memory_hook(
     monkeypatch.setattr(run, '_load_gateway_config', dict)
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db
-    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
     from agent import compaction_events
     from hermes_constants import get_hermes_home
 
@@ -150,7 +151,7 @@ async def test_input_is_admitted_while_compress_summarizes_but_not_claimed_until
     monkeypatch.setattr(run, '_load_gateway_config', dict)
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db
-    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
     summarizing, release = threading.Event(), threading.Event()
 
     def compress(self, messages, **kw):
@@ -206,7 +207,7 @@ async def test_a_compress_that_removes_nothing_reports_mains_no_changes_without_
     monkeypatch.setattr(run, '_load_gateway_config', dict)
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db
-    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
     monkeypatch.setattr(ContextCompressor, '__init__', lambda self, *a, **k: None)
     monkeypatch.setattr(ContextCompressor, 'compress', lambda self, messages, **kw: messages)
     runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
@@ -249,7 +250,7 @@ async def test_no_op_compress_without_a_resident_agent_estimates_the_stored_prom
     monkeypatch.setattr(run, '_load_gateway_config', dict)
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db
-    epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
     monkeypatch.setattr(ContextCompressor, '__init__', lambda self, *a, **k: None)
     monkeypatch.setattr(ContextCompressor, 'compress', lambda self, messages, **kw: messages)
     runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,

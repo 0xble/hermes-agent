@@ -53,7 +53,7 @@ async def probe(peer, target):
     from gateway.platforms.base import BasePlatformAdapter, SendResult
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_cli import web_server
     from gateway.run_api import start_gateway_api, stop_gateway_api
     from tools.approval import list_gateway_approvals, resolve_gateway_approval

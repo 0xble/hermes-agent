@@ -50,6 +50,59 @@ async def recover_failed_settlement(authority, row):
             await asyncio.sleep(1)
 
 
+async def requeue_shutdown_unstarted(authority, ref, live, row):
+    """A native turn this owner's restart or shutdown stopped before its first model call ran
+    nothing: the claim goes back to its FIFO place for the successor, which runs it once, and this
+    process sends nothing for it (no "send it again"). True when requeued; anything else settles
+    as before. An API, LOCAL or managed claim has its own caller and receipts, so it never qualifies."""
+    if not authority.runner._draining or authority.retiring:
+        return False  # the common case: no restart, nothing to decide
+    admission_id = row['admission_id']
+    result = (authority.pending_results.get(admission_id) or {}).get('result') or {}
+    from gateway.run_interrupt_cause import is_owner_shutdown_interrupt
+    if not ('native_text_v1' in (row.get('payload') or {}) and result.get('interrupted')
+            and type(result.get('api_calls')) is int and result['api_calls'] == 0
+            and is_owner_shutdown_interrupt(result)):
+        return False
+    from gateway.session_ingress import deliver_settled, waiter_replies
+    from gateway.session_queued_controls import publish_transfers
+    from gateway.session_runtime_workers import track_mutation
+    from hermes_state_runtime import requeue_unstarted_claim
+    try:
+        transfers = tuple(_transfers(authority, live, row) or ())
+        requeued = await asyncio.shield(track_mutation(authority, asyncio.to_thread(
+            requeue_unstarted_claim, authority.db, epoch=authority.epoch, admission_id=admission_id,
+            generation=row['generation'], transfers=transfers, transcript_mark=row.get('transcript_mark'))))
+    except (OSError, sqlite3.Error, RuntimeStoreError):
+        logger.warning('Requeue of shutdown-interrupted admission %s failed; settling it', admission_id, exc_info=True)
+        return False
+    if not requeued:
+        return False
+    logger.info('Admission %s was stopped by shutdown before its first model call; requeued for the next owner',
+                admission_id)
+    authority.pending_results.pop(admission_id, None)
+    authority.pending_deliveries.pop(admission_id, None)
+    waiter_replies(authority).pop(admission_id, None)
+    with live.event_stream.lock:
+        live.event_stream.execution = {}
+    for pending in (authority.pending_stops, authority.pending_stop_causes, authority.pending_steers, authority.adopted):
+        pending.pop(ref.session_id, None)
+    publish_transfers(authority, ref, row['generation'])
+    authority.deferred_resets.pop(live.route, None)
+    # Nothing was interrupted mid-work: the successor's replay is the resume, not a synthetic one.
+    store = getattr(authority.runner, 'async_session_store', None)
+    if store is not None:
+        try:
+            await store.clear_resume_pending(live.route)
+        except Exception:
+            logger.debug('clear_resume_pending after requeue failed for %s', live.route, exc_info=True)
+    if authority.sessions.get(ref.session_id) is live:
+        authority._publish_pending(ref)
+    await deliver_settled(authority, admission_id)  # nothing to send: releases a held crash marker
+    await authority._resolve_settled_waiter(admission_id, '')
+    return True
+
+
 def completion_payload(row, settled, response, captured):
     # ``status`` is the message.complete contract's TurnStatus: the Desktop
     # extends a Stopped bubble to the persisted partial only on 'interrupted'.
@@ -158,15 +211,6 @@ def gateway_refusal_boundary(captured, outcome):
     return error, {'error': error, 'error_surface': dict(surface)}
 
 
-def _release_media(authority, row):
-    """Terminal media cleanup: its own write txn after publication, never under the stream lock."""
-    try:
-        from gateway.session_ingress_media import release_admission_media
-        release_admission_media(authority.db, row['admission_id'])
-    except Exception:
-        logger.exception('Terminal media cleanup failed for admission %s', row['admission_id'])
-
-
 def commit_and_publish(authority, live, ref, row, response, outcome, captured, settlement):
     """Worker-thread settlement: redaction, encoding and the SQLite write never stall the owner loop.
 
@@ -177,6 +221,7 @@ def commit_and_publish(authority, live, ref, row, response, outcome, captured, s
     so none sees the terminal row without its completion. ``settlement`` receives the committed
     ``(settled, response)`` before publication, so a publish failure is not a lost commit.
     The caller publishes idle ``session.info`` on the loop afterwards (bot receipt wakeups are tasks).
+    Terminal media cleanup is not part of it: ``settle_with_retry`` queues it once this returns.
     """
     from gateway.session_results import finish_result, prepare_result
     # Compaction, redaction and outcome flags are CPU-only.
@@ -197,7 +242,6 @@ def commit_and_publish(authority, live, ref, row, response, outcome, captured, s
     finally:
         with live.event_stream.lock:
             live.settling.pop(admission_id, None)
-    _release_media(authority, row)
 
 
 # Pauses between settlement attempts after a transient storage error (held writer past its
@@ -212,11 +256,15 @@ async def settle_with_retry(authority, live, ref, row, response, outcome, captur
     lives only in memory. Retrying is exact: a write that committed before reporting failure is
     read back by ``finish_result``, and a failure after the commit (``settled`` set) never retries.
     A fence refusal (``RuntimeStoreError``) is not transient and is raised at once."""
+    from gateway.session_ingress_media import release_admission_media_later
     from gateway.session_runtime_workers import track_mutation
     for delay in (*_SETTLE_RETRY_DELAYS_S, None):
         try:
-            return await asyncio.shield(track_mutation(authority, asyncio.to_thread(
+            await asyncio.shield(track_mutation(authority, asyncio.to_thread(
                 commit_and_publish, authority, live, ref, row, response, outcome, captured, settlement)))
+            # Queued, never awaited: the next FIFO row and this turn's delivery do not wait on it.
+            release_admission_media_later(authority, row['admission_id'])
+            return
         except (OSError, sqlite3.Error) as exc:
             if delay is None or 'settled' in settlement:
                 raise
@@ -230,6 +278,7 @@ def publish_terminal(authority, ref, row, settled, response, captured):
     live = authority.sessions[ref.session_id]
     with live.event_stream.lock:
         _publish_completion(authority, live, ref, row, settled, response, captured)
-    _release_media(authority, row)
+    from gateway.session_ingress_media import release_admission_media_later
+    release_admission_media_later(authority, row['admission_id'])
     # Idle follows the completion so a viewer cannot mistake a settled turn for a lost frame.
     authority._publish_pending(ref)

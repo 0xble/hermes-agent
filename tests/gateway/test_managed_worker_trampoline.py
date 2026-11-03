@@ -20,7 +20,8 @@ import pytest
 
 from hermes_cli.process_identity import worker_birth
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
+from hermes_state_runtime import admit_session_input, claim_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tests.gateway.fixtures.local_recovery_probe import child_env, daemon, rpc, websocket
 from tests.waiting import async_wait_until
 

@@ -1,27 +1,34 @@
 import time
+from datetime import datetime, timezone
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionEntry, SessionSource
 from hermes_cli import goals
-
-
-class _FakeSessionEntry:
-    session_id = "sid-gateway-goal-config"
 
 
 class _FakeSessionStore:
     def __init__(self):
-        self.entry = _FakeSessionEntry()
+        now = datetime.now(timezone.utc)
+        self.entry = SessionEntry("agent:main:discord:channel:goal-config",
+                                  "sid-gateway-goal-config", now, now)
 
     def get_or_create_session(self, source, **_kwargs):
+        self.entry.origin = source
         return self.entry
 
     def _generate_session_key(self, source):
-        return "agent:main:discord:channel:goal-config"
+        return self.entry.session_key
+
+    def lookup_by_session_key(self, key):
+        return self.entry if key == self.entry.session_key else None
+
+    def _db_for_key(self, key):
+        assert key == self.entry.session_key
+        return goals._get_session_db()
 
 
 def _make_runner() -> GatewayRunner:

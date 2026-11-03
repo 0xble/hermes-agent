@@ -2236,11 +2236,22 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         _catch_up_immutable_release(defer=opts.no_gateway_restart, sha=fetched, source=source)
         _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
         return
+    # Failed-update notices may say "Nothing changed" only from this record: the active release
+    # before the build, and that activation had not started. The terminal receipt adds "after".
+    from hermes_cli.immutable_releases import release_identity
+    from hermes_cli.update_receipt import record_fact
+    immutable_proof = {"before": release_identity(home), "candidate": str(paths.release(fetched)),
+                       "source": str(source), "activation_started": False}
+    record_fact("immutable_update", immutable_proof)
+    record_fact("staging_runtime_mutation_started", False)
     # stage_release archives the selected target (FETCH_HEAD or a local carry-forward merge),
     # builds web and its own locked environment in a build-aside directory, then publishes it.
     candidate, _ = stage_release(source, home, sha=fetched, branch=selected_branch)
     if candidate != paths.release(fetched) or not _release_is_ready(candidate, fetched):
         raise RuntimeError("staged release does not match fetched commit")
+    # Activation can change runtime state from the pending marker onward. Staging's PM sync
+    # separately records staging_runtime_mutation_started before it can edit shared profiles.
+    record_fact("immutable_update", {**immutable_proof, "activation_started": True})
     _write_fleet_restart_pending_marker(
         expected_sha=fetched,
         runtimes=_pre_update_plan.to_dict().get("runtimes") if _pre_update_plan is not None else None,

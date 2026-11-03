@@ -81,6 +81,7 @@ def classic_mode(settings: dict) -> bool:
 
 
 def _inside(target: str, roots: list[str]) -> Optional[str]:
+    target = os.path.normcase(os.path.abspath(target))
     for root in roots:
         if target == root or target.startswith(root + os.sep):
             return root
@@ -122,7 +123,8 @@ def _psutil_live_pids(roots: list[str], exclude: frozenset) -> dict[str, list[in
         try:
             if proc.pid in exclude:
                 continue
-            root = _inside(os.path.realpath(proc.cwd()), roots)
+            # OS cwd is physical; compare lexically without statting another owner's paths.
+            root = _inside(proc.cwd(), roots)
         except (psutil.Error, OSError):
             continue
         if root is not None:
@@ -134,7 +136,7 @@ def live_process_pids(paths, exclude=()) -> dict[str, list[int]]:
     """``{path: [pid, ...]}`` for every *path* some live process works in: cwd or an open fd on
     Linux (``/proc``), cwd elsewhere (psutil, best-effort). Keys are the paths as given;
     *exclude* pids are ignored (an exiting session's own process)."""
-    real = {os.path.realpath(str(p)): str(p) for p in paths}
+    real = {os.path.normcase(os.path.realpath(str(p))): str(p) for p in paths}
     if not real:
         return {}
     roots = sorted(real, key=len, reverse=True)
@@ -203,7 +205,8 @@ def _plan_survivor(repo_root: str, entry: Path, verdict: str, lock_state, settin
     from hermes_cli import worktree_ops as ops
     from hermes_cli.worktree_archive import archive_preflight
     what = _ARCHIVE_REASONS[verdict]
-    lock_state = ops._worktree_lock_is_live(repo_root, str(entry), timeout=5)
+    lock_state = ops._worktree_lock_is_live(
+        repo_root, str(entry), timeout=5, initializing_before=now - tier_hours * 3600)
     if lock_state == "live":
         return "skip-live-lock", "lock owner still running", lock_state, None
     active = _last_activity(str(entry))
@@ -271,7 +274,7 @@ def plan_sweep(repo_root: str, max_age_hours: int = 24, settings: Optional[dict]
         kanban = re.match(r"^t_[0-9a-f]+$", entry.name)
         decisions.append(Decision(entry.name, str(entry), "skip-kanban" if kanban else "skip-young",
                                   "owned by kanban gc" if kanban else "younger than its age tier", round(age, 1)))
-    verdicts = ops._classify_prune_candidates(repo_root, candidates) if candidates else []
+    verdicts = ops._classify_prune_candidates(repo_root, candidates, max_age_hours, now) if candidates else []
     # archive_dirty: false is the classic pruner verbatim (I6), which has no process check.
     live = {} if classic_mode(settings) else live_process_pids([str(v[0]) for v in verdicts])
     for entry, mtime, force, verdict, lock_state in verdicts:
@@ -349,7 +352,7 @@ def _index_moved(path: str, captured: str) -> Optional[str]:
 
 def archive_then_remove(repo_root: str, path: str, *, reason: str, max_untracked_mb: float,
                         unlock: bool, remote_heads_fn=None, keep_branch: bool = False,
-                        exclude_pids=(),
+                        exclude_pids=(), initializing_before: Optional[float] = None,
                         ) -> tuple[str, Optional[str], bool, Optional[str]]:
     """Snapshot *path*, then remove it -> ``(archive_ref, kept_branch, removed, why_kept)``.
 
@@ -362,7 +365,7 @@ def archive_then_remove(repo_root: str, path: str, *, reason: str, max_untracked
     otherwise the archive ref anchors its commits and the local branch is deleted.
     """
     from hermes_cli.worktree_archive import snapshot_worktree
-    from hermes_cli.worktree_ops import _git, _git_quiet, release_lsp_clients
+    from hermes_cli.worktree_ops import _git, _unlock_owned_worktree, release_lsp_clients
     from hermes_cli.worktree_retention import removal_blocker
     from hermes_cli._subprocess_compat import noninteractive_git_env
     started = time.time()
@@ -374,8 +377,8 @@ def archive_then_remove(repo_root: str, path: str, *, reason: str, max_untracked
         logger.warning("Archived %s to %s but keeping it: %s", path, arc.ref, busy)
         return arc.ref, None, False, busy
     release_lsp_clients(path)
-    if unlock:
-        _git_quiet(["worktree", "unlock", path], repo_root, log=f"unlock {path}")
+    if unlock and not _unlock_owned_worktree(repo_root, path, initializing_before=initializing_before):
+        return arc.ref, None, False, "lock held or unverifiable"
     removed = _git(["worktree", "remove", "--force", path], repo_root, timeout=60)
     if removed.returncode != 0:
         logger.warning("Archived %s to %s but could not remove it: %s", path, arc.ref, removed.stderr.strip())
@@ -401,7 +404,9 @@ def _recheck(repo_root: str, d: Decision) -> tuple[Optional[str], Optional[str]]
     from hermes_cli import worktree_ops as ops
     if not os.path.isdir(d.path):
         return "gone", None
-    lock_state = ops._worktree_lock_is_live(repo_root, d.path, timeout=5)
+    lock_state = ops._worktree_lock_is_live(
+        repo_root, d.path, timeout=5,
+        initializing_before=(time.time() - d.tier_hours * 3600) if d.tier_hours > 0 else None)
     if lock_state == "live":
         return "lock owner still running", lock_state
     since = d.planned_at or time.time()
@@ -439,13 +444,15 @@ def execute_plan(repo_root: str, plan: list[Decision], settings: dict
             continue
         if d.action != "archive-remove":
             _, kept = ops._reap_prune_verdicts(
-                repo_root, [(Path(d.path), d.mtime, d.force, d.verdict, lock_state)], 0.0)
+                repo_root, [(Path(d.path), d.mtime, d.force, d.verdict, lock_state)], 0.0,
+                initializing_before=time.time() - d.tier_hours * 3600)
             kept_branches |= kept
             continue
         try:
             ref, kept, removed, why = archive_then_remove(
                 repo_root, d.path, reason=f"sweep: {d.reason}", max_untracked_mb=settings["archive_max_file_mb"],
-                unlock=lock_state == "dead", remote_heads_fn=remote_heads)
+                unlock=lock_state == "dead", remote_heads_fn=remote_heads,
+                initializing_before=time.time() - d.tier_hours * 3600)
         except (ArchiveError, OSError, subprocess.SubprocessError) as exc:
             logger.warning("Keeping worktree %s: archive failed (%s)", d.name, exc)
             preserved.append(f"{d.name} (archive failed)")

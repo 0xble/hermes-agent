@@ -235,6 +235,25 @@ def _local_changes_evidence(receipt: dict) -> tuple[bool, str]:
                  if step.get("name") == "immutable_source_untouched"), False), ""
 
 
+def _immutable_unchanged_proof(home: Path, receipt: dict) -> bool:
+    """Positive proof that a failed immutable update never reached activation.
+
+    Needs the pointer recorded before the candidate build, the same pointer at finalize and
+    now, activation and any staging runtime-mutation path never started, and a candidate
+    distinct from the active release. A receipt without the record proves nothing.
+    """
+    from hermes_cli.immutable_releases import release_identity
+
+    proof = receipt.get("immutable_update")
+    if (not isinstance(proof, dict) or proof.get("activation_started") is not False
+            or receipt.get("staging_runtime_mutation_started") is not False):
+        return False
+    before, after = proof.get("before"), proof.get("after")
+    if not isinstance(before, dict) or before != after or before != release_identity(home):
+        return False
+    return bool(proof.get("candidate")) and proof["candidate"] != before.get("path")
+
+
 def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> str:
     if receipt is None:
         return f"The updater exited with code {exit_code}. Runtime state is unverified; see the update output."
@@ -248,10 +267,15 @@ def _failed_update_detail(home: Path, receipt: dict | None, exit_code: int) -> s
         if release is None or release.name != expected:
             expected = None
     # Immutable source HEAD is frozen, so equality alone cannot rule out a promotion.
-    changed_runtime = (any(receipt.get(key) for key in ("release_transition", "gateway_restart", "fleet"))
+    changed_runtime = (any(receipt.get(key) for key in (
+        "release_transition", "gateway_restart", "fleet", "staging_runtime_mutation_started"))
                        or any(step.get("name") == "zip_source_swap" for step in receipt.get("steps") or []))
     pending_runtime = any((home / name).exists() for name in ("release-txn.json", "fleet_restart_pending"))
     tree_verified, local_changes = _local_changes_evidence(receipt)
+    immutable_apply = ("immutable_update" in receipt or any(
+        step.get("name") == "immutable_source_untouched" for step in receipt.get("steps") or []))
+    if ((home / "current").is_symlink() or immutable_apply) and not _immutable_unchanged_proof(home, receipt):
+        tree_verified = False
     valid_sha = isinstance(previous, str) and re.fullmatch(r"[0-9a-fA-F]{40}", previous)
     if (receipt.get("outcome") in {"failed", "partial"} and valid_sha and previous == post
             and expected and not disagreement and not changed_runtime and not pending_runtime

@@ -157,6 +157,7 @@ class GatewaySessionAgentMixin:
         from gateway.session_authorities import active_authority
         from gateway.session_policy import policy_for_source
         from gateway.session_worker_construct import session_prefill
+        from agent.incognito import is_incognito
         policy = policy_for_source(runner, src)
         return ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
@@ -170,7 +171,7 @@ class GatewaySessionAgentMixin:
             providers_allowed=pr.get("only"), providers_ignored=pr.get("ignore"), providers_order=pr.get("order"),
             provider_sort=pr.get("sort"), provider_require_parameters=pr.get("require_parameters", False),
             provider_data_collection=pr.get("data_collection"),
-            session_id=ctx.session_id, platform=platform_key,
+            session_id=ctx.session_id, platform=platform_key, incognito=is_incognito(ctx.session_id),
             user_id=src.user_id, user_id_alt=src.user_id_alt, user_name=src.user_name,
             chat_id=src.chat_id, chat_name=src.chat_name, chat_type=src.chat_type, thread_id=src.thread_id,
             gateway_session_key=ctx.session_key,

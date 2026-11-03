@@ -523,6 +523,10 @@ def noninteractive_repo_git_env(
     automatic git operation instead of running with only partial hardening.
     """
     env = noninteractive_git_env(base)
+    # Internal repository operations persist git-generated state (notably worktree
+    # add's "initializing" lock reason). Keep it canonical even on translated hosts.
+    # This helper is for unattended Git; interactive/user-facing Git keeps its locale.
+    env.update(LC_ALL="C", LANGUAGE="C")
     # bounded_probe_run, not subprocess.run: Windows' post-timeout communicate() can deadlock and
     # a bare spawn flashes a console. (Not bounded_git_probe: rc 1 = "no filters" is a verdict.)
     # One probe lists the filter keys and the include paths with their origin file: -z --show-origin

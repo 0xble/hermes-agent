@@ -1,4 +1,5 @@
 """Revision, replay and business-rule invariants on real isolated SQLite."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 
 import pytest
@@ -12,7 +13,7 @@ def test_mutation_receipt_fences_replay_revision_and_epoch(tmp_path, operation, 
     db = SessionDB(db_path=tmp_path / 'state.db')
     try:
         db.create_session('s', source='test')
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         mutate = getattr(rt, 'mutate_runtime_session', None)
         assert callable(mutate), 'revision-fenced mutation operation missing'
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='edit', expected_revision=0, operation=operation, payload=payload)
@@ -44,7 +45,7 @@ def test_mutation_receipt_fences_replay_revision_and_epoch(tmp_path, operation, 
             assert db.get_session('s')['runtime_revision'] == 2
         finally:
             peer.close()
-        new_epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
+        new_epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
         with pytest.raises(rt.RuntimeStoreError, match='stale_epoch'):
             mutate(db, **args)
         assert mutate(db, **{**args, 'epoch': new_epoch}) == result
@@ -61,7 +62,7 @@ def test_mutation_rules_and_receipt_failure_are_atomic(tmp_path, operation, payl
     try:
         db.create_session('s', source='test')
         db.set_session_title('s', 'Original')
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         mutate = getattr(rt, 'mutate_runtime_session', None)
         assert callable(mutate), 'revision-fenced mutation operation missing'
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='edit', expected_revision=0, operation=operation, payload=payload)

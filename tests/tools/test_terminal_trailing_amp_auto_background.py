@@ -112,3 +112,19 @@ def test_conversion_never_changes_what_runs_or_how_it_is_approved(command):
         def out(script):
             return subprocess.run(["bash", "-c", script], check=False, capture_output=True, timeout=10).stdout
         assert out(stripped) == out(command + " wait")
+
+
+def test_trailing_amp_is_refused_in_incognito_before_any_spawn(tmp_path, monkeypatch):
+    """The rewrite makes this a background spawn; its registry entry and log would persist."""
+    from agent.incognito import incognito_scope
+    from tools.terminal_tool import terminal_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    with patch("tools.terminal_tool._get_env_config", return_value=_env_config(tmp_path)), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._acquire_env", side_effect=AssertionError("must not run")), \
+         patch("tools.terminal_tool.spawn_background_process", side_effect=AssertionError("must not spawn")), \
+         incognito_scope(True, "private-amp"):
+        result = json.loads(terminal_tool(command="echo private-canary &"))
+    assert "unavailable in incognito" in result["error"], result
+    assert not (tmp_path / "hh").exists() or not any((tmp_path / "hh").rglob("processes.json"))

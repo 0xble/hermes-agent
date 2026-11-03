@@ -2,7 +2,8 @@
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch, register_worker_execution
+from hermes_state_runtime import RuntimeStoreError, register_worker_execution
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from agent.message_metadata import CANONICAL_ROW, DB_ROW_SNAPSHOT
 
 

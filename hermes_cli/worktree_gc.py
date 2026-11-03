@@ -563,9 +563,10 @@ def reclaim_worktrees(
                 continue
             actions.append(f"archived {len(record.untracked)} untracked file(s) → {archive}")
 
-        # Dead-pid locks must be unlocked or `remove --force` refuses.
-        with contextlib.suppress(Exception):
-            _git(["worktree", "unlock", record.path], cwd=repo_root, timeout=10)
+        # A frozen audit is not authority to release a newly installed lock.
+        if not _ops._unlock_owned_worktree(repo_root, record.path, dead_only=True):
+            actions.append(f"kept {record.name} (lock held or unverifiable)")
+            continue
         try:
             remove_result = _git(["worktree", "remove", record.path, "--force"], cwd=repo_root,
                                  timeout=_ops.WORKTREE_REMOVE_TIMEOUT)

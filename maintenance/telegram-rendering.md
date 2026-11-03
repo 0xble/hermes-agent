@@ -88,14 +88,19 @@ Fork patch identity: `telegram-standalone-rich`.
 Based on fork `main` `487aa7910ec01764310411ca0fb3d6feeac35375`.
 
 `hermes send` and `send_message`'s standalone Telegram route receive the resolved
-platform's `extra.rich_messages` and `allow_cjk_rich_messages`. Text without
-media or `copy_block` uses the adapter's `_should_attempt_rich` policy, raw-Markdown
+platform's `extra.rich_messages` and `allow_cjk_rich_messages`. Text outside
+`copy_block` uses the adapter's `_should_attempt_rich` policy, raw-Markdown
 `_rich_payload_base`, and shared `rich_delivery.py` shaping/classification. Thus
 `always` sends every safe eligible message; `auto` selects tables, tasks,
 `<details>`, or display math, not ordinary headings or prose. Raw and normalized
 payload limits, Desktop guards, General-topic mapping, and link-preview settings
-remain unchanged. Oversized messages, media, and paste-ready copy blocks stay on
-their previous legacy paths.
+remain unchanged. Oversized messages and paste-ready copy blocks stay on their
+previous legacy paths. Attachments do not disable rich rendering: eligible text
+is sent once as a Rich Message, followed by native media uploads in the same
+topic without repeating the report as a caption. An ambiguous text outcome stops
+the send before media, while missing or failed uploads preserve the accepted
+text receipt and surface attachment warnings. Permanent rich refusals retain
+the existing MarkdownV2/caption fallback.
 
 A permanent/capability refusal falls back to MarkdownV2. A transient or unknown
 failure returns an error without legacy-resending, because acceptance is

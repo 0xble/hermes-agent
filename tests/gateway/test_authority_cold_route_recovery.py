@@ -71,7 +71,7 @@ def _seed(tmp_path, sid, source, *, routed=True, row_origin=_ROUTE, row_source=N
 async def _cold(tmp_path, multiplex=None, profile_name=None):
     """A fresh process: new store, new authority, nothing published."""
     from gateway.session_authorities import SessionAuthorities
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     runner = _Runner(tmp_path, multiplex)
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='cold')
@@ -104,7 +104,7 @@ def _home(tmp_path, monkeypatch):
 async def test_a_routed_messaging_session_mounts_on_a_cold_authority(tmp_path):
     """The lane is registered by the pre-restart process through the real write path."""
     from gateway.config import Platform
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     warm = await initialize_session_authority(_Runner(tmp_path), profile_id='fixture', instance_id='warm')
     ref = warm.register(_source())
     cold = await _cold(tmp_path)
@@ -386,7 +386,7 @@ async def test_resume_by_a_messaging_segment_shares_the_lanes_next_inbound_mount
     inbound registers, never a second LiveSession on the same route. Real authority, real SQLite
     store, real compression publish, routing peer re-stamped as the turn path does."""
     import json as _json
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     warm_runner = _Runner(tmp_path)
     warm = await initialize_session_authority(warm_runner, profile_id='fixture', instance_id='warm')

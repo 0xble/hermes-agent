@@ -4,6 +4,7 @@ A local reset keeps policy/FIFO/generation on the creation id and advances the r
 physical child. Retention and empty-session sweeps age the ended root on its own; deleting it
 would leave the child's history behind with no owner to admit into or restore from.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import time
 import uuid
 from contextlib import closing
@@ -32,7 +33,7 @@ def _store_reset(db, epoch, sid):
 def test_sweeps_keep_the_owner_a_retained_reset_child_needs(tmp_path, producer, sweep):
     from hermes_state_local_lineage import local_physical_target
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         sid = _local_session(db, epoch, tmp_path)
         child = (_mutate(db, epoch, sid, 'reset')['target_session_id'] if producer == 'canonical'
                  else _store_reset(db, epoch, sid))

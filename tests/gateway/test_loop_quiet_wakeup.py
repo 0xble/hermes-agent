@@ -283,7 +283,7 @@ async def _deliver(event, final_response, monkeypatch):
     silence inputs (display kind, reply_expected) from the fired event itself."""
     _stub_gateway_run(monkeypatch)
     runner = _ShapeRunner()
-    session = SimpleNamespace(session_id="loop-session")
+    session = SimpleNamespace(session_id="loop-session", incognito=False)
     shaped, marker, _ = await runner._hmwa_shape_agent_response(
         {"final_response": final_response, "messages": [], "api_calls": 1},
         event.source, history=[], session_entry=session, session_key=None,

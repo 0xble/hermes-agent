@@ -70,6 +70,9 @@ def spill_if_oversized(
     string pointing at the full content. Non-string input is ``str()``-coerced;
     ``source`` labels the preview header; ``config`` overrides config.yaml.
     """
+    from agent.incognito import is_incognito
+    if is_incognito(session_id):
+        return text or ""
     if text is None:
         return ""
     if not isinstance(text, str):

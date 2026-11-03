@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from agent.compaction_display import project_compaction_message_for_display
 from agent.context_compressor import user_originated_turn_view
 from hermes_state_messages import DISPLAY_VISIBLE_SQL
+from hermes_state_deletion import visible_session_sql
 
 
 _SYNTHETIC_PROMPT = re.compile(
@@ -58,6 +59,7 @@ def _display_rows_sql(conn, session_id, *, users_only=False):
     Current stores use the durable display index, including protected-tail copies.
     """
     filters = (" AND role = 'user'" if users_only else "") + DISPLAY_VISIBLE_SQL
+    filters += f" AND {visible_session_sql('session_id')}"
     indexed = conn.execute(
         "SELECT 1 FROM messages WHERE session_id = ? AND (active = 1 OR compacted = 1) "
         f"{filters} AND (display_order IS NULL OR display_identity IS NULL) LIMIT 1",
@@ -108,7 +110,7 @@ def get_session_messages_around(db, session_id, row_id, *, limit=120):
         _register_functions(db, conn)
         anchor = conn.execute(
             "SELECT content, display_kind, _compressed_summary FROM messages "
-            "WHERE session_id = ? AND id = ? AND role = 'user' AND (active = 1 OR compacted = 1)",
+            f"WHERE {visible_session_sql('session_id')} AND session_id = ? AND id = ? AND role = 'user' AND (active = 1 OR compacted = 1)",
             (session_id, row_id),
         ).fetchone()
         if anchor is None or not _prompt_preview(db, *anchor):

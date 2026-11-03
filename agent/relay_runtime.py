@@ -868,6 +868,9 @@ class RelayHostRegistry:
         self._hosts: dict[str, RelayHost] = {}
 
     def for_profile(self, profile_key: str | None = None, *, create: bool = True) -> RelayHost | None:
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return None
         key = profile_key or current_profile_key()
         with self._lock:
             host = self._hosts.get(key)
@@ -906,6 +909,9 @@ class ConversationLease:
 
     def live_runtime(self) -> RelayRuntime | None:
         """Return the real Relay host when this lease owns an open session."""
+        from agent.incognito import is_incognito
+        if is_incognito(self.session_id):
+            return None
         return self.host if isinstance(self.host, RelayRuntime) and self.session is not None else None
 
 
@@ -1251,12 +1257,17 @@ def current_turn() -> RelayTurnContext | None:
 
 def relay_instrumentation_enabled() -> bool:
     """Return whether this inherited turn may create Relay instrumentation."""
+    from agent.incognito import is_incognito
     turn = current_turn()
+    if is_incognito(getattr(getattr(turn, "lease", None), "session_id", None)):
+        return False
     return turn is None or (turn.relay_enabled and not turn.closed)
 
 
 def active_turn(session_id: str | None = None) -> RelayTurnContext | None:
     """Return a live turn only when it belongs to the active profile/session."""
+    if not relay_instrumentation_enabled():
+        return None
     turn = current_turn()
     if turn is None or not turn.relay_enabled or turn.closed or turn.lease.released:
         return None

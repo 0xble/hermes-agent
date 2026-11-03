@@ -1,4 +1,5 @@
 """Deletion cannot erase an admitted input or an adopted worker."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import pytest
 from hermes_state import SessionDB
 import hermes_state_runtime as rt
@@ -9,7 +10,7 @@ def test_delete_refuses_outstanding_descendant_obligations(tmp_path, obligation)
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('s', source='test')
         db.create_session('child', source='test', parent_session_id='s', model_config={'_delegate_from': 's'})
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         if obligation == 'worker':
             rt.register_worker_execution(db, epoch=epoch, execution_id='w', session_id='child',
                 generation=0, kind='child', adoption_secret='private')
@@ -18,7 +19,7 @@ def test_delete_refuses_outstanding_descendant_obligations(tmp_path, obligation)
             if obligation != 'queued':
                 rt.claim_session_input(db, epoch=epoch, session_id='child')
             if obligation == 'unknown':
-                epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
+                epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
                 rt.recover_session_inputs(db, epoch=epoch)
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='delete',
                     expected_revision=0, expected_generation=0, operation='delete', payload={})
@@ -33,7 +34,7 @@ def test_delete_receipt_survives_removal_and_fences_generation(tmp_path):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('s', source='test')
         db.create_session('branch', source='test', parent_session_id='s')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='delete',
                     expected_revision=0, expected_generation=1, operation='delete', payload={})
         with pytest.raises(rt.RuntimeStoreError, match='stale_generation'):
@@ -61,7 +62,7 @@ def test_delete_of_compressed_logical_root_retires_every_physical_continuation(t
                                      messages=[{'role': 'user', 'content': 'summary'}], compression_lock_holder='holder')
         db.append_message('child', 'user', 'after compression')
         db.save_gateway_routing_entry('agent:telegram:dm:1', json.dumps({'session_id': 'child', 'session_key': 'agent:telegram:dm:1'}))
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         receipt = rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='root', request_id='delete',
                                             expected_revision=0, expected_generation=0, operation='delete', payload={})
         assert set(receipt['deleted_ids']) == {'root', 'child'}
@@ -105,7 +106,7 @@ def test_queued_work_on_a_delegate_or_fork_continuation_blocks_the_delete(tmp_pa
     leaving the continuation and its queued admission orphaned under a deleted parent."""
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         tip, _ = _delegate_topology(db, shape)
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id=tip, request_id='q', payload={'text': 'keep'})
         before = [dict(r) for r in db._read_all('SELECT id, parent_session_id FROM sessions ORDER BY id')]
         with pytest.raises(rt.RuntimeStoreError, match='session_busy'):
@@ -118,7 +119,7 @@ def test_queued_work_on_a_delegate_or_fork_continuation_blocks_the_delete(tmp_pa
 def test_idle_delete_takes_every_delegate_and_fork_continuation(tmp_path, shape):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         _, chain = _delegate_topology(db, shape)
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         receipt = rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='root', request_id='delete',
                                             expected_revision=0, expected_generation=0, operation='delete', payload={})
         assert set(receipt['deleted_ids']) == chain

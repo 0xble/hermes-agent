@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import threading
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 from hermes_state_runtime import RuntimeStoreError
 
 PREFIX = 'cron-worker:'
+logger = logging.getLogger(__name__)
 
 
 def detached_assignment(job_id, execution_id):
@@ -123,6 +125,19 @@ def stored_result(result):
                        'cron_job_flags': result['job_flags']}, 'usage': {}}
 
 
+def _log_lost_detached(row, job_id, execution_id):
+    from cron.executions import _owner_identity, get_execution
+    execution = get_execution(execution_id)
+    identity = (_owner_identity(execution['pid'], execution['process_started_at'])
+                if execution is not None else 'absent')
+    details = execution or {}
+    logger.warning(
+        'detached_cron_worker_lost admission_id=%s job_id=%s execution_id=%s '
+        'status=%s pid=%s process_id=%s process_started_at=%s owner_liveness=%s',
+        row['admission_id'], job_id, execution_id, details.get('status', 'absent'),
+        details.get('pid'), details.get('process_id'), details.get('process_started_at'), identity)
+
+
 async def observe_detached(row):
     """Observe without taking ownership of the worker or cancelling it on teardown."""
     request = row['request_id'].split(':', 2)
@@ -131,6 +146,12 @@ async def observe_detached(row):
         if result is not None:
             return result
         if await asyncio.to_thread(detached_execution, request[1], request[2]) is None:
+            # The worker publishes its receipt before terminalizing the ledger.
+            # The initial read may have preceded both commits.
+            result = await asyncio.to_thread(detached_result, row)
+            if result is not None:
+                return result
+            await asyncio.to_thread(_log_lost_detached, row, request[1], request[2])
             raise RuntimeStoreError('detached_cron_worker_lost')
         await asyncio.sleep(.1)
 
@@ -173,11 +194,13 @@ def recover_detached(db, epoch, row):
         finish_result(db, epoch=epoch, row=row, response=result['result'][2],
                       outcome='completed', result=stored_result(result))
     from utils import atomic_json_write
-    found = _record(row)
-    if found is not None:
-        path, record = found
-        record['canonical_settled'] = True
-        atomic_json_write(path, record, mode=0o600, fsync_dir=True)
+    from cron.jobs import _jobs_lock
+    with _jobs_lock():
+        found = _record(row)
+        if found is not None:
+            path, record = found
+            record['canonical_settled'] = True
+            atomic_json_write(path, record, mode=0o600, fsync_dir=True)
     return True
 
 
@@ -205,12 +228,45 @@ async def register_detached(connection, ref, params, claim):
         kind='cron', adoption_secret=claim)
 
 
+def _attach_worker(rpc, scope):
+    """Registration is idempotent only with this exact fenced scope, including its secret."""
+    from agent.runtime_session_store import WorkerPersistenceError
+    from hermes_state_errors import GatewayOwnerRestartError
+    from websockets.exceptions import ConnectionClosed
+
+    ambiguous = False
+    for attempt in range(4):
+        try:
+            try:
+                rpc('worker.register', **scope, kind='cron')
+            except WorkerPersistenceError as exc:
+                # A successor may refuse the old epoch's registration; authenticate the
+                # original worker instead. Never create a replacement identity.
+                if not ambiguous or str(exc) not in ('admission_conflict', 'producer_not_started', 'stale_epoch'):
+                    raise
+            return rpc('worker.adopt', **scope)
+        except (WorkerPersistenceError, GatewayOwnerRestartError, ConnectionClosed, OSError) as exc:
+            if isinstance(exc, WorkerPersistenceError) and str(exc) not in (
+                    'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
+                raise
+            if attempt == 3:
+                raise
+            ambiguous = True
+            logger.warning('detached_cron_handshake_retry execution_id=%s session_id=%s '
+                           'generation=%s attempt=%s cause=%s: %s',
+                           scope['execution_id'], scope['session_id'], scope['generation'],
+                           attempt + 1, type(exc).__name__, exc)
+            time.sleep(.1 * 2 ** attempt)
+
+
 def run_detached(job, receipt, state, record, save, *, execution_id, extra_prompt, cancel_event):
     """Run in the existing external worker, with the canonical owner's receipt facade."""
     from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC, WorkerPersistenceError
     from gateway.session_cron import bind_execution, _execution
     from hermes_cli.process_identity import process_birth
     from hermes_constants import get_hermes_home
+    from hermes_state_errors import GatewayOwnerRestartError
+    from websockets.exceptions import ConnectionClosed
     import psutil
 
     if not owns_detached_execution(job['id'], execution_id):
@@ -219,8 +275,11 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
                  execution_id=PREFIX + execution_id, generation=state['generation'],
                  pid=os.getpid(), birth=process_birth(psutil.Process()), secret=secrets.token_urlsafe(32))
     rpc = WorkerRPC(get_hermes_home())
-    rpc('worker.register', **scope, kind='cron')
-    adopted = rpc('worker.adopt', **scope)
+    try:
+        adopted = _attach_worker(rpc, scope)
+    except BaseException:
+        rpc.close()
+        raise
     scope['epoch'] = adopted['owner_epoch']
     store = None
     stopping = threading.Event()
@@ -228,20 +287,23 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
 
     def reconnect(method, **params):
         nonlocal scope
-        from websockets.exceptions import ConnectionClosed
         while True:
             try:
                 return rpc(method, **params)
-            except (WorkerPersistenceError, ConnectionClosed, OSError, TimeoutError) as exc:
+            except (WorkerPersistenceError, GatewayOwnerRestartError, ConnectionClosed, OSError, TimeoutError) as exc:
                 # A returned authorization/assignment refusal is terminal. Only
                 # owner absence and the released epoch are lifecycle events.
+                # Detached executions outlive each bounded pre-send retry window.
+                # WorkerRPC never blindly resends an ambiguous send. After
+                # authenticated adoption, this wrapper replays the identical
+                # journal entry, deduplicated by the owner's stored receipt.
                 if isinstance(exc, WorkerPersistenceError) and str(exc) not in (
                         'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
                     raise
                 try:
                     current = store.scope if store is not None else scope
                     next_owner = rpc('worker.adopt', **{k: v for k, v in current.items() if k != 'epoch'})
-                except (WorkerPersistenceError, ConnectionClosed, OSError, TimeoutError) as adoption:
+                except (WorkerPersistenceError, GatewayOwnerRestartError, ConnectionClosed, OSError, TimeoutError) as adoption:
                     if isinstance(adoption, WorkerPersistenceError) and str(adoption) not in (
                             'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
                         raise

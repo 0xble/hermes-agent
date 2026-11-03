@@ -5,7 +5,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session_authority import initialize_session_authority
+from tests.fakes.runtime_owner import initialize_session_authority
 from gateway.session_envelope import restore_native
 from gateway.session_ingress import admit_message
 from hermes_state_runtime import list_session_admissions
