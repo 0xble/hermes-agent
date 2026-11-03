@@ -24,6 +24,8 @@ from hermes_constants import get_hermes_home
 from hermes_cli.forward_only_guard import _LAUNCHCTL_SERVICE_NOT_FOUND
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
 
+from hermes_cli.gateway_launchd_login import stop_requested
+
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
 INTERVAL = 30
 MAX_REPAIRS = 3
@@ -183,6 +185,9 @@ def _launch_state(domain: str, label: str, *, deadline: float | None = None) -> 
         return "loaded"
     if _LAUNCHCTL_SERVICE_NOT_FOUND in result.stderr or _LAUNCHCTL_SERVICE_NOT_FOUND in result.stdout:
         return "unloaded"
+    if (result.returncode == 112 and domain.startswith("gui/")
+            and "Could not find domain for user gui:" in result.stderr):
+        return "unloaded"  # A real logout removes Aqua, not the Background gateway.
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 
 
@@ -306,6 +311,8 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         _reap_rollback_owners(owners, deadline, home=home)
         # The exact remaining budget: flooring it to a whole second would hand the bootstrap a fresh
         # second past the rollback deadline.
+        if stop_requested(home):
+            raise RuntimeError("operator stopped intent appeared before rollback bootstrap")
         _launchctl_bootstrap(domain, plist, label, timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         return True
     try:
@@ -411,6 +418,8 @@ def _refuse_leftovers_before_launch(home: Path, deadline: float | None = None) -
     Raises RuntimeError (leftovers found or launchd uninspectable); run_once records it as an alert.
     Checked only right before a launch so inspection-only outcomes never shell out.
     """
+    if stop_requested(home):
+        raise RuntimeError("operator stopped intent appeared before guardian repair")
     from hermes_cli.forward_only_guard import refuse_if_forward_only_leftovers
     refuse_if_forward_only_leftovers(home, timeout_for=lambda cap: _bounded_timeout(cap, deadline))
 
@@ -453,7 +462,7 @@ def _recover_switch(home: Path, plist: Path, label: str, current: Path,
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
          deadline: float | None = None) -> str:
     deadline = deadline or time.monotonic() + STARTUP_SECONDS
-    if intent_path(home).exists():
+    if stop_requested(home):
         return "stopped"
     if not plist.is_file():
         receipt(home, "inspect", "alert", reason="gateway plist missing")
@@ -512,6 +521,8 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         if _launch_state(domain, label, deadline=deadline) != "unloaded":
             receipt(home, "bootstrap", "failed", label=label, reason="parked label bootout did not read back unloaded")
             return "failed"
+    if stop_requested(home):
+        return "stopped"
     subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True,
                    timeout=_bounded_timeout(10, deadline))
     deadline = deadline or time.monotonic() + 12
@@ -556,6 +567,15 @@ def inspection_lock(home: Path):
 
 def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
              domain: str | None = None, deadline: float | None = None) -> str:
+    from hermes_cli.gateway_launchd_lifetime import lifetime_lock
+    with lifetime_lock(Path(home), blocking=False) as acquired:
+        if not acquired:
+            return "locked"
+        return _run_once_locked(home, plist, label, grace=grace, domain=domain, deadline=deadline)
+
+
+def _run_once_locked(home: Path, plist: Path, label: str, *, grace: float | None = None,
+                     domain: str | None = None, deadline: float | None = None) -> str:
     home = Path(home)
     with inspection_lock(home) as acquired:
         if not acquired:
@@ -563,7 +583,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
         try:
             # Stopped intent is authoritative and must short-circuit config loading: a
             # deliberately parked gateway stays parked even if config is now malformed.
-            if intent_path(home).exists():
+            if stop_requested(home):
                 return "stopped"
             from hermes_cli.config import _validate_updates
             if grace is None:
@@ -595,9 +615,18 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
             return "alert"
 
 
-def guardian_plist(home: Path, gateway_plist: Path, label: str, *, domain: str) -> bytes:
+def guardian_plist(home: Path, gateway_plist: Path, label: str, *, domain: str,
+                   explicit: bool | None = None) -> bytes:
+    mode = domain.split("/", 1)[0]
+    if mode not in {"gui", "user"}:
+        raise ValueError("guardian launchd domain must be gui or user")
     python = home / "current/.venv/bin/python"
-    return plistlib.dumps({"Label": GUARDIAN_LABEL, "RunAtLoad": True, "StartInterval": INTERVAL,
+    if explicit is None:
+        session_type = (plistlib.loads(gateway_plist.read_bytes()).get("LimitLoadToSessionType")
+                        if gateway_plist.is_file() else None)
+        explicit = mode == "user" or session_type in ("Aqua", "Background")
+    session = {"LimitLoadToSessionType": "Background" if mode == "user" else "Aqua"} if explicit else {}
+    return plistlib.dumps({**session, "Label": GUARDIAN_LABEL, "RunAtLoad": True, "StartInterval": INTERVAL,
                            "ProgramArguments": [str(python), "-m", "hermes_cli.gateway_guardian", "run",
                                                 "--gateway-plist", str(gateway_plist), "--gateway-label", label,
                                                 "--domain", domain],
@@ -624,7 +653,7 @@ def cli(argv: list[str] | None = None) -> int:
     import pwd
     path = Path(pwd.getpwuid(getattr(os, 'getuid')()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
     if args.action == "status":
-        print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()}")
+        print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()} domain={args.domain}")
         return 0
     if args.action == "uninstall":
         subprocess.run(["launchctl", "bootout", f"{args.domain}/{GUARDIAN_LABEL}"], capture_output=True, timeout=10)

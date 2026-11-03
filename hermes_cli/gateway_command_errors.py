@@ -39,9 +39,14 @@ def _verb_for(exc: subprocess.CalledProcessError) -> str:
     return "start"
 
 
+class GatewayInstallError(RuntimeError):
+    """An expected install refusal that the gateway CLI can present without a traceback."""
+
+
 def explain_service_failure(exc: BaseException) -> list[str] | None:
-    """Lines to print for a systemd service failure escaping the gateway command, or None
-    when *exc* is not one this module knows how to explain (callers re-raise)."""
+    """Lines for known service/install failures; None preserves unexpected exceptions."""
+    if isinstance(exc, GatewayInstallError):
+        return [str(exc)]
     if isinstance(exc, SystemctlUnavailableError):
         return list(_NO_SYSTEMCTL_LINES)
     if isinstance(exc, subprocess.CalledProcessError):

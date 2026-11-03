@@ -162,6 +162,8 @@ def build_gateway_parser(
         help="Force reinstall, and install even when the default multiplexer already serves this profile")
     _flag(gateway_install, "--system",
         help="Install as a Linux system-level service (starts at boot)")
+    gateway_install.add_argument("--launchd-domain", choices=("gui", "user"),
+        help="macOS only: explicit Aqua or logout-independent Background lifetime; stop before migrating")
     gateway_install.add_argument("--run-as-user", dest="run_as_user",
         help="User account the Linux system service should run as")
     _flag(gateway_install, "--start-now", dest="start_now", default=None,
