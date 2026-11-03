@@ -42,10 +42,12 @@ def foreign_guardian(path: Path, home: Path, label: str) -> bool:
         owner = env.get("HERMES_HOME") if isinstance(env, dict) else None
         if (not isinstance(body, dict) or body.get("Label") != label
                 or not isinstance(owner, str) or not owner):
-            raise RuntimeError(guidance)
+            raise ValueError(guidance)
         return Path(owner).resolve() != home.resolve()
     except (OSError, ValueError, IndexError, plistlib.InvalidFileException, ExpatError) as exc:
-        raise RuntimeError(guidance) from exc
+        # Valid isolated login triggers need no application imports.
+        from hermes_cli.gateway_command_errors import LaunchdServiceError
+        raise LaunchdServiceError(guidance) from exc
 
 
 @contextmanager
