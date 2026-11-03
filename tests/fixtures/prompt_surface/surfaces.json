@@ -50,8 +50,8 @@
   },
   "cli.claude": {
     "prompt_tokens": {
-      "context": 254,
-      "stable": 1935,
+      "context": 0,
+      "stable": 1445,
       "volatile": 1813
     },
     "tool_tokens": 15429,
@@ -99,8 +99,8 @@
   },
   "cli.gemini": {
     "prompt_tokens": {
-      "context": 254,
-      "stable": 2357,
+      "context": 0,
+      "stable": 1866,
       "volatile": 1812
     },
     "tool_tokens": 15429,
@@ -148,8 +148,8 @@
   },
   "cli.gpt": {
     "prompt_tokens": {
-      "context": 254,
-      "stable": 3092,
+      "context": 0,
+      "stable": 2612,
       "volatile": 1810
     },
     "tool_tokens": 15585,
@@ -197,8 +197,8 @@
   },
   "cli.hermes": {
     "prompt_tokens": {
-      "context": 254,
-      "stable": 1935,
+      "context": 0,
+      "stable": 1445,
       "volatile": 1813
     },
     "tool_tokens": 15429,
@@ -295,8 +295,8 @@
   },
   "desktop.claude": {
     "prompt_tokens": {
-      "context": 388,
-      "stable": 1935,
+      "context": 0,
+      "stable": 1579,
       "volatile": 1814
     },
     "tool_tokens": 15680,
