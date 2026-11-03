@@ -13,10 +13,11 @@ import signal
 import subprocess
 import sys
 import textwrap
-import time
 from pathlib import Path
 
 import pytest
+
+from tests.waiting import wait_until
 
 pytestmark = pytest.mark.platforms("posix")
 
@@ -70,10 +71,8 @@ def test_sigkill_of_the_update_parent_kills_the_completion_session(tmp_path: Pat
         assert _alive(child_pid)
         os.kill(proc.pid, signal.SIGKILL)
         proc.wait(timeout=5)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and _alive(child_pid):
-            time.sleep(0.05)
-        assert not _alive(child_pid), "completion session outlived a SIGKILL of the updater"
+        wait_until(lambda: not _alive(child_pid), timeout=5,
+                   what="completion session to die with its killed updater")
     finally:
         if proc.poll() is None:
             os.kill(proc.pid, signal.SIGKILL)
