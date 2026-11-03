@@ -4830,15 +4830,54 @@ def _submit_with_guard(
                          execution_err)
         return None
 
-    def _run_and_release(j=dispatched_job, ctx=_ctx, home=_claim_home):
+    from cron.scheduler_admission import AgentAdmissionRequired
+
+    # A script queued from a stale snapshot may need agent admission. Flatten the
+    # executor handoff into one completion: sync ticks, drain, and dedup must still
+    # own this same execution until the general worker has actually finished.
+    completion = concurrent.futures.Future()
+
+    def _run_and_release(ctx=_ctx):
         try:
-            return ctx.run(run_dispatched_job, process_job, j)
+            return ctx.run(run_dispatched_job, process_job, dispatched_job)
+        except AgentAdmissionRequired:
+            def handoff():
+                # Pool identity, capacity, and the failure ledger all belong to the
+                # captured profile, not the executor thread's default/launch home.
+                general_ctx = dispatch_context("general", execution.get("code_sha"))
+                try:
+                    return _get_parallel_pool(_resolve_max_parallel_workers()).submit(
+                        _run_and_release, general_ctx)
+                except BaseException as exc:
+                    settle_unstarted_execution(
+                        execution["id"], job_id, f"Agent admission handoff failed: {exc}")
+                    raise
+            return ctx.run(handoff)
         finally:
-            release_running_job(j["id"], home=home, owner=registration_owner)
+            if dispatch_lane != "script":
+                release_running_job(job_id, home=_claim_home, owner=registration_owner)
+
+    def _complete(done):
+        try:
+            result = done.result()
+            if isinstance(result, concurrent.futures.Future):
+                result.add_done_callback(_complete)
+                return
+        except BaseException as exc:
+            release_running_job(job_id, home=_claim_home, owner=registration_owner)
+            completion.set_exception(exc)
+        else:
+            release_running_job(job_id, home=_claim_home, owner=registration_owner)
+            completion.set_result(result)
 
     try:
         _ctx.run(note_dispatch_stage, dispatched_job, "executor_queued")
         fut = pool.submit(_run_and_release)
+        if dispatch_lane == "script":
+            completion.set_running_or_notify_cancel()
+            fut.add_done_callback(_complete)
+        else:
+            completion = fut
     except Exception as submit_err:
         release_running_job(job_id, home=_claim_home, owner=registration_owner, wake=False)
         _clear_run_claim_best_effort()
@@ -4853,8 +4892,8 @@ def _submit_with_guard(
     with _running_lock:
         _submit_key = _inflight_key(job_id, _claim_home)
         if _running_registration_owners.get(_submit_key) is registration_owner:
-            _running_futures[_submit_key] = fut
-    return fut
+            _running_futures[_submit_key] = completion
+    return completion
 
 
 def _sweep_mcp_orphans_when_all_done(futures: list) -> None:
