@@ -108,10 +108,9 @@ def _reconcile_locked(path, backup, report):
 # `hermes sessions repair` (repair_declarative_schema: same additive catch-up, no time limit). The
 # scan is tied to the file's (size, mtime) signature: if the store changed by the time the lock is
 # held, the scan no longer vouches for it and nothing is written. Under the lock only the cheap drift
-# re-check and the DDL run, cut off by BROWSE_RECONCILE_BUDGET_S (a sqlite progress handler plus
-# a same-deadline Connection.interrupt; the DDL rolls back). Busy waiting does not run the
-# progress handler, so each connection's busy timeout is capped at the remaining budget. Gateway boot
-# waits this budget out (gateway.run_bootstrap).
+# re-check and the DDL run, cut off by BROWSE_RECONCILE_BUDGET_S (a sqlite progress handler; the DDL
+# rolls back). Busy waiting does not run the progress handler, so each connection's busy timeout is
+# capped at the remaining budget. Gateway boot waits this budget out (gateway.run_bootstrap).
 BROWSE_RECONCILE_BUDGET_S = 3.0
 BROWSE_INTEGRITY_BUDGET_S = BROWSE_RECONCILE_BUDGET_S
 _BUDGET_PROGRESS_OPS = 1000
@@ -204,33 +203,12 @@ class _Budget:
         return max(self.remaining(), 0.05)
 
     def arm(self, conn) -> None:
-        import threading
-        import time
-
         def progress():
             if self._clock() >= self.deadline:
                 self.expired = True
                 return 1  # sqlite raises OperationalError('interrupted'); the caller rolls back
             return 0
         conn.set_progress_handler(progress, _BUDGET_PROGRESS_OPS)
-        # The handler return is not the only way a statement stops. A slow DDL
-        # stand-in is ~14s of callback sleeps if sqlite ignores that return, and
-        # boot only waits this budget plus 2s. sqlite3_interrupt is checked on
-        # the way back from a callback even when the callback itself returns 0,
-        # including after a blocking syscall the handler did not run during.
-        def watch():
-            delay = self.deadline - self._clock()
-            if delay > 0:
-                time.sleep(delay)
-            self.expired = True
-            interrupt = getattr(conn, "interrupt", None)
-            if interrupt is None:
-                return
-            try:
-                interrupt()
-            except Exception:
-                return
-        threading.Thread(target=watch, name="browse-budget", daemon=True).start()
 
     def check(self) -> None:
         if self.expired or self.remaining() <= 0:
@@ -254,8 +232,12 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     budget.check()
     with closing(connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
                                  isolation_level=None)) as conn:
+        # macOS durability PRAGMAs may parse the schema: budget them too, not
+        # just BEGIN/DDL. Their best-effort wrappers swallow interruption, so
+        # check again before beginning a write transaction.
         budget.arm(conn)
         _reapply_durability_barriers(conn)
+        budget.check()
         conn.execute('BEGIN IMMEDIATE')
         try:
             cursor = conn.cursor()
