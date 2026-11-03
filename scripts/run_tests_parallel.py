@@ -51,6 +51,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -619,6 +620,22 @@ _FLAKY_RESULTS: list[tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+# Register before importing pytest so collection, fixtures, and interpreter shutdown
+# are covered too. pytest's own dump_traceback_later timer is per-test and gets
+# cancelled/replaced; its signal registration is independent of this one. Keep the
+# file open until process exit, including a wait for leaked non-daemon threads.
+# Inline rather than a helper module: runner regression probes copy this script.
+_PYTEST_STACK_BOOTSTRAP = """
+import faulthandler, pathlib, runpy, signal, sys
+stack_path, ready_path = sys.argv[1:3]
+del sys.argv[1:3]
+_stack_stream = open(stack_path, "w", encoding="utf-8")
+faulthandler.register(signal.SIGUSR2, file=_stack_stream, all_threads=True, chain=False)
+pathlib.Path(ready_path).touch()
+runpy.run_module("pytest", run_name="__main__", alter_sys=True)
+"""
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: list[str],
@@ -651,7 +668,19 @@ def _run_one_file_once(
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
     env["TMPDIR"] = temproot
 
+    stack_path = Path(temproot) / "timeout-stacks.log"
+    stack_ready = Path(temproot) / "timeout-stacks.ready"
+    can_dump = hasattr(signal, "SIGUSR2")
+    if can_dump:
+        cmd = [sys.executable, "-c", _PYTEST_STACK_BOOTSTRAP,
+               str(stack_path), str(stack_ready), str(file), *pytest_args]
+
     subproc_start = time.monotonic()
+    deadline = subproc_start + file_timeout
+    # Diagnostics consume the existing budget: ask just BEFORE the hard cap,
+    # never extend it to allow a dump. Tiny explicit caps get a proportional lead.
+    dump_lead = min(1.0, file_timeout / 4.0) if can_dump else 0.0
+    dump_status = "unavailable on this platform"
     # launch the pytest process
     proc = subprocess.Popen(
         cmd,
@@ -678,8 +707,23 @@ def _run_one_file_once(
         except (ProcessLookupError, PermissionError):
             pgid = None
 
+    output = ""
+    rc = 0
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
+        try:
+            output, _ = proc.communicate(timeout=max(0.0, deadline - dump_lead - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            # Signal only the pytest PID, never its descendants/process group, and
+            # never a process that has not acknowledged installing the handler.
+            if can_dump:
+                dump_status = "handler not ready or pytest already exited"
+                if stack_ready.exists() and proc.poll() is None:
+                    try:
+                        os.kill(proc.pid, signal.SIGUSR2)  # windows-footgun: ok — guarded by can_dump
+                        dump_status = "requested; no stacks recovered"
+                    except OSError as exc:
+                        dump_status = f"signal failed: {exc}"
+            output, _ = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
         rc = proc.returncode
     except subprocess.TimeoutExpired:
         _kill_tree(proc, pgid=pgid)
@@ -704,6 +748,17 @@ def _run_one_file_once(
 
         output +=  "\n"
     finally:
+        # Separate from pytest's captured stderr and any child-held stdout pipe.
+        # Preserve stacks before the attempt's scratch root is removed.
+        try:
+            stacks = stack_path.read_text(encoding="utf-8-sig", errors="replace") if stack_path.exists() else ""
+            if stacks:
+                output += f"\n=== Python thread stacks before file timeout (pid={proc.pid}) ===\n{stacks}"
+            elif rc == 124:
+                output += f"\n(Python stack dump {dump_status})\n"
+        except OSError as exc:
+            if rc == 124:
+                output += f"\n(Python stack dump could not be read: {exc})\n"
         _kill_detached_leftovers(temproot)
         # Delete the temp root for this attempt. Nothing reads it after the
         # subprocess exits. More than 3000 of them fill the disk of the
