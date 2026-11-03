@@ -255,8 +255,10 @@ a gateway pid `kill -0` can see (including EPERM), or any path under the OS
 account default. A profile under that default, or under another live root
 (`<root>/profiles/<name>`), is live even when the profile directory itself has
 no markers. That profiles parent is lexical, including when the profile
-directory is a symlink. If canonicalizing the home names a different root,
-either live root refuses. The account-default lookup uses the password
+directory is a symlink. Canonicalization matches Python
+`Path.resolve(strict=False)`, including a missing suffix under a symlinked
+ancestor. If that canonical root differs from the lexical root, either live
+root refuses. A resolution error is live. The account-default lookup uses the password
 database, not `/usr/bin/python3`; if it fails, the home is treated as live. Rebuild the
 checkout venv with the command above, or set `HERMES_HOME` to a scratch
 directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1` overrides the refusal only when

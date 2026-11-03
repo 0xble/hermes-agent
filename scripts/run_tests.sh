@@ -41,8 +41,10 @@
 # or any path under the OS account default. A home under the account default
 # resolves to that default. Otherwise the profiles parent is lexical, matching
 # hermes_constants._hermes_root_of: <root>/profiles/<name> resolves to <root>
-# even when that profile directory is a symlink. If canonicalizing the home
-# names a different root, refuse when either root is live.
+# even when that profile directory is a symlink. Canonicalization matches
+# Python Path.resolve(strict=False), including a missing suffix under a
+# symlinked ancestor. If that canonical root differs from the lexical root,
+# refuse when either root is live. A resolution error is live.
 # The account default comes from the password database (getent, dscl, or
 # ~user), never $HOME and never /usr/bin/python3. Workers pin HOME to scratch.
 # If that lookup fails, the home is treated as live. Rebuild the checkout-local
@@ -102,20 +104,93 @@ hermes_account_default_home() {
   esac
 }
 
-hermes_canonical_home() {
-  local path="${1%/}"
-  [ -n "$path" ] || return 1
-  if [ -d "$path" ]; then
-    (cd "$path" && pwd -P) || return 1
-    return 0
-  fi
+# Mirror of Python Path.resolve(strict=False). Walk to the deepest existing
+# ancestor, canonicalize it with cd -P / pwd -P (a symlink leaf included), and
+# re-append missing suffix components, normalizing . and .. the way Python does.
+# A later .. that pops back into an existing path is resolved again, so a
+# symlink after a missing component is not left lexical. Resolution errors
+# return 1. This is the only canonicalizer in the guard.
+hermes_resolve_path() {
+  local input="${1-}"
+  local abs rest path name candidate target seen depth steps
+  [ -n "$input" ] || return 1
+  case "$input" in
+    *$'\n'*) return 1 ;;
+  esac
+  case "$input" in
+    /*) abs="$input" ;;
+    *)
+      abs="$(pwd -P)" || return 1
+      abs="${abs%/}/$input"
+      ;;
+  esac
+  rest="${abs#/}"
+  path="/"
+  seen=$'\n'
+  depth=0
+  steps=0
+  while [ -n "$rest" ]; do
+    steps=$((steps + 1))
+    [ "$steps" -le 4096 ] || return 1
+    name="${rest%%/*}"
+    case "$rest" in
+      */*) rest="${rest#*/}" ;;
+      *) rest="" ;;
+    esac
+    case "$name" in
+      ""|.) continue ;;
+    esac
+    if [ "$name" = ".." ]; then
+      if [ "$path" != "/" ]; then
+        path="${path%/*}"
+        [ -n "$path" ] || path="/"
+      fi
+      continue
+    fi
+    if [ "$path" = "/" ]; then
+      candidate="/${name}"
+    else
+      candidate="${path}/${name}"
+    fi
+    if [ -d "$candidate" ]; then
+      path="$(cd -P "$candidate" && pwd -P)" || return 1
+      continue
+    fi
+    if [ -L "$candidate" ]; then
+      case "$seen" in
+        *$'\n'"${candidate}"$'\n'*) return 1 ;;
+      esac
+      seen="${seen}${candidate}"$'\n'
+      depth=$((depth + 1))
+      [ "$depth" -le 40 ] || return 1
+      target="$(readlink "$candidate")" || return 1
+      case "$target" in
+        /*) path="/" ;;
+      esac
+      target="${target#/}"
+      target="${target%/}"
+      if [ -n "$target" ]; then
+        if [ -n "$rest" ]; then
+          rest="${target}/${rest}"
+        else
+          rest="$target"
+        fi
+      fi
+      continue
+    fi
+    if [ -e "$candidate" ]; then
+      path="$candidate"
+      continue
+    fi
+    path="$candidate"
+  done
   printf '%s\n' "$path"
 }
 
 hermes_same_home() {
   local left right
-  left="$(hermes_canonical_home "$1")" || return 1
-  right="$(hermes_canonical_home "$2")" || return 1
+  left="$(hermes_resolve_path "$1")" || return 2
+  right="$(hermes_resolve_path "$2")" || return 2
   [ "$left" = "$right" ]
 }
 
@@ -191,9 +266,9 @@ hermes_home_marker_reason() {
 # True when home is root or a descendant. A sibling such as root-extra is not.
 hermes_home_is_under() {
   local home="$1" root="$2" canon_home canon_root
-  [ -n "$home" ] && [ -n "$root" ] || return 1
-  canon_home="$(hermes_canonical_home "$home")" || return 1
-  canon_root="$(hermes_canonical_home "$root")" || return 1
+  [ -n "$home" ] && [ -n "$root" ] || return 2
+  canon_home="$(hermes_resolve_path "$home")" || return 2
+  canon_root="$(hermes_resolve_path "$root")" || return 2
   [ "$canon_home" = "$canon_root" ] && return 0
   case "$canon_home" in
     "$canon_root"/*) return 0 ;;
@@ -205,12 +280,19 @@ hermes_home_is_under() {
 # the native home, but keep the profiles parent lexical. Canonicalizing first
 # follows a symlink at <root>/profiles/<name> and loses <root>.
 hermes_resolved_runtime_root() {
-  local home="$1" native="${2-}" lexical parent
+  local home="$1" native="${2-}" lexical parent under
   lexical="${home%/}"
   [ -n "$lexical" ] || return 1
-  if [ -n "$native" ] && hermes_home_is_under "$lexical" "$native"; then
-    hermes_canonical_home "$native" || printf '%s\n' "${native%/}"
-    return 0
+  if [ -n "$native" ]; then
+    under=0
+    hermes_home_is_under "$lexical" "$native" || under=$?
+    if [ "$under" -eq 0 ]; then
+      hermes_resolve_path "$native" || return 1
+      return 0
+    fi
+    if [ "$under" -ne 1 ]; then
+      return 1
+    fi
   fi
   parent="$(dirname "$lexical")" || return 1
   case "${parent##*/}" in
@@ -222,11 +304,11 @@ hermes_resolved_runtime_root() {
   printf '%s\n' "$lexical"
 }
 
-# The same rule applied to the canonical path. Used only so a disagreement
-# with hermes_resolved_runtime_root can fail safe.
+# The same rule applied after Path.resolve(strict=False). A resolution error
+# is a failure, not a lexical fallback.
 hermes_canonical_runtime_root() {
   local home="$1" native="${2-}" canon
-  canon="$(hermes_canonical_home "$home")" || canon="${home%/}"
+  canon="$(hermes_resolve_path "$home")" || return 1
   hermes_resolved_runtime_root "$canon" "$native"
 }
 
@@ -235,7 +317,7 @@ hermes_canonical_runtime_root() {
 hermes_runtime_home_live_reason() {
   local home="$1"
   local account_default="${2-}"
-  local root canon_root candidate reason
+  local root canon_root candidate reason under same
   [ -n "$home" ] || return 1
   reason="$(hermes_home_marker_reason "$home" || true)"
   if [ -n "$reason" ]; then
@@ -248,9 +330,17 @@ hermes_runtime_home_live_reason() {
       return 0
     fi
   fi
-  if hermes_home_is_under "$home" "$account_default"; then
-    printf '%s\n' "under account default home"
-    return 0
+  if [ -n "$account_default" ]; then
+    under=0
+    hermes_home_is_under "$home" "$account_default" || under=$?
+    if [ "$under" -eq 0 ]; then
+      printf '%s\n' "under account default home"
+      return 0
+    fi
+    if [ "$under" -ne 1 ]; then
+      printf '%s\n' "runtime root resolution failed"
+      return 0
+    fi
   fi
   root="$(hermes_resolved_runtime_root "$home" "$account_default")" || {
     printf '%s\n' "runtime root resolution failed"
@@ -263,16 +353,28 @@ hermes_runtime_home_live_reason() {
   # PM writes the lexical root. If canonicalizing names a different root,
   # setup can still follow the symlink, so either live root refuses.
   for candidate in "$root" "$canon_root"; do
-    if hermes_same_home "$candidate" "$home"; then
+    same=0
+    hermes_same_home "$candidate" "$home" || same=$?
+    if [ "$same" -eq 0 ]; then
       continue
+    fi
+    if [ "$same" -ne 1 ]; then
+      printf '%s\n' "runtime root resolution failed"
+      return 0
     fi
     reason="$(hermes_home_marker_reason "$candidate" || true)"
     if [ -n "$reason" ]; then
       printf '%s\n' "$reason"
       return 0
     fi
-    if hermes_home_is_under "$candidate" "$account_default"; then
+    under=0
+    hermes_home_is_under "$candidate" "$account_default" || under=$?
+    if [ "$under" -eq 0 ]; then
       printf '%s\n' "under account default home"
+      return 0
+    fi
+    if [ "$under" -ne 1 ]; then
+      printf '%s\n' "runtime root resolution failed"
       return 0
     fi
   done

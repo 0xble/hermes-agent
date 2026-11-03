@@ -54,7 +54,7 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     commands.mkdir()
     # id/dscl/getent are the account-default lookup. python3 is intentionally
     # absent: the lookup must not fall back to the macOS Command Line Tools stub.
-    for name in ("bash", "dirname", "env", "sed", "head", "uname", "mkdir", "id", "cut"):
+    for name in ("bash", "dirname", "env", "sed", "head", "uname", "mkdir", "id", "cut", "readlink"):
         source = shutil.which(name)
         if source:
             commands.joinpath(name).symlink_to(source)
@@ -65,11 +65,18 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     return root, commands
 
 
-def _run(root: Path, commands: Path, home: Path, *, extra_env: dict[str, str] | None = None):
+def _run(
+    root: Path,
+    commands: Path,
+    home: Path,
+    extra_env: dict[str, str] | None = None,
+    *,
+    home_text: str | None = None,
+):
     env = {
         "PATH": str(commands),
         "HOME": str(root.parent / "account-home"),
-        "HERMES_HOME": str(home),
+        "HERMES_HOME": home_text if home_text is not None else str(home),
         "HERMES_RUNTIME_DIR": str(root.parent / "runtime"),
         "TMPDIR": str(root.parent / "tmp"),
     }
@@ -446,6 +453,37 @@ def test_account_default_lookup_does_not_invoke_usr_bin_python3():
 
 
 @pytest.mark.platforms("posix")
+def test_missing_profile_under_symlinked_profiles_refuses_without_writing(tmp_path):
+    """Review round 3: a missing profile under a symlinked profiles dir is live.
+
+    quiet/profiles -> live/profiles, live/gateway_state.json present, and
+    HERMES_HOME=quiet/profiles/new-profile does not exist yet. Path.resolve()
+    places that home under live. The existing-dir canonicalizer returned quiet
+    and let setup run.
+    """
+    root, commands = _checkout(tmp_path)
+    layout = tmp_path / "layout"
+    live = layout / "live"
+    quiet = layout / "quiet"
+    (live / "profiles").mkdir(parents=True)
+    quiet.mkdir()
+    (quiet / "profiles").symlink_to(live / "profiles")
+    (live / "gateway_state.json").write_text("{}\n")
+    home = quiet / "profiles" / "new-profile"
+    assert not home.exists()
+    assert home.resolve() == live / "profiles" / "new-profile"
+    before = _snapshot(layout)
+    result = _run(root, commands, home)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "refusing" in output.lower(), output
+    assert "SETUP_RAN" not in output
+    assert _snapshot(layout) == before
+    assert not home.exists()
+    assert not (live / "profiles" / "new-profile").exists()
+
+
+@pytest.mark.platforms("posix")
 def test_account_default_lookup_failure_refuses_without_writing(tmp_path):
     """A failed lookup is live. The restricted PATH has no id, dscl, getent, or python3."""
     root, commands = _checkout(tmp_path)
@@ -462,3 +500,219 @@ def test_account_default_lookup_failure_refuses_without_writing(tmp_path):
     assert "refusing" in output.lower(), output
     assert "SETUP_RAN" not in output
     assert _snapshot(home) == before
+
+
+RESOLUTION_CASES = (
+    "existing_leaf",
+    "missing_leaf",
+    "missing_multi",
+    "symlink_ancestor_absolute",
+    "symlink_ancestor_relative",
+    "symlinked_profile_dir",
+    "dangling_relative",
+    "dangling_absolute",
+    "dotdot_in_input",
+    "dotdot_reenters_symlink",
+    "trailing_slash",
+    "spaces",
+    "relative_missing",
+)
+
+GUARD_LAYOUTS = (
+    "existing_leaf",
+    "missing_leaf",
+    "missing_multi",
+    "symlink_ancestor_absolute",
+    "symlink_ancestor_relative",
+    "symlinked_profile_dir",
+    "dotdot_under_symlink",
+    "trailing_slash_under_symlink",
+    "spaces",
+    "spaces_symlink",
+)
+
+GUARD_MARKERS = ("lexical", "canonical", "neither")
+
+
+def _assert_outside_account_default(path: Path) -> None:
+    account = (_passwd_account_home() / ".hermes").resolve()
+    resolved = path.resolve()
+    assert resolved != account and account not in resolved.parents, resolved
+
+
+def _lexical_root(home_text: str) -> Path:
+    text = home_text[:-1] if len(home_text) > 1 and home_text.endswith("/") else home_text
+    parent = Path(text).parent
+    if parent.name == "profiles":
+        return parent.parent
+    return Path(text)
+
+
+def _canonical_root(home_text: str) -> Path:
+    return _lexical_root(str(Path(home_text).resolve()))
+
+
+def _resolution_input(tmp_path: Path, name: str) -> tuple[str, Path | None]:
+    base = tmp_path / "resolve"
+    live = base / "live"
+    quiet = base / "quiet"
+    (live / "profiles" / "dev").mkdir(parents=True)
+    quiet.mkdir()
+    (quiet / "profiles").symlink_to(live / "profiles")
+    (base / "relquiet").mkdir()
+    (base / "relquiet" / "profiles").symlink_to(Path("../live/profiles"))
+    (base / "link-root" / "profiles").mkdir(parents=True)
+    (base / "quiet-profile").mkdir()
+    (base / "link-root" / "profiles" / "dev").symlink_to(base / "quiet-profile")
+    (base / "dangling").mkdir()
+    (base / "dangling" / "gone").symlink_to("missing-target")
+    (base / "dangling" / "abs-gone").symlink_to(base / "no-such" / "leaf")
+    (base / "space dir" / "sub").mkdir(parents=True)
+    (base / "reenter").mkdir()
+    (base / "somewhere").mkdir()
+    (base / "reenter" / "link").symlink_to(base / "somewhere")
+    cases = {
+        "existing_leaf": (str(live / "profiles" / "dev"), None),
+        "missing_leaf": (str(live / "profiles" / "new-profile"), None),
+        "missing_multi": (str(live / "profiles" / "a" / "b"), None),
+        "symlink_ancestor_absolute": (str(quiet / "profiles" / "new-profile"), None),
+        "symlink_ancestor_relative": (str(base / "relquiet" / "profiles" / "new-profile"), None),
+        "symlinked_profile_dir": (str(base / "link-root" / "profiles" / "dev"), None),
+        "dangling_relative": (str(base / "dangling" / "gone"), None),
+        "dangling_absolute": (str(base / "dangling" / "abs-gone"), None),
+        "dotdot_in_input": (str(quiet / "profiles" / "new-profile" / ".." / "other"), None),
+        "dotdot_reenters_symlink": (str(base / "reenter" / "missing" / ".." / "link" / "child"), None),
+        "trailing_slash": (str(quiet / "profiles" / "dev") + "/", None),
+        "spaces": (str(base / "space dir" / "sub" / "no such"), None),
+        "relative_missing": ("quiet/profiles/new-profile", base),
+    }
+    return cases[name]
+
+
+def _shell_resolve(raw: str, cwd: Path | None, scratch: Path) -> str:
+    script = ROOT / "scripts" / "run_tests.sh"
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(scratch),
+        "HERMES_HOME": str(scratch / "home"),
+        "HERMES_RUNTIME_DIR": str(scratch / "runtime"),
+    }
+    probe = subprocess.run(
+        ["bash", "-c", 'source "$1"; hermes_resolve_path "$2"', "probe", str(script), raw],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    return probe.stdout.strip()
+
+
+def _guard_home(base: Path, name: str) -> str:
+    if name == "existing_leaf":
+        home = base / "root" / "profiles" / "dev"
+        home.mkdir(parents=True)
+        return str(home)
+    if name == "missing_leaf":
+        (base / "root" / "profiles").mkdir(parents=True)
+        return str(base / "root" / "profiles" / "new-profile")
+    if name == "missing_multi":
+        live = base / "live"
+        quiet = base / "quiet"
+        live.mkdir(parents=True)
+        quiet.mkdir()
+        (quiet / "sub").symlink_to(live)
+        return str(quiet / "sub" / "profiles" / "new-profile")
+    if name in {"symlink_ancestor_absolute", "symlink_ancestor_relative", "dotdot_under_symlink", "trailing_slash_under_symlink"}:
+        live = base / "live"
+        quiet = base / "quiet"
+        (live / "profiles").mkdir(parents=True)
+        quiet.mkdir()
+        target = live / "profiles" if name == "symlink_ancestor_absolute" else Path("../live/profiles")
+        (quiet / "profiles").symlink_to(target)
+        if name == "dotdot_under_symlink":
+            return str(quiet / "profiles" / ".." / "profiles" / "new-profile")
+        home = str(quiet / "profiles" / "new-profile")
+        return home + "/" if name == "trailing_slash_under_symlink" else home
+    if name == "symlinked_profile_dir":
+        live = base / "live"
+        quiet = base / "quiet-profile"
+        (live / "profiles").mkdir(parents=True)
+        quiet.mkdir()
+        (live / "profiles" / "dev").symlink_to(quiet)
+        return str(live / "profiles" / "dev")
+    if name == "spaces":
+        (base / "my root" / "profiles").mkdir(parents=True)
+        return str(base / "my root" / "profiles" / "new profile")
+    if name == "spaces_symlink":
+        live = base / "live dir"
+        quiet = base / "quiet dir"
+        (live / "profiles").mkdir(parents=True)
+        quiet.mkdir()
+        (quiet / "profiles").symlink_to(live / "profiles")
+        return str(quiet / "profiles" / "new profile")
+    raise AssertionError(name)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("case", RESOLUTION_CASES)
+def test_resolve_path_matches_python(tmp_path, case):
+    """hermes_resolve_path matches Path.resolve(strict=False) on each layout."""
+    _assert_outside_account_default(tmp_path)
+    raw, cwd = _resolution_input(tmp_path, case)
+    expected = str((cwd / raw).resolve() if cwd is not None else Path(raw).resolve())
+    assert _shell_resolve(raw, cwd, tmp_path / "scratch") == expected
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("layout", GUARD_LAYOUTS)
+@pytest.mark.parametrize("marker", GUARD_MARKERS)
+def test_guard_matrix_refuses_either_root_and_writes_nothing(tmp_path, layout, marker):
+    """A live marker on the lexical root, the canonical root, or neither."""
+    _assert_outside_account_default(tmp_path)
+    root, commands = _checkout(tmp_path)
+    base = tmp_path / "layout"
+    home_text = _guard_home(base, layout)
+    lexical = _lexical_root(home_text)
+    canonical = _canonical_root(home_text)
+    if marker == "lexical":
+        marked = lexical
+    elif marker == "canonical":
+        marked = canonical
+    else:
+        marked = None
+    if marked is not None:
+        assert marked.is_dir(), (layout, marker, marked)
+        (marked / "gateway_state.json").write_text("{}\n", encoding="utf-8")
+    before = _snapshot(base)
+    result = _run(root, commands, Path(home_text), home_text=home_text)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    if marker == "neither":
+        assert "SETUP_RAN" in output, output
+        assert "refusing" not in output.lower(), output
+        return
+    assert "refusing" in output.lower(), output
+    assert "SETUP_RAN" not in output
+    assert _snapshot(base) == before
+
+
+@pytest.mark.platforms("posix")
+def test_symlink_loop_resolution_error_refuses_without_writing(tmp_path):
+    """A path that cannot be resolved is live, and nothing is written."""
+    _assert_outside_account_default(tmp_path)
+    root, commands = _checkout(tmp_path)
+    base = tmp_path / "layout"
+    base.mkdir()
+    (base / "a").symlink_to("b")
+    (base / "b").symlink_to("a")
+    before = _snapshot(base)
+    result = _run(root, commands, base / "a")
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "refusing" in output.lower(), output
+    assert "resolution failed" in output.lower(), output
+    assert "SETUP_RAN" not in output
+    assert _snapshot(base) == before
