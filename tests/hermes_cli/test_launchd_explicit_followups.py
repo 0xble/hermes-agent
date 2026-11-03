@@ -55,7 +55,7 @@ def layout(tmp_path, monkeypatch):
     monkeypatch.setattr(launchd, "get_launchd_label", lambda: label)
     monkeypatch.setattr(gw, "_prepare_service_launcher", lambda: None)
     monkeypatch.setattr(gw, "launchd_gateway_labels_for_install", lambda: [label])
-    monkeypatch.setattr(gw, "legacy_launchd_labels_for_install", lambda: [])
+    monkeypatch.setattr(gw, "legacy_launchd_labels_for_install", list)
     monkeypatch.setattr(gw, "_wait_for_pid_exit", lambda *a: True)
     monkeypatch.setattr(guardian, "_rollback_owners", lambda *a: (None, []))
     monkeypatch.setattr("gateway.status.get_running_pid", lambda **kw: None)
@@ -92,7 +92,7 @@ def test_profile_lifetime_leaves_shared_guardian_with_its_owner(layout, monkeypa
 
 
 def test_missing_plist_start_preserves_explicit_domain_from_login_trigger(layout):
-    home, path, label, _, user, loaded, _, run = layout
+    home, path, label, _, user, loaded, _, _ = layout
     from hermes_cli.gateway_launchd_login import login_plist
     trigger = path.with_name(f"{_login_trigger_label(label)}.plist")
     trigger.write_bytes(login_plist(home, path, label))
@@ -102,17 +102,115 @@ def test_missing_plist_start_preserves_explicit_domain_from_login_trigger(layout
     assert trigger.exists()
 
 
-def test_force_same_explicit_domain_refreshes_running_definition(layout, monkeypatch):
-    home, path, label, _, user, loaded, _, _ = layout
-    path.write_bytes(definition(home, label, "Background"))
-    loaded[(user, label)] = 211
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda **kw: 211)
-    refreshed = []
-    monkeypatch.setattr(gw, "_launchctl_bootstrap", lambda *args, **kw: refreshed.append(args))
-    launchd.launchd_install(force=True, start_now=True, domain="user")
-    assert refreshed == [(user, path, label)]
+@pytest.mark.parametrize("writer", ["home", "launchd"])
+@pytest.mark.parametrize("start_now", [True, False])
+def test_force_same_explicit_domain_refuses_running_writer(layout, monkeypatch, writer, start_now):
+    from hermes_cli.gateway_command_errors import GatewayInstallError
+    home, path, label, _, user, loaded, calls, _ = layout
+    original = definition(home, label, "Background")
+    path.write_bytes(original)
+    if writer == "home":
+        monkeypatch.setattr("gateway.status.live_gateway_pid_for_home", lambda home: 211)
+    else:
+        loaded[(user, label)] = 211
+    with pytest.raises(GatewayInstallError, match=r"stop the gateway \(hermes gateway stop\) before refreshing its explicit launchd definition"):
+        launchd.launchd_install(force=True, start_now=start_now, domain="user")
+    assert path.read_bytes() == original
+    assert not (home / "gateway-guardian-stopped").exists()
+    assert not any(call[1] in {"bootout", "bootstrap"} for call in calls)
+
+
+@pytest.mark.parametrize("mode", ["user", "gui"])
+@pytest.mark.parametrize("start_now", [True, False])
+def test_force_stopped_refreshes_all_owned_definitions(layout, mode, start_now):
+    from hermes_cli.gateway_launchd_login import login_plist
+    home, path, label, gui, user, loaded, calls, _ = layout
+    domain = user if mode == "user" else gui
+    path.write_bytes(definition(home, label, lifetime.SESSION_TYPES[mode]))
+    shared = path.with_name(f"{guardian.GUARDIAN_LABEL}.plist")
+    shared.write_bytes(definition(home, shared.stem, lifetime.SESSION_TYPES[mode]))
+    trigger = path.with_name(f"{_login_trigger_label(label)}.plist")
+    trigger.write_bytes(definition(home, trigger.stem, "Aqua"))
+    # A stopped but registered gateway still caches the old definition.
+    loaded[(domain, label)] = None
+    launchd.launchd_install(force=True, start_now=start_now, domain=mode)
     assert "ProgramArguments" in plistlib.loads(path.read_bytes())
-    assert (user, label) in loaded
+    assert shared.read_bytes() == guardian.guardian_plist(home, path, label, domain=domain, explicit=True)
+    if mode == "user":
+        assert trigger.read_bytes() == login_plist(home, path, label)
+    else:
+        assert not trigger.exists()
+    assert ((domain, label) in loaded) == start_now
+    assert (domain, shared.stem) in loaded
+    assert (home / "gateway-guardian-stopped").exists() != start_now
+    assert any(call[1] == "bootout" for call in calls)
+
+
+def test_force_refresh_launchctl_failure_has_macos_cli_guidance(layout, monkeypatch, capsys):
+    from types import SimpleNamespace
+    home, path, label, _, _, _, _, run = layout
+    path.write_bytes(definition(home, label, "Background"))
+
+    def fail_bootstrap(argv, **kw):
+        if argv[1] == "bootstrap":
+            raise subprocess.CalledProcessError(5, argv, stderr="I/O error")
+        return run(argv, **kw)
+
+    monkeypatch.setattr(launchd.subprocess, "run", fail_bootstrap)
+    monkeypatch.setattr(gw, "_gateway_command_inner", lambda args: launchd.launchd_install(force=True, domain="user"))
+    with pytest.raises(SystemExit) as exc:
+        gw.gateway_command(SimpleNamespace(gateway_command="install"))
+    assert exc.value.code == 1
+    output = capsys.readouterr().out
+    assert "launchd" in output and "I/O error" in output
+    assert "hermes gateway status --deep" in output
+    assert "systemd" not in output and "journalctl" not in output
+
+
+@pytest.mark.parametrize("body", [b"not a plist", plistlib.dumps([]), plistlib.dumps({"EnvironmentVariables": []}), "foreign"])
+def test_missing_gateway_ignores_untrusted_login_trigger(layout, body):
+    home, path, label, _, _, _, _, _ = layout
+    trigger = path.with_name(f"{_login_trigger_label(label)}.plist")
+    if body == "foreign":
+        body = definition(home.parent / "other", trigger.stem, "Aqua")
+    trigger.write_bytes(body)
+    assert lifetime.configured_launchd_domain() is None
+
+
+@pytest.mark.parametrize("body", [b"not a plist", plistlib.dumps([]), plistlib.dumps({"EnvironmentVariables": []})])
+def test_malformed_guardian_is_cli_guidance(layout, monkeypatch, capsys, body):
+    from types import SimpleNamespace
+    home, path, label, _, _, _, calls, _ = layout
+    path.write_bytes(definition(home, label, "Background"))
+    shared = path.with_name(f"{guardian.GUARDIAN_LABEL}.plist")
+    shared.write_bytes(body)
+    monkeypatch.setattr(gw, "_gateway_command_inner", lambda args: launchd.launchd_install(domain="gui"))
+    with pytest.raises(SystemExit) as exc:
+        gw.gateway_command(SimpleNamespace(gateway_command="install"))
+    assert exc.value.code == 1
+    output = capsys.readouterr().out
+    assert "cannot prove guardian ownership" in output
+    assert "hermes gateway status --deep" in output
+    assert not any(call[1] in {"bootout", "bootstrap"} for call in calls)
+
+
+def test_retirement_failure_repairs_original_domain_without_loaded_gateway(layout):
+    home, path, label, _, user, loaded, _, run = layout
+    path.write_bytes(definition(home, label, "Background"))
+    shared = path.with_name(f"{guardian.GUARDIAN_LABEL}.plist")
+    shared.write_bytes(definition(home, shared.stem, "Background"))
+    loaded[(user, shared.stem)] = None
+
+    def fail_guardian(argv, **kw):
+        if argv[1:3] == ["bootout", f"{user}/{shared.stem}"]:
+            return subprocess.CompletedProcess(argv, 5, stdout="", stderr="I/O error")
+        return run(argv, **kw)
+
+    with pytest.raises(RuntimeError) as exc:
+        lifetime.migrate_launchd_domain("gui", start_now=False, runner=fail_guardian)
+    assert "install --launchd-domain user --no-start-now" in str(exc.value)
+    assert "install --launchd-domain gui" not in str(exc.value)
+    assert (home / "gateway-guardian-stopped").exists()
 
 
 def test_partial_retirement_reports_exact_unloaded_targets_and_repair(layout, capsys):
@@ -149,10 +247,9 @@ def test_unexpected_explicit_probe_code_is_cli_guidance(layout, monkeypatch, cap
                         subprocess.CompletedProcess(argv, 5, stdout="", stderr="I/O error"))
     monkeypatch.setattr(gw, "_gateway_command_inner", lambda args:
                         launchd.launchd_status() if operation == "status" else launchd._launchd_domain())
-    try:
+    with pytest.raises(SystemExit) as exc:
         gw.gateway_command(SimpleNamespace(gateway_command=operation))
-    except SystemExit as exc:
-        assert exc.code == 1
+    assert exc.value.code == 1
     output = capsys.readouterr().out
     assert "cannot inspect launchd target" in output
     assert "I/O error" in output

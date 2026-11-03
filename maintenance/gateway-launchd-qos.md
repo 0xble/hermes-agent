@@ -60,13 +60,21 @@ Explicit-mode uninstall drains both domains and removes only its own guardian.
 The guardian's account-shared label/plist may belong to a different profile;
 migration, uninstall and the login trigger must neither query nor manage that
 other home's guardian. Missing gateway plists infer user-domain intent from the
-owned login trigger before regeneration. A forced refresh within the same explicit
-domain follows the ordinary in-place reload path under the lifetime lock, without
-requiring a running gateway to undergo a domain migration. Start/stop announce
-lock contention. Unexpected launchctl probe codes are CLI guidance, not tracebacks.
+owned login trigger before regeneration; foreign/malformed triggers do not select
+a domain or crash status. A forced refresh within the same explicit domain refuses
+while a home writer is live or its launchd label has a PID: stop it with
+`hermes gateway stop` first. Once stopped, the lifetime transaction refreshes the
+gateway, its owned guardian and user-domain login trigger together (GUI selection
+removes the trigger), retaining `--no-start-now` intent. It reuses migration's
+rendering and drain/rollback path rather than the automatic-mode bootstrap helper.
+Start/stop announce lock contention. Unexpected launchctl probe codes are CLI
+guidance, not tracebacks; explicit status exits **1** when inspection fails, so
+scripts cannot treat an unknown service state as success. Malformed guardian
+plists fail closed with ownership/inspection guidance before changing any job.
 A partially failed retire retains stopped intent and reports exactly which prior
 registrations are unloaded, still loaded or uninspectable, with the command to
-repair the prior domain after writer drain is verified. Deferred reloads render
+repair the original plist's domain (never inferred from loaded placement or a GUI
+fallback) after writer drain is verified. Deferred reloads render
 the fail-closed drain-timeout branch from an explicit parameter, not a textual
 replacement in the generated shell. Unknown domain errors never degrade an
 explicit install to an unsupervised process.

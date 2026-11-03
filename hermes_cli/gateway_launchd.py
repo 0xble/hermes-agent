@@ -818,18 +818,19 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
         from hermes_cli.gateway_command_errors import GatewayInstallError
         try:
             from hermes_cli.gateway_launchd_lifetime import _uid
-            if force and configured == f"{selected}/{_uid()}" and _gw().get_launchd_plist_path().exists():
-                from hermes_cli.gateway_launchd_lifetime import lifetime_lock
-                with lifetime_lock(_gw().get_hermes_home(), blocking=False) as acquired:
-                    if not acquired:
-                        raise BlockingIOError("launchd lifetime operation is busy")
-                    # Refresh is not a domain migration. Keep the regular install semantics,
-                    # but prove there is no conflicting-domain copy before reloading.
-                    _gw()._resolved_launchd_domain = _probe_launchd_domain_for_label(_gw().get_launchd_label())
-                    return _install_launchd_definition(force, start_now=start_now, force_unit_path=force_unit_path)
-            migrate_launchd_domain(selected, start_now=start_now)
+            # Reuse migration's owned-definition rendering and stopped transaction.
+            refresh = force and configured == f"{selected}/{_uid()}"
+            if refresh:
+                migrate_launchd_domain(selected, start_now=start_now, force_refresh=True)
+            else:
+                migrate_launchd_domain(selected, start_now=start_now)
         except BlockingIOError as exc:
             raise GatewayInstallError("Launchd lifetime operation is busy; retry shortly.") from exc
+        except subprocess.CalledProcessError as exc:
+            raise GatewayInstallError(
+                f"Could not install gateway launchd service: {exc}. {exc.stderr or ''} "
+                "Inspect macOS launchd with `hermes gateway status --deep` before retrying."
+            ) from exc
         except RuntimeError as exc:
             raise GatewayInstallError(f"Could not install gateway launchd service: {exc}") from exc
         return
@@ -1201,16 +1202,13 @@ def launchd_status(deep: bool = False):
     observed_domains = []
     if domain is not None:
         from hermes_cli.gateway_launchd_lifetime import _state
-        from hermes_cli.gateway_command_errors import LaunchdServiceError
-        try:
-            service_listed, launchd_pid = _state(subprocess.run, domain, label)
-            uid = os.getuid()  # windows-footgun: ok — launchd status is a macOS-only path.
-            for candidate in (f"gui/{uid}", f"user/{uid}"):
-                if candidate == domain and service_listed or candidate != domain and _state(subprocess.run, candidate, label)[0]:
-                    observed_domains.append(candidate)
-        except LaunchdServiceError as exc:
-            print(f"⚠ Launchd status unavailable: {exc}")
-            return
+        # Inspection failures propagate as LaunchdServiceError: the CLI exits 1,
+        # rather than letting scripts mistake an unknown service state for success.
+        service_listed, launchd_pid = _state(subprocess.run, domain, label)
+        uid = os.getuid()  # windows-footgun: ok — launchd status is a macOS-only path.
+        for candidate in (f"gui/{uid}", f"user/{uid}"):
+            if candidate == domain and service_listed or candidate != domain and _state(subprocess.run, candidate, label)[0]:
+                observed_domains.append(candidate)
     else:
         launchd_pid = _gw()._parse_launchd_pid_from_list_output(list_output) if service_listed else None
 

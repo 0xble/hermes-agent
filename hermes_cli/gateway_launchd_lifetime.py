@@ -33,7 +33,10 @@ def configured_launchd_domain(label: str | None = None) -> str | None:
         trigger_label = _login_trigger_label(path.stem)
         trigger_path = path.with_name(f"{trigger_label}.plist")
         if trigger_path.exists():
-            _owned_definition(trigger_path, gw.get_hermes_home(), trigger_label)
+            try:
+                _owned_definition(trigger_path, gw.get_hermes_home(), trigger_label)
+            except (OSError, RuntimeError, ValueError):
+                return None  # An untrusted login trigger cannot select a service domain.
             return f"user/{_uid()}"
         return None
     try:
@@ -109,11 +112,16 @@ def _write(path: Path, body: bytes | None) -> None:
 def _owned_definition(path: Path, home: Path, label: str) -> bytes | None:
     if not path.exists():
         return None
-    original = path.read_bytes()
-    body = plistlib.loads(original)
-    owner = body.get("EnvironmentVariables", {}).get("HERMES_HOME")
-    if body.get("Label") != label or not owner or Path(owner).resolve() != home.resolve():
-        raise RuntimeError(f"refusing foreign launchd definition: {path}")
+    try:
+        original = path.read_bytes()
+        body = plistlib.loads(original)
+    except (OSError, ValueError, IndexError, plistlib.InvalidFileException, ExpatError) as exc:
+        raise LaunchdServiceError(f"cannot read launchd definition {path}: {exc}") from exc
+    env = body.get("EnvironmentVariables") if isinstance(body, dict) else None
+    owner = env.get("HERMES_HOME") if isinstance(env, dict) else None
+    if (not isinstance(body, dict) or body.get("Label") != label
+            or not isinstance(owner, str) or not owner or Path(owner).resolve() != home.resolve()):
+        raise LaunchdServiceError(f"refusing foreign or malformed launchd definition: {path}")
     return original
 
 
@@ -161,7 +169,7 @@ def _restore_definitions(run, originals, labels, states, *, gateway_label, stopp
                               for (_, name), (_, pid) in states.items())
 
 
-def _retirement_failure(run, states, gateway_label: str) -> str:
+def _retirement_failure(run, states, gateway_label: str, original_gateway: bytes | None) -> str:
     """Report partial retirement without reloading beside a possibly undrained writer."""
     unloaded, loaded, unknown = [], [], []
     for (domain, name), (was_loaded, _) in states.items():
@@ -172,25 +180,36 @@ def _retirement_failure(run, states, gateway_label: str) -> str:
             (loaded if _state(run, domain, name)[0] else unloaded).append(target)
         except (RuntimeError, OSError, subprocess.SubprocessError):
             unknown.append(target)
-    prior = next((d for (d, n), (present, _) in states.items() if n == gateway_label and present),
-                 f"gui/{_uid()}").split("/", 1)[0]
+    # Loaded placement is not durable intent (the gateway may be stopped or misplaced).
+    original = plistlib.loads(original_gateway) if original_gateway is not None else {}
+    prior = next((mode for mode, session in SESSION_TYPES.items()
+                  if original.get("LimitLoadToSessionType") == session), None)
+    configured = configured_launchd_domain(gateway_label)
+    if prior is None and configured is not None:
+        prior = configured.split("/", 1)[0]
+    repair = (f"`hermes gateway install --launchd-domain {prior} --no-start-now` "
+              "and `hermes gateway start`." if prior else
+              "select the intended --launchd-domain from the original definition before reinstalling.")
     return (f"Unloaded: {', '.join(unloaded) or 'none'}. "
             f"Still loaded: {', '.join(loaded) or 'none'}. "
             f"Unknown: {', '.join(unknown) or 'none'}. "
             "Stopped intent retained; any unregistered writer may still be draining. "
             "Repair: verify all writers have exited with `hermes gateway stop` and "
-            "`hermes gateway status --deep`, then run "
-            f"`hermes gateway install --launchd-domain {prior} --no-start-now` "
-            "and `hermes gateway start`.")
+            "`hermes gateway status --deep`, then run " + repair)
 
 
-def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
+def _running_writer(home: Path) -> bool:
+    from gateway.status import get_running_pid, live_gateway_pid_for_home
+    return (get_running_pid(cleanup_stale=False) is not None
+            or live_gateway_pid_for_home(home) is not None)
+
+
+def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None, force_refresh: bool = False) -> None:
     import fcntl  # POSIX-only path; importing gateway CLI remains safe on Windows.
     if mode not in SESSION_TYPES:
         raise ValueError("launchd domain must be 'gui' or 'user'")
     from hermes_cli import gateway as gw
     from hermes_cli.gateway_guardian import GUARDIAN_LABEL, guardian_plist, set_intent
-    from gateway.status import get_running_pid
     home, path, label = gw.get_hermes_home(), gw.get_launchd_plist_path(), gw.get_launchd_label()
     guardian_path = path.with_name(f"{GUARDIAN_LABEL}.plist")
     from hermes_cli.gateway_launchd_login import _login_trigger_label
@@ -222,11 +241,15 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
         if any((p.read_bytes() if p.exists() else None) != b for p, b in originals.items()):
             raise RuntimeError("launchd definitions changed during migration preflight; retry")
         states = _inspect_layout(run, domains, labels, originals, mode=mode, gateway_label=label)
+        if force_refresh and (_running_writer(home) or any(
+                name == label and pid is not None for (_, name), (_, pid) in states.items())):
+            raise LaunchdServiceError(
+                "stop the gateway (hermes gateway stop) before refreshing its explicit launchd definition")
         correct = all(originals[p] == b for p, b in bodies.items())
         placed = all(not loaded or domain == (domains[0] if name == login_label else target)
                      for (domain, name), (loaded, _) in states.items())
         guardian_placed = guardian_path not in bodies or states[(target, GUARDIAN_LABEL)][0]
-        if correct and placed and guardian_placed and (not start_now or states[(target, label)][0]):
+        if not force_refresh and correct and placed and guardian_placed and (not start_now or states[(target, label)][0]):
             if not start_now and states[(target, label)][0]:
                 raise RuntimeError("stop the gateway before installing with --no-start-now")
             if not start_now:
@@ -234,7 +257,7 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
             gw._clear_launchd_unsupported_marker()
             print(f"Service already installed in {target}")
             return
-        if get_running_pid(cleanup_stale=False) is not None:
+        if _running_writer(home):
             raise RuntimeError("stop the gateway before changing its launchd domain")
         from hermes_cli.gateway_launchd_login import stop_requested
         stopped = stop_requested(home)
@@ -246,7 +269,7 @@ def migrate_launchd_domain(mode: str, *, start_now: bool, runner=None) -> None:
             try:
                 _retire_copies(run, home, domains, names, gateway_label=label)
             except Exception as exc:
-                raise RuntimeError(f"{exc}. {_retirement_failure(run, states, label)}") from exc
+                raise RuntimeError(f"{exc}. {_retirement_failure(run, states, label, originals[path])}") from exc
             changed = True
             from gateway.status import live_gateway_pid_for_home
             if live_gateway_pid_for_home(home) is not None:

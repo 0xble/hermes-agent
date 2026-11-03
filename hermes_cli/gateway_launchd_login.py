@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import plistlib
 import subprocess
+from xml.parsers.expat import ExpatError
 
 
 def stop_requested(home: Path) -> bool:
@@ -33,11 +34,18 @@ def foreign_guardian(path: Path, home: Path, label: str) -> bool:
     """The guardian is account-shared; only its owning Hermes home may manage it."""
     if not path.exists():
         return False  # An unowned loaded label must still fail closed during preflight.
-    body = plistlib.loads(path.read_bytes())
-    owner = body.get("EnvironmentVariables", {}).get("HERMES_HOME")
-    if body.get("Label") != label or not owner:
-        raise RuntimeError(f"cannot prove guardian ownership: {path}")
-    return Path(owner).resolve() != home.resolve()
+    guidance = (f"cannot prove guardian ownership: {path}; "
+                "inspect the definition and `hermes gateway status --deep` before retrying")
+    try:
+        body = plistlib.loads(path.read_bytes())
+        env = body.get("EnvironmentVariables") if isinstance(body, dict) else None
+        owner = env.get("HERMES_HOME") if isinstance(env, dict) else None
+        if (not isinstance(body, dict) or body.get("Label") != label
+                or not isinstance(owner, str) or not owner):
+            raise RuntimeError(guidance)
+        return Path(owner).resolve() != home.resolve()
+    except (OSError, ValueError, IndexError, plistlib.InvalidFileException, ExpatError) as exc:
+        raise RuntimeError(guidance) from exc
 
 
 @contextmanager
