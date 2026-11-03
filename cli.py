@@ -577,16 +577,16 @@ def _cleanup_worktree(info: dict[str, str] | None = None) -> None:
             print(f"  {_t('cli.worktree.clean_up_manually', path=wt_path)}")
         return
 
-    from hermes_cli.worktree_ops import removal_blocked
+    from hermes_cli.worktree_ops import _unlock_owned_worktree, removal_blocked
     blocked = removal_blocked(wt_path)  # an embedded repo or private ref dies with it
     if blocked:
         _cprint(f"\n\033[33m{_t('cli.worktree.kept_reason', path=wt_path, reason=blocked[1])}\033[0m")
         return
 
-    # Release the tree's language servers while the path still exists, then unlock so `remove`
-    # isn't blocked by the lock placed at creation. Fail-soft.
     release_lsp_clients(wt_path)
-    _git_quiet(["worktree", "unlock", wt_path], repo_root, log="git worktree unlock failed (non-fatal)")
+    if not _unlock_owned_worktree(repo_root, wt_path):
+        _cprint(f"\n\033[33m{_t('cli.worktree.kept_reason', path=wt_path, reason='lock held or unverifiable')}\033[0m")
+        return
     _git_quiet(["worktree", "remove", wt_path, "--force"], repo_root, timeout=15, log="Failed to remove worktree")
     _git_quiet(["branch", "-D", branch], repo_root, log=f"Failed to delete branch {branch}")
     _cprint(f"\033[32m{_t('cli.worktree.cleaned_up', path=wt_path)}\033[0m")

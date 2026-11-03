@@ -108,9 +108,11 @@ def apply_exit_choice(info: dict, echo) -> bool:
         echo(f"  {t('cli.worktree.restore_hint', name=name)}")
         return True
     from hermes_cli._subprocess_compat import noninteractive_git_env
-    from hermes_cli.worktree_ops import _git_quiet, release_lsp_clients
+    from hermes_cli.worktree_ops import _git_quiet, _unlock_owned_worktree, release_lsp_clients
     release_lsp_clients(path)
-    _git_quiet(["worktree", "unlock", path], repo_root, log="git worktree unlock failed (non-fatal)")
+    if not _unlock_owned_worktree(repo_root, path):
+        echo(t("cli.worktree.kept_reason", path=path, reason="lock held or unverifiable"))
+        return True
     _git_quiet(["worktree", "remove", path, "--force"], repo_root, timeout=60, log="Failed to remove worktree")
     if branch and not os.path.isdir(path):
         _git_quiet(["branch", "-D", branch], repo_root, log=f"Failed to delete branch {branch}",

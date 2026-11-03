@@ -36,6 +36,18 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   both `hermes worktree prune` and the startup/cron pruner. A 15-30s timeout
   killed removals mid-delete on a saturated volume and left registered,
   half-deleted trees that every later prune keeps as dirty.
+- Only a lock Hermes wrote (`hermes pid=`/`hermes session=`) can be judged dead
+  and unlocked for reclaim. A lock with any other reason belongs to another tool
+  or person and is always live: the tree is never unlocked or removed, at any
+  age. Upstream treated a foreign lock as a leftover, and on 2026-10-30 the sweep
+  deleted another topic's locked eval candidate twice (launch-time sweeps ignore
+  the deletion window).
+- Every unlock goes through the same ownership check immediately before mutation,
+  including execution of frozen sweep/audit results, post-snapshot removal, clean
+  exit, discard, session retention and failed-add cleanup (including its directory
+  removal fallback). Unattended reclaim also refreshes Hermes-lock liveness. A
+  bare, malformed, foreign or unreadable lock is preserved rather than guessed to
+  belong to the failed add, even if Git left an initialization lock.
 - `hermes worktree prune --dry-run` reports, per tree and in total, how much
   would be copied to the archive. It sizes only those paths, never whole trees;
   the rest of each tree is freed.
@@ -52,7 +64,10 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   parsing; review reproduced silent loss of a quoted filename followed by a
   full reclaim, and a later review found ignored-directory symlinks archived as
   regular files. Neither revision was adopted here.
-- Surfaces: `hermes_cli/worktree_gc.py`, `hermes_cli/worktree_ops.py` (remove timeout), `tests/hermes_cli/test_worktree_gc.py`.
+- Surfaces: `hermes_cli/worktree_gc.py`, `hermes_cli/worktree_ops.py` (remove timeout,
+  foreign-lock liveness and ownership-aware unlock), `hermes_cli/worktree_sweep.py`,
+  `hermes_cli/worktree_exit.py`, `cli.py`, `tests/hermes_cli/test_worktree_gc.py`,
+  `tests/hermes_cli/test_worktree.py` (lock reaping).
 
 ## Verification
 
@@ -65,6 +80,12 @@ go with the tree while an ignored `.env` (including one inside a tracked `script
 an untracked `dist/` file and an ignored parent holding a cache are archived, a tree with only
 regenerable dirt must reap with no archive, and a dry run must report archive size without
 sizing a whole tree.
+
+`scripts/run_tests.sh tests/hermes_cli/test_worktree*.py` also covers foreign locks
+through startup/classic sweeps, frozen plans/verdicts/audits, ownership changing
+during the archive, exit cleanup/discard, retention and failed-add cleanup. The
+tree's contents and exact foreign lock must survive each path; existing tests keep
+dead-Hermes-lock reclamation and clean exit working.
 
 ## Retirement and rollback
 

@@ -101,9 +101,12 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
     """
     try:
         # Unlock first: `worktree remove --force` refuses a locked tree.
-        _git_quiet(["worktree", "unlock", str(wt_path)], repo_root, timeout=15)
+        if not _unlock_owned_worktree(repo_root, str(wt_path), timeout=15):
+            return  # Another owner may have claimed this path after the failed add.
         _git_quiet(["worktree", "remove", "--force", str(wt_path)], repo_root, timeout=15)
         if wt_path.exists():
+            if not _unlock_owned_worktree(repo_root, str(wt_path), timeout=15):
+                return  # Git may have refused removal because another tool just locked it.
             shutil.rmtree(wt_path, ignore_errors=True)
         # `remove` needs the dir; `prune` drops the admin entry when it is already gone.
         _git_quiet(["worktree", "prune"], repo_root, timeout=15,
@@ -816,7 +819,8 @@ def _retain_worktree_for_session(repo_root: str, worktree_path: str, session_id:
     (``_retained_tree_is_live``), not only the named one: ``/new`` leaves the older session's
     history in the same checkout.
     """
-    _git_quiet(["worktree", "unlock", worktree_path], repo_root, log="worktree unlock before retain failed")
+    if not _unlock_owned_worktree(repo_root, worktree_path):
+        return False
     try:
         result = _git(["worktree", "lock", "--reason", f"hermes session={session_id} db={db_path}",
                        worktree_path], repo_root)
@@ -956,9 +960,30 @@ def _worktree_lock_reason(repo_root: str, worktree_path: str, timeout: int):
         return True, None
 
 
+def _unlock_owned_worktree(repo_root: str, worktree_path: str, timeout: int = 10, *, dead_only: bool = False) -> bool:
+    """Allow removal/relocking only when unlocked or holding a recognized Hermes lock.
+
+    Refresh ownership at the mutation boundary, not from an earlier sweep/audit verdict.
+    Unattended reclaim also requires the Hermes owner to be dead; session exit may release
+    its own live lock. Bare, foreign, malformed and unreadable locks all fail closed.
+    """
+    try:
+        found, reason = _worktree_lock_reason(repo_root, worktree_path, timeout)
+        if not found or reason is None:
+            return True
+        if _HERMES_LOCK_RE.fullmatch(reason) is None:
+            return False
+        if dead_only and _worktree_lock_is_live(repo_root, worktree_path, timeout) != "dead":
+            return False
+        return _git(["worktree", "unlock", worktree_path], repo_root, timeout=timeout).returncode == 0
+    except Exception as exc:
+        logger.debug("Keeping worktree %s: cannot release its lock (%s)", worktree_path, exc)
+        return False
+
+
 def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10):
-    """Lock state: ``"live"`` (owning pid runs / a resumable session works in the tree),
-    ``"dead"`` (pid and sessions gone / non-hermes reason), None (unlocked).
+    """Lock state: ``"live"`` (owning pid runs / a resumable session works in the tree, or
+    another tool holds the lock), ``"dead"`` (Hermes pid and sessions gone), None (unlocked).
 
     A Hermes tree locks with reason ``hermes pid=<pid>``; ``worktree remove --force`` refuses
     locked trees, so a crashed session's lock would keep its tree forever. A ``-w`` tree
@@ -966,7 +991,9 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
     its terminal (SIGHUP skips the exit re-lock) still keeps the tree while a resumable session's
     row cwd is inside it. A classic ``-w`` row's cwd is the repo root: its tree is only recorded,
     and a reaped clean one is recreated on resume. Fails SAFE toward "live", including a
-    ``hermes`` reason this version cannot parse.
+    ``hermes`` reason this version cannot parse. A lock Hermes did not write belongs to
+    another tool or person, which git's lock contract says to leave alone, so it is always
+    ``"live"``: only Hermes' own locks can be judged dead and unlocked.
     """
     try:
         found, reason = _worktree_lock_reason(repo_root, worktree_path, timeout)
@@ -975,8 +1002,7 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
     if not found or reason is None:
         return None
     if not reason.startswith("hermes "):
-        # A foreign lock here is a leftover; the age/dirty/unpushed gates already passed.
-        return "dead"
+        return "live"
     lock = _HERMES_LOCK_RE.fullmatch(reason)
     if lock is None:
         return "live"
@@ -1134,9 +1160,9 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
             preserved_stale.append(f"{entry.name} ({blocked[1]})")
             continue
 
-        if lock_state == "dead":
-            _git_quiet(["worktree", "unlock", str(entry)], repo_root,
-                       log=f"Failed to unlock dead worktree {entry.name}")
+        if not _unlock_owned_worktree(repo_root, str(entry), dead_only=True):
+            preserved_stale.append(f"{entry.name} (lock held or unverifiable)")
+            continue
 
         try:
             branch = _git(["branch", "--show-current"], str(entry), timeout=5).stdout.strip()
