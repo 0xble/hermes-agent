@@ -56,7 +56,11 @@ Fork patch identity: `terminal-background-survival`.
   timeout. A crash before rendering/admission retries; a crash after external
   delivery but before its marker is written has an ambiguous outcome and may
   replay (the transport and marker are not one transaction). Delivered markers
-  suppress restart replays. Shutdown fences survivor pollers before teardown.
+  suppress restart replays. Shutdown fences only `survive_restart` pollers before
+  teardown. Ordinary and `persist_on_release` file-backed pollers keep finalizing
+  during the agent drain. Kill paths collect a published exit marker before PID
+  checks, cut receipts, or signals, preserving the real exit and completion rather
+  than labelling an already-completed job `killed`.
   Run directories are pruned after acknowledged-result retention
   expires, and immediately on spawn failure. Directory sweeps are throttled to
   at most once per minute per profile to bound registry-lock IO; in-memory result
@@ -128,7 +132,7 @@ Fork patch identity: `terminal-background-survival`.
 
 ## Verification
 
-Contract tests: `tests/tools/test_process_registry_login_rc.py`
+Contract tests: `tests/tools/test_process_registry_login_rc.py` `tests/tools/test_process_registry_shutdown_drain.py`
 
 Run the focused process-registry and terminal proof surfaces with the canonical
 FIFO runner, then run Ruff and `scripts/check_fork_patches.py --source-only`.

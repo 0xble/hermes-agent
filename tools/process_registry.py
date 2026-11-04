@@ -754,8 +754,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         # Completions the agent already consumed via wait()/read_log() (output in
         # hand): drain loops AND gateway/tui watchers skip them.
         self._completion_consumed: set = set()
-        # Shutdown fences survivor pollers before the old gateway can claim a completion
-        # into an in-memory queue that the successor cannot drain.
+        # Shutdown fences restart-safe pollers for adoption, not ordinary file-backed jobs.
         self._survivor_pollers_stopped = threading.Event()
         self._survivor_poller_fence = threading.Lock()
         # Sessions merely *observed* exited via poll(). poll() is read-only and must NOT
@@ -2243,25 +2242,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             return {"status": "deadline", "session_id": session_id}
         previous_kill_deadline = session._kill_deadline
         session._kill_deadline = deadline
-        if session.exited:
-            # If the worker was spawned in its own systemd scope (#70716), stop the entire unit to reap any
-            # double-forked descendants that were reparented inside the scope and survived the PID signal
-            # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
-            # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
-            # above already handled the main process; this catches stragglers.
-            scope_stopped = self._stop_scope(session, deadline)
-            with session._lock:
-                result = self._exit_snapshot(session, "already_exited")
-                finalizing = self._reader_finalizing(session)
-            if not scope_stopped:
-                result["scope_stop_failed"] = session.systemd_unit
-            # Only suppress the autonomous turn after its output is present in
-            # the explicit kill result, matching wait/log consumption.
-            if consume_output and not finalizing:
-                self._completion_consumed.add(session_id)
-                self._consume_survivor_completion(session_id)
-            session._kill_deadline = previous_kill_deadline
-            return result
+        if self._collect_recorded_exit(session):
+            try:
+                return self._already_exited_kill_result(session, consume_output, deadline)
+            finally:
+                session._kill_deadline = previous_kill_deadline
         # Keep an additive receipt before a restart/shutdown signal can outlive this
         # gateway. The normal completion write below may be fenced by the shared deadline.
         session._kill_requested = True
@@ -2737,17 +2722,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 retry = self.kill_process(session.id, **retry_kwargs)
                 retried += retry.get("status") == "already_exited" and "scope_stop_failed" not in retry
             return retried
-        bounded_guard_fired = (
-            (stop_event is not None and stop_event.is_set())
-            or (deadline is not None and time.monotonic() >= deadline)
-        )
-        detached_nonrunning = [] if bounded_guard_fired else [
-            session for session in targets
-            if session.detached
-            and session.pid_scope == "host"
-            and session.pid
-            and self._detached_host_fate(session.pid, session.host_start_time) != "running"
-        ]
+        targets, detached_nonrunning = self._partition_kill_targets(
+            targets, deadline, stop_event, scope_retries, consume_output)
         def _close_detached_nonrunning() -> None:
             # Scope teardown may spend the whole remaining budget. In bounded
             # sweeps, run it only after active workers have had their signals.
@@ -2760,7 +2736,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                         or (deadline is not None and time.monotonic() >= deadline)):
                     break
                 self._close_reused_detached(session)
-        targets = [session for session in targets if session not in detached_nonrunning]
         def _fallback_kill_one(session: ProcessSession) -> bool:
             if stop_event is not None and stop_event.is_set():
                 return False

@@ -1,4 +1,4 @@
-"""File-backed supervision for explicitly restart-surviving local background jobs."""
+"""File-backed local supervision with opt-in restart-safe dispatch and delivery."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ _LIVE_CLAIM_NONCES: set[str] = set()
 
 
 class ProcessSurvivalMixin:
-    """Keep restart survival separate from ordinary pipe/PTY process supervision."""
+    """Share durable I/O without granting ordinary jobs restart-safe lifecycle semantics."""
 
     def _spawn_local_survivor(
         self, session: ProcessSession, safe_command: str, env_vars: dict | None, *, restart_safe: bool = True,
@@ -392,7 +392,7 @@ class ProcessSurvivalMixin:
             return
 
     def stop_survivor_pollers(self) -> None:
-        """Fence survivor pollers before gateway shutdown drains in-memory notifications."""
+        """Leave restart-safe completions for adoption; ordinary pollers keep draining."""
         stopped = getattr(self, "_survivor_pollers_stopped", None)
         fence = getattr(self, "_survivor_poller_fence", None)
         if stopped is not None:
@@ -414,10 +414,14 @@ class ProcessSurvivalMixin:
             if stopped is None or not stopped.is_set():
                 self.completion_queue.put(notification)
 
-    def _finish_survivor_if_allowed(self, session: ProcessSession, exit_code, reason: str, source: str) -> bool:
-        """Do not start new finalization after shutdown; an in-flight owner may persist."""
+    def _survivor_poller_stopped(self, session: ProcessSession) -> bool:
+        """Only restart-safe jobs have a successor responsible for shutdown completions."""
         stopped = getattr(self, "_survivor_pollers_stopped", None)
-        if stopped is not None and stopped.is_set():
+        return session.survive_restart and stopped is not None and stopped.is_set()
+
+    def _finish_survivor_if_allowed(self, session: ProcessSession, exit_code, reason: str, source: str) -> bool:
+        """Fence restart-safe finalization only; ordinary drain results belong here."""
+        if self._survivor_poller_stopped(session):
             return False
         # Shutdown can win during receipt IO. Publication rechecks under its short fence,
         # leaving the checkpoint pending for the successor instead of blocking teardown.
@@ -426,11 +430,11 @@ class ProcessSurvivalMixin:
 
     def _survivor_poller_loop(self, session: ProcessSession):
         """Collect a file-backed local survivor after this or a successor gateway boots."""
-        if getattr(getattr(self, "_survivor_pollers_stopped", None), "is_set", lambda: False)():
+        if self._survivor_poller_stopped(session):
             return
         exit_path = Path(session.exit_path)
         while not session.exited:
-            if getattr(getattr(self, "_survivor_pollers_stopped", None), "is_set", lambda: False)():
+            if self._survivor_poller_stopped(session):
                 return
             if session._kill_requested:
                 time.sleep(0.05)
@@ -527,6 +531,26 @@ class ProcessSurvivalMixin:
                 )
         except OSError:
             logger.warning("Could not persist survivor termination for %s", session.id, exc_info=True)
+
+    def _collect_recorded_exit(self, session: ProcessSession, *, deadline=None) -> bool:
+        """A published wrapper result wins over a later kill of its already-reaped PID."""
+        if session.exited:
+            return True
+        exit_code = self._recorded_survivor_exit(session.exit_path)
+        if exit_code is None:
+            return False
+        termination = self._recorded_survivor_termination(session.exit_path)
+        previous_deadline = session._kill_deadline
+        if deadline is not None:
+            session._kill_deadline = deadline
+        try:
+            self._finish_survivor(
+                session, exit_code, termination.get("completion_reason", "exited"),
+                termination.get("termination_source", ""),
+            )
+        finally:
+            session._kill_deadline = previous_deadline
+        return True
 
     def _finish_survivor(self, session: ProcessSession, exit_code, reason: str, source: str) -> None:
         self._read_survivor_log(session, final=True)
