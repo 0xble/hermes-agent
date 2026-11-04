@@ -71,8 +71,9 @@ def _commit(manager: Any, expected: str, state: LoopState, *, tick_lifecycle: bo
         revision = state.revisions[-1]
         if not revision.get("user_quote"):
             return True
-        from hermes_cli.session_controls import _read_current_user_quote
-        checked = _read_current_user_quote(manager.session_id, revision["user_quote"], cursor=cursor)
+        from hermes_cli.session_controls import check_user_quote
+        checked = check_user_quote(manager.session_id, revision["user_quote"], cursor=cursor,
+                                   stop_condition=revision.get("after", {}).get("until", ""))
         return (not isinstance(checked, str) and checked[1] == revision["user_message"]
                 and checked.relay_receipt == revision.get("relay_receipt", "")
                 and checked.source_session_id == revision.get("quote_source_session_id", checked.source_session_id))

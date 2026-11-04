@@ -57,7 +57,7 @@ def test_agent_can_stop_own_loop_with_audit(state):
 def test_verified_relay_quote_authorizes_loop_revision(state, monkeypatch, tmp_path):
     from hermes_cli.loops import LoopManager
     LoopManager("requester").set("Check build", interval_seconds=600, until="Build settles")
-    quote = "Remove the build stop condition"
+    quote = "Remove the requester build stop condition"
     relay(state, monkeypatch, tmp_path, quote)
     result = LoopManager("requester").revise(reason="Brian removed the stop condition", until="", user_quote=quote)
     assert result["ok"], result
@@ -144,7 +144,7 @@ def test_verified_relay_quote_can_remove_named_goal_constraint(state, monkeypatc
     from hermes_cli.goals import GoalManager, GoalContract
     manager = GoalManager("requester")
     manager.set("Ship build", contract=GoalContract(constraints="Never publish secrets"), actor="agent")
-    quote = 'Remove "Never publish secrets"'
+    quote = 'Remove "Never publish secrets" from the requester goal'
     relay(state, monkeypatch, tmp_path, quote)
     result = manager.revise(reason="Brian removed that hard limit", contract={"constraints": ""}, user_quote=quote)
     assert result["ok"], result

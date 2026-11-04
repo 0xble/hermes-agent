@@ -299,30 +299,58 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
     return UserQuote(normalized, stripped, relay_receipt=relay_receipt, source_session_id=source_sid)
 
 
-def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
-    """Validate a quote against only the requester's latest typed user message."""
+def quote_authorizes(source: UserQuote, controlled_session_id: str, *, cursor=None) -> bool:
+    """Deictic words belong to where the user typed them, never to a relay receiver."""
+    origin = source.source_session_id
+    return bool(origin) and (origin == controlled_session_id or _quote_names_target(
+        _governing_sentence(_normalize(source[0]), _normalize(source[1])), controlled_session_id, cursor=cursor))
+
+
+def check_user_quote(requester_session_id: str, quote: str, *, cursor=None,
+                     controlled_session_id: Optional[str] = None,
+                     quoted_targets: bool = False, stop_condition: str = "") -> Tuple[str, str] | str:
+    """Validate a current authenticated quote against its typed origin and controlled session."""
     checked = _read_current_user_quote(requester_session_id, quote, cursor=cursor)
     if isinstance(checked, str):
         return checked
     normalized, stripped = checked
     source = _normalize(stripped)
-    if _is_negated(normalized, source):
+    instruction, instruction_quote = stripped, normalized
+    if quoted_targets:
+        # Removal syntax may quote an exact requirement name. Its words are data
+        # (e.g. "Never restart"), not a refusal; code spans and block quotes still refuse.
+        from hermes_cli.goals_authority import _NON_AUTHORITATIVE_QUOTE_RE
+        instruction = _NON_AUTHORITATIVE_QUOTE_RE.sub("", instruction)
+        instruction_quote = _NON_AUTHORITATIVE_QUOTE_RE.sub("", instruction_quote)
+    scoped = UserQuote(instruction_quote, instruction, source_session_id=checked.source_session_id)
+    if stop_condition:
+        # In a new stop specification, "when/until" binds the supplied condition,
+        # not the timing of a removal. Never relax guards for an empty condition.
+        condition = _normalize(stop_condition).rstrip(".!;").casefold()
+        declaration = _normalize(instruction).rstrip(".!;").casefold()
+        if (declaration in {f"stop when {condition}", f"keep checking until {condition}",
+                            f"keep checking until the {condition}"}
+                or (declaration == condition and re.match(r"^(?:stop when|keep checking until)\b", declaration))):
+            instruction = re.sub(r"\b(?:when|until)\b", "", instruction, count=1, flags=re.IGNORECASE)
+    if _is_negated(instruction_quote, _normalize(instruction)):
         return "user_quote_negated"
     # Authority comes from the user's instruction in its full context, never a trimmed substring:
     # any refusal, question or condition anywhere in the message ("Clear the X goal? Not now")
     # refuses. Callers match the control against the quote's whole sentence (_governing_sentence).
     # Quoted-data provenance (block quotes, fences) is line-based: judge it on the raw message,
     # before normalization collapsed the newlines that mark it.
-    if not _message_grants_authority(source) or _QUOTED_DATA_RE.search(stripped):
+    if not _message_grants_authority(instruction) or _QUOTED_DATA_RE.search(instruction):
         return "user_quote_qualified"
     # The whole message must be the one instruction. Any other sentence can revoke, correct or
     # reframe it ("Disregard the next sentence. Clear ...", "Clear ... Actually, keep it"), and no
     # word list can read that reliably, so a multi-sentence message falls back to Approve/Deny.
     # Judge the raw message: normalization collapses the newlines that separate sentences.
-    if len([part for part in _CLAUSE_BREAK.split(stripped) if part.strip()]) != 1:
+    if len([part for part in _CLAUSE_BREAK.split(instruction) if part.strip()]) != 1:
         return "user_quote_multi_sentence"
-    return UserQuote(normalized, source, relay_receipt=getattr(checked, "relay_receipt", ""),
-                     source_session_id=getattr(checked, "source_session_id", ""))
+    if not quote_authorizes(scoped, controlled_session_id or requester_session_id, cursor=cursor):
+        return "user_quote_mismatch"
+    return UserQuote(normalized, source, relay_receipt=checked.relay_receipt,
+                     source_session_id=checked.source_session_id)
 
 
 # A quote authorizes only the control it states. Each control has disjoint verb sets within its
@@ -543,7 +571,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 goal=str(payload.get("goal") or ""),
                 max_turns=payload.get("max_turns"),
                 contract=payload.get("contract"),
-                actor=caller,
+                actor=caller.actor,
                 user_quote=str((authority or {}).get("quote") or ""),
             )
         continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
@@ -999,7 +1027,10 @@ def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
         "requester_title": _session_title(requester_sid, cursor=cursor), "target_title": _session_title(target_sid, cursor=cursor),
         "reason": reason or "session-control", "payload": dict(payload or {}),
         "affected_text": affected_text,
-        "authority": dict(authority), "status": status, "created_at": now,
+        "authority": {key: value for key, value in authority.items() if key != "quote_source_session_id"},
+        **({"quote_source_session_id": authority["quote_source_session_id"]}
+           if authority.get("quote_source_session_id") else {}),
+        "status": status, "created_at": now,
         "lifecycle_authority": LifecycleAuthority.from_control(authority).value,
         "expires_at": expires_at, "resolved_at": None, "error": None,
         "request_posted": status != "pending", "request_skipped": False,
@@ -1157,10 +1188,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     quote_check = None
     quote_matches = False
     if user_quote:
-        quote_check = check_user_quote(requester_sid, user_quote)
+        quote_check = check_user_quote(requester_sid, user_quote, controlled_session_id=target_sid)
         if not isinstance(quote_check, str):
             quote_matches = _quote_matches_control(
-                kind, action, target_sid, requester_sid,
+                kind, action, target_sid, quote_check.source_session_id,
                 _governing_sentence(*quote_check), payload,
             )
 
@@ -1208,13 +1239,15 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
             if action in {"pause", "resume", "stop"} and user_quote:
                 # Only a still-current user instruction may suspend automatic waking, lift a user
                 # pause, or stop (clear) a loop. Anything else stays the agent's own act.
-                checked = check_user_quote(requester_sid, user_quote, cursor=conn)
+                checked = check_user_quote(requester_sid, user_quote, cursor=conn, controlled_session_id=target_sid)
                 if not isinstance(checked, str) and _quote_matches_control(
-                    kind, action, target_sid, requester_sid,
+                    kind, action, target_sid, checked.source_session_id,
                     _governing_sentence(*checked), payload, cursor=conn,
                 ):
                     quote, message = checked
-                    authority = {"via": "quote", "quote": quote, "message": message}
+                    authority = {"via": "quote", "quote": quote, "message": message,
+                                 "quote_source_session_id": checked.source_session_id,
+                                 **({"relay_receipt": checked.relay_receipt} if checked.relay_receipt else {})}
             return commit(conn, authority, "session_control_autonomy")
 
         try:
@@ -1259,15 +1292,16 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
 
     def apply(conn):
         # Recheck after acquiring the write lock: a newer message must not inherit an older quote.
-        checked = check_user_quote(requester_sid, user_quote, cursor=conn)
+        checked = check_user_quote(requester_sid, user_quote, cursor=conn, controlled_session_id=target_sid)
         if isinstance(checked, str):
             return {_REFUSED: checked}
-        if not _quote_matches_control(kind, action, target_sid, requester_sid,
+        if not _quote_matches_control(kind, action, target_sid, checked.source_session_id,
                                       _governing_sentence(*checked), payload,
                                       cursor=conn):
             return {_REFUSED: "user_quote_mismatch"}
         quote, message = checked
         return commit(conn, {"via": "quote", "quote": quote, "message": message,
+                             "quote_source_session_id": checked.source_session_id,
                              **({"relay_receipt": checked.relay_receipt}
                                 if getattr(checked, "relay_receipt", "") else {})},
                       "session_control_quote")

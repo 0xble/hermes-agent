@@ -75,7 +75,8 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
         # under the same writer lock as the contract delta.
         from hermes_cli.goals_autonomy import validate_removal_quote
         def precondition(cursor):
-            validate_removal_quote(staged.state, expected, cursor)
+            validate_removal_quote(staged.state, expected, cursor,
+                                   controlled_session_id=manager.session_id)
         # No-op and validation returns must also observe conflicting command writes.
         commit_and_publish_snapshot(
             manager, staged.state,
@@ -226,7 +227,7 @@ class GoalRevisionsMixin:
         caller = LifecycleAuthority.for_edit(actor, autonomous=goal_autonomy_enabled())
         if caller is None:
             return {"ok": False, "error_code": "invalid_actor",
-                    "error": "actor must be agent, autonomy or user"}
+                    "error": "actor must be agent or user"}
         actor = caller.actor
         if actor == "agent" and (caller is LifecycleAuthority.AUTONOMY or agent_owned(self._state)):
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
@@ -265,7 +266,7 @@ class GoalRevisionsMixin:
         caller = LifecycleAuthority.for_edit(actor, autonomous=goal_autonomy_enabled())
         if caller is None:
             return {"ok": False, "error_code": "invalid_actor",
-                    "error": "actor must be agent, autonomy or user"}
+                    "error": "actor must be agent or user"}
         actor = caller.actor
         if actor == "agent" and (caller is LifecycleAuthority.AUTONOMY or agent_owned(self._state)):
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
@@ -333,6 +334,8 @@ class GoalRevisionsMixin:
                     "user_quote": user_quote if approved else "",
                     "user_message": str(authority.get("message") or "") if approved else "",
                     "before": previous, "after": snapshot()}
+        if authority.get("quote_source_session_id"):
+            revision["quote_source_session_id"] = authority["quote_source_session_id"]
         if authority.get("relay_receipt"):
             revision["relay_receipt"] = authority["relay_receipt"]
         if authority.get("via") == "button":

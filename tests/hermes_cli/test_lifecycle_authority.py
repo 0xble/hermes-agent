@@ -39,7 +39,10 @@ def test_lifecycle_authority_matrix(state, kind, actor, pauser, action):
     if pauser:
         manager.pause("Existing pause", by=pauser)
     if action in {"revise", "replace"}:
-        kwargs = {"reason": "Clearer operational wording", "actor": actor}
+        from hermes_constants import get_hermes_home
+        get_hermes_home().joinpath("config.yaml").write_text(
+            f"{kind}s:\n  autonomy: {str(actor == 'autonomy').lower()}\n")
+        kwargs = {"reason": "Clearer operational wording", "actor": "agent" if actor == "autonomy" else actor}
         if kind == "goal" and action == "revise":
             kwargs["subgoals"] = ["Watch build", "Read the build status"]
         else:
@@ -140,6 +143,7 @@ def test_revision_quotes_rechecked_inside_commit(state, monkeypatch, tmp_path, k
     manager.set("Ship build", actor="agent")
     quote = "Stop when the release window closes"
     if relayed:
+        quote = f"Add the release-window stop condition to the requester {kind}"
         relay(state, monkeypatch, tmp_path, quote)
     else:
         state.append_message("requester", "user", quote)
