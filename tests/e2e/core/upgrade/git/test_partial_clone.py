@@ -14,9 +14,12 @@ a treeless checkout re-downloads whole directory snapshots on every checkout. Co
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from tests.e2e.core.upgrade import _install_helpers as I
+from tests.e2e.core.upgrade._install_cache import InstallCache
 from tests.e2e.core.upgrade.git import _git_world as G
 
 pytestmark = G.PYTESTMARK
@@ -28,8 +31,8 @@ SHAPES = {
 }
 
 
-def _scenario(root, shape: str) -> dict:
-    cm, w = G.start_world(root / shape, base=G.n1_base(), installer_ref=G.n1_tag(), preclone=SHAPES[shape])
+def _scenario(root, shape: str, cache: InstallCache) -> dict:
+    cm, w = G.start_world(root / shape, base=G.n1_base(), installer_ref=G.n1_tag(), preclone=SHAPES[shape], cache=cache)
     run = {"cm": cm, "w": w, "shape0": w.install_shape}
     w.set_main(I.head_sha())
     run["cp1"], run["head1"], run["shape1"] = w.update(), w.head(), w.shape()
@@ -42,7 +45,8 @@ def _scenario(root, shape: str) -> dict:
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("git-partial")
-    results = G.in_parallel({shape: (lambda s=shape: _scenario(root, s)) for shape in SHAPES})
+    cache = InstallCache(root / "downloads", os.environ)
+    results = G.in_parallel({shape: (lambda s=shape: _scenario(root, s, cache)) for shape in SHAPES})
     yield results
     for res in results.values():
         if isinstance(res, dict):

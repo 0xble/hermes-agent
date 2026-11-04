@@ -30,6 +30,7 @@ import pytest
 
 from tests.e2e.core.upgrade import _helpers as H
 from tests.e2e.core.upgrade import _install_helpers as I
+from tests.e2e.core.upgrade._install_cache import InstallCache
 from tests.e2e.core.upgrade.git._smart_http import GitHTTPServer, serve_bare
 
 REPO = "hermes-agent.git"
@@ -204,7 +205,7 @@ def _preclone(sb: I.Sandbox, args: list[str], env: dict[str, str]) -> None:
 
 @contextlib.contextmanager
 def world(root: Path, *, base: str, installer_ref: str | None = None,
-          preclone: list[str] | None = None) -> Iterator[World]:
+          preclone: list[str] | None = None, cache: InstallCache | None = None) -> Iterator[World]:
     """Serve origin ``main`` at ``base`` over smart HTTP and install from it with the installer
     of ``installer_ref`` (None: HEAD's). Yields the live ``World``; the server stops on exit."""
     root.mkdir(parents=True, exist_ok=True)
@@ -213,6 +214,8 @@ def world(root: Path, *, base: str, installer_ref: str | None = None,
     bare = serve_bare(srv_root, REPO, H.WORKTREE, base)
     with GitHTTPServer(srv_root) as srv:
         sb = I.new_sandbox(root / "sb")
+        if cache is not None:
+            sb.env = cache.environment(sb.env, managed_uv=I.real_uv())
         url = srv.url(REPO)
         (sb.home / ".gitconfig").write_text(
             f'[url "{url}"]\n  insteadOf = {I.OFFICIAL_HTTPS}\n  insteadOf = {I.OFFICIAL_SSH}\n'

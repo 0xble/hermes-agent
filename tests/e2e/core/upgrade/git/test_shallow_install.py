@@ -20,10 +20,13 @@ N-1 user has. Three installs run concurrently over smart HTTP:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from tests.e2e.core._pending_fixes import known_failure
 from tests.e2e.core.upgrade import _install_helpers as I
+from tests.e2e.core.upgrade._install_cache import InstallCache
 from tests.e2e.core.upgrade.git import _git_world as G
 
 pytestmark = G.PYTESTMARK
@@ -31,8 +34,8 @@ pytestmark = G.PYTESTMARK
 ORPHAN = "orphan divergence"
 
 
-def _depth1(root) -> dict:
-    cm, w = G.start_world(root / "depth1", base=G.n1_base(), installer_ref=G.n1_tag())
+def _depth1(root, cache: InstallCache) -> dict:
+    cm, w = G.start_world(root / "depth1", base=G.n1_base(), installer_ref=G.n1_tag(), cache=cache)
     run = {"cm": cm, "w": w, "shape0": w.install_shape}
     w.set_main(I.head_sha())
     run["mark1"] = w.srv.mark()
@@ -45,8 +48,8 @@ def _depth1(root) -> dict:
     return run
 
 
-def _checked(root) -> dict:
-    cm, w = G.start_world(root / "checked", base=G.n1_base(), installer_ref=G.n1_tag())
+def _checked(root, cache: InstallCache) -> dict:
+    cm, w = G.start_world(root / "checked", base=G.n1_base(), installer_ref=G.n1_tag(), cache=cache)
     run = {"cm": cm, "w": w, "shape0": w.install_shape, "checks": []}
     between = I.git("rev-list", "--first-parent", f"{G.n1_base()}..{I.head_sha()}", cwd=I.H.WORKTREE).split()
     for k in (len(between) * 3 // 4, len(between) // 2, len(between) // 4):
@@ -59,8 +62,8 @@ def _checked(root) -> dict:
     return run
 
 
-def _prefetched(root) -> dict:
-    cm, w = G.start_world(root / "prefetched", base=I.head_sha())
+def _prefetched(root, cache: InstallCache) -> dict:
+    cm, w = G.start_world(root / "prefetched", base=I.head_sha(), cache=cache)
     run = {"cm": cm, "w": w}
     (w.checkout / "e2e-local-before-prefetch.txt").write_text("my local commit\n", encoding="utf-8")
     w.git("add", "-A")
@@ -76,8 +79,9 @@ def _prefetched(root) -> dict:
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("git-shallow")
-    results = G.in_parallel({"depth1": lambda: _depth1(root), "checked": lambda: _checked(root),
-                             "prefetched": lambda: _prefetched(root)})
+    cache = InstallCache(root / "downloads", os.environ)
+    results = G.in_parallel({"depth1": lambda: _depth1(root, cache), "checked": lambda: _checked(root, cache),
+                             "prefetched": lambda: _prefetched(root, cache)})
     yield results
     for res in results.values():
         if isinstance(res, dict):

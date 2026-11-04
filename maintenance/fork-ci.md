@@ -1,5 +1,29 @@
 # Fork CI reliability
 
+## Historical git-install download isolation
+
+The shallow/partial clone suites retain smart HTTP, complete subject ancestry, historical
+N-1 installer bytes, all clone-shape/transfer assertions and the 900-second nightly file bound.
+Their three simultaneous real installs share only explicit runner content caches (uv, managed
+Python and npm) and a fixture-owned PM runtime download store. Each checkout, PM install identity,
+venv, active selection record and Hermes user home remains distinct. PM's machine uv cache is
+linked to the explicit content cache because PM intentionally does not use `UV_CACHE_DIR`.
+N-1 receives a private copy of the runner's actual uv, avoiding an unrelated Astral bootstrap.
+
+`test_upgrade_path` uses the same download-only fixture for its repeated N-1/update legs. Its
+bare origin advertises only the subject branch, like `_install_helpers.make_origin`, rather than
+all branches of a developer's partial clone (whose unrelated missing blobs could trigger network
+fetches during a local fixture clone). No source clone is redirected to external GitHub. The
+small local-repository regression proves the unrelated branch stays unadvertised; cache
+regressions prove user state and installed environments are not shared.
+
+Historical baseline: nightly 41454766643 completed shallow/partial/upgrade_path in 659.5/677.8/816.0
+seconds; 41834945580 timed out all three at 900 seconds. That establishes expensive successful
+runs, not a proven deadlock. Local process snapshots show installer dependency/runtime downloads
+and N-1's npm workspace install after the loopback Git clone has completed. Network is still
+required on a cold dependency cache; do not describe this fixture as offline or claim complete
+nightly coverage from a focused run.
+
 ## Required behavior
 
 The current CI interface is owned by [repository-ci-contract.md](repository-ci-contract.md);
