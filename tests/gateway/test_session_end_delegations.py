@@ -15,9 +15,14 @@ from tools import async_delegation as delegation
 
 
 @pytest.fixture(autouse=True)
-def _no_delegations():
+def _no_delegations(monkeypatch):
     delegation._reset_for_tests()
     yield
+    # Dispatch marks a record terminal before its worker finishes persistence.
+    # Drain these finite fake runners before monkeypatch restores HERMES_HOME;
+    # _reset_for_tests deliberately uses wait=False for other suites' blocked fakes.
+    if delegation._executor is not None:
+        delegation._executor.shutdown(wait=True)
     delegation._reset_for_tests()
 
 
