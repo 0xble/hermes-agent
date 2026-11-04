@@ -123,7 +123,10 @@ def test_uninstall_while_gateway_has_plugin_loaded(live_gateway, name):
     result = _hermes(home, "plugins", "uninstall", name)
     print(f"UNINSTALL {name}: rc={result.returncode}\n{result.stdout[-1500:]}\n{result.stderr[-1500:]}")
 
-    assert proc.poll() is None, "the gateway died during uninstall"
+    assert proc.poll() is None, (
+        f"the gateway died during uninstall (rc={proc.returncode}):\n"
+        + (home.parent.parent / "gateway.log").read_text(encoding="utf-8", errors="replace")[-12000:]
+    )
     assert result.returncode == 0, f"uninstall failed: {result.stdout[-800:]} {result.stderr[-800:]}"
     leftovers = sorted(str(p.relative_to(home / "plugins")) for p in (home / "plugins").rglob("plugin.yaml"))
     assert not any(name in p for p in leftovers), f"a loadable copy stayed under plugins/: {leftovers}"
