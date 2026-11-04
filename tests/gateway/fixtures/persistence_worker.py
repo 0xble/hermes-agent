@@ -78,11 +78,13 @@ for line in sys.stdin:
                 'wrong_session': reason(lambda: original('worker.persist', **(saved | {'session_id': 'foreign'}))),
                 'wrong_profile': reason(lambda: original('worker.persist', **(saved | {'profile_id': '/foreign'}))),
                 'wrong_generation': reason(lambda: original('worker.persist', **(saved | {'generation': 99}))),
-                'outbox_full': reason(lambda: store.append_messages_batch(sid, [{'role': 'user', 'content': 'x' * 30000}])),
+                # Exceed the bounded decoded budget as well as disk: 30k of
+                # repeated text now correctly fits the lossless gzip fallback.
+                'outbox_full': reason(lambda: store.append_messages_batch(sid, [{'role': 'user', 'content': 'x' * 50000}])),
                 'writable_canonical_fds': writable_fds(home), 'canonical_opens': list(canonical_opens)}
         elif command['op'] == 'outage':
             from agent import runtime_session_store as module
-            store.retry_pending()  # clear the deliberate full-entry rejection
+            assert store.failure is None and not store.journal['pending']
             # This command deliberately exhausts patience before the parent starts a successor.
             patience = module.OWNER_RESTART_TIMEOUT
             module.OWNER_RESTART_TIMEOUT = 2.0
