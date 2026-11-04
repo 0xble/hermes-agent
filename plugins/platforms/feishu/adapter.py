@@ -85,6 +85,7 @@ FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
+from agent.attachment_context import format_document_content
 from agent.i18n import t
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
@@ -3090,7 +3091,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 return ""
             content = Path(cached_path).read_text(encoding="utf-8-sig")
             display_name = self._display_name_from_cached_path(cached_path)
-            return f"[Content of {display_name}]:\n{content}"
+            return format_document_content(display_name, content)
         except (OSError, UnicodeDecodeError):
             logger.warning("[Feishu] Failed to inject text document content from %s", cached_path, exc_info=True)
             return ""

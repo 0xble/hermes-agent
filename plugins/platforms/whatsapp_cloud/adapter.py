@@ -39,6 +39,7 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
+from agent.attachment_context import format_document_content
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import config_connected_extra
 from agent.i18n import t
@@ -989,7 +990,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if file_size > _MAX_TEXT_INJECT_BYTES:
                     logger.info("[whatsapp_cloud] skipping text injection for %s (%d bytes > %d)", doc, file_size, _MAX_TEXT_INJECT_BYTES)
                     continue
-                injection = f"[Content of {doc.name}]:\n{doc.read_text(encoding='utf-8-sig', errors='replace')}"
+                injection = format_document_content(
+                    doc.name, doc.read_text(encoding="utf-8-sig", errors="replace"),
+                )
                 body = f"{injection}\n\n{body}" if body else injection
                 inlined[i] = True
             except OSError:

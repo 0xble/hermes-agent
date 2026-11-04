@@ -346,19 +346,10 @@ def _strip_recall_context(text: str) -> tuple[str, list[str]]:
     may wrap the attachment enrichment. The meaningful image descriptions are retained separately
     for the image-only fallback.
     """
-    descriptions: list[str] = []
-    while text:
-        matches = [match for pattern in _RECALL_CONTEXT_PREFIXES
-                   if (match := pattern.search(text))]
-        if not matches:
-            break
-        prefix = min(matches, key=lambda match: match.start())
-        if "description" in prefix.re.groupindex:
-            description = prefix.group("description").strip()
-            if description:
-                descriptions.append(description)
-        text = (text[:prefix.start()] + text[prefix.end():]).strip()
-    return text, descriptions
+    from agent.attachment_context import strip_inbound_recall_context
+    from agent.recall_context import strip_recall_context
+
+    return strip_recall_context(strip_inbound_recall_context(text), _RECALL_CONTEXT_PREFIXES)
 
 
 def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None:
@@ -408,7 +399,11 @@ def auto_recall_query(
     the human request in the query; meaningful image-only descriptions remain a fallback. Explicit
     memory tools, retained content and the model's prompt are unaffected.
     """
-    text = (content or "").strip()
+    from agent.attachment_context import strip_inbound_recall_context
+
+    # Extract counted file frames before trimming: the file can itself end in
+    # whitespace, and that whitespace is part of its producer-recorded length.
+    text = strip_inbound_recall_context(content or "").strip()
     query = text if include_synthetic else human_prompt_text(text, display_kind=display_kind, platform=platform)
     if query:
         query = _attachment_recall_text(query, include_synthetic=include_synthetic)
