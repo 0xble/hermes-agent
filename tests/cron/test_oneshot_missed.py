@@ -79,14 +79,18 @@ def test_due_scan_accounts_for_miss_or_dispatches(store, monkeypatch, late, scan
     run_one = Mock(side_effect=run)
     monkeypatch.setattr(scheduler, "run_one_job", run_one)
     ran = scheduler.tick(verbose=False, sync=True, adapters=adapters, loop=loop)
-    if expected_due:
+    if late <= jobs.ONESHOT_GRACE_SECONDS:
         assert ran == 1
         run_one.assert_called_once()
         row, = executions.list_executions(job_id=job["id"])
         assert row["status"] == "completed"
         deliver.assert_not_called()
     else:
-        assert ran == 0 and jobs.load_jobs() == []
+        assert ran == 0
+        held, = jobs.load_jobs()
+        assert held["state"] == "missed" and held["enabled"] is False
+        assert held["prompt"] == job["prompt"] and held["next_run_at"] == due_at
+        assert ("scheduler scan stalled" in held["missed_reason"]) == expected_due
         run_one.assert_not_called()
         row, = executions.list_executions(job_id=job["id"])
         assert row["status"] == "failed" and row["started_at"] is None
@@ -96,9 +100,9 @@ def test_due_scan_accounts_for_miss_or_dispatches(store, monkeypatch, late, scan
         assert incidents.list_incidents()[0]["job_id"] == job["id"]
         # Main's durable outbox owns delivery; never bypass it with a direct send.
         deliver.assert_not_called()
-        receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
+        receipt = delivery_queue.get_status(f"oneshot-missed:{job['id']}:{due_at}")
         assert receipt is not None
-        assert "not run; recreate to run" in receipt["content"]
+        assert "Payload kept" in receipt["content"]
         jobs.get_due_jobs(adapters=adapters, loop=loop)
         assert delivery_queue.get_status(receipt["execution_id"]) == receipt
         deliver.assert_not_called()
@@ -122,13 +126,15 @@ def test_untrusted_scan_evidence_cannot_exempt_miss(store, marker):
         pid=os.getpid(), nonce=jobs_oneshot._SCAN_PROCESS_ID, epoch=NOW.timestamp() - 720))
     # A genuinely fresh heartbeat remains irrelevant even for this same PID.
     jobs.record_ticker_heartbeat(success=True)
-    assert jobs.get_due_jobs() == jobs.load_jobs() == []
+    assert jobs.get_due_jobs() == []
+    held, = jobs.load_jobs()
+    assert held["state"] == "missed" and held["enabled"] is False
     row, = executions.list_executions(job_id="invalid-evidence")
     assert row["status"] == "failed" and row["started_at"] is None
 
 
 @pytest.mark.parametrize("multiplex", [True, False])
-def test_provider_stall_after_profile_scan_preserves_catch_up(store, tmp_path, monkeypatch, multiplex):
+def test_provider_stall_after_profile_scan_preserves_provenance(store, tmp_path, monkeypatch, multiplex):
     from cron import scheduler_provider
     from hermes_constants import get_hermes_home
 
@@ -179,9 +185,12 @@ def test_provider_stall_after_profile_scan_preserves_catch_up(store, tmp_path, m
     expected_scans = [tmp_path, other, tmp_path, other] if multiplex else [tmp_path, tmp_path]
     assert scans == expected_scans
     row, = executions.list_executions(job_id="never-started")
-    assert row["status"] == "completed"
+    assert row["status"] == "failed" and row["started_at"] is None
     assert row["scheduled_instant"] == due_at
-    run_one.assert_called_once()
+    held, = jobs.load_jobs()
+    assert held["state"] == "missed" and held["enabled"] is False
+    assert held["missed_reason"] == "scheduler scan stalled with continuity"
+    run_one.assert_not_called()
 
 
 @pytest.mark.parametrize("failure_boundary", ["terminalize", "publish"])
@@ -204,7 +213,9 @@ def test_missed_accounting_failure_never_leaves_claim_or_duplicate(store, monkey
     if failure_boundary == "terminalize":
         assert rows == []
     monkeypatch.setattr(executions, attr, original)
-    assert jobs.get_due_jobs() == jobs.load_jobs() == []
+    assert jobs.get_due_jobs() == []
+    held, = jobs.load_jobs()
+    assert held["state"] == "missed" and held["enabled"] is False
     row, = executions.list_executions(job_id="atomic-miss")
     assert row["status"] == "failed" and row["scheduled_instant"] == due_at
 
@@ -227,9 +238,11 @@ def test_retirement_requires_durable_accounting_and_save(store, monkeypatch, fai
     assert [j["id"] for j in jobs.load_jobs()] == [job["id"]]
     deliver.assert_not_called()
     monkeypatch.setattr(target, attr, original)
-    assert jobs.get_due_jobs() == jobs.load_jobs() == []
+    assert jobs.get_due_jobs() == []
+    held, = jobs.load_jobs()
+    assert held["state"] == "missed" and held["enabled"] is False
     assert len(executions.list_executions(job_id=job["id"])) == 1
     assert incidents.list_incidents()
-    receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
+    receipt = delivery_queue.get_status(f"oneshot-missed:{job['id']}:{due_at}")
     assert receipt is not None and receipt["status"] == "pending"
     deliver.assert_not_called()

@@ -58,9 +58,9 @@ def test_retirement_queues_one_owner_failure_even_across_removal_crash(store, mo
 
     def crash_before_removal(rows, **kwargs):
         nonlocal crashed
-        if kwargs.get("removed_ids") and not crashed:
+        if (kwargs.get("removed_ids") or any(row.get("state") == "missed" for row in rows)) and not crashed:
             crashed = True
-            raise OSError("simulated restart before removal commit")
+            raise OSError("simulated restart before removal/hold commit")
         return real_save(rows, **kwargs)
 
     # The queue must commit before removal: a restart in between reuses its receipt.
@@ -79,10 +79,23 @@ def test_retirement_queues_one_owner_failure_even_across_removal_crash(store, mo
         target, content = send.call_args.args[:2]
         assert target.chat_id == ("owner-chat" if origin else "fallback-chat")
         assert target.thread_id == ("owner-topic" if origin else "fallback-topic")
-        for value in (job["id"], job["name"], job["schedule"]["run_at"], "297", "recreate to run"):
+        for value in (job["id"], job["name"], job["schedule"]["run_at"], "297"):
             assert value in content
         if path == "missed":
-            assert "outside" in content and "not run" in content
+            assert "send now" in content and "drop" in content
+            assert "Payload kept" in content
+            assert "recreate to run" not in content
+            action()
+            held = jobs.get_job(job["id"])
+            assert held is not None
+            assert held["state"] == "missed"
+            assert held["enabled"] is False
+            assert held["prompt"] == "do it"
+            assert scheduler.drain_delivery_queue({}, None) == 0
+            assert send.call_count == 1
+            from cron.incidents import list_incidents
+            assert len(list_incidents()) == 1
+            return
         else:
             assert "interrupted" in content and "partial effects" in content
             assert "Elapsed since scheduled: 297s" in content
@@ -115,7 +128,11 @@ def test_outbox_failure_preserves_job_until_retry(store, monkeypatch, path):
             assert action() == []
     assert jobs.get_job(job["id"]) is not None
     action()
-    assert jobs.get_job(job["id"]) is None
+    if path == "missed":
+        held = jobs.get_job(job["id"])
+        assert held is not None and held["state"] == "missed" and held["prompt"] == "do it"
+    else:
+        assert jobs.get_job(job["id"]) is None
     with patch("cron.scheduler_delivery._deliver_standalone") as send:
         assert scheduler.drain_delivery_queue({}, None) == 1
         assert send.call_count == 1
@@ -128,12 +145,13 @@ def test_no_configured_chat_retains_the_normal_incident_fallback(store, monkeypa
     monkeypatch.setattr("cron.scheduler_delivery._iter_home_target_platforms", lambda: iter([]))
     jobs.save_jobs([job])
     assert jobs.get_due_jobs() == []
-    assert jobs.get_job(job["id"]) is None
+    held = jobs.get_job(job["id"])
+    assert held is not None and held["state"] == "missed"
     rows = list_incidents()
     assert len(rows) == 1
     assert rows[0]["job_id"] == job["id"]
-    assert "missed-oneshot" in rows[0]["error"]
-    assert "not run; recreate to run" in rows[0]["error"]
+    assert "missed-oneshot-held" in rows[0]["error"]
+    assert "Payload kept" in rows[0]["error"]
 
 
 def test_startup_context_survives_heartbeat_replacement(store):
@@ -254,14 +272,14 @@ def test_run_body_outbox_failure_preserves_retirement_for_retry(store, monkeypat
     ({"deliver": "telegram:-1001:17",
       "failure_deliver": "telegram:-1002:29"}, ("-1002", "29")),
 ])
-def test_retirement_preserves_explicit_nonlocal_targets(store, lanes, expected):
+def test_missed_decision_always_reaches_origin(store, lanes, expected):
     job = dict(oneshot(), **lanes)
     jobs.save_jobs([job])
     assert jobs.get_due_jobs() == []
-    receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
+    receipt = delivery_queue.get_status(f"oneshot-missed:{job['id']}:{job.get('next_run_at') or job['schedule']['run_at']}")
     assert receipt is not None and receipt["status"] == "pending"
     with patch("cron.scheduler_delivery._deliver_standalone") as send:
         assert scheduler.drain_delivery_queue({}, None) == 1
         assert send.call_count == 1
         target = send.call_args.args[0]
-        assert (target.chat_id, target.thread_id) == expected
+        assert (target.chat_id, target.thread_id) == ("owner-chat", "owner-topic")

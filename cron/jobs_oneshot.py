@@ -36,11 +36,13 @@ def _stall_covers(d) -> bool:
     )
 
 
-def _record_miss(d) -> str:
+def _record_miss(d, cause: str) -> str:
     from cron import executions, incidents
+    from cron.oneshot_retirement import held_outcome
     error = (
         f"Missed one-shot: scheduled for {d.next_run}; due scan at {d.scan.now.isoformat()} "
-        "was beyond the 120-second grace window without scheduler continuity. Job did not run."
+        f"was beyond the 120-second grace window ({cause}). "
+        "Job did not run. Payload kept for an owner decision; no automatic replay."
     )
     row = executions.record_missed_execution(
         d.job["id"], scheduled_instant=d.next_run, error=error)
@@ -50,40 +52,48 @@ def _record_miss(d) -> str:
     scheduled = (d.job.get("schedule") or {}).get("run_at") or d.next_run
     incidents.upsert_incident(
         d.job["id"],
-        f"missed-oneshot: one-shot {d.job['id']} scheduled at {scheduled}; "
-        "Job not run; recreate to run.", job_name=d.job.get("name"))
+        f"missed-oneshot-held: one-shot {d.job['id']} scheduled at {scheduled}; "
+        f"{held_outcome(d.job)}", job_name=d.job.get("name"))
     return error
 
 
 def retire_expired_oneshot(d) -> bool:
-    """Skip expired claims, catch up scheduler/store stalls, or durably account for a miss."""
+    """Keep overdue never-started payloads held; continuity is provenance, not send approval."""
     from cron import jobs
+    from cron.oneshot_retirement import queue_retirement_alert
 
     if jobs._elapsed_seconds(d.scan.now, d.next_run_dt) <= jobs.ONESHOT_GRACE_SECONDS:
         return False
-    if jobs.store_health.outage_covers(
-            jobs._current_cron_store().cron_dir, d.next_run_dt.timestamp(), jobs.ONESHOT_GRACE_SECONDS):
-        return False
+    covered = jobs.store_health.outage_covers(
+        jobs._current_cron_store().cron_dir, d.next_run_dt.timestamp(), jobs.ONESHOT_GRACE_SECONDS)
     claim = d.job.get("run_claim")
-    # The existing interruption stamp keeps a catch-up eligible if dispatch could not start.
+    # An outage-covered admission that never acquired a fire claim never started.
+    # Keep its payload, but do not treat recovery as permission for a stale send.
     if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
-        return False
+        d.scan.persist(d.job["id"], run_claim=None)
+        d.job["run_claim"] = claim = None
     # A consumed dispatch is interrupted, not a never-started scheduler miss.
     # Preserve main's partial-effects diagnostic and never replay it after a stall.
-    if (d.job.get("repeat") or {}).get("completed", 0) > 0:
+    if (d.job.get("repeat") or {}).get("completed", 0) > 0 or d.job.get("last_run_at"):
         if not (claim or d.job.get("fire_claim")):
             jobs._write_retired_oneshot_diagnostic(d.job, d.next_run)
             d.scan.retire(d.job["id"])
             d.scan.on_saved.append(lambda job=d.job: jobs.record_cron_missed(job))
         return True
-    if _stall_covers(d):
-        return False
     if not (claim or d.job.get("fire_claim")):
-        error = _record_miss(d)
-        # The existing outbox commits the owner notice and incident before deletion.
-        # Its durable receipt survives a jobs-save failure without a duplicate send.
-        jobs._write_retired_oneshot_diagnostic(d.job, d.next_run)
-        d.scan.retire(d.job["id"])
+        cause = ("scheduler scan stalled with continuity" if _stall_covers(d) else
+                 "store outage covered run time" if covered else "without scheduler continuity")
+        error = _record_miss(d, cause)
+        # Match #1068's fail-closed policy: prompts and scripts can send to a
+        # person even with deliver=local, so do not guess safety from delivery.
+        queue_retirement_alert(d.job, error, "missed-oneshot-held", now=d.scan.now)
+        try:
+            jobs.save_job_output(d.job["id"], error + "\nThis one-shot was not deleted.")
+        except OSError:
+            logger.warning("Could not save held one-shot diagnostic for %s", d.job["id"])
+        fields = dict(enabled=False, state="missed", missed_at=d.scan.now.isoformat(), missed_reason=cause)
+        d.scan.persist(d.job["id"], **fields)
+        d.job.update(fields)
         d.scan.on_saved.append(lambda job=d.job: jobs.record_cron_missed(job))
         logger.error("Job %s: %s", d.job["id"], error)
     return True

@@ -115,25 +115,36 @@ and process nonce; only this process's previous scan at/before the job's grace
 deadline proves continuity. Heartbeats refreshed after another profile stalls
 must never replace that evidence. Missing/malformed markers, a different PID or
 nonce (including a recycled PID), or a scan after the deadline establish no
-continuity. Those expired one-shots must not fire hours late after downtime.
-This continuity rule cannot distinguish host suspension from a stalled ticker
-inside the same surviving process.
+continuity. This distinguishes scheduler delay from downtime in the diagnostic,
+but neither authorizes an overdue person-facing send.
 
-Before removing an unclaimed miss, atomically insert a terminal failed execution
+**Interaction with #1068 (`cron-missed-oneshot-hold`): held wins.** Prompts and
+scripts can send to people even with `deliver=local`, so never infer replay
+permission from the output lane. Keep every overdue never-started one-shot
+payload disabled with `state=missed`, its original schedule and payload intact,
+and a durable per-occurrence origin decision notice. No scheduler-continuity or
+store-outage catch-up path may bypass that hold. An owner must approve a new
+time/run-now or remove the job. Consumed/ambiguous dispatches retain the separate
+interrupted/partial-effects retirement contract. This supersedes this PR's prior
+automatic same-process catch-up policy under the explicit safety steering.
+
+Before holding an unclaimed miss, atomically insert a terminal failed execution
 with the scheduled instant and original scan time in its missed reason; never
 commit an intermediate claim. Serialize occurrence lookup/insertion in the same
 ledger transaction and reuse that occurrence on incident/jobs-save retries.
 Persist the incident too. If either store fails, keep the job for retry.
-Preserve the existing durable retirement outbox:
-commit its stable owner-notice receipt before removal, then let normal outbox
-draining send outside the jobs lock. Never bypass it with a direct crash-failure
-send. Spent dispatches retain the interrupted/partial-effects diagnostic and
-must not receive the scheduler-stall exemption. Keep claimed and on-time behavior unchanged. The
-implementation belongs in `cron/jobs_oneshot.py`, not the jobs facade.
+Commit the stable `oneshot-missed:<job>:<instant>` owner-notice receipt before
+persisting the hold, then let normal outbox draining send outside the jobs lock.
+Never bypass it with a direct crash-failure send. Spent dispatches retain the
+interrupted/partial-effects diagnostic and must not be replayed. Keep claimed
+and on-time behavior unchanged. The implementation belongs in
+`cron/jobs_oneshot.py`, not the jobs facade.
 
-`tests/cron/test_oneshot_missed.py` covers same-process stalls, startup/downtime,
-on-time grace, and incident/save failure retries through the real temp-home
-stores. No execution-status migration or live-store change is needed.
+`tests/cron/test_oneshot_missed.py` covers actual single/multiplex provider
+stalls, startup/downtime evidence, on-time grace, and accounting/incident/save
+failure retries through real temp-home stores. `test_oneshot_person_hold.py`
+proves the hold applies to local agent prompts and declared/non-local sends.
+No execution-status migration or live-store change is needed.
 
 ## Dispatch Diagnostics
 

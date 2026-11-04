@@ -221,19 +221,28 @@ def test_unwritable_store_degrades_once_throttles_and_catches_up_once(cron_store
     assert get_catch_up_occurrence_count() == 0  # the fast-forward did not persist: not counted yet
     outage = False
     clock["now"], clock["mono"] = FIXED_NOW + timedelta(minutes=5), 180.0
-    assert scheduler.tick(verbose=False, sync=True) == 2
-    assert sorted(ran) == ["due-job", "once"] and events[-1][0] == "recovered" and len(events) == 2
+    assert scheduler.tick(verbose=False, sync=True) == 1
+    assert ran == ["due-job"] and events[-1][0] == "recovered" and len(events) == 2
+    held = cronjobs.get_job("once")
+    assert held is not None
+    assert held["enabled"] is False and held["state"] == "missed"
+    assert held["prompt"] == once["prompt"]
     assert store_health.degraded_record(cron_store / "cron") is None
     assert get_catch_up_occurrence_count() == 1  # counted once, when the fast-forward persisted
     once_rows = executions.list_executions(job_id="once")
-    assert [r["status"] for r in once_rows].count("failed") == 1
+    # The first on-time admission failed on the unwritable jobs store; later
+    # expiry adds one terminal never-started hold, not a duplicate admission.
+    assert len(once_rows) == 2
+    assert all(r["status"] == "failed" and r["started_at"] is None for r in once_rows)
+    assert sum(r["source"] == "scheduler-missed" for r in once_rows) == 1
 
 
 def test_skipped_oneshot_survives_recovery_by_any_save(cron_store, monkeypatch):
-    """The outage window outlives the save that ends it: another job's save (a heartbeat, a
-    create) usually lands before the due scan, and the one-shot the outage skipped must still
-    fire once, not be retired as missed. A one-shot due after the store recovered and missed
-    later is retired as on main."""
+    """Store recovery never deletes the skipped payload or authorizes a stale send.
+
+    A failed hold save leaves the original record intact; the next successful
+    scan persists a disabled missed state without claiming or firing the job.
+    """
     clock = {"now": FIXED_NOW}
     monkeypatch.setattr(cronjobs, "_hermes_now", lambda: clock["now"])
     monkeypatch.setattr(store_health.time, "time", lambda: clock["now"].timestamp())
@@ -245,32 +254,35 @@ def test_skipped_oneshot_survives_recovery_by_any_save(cron_store, monkeypatch):
     clock["now"] = FIXED_NOW + timedelta(minutes=10)
     save_jobs(load_jobs() + [dict(_due_job("other"), next_run_at=(clock["now"] + timedelta(hours=1)).isoformat())])
     assert store_health.degraded_record(cron_store / "cron") is None
-    with monkeypatch.context() as m:  # fails again before the scan's save lands: still not missed
+    with monkeypatch.context() as m:
         m.setattr(cronjobs, "_stage_jobs_payload", _enospc)
-        assert [d["id"] for d in get_due_jobs()] == ["once"]
-    save_jobs(load_jobs())  # second recovery
-    assert [d["id"] for d in get_due_jobs()] == ["once"]
-    # Its fire claim never landed: the live run claim skips it (that saved scan ends the
-    # recovery window), and once the claim expires it still fires instead of staying stuck.
+        assert get_due_jobs() == []
+        current = cronjobs.get_job("once")
+        assert current is not None
+        assert current["enabled"] is True and current["prompt"] == once["prompt"]
+    save_jobs(load_jobs())
     assert get_due_jobs() == []
+    held = cronjobs.get_job("once")
+    assert held is not None
+    assert held["state"] == "missed" and held["enabled"] is False
+    assert held["prompt"] == once["prompt"] and not held.get("run_claim")
     clock["now"] += timedelta(seconds=cronjobs._oneshot_run_claim_ttl_seconds() + 60)
-    assert [d["id"] for d in get_due_jobs()] == ["once"]
-    cronjobs.clear_run_claim("once")  # its dispatch failed (pool shut down): still not missed
-    assert [d["id"] for d in get_due_jobs()] == ["once"]
-    stale = dict(once, id="stale")  # due during the outage, first scanned after the recovery scan
+    assert get_due_jobs() == []
+    assert cronjobs.get_job("once") == held
+    stale = dict(once, id="stale")
     save_jobs(load_jobs() + [stale])
-    assert "stale" not in [d["id"] for d in get_due_jobs()]
-
+    assert get_due_jobs() == []
+    stale_held = cronjobs.get_job("stale")
+    assert stale_held is not None
+    assert stale_held["state"] == "missed" and stale_held["prompt"] == stale["prompt"]
     late = dict(once, id="late", next_run_at=(clock["now"] + timedelta(minutes=1)).isoformat())
     save_jobs(load_jobs() + [late])
-    # The store is healthy but the ticker process stops before this job is due.
-    # A surviving-process scan stall is deliberately catch-up eligible; a new
-    # ticker's nonce must retain this test's post-recovery downtime retirement.
-    from cron import jobs_oneshot
-    monkeypatch.setattr(jobs_oneshot, "_SCAN_PROCESS_ID", "post-recovery-restart")
     clock["now"] += timedelta(minutes=10)
-    assert "late" not in [d["id"] for d in get_due_jobs()]
-    assert "late" not in [j["id"] for j in load_jobs()]
+    assert get_due_jobs() == []
+    late_held = cronjobs.get_job("late")
+    assert late_held is not None
+    assert late_held["state"] == "missed" and late_held["enabled"] is False
+    assert late_held["prompt"] == late["prompt"]
 
 
 def test_idle_tick_reprobes_a_degraded_store_and_clears_it(cron_store, monkeypatch):

@@ -9,7 +9,7 @@ past the window, host asleep, hand-edited jobs.json). That fired a
 wall-clock one-shot late, contradicting the "will never fire" contract.
 
 These tests pin the due-scan grace gate:
-  - beyond grace  -> not due; record retired with a diagnostic
+  - beyond grace  -> not due; record kept, marked missed, payload retained
   - within grace  -> still due (legitimate catch-up)
   - beyond grace + claim -> not due, but the record is kept (a run may be
     in flight in another process; its mark_job_run must still land)
@@ -64,12 +64,15 @@ class TestOneShotGraceDueScan:
         due = get_due_jobs()
 
         assert [d["id"] for d in due] == []
-        # Record is retired (removed) so it stops being scanned — with a
-        # diagnostic left behind so the miss is operator-visible.
-        assert [j["id"] for j in load_jobs()] == []
+        held = load_jobs()
+        assert [j["id"] for j in held] == ["stale"]
+        assert held[0]["state"] == "missed"
+        assert held[0]["enabled"] is False
+        assert held[0]["prompt"] == "x"
         out_dir = cron_store / "cron" / "output" / "stale"
         diag = list(out_dir.glob("*.md")) if out_dir.exists() else []
-        assert diag, "expected a diagnostic file for the retired stale one-shot"
+        assert diag, "expected a diagnostic file for the held stale one-shot"
+        assert "not deleted" in diag[0].read_text()
 
     def test_within_grace_still_due(self, cron_store):
         recent = _oneshot("recent", FIXED_NOW - timedelta(seconds=60))
