@@ -3647,6 +3647,10 @@ def _get_due_jobs_locked() -> list[dict[str, Any]]:
     store_health.end_recovery_window(_current_cron_store().cron_dir)
     for emit in scan.on_saved:
         emit()
+    # Preserve the previous scan's evidence for every job in this scan. Capture
+    # the scan instant, not tick/cycle completion (which another profile can stall).
+    from cron.jobs_oneshot import record_due_scan
+    record_due_scan(scan.now)
     return due
 
 

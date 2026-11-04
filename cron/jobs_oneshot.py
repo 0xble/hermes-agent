@@ -3,23 +3,34 @@
 import logging
 import math
 import os
+import uuid
+from datetime import datetime
 
 logger = logging.getLogger("cron.jobs")
+_SCAN_PROCESS_ID = uuid.uuid4().hex
+
+
+def record_due_scan(now: datetime) -> None:
+    """Persist this profile's scan instant, independent of cycle-completion heartbeats."""
+    from cron.jobs import _write_marker
+
+    _write_marker("ticker_due_scan", f"{now.timestamp()} {os.getpid()} {_SCAN_PROCESS_ID}", ".scan_")
 
 
 def _stall_covers(d) -> bool:
     from cron import jobs
 
-    fields = jobs._read_marker_fields("ticker_heartbeat")
+    fields = jobs._read_marker_fields("ticker_due_scan")
     try:
-        epoch, pid = float(fields[0]), int(fields[1])
+        epoch, pid, process_id = float(fields[0]), int(fields[1]), fields[2]
     except (IndexError, ValueError):
         return False
-    # The beat is written AFTER a tick (and at startup). A same-process beat before the
-    # deadline means this is its first opportunity to observe the expired slot. A fresh
-    # startup beat after the deadline or another process's beat proves no such continuity.
+    # Only a prior scan in this process proves continuity. Provider heartbeats
+    # may be refreshed minutes after this profile was scanned (including stalls
+    # in another multiplexed profile). The nonce also rejects recycled PIDs.
     return (
-        pid == os.getpid() and math.isfinite(epoch) and epoch > 0
+        pid == os.getpid() and process_id == _SCAN_PROCESS_ID
+        and math.isfinite(epoch) and epoch > 0
         and epoch <= d.scan.now.timestamp()
         and epoch <= d.next_run_dt.timestamp() + jobs.ONESHOT_GRACE_SECONDS
     )
@@ -27,23 +38,12 @@ def _stall_covers(d) -> bool:
 
 def _record_miss(d) -> str:
     from cron import executions, incidents
-    from cron.occurrences import scheduled_instant
-
-    row = executions.latest_execution(d.job["id"])
-    # A save/incident failure leaves the job intact. Retry the accounting without inventing
-    # a second missed attempt or changing the original scan time.
-    if not (row and row["source"] == "scheduler-missed"
-            and row["status"] == "failed"
-            and row["scheduled_instant"] == scheduled_instant(d.next_run)):
-        error = (
-            f"Missed one-shot: scheduled for {d.next_run}; due scan at {d.scan.now.isoformat()} "
-            "was beyond the 120-second grace window without scheduler continuity. Job did not run."
-        )
-        row = executions.create_execution(
-            d.job["id"], source="scheduler-missed", scheduled_instant=d.next_run)
-        row = executions.finish_execution(row["id"], success=False, error=error)
-        if row is None:
-            raise RuntimeError("Missed one-shot execution could not be terminalized")
+    error = (
+        f"Missed one-shot: scheduled for {d.next_run}; due scan at {d.scan.now.isoformat()} "
+        "was beyond the 120-second grace window without scheduler continuity. Job did not run."
+    )
+    row = executions.record_missed_execution(
+        d.job["id"], scheduled_instant=d.next_run, error=error)
     error = row["error"]
     # Match the durable retirement outbox's incident signature. Store failure must
     # keep the job for retry, rather than deleting it with only best-effort visibility.

@@ -108,19 +108,23 @@ failure-routing contract rather than introducing a transport.
 
 ## Missed One-Shots
 
-Retain the 120-second grace for ordinary catch-up. A persisted ticker heartbeat
-contains an epoch and PID. A beat from this process at or before the job's grace
-deadline means the delayed scan has not had an opportunity to retire that slot:
-allow it once, including jobs that became due during the stall. A different PID,
-a missing/malformed beat, or a startup beat after the deadline does not establish
+Retain the 120-second grace for ordinary catch-up. Persist each profile's actual
+scan-start instant in `ticker_due_scan` after evaluating that scan, separately
+from the provider's tick-completion heartbeat. The marker contains epoch, PID,
+and process nonce; only this process's previous scan at/before the job's grace
+deadline proves continuity. Heartbeats refreshed after another profile stalls
+must never replace that evidence. Missing/malformed markers, a different PID or
+nonce (including a recycled PID), or a scan after the deadline establish no
 continuity. Those expired one-shots must not fire hours late after downtime.
 This continuity rule cannot distinguish host suspension from a stalled ticker
 inside the same surviving process.
 
-Before removing an unclaimed miss, persist a terminal failed execution with the
-scheduled instant and original scan time in its missed reason, plus an incident.
-If either store fails, keep the job for retry. Reuse the failed missed execution
-when a later jobs save retries. Preserve the existing durable retirement outbox:
+Before removing an unclaimed miss, atomically insert a terminal failed execution
+with the scheduled instant and original scan time in its missed reason; never
+commit an intermediate claim. Serialize occurrence lookup/insertion in the same
+ledger transaction and reuse that occurrence on incident/jobs-save retries.
+Persist the incident too. If either store fails, keep the job for retry.
+Preserve the existing durable retirement outbox:
 commit its stable owner-notice receipt before removal, then let normal outbox
 draining send outside the jobs lock. Never bypass it with a direct crash-failure
 send. Spent dispatches retain the interrupted/partial-effects diagnostic and
