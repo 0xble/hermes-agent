@@ -1,5 +1,41 @@
 # Maintained fork patch register
 
+## cron-person-send-admission (candidate; activation held)
+
+- **Stack fit:** Existing Python scheduler admission, auxiliary executors,
+  ContextVars, execution journal and pytest suite; no dependency, transport,
+  persistent field, configuration or external scheduler.
+- **Boundary:** A separate serial per-profile lane only for explicitly declared
+  one-shot `no_agent`, `deliver=local` person-send wrappers. Exact bounded first-line
+  marker `# hermes: person-send` inside the profile scripts root. Existing ordinary
+  script FIFO and agent/reserved capacities are unchanged. Revalidate persisted
+  classification under the fire-claim lock and demote edits without releasing the
+  original execution/dedup owner or taking an early lease.
+- **Source:** `cron/scheduler_admission.py`, `scheduler_diagnostics.py`,
+  `scheduler_tick.py`, `scheduler.py`, `cron/jobs.py`; contract/prior art and exact
+  rollback boundary: `maintenance/cron-admission.md`.
+- **Verification:** `scripts/run_tests.sh tests/cron/test_person_send_admission.py
+  tests/cron/test_script_admission.py tests/cron/test_reserved_admission.py
+  tests/cron/test_dispatch_stage_timing.py`. The new real script/tick regression
+  failed on base `2fece2a7529e495c2026be0f4b92ed0231678c4a` while an ordinary
+  script held its event, then passed with the additional lane. No real sends.
+- **Prior art:** Fork [#925](https://github.com/0xble/hermes-agent/pull/925) supplies
+  script admission and deliberately allows script-vs-script wait. Related open
+  upstream [#138072](https://github.com/NousResearch/hermes-agent/pull/138072) only
+  separates agent/no-agent lanes. Closed upstream
+  [#73804](https://github.com/NousResearch/hermes-agent/issues/73804)'s historical
+  process-global cwd hazard is covered by concurrent subprocess cwd/home isolation.
+  No exact equivalent found in searched open/closed issues, PRs or source history.
+- **Retirement:** Remove this private lane when selected upstream preserves the
+  narrow-class start, mode-edit admission, execution ownership and profile lifecycle.
+- **Rollback:** Revert this source-only candidate commit, not #925 or the reserved
+  cadence patch; marked wrappers then use ordinary script FIFO. No state migration
+  or payload rewrite. No live cron or payload directory is changed.
+- **Landing prerequisite:** Explicit runtime restart hold. Published only, not
+  promoted; do not restart. Parent owns review/merge and the separately authorized
+  4AM PT activation window. Source CI is not live send acceptance.
+
+
 ## react-tool-name
 
 See [Reaction Tool Name](../../../maintenance/react-tool-name.md) for the contract, upstream findings, verification and retirement conditions.
