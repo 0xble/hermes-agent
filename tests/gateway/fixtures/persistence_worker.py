@@ -78,9 +78,10 @@ for line in sys.stdin:
                 'wrong_session': reason(lambda: original('worker.persist', **(saved | {'session_id': 'foreign'}))),
                 'wrong_profile': reason(lambda: original('worker.persist', **(saved | {'profile_id': '/foreign'}))),
                 'wrong_generation': reason(lambda: original('worker.persist', **(saved | {'generation': 99}))),
-                # Exceed the bounded decoded budget as well as disk: 30k of
-                # repeated text now correctly fits the lossless gzip fallback.
-                'outbox_full': reason(lambda: store.append_messages_batch(sid, [{'role': 'user', 'content': 'x' * 50000}])),
+                # Best-effort archive may be skipped; mandatory append stickiness
+                # is covered separately by test_worker_mandatory_capacity.
+                # Exceed decoded budget too: repetitive 30k now fits gzip.
+                'outbox_full': reason(lambda: store.archive_and_compact_best_effort(sid, [{'role': 'user', 'content': 'x' * 50000}])),
                 'writable_canonical_fds': writable_fds(home), 'canonical_opens': list(canonical_opens)}
         elif command['op'] == 'outage':
             from agent import runtime_session_store as module

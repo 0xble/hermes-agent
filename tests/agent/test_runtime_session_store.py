@@ -57,10 +57,12 @@ def test_outbox_capacity_failure_does_not_advance_or_discard(tmp_path):
         with pytest.raises(WorkerPersistenceError, match='outbox_full'):
             store.append_messages_batch('s', [{'role': 'user', 'content': 'x' * 1000}])
         assert store.path.read_bytes() == before
-        assert store.failure is None
-        assert store.flush_token_counts()
+        assert store.failure == 'outbox_full'
+        with pytest.raises(WorkerPersistenceError, match='outbox_full'):
+            store.flush_token_counts()
     finally:
-        store.close()
+        with pytest.raises(WorkerPersistenceError, match='outbox_full'):
+            store.close()
 
 
 def test_worker_turn_wait_callbacks_remain_local(tmp_path):

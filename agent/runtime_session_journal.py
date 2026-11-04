@@ -33,8 +33,11 @@ def read_journal(path, max_bytes):
         raise WorkerPersistenceError('outbox_full')
     if encoded.startswith(b'\x1f\x8b'):
         limit = min(2 * max_bytes, MAX_WORKER_FRAME_BYTES)
-        with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as source:
-            encoded = source.read(limit + 1)
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as source:
+                encoded = source.read(limit + 1)
+        except (EOFError, gzip.BadGzipFile) as exc:
+            raise WorkerPersistenceError('outbox_corrupt') from exc
         if len(encoded) > limit:
             raise WorkerPersistenceError('outbox_full')
     return json.loads(encoded.decode('utf-8-sig'))

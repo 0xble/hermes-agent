@@ -74,7 +74,7 @@ def test_definitely_unsent_capacity_rejection_keeps_sequence_and_turn_usable(tmp
         rng = random.Random(0)
         content = ''.join(rng.choices(string.ascii_letters + string.digits, k=size))
         with pytest.raises(WorkerPersistenceError, match='outbox_full'):
-            store.append_messages_batch('s', [{'role': 'user', 'content': content}])
+            store.archive_and_compact_best_effort('s', [{'role': 'user', 'content': content}])
         assert calls == [] and store.path.read_bytes() == before
         assert store.journal['next_sequence'] == 1 and store.journal['pending'] == []
         assert store.failure is None

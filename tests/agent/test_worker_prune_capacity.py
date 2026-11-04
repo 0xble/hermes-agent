@@ -4,11 +4,12 @@ import copy
 import pytest
 
 from agent.runtime_session_store import RuntimeSessionStore
-from tests.agent.test_proactive_tool_result_pruning import _build, _compressor
+from tests.agent.pruning_helpers import _build, _compressor
 
 
+@pytest.mark.parametrize('path', ['proactive', 'micro'])
 @pytest.mark.parametrize('budget,chars', [(500, 9000), (4 * 1024 * 1024, 600_000)])
-def test_proactive_prune_keeps_original_and_persistence_healthy(tmp_path, monkeypatch, caplog, budget, chars):
+def test_proactive_prune_keeps_original_and_persistence_healthy(tmp_path, monkeypatch, caplog, budget, chars, path):
     calls = []
     def owner(method, **params):
         calls.append(params)
@@ -24,9 +25,13 @@ def test_proactive_prune_keeps_original_and_persistence_healthy(tmp_path, monkey
     messages = _build(8, big_indices={0, 1, 2, 3}, big_chars=chars)
     original = copy.deepcopy(messages)
     try:
-        result, count = compressor.prune_tool_results_only(messages, current_tokens=1_000_000)
-        assert result is messages and count == 0 and messages == original
-        assert 'keeping the original transcript: outbox_full' in caplog.text
+        if path == 'proactive':
+            result, count = compressor.prune_tool_results_only(messages, current_tokens=1_000_000)
+            assert result is messages and count == 0 and messages == original
+            assert 'keeping the original transcript: outbox_full' in caplog.text
+        else:
+            assert compressor._sync_micro_compact_to_db(messages, held=messages) is False
+            assert messages == original
         assert calls == [] and store.failure is None
         assert store.journal['pending'] == [] and store.journal['next_sequence'] == 1
         store.queue_token_counts('s', input_tokens=1)

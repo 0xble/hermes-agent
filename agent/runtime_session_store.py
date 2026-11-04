@@ -373,7 +373,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         if session_id != self.scope['session_id']:
             raise WorkerPersistenceError('permission_denied')
 
-    def _apply(self, operation, payload):
+    def _apply(self, operation, payload, *, best_effort=False):
         with self.lock:
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
@@ -388,8 +388,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 check_worker_frame(self.scope, candidate['pending'][-1])
                 self._save(candidate)
             except OutboxCapacityError:
-                # No send or disk mutation occurred: best-effort compression may
-                # retain its original transcript without killing lease/usage writes.
+                # Only explicitly optional archives may skip an unsent rejection. Mandatory
+                # append callers can swallow errors: retain the failure for flush/finish.
+                if not best_effort:
+                    self.failure = 'outbox_full'
                 raise
             except Exception as exc:
                 self.failure = str(exc)

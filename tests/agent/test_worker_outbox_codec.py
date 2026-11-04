@@ -9,7 +9,7 @@ import pytest
 from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
 
 
-@pytest.mark.parametrize('kind', ['plain', 'gzip', 'bomb', 'truncated', 'scope', 'over_disk'])
+@pytest.mark.parametrize('kind', ['plain', 'gzip', 'bomb', 'truncated', 'bad_crc', 'scope', 'over_disk'])
 def test_journal_reopen_codec_and_resource_bounds(tmp_path, kind):
     scope = {'session_id': 's'}
     journal = {'scope': scope, 'next_sequence': 1, 'pending': []}
@@ -26,7 +26,10 @@ def test_journal_reopen_codec_and_resource_bounds(tmp_path, kind):
         expected = WorkerPersistenceError
     elif kind == 'truncated':
         data = gzip.compress(data)[:-4]
-        expected = EOFError
+        expected = WorkerPersistenceError
+    elif kind == 'bad_crc':
+        data = gzip.compress(data)[:-8] + b'\x00' * 8
+        expected = WorkerPersistenceError
     elif kind == 'over_disk':
         data = b' ' * 501
         expected = WorkerPersistenceError
@@ -34,7 +37,7 @@ def test_journal_reopen_codec_and_resource_bounds(tmp_path, kind):
     # Bomb fixture must fit disk to test the independent decode bound.
     limit = 100_000 if kind == 'bomb' else 500
     if expected:
-        with pytest.raises(expected):
+        with pytest.raises(expected, match='outbox_corrupt' if kind in ('truncated', 'bad_crc') else None):
             RuntimeSessionStore(lambda *a, **kw: {}, scope, tmp_path, max_bytes=limit)
     else:
         store = RuntimeSessionStore(lambda *a, **kw: {'value': True}, scope, tmp_path, max_bytes=limit)

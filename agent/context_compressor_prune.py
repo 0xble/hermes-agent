@@ -96,7 +96,7 @@ class ProactivePruneMixin:
                 if rewritten is None:
                     from agent.conversation_compression_archive import coverage_for_commit
                     covered_ids, unresolved_held = coverage_for_commit(session_db, session_id, messages)
-                    session_db.archive_and_compact(
+                    getattr(session_db, 'archive_and_compact_best_effort', session_db.archive_and_compact)(
                         session_id, pruned_msgs,
                         model_config_patch=model_config_patch,
                         watermark=watermark,

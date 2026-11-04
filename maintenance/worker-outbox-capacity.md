@@ -15,8 +15,10 @@ payload was not retained; the operation is inferred from the prune call path.
 The narrow fix is a lossless compressed representation for oversized journals,
 retaining the existing 4 MiB disk bound, single outstanding operation, atomic
 private writes, scope verification and identical receipt replay. Decode must be
-bounded too. A definitely-unsent capacity rejection must leave the prior journal
-and sequence usable rather than poisoning subsequent usage/lease/finalization.
+bounded too. A definitely-unsent capacity rejection of an explicitly best-effort
+archive must leave the prior journal and sequence usable rather than poisoning
+subsequent usage/lease/finalization. Mandatory writes must latch `outbox_full`,
+so a swallowed append error still fails the turn at its flush/finish barrier.
 Unknown outcomes and filesystem failures must remain sticky. Raising the disk
 cap alone or dropping transcript/CAS fields would not solve the contract.
 
@@ -50,13 +52,47 @@ frame budget and preventing gzip bombs. Disk budget remains exactly 4 MiB by
 default. Only journals whose raw representation does not fit are compressed.
 Unknown outcomes, write/rename failures and ack-save failures remain fatal until
 explicit identical receipt replay, as before. Oversized mandatory writes still
-raise honestly; this is not an assertion of canonical persistence.
+raise and latch honestly; this is not an assertion of canonical persistence.
+Malformed gzip headers/trailers and truncated streams report `outbox_corrupt`.
+
+## Capacity policy by call site
+
+One mechanism owns the policy: `_apply(..., best_effort=False)` latches capacity
+failures by default, including when a caller catches the exception. Only the
+worker's `archive_and_compact_best_effort` capability opts in to non-sticky
+admission. Non-worker stores keep their existing `archive_and_compact` call.
+Neither opt-in bypasses existing pending/fatal failures, filesystem errors or
+uncertain RPC outcomes. No mandatory call site needs a separate return-value rule.
+
+| Call site | Class | Capacity behavior |
+| --- | --- | --- |
+| `context_compressor_prune.prune_tool_results_only` archive fallback | Best effort | Explicit capability; retain original transcript and prune state, continue |
+| `micro_compaction._sync_micro_compact_to_db` archive | Best effort | Explicit capability; return `False` so caller discards tentative compaction |
+| `conversation_compression_publication._commit_compaction` in-place archive and rotated `publish_compression_child` | Mandatory | Default sticky; do not report successful publication |
+| `conversation_compression._adopt_grown_durable_parent` preflush and `_publish_rotated_compaction` follow-up | Mandatory | Transcript append stays sticky |
+| `turn_context._persist_turn_start` / `_ensure_and_persist`; `build_turn_context` flush | Mandatory | Turn-start user row stays sticky |
+| `turn_tool_round.run_tool_round`; `tool_executor._flush_session_db_after_tool_progress`; `turn_stop_gates._append_interim_answer` | Mandatory | Tool/interim transcript rows stay sticky |
+| `turn_final_response.finish_text_response` persist and flush; `codex_runtime._persist_projected_messages` | Mandatory | Final assistant/provider transcript stays sticky |
+| `conversation_loop._close_durable_failed_turn`, `_preflight_hard_window_result`, `_provider_overflow_exhausted_result`; `session_persistence._persist_session` | Mandatory | All flushes/appends retain failure for token-count flush |
+| `runtime_session_store.append_messages_batch`; `runtime_session_compression._append_compression_messages` | Mandatory | `transcript.append` and compression-scoped append stay sticky |
+| `runtime_session_store.queue_token_counts`, `record_auxiliary_usage`, turn/compression lease acquire/renew/release; session metadata and history writes | Mandatory | Default sticky, no opt-in |
+| `managed_worker.execute`: `flush_token_counts` before result and `store.finish`; `runtime_session_store.finish` | Mandatory | Latched failure raises before successful result/final receipt; `execution.finish` rejection also latches |
+
+Call-site inventory includes the indirect `retry_publication` in-place archive;
+it is not an optional prune. Any new worker call is mandatory unless it explicitly
+uses the optional capability and has an original-transcript rollback path.
+
+Review regression: on the previous PR head, the final assistant append logged an
+`outbox_full` warning but `_persist_session` and the managed-worker flush barrier
+both returned normally. RED: all ten mandatory-capacity cases failed; two optional
+micro-compaction rollback cases failed, while both proactive-prune cases passed.
+The fix preserves mandatory failure visibility while retaining the incident fix.
 
 Prior art: upstream open PR #146198 addresses the unrelated on-loop refusal
 poisoning boundary and deliberately retains outbox_full as sticky. No upstream
 outbox-capacity fix or fork PR was found by exact-term search on 2026-11-04.
 
-Contract tests: `tests/agent/test_worker_outbox_capacity.py`, `tests/agent/test_worker_outbox_codec.py`, `tests/agent/test_worker_outbox_io_failure.py`, `tests/agent/test_worker_prune_capacity.py`
+Contract tests: `tests/agent/test_worker_outbox_capacity.py`, `tests/agent/test_worker_outbox_codec.py`, `tests/agent/test_worker_outbox_io_failure.py`, `tests/agent/test_worker_prune_capacity.py`, `tests/agent/test_worker_mandatory_capacity.py`
 
 Verification: RED on the unchanged baseline raised `outbox_full` on both large
 snapshot paths and proved the failure latched; 3 tests failed. GREEN exercises
