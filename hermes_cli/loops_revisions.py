@@ -159,7 +159,7 @@ class LoopRevisionsMixin:
                 error_code="no_change", error="the revision changes nothing",
             )
 
-        from hermes_cli.lifecycle_authority import agent_owned, user_stop_condition
+        from hermes_cli.lifecycle_authority import user_stop_condition
         new_effective_delay = (
             after["interval_seconds"] if after["mode"] == "interval"
             else float(self_paced_floor_seconds())
@@ -178,19 +178,23 @@ class LoopRevisionsMixin:
             and state.times > 0
             and (after["times"] == 0 or after["times"] > state.times)
         )
-        if agent_owned(state):
-            needs_authority = "until" in changed and user_stop_condition(state)
-        else:
-            needs_authority = (
-                ("prompt" in changed)
-                or ("until" in changed and user_stop_condition(state))
-                or faster
-                or raising_times
-            )
+        from hermes_cli.lifecycle_policy import decision, A
         actor = caller.actor
         autonomous = caller is LifecycleAuthority.AUTONOMY
+        operations = ["revise"]
+        if "prompt" in changed:
+            operations.append("outcome")
+        if faster:
+            operations.append("cadence_faster")
+        if raising_times:
+            operations.append("budget")
+        needs_authority = any(decision("loop", operation, state, actor=actor,
+                                       autonomous=autonomous) != A for operation in operations)
+        if "until" in changed:
+            needs_authority |= decision("loop", "stop_when", state, actor=actor,
+                autonomous=autonomous, owner="user" if user_stop_condition(state) else "agent") != A
         quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=needs_authority and caller.actor == "agent" and not autonomous,
+            state, user_quote, user_messages, required=needs_authority,
             stop_condition=after["until"] if "until" in changed else "",
         )
         if quote_error:
@@ -304,12 +308,16 @@ class LoopRevisionsMixin:
                 ok=False, revision=None, version=state.version,
                 error_code="no_change", error="replacement prompt is empty",
             )
-        from hermes_cli.lifecycle_authority import agent_owned, user_stop_condition
-        needs_authority = (not agent_owned(state) or
-                           (state.until != (until or "").strip() and user_stop_condition(state)))
+        from hermes_cli.lifecycle_authority import user_stop_condition
+        from hermes_cli.lifecycle_policy import decision, A
         autonomous = caller is LifecycleAuthority.AUTONOMY
+        needs_authority = decision("loop", "replace", state, actor=caller.actor,
+                                   autonomous=autonomous) != A
+        if state.until != (until or "").strip():
+            needs_authority |= decision("loop", "stop_when", state, actor=caller.actor,
+                autonomous=autonomous, owner="user" if user_stop_condition(state) else "agent") != A
         quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=needs_authority and caller.actor == "agent" and not autonomous,
+            state, user_quote, user_messages, required=needs_authority,
             stop_condition=(until or "").strip() if until != state.until else "",
         )
         if quote_error:

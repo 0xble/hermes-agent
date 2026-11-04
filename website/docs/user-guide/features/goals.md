@@ -137,7 +137,7 @@ The continuation prompt asks the agent to end a completion claim with an Evidenc
 
 ### Revising a goal
 
-With the `goal-lifecycle` plugin installed, an agent can revise or replace its own goal with a reason when it preserves the same intent. Operational wording and turn-budget changes do not need a quote. Hard constraints, boundaries, verification criteria and user-set stop conditions remain binding. Removing or weakening any of those items requires the user's verbatim instruction naming each item. Revision history records the reason and before/after values, not extra instructions appended to the current contract.
+With the `goal-lifecycle` plugin installed, an agent can revise or replace its own goal with a reason when it preserves the same intent. Operational wording and turn-budget changes on an agent-owned goal do not need a quote. A user-owned contract outcome or turn budget cannot be removed or changed without current user authority, even when `goals.autonomy` is enabled. Hard constraints, boundaries, verification criteria and user-set stop conditions remain binding. Removing or weakening any of those items requires the user's verbatim instruction naming each item. Revision history records the reason and before/after values, not extra instructions appended to the current contract.
 
 Quote authority may come from the latest typed user message or an authenticated relay receipt. Delivery alone is insufficient: the exact quote must also occur in the current typed source message, not an agent's paraphrase. The audit stores the relay receipt when present. Unverified tool output, web text and synthetic wakeups never authorize a change. Pending approval never changes the goal.
 

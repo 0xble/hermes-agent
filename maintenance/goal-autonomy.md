@@ -15,6 +15,91 @@ completion, and idle wake admission share durable goal state across CLI, gateway
 and TUI. The plugin remains a thin caller rather than keeping another goal store
 or overriding scheduler internals. No core tool or dependency is added.
 
+Contract tests: `tests/hermes_cli/test_lifecycle_policy.py::test_every_authority_cell`, `tests/hermes_cli/test_lifecycle_policy.py::test_hidden_approval_refusal_precedes_request_validation`.
+
+## Declarative Authority Policy
+
+`hermes_cli/lifecycle_policy.py` is the sole permission table for goal and loop
+contract edits and session controls. It expands every row below across item owner
+(user/agent), trusted actor (user/agent), autonomy (off/on), and current valid-scoped
+quote (absent/present). A = allow, Q = require quote, D = deny. The four columns
+below describe **agent callers without a quote**. A trusted native user caller is
+A in every supported cell (loop `clear` is unsupported for everyone). A valid
+quote turns Q into A, never D. Unknown actors/operations
+are D; legacy/unknown ownership is user ownership. A quote is valid only after the
+existing current-typed-message or authenticated-relay check, full-message refusal
+checks, exact removed-item match where required, and typed-origin target scope.
+An agent cannot select autonomy as its actor; autonomy comes from effective config.
+
+| Field/delta/action | User owner, off | Agent owner, off | User owner, on | Agent owner, on |
+| --- | --- | --- | --- | --- |
+| goal / outcome | Q | A | Q | A |
+| goal / verification | Q | Q | Q | Q |
+| goal / constraints | Q | Q | Q | Q |
+| goal / boundaries | Q | Q | Q | Q |
+| goal / subgoals | Q | Q | Q | Q |
+| goal / stop_when | Q | A | Q | A |
+| goal / max_turns | Q | A | Q | A |
+| goal / objective | Q | A | A | A |
+| goal / revise | A | A | A | A |
+| goal / replace | Q | A | A | A |
+| goal / pause | Q | A | A | A |
+| goal / resume | Q | A | A | A |
+| goal / resume_user_pause | Q | Q | Q | Q |
+| goal / stop | Q | Q | D | D |
+| goal / clear | Q | Q | D | D |
+| loop / outcome | Q | A | A | A |
+| loop / stop_when | Q | A | A | A |
+| loop / budget | Q | A | A | A |
+| loop / cadence_faster | Q | A | A | A |
+| loop / cadence_slower | A | A | A | A |
+| loop / budget_reduce | A | A | A | A |
+| loop / revise | A | A | A | A |
+| loop / replace | Q | A | A | A |
+| loop / pause | Q | A | A | A |
+| loop / resume | Q | A | A | A |
+| loop / resume_user_pause | Q | Q | Q | Q |
+| loop / stop_user_pause | Q | Q | Q | Q |
+| loop / stop | Q | A | A | A |
+| loop / stop_user_condition | Q | Q | A | A |
+| loop / clear | D | D | D | D |
+
+Field rows describe destructive changes/removal; additive goal criteria and
+preserved fields stay allowed through `revise`. `outcome` means the goal contract
+outcome (not the objective text); loop `outcome` means its prompt. `budget` is a
+loop run-count increase including finite-to-zero/unlimited; `max_turns` means any
+change to a goal turn budget. Cadence floors and the global tick cap still bind.
+The stop-condition field uses that **item's** recorded owner, not just the creator
+of the enclosing lifecycle. A user stop commitment on an agent-created loop uses
+`stop_user_condition` for stopping it. A user/system pause uses `resume_user_pause`
+even when the enclosing goal/loop was agent-created. `stop_user_pause` also
+prevents an agent from escaping a user/system loop pause by finishing instead.
+Goal `stop` is the clearing
+alias, not evidence-backed completion. Loop `clear` is the unsupported alias;
+its native user command is `stop`; the unsupported `clear` row is D even for a user.
+These distinctions are exercised by the table
+boundary test rather than by constructing permissive synthetic ownership rows.
+
+Autonomy explicitly grants goal/loop pause, resume (except user/system pauses),
+replace and loop prompt/cadence/budget/stop-condition latitude. It does **not**
+release a user's goal outcome or turn budget. Goal verification, constraints,
+boundaries and additive criteria remain protected for **both** owners. A reason
+is required for every model edit; same-intent wording is not a semantic oracle
+that can authorize removing a user's requirements.
+
+Default-off user-owned goal edits retain the native additive revision and
+explicit quoted/approved replacement/removal surfaces. The table does not turn
+`revise` into a generic user-contract removal API. The native user command is a
+trusted caller, not an agent-supplied actor label. Existing snapshot/CAS publication,
+transaction-lock quote rechecks, approval receipts and outbox delivery remain in
+charge. An agent-owned edit records `authority=agent` when autonomy is disabled;
+only actual configuration-derived autonomy records `authority=autonomy`.
+
+`tests/hermes_cli/test_lifecycle_policy.py::test_every_authority_cell` exercises
+every expanded cell against real managers and SessionDB persistence, using native
+creation and pause APIs. This includes authenticated quotes, scoped controls,
+default-off user command surfaces, durable refusal readback and authority receipts.
+
 ## Completion And Contract Preservation
 
 `GoalManager.complete(reason=..., evidence=...)` accepts a mapping from every
@@ -36,8 +121,9 @@ Autonomous mode does not accept the auxiliary judge's DONE as completion.
 Autonomous edits patch only named contract fields. Every constraint, boundary,
 verification item and additive criterion is retained unless a current verbatim
 user removal instruction names the exact item. The same protection applies to a
-user-set stop condition. Ordinary wording, agent-owned stop conditions and turn
-budgets can change with a reason while keeping the same intent. Creation APIs
+user-set stop condition. Ordinary agent-owned wording, agent-owned stop conditions and agent-owned turn
+budgets can change with a reason while keeping the same intent. A user-owned
+contract outcome or turn budget requires current user authority to remove/change. Creation APIs
 record ownership for the model tools, which are maintained in the agents repo.
 Replacement advances the continuation-instance fence and requires fresh proof,
 while preserving quality gates, consumed turns and breach history. Its reason
