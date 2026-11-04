@@ -361,8 +361,12 @@ def _write_wrappers(leg_root: Path, install: Path, hermes_home: Path) -> Path:
     return wrap
 
 
-def make_leg(root: Path, template_home: Path | None, cache: InstallCache) -> Leg:
+def make_leg(root: Path, template_home: Path | None, cache: InstallCache | None = None) -> Leg:
     root.mkdir(parents=True, exist_ok=True)
+    # Other upgrade suites use the original two-argument helper. Keep their downloads
+    # private to this leg; only callers explicitly supplying a fixture cache share content.
+    if cache is None:
+        cache = InstallCache(root / "downloads")
     origin = _make_origin(root)
     install = root / "install"
     _git("clone", "-q", "--shared", "-b", "main", str(origin), str(install), cwd=root)

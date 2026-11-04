@@ -27,6 +27,10 @@ starts with an empty machine home, does not use `InstallCache` or copy uv/runtim
 and runs the real installer against its pinned download sources. This PR does not preseed that
 separate cold path; all three git worlds retain the download-sharing optimization.
 
+`make_leg(root, template_home)` remains supported for other upgrade suites. Omitting the optional
+cache creates download storage under that leg's own root; only explicit fixture-cache callers share
+content. Keep caller audits and a two-argument regression when extending shared test helpers.
+
 `test_upgrade_path` uses the same download-only fixture for its repeated N-1/update legs. Its
 bare origin advertises only the subject branch, like `_install_helpers.make_origin`, rather than
 all branches of a developer's partial clone (whose unrelated missing blobs could trigger network
