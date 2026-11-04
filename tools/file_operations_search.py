@@ -110,7 +110,7 @@ _ADMISSION_INTERRUPTED_ERROR = (
     "File search was interrupted while waiting for another filename "
     "search on the same root. Retry when ready.")
 
-_SEARCH_TIMEOUT_MARKER_RE = re.compile(r"\n?\[Command timed out after \d+s\]\s*$")
+_SEARCH_TIMEOUT_MARKER_RE = re.compile(r"\n?\[Command timed out after \d+(?:\.\d+)?(?:[eE][+-]?\d+)?s\]\s*$")
 
 
 def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]:
@@ -213,12 +213,16 @@ _OUTPUT_MODE_FLAGS = {"files_only": "-l", "count": "-c"}
 def _parse_search_output(result, output_mode: str, limit: int, offset: int,
                          context: int, warning: Optional[str] = None) -> SearchResult:
     """Parse rg/grep ``| head`` output into a SearchResult (shared by both engines).
-    Exit codes: 0=matches, 1=none, 2=error — but both tools return 2 on PARTIAL
-    errors (one unreadable file), so an error is surfaced only when exit==2 AND no
-    usable payload remains. ``warning`` is attached to files_only/content results."""
+    Exit codes: 0=matches, 1=none, 2=error — but both tools can report PARTIAL
+    errors (one unreadable file). A find-wrapped grep hard error can also exit 1;
+    surface diagnostic-only failures without discarding usable match payload.
+    ``warning`` is attached to files_only/content results."""
     stdout, limit_reason = _search_stdout_and_limit(result)
     diagnostics, payload = _split_tool_diagnostics(stdout)
-    if result.exit_code == 2 and not payload.strip():
+    # BSD find -exec ... + reports a grep hard error as exit 1, not 2.
+    # A normal grep no-match is also 1, but has no diagnostics.
+    hard_error = result.exit_code == 2 or (result.exit_code == 1 and bool(diagnostics.strip()))
+    if hard_error and not payload.strip():
         error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
     lines = [ln for ln in payload.strip().split('\n') if ln]
@@ -835,31 +839,47 @@ class SearchMixin:
             filtered.append(item_path)
         return filtered
 
-    def _filter_gitignored_paths(self, paths: list[str], root: str) -> list[str]:
-        """Drop paths ignored by git when *root* is inside a git worktree."""
+    def _exec_before_deadline(self, command: str, deadline: float, **kwargs) -> ExecuteResult:
+        """Use only the filename search's remaining wall-clock budget."""
+        remaining = max(0, deadline - time.monotonic())
+        if remaining <= 0:
+            return ExecuteResult(stdout="", exit_code=124)
+        kwargs["timeout"] = min(kwargs.get("timeout", 60), remaining)
+        result = self._exec(command, **kwargs)
+        if time.monotonic() >= deadline:
+            result.exit_code = 124
+        return result
+
+    def _filter_gitignored_paths(
+        self, paths: list[str], root: str, deadline: float
+    ) -> tuple[list[str], Optional[str]]:
+        """Drop gitignored paths without extending the filename search deadline."""
         if not paths:
-            return paths
+            return paths, None
 
         escaped_root = self._escape_shell_arg(root)
-        probe = self._exec(
+        probe = self._exec_before_deadline(
             f"git -C {escaped_root} rev-parse --is-inside-work-tree >/dev/null 2>&1",
-            timeout=10,
+            deadline, timeout=10,
         )
         if probe.exit_code != 0:
-            return paths
+            return paths, "search_timeout" if probe.exit_code == 124 else None
 
-        result = self._exec(
+        result = self._exec_before_deadline(
             f"git -C {escaped_root} check-ignore --stdin",
-            timeout=10,
-            stdin_data="\n".join(paths),
+            deadline, timeout=10, stdin_data="\n".join(paths),
         )
+        if result.exit_code == 124:
+            return paths, "search_timeout"
         ignored = set(result.stdout.splitlines())
-        return [item_path for item_path in paths if item_path not in ignored]
+        return [item_path for item_path in paths if item_path not in ignored], None
 
-    def _sort_paths_by_mtime(self, paths: list[str]) -> list[str]:
-        """Sort paths newest-first using metadata from the active backend."""
+    def _sort_paths_by_mtime(
+        self, paths: list[str], deadline: float
+    ) -> tuple[list[str], Optional[str]]:
+        """Sort newest-first using backend metadata within the search deadline."""
         if len(paths) < 2:
-            return paths
+            return paths, None
 
         script = (
             'while IFS= read -r item || [ -n "$item" ]; do '
@@ -868,7 +888,12 @@ class SearchMixin:
             "printf '%s\\n' \"${mtime:-0}\"; "
             "done"
         )
-        result = self._exec(script, timeout=60, stdin_data="\n".join(paths))
+        result = self._exec_before_deadline(script, deadline, stdin_data="\n".join(paths))
+        _, limit_reason = _search_stdout_and_limit(result)
+        if limit_reason:
+            # Partial metadata cannot establish an exact order. Retain every
+            # already discovered path and advertise the interrupted search.
+            return paths, limit_reason
 
         mtimes = []
         for line in result.stdout.splitlines()[:len(paths)]:
@@ -884,10 +909,11 @@ class SearchMixin:
             for _, item in sorted(
                 zip(mtimes, paths), key=lambda pair: pair[0], reverse=True
             )
-        ]
+        ], None
 
     def _search_directories_with_find(
-        self, pattern: str, path: str, fetch_limit: int
+        self, pattern: str, path: str, fetch_limit: int, deadline: float,
+        protected_paths: list[str],
     ) -> tuple[list[str], Optional[str]]:
         """Return matching descendant directories using find, if available.
 
@@ -897,28 +923,34 @@ class SearchMixin:
         the matching directory entries so the tool honours its documented
         ls-replacement contract.
         """
-        if fetch_limit <= 0 or not self._has_command("find"):
+        if fetch_limit <= 0:
             return [], None
 
         escaped_path = self._escape_shell_arg(path)
         escaped_pattern = self._escape_shell_arg(pattern)
         q_roots = [escaped_path]
         hidden_prune = self._hidden_prune_expr(q_roots)
+        # Match the effective rg exclusions before descending (not post-filtering),
+        # including literal glob metacharacters in a home/root directory name.
+        protected_prune = (
+            f"{self._prune_expr(_find_literal_path_expressions(protected_paths))} -o "
+            if protected_paths else ""
+        )
         cmd = (
-            f"find -H {escaped_path} -mindepth 1 {hidden_prune} -o -type d "
+            f"find -H {escaped_path} -mindepth 1 {protected_prune}{hidden_prune} -o -type d "
             f"! -name '.*' -name {escaped_pattern} -printf '%T@ %p\\n' "
             f"2>/dev/null | sort -rn"
         )
-        result = self._exec(cmd, timeout=30)
+        result = self._exec_before_deadline(cmd, deadline, timeout=30)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
             cmd_simple = (
-                f"find -H {escaped_path} -mindepth 1 {hidden_prune} -o -type d "
+                f"find -H {escaped_path} -mindepth 1 {protected_prune}{hidden_prune} -o -type d "
                 f"! -name '.*' -name {escaped_pattern} -print 2>/dev/null"
             )
-            result = self._exec(cmd_simple, timeout=30)
+            result = self._exec_before_deadline(cmd_simple, deadline, timeout=30)
             stdout, limit_reason = _search_stdout_and_limit(result)
 
         dirs = []
@@ -936,8 +968,10 @@ class SearchMixin:
             # any other hidden descendants stay invisible, matching rg.
             if self._root_under_hidden_dir(path):
                 dirs = self._filter_hidden_descendants(dirs, Path(path))
-            dirs = self._filter_gitignored_paths(dirs, path)
-        return self._sort_paths_by_mtime(dirs)[:fetch_limit], limit_reason
+            dirs, ignore_limit = self._filter_gitignored_paths(dirs, path, deadline)
+            limit_reason = limit_reason or ignore_limit
+        dirs, sort_limit = self._sort_paths_by_mtime(dirs, deadline)
+        return dirs[:fetch_limit], limit_reason or sort_limit
 
     def _search_files(self, pattern: str, path: str | list[str], limit: int, offset: int,
                       order: str = "discovery") -> SearchResult:
@@ -1076,6 +1110,11 @@ class SearchMixin:
         all_files = []
         seen = set()
         limit_reason = None
+        parts = pattern.split('/')
+        has_find = (not pattern.startswith(('/', './'))
+                    and not any(char in pattern for char in '{}')
+                    and all(part == '**' for part in parts[:-1])
+                    and self._has_command("find"))
         deadline = time.monotonic() + 60
         for parent, globs, operand in jobs:
             remaining = fetch_limit if order == "modified" else fetch_limit - len(all_files)
@@ -1084,7 +1123,7 @@ class SearchMixin:
                 limit_reason = "search_timeout"
                 break
             result = self._search_filename_root(
-                pattern, parent, globs, operand, remaining, order, rg_executable, max(1, int(timeout)))
+                pattern, parent, globs, operand, remaining, order, rg_executable, deadline, has_find)
             if result.error:
                 return result
             for file in result.files:
@@ -1095,13 +1134,14 @@ class SearchMixin:
             if limit_reason or (order == "discovery" and len(all_files) >= fetch_limit):
                 break
         if order == "modified":
-            all_files = self._sort_paths_by_mtime(all_files)
+            all_files, sort_limit = self._sort_paths_by_mtime(all_files, deadline)
+            limit_reason = limit_reason or sort_limit
         return SearchResult(
             files=all_files[offset:offset + limit], total_count=len(all_files),
             truncated=len(all_files) > offset + limit or bool(limit_reason), limit_reason=limit_reason)
 
     def _search_filename_root(self, pattern, parent, globs, operand, fetch_limit,
-                              order, rg_executable, timeout):
+                              order, rg_executable, deadline, has_find):
         root = posixpath.normpath(posixpath.join(parent, operand))
         exclusions = self._effective_macos_search_exclusions([root])
         exclusion_globs = [
@@ -1113,7 +1153,10 @@ class SearchMixin:
         walker_threads = max(1, min(4, (os.cpu_count() or 1) // 4))
         cmd = (f"{self._quote_executable(rg_executable)} --files{sort_arg} --threads {walker_threads} "
                f"{glob_args} -- {self._escape_native_tool_arg(operand)}")
-        result = self._run_rg_bounded([cmd], fetch_limit, timeout=timeout, native_cwd=parent,
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return SearchResult(limit_reason="search_timeout")
+        result = self._run_rg_bounded([cmd], fetch_limit, timeout=remaining, native_cwd=parent,
                                       shell_prefix="set -o pipefail; ", capture_stderr=True)
         stdout, limit_reason = _search_stdout_and_limit(result)
         files = [posixpath.normpath(file if re.match(r"^[A-Za-z]:/", file)
@@ -1126,17 +1169,21 @@ class SearchMixin:
             return SearchResult(error=(
                 f"{operation} failed while running ripgrep (exit {result.exit_code})."
                 + (f" {diagnostic}" if diagnostic else "")))
-        parts = pattern.split('/')
         # find's directory supplement supports basename globs, not path/brace globs.
-        if (limit_reason != "search_timeout" and not pattern.startswith(('/', './'))
-                and not any(char in pattern for char in '{}')
-                and all(part == '**' for part in parts[:-1]) and self._has_command("find")):
-            basename = parts[-1]
+        if limit_reason != "search_timeout" and has_find:
+            basename = pattern.rsplit('/', 1)[-1]
             directory_glob = basename if basename.startswith('*') else '*' + basename
-            dirs, directory_limit = self._search_directories_with_find(directory_glob, root, fetch_limit)
+            dirs, directory_limit = self._search_directories_with_find(
+                directory_glob, root, fetch_limit, deadline,
+                [absolute for _r, _rel, absolute in exclusions])
             if dirs:
-                files = self._sort_paths_by_mtime(list(dict.fromkeys([*files, *dirs])))[:fetch_limit]
-                limit_reason = limit_reason or directory_limit
+                files, sort_limit = self._sort_paths_by_mtime(
+                    list(dict.fromkeys([*files, *dirs])), deadline)
+                files = files[:fetch_limit]
+                directory_limit = directory_limit or sort_limit
+            limit_reason = limit_reason or directory_limit
+        if time.monotonic() >= deadline:
+            limit_reason = "search_timeout"
         return SearchResult(files=files, total_count=len(files), limit_reason=limit_reason)
 
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
@@ -1277,8 +1324,8 @@ class SearchMixin:
                                  protected_paths: list[str]) -> SearchResult:
         """grep fallback via ``find ... -prune -exec grep {} +``, used when the root needs
         path-scoped pruning (macOS protected dirs) or is itself under a dot-directory
-        (#18473: grep's ``--exclude-dir='.*'`` would drop the root). Trade-off: find folds
-        grep's exit code, so a hard grep error surfaces as an empty result."""
+        (#18473: grep's ``--exclude-dir='.*'`` would drop the root). Preserve diagnostics
+        because find folds a grep hard error into exit 1 (also the no-match code)."""
         grep_parts = self._grep_cmd(["grep", "-nHE"], pattern, output_mode, context)
         q_root = self._escape_shell_arg(path or ".")
         # ``-H``: follow a symlink handed in as the OPERAND (and only the operand). Without
@@ -1290,5 +1337,5 @@ class SearchMixin:
         find_parts.extend([self._hidden_prune_expr([q_root]), "-o", "-type f"])
         if file_glob:
             find_parts.extend(["-name", self._escape_shell_arg(file_glob)])
-        find_parts.extend(["-exec", *grep_parts, "{}", "+", "2>/dev/null"])
+        find_parts.extend(["-exec", *grep_parts, "{}", "+", "2>&1"])
         return self._run_search_pipeline(find_parts, output_mode, limit, offset, context, line_cap=True)

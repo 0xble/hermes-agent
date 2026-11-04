@@ -1,7 +1,7 @@
 # Bounded filename search
 
 Fork patch identity: `bounded-filename-search`.
-Contract tests: `tests/tools/test_search_filename_globs.py`, `tests/tools/test_search_cwd_preservation.py`, `tests/tools/test_search_files_engine_selection.py`, `tests/tools/test_search_budget_truncation.py`, `tests/tools/test_macos_protected_search.py`.
+Contract tests: `tests/tools/test_search_filename_globs.py`, `tests/tools/test_search_cwd_preservation.py`, `tests/tools/test_search_files_engine_selection.py`, `tests/tools/test_search_budget_truncation.py`, `tests/tools/test_macos_protected_search.py`, `tests/tools/test_search_supplement_safety.py`.
 
 ## Current contract
 
@@ -27,7 +27,10 @@ coordinates fail explicitly rather than returning silent empty matches.
 
 Filename walkers use `max(1, min(4, cpu_count // 4))` threads (one if CPU count
 is unknown). Root admission, bounded result capture, pagination and the shared
-60-second rg deadline remain in force. Discovery stops at the page budget;
+60-second search deadline remain in force. The directory supplement, BSD find
+retry, gitignore checks and all mtime stat passes share that deadline; exhaustion
+retains discovered paths with the existing `search_timeout` truncation notice.
+Discovery stops at the page budget;
 modified order merges each root's bounded newest candidates globally. Native
 and shell transports keep bounded stderr separate from paths and report engine
 status plus at most 4096 diagnostic bytes on failure. Neither transport changes
@@ -35,9 +38,14 @@ the caller's session cwd, including after empty matches or failures.
 
 Ripgrep ignore rules, hidden-directory defaults and macOS protected-root pruning
 remain enabled. Basename globs (including `**/basename`) retain the `find`
-directory supplement in every root so empty directories remain discoverable;
-path/brace globs exceed its basename syntax. The no-rg `find -name` fallback
-retains its historical basename-only syntax. Content search is unchanged.
+directory supplement in every root so empty directories remain discoverable.
+Both find forms prune the same protected roots before descending, including in
+single-root searches; explicit protected roots remain searchable. Unchanged
+hidden-directory pruning and gitignore checks still apply. Path/brace globs
+exceed its basename syntax. The no-rg `find -name` fallback
+retains its historical basename-only syntax. Content matching is unchanged;
+BSD find-wrapped grep errors now surface diagnostics at exit 1 instead of being
+misreported as empty matches (a diagnostic-free grep exit 1 still means no matches).
 
 ## Verification
 
