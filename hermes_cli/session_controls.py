@@ -614,7 +614,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         code = f"nothing_to_{action}"
         return {"result": {"ok": False, "error_code": code, "error": code}, "state": state}
     receipt = {"result": result, "state": state}
-    if cleared_goal and (authority or {}).get("via") == "autonomy":
+    if cleared_goal and caller is LifecycleAuthority.AUTONOMY:
         receipt["notice"] = f"Goal cleared autonomously without approval. Reason: {reason}"
     if (kind, action) == ("goal", "pause"):
         receipt.update(outcome="paused", notice="Goal paused; use /goal resume to continue")

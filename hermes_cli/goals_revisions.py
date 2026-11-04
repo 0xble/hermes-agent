@@ -224,6 +224,9 @@ class GoalRevisionsMixin:
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
         from hermes_cli.lifecycle_authority import LifecycleAuthority, agent_owned
         caller = LifecycleAuthority.for_edit(actor, autonomous=goal_autonomy_enabled())
+        if caller is None:
+            return {"ok": False, "error_code": "invalid_actor",
+                    "error": "actor must be agent, autonomy or user"}
         actor = caller.actor
         if actor == "agent" and (caller is LifecycleAuthority.AUTONOMY or agent_owned(self._state)):
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
@@ -260,6 +263,9 @@ class GoalRevisionsMixin:
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
         from hermes_cli.lifecycle_authority import LifecycleAuthority, agent_owned
         caller = LifecycleAuthority.for_edit(actor, autonomous=goal_autonomy_enabled())
+        if caller is None:
+            return {"ok": False, "error_code": "invalid_actor",
+                    "error": "actor must be agent, autonomy or user"}
         actor = caller.actor
         if actor == "agent" and (caller is LifecycleAuthority.AUTONOMY or agent_owned(self._state)):
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,

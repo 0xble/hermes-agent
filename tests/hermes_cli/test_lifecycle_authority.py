@@ -8,6 +8,20 @@ import pytest
 pytest_plugins = ["tests.hermes_cli.test_session_controls"]
 
 
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("action", ["revise", "replace"])
+def test_unknown_edit_actor_returns_a_structured_refusal(state, kind, action):
+    manager = manager_for(kind)
+    manager.set("Watch build", actor="agent")
+    before = manager.state.to_json()
+    kwargs = {"reason": "Clarify wording", "actor": "unknown-actor"}
+    kwargs["goal" if kind == "goal" else "prompt"] = "Watch the build status"
+    result = getattr(manager, action)(**kwargs)
+    assert not result["ok"]
+    assert result["error_code"] == "invalid_actor"
+    assert manager_for(kind).state.to_json() == before
+
+
 def manager_for(kind):
     from hermes_cli.goals import GoalManager
     from hermes_cli.loops import LoopManager
