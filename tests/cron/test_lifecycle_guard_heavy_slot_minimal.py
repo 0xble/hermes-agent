@@ -29,18 +29,20 @@ def trusted_slot(tmp_path, monkeypatch):
     return installed
 
 
-def test_lpg_wrapper_scan_is_allowed(tmp_path, trusted_slot):
+@pytest.mark.parametrize("options", ["", "--max-wait 5", "--max-wait=5"])
+def test_lpg_wrapper_scan_is_allowed(tmp_path, trusted_slot, options):
+    trusted_slot.write_text("#!/usr/bin/env python3\nhermes gateway restart\n", encoding="utf-8")
     recovery = _script(tmp_path, "run-recovery.sh", "#!/bin/sh\nprintf 'proof\\n'\n")
     command = (
         f"env -u HEAVY_SLOT_HELD {trusted_slot} --label lpg-v2-fresh-copy-old-vs-batched-recovery "
-        f"-- bash {recovery}"
+        f"{options} -- bash {recovery}"
     )
     assert scan_gateway_lifecycle(command) == (False, None)
 
 
 @pytest.mark.parametrize("options", [
     "", "--label proof", "--label=proof", "--label=", "--gate-fd 3", "--gate-fd=3",
-    "--label proof --gate-fd 3 --label=again",
+    "--label proof --gate-fd 3 --label=again", "--max-wait 5", "--max-wait=5",
 ])
 @pytest.mark.parametrize("prefix", ["", "env -u HEAVY_SLOT_HELD ", "nohup ", "timeout 30 "])
 def test_exact_wrappers_scan_the_wrapped_command(tmp_path, trusted_slot, options, prefix):
@@ -134,6 +136,39 @@ def test_bare_and_unknown_heavy_slot_wrappers_scan_the_wrapped_command(
         assert refusal is None
 
 
+@pytest.mark.parametrize("wrapper", ["heavy-slot", "{trusted}"])
+@pytest.mark.parametrize("options", [
+    "--max-wait 10800", "--max-wait=10800", "--label check --max-wait 5",
+    "--max-wait=0 --gate-fd=3 --label=proof", "--max-wait 0.25", "--max-wait=1e2",
+])
+@pytest.mark.parametrize(("payload", "blocked"), [
+    ("./bin/check", False), ("hermes gateway restart", True),
+    ("bash -c 'hermes gateway restart'", True),
+])
+def test_max_wait_preserves_wrapped_command_scanning(
+    tmp_path, trusted_slot, monkeypatch, wrapper, options, payload, blocked,
+):
+    monkeypatch.setenv("PATH", str(trusted_slot.parent))
+    (tmp_path / "bin").mkdir()
+    _script(tmp_path / "bin", "check", "#!/bin/sh\ntrue\n")
+    command = f"{wrapper.format(trusted=trusted_slot)} {options} -- {payload}"
+    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (blocked, None)
+
+
+@pytest.mark.parametrize("wrapper", ["heavy-slot", "{trusted}"])
+@pytest.mark.parametrize("options", [
+    "--unknown 5", "--unknown=5", "--max-wait 5 --unknown 1", "--max-wait=5 --unknown=1",
+])
+def test_unknown_heavy_slot_options_still_fail_closed(
+    tmp_path, trusted_slot, monkeypatch, wrapper, options,
+):
+    monkeypatch.setenv("PATH", str(trusted_slot.parent))
+    command = f"{wrapper.format(trusted=trusted_slot)} {options} -- true"
+    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+    assert unsafe is True
+    assert refusal is not None and "unknown option `--unknown" in refusal
+
+
 def test_heavy_slot_device_path_predicate_is_exact():
     from cron.lifecycle_guard import _is_non_executable_device_path
 
@@ -167,7 +202,11 @@ def test_opaque_heavy_slot_keeps_option_carried_commands(
         assert refusal is None
 
 
-@pytest.mark.parametrize("options", ["--bogus", "--label", "--gate-fd", "--"])
+@pytest.mark.parametrize("options", [
+    "--bogus", "--label", "--gate-fd", "--", "--max-wait", "--max-wait=",
+    "--max-wait -- true", "--max-wait= -- true", "--max-wait nope -- true",
+    "--max-wait=-1 -- true", "--max-wait=nan -- true", "--max-wait=inf -- true",
+])
 def test_ambiguous_heavy_slot_command_is_refused_by_name(trusted_slot, options):
     unsafe, refusal = scan_gateway_lifecycle(f"{trusted_slot} {options}")
     assert unsafe is True
