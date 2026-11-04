@@ -16,6 +16,11 @@ Only absolute explicit cache paths are eligible. Resolve symlinks and refuse des
 `.hermes`, `.cache/uv`, `.npm` and `.local/share/uv` under the OS password-database home, even
 when `HOME` names a sandbox. Failure to resolve that account also drops these inputs.
 N-1 receives a private copy of the runner's actual uv, avoiding repeated Astral bootstrap.
+The Git worlds pass the existing `--skip-browser` option to both real installer versions.
+Their contract is clone shape, transfer, hydration and update behavior, not optional browser
+provisioning. Process snapshots from the 900-second Linux reproduction found their installers
+inside `npx playwright install --with-deps chromium` (a separate 600-second optional step).
+Skipping that unrelated step does not replace the installer or bypass Git/dependency assertions.
 Cold real installer download coverage remains in
 `test_install_fresh.py::test_fresh_install_serves_head_and_runs_a_turn`: its `installed` fixture
 starts with an empty machine home, does not use `InstallCache` or copy uv/runtime artifacts,
