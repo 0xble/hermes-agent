@@ -147,9 +147,11 @@ class TestEAGAINCreateExecutionLeak:
         S._running_since.clear()
         S._running_futures.clear()
 
-        # First tick: pool.submit raises EAGAIN (thread exhaustion). The claim
-        # is released and the run recorded as failed.
-        pool = S._get_parallel_pool(S._resolve_max_parallel_workers())
+        # First tick: the no_agent script lane raises EAGAIN (thread exhaustion).
+        # Recovery and general-agent pools remain independent of this failure.
+        from cron import scheduler_admission as A
+        with A._lock:
+            pool = A._get_lane_pool(S.hermes_home_key(S._get_hermes_home()), "script")
         real_submit = pool.submit
         state = {"n": 0}
         def flaky(*a, **k):
