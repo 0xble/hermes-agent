@@ -159,7 +159,7 @@ def test_handed_off_completion_turn_runs_as_the_parent(tmp_path):
         'model': {'provider': 'openrouter', 'default': 'openai/gpt-5', 'base_url': url,
                   'api_key': 'loopback-only', 'api_mode': 'chat_completions'},
         'auxiliary': {'title_generation': {'enabled': False}},
-        'display': {'background_process_notifications': 'off'},
+        'display': {'background_process_notifications': 'concise'},
         'plugins': {'enabled': ['output_mark']},
     }
     _profile_home(home, 'LAUNCH', config)
