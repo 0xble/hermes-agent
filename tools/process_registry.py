@@ -641,6 +641,9 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     # Only the finalization claimant publishes completion and releases waiters.
     _finish_claimed: bool = field(default=False, repr=False)
+    # Notification acknowledgement is separate from wait/log consumption; transient,
+    # because ordinary persistent jobs do not acquire a survivor delivery lease.
+    _completion_delivered: bool = field(default=False, repr=False)
     _result_owner_write_done: bool = field(default=False, repr=False)
     # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
     # cleanup retries the stop even after the session finished.

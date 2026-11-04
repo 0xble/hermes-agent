@@ -224,6 +224,7 @@ class ProcessSurvivalMixin:
                 and getattr(session, "persist_on_release", False)
                 and not is_restart_safe(session) and has_exit_marker(session)
                 and getattr(session, "notify_on_complete", False)
+                and not getattr(session, "_completion_delivered", False)
                 and session.id not in self._completion_consumed)
 
     def _survivor_delivery_pending(self, session: ProcessSession) -> bool:
@@ -310,6 +311,14 @@ class ProcessSurvivalMixin:
         session = self.get(session_id)
         if session is not None and is_restart_safe(session):
             self._mark_survivor_delivered(session)
+        elif session is not None and session.persist_on_release:
+            # Known delivery must not become a new shutdown handoff. This does
+            # not consume wait/log output or create a durable delivered marker.
+            with self._lock:
+                session._completion_delivered = True
+            stopped = getattr(self, "_survivor_pollers_stopped", None)
+            if stopped is not None and stopped.is_set():
+                self._write_checkpoint()
 
     def _consume_survivor_completion(self, session_id: str) -> None:
         """An explicit wait/log claims first rather than settling a peer's lease."""

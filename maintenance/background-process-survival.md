@@ -79,6 +79,9 @@ Fork patch identity: `terminal-background-survival`.
   gateway queue consumer stops. Keep that finished job's existing checkpoint and
   exit-marker/log result through shutdown so the successor restores its route,
   enqueues the collected outcome and tail, and removes the one-startup handoff.
+  Consumer acknowledgement excludes known-delivered completions (before shutdown
+  or during drain) from handoff, independently of wait/log consumption. This is
+  transient delivery knowledge, not a durable ordinary-job lease.
   Pending drain handoffs are protected from finished-result TTL/cap pruning only
   while the shutdown fence is set; a long-running job can exceed TTL when it exits.
   This reuses the checkpoint-backed saved-result recovery path, not a new outbox

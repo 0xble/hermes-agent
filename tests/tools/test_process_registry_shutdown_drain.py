@@ -165,3 +165,36 @@ def test_persistent_completion_during_shutdown_drain_reaches_successor(tmp_path,
         gate.touch()
         session.process.wait(timeout=5)
         session._reader_thread.join(5)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("delivery_timing", ["before_shutdown", "during_drain"])
+def test_acknowledged_persistent_completion_is_not_handed_off(tmp_path, monkeypatch, delivery_timing):
+    from tools.process_registry_notifications import acknowledge_survivor_notifications
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    registry = ProcessRegistry()
+    registry._completions_restored = True
+    session, gate = _spawn_gated(registry, tmp_path, persist_on_release=True)
+    assert session.process is not None and session._reader_thread is not None
+    try:
+        if delivery_timing == "during_drain":
+            registry.stop_survivor_pollers()
+        gate.touch()
+        assert session.process.wait(timeout=5) == 0
+        session._reader_thread.join(5)
+        notices = registry.drain_notifications(session_key="session")
+        assert len(notices) == 1
+        acknowledge_survivor_notifications(registry, notices)
+        # Acknowledgement is not wait/log consumption and must not change that policy.
+        assert not registry.is_completion_consumed(session.id)
+        if delivery_timing == "before_shutdown":
+            registry.stop_survivor_pollers()
+        assert registry.kill_all(source="gateway_shutdown", deadline=time.monotonic() + 5) == 0
+        successor = ProcessRegistry()
+        assert successor.recover_from_checkpoint() == 0
+        assert successor.drain_notifications(session_key="session") == []
+    finally:
+        gate.touch()
+        session.process.wait(timeout=5)
+        session._reader_thread.join(5)
