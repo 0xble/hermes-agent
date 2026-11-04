@@ -526,9 +526,10 @@ def _next_control_generation(session_id: str, stored: Optional[LoopState], state
 
 
 def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None,
-              tick_lifecycle: bool = False, apply=None):
+              tick_lifecycle: bool = False, apply=None, precondition=None):
     """Write a loop or apply a command to the current row under the same control fence.
 
+    An optional precondition checks transcript/quote authority under this same write lock.
     Command callbacks validate and edit only their owned fields on the live row. They may
     be replayed on lock contention and must not mutate a manager's cached state. Return the
     persisted row and command result only after a successful write; cursor owners see errors.
@@ -550,6 +551,8 @@ def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None
         stored = _parse_state(row[0]) if row and row[0] else None
         original = stored.to_json() if stored is not None else None
         live = _parse_state(original) if original is not None else None
+        if precondition is not None and not precondition(conn):
+            return stored, False
         result = apply(live) if apply is not None else None
         updated = live if apply is not None else state
         if updated is not None and (apply is None or updated.to_json() != original):
