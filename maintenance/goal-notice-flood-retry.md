@@ -80,6 +80,20 @@ helper and thresholds instead of carrying a second copy.
 **Proof surface:** `tests/gateway/test_goal_status_notice.py` plus the existing
 cron live-delivery confirmation and goal verdict/parked-wake suites.
 
+The deferred outcome flood-retry test injects `DailyQuota.wall` to keep its
+11-message pressure in one Telegram day while the real short retry waits. This
+is a test-input correction, not a quota or cooldown behavior change:
+`DailyQuota` intentionally starts an empty window at UTC midnight by default,
+and a short penalty does not move that anchor (see
+`test_window_rolls_at_the_anchor_and_starts_empty` and
+`test_short_penalty_does_not_move_the_window`). `ChatOutboundBudget` uses a
+separate monotonic slot clock, and durable flood deadlines remain unchanged.
+The original test's real wall could cross midnight during `RetryAfter(1)`,
+correctly reset the daily count, and fail its unchanged `== 11` assertion.
+A scratch default-wall probe advances 23:59:59 to 00:00:01 at the real flood
+handler: both original parametrizations fail with `0 == 11`; the explicit
+fixed wall keeps the same pressure, two Bot API attempts, and task cleanup.
+
 **Upstream prior art:** The request names fork commit `7b78199d51` (#290), which
 is the covering implementation and was inspected before adaptation. No separate
 upstream search is required for this fork-only adaptation; any later search
