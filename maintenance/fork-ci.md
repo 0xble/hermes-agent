@@ -52,8 +52,11 @@ the failure output before scratch cleanup. A readiness marker prevents sending
 SIGUSR2 to an unregistered child; Windows reports that signal-based diagnostics
 are unavailable and retains its existing kill path. Pytest's own per-test
 faulthandler plugin remains enabled. Collection, an earlier failing test, and
-session-finish hangs must not suppress the file-level diagnostic. Verify with
-`scripts/run_tests.sh tests/scripts/test_run_tests_timeout_dump.py tests/scripts/test_run_tests_parallel.py tests/scripts/test_run_tests_parallel_stdio.py tests/scripts/test_run_tests_parallel_timeout_scaling.py`.
+session-finish hangs must not suppress the file-level diagnostic. The bootstrap
+retains the actual `pytest` module argument in the process command line so the
+live-DB ancestry guard still recognizes children with scrubbed environments.
+Verify with
+`scripts/run_tests.sh tests/scripts/test_run_tests_timeout_dump.py tests/scripts/test_run_tests_parallel.py tests/scripts/test_run_tests_parallel_stdio.py tests/scripts/test_run_tests_parallel_timeout_scaling.py tests/hermes_state/test_live_db_guard_ancestry.py`.
 This instrumentation does not claim a cause for the intermittent turn-hold
 adoption hang: hosted runs 41525743485, 41698107946 and 41703877839, attempt 1,
 collected seven tests but printed no first result before their 300-second kill.

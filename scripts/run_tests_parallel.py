@@ -627,12 +627,12 @@ _flaky_lock = threading.Lock()
 # Inline rather than a helper module: runner regression probes copy this script.
 _PYTEST_STACK_BOOTSTRAP = """
 import faulthandler, pathlib, runpy, signal, sys
-stack_path, ready_path = sys.argv[1:3]
-del sys.argv[1:3]
+stack_path, ready_path, module_name = sys.argv[1:4]
+del sys.argv[1:4]
 _stack_stream = open(stack_path, "w", encoding="utf-8")
 faulthandler.register(signal.SIGUSR2, file=_stack_stream, all_threads=True, chain=False)
 pathlib.Path(ready_path).touch()
-runpy.run_module("pytest", run_name="__main__", alter_sys=True)
+runpy.run_module(module_name, run_name="__main__", alter_sys=True)
 """
 
 
@@ -672,8 +672,10 @@ def _run_one_file_once(
     stack_ready = Path(temproot) / "timeout-stacks.ready"
     can_dump = hasattr(signal, "SIGUSR2")
     if can_dump:
+        # Keep the actual module as a distinct argv token: the live-DB guard
+        # recognizes pytest ancestry even when a spawned child scrubs its env.
         cmd = [sys.executable, "-c", _PYTEST_STACK_BOOTSTRAP,
-               str(stack_path), str(stack_ready), str(file), *pytest_args]
+               str(stack_path), str(stack_ready), "pytest", str(file), *pytest_args]
 
     subproc_start = time.monotonic()
     deadline = subproc_start + file_timeout

@@ -96,10 +96,11 @@ def test_fast_file_keeps_normal_pytest_output(tmp_path, monkeypatch):
 def _fake_timeout(tmp_path, monkeypatch, *, ready):
     runner = _runner()
     clock = [100.0]
-    waits, signals, kills = [], [], []
+    waits, signals, kills, launches = [], [], [], []
     child = SimpleNamespace(pid=123, returncode=None, poll=lambda: None)
 
     def launch(cmd, **kwargs):
+        launches.append(cmd)
         scratch = Path(kwargs["env"]["TMPDIR"])
         if ready:
             (scratch / "timeout-stacks.ready").touch()
@@ -122,13 +123,13 @@ def _fake_timeout(tmp_path, monkeypatch, *, ready):
     monkeypatch.setattr(runner.os, "getpgid", lambda pid: pid, raising=False)
     monkeypatch.setattr(runner.os, "kill", lambda pid, sig: signals.append((pid, sig, clock[0])))
     result = runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 3.0)
-    return result, waits, signals, kills
+    return result, waits, signals, kills, launches
 
 
 def test_dump_request_does_not_move_the_original_deadline(tmp_path, monkeypatch):
     if not hasattr(signal, "SIGUSR2"):
         monkeypatch.setattr(signal, "SIGUSR2", 12, raising=False)
-    result, waits, signals, kills = _fake_timeout(tmp_path, monkeypatch, ready=True)
+    result, waits, signals, kills, _ = _fake_timeout(tmp_path, monkeypatch, ready=True)
     assert result[1] == 124
     assert waits == [2.25, 0.75, 10]
     assert signals == [(123, getattr(signal, "SIGUSR2"), 102.25)]
@@ -139,8 +140,18 @@ def test_dump_request_does_not_move_the_original_deadline(tmp_path, monkeypatch)
 def test_unregistered_child_is_not_sent_a_fatal_default_signal(tmp_path, monkeypatch):
     if not hasattr(signal, "SIGUSR2"):
         monkeypatch.setattr(signal, "SIGUSR2", 12, raising=False)
-    result, waits, signals, kills = _fake_timeout(tmp_path, monkeypatch, ready=False)
+    result, waits, signals, kills, _ = _fake_timeout(tmp_path, monkeypatch, ready=False)
     assert result[1] == 124
     assert signals == []
     assert kills[0] == 103.0
     assert "handler not ready" in result[2]
+
+
+def test_bootstrap_preserves_pytest_ancestry_for_scrubbed_children(tmp_path, monkeypatch):
+    from hermes_state_guard import _process_looks_like_pytest
+
+    _, _, _, _, launches = _fake_timeout(tmp_path, monkeypatch, ready=False)
+    assert _process_looks_like_pytest(SimpleNamespace(cmdline=lambda: launches[0]))
+    # This is an actual bootstrap module argument, not a misleading argv label.
+    if "-c" in launches[0]:
+        assert launches[0][5] == "pytest"
