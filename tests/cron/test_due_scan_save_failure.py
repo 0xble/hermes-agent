@@ -263,7 +263,12 @@ def test_skipped_oneshot_survives_recovery_by_any_save(cron_store, monkeypatch):
 
     late = dict(once, id="late", next_run_at=(clock["now"] + timedelta(minutes=1)).isoformat())
     save_jobs(load_jobs() + [late])
-    clock["now"] += timedelta(minutes=10)  # missed while the store was writable: retired
+    # The store is healthy but the ticker process stops before this job is due.
+    # A surviving-process scan stall is deliberately catch-up eligible; a new
+    # ticker's nonce must retain this test's post-recovery downtime retirement.
+    from cron import jobs_oneshot
+    monkeypatch.setattr(jobs_oneshot, "_SCAN_PROCESS_ID", "post-recovery-restart")
+    clock["now"] += timedelta(minutes=10)
     assert "late" not in [d["id"] for d in get_due_jobs()]
     assert "late" not in [j["id"] for j in load_jobs()]
 
