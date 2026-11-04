@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.redact import redact_sensitive_text
+from tools.process_registry_survival import has_exit_marker, is_restart_safe
 
 logger = logging.getLogger("tools.process_registry")
 
@@ -30,13 +31,15 @@ class ProcessCheckpointMixin:
                     if self._retain_survivor_completion(s)
                 ]
                 for s in (*self._running.values(), *pending_survivors):
-                    if s.exited and not s.survive_restart:
+                    if s.exited and not is_restart_safe(s):
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
                     if s.host_start_time is None and s.pid_scope == "host" and s.pid:
                         s.host_start_time = self._safe_host_start_time(s.pid)
                     entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
+                    if not has_exit_marker(s):
+                        entry.pop("exit_path", None)
                     # Redact inline credentials before persisting (~/.hermes/processes.json).
                     # Recovery uses command only for display (adoption re-validates the
                     # PID, never re-runs it), so masking is lossless.
@@ -99,10 +102,9 @@ class ProcessCheckpointMixin:
         unresolved_scope_entries: list[dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
-            # A file-backed job (survive_restart, or a local persist_on_release job) has a
-            # wrapper-written exit marker and log, so its result outlives the old gateway.
-            survivor = bool(entry.get("survive_restart") or entry.get("exit_path"))
-            if not pid and not survivor:
+            # Exit collection is independent of dispatch, PID identity and delivery.
+            restart_safe = is_restart_safe(entry)
+            if not pid and not restart_safe and not has_exit_marker(entry):
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
@@ -122,7 +124,11 @@ class ProcessCheckpointMixin:
             # completion. A positive mismatch means the number was recycled:
             # do not adopt it and do not signal it.
             log = adoptable_log(entry.get("output_log"))
-            fate = self._detached_host_fate(pid, entry.get("host_start_time")) if pid else "gone"
+            recorded_exit, recorded_termination = self._read_recovery_receipts(entry)
+            # A receipt belongs to this job, never to a later owner of its PID.
+            # Settling it must not probe/adopt/signal that PID or its old scope.
+            fate = ("gone" if recorded_exit is not None or not pid else
+                    self._detached_host_fate(pid, entry.get("host_start_time")))
             # A worker spawn's output log and recorded exit outlive both the spawner and the PID,
             # so its reader decides the outcome. A positive start-time mismatch still proves the
             # PID was recycled, so a reused PID is never adopted or signalled.
@@ -131,14 +137,14 @@ class ProcessCheckpointMixin:
             # A survivor whose PID was recycled is never adopted, supervised, or signalled
             # either. Only a result its wrapper already recorded is reported (once, via the
             # delivery claim); without one the stale entry is discarded like any other.
-            if fate == "reused" and not survivor:
+            if fate == "reused" and not restart_safe:
                 logger.info(
                     "Not recovering session %s: pid %d is alive but its "
                     "start time no longer matches — PID was recycled onto "
                     "an unrelated process; refusing to adopt or signal it.",
                     entry.get("session_id", "?"), pid)
                 continue
-            if fate != "running" and not survivor:
+            if fate != "running" and not restart_safe and recorded_exit is None:
                 systemd_unit = entry.get("systemd_unit", "")
                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
                     logger.warning(
@@ -146,30 +152,16 @@ class ProcessCheckpointMixin:
                         "retaining checkpoint entry for the next startup",
                         systemd_unit, pid)
                     unresolved_scope_entries.append(entry)
-                continue
-            fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
-            recorded_exit = None
-            recorded_termination = {}
-            if survivor:
-                # A survivor's durable exit marker is authoritative even when the
-                # wrapper PID still looks alive during the restart probe. The
-                # operator-kill receipt is written before the local process tree is
-                # fully reaped, so recovery must not start a poller that downgrades
-                # that receipt to a normal exit or survivor_lost result.
-                recorded_exit = self._recorded_survivor_exit(fields.get("exit_path"))
-                recorded_termination = self._recorded_survivor_termination(fields.get("exit_path"))
-                if recorded_exit is None and recorded_termination.get("completion_reason") == "killed":
-                    recorded_exit = recorded_termination.get("exit_code", -15)
-                    if not isinstance(recorded_exit, int):
-                        recorded_exit = -15
-                if fate == "reused" and recorded_exit is None:
-                    logger.info(
-                        "Not recovering survivor %s: pid %d was recycled onto an unrelated "
-                        "process and no exit was recorded; discarding the stale entry.",
-                        entry.get("session_id", "?"), pid)
-                    self._remove_survivor_run_dir(ProcessSession(
-                        id=entry["session_id"], command="", log_path=fields.get("log_path", "")))
                     continue
+            fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
+            if restart_safe and fate == "reused" and recorded_exit is None:
+                logger.info(
+                    "Not recovering survivor %s: pid %d was recycled onto an unrelated "
+                    "process and no exit was recorded; discarding the stale entry.",
+                    entry.get("session_id", "?"), pid)
+                self._remove_survivor_run_dir(ProcessSession(
+                    id=entry["session_id"], command="", log_path=fields.get("log_path", "")))
+                continue
             fields.update(
                 command=entry.get("command", "unknown"),
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
@@ -178,6 +170,8 @@ class ProcessCheckpointMixin:
             # (and recorded exit) outlives its spawner, so tail it from the start.
             fields["output_log"] = log
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+            # Historical output is a bounded snapshot, never a new live/watch event.
+            self._adopt_survivor_log_tail(session, final=recorded_exit is not None or fate == "gone")
             if recorded_exit is not None:
                 session.pid = None  # a file-backed result has no signalable PID
                 with self._lock:
@@ -199,12 +193,7 @@ class ProcessCheckpointMixin:
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })
-            if not pid or recorded_exit is not None:
-                self._finish_survivor(
-                    session, recorded_exit,
-                    recorded_termination.get("completion_reason", "exited") if recorded_exit is not None else "lost",
-                    recorded_termination.get("termination_source", "") if recorded_exit is not None else "survivor_lost",
-                )
+            if self._finish_recovered_exit(session, fate, recorded_exit, recorded_termination):
                 continue
             if self._file_backed(session):
                 from contextvars import copy_context
@@ -218,3 +207,29 @@ class ProcessCheckpointMixin:
                 poller.start()
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered
+
+    def _read_recovery_receipts(self, entry):
+        """Marker capability supplies status; only explicit opt-ins have kill metadata."""
+        if not has_exit_marker(entry):
+            return None, {}
+        recorded_exit = self._recorded_survivor_exit(entry.get("exit_path"))
+        termination = self._recorded_survivor_termination(entry.get("exit_path")) if is_restart_safe(entry) else {}
+        if recorded_exit is None and termination.get("completion_reason") == "killed":
+            recorded_exit = termination.get("exit_code", -15)
+            if not isinstance(recorded_exit, int):
+                recorded_exit = -15
+        return recorded_exit, termination
+
+    def _finish_recovered_exit(self, session, fate, recorded_exit, recorded_termination) -> bool:
+        """Settle a dead recovery before scheduling readers for still-live processes."""
+        if fate == "gone" and not is_restart_safe(session) and recorded_exit is None and not session.output_log:
+            self._prune_uncollected_detached(session)
+            return True
+        if session.pid and recorded_exit is None:
+            return False
+        self._finish_exited(
+            session, recorded_exit,
+            recorded_termination.get("completion_reason", "exited") if recorded_exit is not None else "lost",
+            recorded_termination.get("termination_source", "") if recorded_exit is not None else "survivor_lost",
+        )
+        return True

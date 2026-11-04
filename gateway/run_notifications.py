@@ -3117,14 +3117,14 @@ class GatewayNotificationsMixin(
         if exit != 0) / off."""
         from tools.process_registry import process_registry
         from tools.process_registry_notifications import acknowledge_survivor_notifications, format_process_notification, should_surface_notification
+        from tools.process_registry_survival import is_restart_safe
         session_id = watcher["session_id"]
         interval = watcher["check_interval"]
         platform_name = watcher.get("platform", "")
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
         agent_notify = watcher.get("notify_on_complete", False)
-        # The mode belongs to the profile that started the process; recovered watchers run in the
-        # root context, so resolve it under the owning profile's scope (no-op for the default).
+        # Resolve under the launching profile: recovered watchers may run in the root context.
         async with self._completion_event_scope(watcher):
             notify_mode = self._load_background_notifications_mode()
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
@@ -3160,7 +3160,7 @@ class GatewayNotificationsMixin(
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
                 if session.exited:
-                    if getattr(session, "survive_restart", False) and process_registry._claim_survivor_delivery(session):
+                    if is_restart_safe(session) and process_registry._claim_survivor_delivery(session):
                         process_registry._mark_survivor_delivered(session)
                     break
                 continue
@@ -3171,7 +3171,7 @@ class GatewayNotificationsMixin(
                 # Durable delivery suppresses replay, not a consumer's render/wait/log snapshot.
                 # Claim before admission; while a live peer gateway holds the claim, wait so
                 # this watcher can reclaim the completion if that peer dies before delivering.
-                if getattr(session, "survive_restart", False) and not process_registry._claim_survivor_delivery(session):
+                if is_restart_safe(session) and not process_registry._claim_survivor_delivery(session):
                     if process_registry._survivor_delivery_pending(session):
                         continue
                     break
@@ -3207,7 +3207,7 @@ class GatewayNotificationsMixin(
                     completion_attempts += 1
                     if completion_attempts < _MAX_COMPLETION_INJECTION_ATTEMPTS:
                         # The process remains terminal; only this claim owner may return it to pending.
-                        if getattr(session, "survive_restart", False):
+                        if is_restart_safe(session):
                             process_registry.release_survivor_completion(session_id)
                         retry_interval = jittered_backoff(
                             completion_attempts, base_delay=max(interval, 1) * 2,
@@ -3240,7 +3240,7 @@ class GatewayNotificationsMixin(
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,
                     )
-                    if getattr(session, "survive_restart", False):
+                    if is_restart_safe(session):
                         process_registry._mark_survivor_delivered(session)
                     break
                 if notify_mode in {"concise", "all", "result"} or (
@@ -3259,7 +3259,7 @@ class GatewayNotificationsMixin(
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                         await present_notification(send_final, platform=platform_name,
                                                    diagnostic=session.exit_code not in {0, None})
-                    if sent is False and getattr(session, "survive_restart", False):
+                    if sent is False and is_restart_safe(session):
                         process_registry.release_survivor_completion(session_id)
                         # Keep one offer alive until shutdown cancels the watcher, even if
                         # transport recovery takes hours. A capped scalar bounds retry state.
@@ -3268,7 +3268,7 @@ class GatewayNotificationsMixin(
                         continue
                 # Presented, or deliberately suppressed by the notification mode: either way the
                 # claimed survivor completion is settled and must not replay on a successor.
-                if getattr(session, "survive_restart", False):
+                if is_restart_safe(session):
                     process_registry.acknowledge_survivor_completion(session_id)
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
