@@ -11,6 +11,8 @@ are indeterminate and must never trigger replay under a new identity.
 
 Consumer: the separately maintained session-relay plugin in 0xble/agents.
 
+Contract tests: `tests/gateway/test_plugin_injection_result.py`.
+
 Verification: `scripts/run_tests.sh tests/gateway/test_plugin_injection_result.py`.
 
 Removal: drop this unit when upstream exposes equivalent admission receipts and
