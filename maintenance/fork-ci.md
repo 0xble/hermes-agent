@@ -8,6 +8,10 @@ Their three simultaneous real installs share only explicit runner content caches
 Python and npm) and a fixture-owned PM runtime download store. Each checkout, PM install identity,
 venv, active selection record and Hermes user home remains distinct. PM's machine uv cache is
 linked to the explicit content cache because PM intentionally does not use `UV_CACHE_DIR`.
+The shell runner must forward only `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, and `npm_config_cache`
+across its `env -i` boundary: otherwise the portable lane's already-primed downloads silently
+vanish before the file worker starts. The runner regression also proves installed/runtime/user
+state and credentials remain scrubbed; do not widen this to a generic environment passthrough.
 N-1 receives a private copy of the runner's actual uv, avoiding an unrelated Astral bootstrap.
 
 `test_upgrade_path` uses the same download-only fixture for its repeated N-1/update legs. Its
