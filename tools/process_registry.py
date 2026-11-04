@@ -641,6 +641,9 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     # Only the finalization claimant publishes completion and releases waiters.
     _finish_claimed: bool = field(default=False, repr=False)
+    # Notification acknowledgement is separate from wait/log consumption; transient,
+    # because ordinary persistent jobs do not acquire a survivor delivery lease.
+    _completion_delivered: bool = field(default=False, repr=False)
     _result_owner_write_done: bool = field(default=False, repr=False)
     # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
     # cleanup retries the stop even after the session finished.
@@ -3146,7 +3149,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         prunable = {
             sid: s for sid, s in self._finished.items()
             if not getattr(s, "_scope_stop_pending", False)
-            and not self._retain_survivor_completion(s) and not retained_for_delivery(s)
+            and not self._retain_survivor_completion(s) and not self._retain_drain_completion(s)
+            and not retained_for_delivery(s)
         }
         expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
         over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES
