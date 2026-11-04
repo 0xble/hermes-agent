@@ -263,41 +263,33 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
 def _filename_search_coordinates(
     pattern: str, roots: list[str], cwd: str,
 ) -> tuple[Optional[str], list[str], list[str]]:
-    """Translate every root count into one rg cwd, glob union and operand list.
+    """Translate explicit root anchors into one rg cwd, glob union and operand list.
 
-    rg's slash anchors use its cwd, NOT each operand. Keep all POSIX searches
-    in one coordinate system so transport and root count cannot change meaning.
-    Root prefixes are literals; only the user's suffix is glob syntax.
+    Unanchored globs retain base ripgrep coordinates exactly: the caller's cwd
+    and original root operands. Common-parent translation exists only for explicit
+    per-root anchoring, so it must not affect ordinary path globs.
     """
     anchored = pattern.startswith(('/', './'))
     dot_anchored = pattern.startswith('./')
     while pattern.startswith('./'):
         pattern = pattern[2:]
+    if not anchored:
+        if '/' not in pattern:
+            pattern = pattern if pattern.startswith('*') else f'*{pattern}'
+        return None, [pattern], roots
     posix = all(not re.match(r"^[A-Za-z]:", value) and "\\" not in value
                 for value in [cwd, *roots])
-    if '/' in pattern:
-        glob = pattern if pattern.startswith('**/') else f"**/{pattern}"
-    else:
-        glob = pattern if pattern.startswith('*') else f"*{pattern}"
     if not posix:
-        if anchored:
-            raise ValueError("Root-anchored filename globs require POSIX search roots and cwd.")
-        return None, [glob], roots
-
+        raise ValueError("Root-anchored filename globs require POSIX search roots and cwd.")
     # A backend (notably SSH before its first cwd marker) may still report '~'.
     # Never interpret that relative token in the controller's namespace, mix it
     # with absolute roots in commonpath, or pass a quoted '~' to cd.
     if not posixpath.isabs(cwd):
-        if anchored:
-            raise ValueError("Root-anchored filename globs require an absolute POSIX backend cwd.")
-        return None, [glob], roots
+        raise ValueError("Root-anchored filename globs require an absolute POSIX backend cwd.")
     absolute_roots = [posixpath.normpath(posixpath.join(cwd, root)) for root in roots]
     # Parents also work for explicitly selected FILE operands: never cd into a file.
     common = posixpath.commonpath(map(posixpath.dirname, absolute_roots))
     operands = [posixpath.relpath(root, common) for root in absolute_roots]
-    if not anchored:
-        return common, [glob], operands
-
     candidates = [(root, pattern.lstrip('/')) for root in absolute_roots]
     if not dot_anchored:
         for root in sorted(absolute_roots, key=len, reverse=True):
@@ -1073,7 +1065,7 @@ class SearchMixin:
         fetch_limit = limit + offset + 1
         effective_exclusions = self._effective_macos_search_exclusions(roots)
         exclusion_terms = [
-            f"--glob {self._escape_shell_arg('!' + (posixpath.relpath(absolute, scoped_common) if scoped_common else relative) + '/**')}"
+            f"--glob {self._escape_shell_arg('!' + (posixpath.relpath(absolute, scoped_common or cwd) if scoped_common or len(roots) == 1 else relative) + '/**')}"
             for _r, relative, absolute in effective_exclusions]
         exclusion_globs = " ".join(dict.fromkeys(exclusion_terms))
         exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""

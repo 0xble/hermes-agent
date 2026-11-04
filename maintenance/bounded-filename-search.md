@@ -9,22 +9,30 @@ filename search into a whole-machine parallel walk. An unknown CPU count uses on
 thread. Content searches keep their existing ripgrep command and parallelism.
 
 Filename globs retain their complete path and brace syntax in both ripgrep
-transports. Unanchored slash-bearing patterns match the complete suffix at any
-depth within the selected roots, while ordinary basename globs keep their
-existing matching. Leading `./` and `/` anchor to each selected root independently;
-`./hooks/*` therefore excludes `nested/hooks/*`. Absolute patterns within a search
-root retain that root's identity instead of matching the same suffix under sibling
-roots. Other leading `/` patterns are interpreted as root-relative glob syntax.
-One translation maps `(pattern, roots, cwd)` to `(rg cwd, globs, operands)` for all
-POSIX searches, with no anchoring branch based on root count. Its working directory
-is the common ancestor of the operands' parents, so file operands never become a
-`cd` target. Single roots, multiple roots, relative and absolute operands, and
-roots outside the caller's cwd all use the same coordinates in both transports.
+transports. Unanchored patterns retain the base ripgrep invocation's cwd and root
+operands: no synthesized `**/`, root rebasing, or common-parent cwd. The matching
+contract below applies identically for one or several roots; adding an unrelated
+root cannot change matches under an existing root.
+
+| Pattern kind | Root kind | String matched by the glob |
+| --- | --- | --- |
+| Basename (no `/`) | Relative or absolute | Basename at any depth; retain the historical leading `*` unless already present |
+| Unanchored path (including braces and explicit `**/`) | Relative | Cwd-relative operand spelling plus descendant path (retain leading `../`; omit `./`) |
+| Unanchored path (including braces and explicit `**/`) | Absolute below cwd | Cwd-relative file path, as ripgrep strips its cwd prefix before glob matching |
+| Unanchored path (including braces and explicit `**/`) | Absolute outside cwd | Absolute file path |
+| Leading `./` or `/` | Relative or absolute | Descendant path relative to each selected root; no implicit recursive prefix |
+| Absolute pattern inside a selected root | Relative or absolute | Descendant path relative to that root only (preserve root identity) |
+
+Ripgrep still emits absolute paths for absolute operands, including those below
+cwd: emitted paths are not always its glob-match strings. Slash-bearing globs
+are passed verbatim, so `deep/*` is not shorthand for `**/deep/*`. Other leading
+`/` patterns are root-relative syntax. Only root anchoring needs a shared parent
+cwd and literal root-prefix escaping, keeping file operands out of `cd` targets.
+The base's existing macOS protected-multi-root exclusion scope is retained: that
+special traversal runs from the roots' common ancestor in both base and head.
 Each search remains one bounded ripgrep invocation, preserving global modified
-order and pagination. Literal root names are escaped separately from user glob
-syntax. Non-POSIX (drive-letter or backslash-shaped) roots/cwd retain the existing
-unanchored search path; anchored globs fail explicitly before traversal rather
-than passing those paths through POSIX commonpath or a shell `cd`.
+order and pagination. Non-POSIX roots/cwd retain the base unanchored path;
+anchored globs fail explicitly rather than guessing POSIX coordinates.
 The historical basename reduction belongs only to the `find -name` fallback,
 whose parser does not support ripgrep's path and brace syntax. That fallback was
 the original reason for the reduction (`533c064269417`), not a requirement to
@@ -46,9 +54,9 @@ must stay at the caller's directory after successful, empty, or failed searches.
 not in the wrapper shell. The native transport scopes only its subprocess cwd.
 This protects the directory supplement within a call as well as subsequent
 relative search/read operations. Expand a tilde cwd using the backend's HOME
-before translating coordinates; never use the controller's home. If a cwd cannot
-be resolved to an absolute POSIX path, unanchored searches keep the original
-unscoped operands, and anchored searches fail explicitly rather than guessing.
+before root anchoring; never use the controller's home. If a cwd cannot be
+resolved to an absolute POSIX path, anchored searches fail explicitly rather
+than guessing. Unanchored searches never translate their original operands.
 
 Cwd-mutation audit: `file_operations_search.py`'s filename rg builder was the only
 bare `cd` command. The shared bounded-rg transport now owns its isolation. The
@@ -129,7 +137,8 @@ and the previously recursive `./` interpretation. GREEN through `heavy-slot` and
 `scripts/run_tests.sh` passes 669 tests across 20 files with 0 failures and 13
 platform skips; the filename-glob module passes all 294 cases, including four
 file-operand checks. The directory supplement's results are normalized into the
-same absolute output coordinates as ripgrep before deduplication.
+same output coordinates as ripgrep before deduplication. The later compatibility
+correction below supersedes this universal-coordinate experiment.
 
 The cwd-preservation regression module `tests/tools/test_search_cwd_preservation.py`
 first ran at `0ed0708b9304` and produced **9 failed / 5 passed**: all three shell

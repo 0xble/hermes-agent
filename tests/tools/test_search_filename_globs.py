@@ -202,8 +202,10 @@ def _oracle_glob(parts, pattern):
     return bool(parts) and fnmatch.fnmatchcase(parts[0], pattern[0]) and _oracle_glob(parts[1:], pattern[1:])
 
 
-def _walk_oracle(pattern, roots):
-    # This oracle walks independently of rg, its cwd and the production translator.
+def _walk_oracle(pattern, roots, cwd=None, operands=None):
+    # Match the table in maintenance/bounded-filename-search.md, not production coordinates.
+    cwd = Path(cwd or roots[0])
+    operands = operands or [str(root) for root in roots]
     absolute_owner = next((root for root in sorted(roots, key=lambda p: len(str(p)), reverse=True)
                            if pattern.startswith(str(root) + "/")), None)
     anchored = pattern.startswith(("/", "./"))
@@ -217,7 +219,7 @@ def _walk_oracle(pattern, roots):
         choices, after = choices.split("}", 1)
         alternatives = [before + choice + after for choice in choices.split(",")]
     expected = set()
-    for root in roots:
+    for root, operand in zip(roots, operands):
         if absolute_owner and root != absolute_owner:
             continue
         for directory, dirs, files in os.walk(root):
@@ -225,12 +227,17 @@ def _walk_oracle(pattern, roots):
             for name in files:
                 candidate = Path(directory, name)
                 relative = candidate.relative_to(root).as_posix()
+                matched_path = relative
+                if not anchored:
+                    matched_path = (Path(operand) / candidate.relative_to(root)).as_posix()
+                    if Path(operand).is_absolute() and candidate.is_relative_to(cwd):
+                        matched_path = candidate.relative_to(cwd).as_posix()
                 for alternative in alternatives:
                     if not anchored and "/" not in suffix and "{" not in suffix:
                         matches = fnmatch.fnmatchcase(name, "*" + alternative)
                     else:
-                        glob = alternative if anchored or alternative.startswith("**/") else "**/" + alternative
-                        matches = _oracle_glob(relative.split("/"), glob.split("/"))
+                        glob = alternative
+                        matches = _oracle_glob(matched_path.split("/"), glob.split("/"))
                     if matches:
                         expected.add(candidate.resolve())
     return expected
@@ -241,16 +248,17 @@ def _walk_oracle(pattern, roots):
 @pytest.mark.parametrize("spelling", ["relative", "absolute"])
 @pytest.mark.parametrize("pattern_kind", [
     "root-file", "root-subdir", "absolute-inside", "absolute-outside",
-    "basename", "recursive-dir", "brace", "dot-root",
+    "basename", "recursive-dir", "brace", "dot-root", "path",
+    "repeat-full-root", "repeat-root-basename",
 ])
 def test_filename_coordinate_matrix(search, root_count, location, spelling, pattern_kind, monkeypatch):
     _, base, ops = search
     cwd = base / "caller"
     cwd.mkdir()
-    first = {"cwd": cwd, "subdir": cwd / "a", "outside": base / "external"}[location]
+    first = {"cwd": cwd, "subdir": cwd / "sub/deep", "outside": base / "external/deep"}[location]
     roots = [first]
     if root_count == 2:
-        roots.append(first / "b" if location == "cwd" else first.with_name(first.name + "-peer"))
+        roots.append(base / "unrelated/peer")
     for root in roots:
         for name in ("x", "prefix-x", "y", "sub/x", "sub/y", "sub/deep/x", "dir/x", "nested/dir/x", "nested/x"):
             file = root / name
@@ -262,7 +270,9 @@ def test_filename_coordinate_matrix(search, root_count, location, spelling, patt
     patterns = {
         "root-file": "/x", "root-subdir": "/sub/*", "absolute-inside": str(first / "x"),
         "absolute-outside": str(outside), "basename": "x", "recursive-dir": "**/dir/x",
-        "brace": "{x,sub/y}", "dot-root": "./x",
+        "brace": "{x,sub/y}", "dot-root": "./x", "path": "sub/*",
+        "repeat-full-root": os.path.relpath(first, cwd) + "/x",
+        "repeat-root-basename": first.name + "/x",
     }
     pattern = patterns[pattern_kind]
     ops.cwd = ops.env.cwd = str(cwd)
@@ -280,12 +290,17 @@ def test_filename_coordinate_matrix(search, root_count, location, spelling, patt
     result = ops.search(pattern, ", ".join(operands), target="files", limit=200)
     assert result.error is None, result.to_dict()
     actual = {Path(cwd, file).resolve() for file in result.files}
-    assert actual == _walk_oracle(pattern, roots)
+    assert actual == _walk_oracle(pattern, roots, cwd, operands)
     assert bool(native_calls) == ops._native_read_enabled()
     assert len(native_calls) <= 1
+    if root_count == 2:
+        single = ops.search(pattern, operands[0], target="files", limit=200)
+        assert single.error is None, single.to_dict()
+        under_first = {file for file in actual if file.is_relative_to(first.resolve())}
+        assert under_first == {Path(cwd, file).resolve() for file in single.files}
 
 
-@pytest.mark.parametrize("case", range(6))
+@pytest.mark.parametrize("case", range(10))
 def test_single_root_review_reproductions(search, case):
     # Verbatim review repros, cwd=D with D/a/main.py and D/a/sub/main.py:
     # search('/main.py','a'), search('/main.py','D/a'), search('/sub/*','a'),
@@ -299,10 +314,13 @@ def test_single_root_review_reproductions(search, case):
         ("/main.py", "a"), ("/main.py", str(D / "a")), ("/sub/*", "a"),
         (str(D / "a/main.py"), "a"), (str(D / "a/main.py"), str(D / "a")),
         ("/main.py", str(D)),
+        ("a/sub/*", "a/sub"), ("a/sub/*", f"a/sub, {D / 'hooks'}"),
+        ("sub/*", "a/sub"), ("sub/*", f"a/sub, {D / 'hooks'}"),
     ][case]
     result = ops.search(pattern, root, target="files")
     assert result.error is None, result.to_dict()
-    assert {Path(D, file).resolve() for file in result.files} == _walk_oracle(pattern, [Path(D, root)])
+    assert {Path(D, file).resolve() for file in result.files} == _walk_oracle(
+        pattern, [Path(D, item) for item in root.split(", ")], D, root.split(", "))
 
 
 def test_non_posix_anchoring_never_changes_shell_directory(search, monkeypatch):
