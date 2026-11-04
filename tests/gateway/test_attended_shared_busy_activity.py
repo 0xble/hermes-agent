@@ -91,7 +91,7 @@ async def test_nonhuman_or_refused_shared_input_never_persists_activity(
     elif kind in {'bot', 'bot_refused'}:
         source.is_bot = True
         monkeypatch.setattr(env.runner, '_is_user_authorized_for_source', lambda source: True)
-        monkeypatch.setattr(env.runner, '_admit_bot_message_for_source', lambda source: kind != 'bot_refused')
+        monkeypatch.setattr(env.runner, '_admit_bot_message_for_source', lambda source, **kwargs: kind != 'bot_refused')
     elif kind.startswith('unauthorized'):
         source.user_id = 'unauthorized-user'
         source.user_name = 'Unauthorized'
@@ -211,7 +211,7 @@ async def test_busy_bot_budget_is_not_charged_again_at_fifo_commit(shared_busy, 
     event = MessageEvent(text='follow-up', source=replace(env.source, is_bot=True), message_id='budget')
     await env.adapter.handle_message(event)
     await flush_busy_burst(env.adapter, env.owner.key)
-    budget.assert_called_once_with(event.source)
+    budget.assert_called_once_with(event.source, charge=ANY)
 
 
 @pytest.mark.asyncio
@@ -333,3 +333,123 @@ async def test_failed_busy_receipt_retries_original_clock_after_fifo_restore(sha
     env.settled = True
     assert env.drained[0]._attended_activity_received_at == original_stamp
     env.persist.assert_awaited_with(env.owner.key, when=datetime.fromtimestamp(original_stamp))
+
+
+@pytest.mark.asyncio
+async def test_merged_unmarked_receipt_is_the_newest_instant_and_restores_once(shared_busy):
+    """A restart after commit retries the newest unmarked merged receipt, not the head's clock.
+
+    Merge order is not time order. An already-marked head must not hide a newer follower, and a
+    later but older follower must not replace that newer instant. Restore stamps it once.
+    """
+    from gateway.session_ingress_media import ingress_fingerprint
+
+    env = shared_busy
+    release = asyncio.Event()
+    head_done = []
+
+    async def hold_followers(*_args, **_kwargs):
+        if not head_done:
+            head_done.append(True)
+            return True
+        await release.wait()
+        return True
+
+    env.persist.side_effect = hold_followers
+    env.clock[0] = 1_800_000_100.0
+    head = MessageEvent(text='head', source=env.source, message_id='merged-head')
+    await env.adapter.handle_message(head)
+    await head._attended_activity_task
+    assert head._attended_activity_marked
+
+    env.clock[0] = 1_800_000_200.5  # newest instant, not the last merge
+    newest = MessageEvent(text='newest', source=env.source, message_id='merged-newest')
+    await env.adapter.handle_message(newest)
+    env.clock[0] = 1_800_000_150.25
+    older = MessageEvent(text='older', source=env.source, message_id='merged-older')
+    await env.adapter.handle_message(older)
+    assert newest._attended_activity_received_at == 1_800_000_200.5
+    assert getattr(newest, '_attended_activity_marked', False) is False
+    assert older._attended_activity_received_at == 1_800_000_150.25
+    assert getattr(older, '_attended_activity_marked', False) is False
+
+    await flush_busy_burst(env.adapter, env.owner.key)
+    row = next(row for row in _rows(env.owner.authority) if row['request_id'] == 'merged-head')
+    activity = row['payload']['native_text_v1']['attended_activity']
+    assert activity == {'received_at': 1_800_000_200.5, 'marked': False}
+    mutated = deepcopy(row['payload'])
+    mutated['native_text_v1']['attended_activity'] = {'received_at': 1.0, 'marked': True}
+    assert ingress_fingerprint(mutated) == ingress_fingerprint(row['payload'])
+
+    for event in (newest, older):
+        event._attended_activity_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await event._attended_activity_task
+    release.set()
+    env.persist.reset_mock()
+    env.persist.side_effect = None
+    await env.owner.settle(2)
+    env.settled = True
+
+    replay = env.drained[0]
+    assert replay.text == 'head\nnewest\nolder'
+    assert replay._attended_activity_received_at == 1_800_000_200.5
+    assert replay._attended_activity_marked
+    env.persist.assert_awaited_once_with(env.owner.key, when=datetime.fromtimestamp(1_800_000_200.5))
+    assert env.runner._session_state(env.owner.key).conversation.last_user_activity_at == 1_800_000_200.5
+
+
+def _bot_guard(runner, *, max_events):
+    from gateway.bot_loop_guard import BotLoopGuard, BotLoopGuardSettings
+
+    guard = BotLoopGuard(
+        settings=lambda: BotLoopGuardSettings(max_events=max_events, window_seconds=60, cooldown_seconds=60),
+        clock=lambda: 1_000.0,
+    )
+    runner._bot_loop_guard = guard
+    return guard
+
+
+def _window(guard, conversation):
+    return len(guard._events.get(conversation, ()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('command', [None, '/stop', '/new', '/reset'])
+async def test_discarded_busy_burst_refunds_only_its_bot_loop_charges(shared_busy, monkeypatch, command):
+    """A held burst dropped before commit returns exactly the slots it charged, once."""
+    from gateway.session_ingress_burst import discard_busy_burst
+
+    env = shared_busy
+    monkeypatch.setattr(env.runner, '_is_user_authorized_for_source', lambda source, **kwargs: True)
+    guard = _bot_guard(env.runner, max_events=4)
+    bot = replace(env.source, is_bot=True)
+    conversation = env.runner._bot_loop_guard_conversation(bot)
+    other = ('other-profile', 'signal', 'other-chat')
+    assert guard.admit(conversation) == (True, 'ok')  # another burst's charge; discard must keep it
+    for _ in range(4):
+        assert guard.admit(other)[0] is True
+    assert guard.admit(other)[0] is False
+
+    for name in ('burst-head', 'burst-follower'):
+        await env.adapter.handle_message(MessageEvent(text=name, source=bot, message_id=name))
+    assert holds_busy_burst(env.adapter, env.owner.key)
+    assert _window(guard, conversation) == 3
+    # Bot input deliberately does not merge. The second input commits the first burst and
+    # starts a new held one. Neither that committed charge nor the unrelated charge is ours
+    # to refund, even if a lifecycle command later cancels the committed turn.
+    assert any(row['request_id'] == 'burst-head' for row in _rows(env.owner.authority))
+    assert not any(row['request_id'] == 'burst-follower' for row in _rows(env.owner.authority))
+
+    if command is None:
+        discard_busy_burst(env.adapter, env.owner.key)
+    else:
+        await env.adapter.handle_message(MessageEvent(text=command, source=env.source, message_id=f'cmd{command}'))
+    discard_busy_burst(env.adapter, env.owner.key)  # idempotent: a second drop refunds nothing
+    assert not holds_busy_burst(env.adapter, env.owner.key)
+    assert _window(guard, conversation) == 2
+    assert guard.admit(conversation)[0] is True
+    assert guard.admit(conversation)[0] is True
+    assert guard.admit(conversation)[0] is False
+    assert guard.blocked(other)
+    assert guard.admit(other)[0] is False

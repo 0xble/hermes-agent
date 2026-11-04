@@ -98,9 +98,20 @@ def _adapter_event(event, **changes):
     Any other non-list still reaches ``_validate_native`` and refuses."""
     changes.update({name: [] for name in _MEDIA_FIELDS if getattr(event, name) is None})
     projected = replace(event, **changes) if changes else event
+    # Each absorbed input owns its stamp task. Do not replace the head's live clock: a task
+    # already persisting that clock could then mark a newer, unpersisted receipt as complete.
+    # Only the durable projection represents the newest receipt still needing a retry.
+    unmarked = [candidate for candidate in (event, *getattr(event, '_hermes_absorbed_events', ()))
+                if getattr(candidate, '_attended_activity_received_at', None) is not None
+                and not getattr(candidate, '_attended_activity_marked', False)]
+    receipt = max(unmarked, key=lambda candidate: candidate._attended_activity_received_at) if unmarked else event
+    if receipt is not event and projected is event:
+        projected = copy(event)
     for name in ('_attended_activity_received_at', '_attended_activity_marked'):
-        if hasattr(event, name):
-            setattr(projected, name, getattr(event, name))
+        if hasattr(receipt, name):
+            setattr(projected, name, getattr(receipt, name))
+    if unmarked:
+        projected._attended_activity_marked = False
     from gateway.session_synthetic import is_synthetic, mark_synthetic
     if is_synthetic(event):
         mark_synthetic(projected)

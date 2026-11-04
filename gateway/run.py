@@ -4164,10 +4164,11 @@ class GatewayRunner(
 
         return self._under_authorization_profile(source, _check)
 
-    def _admit_bot_message_for_source(self, source: SessionSource) -> bool:
+    def _admit_bot_message_for_source(self, source: SessionSource, *, charge: object | None = None) -> bool:
         """Count a bot message under the profile that authorized it, so the guard's peek, count and
         config all read the transport profile's ``gateway.bot_loop_guard``."""
-        return self._under_authorization_profile(source, lambda: self._admit_bot_message(source))
+        return self._under_authorization_profile(source, lambda: (
+            self._admit_bot_message(source) if charge is None else self._admit_bot_message(source, charge=charge)))
 
     def _under_authorization_profile(self, source: SessionSource, check):
         authorization_home = self._authorization_home_for_source(source)

@@ -644,12 +644,12 @@ class GatewayAuthorizationMixin:
         platform = source.platform.value if source.platform else ""
         return (self._adapter_profile_for_source(source) or "", platform, str(source.chat_id or ""))
 
-    def _admit_bot_message(self, source: SessionSource) -> bool:
+    def _admit_bot_message(self, source: SessionSource, *, charge: object | None = None) -> bool:
         """Count one authorized bot-authored inbound message. False when it trips the budget or the chat is cooling down.
         The inbound handler calls this once per message; ``_is_user_authorized`` only peeks because it is asked several times."""
         if not getattr(source, "is_bot", False):
             return True
-        allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source))
+        allowed, state = self._bot_loop_guard_instance().admit(self._bot_loop_guard_conversation(source), charge=charge)
         if state == "tripped":
             logger.warning(
                 "Bot loop guard is dropping bot messages in %s chat %s: bot %s sent one message too many "

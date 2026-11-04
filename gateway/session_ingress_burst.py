@@ -62,8 +62,12 @@ def _authorized(runner, event, session_key):
         )
         return False
     if not getattr(event, '_bot_loop_admitted', False):
-        if not runner._admit_bot_message_for_source(event.source):
+        charge = object() if event.source.is_bot else None
+        if not runner._admit_bot_message_for_source(event.source, **({'charge': charge} if charge is not None else {})):
             return False
+        if charge is not None:
+            event._busy_bot_loop_charge = (
+                runner._bot_loop_guard_instance(), runner._bot_loop_guard_conversation(event.source), charge)
         event._bot_loop_admitted = True
     return True
 
@@ -257,4 +261,10 @@ def discard_busy_burst(adapter, session_key):
     burst = adapter.__dict__.get('_shared_bursts', {}).pop(session_key, None)
     if burst is not None:
         burst.timer.cancel()
+        for event in (burst.head, *burst.absorbed):
+            receipt = event.__dict__.pop('_busy_bot_loop_charge', None)
+            if receipt is not None:
+                guard, conversation, charge = receipt
+                guard.refund(conversation, charge)
+                event._bot_loop_admitted = False
         burst.done.done() or burst.done.set_result(None)
