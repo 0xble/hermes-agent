@@ -7,33 +7,39 @@ import threading
 import pytest
 
 
-def test_ledger_first_open_is_not_quarantined_by_sessiondb(tmp_path, monkeypatch):
+@pytest.mark.parametrize("module", ["tools.async_delegation", "gateway.delivery_ledger"])
+def test_ledger_first_open_is_not_quarantined_by_sessiondb(tmp_path, monkeypatch, module):
     """Pause a real ledger connection in the empty-file -> schema-commit window.
 
     A second SessionDB must wait, not move the ledger's live inode and sidecars.
     This is the competing opener in the session-end CI flake; [process] there
     describes a notification type, not a subprocess.
     """
+    import importlib
     import hermes_state as hs
-    from tools import async_delegation as ledger
 
+    ledger = importlib.import_module(module)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     path = tmp_path / "state.db"
+    monkeypatch.setattr(ledger, "_db_path", lambda: path)
     connected, release, peer_started, peer_finished = (threading.Event() for _ in range(4))
-    initialize = ledger._initialize_schema
+    connect = sqlite3.connect
 
-    def paused_schema(conn):
-        assert path.stat().st_size == 0
-        connected.set()
-        assert release.wait(10), "ledger initializer was not released"
-        initialize(conn)
+    def paused_connect(database, *args, **kwargs):
+        conn = connect(database, *args, **kwargs)
+        if str(database) == str(path) and not connected.is_set():
+            assert path.stat().st_size == 0
+            connected.set()
+            assert release.wait(10), "ledger initializer was not released"
+        return conn
 
-    monkeypatch.setattr(ledger, "_initialize_schema", paused_schema)
+    monkeypatch.setattr(sqlite3, "connect", paused_connect)
 
     def open_ledger():
         conn = ledger._connect()
         try:
-            conn.execute("INSERT INTO sessions (id, source, started_at) VALUES ('ledger-owner', 'test', 1)")
+            conn.execute("CREATE TABLE startup_marker (owner TEXT)")
+            conn.execute("INSERT INTO startup_marker VALUES ('ledger-owner')")
             conn.commit()
         finally:
             conn.close()
@@ -66,7 +72,7 @@ def test_ledger_first_open_is_not_quarantined_by_sessiondb(tmp_path, monkeypatch
     assert not list(tmp_path.glob("state.db.*.bak")), "a live database was quarantined"
     db = hs.SessionDB(db_path=path)
     try:
-        assert db.get_session("ledger-owner")
+        assert db._conn.execute("SELECT owner FROM startup_marker").fetchone()[0] == "ledger-owner"
         assert db.get_session("session-owner")
         assert db._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
@@ -166,10 +172,21 @@ def _process_ledger_first_open(home, connected, release):
 
 
 def test_separate_process_ledger_startup_is_not_quarantined(tmp_path, monkeypatch):
+    import contextlib
     import multiprocessing
     import hermes_state as hs
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    attempted = threading.Event()
+    startup_lock = hs.quarantine_cross_process_lock
+
+    @contextlib.contextmanager
+    def observed_lock(path, *args, **kwargs):
+        attempted.set()
+        with startup_lock(path, *args, **kwargs) as acquired:
+            yield acquired
+
+    monkeypatch.setattr(hs, "quarantine_cross_process_lock", observed_lock)
     context = multiprocessing.get_context("spawn")
     connected, release = context.Event(), context.Event()
     child = context.Process(target=_process_ledger_first_open, args=(str(tmp_path), connected, release))
@@ -179,12 +196,9 @@ def test_separate_process_ledger_startup_is_not_quarantined(tmp_path, monkeypatc
         with ThreadPoolExecutor(max_workers=1) as pool:
             peer = pool.submit(hs.SessionDB, db_path=tmp_path / "state.db")
             try:
-                assert not peer.done()
-                # Keep the live empty inode exposed long enough for the second
-                # opener to attempt the real cross-process startup lock.
-                assert not peer.exception(timeout=0.25)
-            except TimeoutError:
-                pass
+                assert attempted.wait(10), "peer never attempted the startup lock"
+                with pytest.raises(TimeoutError):
+                    peer.result(timeout=0.25)
             finally:
                 release.set()
             db = peer.result(timeout=20)
