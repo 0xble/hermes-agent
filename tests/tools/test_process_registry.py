@@ -2200,19 +2200,23 @@ class TestSpawnRewriteCompoundBackground:
 # =========================================================================
 
 class TestCheckpoint:
-    def test_recover_dead_pid(self, registry, tmp_path):
+    @pytest.mark.parametrize("notify", [False, True])
+    def test_recover_dead_pid(self, registry, tmp_path, notify):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_dead",
             "command": "sleep 999",
             "pid": 999999999,  # almost certainly not running
-            "task_id": "t1",
+            "task_id": "t1", "notify_on_complete": notify,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 1
             assert registry.poll("proc_dead")["exit_code"] is None
-            assert registry.completion_queue.get_nowait()["session_id"] == "proc_dead"
+            if notify:
+                assert registry.completion_queue.get_nowait()["session_id"] == "proc_dead"
+            else:
+                assert registry.completion_queue.empty()
 
     def test_recover_dead_wrapper_retries_unreaped_systemd_scope(
         self, registry, tmp_path, monkeypatch
@@ -3227,6 +3231,7 @@ class TestSystemdCgroupIsolation:
         def fake_popen(argv, **kwargs):
             captured["argv"] = list(argv)
             captured["start_new_session"] = kwargs.get("start_new_session")
+            captured["stdout"] = kwargs.get("stdout")
             proc = MagicMock()
             proc.pid = 4321
             proc.stdout = iter([])
@@ -3295,8 +3300,9 @@ class TestSystemdCgroupIsolation:
         # The recoverable wrapper retains both the exact command and its status.
         wrapper = argv[-1]
         assert wrapper.startswith("set +m; trap ")
-        assert session.log_path in wrapper and session.exit_path in wrapper
-        assert " EXIT\n(\necho hello\n) >> " in wrapper
+        assert not session.log_path and session.exit_path in wrapper
+        assert wrapper.endswith(" EXIT\n(\necho hello\n)")
+        assert captured["stdout"] == subprocess.PIPE
         # systemd-run --scope gives the worker a new cgroup but NOT a new
         # session (#70716 regression: start_new_session was False, so the
         # worker kept the parent's session + controlling terminal → SIGTTIN/
@@ -3332,7 +3338,8 @@ class TestSystemdCgroupIsolation:
         argv = captured["argv"]
         # No systemd-run wrapping — direct shell invocation.
         assert argv[:2] == ["/bin/bash", "-lic"], argv
-        assert argv[2].startswith("set +m; trap ") and "\necho hello\n) >> " in argv[2], argv
+        assert argv[2].startswith("set +m; trap ") and argv[2].endswith("\necho hello\n)"), argv
+        assert captured["stdout"] == subprocess.PIPE
         assert captured["start_new_session"] is True
 
     def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
@@ -3359,7 +3366,8 @@ class TestSystemdCgroupIsolation:
 
         argv = captured["argv"]
         assert argv[:2] == ["/bin/bash", "-lic"], argv
-        assert argv[2].startswith("set +m; trap ") and "\necho hello\n) >> " in argv[2], argv
+        assert argv[2].startswith("set +m; trap ") and argv[2].endswith("\necho hello\n)"), argv
+        assert captured["stdout"] == subprocess.PIPE
         assert captured["start_new_session"] is True
 
     @pytest.mark.parametrize("use_pty", [False, True])
@@ -3402,7 +3410,9 @@ class TestSystemdCgroupIsolation:
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
             assert captured["argv"][:2] == ["/bin/bash", "-lic"]
-            assert captured["argv"][2].startswith("set +m; trap ") and "\necho hello\n) >> " in captured["argv"][2]
+            assert captured["argv"][2].startswith("set +m; trap ")
+            assert captured["argv"][2].endswith("\necho hello\n)")
+            assert captured["stdout"] == subprocess.PIPE
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""
@@ -3452,7 +3462,9 @@ class TestSystemdCgroupIsolation:
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
             assert captured["argv"][:2] == ["/bin/bash", "-lic"]
-            assert captured["argv"][2].startswith("set +m; trap ") and "\necho hello\n) >> " in captured["argv"][2]
+            assert captured["argv"][2].startswith("set +m; trap ")
+            assert captured["argv"][2].endswith("\necho hello\n)")
+            assert captured["stdout"] == subprocess.PIPE
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""

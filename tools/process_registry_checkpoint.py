@@ -178,6 +178,8 @@ class ProcessCheckpointMixin:
             # (and recorded exit) outlives its spawner, so tail it from the start.
             fields["output_log"] = log
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+            # Historical output is a bounded snapshot, never a new live/watch event.
+            self._adopt_survivor_log_tail(session, final=recorded_exit is not None or fate == "gone")
             if recorded_exit is not None:
                 session.pid = None  # a file-backed result has no signalable PID
                 with self._lock:
@@ -221,7 +223,7 @@ class ProcessCheckpointMixin:
             return True
         if session.pid and recorded_exit is None:
             return False
-        self._finish_survivor(
+        self._finish_exited(
             session, recorded_exit,
             recorded_termination.get("completion_reason", "exited") if recorded_exit is not None else "lost",
             recorded_termination.get("termination_source", "") if recorded_exit is not None else "survivor_lost",

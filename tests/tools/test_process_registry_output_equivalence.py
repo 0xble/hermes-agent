@@ -22,6 +22,7 @@ def _observed(session, streamed):
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("persist", [False, True], ids=["ordinary-pipe", "persistent-log"])
 @pytest.mark.parametrize("shell_flag", ["-c", "-lic"], ids=["plain-shell", "login-shell"])
 @pytest.mark.parametrize("command", [
     _python_command("import sys; sys.stdout.write('PANIC\\n' + 'x' * 600000)"),
@@ -30,7 +31,7 @@ def _observed(session, streamed):
     "printf 'normal-out\\n'; printf 'normal-err\\n' >&2",
     "printf 'bash: no job control in this shell\\nnormal-out\\n'",
 ], ids=["burst-watch", "split-utf8", "parser-error", "normal", "shell-noise"])
-def test_ordinary_output_matches_pipe_reader(tmp_path, monkeypatch, command, shell_flag):
+def test_ordinary_output_matches_pipe_reader(tmp_path, monkeypatch, command, shell_flag, persist):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     # Exercise real bash without user startup files or host-specific dispatch.
     def argv(session, safe_command, unit_suffix, label):
@@ -51,11 +52,14 @@ def test_ordinary_output_matches_pipe_reader(tmp_path, monkeypatch, command, she
     monkeypatch.setattr(registry, "_scope_argv", argv)
     # Delay file ingestion until the burst has landed, rather than racing its writer.
     monkeypatch.setattr(registry, "_track_started", lambda *args, **kwargs: None)
-    survivor = registry.spawn_local(command, cwd=str(tmp_path))
+    survivor = registry.spawn_local(command, cwd=str(tmp_path), persist_on_release=persist)
     survivor.watch_patterns = ["PANIC"]
     try:
-        survivor.process.wait(timeout=10)
-        registry._survivor_poller_loop(survivor)
+        if persist:
+            survivor.process.wait(timeout=10)
+            registry._survivor_poller_loop(survivor)
+        else:
+            registry._reader_loop(survivor)
         assert survivor.exit_code == pipe.exit_code
         assert _observed(survivor, streamed) == _observed(pipe, pipe_text)
         assert survivor.output_buffer, "shell parser failures must retain their diagnostic"

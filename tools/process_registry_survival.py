@@ -46,20 +46,7 @@ class ProcessSurvivalMixin:
         session.log_path = str(run_dir / "out.log")
         session.exit_path = str(run_dir / "exit")
         session.delivered_path = str(run_dir / "delivered") if restart_safe else ""
-        q = shlex.quote
-        # The log is already opened for outer-shell diagnostics. Append so a
-        # user's noclobber rc option cannot reject it. EXIT also records status
-        # under errexit without disabling that option for the user's command.
-        # Only our private temp marker is forcibly overwritten; rename publishes it.
-        # bash's parser exposes 258 in EXIT traps but exits with status 2.
-        exit_trap = (
-            f"rc=$(($? & 255)); printf '%s\\n' \"$rc\" >| {q(session.exit_path + '.tmp')}; "
-            f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}"
-        )
-        wrapped = (
-            f"trap {q(exit_trap)} EXIT\n"
-            f"(\n{safe_command}\n) >> {q(session.log_path)} 2>&1"
-        )
+        wrapped = self._local_exit_wrapper(session, safe_command)
         if restart_safe:
             command_argv = [registry._find_shell(), "-lic", f"set +m; {wrapped}"]
             dispatch = registry.restart_safe_gateway_child_argv(
@@ -105,9 +92,38 @@ class ProcessSurvivalMixin:
             raise
         return session
 
+    def _local_exit_wrapper(self, session: ProcessSession, safe_command: str) -> str:
+        """Publish status independently of stdout; durable output is a separate opt-in."""
+        from tools import process_registry as registry
+
+        run_dir = registry.get_hermes_home() / "process-runs" / session.id
+        run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        session.exit_path = str(run_dir / "exit")
+        q = shlex.quote
+        # EXIT honors inherited errexit. Only the private temp marker is forcibly
+        # overwritten under noclobber; rename publishes it. bash exposes 258 to
+        # the trap on parser failure but its real exit is 2.
+        exit_trap = (
+            f"rc=$(($? & 255)); printf '%s\\n' \"$rc\" >| {q(session.exit_path + '.tmp')}; "
+            f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}"
+        )
+        redirect = f" >> {q(session.log_path)} 2>&1" if session.log_path else ""
+        return f"trap {q(exit_trap)} EXIT\n(\n{safe_command}\n){redirect}"
+
+    def _record_local_wait_status(self, session: ProcessSession, code) -> None:
+        """The original parent can collect SIGKILL even when EXIT never ran."""
+        if not session.exit_path or code is None or self._recorded_survivor_exit(session.exit_path) is not None:
+            return
+        try:
+            from utils import atomic_write_text
+            atomic_write_text(session.exit_path, f"{code}\n", mode=0o600, fsync_dir=True)
+        except OSError:
+            logger.warning("Could not persist collected exit for %s", session.id, exc_info=True)
+
     @staticmethod
     def _survivor_run_dir(session: ProcessSession) -> Path | None:
-        return Path(session.log_path).parent if session.log_path else None
+        path = session.exit_path or session.log_path
+        return Path(path).parent if path else None
 
     def _remove_survivor_run_dir(self, session: ProcessSession) -> None:
         """Remove only this session's profile-local survivor directory."""
@@ -290,7 +306,20 @@ class ProcessSurvivalMixin:
             self.acknowledge_survivor_completion(session_id)
 
     def _read_survivor_log(self, session: ProcessSession, *, final: bool = False) -> None:
-        """Drain every unread byte; only the retained output buffer is bounded."""
+        """One owner updates the file offset, decoder and output/watch sinks at a time."""
+        with session._survivor_read_lock:
+            watch_state = (session._watch_hits, session._watch_suppressed, session._watch_disabled,
+                           session._watch_cooldown_until, session._watch_strike_candidate,
+                           session._watch_consecutive_strikes)
+            self._read_survivor_log_locked(session, final=final)
+            changed = watch_state != (session._watch_hits, session._watch_suppressed, session._watch_disabled,
+                                      session._watch_cooldown_until, session._watch_strike_candidate,
+                                      session._watch_consecutive_strikes)
+        if changed:
+            self._write_checkpoint()
+
+    def _read_survivor_log_locked(self, session: ProcessSession, *, final: bool = False) -> None:
+        """Drain live unread bytes in bounded chunks; adoption seeds its own bounded tail."""
         if not session.log_path:
             return
         try:
@@ -319,6 +348,27 @@ class ProcessSurvivalMixin:
         except OSError:
             return
 
+    def _adopt_survivor_log_tail(self, session: ProcessSession, *, final: bool = False) -> None:
+        """Restore history, not live events: bounded boot IO and no replayed watch hits."""
+        if not session.log_path:
+            return
+        with session._survivor_read_lock:
+            try:
+                with Path(session.log_path).open("rb") as stream:
+                    size = os.fstat(stream.fileno()).st_size
+                    start = max(0, size - session.max_output_chars)
+                    stream.seek(start)
+                    raw = stream.read(min(size, session.max_output_chars))
+                    session._survivor_log_offset = start + len(raw)
+                session._survivor_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                text = session._survivor_decoder.decode(raw, final=final)
+                if start == 0:
+                    text = self._clean_shell_noise(text)
+                session._survivor_head_noise = False
+                session.append_output(text)
+            except OSError:
+                return
+
     def _ingest_survivor_output(self, session: ProcessSession, text: str) -> None:
         if session._survivor_head_noise:
             text = self._clean_shell_noise(text)
@@ -327,8 +377,8 @@ class ProcessSurvivalMixin:
 
     @staticmethod
     def _file_backed(session: ProcessSession) -> bool:
-        """True when the job writes to its own log/exit files instead of a gateway pipe."""
-        return bool(getattr(session, "survive_restart", False) or getattr(session, "exit_path", ""))
+        """Collect from files only when no live pipe reader owns this session's output."""
+        return bool(session.survive_restart or (session.exit_path and (session.log_path or session.detached)))
 
     def prune_survivor_run_dir(self, session: ProcessSession) -> None:
         """Prune an aged survivor only after its completion was delivered.
@@ -539,6 +589,16 @@ class ProcessSurvivalMixin:
         exit_code = self._recorded_survivor_exit(session.exit_path)
         if exit_code is None:
             return False
+        if not self._file_backed(session):
+            # The pipe reader remains the sole output/finalization owner. Never
+            # run a competing read or close its pipe from the kill path.
+            session._reader_finish_requested.set()
+            wait = 1.0 if deadline is None else min(1.0, max(0.0, deadline - time.monotonic()))
+            session._completion_event.wait(wait)
+            if not session._completion_event.is_set():
+                with session._lock:
+                    session.mark_exited(exit_code)
+            return True
         termination = self._recorded_survivor_termination(session.exit_path)
         previous_deadline = session._kill_deadline
         if deadline is not None:

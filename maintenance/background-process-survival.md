@@ -3,6 +3,27 @@
 Load this unit when changing terminal background-process checkpointing, gateway
 shutdown cut receipts, restart adoption, or exactly-once completion delivery.
 
+## Design decision: narrow exit publication (B)
+
+PR #939 fixes a detached job losing its real wait status after its registry
+owner exits. A durable numeric exit receipt solves that problem; durable stdout
+for every command is neither required nor an ordinary-job contract. Keep the
+base pipe reader for ordinary local jobs and wrap only the exit publication.
+Use the full existing log-backed wrapper only for `survive_restart`,
+`persist_on_release`, and the separate pre-existing managed-worker handoff.
+This avoids making every dev server an unlimited disk logger and avoids routing
+ordinary output through concurrent file readers or replaying it on adoption.
+It does not promise an ordinary writer can keep printing after its pipe owner
+exits; select one of the existing persistent modes for that requirement.
+
+For retained full log-backed jobs, serialize reads/decoder updates with a
+per-session reader lock. Adoption seeds at most `max_output_chars` bytes from
+the log tail without live-output or watch hooks, resumes at that snapshot's end,
+and preserves the checkpointed lifetime watch counters. Unseen historical bytes
+are a history snapshot, not fresh watch events. Live reads still ingest every
+new byte in bounded chunks (not a bounded total tail). Finished-log recovery
+performs only the one bounded tail read, never a synchronous full replay.
+
 ## Required behavior
 
 Fork patch identity: `terminal-background-survival`.
@@ -11,13 +32,16 @@ Fork patch identity: `terminal-background-survival`.
   sweep. They are additive JSON records and do not mutate the live session state.
 - Cut receipts use their own age and count retention budget; they are not evicted
   by the normal completed-result cap.
-- Every local POSIX non-PTY job writes its output and exit status outside the
-  gateway process. Exit markers are published by atomic rename, including managed
-  workers' existing output-log handoffs. Only explicitly opted-in background
-  commands claim restart-safe dispatch and exactly-once delivery. Ordinary jobs
-  retain their existing lifecycle kill policy. Legacy detached jobs whose PID is
-  gone are retained as completed results, with `exit_code=null`, an explicit
-  `exited, status unknown (not collected)` completion, and any available log tail.
+- Every local POSIX non-PTY job atomically publishes its exit status outside the
+  gateway process. Ordinary jobs keep the existing memory-bounded pipe output:
+  they do not create an `out.log`, and their output is not promised after the
+  pipe owner exits. Managed workers retain their existing output-log handoff.
+  Only explicitly opted-in background commands claim restart-safe dispatch and
+  exactly-once delivery. Ordinary jobs retain their existing lifecycle kill
+  policy. Legacy detached jobs whose PID is gone are retained as completed
+  results, with `exit_code=null`, an explicit
+  `exited, status unknown (not collected)` completion when notification was
+  requested, and any available log tail. Preserve explicit notification opt-outs.
   No missing status is inferred to be success or silently pruned.
 - Only explicitly opted-in local non-PTY background commands may survive a
   gateway restart. The wrapper owns `out.log`, an exit file, and a delivered
@@ -57,8 +81,9 @@ Fork patch identity: `terminal-background-survival`.
   delivery but before its marker is written has an ambiguous outcome and may
   replay (the transport and marker are not one transaction). Delivered markers
   suppress restart replays. Shutdown fences only `survive_restart` pollers before
-  teardown. Ordinary and `persist_on_release` file-backed pollers keep finalizing
-  during the agent drain. Kill paths collect a published exit marker before PID
+  teardown. Ordinary pipe readers and `persist_on_release` file-backed pollers
+  keep finalizing during the agent drain. Fenced survivor queries do not wait
+  on a poller that shutdown intentionally stopped. Kill paths collect a published exit marker before PID
   checks, cut receipts, or signals, preserving the real exit and completion rather
   than labelling an already-completed job `killed`.
   Run directories are pruned after acknowledged-result retention
@@ -68,7 +93,9 @@ Fork patch identity: `terminal-background-survival`.
   they have an exit file older than the result TTL and are absent from both the
   current registry and its on-disk checkpoint; a startup sweep must not delete
   output that adoption has not read yet. Preserve pending survivor markers and
-  fail closed on unreadable checkpoint ownership. Log polls read only a bounded tail.
+  fail closed on unreadable checkpoint ownership. Recovery reads a bounded
+  historical tail without watch/live callbacks; live polling drains all new
+  bytes in bounded chunks into a memory-bounded tail.
 - Login rc options must not defeat file-backed supervision. Append to the
   pre-created output log under `noclobber`, and use an outer EXIT trap so
   `errexit` cannot bypass atomic exit publication without changing command
@@ -132,7 +159,7 @@ Fork patch identity: `terminal-background-survival`.
 
 ## Verification
 
-Contract tests: `tests/tools/test_process_registry_login_rc.py` `tests/tools/test_process_registry_shutdown_drain.py`
+Contract tests: `tests/tools/test_process_registry_login_rc.py` `tests/tools/test_process_registry_shutdown_drain.py` `tests/tools/test_process_registry_survivor_boundaries.py`
 
 Run the focused process-registry and terminal proof surfaces with the canonical
 FIFO runner, then run Ruff and `scripts/check_fork_patches.py --source-only`.

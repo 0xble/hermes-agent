@@ -652,6 +652,7 @@ class ProcessSession:
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
     _reader_selectable: bool = field(default=False, repr=False)
+    _survivor_read_lock: Any = field(default_factory=threading.RLock, repr=False)
     _survivor_decoder: Any = field(default=None, repr=False)
     _survivor_log_offset: int = field(default=0, repr=False)
     _survivor_head_noise: bool = field(default=True, repr=False)
@@ -707,7 +708,8 @@ _CHECKPOINT_FIELDS = (
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "handoff_note", "notify_on_complete", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release", "survive_restart", "log_path", "exit_path", "delivered_path",
-    "output_log")
+    "output_log", "_watch_hits", "_watch_suppressed", "_watch_disabled",
+    "_watch_cooldown_until", "_watch_strike_candidate", "_watch_consecutive_strikes")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1098,11 +1100,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
 
     def _prune_uncollected_detached(self, session: ProcessSession) -> Optional[ProcessSession]:
         """Retain a gone recovered entry and announce its uncollected exit status."""
-        self._read_survivor_log(session, final=True)
+        if not session.output_buffer:
+            self._adopt_survivor_log_tail(session, final=True)
         # A missing wait status is an outcome, not permission to discard the job.
-        # Preserve the receipt and queue one honest completion, even for old entries
-        # created before completion watches were enabled by default.
-        session.notify_on_complete = True
+        # Preserve the receipt without overriding an explicit notification opt-out.
         self._finish_exited(session, None, reason="lost", source="checkpoint.exit_uncollected")
         return session
 
@@ -1239,12 +1240,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release, survive_restart=survive_restart)
         log = None if survive_restart else worker_output_log(session.id)
-        if survive_restart or (not use_pty and not _IS_WINDOWS and log is None):
+        if survive_restart or (persist_on_release and not use_pty and not _IS_WINDOWS and log is None):
             if use_pty:
                 raise ValueError("survive_restart is only supported for non-PTY commands")
-            # Every ordinary job can be checkpoint-adopted after its gateway exits.
-            # Persist stdout and the wrapper's status before losing its waitable handle.
-            # This does not opt the job into restart-safe dispatch or lifecycle survival.
+            # Durable output remains opt-in. Ordinary jobs keep their bounded pipe;
+            # only persistent jobs require stdout to outlive its original reader.
             try:
                 return self._spawn_local_survivor(
                     session, safe_command, env_vars, restart_safe=survive_restart)
@@ -1271,13 +1271,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
-        if not _IS_WINDOWS and log is None:
-            # Keep the failed PTY scope's name distinct even for file-backed fallback.
-            return self._spawn_local_survivor(
-                session, safe_command, env_vars, restart_safe=False, unit_suffix=unit_suffix)
-
-        spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
-                                      unit_suffix, "Local")
+        if log:
+            safe_command = record_exit_command(log, safe_command)
+        elif not _IS_WINDOWS:
+            safe_command = self._local_exit_wrapper(session, safe_command)
+        spawn_argv = self._scope_argv(session, safe_command, unit_suffix, "Local")
         spawn_env = self._spawn_env(env_vars)
         if session.systemd_unit:
             spawn_env = systemd_user_bus_env(spawn_env)
@@ -1292,6 +1290,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
                 errors="replace", stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 start_new_session=True, **_popen_kwargs)
+        except Exception:
+            self._remove_survivor_run_dir(session)
+            raise
         finally:
             if log:
                 os.close(output)
@@ -1302,6 +1303,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             self._track_started(session, self._log_reader_loop if log else self._reader_loop, f"proc-reader-{session.id}")
         except Exception:
             self._reap_untracked(session, proc)
+            self._remove_survivor_run_dir(session)
             raise
         return session
 
@@ -1482,7 +1484,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 logger.warning("%s wait failed; leaving process tracked: %s", label, e)
                 return
             logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        self._finish_exited(session, exit_code())
+        code = exit_code()
+        self._record_local_wait_status(session, code)
+        self._finish_exited(session, code)
 
     _log_delta_command = staticmethod(log_delta_command)
 
@@ -2022,6 +2026,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         if session is None or session.exited:
             return
         if self._file_backed(session):
+            if self._survivor_poller_stopped(session):
+                return  # Shutdown leaves this completion for its successor.
             # The file reader owns the final drain too. A slow live-output sink
             # must not make a completed wrapper appear to keep running forever.
             if session.process is not None and session.process.poll() is not None:

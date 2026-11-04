@@ -77,13 +77,14 @@ def test_shutdown_collects_published_exit_before_signalling_delayed_reader(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     registry = ProcessRegistry()
     release_reader = threading.Event()
-    real_poller = registry._survivor_poller_loop
+    reader_name = "_survivor_poller_loop" if persist else "_reader_loop"
+    real_poller = getattr(registry, reader_name)
 
     def delayed_poller(session):
         assert release_reader.wait(15)
         real_poller(session)
 
-    monkeypatch.setattr(registry, "_survivor_poller_loop", delayed_poller)
+    monkeypatch.setattr(registry, reader_name, delayed_poller)
     session, gate = _spawn_gated(registry, tmp_path, persist_on_release=persist)
     try:
         registry.stop_survivor_pollers()
@@ -97,6 +98,7 @@ def test_shutdown_collects_published_exit_before_signalling_delayed_reader(
         else:
             kwargs = {"deadline": time.monotonic() + 5} if sweep == "bounded" else {}
             assert registry.kill_all(source="gateway_shutdown", **kwargs) == 0
+        release_reader.set()  # Pipe finalization stays with its original reader.
         _assert_normal_completion(registry, session, caplog)
     finally:
         gate.touch()

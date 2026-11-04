@@ -58,17 +58,19 @@ def test_login_rc_options_preserve_output_and_atomic_exit(
     exit_path = log_path.with_suffix(".exit") if session.output_log else Path(session.exit_path)
     try:
         session.process.wait(timeout=10)
-        output = log_path.read_text(encoding="utf-8-sig")
-        assert "rc:yes" in output, output
         expected = 3 if failure == "exit 3" else (1 if errexit else 0)
         assert exit_path.read_text(encoding="utf-8-sig").strip() == str(expected)
         assert not exit_path.with_name(exit_path.name + ".tmp").exists()
-        if errexit:
-            assert "must-not-run" not in output
         if session.output_log:
             registry._log_reader_loop(session)
-        else:
+        elif session.log_path:
             registry._survivor_poller_loop(session)
+        else:
+            registry._reader_loop(session)
+        output = session.output_buffer
+        assert "rc:yes" in output, output
+        if errexit:
+            assert "must-not-run" not in output
         assert session.exit_code == expected
         assert "rc:yes" in session.output_buffer
     finally:
@@ -79,14 +81,15 @@ def test_login_rc_options_preserve_output_and_atomic_exit(
 
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("case", ["expired", "young", "checkpointed", "tracked", "running", "survivor"])
-def test_successor_prunes_only_expired_untracked_ordinary_runs(tmp_path, monkeypatch, case):
+@pytest.mark.parametrize("persist", [False, True], ids=["status-only", "durable-output"])
+def test_successor_prunes_only_expired_untracked_ordinary_runs(tmp_path, monkeypatch, case, persist):
     import tools.process_registry as module
 
     home = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(module, "CHECKPOINT_PATH", home / "processes.json")
     producer = ProcessRegistry()
-    session = producer.spawn_local("printf 'private-output\\n'", cwd=str(tmp_path))
+    session = producer.spawn_local("printf 'private-output\n'", cwd=str(tmp_path), persist_on_release=persist)
     assert producer.wait(session.id, timeout=10)["exit_code"] == 0
     producer._write_checkpoint()
     checkpoint = home / "processes.json"
@@ -115,4 +118,7 @@ def test_successor_prunes_only_expired_untracked_ordinary_runs(tmp_path, monkeyp
         assert successor.wait(session.id, timeout=10)["exit_code"] == 0
         recovered = successor.get(session.id)
         assert recovered is not None
-        assert "private-output" in recovered.output_buffer
+        if persist:
+            assert "private-output" in recovered.output_buffer
+        else:
+            assert recovered.output_buffer == "", "ordinary output must not be durably logged"
