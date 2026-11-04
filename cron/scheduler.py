@@ -4845,14 +4845,14 @@ def _submit_with_guard(
             def handoff():
                 # Pool identity, capacity, and the failure ledger all belong to the
                 # captured profile, not the executor thread's default/launch home.
-                general_ctx = dispatch_context(target_lane, execution.get("code_sha"))
+                target_ctx = dispatch_context(target_lane, execution.get("code_sha"))
                 try:
                     if target_lane == "script":
                         from cron.scheduler_admission import script_pool
                         target_pool = script_pool(_get_hermes_home())
                     else:
                         target_pool = _get_parallel_pool(_resolve_max_parallel_workers())
-                    return target_pool.submit(_run_and_release, general_ctx)
+                    return target_pool.submit(_run_and_release, target_ctx)
                 except BaseException as exc:
                     settle_unstarted_execution(
                         execution["id"], job_id, f"{target_lane} admission handoff failed: {exc}")

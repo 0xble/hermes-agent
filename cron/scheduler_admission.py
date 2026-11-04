@@ -50,12 +50,13 @@ def is_person_send(job: dict) -> bool:
         return False
     from pathlib import Path
     from cron import scheduler
+    from cron.lifecycle_guard import _on_cloud_path
 
     try:
         root = (scheduler._get_hermes_home() / "scripts").resolve()
         raw = Path(job.get("script") or "").expanduser()
         path = (raw if raw.is_absolute() else root / raw).resolve()
-        if not path.is_relative_to(root) or not path.is_file():
+        if not path.is_relative_to(root) or _on_cloud_path(path) or not path.is_file():
             return False
         with path.open("rb") as script:
             return script.readline(len(PERSON_SEND_MARKER) + 2).rstrip(b"\r\n") == PERSON_SEND_MARKER

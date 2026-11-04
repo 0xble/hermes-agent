@@ -53,6 +53,38 @@ def test_only_explicit_local_oneshot_scripts_qualify(home, tmp_path, change):
     assert not admission.is_person_send(job)
 
 
+@pytest.mark.parametrize("symlink", [False, True])
+def test_cloud_scripts_never_open_during_admission(home, tmp_path, monkeypatch, symlink):
+    from pathlib import Path
+
+    path, now = home
+    job = declared_send(path, now)
+    cloud_home = tmp_path / "Library" / "CloudStorage" / "profile"
+    cloud_script = cloud_home / "scripts" / "send.py"
+    cloud_script.parent.mkdir(parents=True)
+    cloud_script.write_bytes(admission.PERSON_SEND_MARKER + b"\npass\n")
+    if symlink:
+        scripts = path / "scripts"
+        (scripts / "send.py").unlink()
+        scripts.rmdir()
+        scripts.symlink_to(cloud_home / "scripts", target_is_directory=True)
+        owner_home = path
+    else:
+        owner_home = cloud_home
+        job["script"] = str(cloud_script)
+    with _profile_cron_scope(owner_home):
+        opened = []
+        original_open = Path.open
+
+        def record_open(candidate, *args, **kwargs):
+            opened.append(candidate)
+            return original_open(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", record_open)
+        assert not admission.is_person_send(job)
+        assert not opened, "admission tried to hydrate a cloud script"
+
+
 @pytest.mark.parametrize("edit", ["script", "agent", "delivery", "recurring"])
 def test_queued_edits_reroute_before_claim_without_losing_execution(home, monkeypatch, edit):
     path, now = home
