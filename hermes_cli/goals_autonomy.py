@@ -144,11 +144,12 @@ def _existing_removal_requirements(state):
             for item in contract_items(field, value)] + completion_criteria(state) + ["turn budget"]
 
 
-def current_removal_quote(session_id, quote, *, requirements=(), cursor=None):
+def current_removal_quote(session_id, quote, *, requirements=(), cursor=None, controlled_session_id=None):
     from hermes_cli.goals_authority import _bound_removal_instruction_units
-    from hermes_cli.session_controls import _read_current_user_quote, _normalize
+    from hermes_cli.session_controls import check_user_quote, _normalize
 
-    checked = _read_current_user_quote(session_id, quote, cursor=cursor)
+    checked = check_user_quote(session_id, quote, cursor=cursor, quoted_targets=True,
+                              controlled_session_id=controlled_session_id)
     if isinstance(checked, str):
         return checked
     normalized, source = checked
@@ -201,11 +202,12 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
                for item in contract_items(field, before[field])
                if item not in contract_items(field, after[field])]
     if removed:
-        authority = _CURRENT_AUTHORITY.get() or {}
-        source_sid = authority.get("session_id") or manager.session_id
+        control_authority = _CURRENT_AUTHORITY.get() or {}
+        source_sid = control_authority.get("session_id") or manager.session_id
         requirements = _existing_removal_requirements(state)
         checked = current_removal_quote(source_sid, user_quote, requirements=requirements,
-                                        cursor=manager._cursor) if user_quote else "missing"
+                                        cursor=manager._cursor,
+                                        controlled_session_id=manager.session_id) if user_quote else "missing"
         targets = [] if isinstance(checked, str) else [
             target for _verb, target, _quoted in _bound_removal_instruction_units(checked[1], requirements)]
         missing = [item for item in removed if _normalize_authority_value(item) not in targets]
@@ -218,9 +220,10 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     # A quoted addition is a user commitment even when the agent applies it.
     stop_quote = None
     if user_quote and before["stop_when"] != after["stop_when"] and not removed:
-        from hermes_cli.session_controls import _read_current_user_quote
+        from hermes_cli.session_controls import check_user_quote
         source_sid = (_CURRENT_AUTHORITY.get() or {}).get("session_id") or manager.session_id
-        stop_quote = _read_current_user_quote(source_sid, user_quote, cursor=manager._cursor)
+        stop_quote = check_user_quote(source_sid, user_quote, cursor=manager._cursor,
+                                      controlled_session_id=manager.session_id, stop_condition=after["stop_when"])
         if isinstance(stop_quote, str):
             return {"ok": False, "error_code": stop_quote, "error": "no current authenticated quote"}
     state.goal = after["goal"]
@@ -249,7 +252,7 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     return {"ok": True, "revision": revision, "state": state, "version": len(state.revisions) + 1}
 
 
-def validate_removal_quote(state, expected, cursor):
+def validate_removal_quote(state, expected, cursor, *, controlled_session_id):
     from hermes_cli.goals import GoalState
     from hermes_cli.goals_evaluation import GoalEvaluationConflict
 
@@ -259,10 +262,13 @@ def validate_removal_quote(state, expected, cursor):
     revision = state.revisions[-1]
     if not revision.get("quote_session_id") or not revision.get("user_quote"):
         return
-    from hermes_cli.session_controls import _read_current_user_quote
-    check = _read_current_user_quote if revision.get("quote_kind") == "stop_condition" else current_removal_quote
-    checked = check(revision["quote_session_id"], revision["user_quote"],
-                                    requirements=_existing_removal_requirements(prior), cursor=cursor)
+    from hermes_cli.session_controls import check_user_quote
+    stop_condition = revision.get("quote_kind") == "stop_condition"
+    check = check_user_quote if stop_condition else current_removal_quote
+    options = ({"stop_condition": state.contract.stop_when} if stop_condition
+               else {"requirements": _existing_removal_requirements(prior)})
+    checked = check(revision["quote_session_id"], revision["user_quote"], cursor=cursor,
+                    controlled_session_id=controlled_session_id, **options)
     if (isinstance(checked, str) or checked[1] != revision["quote_message"]
             or checked.relay_receipt != revision.get("relay_receipt", "")
             or checked.source_session_id != revision.get("quote_source_session_id", checked.source_session_id)):
