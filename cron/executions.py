@@ -394,7 +394,7 @@ def record_missed_execution(job_id: str, *, scheduled_instant: str, error: str) 
             (execution_id, str(job_id), _PROCESS_ID, pid, _process_start_time(pid),
              now, now, instant, str(error), running_code_sha(), execution_id),
         )
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     record_cron_finish(record, None)

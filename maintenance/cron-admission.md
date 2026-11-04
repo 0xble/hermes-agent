@@ -133,6 +133,14 @@ Before holding an unclaimed miss, atomically insert a terminal failed execution
 with the scheduled instant and original scan time in its missed reason; never
 commit an intermediate claim. Serialize occurrence lookup/insertion in the same
 ledger transaction and reuse that occurrence on incident/jobs-save retries.
+Protect each just-inserted terminal miss from its transaction's own age/cap
+prune with the ledger's existing current-row keep IDs. A same-job attempt
+with a newer timestamp, or an equal timestamp and higher ID, may remain the
+latest row; both latest and current rows can exceed the best-effort cap.
+`tests/cron/test_missed_execution_retention.py` proves durable readback and retry
+reuse in both orderings, the two nonfailing controls, and bounded cleanup with
+eligible history plus in-flight, delivery and journal protections. The production
+100,000-row backstop and 8-day default are unchanged; live incidence is unproven.
 Persist the incident too. If either store fails, keep the job for retry.
 Commit the stable `oneshot-missed:<job>:<instant>` owner-notice receipt before
 persisting the hold, then let normal outbox draining send outside the jobs lock.
