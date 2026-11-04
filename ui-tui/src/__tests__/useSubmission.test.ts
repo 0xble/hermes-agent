@@ -191,7 +191,7 @@ describe('deferred MoA submissions while busy', () => {
     harness.close()
   })
 
-  it('keeps a token-bearing queue edit at the front while busy', () => {
+  it('keeps a token-bearing queue edit at the front while busy', async () => {
     patchUiState({ busy: true, busyInputMode: 'interrupt', sid: 'sid-edit' })
     const item = queueItem('original payload', '/moa original payload', 'token-edit')
     const harness = createSubmissionHarness(() => item)
@@ -199,8 +199,12 @@ describe('deferred MoA submissions while busy', () => {
 
     harness.result.dispatchSubmission('edited payload')
 
-    expect(harness.actions.prependQueue).toHaveBeenCalledWith(item)
+    // Retirement is asynchronous: the edited row is prepended only after takeQueue resolves.
+    await vi.waitFor(() => expect(harness.actions.prependQueue).toHaveBeenCalledWith(item))
+    expect(harness.actions.prependQueue).toHaveBeenCalledTimes(1)
     expect(harness.gw).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
+    expect(harness.gw).not.toHaveBeenCalledWith('session.steer', expect.anything())
+    expect(harness.gw).not.toHaveBeenCalledWith('session.redirect', expect.anything())
     harness.close()
   })
 
@@ -247,7 +251,9 @@ describe('deferred MoA submissions while busy', () => {
     await vi.waitFor(() =>
       expect(harness.gw).toHaveBeenCalledWith('prompt.submit', {
         moa_token: 'token-interpolation',
+        queued: true,
         session_id: 'sid-token-interpolation',
+        submission_id: undefined,
         text: '!inspect {!date}'
       })
     )
