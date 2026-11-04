@@ -45,14 +45,11 @@ def owned_control_state(kind, action, target_sid, requester_sid, *, cursor=None)
     from hermes_cli.goals import load_goal
     from hermes_cli.loops import load_loop
 
-    if target_sid != requester_sid or (kind, action) == ("goal", "clear"):
+    if target_sid != requester_sid:
         return None
     state = (load_goal if kind == "goal" else load_loop)(target_sid, cursor=cursor)
-    if not agent_owned(state):
-        return None
-    if kind == "loop" and action == "stop" and state.until and user_stop_condition(state):
-        return None
-    return state
+    from hermes_cli.lifecycle_policy import decision, A
+    return state if decision(kind, action, state) == A else None
 
 
 def apply_owned_control(kind, action, target_sid, requester_sid, reason, user_quote, commit):
@@ -133,5 +130,3 @@ def authenticated_relay_sender(db, relay, goal_session_id, profile, receipts, *,
     if isinstance(config, dict) and config.get("_delegate_from"):
         return None
     return sender[1]
-
-

@@ -223,13 +223,20 @@ class GoalRevisionsMixin:
                 evidence: str = "", user_quote: str = "") -> Dict[str, Any]:
         """Validate and apply an additive revision to this manager's (staged) state."""
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
-        from hermes_cli.lifecycle_authority import LifecycleAuthority, agent_owned
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
         caller = LifecycleAuthority.for_edit(actor, autonomous=goal_autonomy_enabled())
         if caller is None:
             return {"ok": False, "error_code": "invalid_actor",
                     "error": "actor must be agent or user"}
         actor = caller.actor
-        if actor == "agent" and (caller is LifecycleAuthority.AUTONOMY or agent_owned(self._state)):
+        from hermes_cli.lifecycle_policy import decision, A
+        if decision("goal", "revise", self._state, actor=actor,
+                    autonomous=caller is LifecycleAuthority.AUTONOMY) != A:
+            return {"ok": False, "error_code": "user_authority_required"}
+        # Individual removed fields are checked by autonomous_edit's table.
+        permitted = decision("goal", "objective", self._state, actor=actor,
+                             autonomous=caller is LifecycleAuthority.AUTONOMY) == A
+        if actor == "agent" and permitted:
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
                                    subgoals=subgoals, user_quote=user_quote, authority=caller.value)
         state = self._require_goal()
@@ -262,13 +269,16 @@ class GoalRevisionsMixin:
         )
 
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
-        from hermes_cli.lifecycle_authority import LifecycleAuthority, agent_owned
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
         caller = LifecycleAuthority.for_edit(actor, autonomous=goal_autonomy_enabled())
         if caller is None:
             return {"ok": False, "error_code": "invalid_actor",
                     "error": "actor must be agent or user"}
         actor = caller.actor
-        if actor == "agent" and (caller is LifecycleAuthority.AUTONOMY or agent_owned(self._state)):
+        from hermes_cli.lifecycle_policy import decision, A
+        permission = decision("goal", "replace", self._state, actor=actor,
+                              autonomous=caller is LifecycleAuthority.AUTONOMY)
+        if actor == "agent" and permission == A:
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
                                    max_turns=max_turns, user_quote=user_quote, kind="replace", authority=caller.value)
         if actor != "user":

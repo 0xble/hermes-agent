@@ -175,12 +175,18 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     if set(after) != set(before):
         return {"ok": False, "error_code": "unknown_field", "error": "unknown contract field"}
     from hermes_cli.lifecycle_authority import user_stop_condition
-    protected = ["constraints", "boundaries", "verification", "subgoals"]
-    if user_stop_condition(state):
-        protected.append("stop_when")
+    from hermes_cli.lifecycle_policy import decision, A
+    autonomous = authority == "autonomy"
+    protected = [field for field in (*state.contract.to_dict(), "subgoals")
+                 if decision("goal", field, state, autonomous=autonomous,
+                             owner=("user" if user_stop_condition(state) else "agent")
+                             if field == "stop_when" else None) != A]
     removed = [item for field in protected
                for item in contract_items(field, before[field])
                if item not in contract_items(field, after[field])]
+    if (after["max_turns"] != before["max_turns"]
+            and decision("goal", "max_turns", state, autonomous=autonomous) != A):
+        removed.append("turn budget")
     if removed:
         control_authority = _CURRENT_AUTHORITY.get() or {}
         source_sid = control_authority.get("session_id") or manager.session_id
@@ -215,7 +221,7 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     # require fresh proof of the new objective rather than accepting stale readbacks.
     if kind == "replace":
         state.created_at = max(time.time(), state.created_at + 1e-6)
-    revision = {"at": time.time(), "actor": "agent", "authority": "autonomy", "lifecycle_authority": authority, "kind": kind,
+    revision = {"at": time.time(), "actor": "agent", "authority": authority, "lifecycle_authority": authority, "kind": kind,
                 "reason": reason, "before": before, "after": after,
                 "user_quote": user_quote if removed or stop_quote else ""}
     if removed or stop_quote:

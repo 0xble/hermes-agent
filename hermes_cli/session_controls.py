@@ -560,8 +560,17 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     caller = LifecycleAuthority.from_control(authority)
     payload = dict(payload or {})
     handler = CONTROLS.get((kind, action))
-    if kind == "goal" and action == "clear" and caller.actor == "agent":
-        return {"result": {"ok": False, "error_code": "user_only"}}
+    from hermes_cli.lifecycle_policy import decision, A
+    from hermes_cli.goals import load_goal
+    from hermes_cli.loops import load_loop
+    policy_state = (load_goal if kind == "goal" else load_loop)(target_sid, cursor=cursor)
+    permission = decision(kind, action, policy_state, actor=caller.actor,
+                          autonomous=caller is LifecycleAuthority.AUTONOMY)
+    if permission != A:
+        user_pause = (policy_state is not None and policy_state.status == "paused"
+                      and policy_state.paused_by != "agent" and action in {"resume", "stop"})
+        code = "user_paused" if user_pause else "user_only"
+        return {"result": {"ok": False, "error_code": code}}
     if action == "replace" and kind == "goal":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid, cursor=cursor)
@@ -586,9 +595,6 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
         autonomous = caller.actor == "agent"
-        if autonomous and manager.state.paused_by != "agent":
-            # A /goal pause, /stop, Ctrl+C, quoted or system pause is the user's to lift.
-            return {"result": _user_paused(manager.state, "goal"), "state": manager.state}
         result = manager.resume(reset_budget=not autonomous, user_override=not autonomous,
                                 by="agent" if autonomous else "user")
         if result is None:
@@ -1114,19 +1120,24 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
                              reason=reason, payload=payload)
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
-    payload = _check_payload(kind, action, payload)
-    target_sid = resolve_target(target_sid)
     from hermes_cli.lifecycle_authority import owned_control_state
-    if owned_control_state(kind, action, target_sid, requester_sid) is not None:
-        return apply_control(kind, action, target_sid, requester_sid=requester_sid,
-                             reason=reason, payload=payload)
     from hermes_cli.goal_notices import lifecycle_cards_hidden
+    # Ownership discovery cannot throw ahead of the stable hidden-card refusal.
+    try:
+        owned_target = resolve_target(target_sid)
+    except ValueError:
+        owned_target = None
+    if owned_target and owned_control_state(kind, action, owned_target, requester_sid) is not None:
+        return apply_control(kind, action, owned_target, requester_sid=requester_sid,
+                             reason=reason, payload=payload)
     if lifecycle_cards_hidden(kind):
         # Nobody would see the card, so a pending request could only expire. Refuse now so the
         # requester learns at once and asks in conversation instead.
         return {"ok": False, "error_code": "approval_cards_hidden",
                 "error": (f"{kind} approval cards are hidden ({kind}s.notices: hidden). Ask the user "
                           "in chat, then pass their exact words as user_quote")}
+    payload = _check_payload(kind, action, payload)
+    target_sid = resolve_target(target_sid)
     if not _has_gateway_route(target_sid):
         return {"ok": False, "error_code": "target_unroutable", "error": "target_unroutable"}
     if not _has_approval_surface(target_sid):
@@ -1169,8 +1180,9 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
     autonomous = _lifecycle_autonomy(kind)
-    if autonomous and action == "clear":
-        return {"ok": False, "error_code": "user_only", "error": "Only the user can clear a goal with /goal clear"}
+    from hermes_cli.lifecycle_policy import decision, D
+    if decision(kind, action, None, autonomous=autonomous) == D:
+        return {"ok": False, "error_code": "user_only", "error": "Clearing is user-only"}
     try:
         payload = _check_payload(kind, action, payload)
         target_sid = resolve_target(target_sid)
@@ -1542,10 +1554,6 @@ def _resume_loop(sid, reason, payload, authority, cursor=None):
     caller = LifecycleAuthority.from_control(authority)
     if caller.actor == "user":
         return manager.resume(by=caller.actor)
-    state = manager.state
-    if state is not None and state.status == "paused" and state.paused_by != "agent":
-        # A user, Ctrl+C or tick-budget pause is the user's to lift.
-        return _user_paused(state, "loop")
     return manager.resume(by="agent")  # None unless this is the agent's own pause
 
 
@@ -1557,9 +1565,6 @@ def _stop_loop(sid, reason, payload, authority, cursor=None):
     caller = LifecycleAuthority.from_control(authority)
     if caller.actor == "user":
         return manager.clear()
-    state = manager.state
-    if state is not None and state.status == "paused" and state.paused_by != "agent":
-        return _user_paused(state, "loop")
     # The agent finishes its loop; clearing it stays a user control.
     return manager.finish(reason or "agent finished the loop")
 
