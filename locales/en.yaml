@@ -918,7 +918,7 @@ gateway:
     db_unavailable: "⚠️ Session database unavailable — messages may not be saved and /resume will be empty. Cause: {cause}. {action}"
   cron_store:
     unwritable: "⚠️ Cron store {store} is not writable ({error}) since {since}. Scheduled jobs are being skipped until it accepts writes again. Fix: {fix}."
-    recovered: "✅ Cron store {store} is writable again; {skipped} skipped run(s), catching up once per job."
+    recovered: "✅ Cron store {store} is writable again; {skipped} skipped run(s). Recurring jobs catch up once. Overdue one-shots stay held for a decision."
 
   whoami:
     scope_dm: "DM"

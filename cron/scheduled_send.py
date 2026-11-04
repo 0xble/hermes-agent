@@ -73,34 +73,53 @@ def validate_scheduled_send_inputs(
             "send_freshness missing required field(s): " + ", ".join(missing)
         )
     channel = send_freshness["channel"]
-    if channel not in {"slack", "telegram", "imessage"}:
+    if channel not in {"slack", "telegram", "imessage", "email", "quo"}:
         raise ValueError("send_freshness.channel has no supported shared reader.")
-    if channel in {"slack", "telegram"} and (
+    if channel != "imessage" and (
             not isinstance(send_freshness.get("account"), str) or not send_freshness["account"].strip()):
-        raise ValueError("send_freshness.account is required for Slack/Telegram.")
+        raise ValueError("send_freshness.account is required for this provider.")
     conversation = send_freshness["conversation"]
     if channel == "slack" and (not re.fullmatch(r"[CDG][A-Z0-9]+", conversation)
                                or not re.fullmatch(r"[UW][A-Z0-9]+", send_freshness["recipient"])):
         raise ValueError("send_freshness requires exact Slack conversation and recipient IDs.")
     if channel in {"telegram", "imessage"} and not re.fullmatch(r"-?[0-9]+", conversation):
         raise ValueError("send_freshness.conversation must be the exact numeric chat ID.")
-    if channel != "slack" and not send_freshness.get("activity_check"):
-        context = send_freshness.get("activity_context")
+    # No shared Slack binding is not a failed read. The communications reader
+    # records N/A coverage with a reason, while declared contexts must resolve.
+    if "activity_context" in send_freshness:
+        context = send_freshness["activity_context"]
         if not isinstance(context, dict) or any(not isinstance(context.get(k), str) or not context[k]
                 for k in ("slack_account", "slack_conversation", "slack_recipient")):
-            raise ValueError("send_freshness requires a resolved shared activity_context for this provider.")
+            raise ValueError("send_freshness.activity_context must contain resolved Slack IDs.")
+    if channel == "email":
+        reviewed = send_freshness.get("reviewed_message_ids")
+        if (not re.fullmatch(r"[0-9a-fA-F]+", conversation)
+                or not isinstance(reviewed, list)
+                or any(not isinstance(v, str) or not re.fullmatch(r"[0-9a-fA-F]+", v) for v in reviewed)
+                or len(set(reviewed)) != len(reviewed)):
+            raise ValueError("send_freshness email requires exact thread and reviewed_message_ids.")
+    if channel == "quo" and (not re.fullmatch(r"PN[A-Za-z0-9]+", conversation)
+                              or not re.fullmatch(r"\+[1-9]\d{6,14}", send_freshness["recipient"])):
+        raise ValueError("send_freshness Quo requires PN number ID and E.164 recipient.")
     if "activity_check" in send_freshness:
         check = send_freshness["activity_check"]
         if (not isinstance(check, dict) or check.get("read_only") is not True
                 or not isinstance(check.get("argv"), list) or not check["argv"]
                 or any(not isinstance(a, str) or not a for a in check["argv"])):
             raise ValueError("send_freshness.activity_check must be an explicit read-only argv.")
-    for key in ("transport_sha256", "payload_sha256"):
+    for key in ("transport_sha256", "payload_sha256", "text_sha256"):
         if key in send_freshness and not _SHA256_HEX.fullmatch(str(send_freshness[key])):
             raise ValueError(f"send_freshness.{key} must be 64 hex characters.")
     if send_freshness.get("payload_path"):
         validate_scheduled_send_inputs(payload_path=send_freshness["payload_path"],
                                        payload_sha256=send_freshness.get("payload_sha256"))
+    if send_freshness.get("text_file"):
+        validate_scheduled_send_inputs(payload_path=send_freshness["text_file"],
+                                       payload_sha256=send_freshness.get("text_sha256"))
+    if "text_file" in send_freshness and "payload_path" in send_freshness and (
+            send_freshness["text_file"] != send_freshness["payload_path"]
+            or send_freshness.get("text_sha256") != send_freshness.get("payload_sha256")):
+        raise ValueError("send_freshness has conflicting approved payload bindings.")
     try:
         approved = datetime.fromisoformat(str(send_freshness["approved_at"]).replace("Z", "+00:00"))
         if approved.tzinfo is None:
@@ -134,11 +153,6 @@ def run_freshness_script(spec: dict[str, Any], job: dict[str, Any]) -> dict[str,
     script = str(spec.get("script") or "")
     payload = {
         **{k: v for k, v in spec.items() if k != "script"},
-        "channel": spec.get("channel"),
-        "conversation": spec.get("conversation"),
-        "account": spec.get("account"),
-        "recipient": spec.get("recipient"),
-        "sender": spec.get("sender"),
         "scheduled_at": (job.get("schedule") or {}).get("run_at") or job.get("next_run_at"),
         "job_id": job.get("id"),
     }
