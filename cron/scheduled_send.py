@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 _SHA256_DECL = re.compile(
-    r"(?i)\b(?:expected\s+)?sha-?256[ \t]*[:=][ \t]*([^\s`\"\'\),;]*)"
+    r"(?i)\b(?P<expected>expected\s+)?sha-?256[ \t]*[:=][ \t]*"
+    r"[`\"\']?(?P<value>[^\s`\"\'\),;]*)"
 )
 _SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
 _FRESHNESS_FIELDS = ("channel", "conversation", "script", "recipient", "approved_at")
@@ -28,7 +29,15 @@ def declared_checksums(prompt: Optional[str], payload_sha256: Any = None) -> lis
     """Return checksum tokens a scheduled send declared, in source order."""
     found: list[str] = []
     if isinstance(prompt, str):
-        found.extend(_SHA256_DECL.findall(prompt))
+        for match in _SHA256_DECL.finditer(prompt):
+            token = match["value"]
+            # Prompt text is also prose, shell commands and unexpanded templates.
+            # Only literal expected values or hash-shaped values declare a digest;
+            # structured payload_sha256 below is always an explicit declaration.
+            if token.startswith(("$", "<", "{")):
+                continue
+            if match["expected"] or re.fullmatch(r"[0-9a-fA-F]+", token):
+                found.append(token)
     if payload_sha256 not in (None, ""):
         found.append(str(payload_sha256))
     return found
@@ -194,7 +203,13 @@ def assess_freshness(
     spec = job.get("send_freshness")
     if not isinstance(spec, dict):
         return {"stale": False, "checked": False, "reason": ""}
-    verdict = (runner or run_freshness_script)(spec, job)
+    try:
+        verdict = (runner or run_freshness_script)(spec, job)
+    except Exception as exc:
+        # This boundary precedes dispatch: an unavailable reader is a hold, not
+        # an unknown/possibly-sent run or an exception escaping the ledger path.
+        return {"stale": True, "checked": False,
+                "reason": f"freshness check failed: {type(exc).__name__}: {exc}"}
     if not isinstance(verdict, dict):
         return {"stale": True, "checked": False, "reason": "freshness check returned nothing"}
     return {

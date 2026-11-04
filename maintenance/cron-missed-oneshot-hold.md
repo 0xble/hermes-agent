@@ -11,10 +11,17 @@ routed to the creating origin (configured-home fallback if absent), before
 committing the hold. The notice offers explicit `cron resume <id> --run-now` or
 `cron remove <id>`. Store-outage coverage explains the miss but never authorizes
 an hours-late send. Consumed/ambiguous dispatches retain their existing distinct
-retirement and partial-effects notice.
+retirement and partial-effects notice. `repeat.completed` counts consumption of
+this occurrence; a preserved `last_run_at` from before explicit rearm is history,
+not evidence that the new occurrence started.
 
 Reject malformed declared SHA-256, missing/mismatched payloads and malformed
 structured freshness contracts before create, update or reactivation persists.
+In prompt text, a literal `Expected SHA-256:` value explicitly declares a digest;
+an unqualified `sha256:`/`sha256=` value declares one only when it is hexadecimal.
+Markdown quoting is accepted. Shell substitutions and angle/brace placeholders
+are not literal digests, and unrelated checksum prose is not a send contract.
+Structured `payload_sha256` and freshness digest bindings remain strict.
 An unrelated disable/pause must still work for malformed historical records.
 The model-tool handler forwards these fields; schema exposure alone is not enough.
 
@@ -22,7 +29,9 @@ Use the common `run_one_job` boundary, including external/detached/manual fires,
 to recheck the deadline and declared freshness without the jobs lock. Recheck
 both time and current occurrence/approval after live reads. A superseded snapshot
 stops without disabling its replacement. A manual rearm remains subject to fresh
-thread/activity evidence; it is not permission to ignore new replies.
+thread/activity evidence; it is not permission to ignore new replies. Reader
+exceptions fail closed through the same held-payload/decision-notice path and
+settle the execution ledger before dispatch, rather than leaving a running row.
 
 The communications edge owns provider semantics: final check-then-transport
 wrapper, approved watermark, exact argv/body digests, live account-bound Slack
