@@ -38,6 +38,19 @@ Hermes homes. The core lineage controls alone do not prove plugin permission.
 
 ## Required behavior
 
+- `LifecycleAuthority` is the common lifecycle caller identity (`agent`, `autonomy`, `user`).
+  Both `agent` and `autonomy` act as the agent, never as the user. Revisions and applied
+  control receipts record `lifecycle_authority`; legacy `authority`/`via` fields retain their
+  evidence/quote/button/session provenance so replacement boundaries and migrations remain valid.
+  Owned goal/loop pauses record `paused_by="agent"`; neither owned nor opted-in controls can
+  relabel or lift a user/system pause. Owned loop stop finishes rather than clears, and an
+  agent resume retains the full cadence floor. Hidden approval cards cannot block owned controls.
+- A current user-quoted stop-condition addition becomes user-owned even when an agent applies it.
+  Goal and loop revise/replace bind both direct and relay quotes again under the commit write lock,
+  including the source session, current source message and receipt. A newer refusal rolls back the
+  entire edit; an unchanged goal/loop JSON snapshot alone is not sufficient authority.
+  `tests/hermes_cli/test_lifecycle_authority.py` covers the actor/action/pauser matrix and these races.
+
 - Store one audit/outbox record per control under `state_meta` with a 24-hour pending expiry.
 - An autonomous goal pause that becomes a native timed wait records `outcome="timed_wait"`,
   `wait_seconds`, `waiting_until` and its shared `notice` in that same transaction. Target,

@@ -133,7 +133,7 @@ def current_removal_quote(session_id, quote, *, cursor=None):
 
 
 def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
-                    max_turns=None, user_quote="", kind="revise"):
+                    max_turns=None, user_quote="", kind="revise", authority="autonomy"):
     """Validate the entire delta before changing the staged snapshot."""
     from hermes_cli.goals import GoalContract, contract_items
     from hermes_cli.goals_authority import (
@@ -187,20 +187,33 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
                     "error": "Retain each requirement or quote the user's exact removal instruction: " + "; ".join(missing)}
     if before == after:
         return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
+    # A quoted addition is a user commitment even when the agent applies it.
+    stop_quote = None
+    if user_quote and before["stop_when"] != after["stop_when"] and not removed:
+        from hermes_cli.session_controls import _read_current_user_quote
+        source_sid = (_CURRENT_AUTHORITY.get() or {}).get("session_id") or manager.session_id
+        stop_quote = _read_current_user_quote(source_sid, user_quote, cursor=manager._cursor)
+        if isinstance(stop_quote, str):
+            return {"ok": False, "error_code": stop_quote, "error": "no current authenticated quote"}
     state.goal = after["goal"]
     state.contract = GoalContract.from_dict(after)
+    if before["stop_when"] != after["stop_when"] and (removed or stop_quote):
+        state.stop_condition_owner = "user"
     state.subgoals = after["subgoals"]
     state.max_turns = after["max_turns"]
     # Replacement is a new continuation instance. Keep breach/contract history, but
     # require fresh proof of the new objective rather than accepting stale readbacks.
     if kind == "replace":
         state.created_at = max(time.time(), state.created_at + 1e-6)
-    revision = {"at": time.time(), "actor": "agent", "authority": "autonomy", "kind": kind,
+    revision = {"at": time.time(), "actor": "agent", "authority": "autonomy", "lifecycle_authority": authority, "kind": kind,
                 "reason": reason, "before": before, "after": after,
-                "user_quote": user_quote if removed else ""}
-    if removed:
+                "user_quote": user_quote if removed or stop_quote else ""}
+    if removed or stop_quote:
+        checked = checked if removed else stop_quote
+        revision["quote_kind"] = "removal" if removed else "stop_condition"
         revision["quote_session_id"] = source_sid
         revision["quote_message"] = checked[1]
+        revision["quote_source_session_id"] = checked.source_session_id
         if getattr(checked, "relay_receipt", ""):
             revision["relay_receipt"] = checked.relay_receipt
     state.revisions.append(revision)
@@ -214,10 +227,14 @@ def validate_removal_quote(state, expected, cursor):
     if len(state.revisions) <= len(json.loads(expected).get("revisions") or []):
         return
     revision = state.revisions[-1]
-    if revision.get("authority") != "autonomy" or not revision.get("user_quote"):
+    if not revision.get("quote_session_id") or not revision.get("user_quote"):
         return
-    checked = current_removal_quote(revision["quote_session_id"], revision["user_quote"], cursor=cursor)
-    if isinstance(checked, str) or checked[1] != revision["quote_message"]:
+    from hermes_cli.session_controls import _read_current_user_quote
+    check = _read_current_user_quote if revision.get("quote_kind") == "stop_condition" else current_removal_quote
+    checked = check(revision["quote_session_id"], revision["user_quote"], cursor=cursor)
+    if (isinstance(checked, str) or checked[1] != revision["quote_message"]
+            or checked.relay_receipt != revision.get("relay_receipt", "")
+            or checked.source_session_id != revision.get("quote_source_session_id", checked.source_session_id)):
         raise GoalEvaluationConflict
 
 

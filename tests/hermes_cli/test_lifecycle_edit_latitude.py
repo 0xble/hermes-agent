@@ -50,8 +50,8 @@ def test_agent_can_stop_own_loop_with_audit(state):
     assert result["status"] == "applied", result
     assert result["record"]["reason"] == "Build tracking moved to its owner"
     assert result["record"]["before"]["status"] == "active"
-    assert result["record"]["after"]["status"] == "cleared"
-    assert load_loop("requester").status == "cleared"
+    assert result["record"]["after"]["status"] == "done"
+    assert load_loop("requester").status == "done"
 
 
 def test_verified_relay_quote_authorizes_loop_revision(state, monkeypatch, tmp_path):

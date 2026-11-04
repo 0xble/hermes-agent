@@ -55,6 +55,7 @@ class LoopRevisionsMixin:
             return None, checked, {"error": "user_quote has no current authenticated source"}
         return checked[0], None, {
             "user_message": checked[1],
+            "source_session_id": checked.source_session_id,
             **({"relay_receipt": checked.relay_receipt} if checked.relay_receipt else {}),
         }
 
@@ -180,9 +181,12 @@ class LoopRevisionsMixin:
                 or faster
                 or raising_times
             )
-        autonomous = actor == "agent" and loop_autonomy_enabled()
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
+        caller = LifecycleAuthority.for_edit(actor, autonomous=loop_autonomy_enabled())
+        actor = caller.actor
+        autonomous = caller is LifecycleAuthority.AUTONOMY
         quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=needs_authority and not autonomous
+            state, user_quote, user_messages, required=needs_authority and caller.actor == "agent" and not autonomous
         )
         if quote_error:
             return self._revision_result(
@@ -200,11 +204,14 @@ class LoopRevisionsMixin:
             "before": {key: before[key] for key in changed},
             "after": {key: after[key] for key in changed},
         }
+        revision["lifecycle_authority"] = caller.value
         if autonomous:
             revision["authority"] = "autonomy"
-        if quote_detail and quote_detail.get("relay_receipt"):
-            revision["relay_receipt"] = quote_detail["relay_receipt"]
-        if "until" in changed and quote:
+        if quote_detail:
+            revision["quote_source_session_id"] = quote_detail["source_session_id"]
+            if quote_detail.get("relay_receipt"):
+                revision["relay_receipt"] = quote_detail["relay_receipt"]
+        if "until" in changed and (quote or caller.actor == "user"):
             state.stop_condition_owner = "user"
         if clamped_from is not None:
             revision["clamped"] = {
@@ -236,6 +243,7 @@ class LoopRevisionsMixin:
         self,
         *,
         prompt: str,
+        actor: str = "agent",
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
@@ -249,12 +257,13 @@ class LoopRevisionsMixin:
         Commit only against the durable snapshot this replacement read.
         """
         from hermes_cli.loops_snapshot import mutate_loop_snapshot
-        return mutate_loop_snapshot(self, "_replace", prompt=prompt, interval_seconds=interval_seconds, times=times, until=until, route=route, reason=reason, user_quote=user_quote, user_messages=user_messages)
+        return mutate_loop_snapshot(self, "_replace", prompt=prompt, actor=actor, interval_seconds=interval_seconds, times=times, until=until, route=route, reason=reason, user_quote=user_quote, user_messages=user_messages)
 
     def _replace(
         self,
         *,
         prompt: str,
+        actor: str = "agent",
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
@@ -288,9 +297,11 @@ class LoopRevisionsMixin:
         from hermes_cli.lifecycle_authority import agent_owned, user_stop_condition
         needs_authority = (not agent_owned(state) or
                            (state.until != (until or "").strip() and user_stop_condition(state)))
-        autonomous = loop_autonomy_enabled()
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
+        caller = LifecycleAuthority.for_edit(actor, autonomous=loop_autonomy_enabled())
+        autonomous = caller is LifecycleAuthority.AUTONOMY
         quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=needs_authority and not autonomous
+            state, user_quote, user_messages, required=needs_authority and caller.actor == "agent" and not autonomous
         )
         if quote_error:
             return self._revision_result(
@@ -329,7 +340,7 @@ class LoopRevisionsMixin:
         }
         revision = {
             "at": now,
-            "actor": "agent",
+            "actor": caller.actor,
             "reason": reason,
             "user_quote": quote or "",
             "user_message": (quote_detail or {}).get("user_message", "") if quote else "",
@@ -337,11 +348,14 @@ class LoopRevisionsMixin:
             "before": old_snapshot,
             "after": new_snapshot,
         }
+        revision["lifecycle_authority"] = caller.value
         if autonomous:
             revision["authority"] = "autonomy"
-        if quote_detail and quote_detail.get("relay_receipt"):
-            revision["relay_receipt"] = quote_detail["relay_receipt"]
-        if state.until != new_until and quote:
+        if quote_detail:
+            revision["quote_source_session_id"] = quote_detail["source_session_id"]
+            if quote_detail.get("relay_receipt"):
+                revision["relay_receipt"] = quote_detail["relay_receipt"]
+        if state.until != new_until and (quote or caller.actor == "user"):
             state.stop_condition_owner = "user"
         old_route = dict(state.route)
         # A replaced paused loop stays paused with its reason. Only /loop resume, or an autonomous

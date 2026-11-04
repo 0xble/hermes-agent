@@ -10,6 +10,7 @@ transaction.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Optional, Tuple
@@ -64,9 +65,21 @@ def _commit(manager: Any, expected: str, state: LoopState, *, tick_lifecycle: bo
         _overlay(live, state)  # a no-op stays unwritten, validated inside the same transaction
         return True
 
+    def precondition(cursor):
+        if len(state.revisions) <= len(json.loads(expected).get("revisions") or []):
+            return True
+        revision = state.revisions[-1]
+        if not revision.get("user_quote"):
+            return True
+        from hermes_cli.session_controls import _read_current_user_quote
+        checked = _read_current_user_quote(manager.session_id, revision["user_quote"], cursor=cursor)
+        return (not isinstance(checked, str) and checked[1] == revision["user_message"]
+                and checked.relay_receipt == revision.get("relay_receipt", "")
+                and checked.source_session_id == revision.get("quote_source_session_id", checked.source_session_id))
+
     try:
         saved = save_loop(manager.session_id, cursor=manager._cursor, apply=apply,
-                          tick_lifecycle=tick_lifecycle)
+                          precondition=precondition, tick_lifecycle=tick_lifecycle)
     except Exception as exc:
         if manager._cursor is not None:
             raise  # transaction owners see their own failures
