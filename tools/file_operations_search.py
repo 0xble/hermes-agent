@@ -260,6 +260,27 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     )
 
 
+def _rooted_filename_globs(pattern: str, roots: list[str], common: str) -> list[str]:
+    """Anchor to each operand, but keep an absolute pattern's selected root identity.
+
+    rg anchors multi-root globs to its working directory, not each operand. The
+    caller runs from ``common`` with relative operands in both transports.
+    """
+    candidates = [(root, pattern.lstrip('/')) for root in roots]
+    for root in sorted(roots, key=len, reverse=True):
+        prefix = root.rstrip('/') + '/'
+        if pattern.startswith(prefix):
+            candidates = [(root, pattern[len(prefix):])]
+            break
+    globs = []
+    for root, suffix in candidates:
+        relative = posixpath.relpath(root, common)
+        # Root names are literals, while the user's suffix retains glob syntax.
+        literal = re.sub(r"([\\*?{}\[\]])", lambda match: "\\" + match.group(0), relative)
+        globs.append('/' + (literal + '/' if relative != '.' else '') + suffix)
+    return globs
+
+
 def _posix_roots(roots: list[str]) -> bool:
     """Darwin-only: every root is POSIX-shaped (no drive letter / backslash)."""
     return sys.platform == "darwin" and all(
@@ -354,7 +375,8 @@ class SearchMixin:
     # --- native rg transport (local POSIX) --------------------------------------
 
     def _run_rg_native(self, argv: list[str], fetch_limit: int, timeout: int,
-                       merge_stderr: bool = False, capture_stderr: bool = False) -> ExecuteResult:
+                       merge_stderr: bool = False, capture_stderr: bool = False,
+                       cwd: Optional[str] = None) -> ExecuteResult:
         """Run ``argv`` (shell-quoted rg words) natively and stop reading after
         ``fetch_limit`` lines — the ``| head -n`` of the shell pipeline without the
         two bash spawns. ``shlex.split`` undoes the escaping the builders apply for
@@ -366,7 +388,7 @@ class SearchMixin:
         search (diagnostics feed the error message). Filename searches capture a
         separate bounded diagnostic stream; probes still discard stderr."""
         from tools.environments.local import _kill_process_group_posix, _make_run_env
-        cwd = getattr(self.env, "cwd", None) or self.cwd
+        cwd = cwd or getattr(self.env, "cwd", None) or self.cwd
         args = shlex.split(" ".join(argv))
         try:
             proc = subprocess.Popen(
@@ -447,14 +469,15 @@ class SearchMixin:
 
     def _run_rg_bounded(self, words: list[str], fetch_limit: int, timeout: int, *,
                         merge_stderr: bool = False, native_ok: bool = True,
-                        shell_prefix: str = "", capture_stderr: bool = False) -> ExecuteResult:
+                        shell_prefix: str = "", capture_stderr: bool = False,
+                        native_cwd: Optional[str] = None) -> ExecuteResult:
         """Run an rg command (shell-quoted words) and keep the first ``fetch_limit``
         lines: natively on a local POSIX host, else through the backend shell as
-        ``<prefix><words> | head -n N``. ``native_ok=False`` keeps a form the native
- lane cannot express (the multi-root ``cd`` prefix); ``shell_prefix`` is shell-only."""
+        ``<prefix><words> | head -n N``. ``native_ok=False`` keeps shell-only
+        forms; ``native_cwd`` mirrors an explicit ``cd`` in ``shell_prefix``."""
         if native_ok and self._native_read_enabled():
             return self._run_rg_native(words, fetch_limit, timeout, merge_stderr=merge_stderr,
-                                       capture_stderr=capture_stderr)
+                                       capture_stderr=capture_stderr, cwd=native_cwd)
         if capture_stderr:
             return self._run_rg_shell_with_stderr(words, fetch_limit, timeout, shell_prefix)
         stderr = "" if merge_stderr else " 2>/dev/null"
@@ -998,12 +1021,13 @@ class SearchMixin:
         parallel walk). Discovery order stays bounded and fast; exact modification-time
         ordering is explicit because it scans globally."""
         roots = [path] if isinstance(path, str) else path
+        cwd = getattr(self.env, "cwd", None) or self.cwd
+        absolute_roots = [posixpath.normpath(posixpath.join(cwd, root)) for root in roots]
         while pattern.startswith('./'):
             pattern = pattern[2:]
+        rooted_pattern = pattern
         anchored = pattern.startswith('/')
         if anchored:
-            cwd = getattr(self.env, "cwd", None) or self.cwd
-            absolute_roots = [posixpath.normpath(posixpath.join(cwd, root)) for root in roots]
             for root in sorted(absolute_roots, key=len, reverse=True):
                 prefix = root.rstrip('/') + '/'
                 if pattern.startswith(prefix):
@@ -1026,13 +1050,9 @@ class SearchMixin:
         effective_exclusions = self._effective_macos_search_exclusions(roots)
         scoped_common = None
         command_roots = roots
-        if len(roots) > 1 and effective_exclusions and _posix_roots(roots):
+        if len(roots) > 1 and (anchored or (effective_exclusions and _posix_roots(roots))):
             # Several roots: rg globs are root-relative, so cd to the common ancestor
             # and express roots + exclusions relative to it.
-            cwd = getattr(self.env, "cwd", None) or self.cwd
-            absolute_roots = [
-                posixpath.normpath(root if posixpath.isabs(root) else posixpath.join(cwd, root))
-                for root in roots]
             scoped_common = posixpath.commonpath(absolute_roots)
             command_roots = [posixpath.relpath(root, scoped_common) for root in absolute_roots]
             exclusion_terms = [
@@ -1042,6 +1062,8 @@ class SearchMixin:
             exclusion_terms = [
                 f"--glob {self._escape_shell_arg(f'!{relative}/**')}"
                 for _r, relative, _abs in effective_exclusions]
+        glob_patterns = (_rooted_filename_globs(rooted_pattern, absolute_roots, scoped_common)
+                         if anchored and scoped_common else [glob_pattern])
         exclusion_globs = " ".join(dict.fromkeys(exclusion_terms))
         exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""
         rg_executable = rg_executable or self._resolve_command("rg")
@@ -1058,10 +1080,11 @@ class SearchMixin:
         # A silent no-match walk can otherwise fan out over every available CPU.
         walker_threads = max(1, min(4, (os.cpu_count() or 1) // 4))
         # ``--`` terminates options so a dash-prefixed root is never parsed as a flag.
-        rg_cmd = (f"{rg} --files{sort_arg} --threads {walker_threads}"
-                  f" -g {self._escape_shell_arg(glob_pattern)}"
+        glob_args = " ".join(f"-g {self._escape_shell_arg(glob)}" for glob in glob_patterns)
+        rg_cmd = (f"{rg} --files{sort_arg} --threads {walker_threads} {glob_args}"
                   f"{exclusion_args} -- {root_args}")
-        result = self._run_rg_bounded([rg_cmd], fetch_limit, timeout=60, native_ok=not scoped_common,
+        result = self._run_rg_bounded([rg_cmd], fetch_limit, timeout=60,
+                                      native_ok=not scoped_common or anchored, native_cwd=scoped_common,
                                       shell_prefix=f"set -o pipefail; {cd_prefix}", capture_stderr=True)
         stdout, limit_reason = _search_stdout_and_limit(result)
         all_files = [f for f in stdout.splitlines() if f]

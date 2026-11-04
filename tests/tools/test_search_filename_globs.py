@@ -95,6 +95,63 @@ def test_filename_globs_normalize_relative_and_root_anchored_prefixes(search, pa
     assert {Path(file).relative_to(root).as_posix() for file in result.files} == expected
 
 
+@pytest.mark.parametrize("root_form", ["relative", "absolute", "outside-cwd"])
+@pytest.mark.parametrize("order", ["discovery", "modified"])
+@pytest.mark.parametrize("pattern,expected", [
+    ("/main.py", {"a/main.py", "b/main.py"}),
+    ("/hooks/*.py", {"a/hooks/hook.py", "b/hooks/hook.py"}),
+    ("{root}/a/main.py", {"a/main.py"}),
+    ("{root}/b/hooks/*.py", {"b/hooks/hook.py"}),
+])
+def test_multiroot_anchored_globs_keep_each_root_and_absolute_identity(
+    search, root_form, order, pattern, expected, monkeypatch,
+):
+    _, root, ops = search
+    native_calls = []
+    run_native = ops._run_rg_native
+
+    def record_native(*args, **kwargs):
+        native_calls.append(kwargs.get("cwd"))
+        return run_native(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "_run_rg_native", record_native)
+    native_enabled = ops._native_read_enabled()
+    for dirname in ("a", "b"):
+        for name in ("main.py", "nested/main.py", "hooks/hook.py", "nested/hooks/decoy.py"):
+            file = root / dirname / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text("fixture\n", encoding="utf-8")
+    roots = [root / "a", root / "b"]
+    if root_form == "relative":
+        roots = [file.relative_to(root) for file in roots]
+    elif root_form == "outside-cwd":
+        cwd = root / "caller-cwd"
+        cwd.mkdir()
+        ops.env.cwd = str(cwd)
+        ops.cwd = str(cwd)
+    result = ops.search(
+        pattern.format(root=root), " ".join(str(file) for file in roots),
+        target="files", order=order,
+    )
+    assert result.error is None, result.to_dict()
+    actual = {Path(ops.env.cwd, file).resolve().relative_to(root.resolve()).as_posix() for file in result.files}
+    assert actual == expected
+    assert native_calls == ([str(root)] if native_enabled else [])
+
+
+def test_multiroot_anchored_globs_escape_literal_root_names(search):
+    _, root, ops = search
+    names = ("a[1]", "b{2}")
+    for name in names:
+        (root / name).mkdir()
+        (root / name / "main.py").write_text("fixture\n", encoding="utf-8")
+    result = ops.search("/main.py", " ".join(names), target="files")
+    assert result.error is None, result.to_dict()
+    assert {Path(file).relative_to(root).as_posix() for file in result.files} == {
+        f"{name}/main.py" for name in names
+    }
+
+
 @pytest.mark.parametrize("order", ["discovery", "modified"])
 def test_filename_failures_report_bounded_diagnostics_separate_from_paths(search, order, monkeypatch):
     run, _, ops = search

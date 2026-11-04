@@ -12,7 +12,12 @@ Filename globs retain their complete path and brace syntax in both ripgrep
 transports. Unanchored slash-bearing patterns match the complete suffix at any
 depth within the selected roots, while ordinary basename globs keep their
 existing matching. Leading `./` is removed. Absolute patterns within a search
-root become root-relative, and other leading `/` patterns anchor to the root.
+root become root-relative, and other leading `/` patterns anchor to each selected
+root independently. Multi-root anchored patterns are translated into a common
+ancestor's coordinates; an absolute pattern retains its selected root instead of
+matching the same suffix under sibling roots. Both transports run the same single
+bounded ripgrep invocation from that ancestor, preserving global modified order
+and pagination. Literal root names are escaped separately from user glob syntax.
 The historical basename reduction belongs only to the `find -name` fallback,
 whose parser does not support ripgrep's path and brace syntax. That fallback was
 the original reason for the reduction (`533c064269417`), not a requirement to
@@ -42,7 +47,9 @@ its regression coverage.
 
 Upstream guidance was checked at `835c3dd038d903182a66ecc45e34bf5e0de65f00`
 and rechecked at `41cd7b649d0980c57620035af736f91be10dae79` during recovery;
-no relevant contract change was found.
+no relevant contract change was found. The upstream agent, tool, and contribution
+guidance was checked again at `9302ba9e212c63ba24cdf1f47f26b47bcd3b042e` for the
+multi-root anchoring correction; no relevant guidance change was found.
 Related issue [NousResearch #127861](https://github.com/NousResearch/hermes-agent/issues/127861)
 and open PR [#129710](https://github.com/NousResearch/hermes-agent/pull/129710)
 propose indexed lookup and completion changes; they are broader alternatives, not
@@ -75,6 +82,15 @@ relative and root-anchored prefixes, and the shell wrapper's observed working
 directory after a failed search. On 2026-10-29, the expanded suite against a
 detached checkout at `1f1d80a42a69` produced 20 failed and 14 passed cases. The
 corrected implementation passes all 34 cases.
+
+The multi-root anchoring regression at `46230b4e63f9` produces 50 failures and
+34 deselections before the correction: root-anchored and absolute patterns, both
+ordering modes, relative/absolute roots, roots outside the working directory, and
+literal metacharacters in root names. Both shell and native transports are
+exercised, and native execution is asserted rather than silently falling back.
+The corrected filename-glob module passes all 84 cases. The expanded GREEN run
+through `heavy-slot` and `scripts/run_tests.sh` passes 452 tests across 17 search
+and file-operations modules with 0 failures and 12 platform skips.
 
 Also run the relevant broader tools tests through the canonical runner.
 Recovery verification through machine-wide `heavy-slot` admission observed:
