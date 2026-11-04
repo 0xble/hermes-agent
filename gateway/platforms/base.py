@@ -4259,7 +4259,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             return new_text
         if new_text.strip() in [c.strip() for c in existing_text.split("\n\n")]:
             return existing_text
-        return f"{existing_text}\n\n{new_text}".strip()
+        # Stripping is for comparison only: trailing whitespace can belong to
+        # a counted document body and must survive media batching verbatim.
+        return f"{existing_text}\n\n{new_text}"
 
     def _text_debounce_store(self) -> dict[str, TextDebounceState]:
         return _lazy_attr(self, "_text_debounce", dict)
