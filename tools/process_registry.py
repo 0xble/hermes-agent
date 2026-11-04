@@ -652,6 +652,9 @@ class ProcessSession:
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
     _reader_selectable: bool = field(default=False, repr=False)
+    _survivor_decoder: Any = field(default=None, repr=False)
+    _survivor_log_offset: int = field(default=0, repr=False)
+    _survivor_head_noise: bool = field(default=True, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
     _kill_deadline: Optional[float] = field(default=None, repr=False)
     _kill_requested: bool = field(default=False, repr=False)
@@ -1096,7 +1099,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
 
     def _prune_uncollected_detached(self, session: ProcessSession) -> Optional[ProcessSession]:
         """Retain a gone recovered entry and announce its uncollected exit status."""
-        self._read_survivor_log(session)
+        self._read_survivor_log(session, final=True)
         # A missing wait status is an outcome, not permission to discard the job.
         # Preserve the receipt and queue one honest completion, even for old entries
         # created before completion watches were enabled by default.

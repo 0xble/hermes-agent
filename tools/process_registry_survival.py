@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import os
@@ -46,10 +47,12 @@ class ProcessSurvivalMixin:
         session.exit_path = str(run_dir / "exit")
         session.delivered_path = str(run_dir / "delivered") if restart_safe else ""
         q = shlex.quote
+        # Return the saved status without exiting the interactive login shell
+        # explicitly: bash otherwise appends a synthetic "logout" diagnostic.
         wrapped = (
             f"(\n{safe_command}\n) > {q(session.log_path)} 2>&1\n"
             f"rc=$?; printf '%s\\n' \"$rc\" > {q(session.exit_path + '.tmp')}; "
-            f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}; exit \"$rc\""
+            f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}; (exit \"$rc\")"
         )
         if restart_safe:
             command_argv = [registry._find_shell(), "-lic", f"set +m; {wrapped}"]
@@ -69,16 +72,19 @@ class ProcessSurvivalMixin:
         if scoped:
             spawn_env = registry.systemd_user_bus_env(spawn_env)
         try:
-            proc = subprocess.Popen(
-                spawn_argv,
-                text=True,
-                cwd=session.cwd,
-                env=spawn_env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            # Parser errors precede the inner redirection. Keep the outer shell's
+            # diagnostics in the same append-only durable log as command output.
+            with open(session.log_path, "ab") as outer_stderr:
+                proc = subprocess.Popen(
+                    spawn_argv,
+                    text=True,
+                    cwd=session.cwd,
+                    env=spawn_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=outer_stderr,
+                    start_new_session=True,
+                )
         except Exception:
             self._remove_survivor_run_dir(session)
             raise
@@ -277,32 +283,41 @@ class ProcessSurvivalMixin:
         if self.claim_survivor_completion(session_id):
             self.acknowledge_survivor_completion(session_id)
 
-    def _read_survivor_log(self, session: ProcessSession) -> None:
-        """Append only bytes not read on the previous poll, bounded on recovery."""
+    def _read_survivor_log(self, session: ProcessSession, *, final: bool = False) -> None:
+        """Drain every unread byte; only the retained output buffer is bounded."""
         if not session.log_path:
             return
-        log_path = Path(session.log_path)
         try:
-            size = log_path.stat().st_size
-            offset = getattr(session, "_survivor_log_offset", None)
-            if offset is None:
-                offset = max(0, size - session.max_output_chars)
-            if size < offset:
-                offset = 0
-                with session._lock:
-                    session.output_buffer = ""
-            offset = max(offset, size - session.max_output_chars)
-            if size == offset:
-                session._survivor_log_offset = offset
-                return
-            with log_path.open("rb") as log_file:
+            with Path(session.log_path).open("rb") as log_file:
+                size = os.fstat(log_file.fileno()).st_size
+                offset = getattr(session, "_survivor_log_offset", 0)
+                if size < offset:
+                    offset = 0
+                    session._survivor_decoder = None
+                    with session._lock:
+                        session.output_buffer = ""
+                if session._survivor_decoder is None:
+                    session._survivor_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                decoder = session._survivor_decoder
                 log_file.seek(offset)
-                chunk = log_file.read(session.max_output_chars)
-            session._survivor_log_offset = offset + len(chunk)
-            text = chunk.decode("utf-8", errors="replace")
-            self._ingest_output(session, text)
+                # Snapshot EOF so a busy writer cannot starve status/stop checks.
+                # Never seek past unread output: watches and live sinks need it.
+                while log_file.tell() < size:
+                    raw = log_file.read(min(4096, session.max_output_chars, size - log_file.tell()))
+                    if not raw:
+                        break
+                    session._survivor_log_offset = log_file.tell()
+                    self._ingest_survivor_output(session, decoder.decode(raw))
+                if final:
+                    self._ingest_survivor_output(session, decoder.decode(b"", final=True))
         except OSError:
             return
+
+    def _ingest_survivor_output(self, session: ProcessSession, text: str) -> None:
+        if session._survivor_head_noise:
+            text = self._clean_shell_noise(text)
+            session._survivor_head_noise = not text.strip()
+        self._ingest_output(session, text)
 
     @staticmethod
     def _file_backed(session: ProcessSession) -> bool:
@@ -491,5 +506,5 @@ class ProcessSurvivalMixin:
             logger.warning("Could not persist survivor termination for %s", session.id, exc_info=True)
 
     def _finish_survivor(self, session: ProcessSession, exit_code, reason: str, source: str) -> None:
-        self._read_survivor_log(session)
+        self._read_survivor_log(session, final=True)
         self._finish_exited(session, exit_code, reason=reason, source=source)

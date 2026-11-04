@@ -13,6 +13,7 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 from tools.process_registry_notifications import format_process_notification
 
 
+@pytest.mark.platforms("posix")
 def test_ordinary_local_exit_survives_spawner(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
@@ -28,17 +29,17 @@ session = registry.spawn_local("sleep 1; printf 'durable-tail\\n'; exit 37")
 session.notify_on_complete = True
 registry._write_checkpoint()
 os._exit(0)
-""")
+""", encoding="utf-8")
     spawned = subprocess.run([sys.executable, str(script)], env={**os.environ, "PYTHONPATH": str(Path.cwd())},
                              capture_output=True, text=True, timeout=15, check=False)
     assert spawned.returncode == 0, spawned.stderr
-    entry, = json.loads(checkpoint.read_text())
+    entry, = json.loads(checkpoint.read_text(encoding="utf-8-sig"))
     assert entry["exit_path"], "ordinary jobs must record an exit outside their spawner"
     deadline = time.monotonic() + 15
     while not Path(entry["exit_path"]).exists():
         assert time.monotonic() < deadline
         time.sleep(0.05)
-    assert Path(entry["exit_path"]).read_text().strip() == "37"
+    assert Path(entry["exit_path"]).read_text(encoding="utf-8-sig").strip() == "37"
     successor = ProcessRegistry()
     assert successor.recover_from_checkpoint() == 1
     result = successor.wait(entry["session_id"], timeout=10)
@@ -47,16 +48,17 @@ os._exit(0)
     assert successor.completion_queue.get(timeout=5)["exit_code"] == 37
 
 
+@pytest.mark.platforms("posix")
 def test_killed_wrapper_persists_its_wait_status(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     registry = ProcessRegistry()
     session = registry.spawn_local("sleep 30", cwd=str(tmp_path))
     try:
         assert session.pid is not None
-        os.killpg(session.pid, signal.SIGKILL)
+        os.killpg(session.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only test
         result = registry.wait(session.id, timeout=10)
-        assert result["exit_code"] == -signal.SIGKILL
-        assert Path(session.exit_path).read_text().strip() == str(-signal.SIGKILL)
+        assert result["exit_code"] == -signal.SIGKILL  # windows-footgun: ok — POSIX-only test
+        assert Path(session.exit_path).read_text(encoding="utf-8-sig").strip() == str(-signal.SIGKILL)  # windows-footgun: ok — POSIX-only test
     finally:
         if not session.exited:
             registry.kill_process(session.id)
@@ -70,7 +72,7 @@ def test_legacy_gone_exit_is_retained_and_announced(tmp_path, monkeypatch, recov
     child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(19)"])
     child.wait(timeout=10)
     log = tmp_path / "legacy.log"
-    log.write_text("legacy-tail\n")
+    log.write_text("legacy-tail\n", encoding="utf-8")
     session = ProcessSession(id="proc_legacy_exit", command="legacy", pid=child.pid,
                              detached=True, log_path=str(log), notify_on_complete=True)
     registry = ProcessRegistry()

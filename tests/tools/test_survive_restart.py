@@ -123,6 +123,8 @@ def test_survivor_log_reads_are_bounded_and_unchanged_polls_do_not_read(tmp_path
     registry = ProcessRegistry()
     session = _checkpoint_survivor(registry, home, pid=999999, log_text="x" * 100_000)
     session.max_output_chars = 100
+    streamed = []
+    registry.on_output = lambda session, chunk: streamed.append(chunk)
     original_open = Path.open
     reads = []
 
@@ -135,6 +137,10 @@ def test_survivor_log_reads_are_bounded_and_unchanged_polls_do_not_read(tmp_path
             self.stream.close()
         def seek(self, offset):
             return self.stream.seek(offset)
+        def tell(self):
+            return self.stream.tell()
+        def fileno(self):
+            return self.stream.fileno()
         def read(self, size=-1):
             assert 0 <= size <= session.max_output_chars
             reads.append(size)
@@ -147,11 +153,14 @@ def test_survivor_log_reads_are_bounded_and_unchanged_polls_do_not_read(tmp_path
     monkeypatch.setattr(Path, "open", instrumented_open)
     registry._read_survivor_log(session)
     registry._read_survivor_log(session)
-    assert reads == [100]
-    with original_open(Path(session.log_path), "a") as log:
+    # All unread bytes reach the sink, but each read and the retained tail stay bounded.
+    assert reads == [100] * 1000
+    assert "".join(streamed) == "x" * 100_000
+    with original_open(Path(session.log_path), "a", encoding="utf-8") as log:
         log.write("y" * 10_000 + "TAIL")
     registry._read_survivor_log(session)
-    assert reads == [100, 100]
+    assert reads == [100] * 1100 + [4]
+    assert "".join(streamed) == "x" * 100_000 + "y" * 10_000 + "TAIL"
     assert len(session.output_buffer) <= 100
     assert session.output_buffer.endswith("TAIL")
 
