@@ -149,6 +149,7 @@ class WorkerRPC:
         self.lock = threading.Lock()
         self.endpoint = None
         self.link = None
+        self.worker_scope = None
         self.request_id = 0
 
     def _connection(self, deadline=None):
@@ -183,6 +184,10 @@ class WorkerRPC:
         # A served secondary has no socket; its multiplexer's descriptor names it.
         from hermes_cli.gateway_runtime import discover_gateway_endpoint
         discovery = discover_gateway_endpoint(self.home, timeout=_connection_budget(deadline))
+        if discovery.reason_code == 'client_owned':
+            from hermes_cli.gateway_worker_discovery import discover_worker_gateway_endpoint
+            discovery = discover_worker_gateway_endpoint(self.home, self.worker_scope,
+                                                         timeout=_connection_budget(deadline))
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
@@ -230,6 +235,12 @@ class WorkerRPC:
             raise WorkerPersistenceError('synchronous_rpc_on_event_loop')
         from websockets.exceptions import ConnectionClosed
         with self.lock:
+            # Initial adopt and subsequent requests carry the owner's private
+            # assignment. Retain its closed adoption scope for rediscovery, not
+            # the creator PID or a caller-selected "worker" flag.
+            from gateway.session_worker import _SCOPE
+            if _SCOPE <= params.keys():
+                self.worker_scope = {key: params[key] for key in _SCOPE}
             deadline = time.monotonic() + OWNER_RESTART_TIMEOUT
             self.request_id += 1
             request_id = self.request_id

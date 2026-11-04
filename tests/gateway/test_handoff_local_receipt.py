@@ -62,7 +62,7 @@ async def test_a_handed_off_bot_chat_opens_on_its_lane_after_a_restart(tmp_path,
     segment (the title follows it), and the earlier segment is that lane's read-only history, never a
     local row no receipt restores."""
     from gateway.config import Platform
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal, SessionRef
     from gateway.session_local import create_local_session
     from gateway.session_local_recovery import transcript_target
@@ -133,7 +133,7 @@ async def test_a_receipt_whose_current_segment_is_still_local_is_never_released(
     """An older build handed off a chat's FIRST segment after a local ``/new``: that row moved, but
     the receipt names the post-``/new`` segment, still local. Releasing it would leave that
     transcript reachable from nowhere, so the boot heal keeps it and the conversation still opens."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from hermes_state_local import local_receipt
@@ -157,7 +157,7 @@ async def test_a_receipt_whose_current_segment_is_still_local_is_never_released(
 
 async def _handed_off_bot_chat(tmp_path):
     """A Bot Chat the Desktop minted and a ``/handoff`` moved to Telegram, still open in that Desktop."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     runner = _Runner(tmp_path)
@@ -177,7 +177,7 @@ async def _handed_off_bot_chat(tmp_path):
 async def test_a_handed_off_bot_chat_stays_the_bots_chat_while_its_lane_holds_it(tmp_path):
     """Bot Mode's one canonical chat per profile: a Bot or cron delivery after the restart goes to
     the handed-off Bot Chat on its lane; it is never renamed aside for a freshly minted one."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_bot import _target, displaceable_bot_chat
     from gateway.session_local_title import resolve_titled_session
     _runner, _warm, owner, ref, _telegram, route = await _handed_off_bot_chat(tmp_path)
@@ -216,7 +216,7 @@ async def test_a_handed_off_bot_chat_whose_lane_moved_on_is_moved_aside(tmp_path
     title moves aside at once, so the Bots row's roster and its registry lookup agree at every step
     (warm, cold) and its click mints a fresh Bot Chat; the Desktop still viewing the old one is
     read-only (its route names the new conversation)."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_bot import _target
     from gateway.session_controls import AuthorityConnection
     from hermes_state_runtime import RuntimeStoreError
@@ -255,7 +255,7 @@ async def test_a_second_chat_handed_off_to_the_same_home_chat_supersedes_the_fir
     """Desktop A handed off its Bot Chat H to the Telegram home chat; Desktop B then hands off its
     own open chat Y there. The lane names Y now: H is history, read-only for the Desktop still
     viewing it (a Stop or turn through it would act on Y), and its canonical title moves aside."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local import create_local_session
     from hermes_state_runtime import RuntimeStoreError
     runner, warm, owner, ref, telegram, route = await _handed_off_bot_chat(tmp_path)
@@ -288,7 +288,7 @@ async def test_the_bots_own_bot_chat_after_a_reset_handoff_and_the_lanes_new_is_
     """The Bot Chat a delivery minted (its automatic creation id), reset locally, handed off, then the
     platform's ``/new``: the next delivery mints the next generation. The handed-off creation row
     (its name went to the head) is spent, never reused as an unfinished creation."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_bot import _target
     from gateway.session_contract import Principal
     runner = _Runner(tmp_path)
@@ -360,7 +360,7 @@ async def test_a_platform_resume_of_a_local_conversation_continues_its_current_h
     continues the conversation's head, as ``/handoff`` carries it, so X2 never stays a local row
     whose receipt was released (refused ``storage_unavailable`` after a restart)."""
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal, SessionRef
     from gateway.session_local import create_local_session
     from gateway.session_local_title import resolve_titled_session
@@ -399,7 +399,7 @@ async def test_a_moved_conversation_is_read_only_once_its_lane_is_taken_over(tmp
     only route is the lane's, so a turn or a Stop through it would act on the new conversation:
     read stays open, submit and control are refused, warm and after a restart."""
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal, SessionRef
     from gateway.session_local import create_local_session
     from hermes_state_local import local_receipt
@@ -460,7 +460,7 @@ async def test_a_moved_conversation_mounted_by_startup_recovery_is_read_only_onc
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.run_runtime import recover_profile_native_sessions
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_ingress_context import native_callback, register_transport_home
     from gateway.session_local import create_local_session
@@ -523,7 +523,7 @@ async def test_a_moved_conversation_resumed_on_another_chat_moves_there(tmp_path
     a turn or a Stop through it acts on chat 77, never on B, which holds 4242; and once chat 77 moves
     on (its ``/new``) A is that chat's history, read-only again."""
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from hermes_state_runtime import RuntimeStoreError
@@ -562,7 +562,7 @@ async def test_a_moved_conversation_resumed_on_another_chat_moves_there(tmp_path
 
 @pytest.mark.asyncio
 async def test_a_moved_receipt_with_a_malformed_lineage_never_stops_the_boot(tmp_path, monkeypatch):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from hermes_state_local import POLICY_PREFIX

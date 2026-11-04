@@ -1384,6 +1384,9 @@ def _collection_enabled() -> bool:
 
 def enabled() -> bool:
     """Return the shared-metrics policy for the active Hermes profile."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return False
     profile_key = relay_runtime.current_profile_key()
     if _collection_enabled():
         return True
@@ -1411,6 +1414,9 @@ def _reconcile_send_consent_once() -> None:
     AND consent is off: nothing to protect, and creating ``~/.hermes/telemetry`` for every
     fully-disabled user would be the wrong behaviour change.
     """
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return
     global _consent_reconcile_done
     if _consent_reconcile_done:
         return

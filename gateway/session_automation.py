@@ -445,6 +445,7 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     # Synthetic wakes clear ``message_id`` (#52694, #123097) while the committed human source keeps
     # it, so compare the routing/provenance identity, never the platform reply anchor.
     if (runner.session_store._generate_session_key(restored.source) != entry.session_key
+            or restored.source.user_id != event.source.user_id
             or runner._adapter_for_source(restored.source) is not adapter):
         raise RuntimeStoreError('admission_conflict')
     provenance = deepcopy(envelope['provenance'])

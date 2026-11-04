@@ -22,6 +22,11 @@ def dispatch_context(lane: str, code_sha: str | None):
     return ctx
 
 
+def script_dispatch() -> bool:
+    """Whether the current worker has only script (not agent) admission."""
+    return _dispatch_identity.get()[0] == "script"
+
+
 def note_dispatch_stage(job: dict, stage: str) -> None:
     """Keep stage timing local, metadata-only, and unable to fail a dispatch."""
     try:

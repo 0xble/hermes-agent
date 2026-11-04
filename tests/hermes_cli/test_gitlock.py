@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli._git_process_scope import git_process_running_for as _REAL_SCOPED_GIT_GUARD
 from hermes_cli.gitlock import (
     LOCK_NAMES,
     STALE_LOCK_MIN_AGE_SECONDS,
@@ -124,7 +125,9 @@ def test_graph_refresh_clears_object_store_debris_and_leaves_the_index_lock(
     # The install checkout's own sweep (every update) still takes it.
     assert clear_stale_git_locks(repo) == [str(git_dir / "index.lock")]
 
+    from hermes_cli import _git_process_scope
     monkeypatch.setattr(gitlock, "_git_proc_running", _REAL_GIT_GUARD)
+    monkeypatch.setattr(_git_process_scope, "git_process_running_for", _REAL_SCOPED_GIT_GUARD)
     lock = git_dir / "objects" / "info" / "commit-graphs" / "commit-graph-chain.lock"
     exec_path = Path(subprocess.run(["git", "--exec-path"], capture_output=True, text=True, check=True).stdout.strip())
     dashed = next(exec_path.glob("git-cat-file*"), None)
@@ -141,11 +144,13 @@ def test_graph_refresh_clears_object_store_debris_and_leaves_the_index_lock(
         _touch(lock, STALE_LOCK_MIN_AGE_SECONDS + 60)
         (git_dir / _FRESH_STAMP).unlink(missing_ok=True)
         if case == "dashed git running":
-            with subprocess.Popen([str(dashed), "--batch"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL) as live:
+            with subprocess.Popen([str(dashed), "--batch"], cwd=repo, stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL) as live:
                 refresh_commit_graph(str(repo), git_dir)
                 live.communicate()
         else:
             monkeypatch.setitem(sys.modules, "psutil", None)
+            monkeypatch.setattr(_git_process_scope, "_PROC_ROOT", tmp_path / "unavailable-proc")
             monkeypatch.setenv("PATH", str(blind))
             refresh_commit_graph(str(repo), git_dir)
         assert lock.exists(), case

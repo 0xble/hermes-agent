@@ -30,8 +30,142 @@
 # separator required. The explicit '--' form still works and stacks with
 # bare flags. Positional path arguments override the default discovery
 # root (tests/).
+#
+# A missing or stale checkout environment is rebuilt by run-in-hermes-env,
+# which runs setup-hermes.sh. That setup writes tool, dependency, and
+# test-env state into the inherited HERMES_HOME. The fallback refuses when
+# that home is a live runtime home: a current release pointer
+# ($HERMES_HOME/current symlink, including a dangling one), gateway_state.json,
+# a running gateway pid (gateway.pid or gateway.b.pid), or the OS account's
+# default Hermes home. The account default comes from the password database,
+# not $HOME — workers pin HOME to scratch. Rebuild the checkout-local venv
+# instead, from the checkout, after stopping anything that is using .venv and
+# removing it if it exists:
+#   python -m pm.build_env --source . --out .venv --group dev --group test
+# Or set HERMES_HOME to a scratch directory that is not a live runtime home.
+# HERMES_ALLOW_LIVE_HOME_SETUP=1 overrides the refusal only when setup against
+# that home is deliberate. hermes update and the installer do not use this guard.
 
 set -euo pipefail
+
+# Predicate for the test-runner fallback. Sourcing this file defines it and
+# returns; it does not run the suite. The runner body below executes only when
+# this file is the program.
+hermes_account_default_home() {
+  local py=""
+  if [ -x /usr/bin/python3 ]; then
+    py=/usr/bin/python3
+  elif command -v python3 >/dev/null 2>&1; then
+    py="$(command -v python3)"
+  else
+    return 1
+  fi
+  "$py" -c 'import os, pwd, sys
+from pathlib import Path
+suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+try:
+    account = Path(pwd.getpwuid(os.getuid()).pw_dir)
+except Exception:
+    raise SystemExit(1)
+if sys.platform == "win32":
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    base = Path(local) if local else account / "AppData" / "Local"
+    print(base / ("hermes" + suffix))
+else:
+    print(account / (".hermes" + suffix))
+' || return 1
+}
+
+hermes_canonical_home() {
+  local path="${1%/}"
+  [ -n "$path" ] || return 1
+  if [ -d "$path" ]; then
+    (cd "$path" && pwd -P) || return 1
+    return 0
+  fi
+  printf '%s\n' "$path"
+}
+
+hermes_same_home() {
+  local left right
+  left="$(hermes_canonical_home "$1")" || return 1
+  right="$(hermes_canonical_home "$2")" || return 1
+  [ "$left" = "$right" ]
+}
+
+hermes_pid_from_file() {
+  local file="$1" line pid
+  [ -f "$file" ] || [ -L "$file" ] || return 1
+  # JSON {"pid": N} or a legacy bare integer. Read only; never unlink.
+  line="$(sed -n '1,20p' "$file" 2>/dev/null || true)"
+  pid="$(printf '%s\n' "$line" | sed -n \
+    -e 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    -e 's/^\([0-9][0-9]*\)$/\1/p' | sed -n '1p')"
+  [ -n "$pid" ] || return 1
+  [ "$pid" -gt 0 ] 2>/dev/null || return 1
+  printf '%s\n' "$pid"
+}
+
+hermes_gateway_pid_running() {
+  local home="$1" file pid
+  for file in "$home/gateway.pid" "$home/gateway.b.pid"; do
+    pid="$(hermes_pid_from_file "$file" 2>/dev/null || true)"
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+hermes_effective_test_home() {
+  local os
+  if [ -n "${HERMES_HOME:-}" ]; then
+    printf '%s\n' "$HERMES_HOME"
+    return 0
+  fi
+  os="$(uname -s 2>/dev/null || printf '%s' unknown)"
+  case "$os" in
+    MINGW*|MSYS*|CYGWIN*) printf '%s\n' "${LOCALAPPDATA:-${HOME:-}/AppData/Local}/hermes" ;;
+    *) printf '%s\n' "${HOME:-}/.hermes" ;;
+  esac
+}
+
+# Prints why HOME is a live runtime home, or nothing and status 1.
+# The optional second argument is an already-resolved account default.
+hermes_runtime_home_live_reason() {
+  local home="$1"
+  local account_default="${2-}"
+  [ -n "$home" ] || return 1
+  if [ -L "$home/current" ]; then
+    printf '%s\n' "current release pointer"
+    return 0
+  fi
+  if [ -e "$home/gateway_state.json" ] || [ -L "$home/gateway_state.json" ]; then
+    printf '%s\n' "gateway_state.json"
+    return 0
+  fi
+  if hermes_gateway_pid_running "$home"; then
+    printf '%s\n' "running gateway pid"
+    return 0
+  fi
+  if [ -z "$account_default" ]; then
+    account_default="$(hermes_account_default_home 2>/dev/null || true)"
+  fi
+  if [ -n "$account_default" ] && hermes_same_home "$home" "$account_default"; then
+    printf '%s\n' "account default home"
+    return 0
+  fi
+  return 1
+}
+
+hermes_runtime_home_is_live() {
+  hermes_runtime_home_live_reason "$@" >/dev/null
+}
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
 
 # ── Locate repo root ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,6 +211,20 @@ else
     if [ -n "${__HERMES_TESTS_REEXEC:-}" ]; then
       echo "error: run-in-hermes-env did not produce a current environment for $REPO_ROOT" >&2
       exit 1
+    fi
+    # Only this fallback. hermes update and the installer call setup directly.
+    if [ "${HERMES_ALLOW_LIVE_HOME_SETUP:-}" != 1 ]; then
+      _live_home="$(hermes_effective_test_home)"
+      _live_reason="$(hermes_runtime_home_live_reason "$_live_home" || true)"
+      if [ -n "$_live_reason" ]; then
+        echo "error: refusing to run test-environment setup against a live runtime home: $_live_home ($_live_reason)." >&2
+        echo "That setup writes tool, dependency, and test-env state into HERMES_HOME." >&2
+        echo "Rebuild the checkout-local venv instead. From the checkout, stop anything using .venv, remove it if it exists, then run:" >&2
+        echo "  python -m pm.build_env --source . --out .venv --group dev --group test" >&2
+        echo "Or set HERMES_HOME to a scratch directory that is not a live runtime home." >&2
+        echo "Set HERMES_ALLOW_LIVE_HOME_SETUP=1 only when setup against this home is deliberate." >&2
+        exit 1
+      fi
     fi
     echo "▶ environment missing or stale for $REPO_ROOT — re-running under run-in-hermes-env" >&2
     export __HERMES_TESTS_REEXEC=1

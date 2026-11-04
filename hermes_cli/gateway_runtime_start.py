@@ -11,6 +11,30 @@ from hermes_cli.gateway_launchd_runtime import GatewayJob, start_gateway_job
 from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
 
 
+def unmanaged_spawn_options(deadline, idle_exit, client_lease) -> dict:
+    """Only finite clients add a private lease to the existing spawn contract."""
+    options = {"deadline": deadline, "idle_exit": idle_exit}
+    if client_lease is not None:
+        options["client_lease"] = client_lease
+    return options
+
+
+def retirement_wait(observed, finite_owner):
+    """One wait policy for expiring finite owners and normally retiring daemons."""
+    from hermes_cli.gateway_runtime import GatewayDiscovery, _RETIRING
+    if observed.reason_code == "client_owned":
+        return True, GatewayDiscovery("conflict", reason_code="client_owned",
+            detail="timed out waiting for another finite client to exit; wait for that client "
+                   "to finish and retry, or use a separate HERMES_HOME for parallel clients")
+    return observed.state == "draining" and observed.reason_code in _RETIRING, finite_owner
+
+
+def deadline_verdict(finite_owner):
+    """Retain the finite-owner wait remedy when its startup budget expires."""
+    from hermes_cli.gateway_runtime import GatewayDiscovery
+    return finite_owner or GatewayDiscovery("starting", reason_code="deadline")
+
+
 # One launch's policy and pins, never the shared daemon's: hook consent would become daemon-lifetime
 # auto-approval for messaging/cron, and a Kanban worker's or terminal's pins would retarget every later
 # session's board, cwd and source. The behaviour values main's CLI read per process (ephemeral prompt,
@@ -34,13 +58,14 @@ DAEMON_STRIPPED_ENV = (
 
 
 def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: bool = False,
-                            force: bool = False) -> subprocess.Popen | GatewayJob:
+                            force: bool = False, client_lease=None) -> subprocess.Popen | GatewayJob:
     """Request a daemon, not readiness. Refuse Windows no-breakaway fallback.
 
     No --replace, persistence, login changes, elevation, shell, or inherited stdio.
     The gateway runtime's own exclusive ownership fence arbitrates racing starts.
     ``idle_exit``: the daemon ends itself once idle (a chat/TUI/cron client's own start; never
     Desktop's ``gateway ensure``, which keeps its attached gateway for the app's lifetime).
+    ``client_lease``: finite local client ownership; replaces idle exit with a private pipe.
     ``force``: a ``gateway restart --force --detach`` replacement keeps the ``--force`` its old owner
     needed (a named profile under a multiplexer), or it exits on the run-side guard.
     """
@@ -51,7 +76,8 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     # profile's daemon. A <root>/profiles/<name> home is already trusted as-is.
     selector = [] if home.parent.name == "profiles" else ["--profile", "default"]
     command = [sys.executable, "-m", "hermes_cli.main", *selector, "gateway", "run", "--quiet",
-               *(["--idle-exit"] if idle_exit else []), *(["--force"] if force else [])]
+               *(["--client-owned"] if client_lease is not None else ["--idle-exit"] if idle_exit else []),
+               *(["--force"] if force else [])]
     # The target profile's own secrets, never the launching client's: a `hermes -p work` client's
     # dotenv would otherwise become the default daemon's frozen launch env (host_gateway_child_env).
     from tools.environments.local import served_profile_child_env
@@ -70,19 +96,27 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     from gateway.session_context import _VAR_MAP  # the launching turn's session identity, too
     for key in (*DAEMON_STRIPPED_ENV, *_VAR_MAP):
         env.pop(key, None)
+    from gateway.client_lifetime import CLIENT_LEASE_TOKEN_ENV
+    env.pop(CLIENT_LEASE_TOKEN_ENV, None)
+    if client_lease is not None:
+        env[CLIENT_LEASE_TOKEN_ENV] = client_lease.token
     remaining(deadline)
     logs = home / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    if sys.platform == "darwin":  # LAN access must outlive the app that asked for the gateway
+    # Finite clients need their private lifetime pipe, not a persistent launchd job.
+    if sys.platform == "darwin" and client_lease is None:
         if job := start_gateway_job(command, env=env, cwd=root, log_path=logs / "gateway-stdio.log",
                                     deadline=deadline):
             return job
     try:
         with (logs / "gateway-stdio.log").open("ab", buffering=0) as output:
             remaining(deadline)
-            return subprocess.Popen(command, cwd=root, env=env, close_fds=True,
-                                    stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                    **windows_detach_popen_kwargs())
+            child = subprocess.Popen(command, cwd=root, env=env, close_fds=True,
+                                     stdin=subprocess.PIPE if client_lease is not None else subprocess.DEVNULL,
+                                     stdout=output, stderr=output, **windows_detach_popen_kwargs())
+            if client_lease is not None:
+                client_lease.own(child)
+            return child
     except OSError as exc:
         reason = "windows_breakaway_unavailable" if sys.platform == "win32" else "spawn_failed"
         raise RuntimeStartError(reason) from exc

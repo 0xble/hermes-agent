@@ -294,7 +294,10 @@ async def _start_gateway_start_control_socket(runner):
             payload = build_identify_payload()
             payload.update({key: descriptor[key] for key in (
                 "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
+                "served_profiles", "parked_profiles", "capabilities", "client_owned") if key in descriptor})
+            if descriptor.get("client_owned"):
+                from gateway.client_lifetime import client_lease_token
+                payload["client_lease_token"] = client_lease_token()
             if getattr(runner, '_draining', False):
                 payload.update(state='draining')
                 # The restart's after-turn wait still owns its turns: clients reach it to answer a
@@ -369,6 +372,8 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.webapp_listener import register_control_verbs
         from hermes_constants import get_hermes_home
         register_control_verbs(runner, get_hermes_home(), server=_control_server)
+        from gateway.session_worker_discovery import worker_discovery_handler
+        _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)
         if not await _control_server.start():
             _control_server = None
         else:
@@ -732,14 +737,14 @@ def _start_gateway_early_environment_probe() -> None:
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
+                        client_owned: bool = False) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all; ``idle_exit`` arms the
     unmanaged idle exit (``gateway.run_idle_exit``) for a client-started daemon."""
     from gateway.run import (
         GatewayRunner,
-        _best_effort,
         _enable_multiplex_log_routing,
         _ensure_windows_gateway_venv_imports,
         _gateway_loop_exception_handler,
@@ -781,6 +786,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Config verdicts come before the duplicate-instance guard: `--replace` must not stop a healthy
     # gateway for a launch that cannot start.
     resolved_config = config if config is not None else load_gateway_config_for_runner()
+    from gateway.run_client_owned import config_for_owner
+    resolved_config = config_for_owner(resolved_config, client_owned)
     # The first turn's prompt needs the host toolchain probe (five subprocess calls); start it now
     # so it runs beside the boot imports instead of serially inside the pre-READY warm-up.
     _start_gateway_early_environment_probe()
@@ -844,6 +851,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _loop_guard.set_loop_thread(None)
         try:
             runner = GatewayRunner(resolved_config)
+            runner._client_owned = client_owned
         finally:
             _loop_guard.set_loop_thread(_previous_loop_thread)
         from gateway.run_runtime import initialize_gateway_runtime
@@ -907,21 +915,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         from gateway.run_runtime import start_gateway_runtime_api
         await start_gateway_runtime_api(runner)
 
-        def _lifecycle_record_startup() -> Optional[dict]:
-            # Report if the previous life died uncleanly (SIGKILL / OOM / VM death), then claim the
-            # sentinel for this life. After the PID-file claim so a --replace loser can't clobber it.
-            # The store scan that report used to run here is deferred: see below.
-            from gateway.lifecycle_ledger import record_startup
-            return record_startup()
-
-        def _start_keepalive() -> None:
-            from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
-            start_nous_auth_keepalive()
-
-        # The lifecycle sentinel belongs to the authoritative gateway, never a standby.
-        _unclean_exit = (None if is_standby() else
-                         _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s"))
-        _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
+        # After the PID claim: a losing replacement must not clobber crash evidence.
+        from gateway.run_client_owned import start_daemon_lifecycle
+        _unclean_exit = start_daemon_lifecycle(client_owned=client_owned, standby=is_standby())
         _ensure_windows_gateway_venv_imports()
 
         _early_verdict = await _start_gateway_run_runner(runner, _signal_initiated_shutdown)
@@ -931,7 +927,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _start_deferred_state_db_integrity_check(_unclean_exit)
 
         cron_stop, cron_provider, cron_thread, housekeeping_thread = (
-            _facade_start_cron_and_housekeeping(runner))
+            (None, None, None, None) if client_owned else _facade_start_cron_and_housekeeping(runner))
         # From here every exit (a READY publication that raises included) runs the shutdown tail,
         # which stops the cron ticker and housekeeping before the adapters they deliver through close.
         from gateway.run_runtime import publish_gateway_runtime_ready, wait_gateway_runtime
@@ -941,15 +937,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 publish_gateway_runtime_ready(runner)
             mark_ready()
             runner._start_systemd_watchdog()
-            if idle_exit:
-                from gateway.run_idle_exit import arm_unmanaged_idle_exit
-                arm_unmanaged_idle_exit(runner)
-            else:
-                # A supervised/explicit gateway serves Desktop and the dashboard SPA, which call the
-                # dashboard routes right away: mount them now, after READY. A client's own idle-exit
-                # gateway (chat -q, TUI) only uses the native WebSocket; it mounts on first request.
-                from gateway.run_api import warm_gateway_dashboard
-                warm_gateway_dashboard(runner)
+            from gateway.run_client_owned import arm_owner_ready_services
+            arm_owner_ready_services(runner, idle_exit=idle_exit, client_owned=client_owned)
             await wait_gateway_runtime(runner)
         finally:
             try:

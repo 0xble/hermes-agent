@@ -127,7 +127,7 @@ async def test_editing_ones_own_branch_leaves_another_logins_parent_alone(tmp_pa
     from gateway.session_authority import SessionAuthority
     from gateway.session_contract import SessionRef
     from gateway.session_mutations import mutate_session
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tui_gateway.methods_session import _persist_branch
 
     caps = frozenset({'session:read', 'session:control', 'session:create', 'session:operator'})
@@ -172,7 +172,7 @@ async def test_renaming_ones_own_branch_leaves_another_logins_parent_title_alone
     from gateway.session_authority import SessionAuthority
     from gateway.session_contract import SessionRef
     from gateway.session_mutations import mutate_session
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tui_gateway.methods_session import _persist_branch
 
     caps = frozenset({'session:read', 'session:control', 'session:create', 'session:operator'})

@@ -97,9 +97,9 @@ def _emit_compression_summary(agent, cs):
             _eff_cap = getattr(_cc, "_effective_threshold_cap", lambda _ctx: None)(_cc.context_length)
             _cap_binds = _eff_cap is not None and _cc.threshold_tokens == _eff_cap
             _cap_note = f" (capped at {_cap:,} tokens)" if _cap_binds else ""
-            print(f"📊 Context limit: {_cc.context_length:,} tokens (compress at {int(_pct*100)}% = {_cc.threshold_tokens:,}{_cap_note})")
+            agent._safe_print(f"📊 Context limit: {_cc.context_length:,} tokens (compress at {int(_pct*100)}% = {_cc.threshold_tokens:,}{_cap_note})", diagnostic=True)
         else:
-            print(f"📊 Context limit: {_cc.context_length:,} tokens (auto-compression disabled)")
+            agent._safe_print(f"📊 Context limit: {_cc.context_length:,} tokens (auto-compression disabled)", diagnostic=True)
         # Gateway users get the same text via _compression_warning on turn 1.
         if _autoraise_notice:
             agent._safe_print(_autoraise_notice, diagnostic=True)

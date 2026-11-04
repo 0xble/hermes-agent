@@ -209,7 +209,7 @@ async def probe(spec):
     from gateway.run import GatewayRunner
     from gateway.run_api import stop_gateway_api
     from gateway.run_runtime import start_gateway_runtime_api
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     import hermes_cli.webapp
 
     home = Path(os.environ["HERMES_HOME"])

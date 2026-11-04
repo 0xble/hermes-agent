@@ -169,7 +169,7 @@ async def run_gateway_chat(args, emitter=None):
     # Finite: answer one prompt and exit (-z, --oneshot, -Q, stream-json, or -q off a TTY).
     oneshot = bool(oneshot_prompt or getattr(args, "oneshot_exit", False) or quiet or
                    (query and not (sys.stdin.isatty() and sys.stdout.isatty())))
-    async with connect_gateway() as client:
+    async with connect_gateway(one_shot=oneshot) as client:
         description = await client.rpc("runtime.describe")
         title = continue_title(args)
         create_if_missing = bool(title and getattr(args, "create_if_missing", False))

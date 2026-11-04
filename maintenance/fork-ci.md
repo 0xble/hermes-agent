@@ -92,6 +92,15 @@ but, on failure, reports per-profile request counts, heartbeat/success age, and
 canary job state (no prompts or keys) so the next missed fire can be attributed
 to enumeration, ticker liveness, claim, or execution instead of an opaque timeout.
 
+Prompt-surface review keeps full commit ancestry for the merge-base comparison,
+but its checkout uses Git's `blob:none` partial-clone filter. Fetching every
+historical blob exhausted the job's 5-minute budget before review could run,
+even though the review reads only the head tree and the merge-base snapshot.
+Checkout and base `git archive` hydrate the content actually read. A real local
+Git regression leaves an unrelated historical artifact missing while rendering
+the base-to-head prompt diff. The job timeout, staleness test, committed
+snapshots, qualification requirement, and core-approval path are unchanged.
+
 The nightly fetches upstream CalVer release tags before its historical upgrade E2E:
 `actions/checkout` sees only fork tags (latest `v2026.8.3`), otherwise the test's
 `git describe HEAD~1` stages an obsolete updater instead of the previous release.
@@ -457,6 +466,20 @@ signal and covers stale identities, vanished leaders and changing membership.
 Linux handoff behavior requires native Linux evidence, not a macOS platform skip.
 Retire this adaptation when the accepted upstream guard proves the same owned
 process topologies without allowing signals to unrelated live processes.
+
+## Attachment Probe Runtime Isolation
+
+The `fork-ci-reliability` identity also covers the attachment-handshake probe.
+It supplies the test runner's already-required Node.js through `HERMES_NODE`,
+resolved with `node -p process.execPath` in the runner's real environment, not
+as a PATH shim that depends on version-manager configuration under `HOME`.
+It disables lazy installs in its credential-stripped child environment. An
+unused bootstrap flag did not prevent a fresh PM runtime and Node installation
+inside each isolated home. The genuine-owner control also requires that no
+managed tool store was created. Keep the real CLI, HTTP discovery, owner lease,
+90-second deadline and live-system guard unchanged. Run the attachment file
+on Linux and macOS. Retire this adaptation when upstream's attachment fixture
+selects its supplied runtime without provisioning one during the assertion.
 
 ## Verification and retirement
 

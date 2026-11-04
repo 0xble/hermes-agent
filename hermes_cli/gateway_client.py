@@ -275,7 +275,25 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
 
 
 @asynccontextmanager
-async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 1024):
+async def connect_gateway(endpoint=None, subject=None, *, one_shot: bool = False,
+                          max_size=8 * 1024 * 1024):
+    """Attach normally, or lease only a finite client's own newly spawned gateway.
+
+    Existing endpoints/services are borrowed, never owned or stopped by this context.
+    The lease covers ensure and ticket failures as well as connection teardown.
+    """
+    from hermes_cli.gateway_client_lifetime import ClientGatewayLease
+    lease = ClientGatewayLease() if one_shot else None
+    try:
+        async with _connect_gateway(endpoint, subject, client_lease=lease, max_size=max_size) as client:
+            yield client
+    finally:
+        if lease is not None:
+            await asyncio.to_thread(lease.close)
+
+
+@asynccontextmanager
+async def _connect_gateway(endpoint=None, subject=None, *, client_lease=None, max_size=8 * 1024 * 1024):
     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
     (maintenance that must never start a gateway); default ensures one, starting it if needed.
     ``subject``: mint the ticket for this principal (the caller's authenticated dashboard user)
@@ -302,7 +320,10 @@ async def connect_gateway(endpoint=None, subject=None, *, max_size=8 * 1024 * 10
         home = gateway_profile_home(get_hermes_home())
         # A client's own start: the daemon it may launch ends itself once idle (no client, adapter,
         # cron/kanban work or admission), and the next client starts a fresh one.
-        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True)
+        kwargs = {"idle_exit": True}
+        if client_lease is not None:
+            kwargs["client_lease"] = client_lease
+        result = await asyncio.to_thread(ensure_gateway_runtime, home, **kwargs)
         if not attachable(result):
             detail = getattr(result, "detail", None)
             if result.reason_code == "runtime_exited" and detail:

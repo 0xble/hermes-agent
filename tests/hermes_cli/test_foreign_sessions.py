@@ -122,7 +122,7 @@ def gateway(tmp_path, monkeypatch):
     from gateway.session_contract import Principal, SessionRef
     from gateway.session_mutations import mutate_session
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     db = SessionDB(db_path=tmp_path / "state.db")
     authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id="p", instance_id="owner",
@@ -320,7 +320,7 @@ async def test_imported_chat_resumes_writable_as_cli(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import SessionRef
     from gateway.session_controls import AuthorityConnection
     monkeypatch.setattr(run, "_load_gateway_config", lambda: {"model": {"default": "m1", "provider": "openrouter"}})

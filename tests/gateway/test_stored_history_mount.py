@@ -28,7 +28,7 @@ async def _connect(tmp_path, monkeypatch, sid, **identity):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {'default': 'm1', 'provider': 'openrouter'}})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())

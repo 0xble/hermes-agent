@@ -44,8 +44,11 @@ import sys
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
+
+from gateway.client_lifetime import arm_client_lifetime_for_argv
+arm_client_lifetime_for_argv(sys.argv)
+
 from hermes_cli import _startup_fast
-import itertools
 
 # A literal ``~``/``$VAR`` in HERMES_HOME (fish, or any quoted value) must become absolute
 # before the first reader — otherwise it resolves against cwd and scaffolds <cwd>/~/.hermes.
@@ -60,11 +63,7 @@ _startup_fast.normalize_hermes_home_env()
 # mentioning both words never arm a 300s hard-exit timer. Foreground runs arm
 # too — a pre-loop wedge is just as dead without a supervisor; GatewayRunner
 # disarms once the event loop is live.
-def _argv_is_gateway_run(argv: list) -> bool:
-    return any(a == "gateway" and b == "run" for a, b in itertools.pairwise(argv))
-
-
-if _argv_is_gateway_run(sys.argv[1:]):
+if _startup_fast.argv_is_gateway_run(sys.argv[1:]):
     try:
         from hermes_startup_watchdog import arm_startup_watchdog as _arm_sw
 
@@ -1587,8 +1586,8 @@ def _warn_retired_xai_models() -> None:
         pass
 
 
-def _start_chat_background_prefetch() -> None:
-    """Kick off the update-check/banner prefetch and the bundled-skills sync.
+def _start_chat_background_prefetch(*, prefetch_banner: bool = True) -> None:
+    """Sync skills and warm banner probes only where displayed, not in TUI launchers.
 
     Update check is opt-in on Termux (it imports rich/prompt_toolkit in the
     foreground and competes for CPU on single-core devices). The skills sync
@@ -1599,7 +1598,7 @@ def _start_chat_background_prefetch() -> None:
     on the very first launch), so the first run syncs in the foreground and
     drops the banner's skills cache.
     """
-    if _termux_should_prefetch_update_check():
+    if prefetch_banner and _termux_should_prefetch_update_check():
         try:
             from hermes_cli.banner import prefetch_banner_data, prefetch_update_check
 
@@ -1706,7 +1705,7 @@ def cmd_chat(args):
         _first_run_setup_guard(args)
         return
 
-    _start_chat_background_prefetch()
+    _start_chat_background_prefetch(prefetch_banner=not use_tui)
 
     # --yolo: bypass all dangerous command approvals. main() also sets this
     # before _prepare_agent_startup() — the authoritative site, since it runs

@@ -186,16 +186,14 @@ def _receipt_looks_unfinished(receipt: dict) -> bool:
 
 
 def _receipt_reports_stale_runtime(receipt: dict, expected_sha: str | None = None) -> bool:
-    """True when ``update_receipts/latest.json`` records a runtime SHA skew.
+    """True when the latest update receipt records runtime SHA skew (#95294).
 
-    Prefer the post-restart ``fleet`` matrix. ``plan.runtimes[].code_sha`` is captured
-    *before* the pull, so a finished update's plan always looks stale and must not
-    retrigger a restart; consult it only for an unfinished receipt.
-
-    See #95294.
+    Prefer the post-restart fleet; pre-pull plan SHAs count only for unfinished
+    updates. An absent receipt needs no source identity: Git-history probes can
+    consume multiple 3 s deadlines in both finite client and gateway before readiness.
     """
     from hermes_cli.update_cmd import _current_checkout_sha
-    if not isinstance(receipt, dict):
+    if not isinstance(receipt, dict) or not receipt:
         return False
     expected_sha = expected_sha or _current_checkout_sha()
     if not expected_sha:

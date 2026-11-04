@@ -151,7 +151,7 @@ async def probe(port):
     from gateway.run import GatewayRunner
     from gateway.run_api import stop_gateway_api
     from gateway.run_runtime import start_gateway_runtime_api
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_cli.dashboard_auth import list_providers
     from hermes_cli.plugins import discover_plugins
     import hermes_cli.webapp

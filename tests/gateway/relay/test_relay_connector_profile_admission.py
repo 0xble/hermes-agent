@@ -107,7 +107,7 @@ def _requests(authority):
 
 @pytest.mark.asyncio
 async def test_single_profile_gateway_serves_a_connector_stamped_profile(tmp_path, monkeypatch):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_constants import get_hermes_home
     launch = Path(get_hermes_home()).resolve()
     # A profile of the stamped name exists on disk: the single-profile gateway must still not use it.
@@ -274,7 +274,7 @@ def _discord_modal(profile):
 
 @pytest.mark.asyncio
 async def test_single_profile_gateway_serves_stamped_commands_and_discord_interactions(tmp_path, monkeypatch):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_constants import get_hermes_home
     launch = Path(get_hermes_home()).resolve()
     (launch / 'profiles' / 'work').mkdir(parents=True, exist_ok=True)

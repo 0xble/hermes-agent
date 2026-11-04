@@ -5,6 +5,17 @@ import sys
 from contextlib import redirect_stdout
 
 
+def run_options(args) -> dict:
+    """CLI-only launch flags, preserving the non-client-owned injected call shape."""
+    return {
+        "quiet": getattr(args, "quiet", False),
+        "replace": getattr(args, "replace", False),
+        "force": getattr(args, "force", False),
+        "idle_exit": getattr(args, "idle_exit", False),
+        **({"client_owned": True} if getattr(args, "client_owned", False) else {}),
+    }
+
+
 def ensure_exit_code(result) -> int:
     if result.reason_code == "deadline":
         return 5
