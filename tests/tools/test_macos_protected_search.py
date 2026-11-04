@@ -76,10 +76,10 @@ def test_grep_pruned_search_still_finds_nested_protected_names(tmp_path, monkeyp
     home = tmp_path / "Users" / "alice"
     project = home / "work" / "repo" / "Downloads"
     project.mkdir(parents=True)
-    (project / "notes.txt").write_text("needle here\n")
+    (project / "notes.txt").write_text("needle here\n", encoding="utf-8")
     protected = home / "Downloads"
     protected.mkdir()
-    (protected / "secret.txt").write_text("needle protected\n")
+    (protected / "secret.txt").write_text("needle protected\n", encoding="utf-8")
     monkeypatch.setattr(file_operations, "_HOME", str(home))
     ops = ShellFileOperations(LocalEnvironment(cwd=str(home)))
     monkeypatch.setattr(ops, "_has_command", lambda command: command == "grep")
@@ -140,7 +140,8 @@ def test_rg_multi_root_scopes_protected_globs_and_restores_absolute_paths(monkey
     commands = _rg_files_commands(env.commands)
     assert len(commands) == 1
     command = commands[0]
-    assert command.startswith("set -o pipefail; cd '/' && ")
+    assert command.startswith("set -o pipefail; ")
+    assert "(cd -- '/' && " in command
     assert "--sortr=modified" in command
     assert "'!Users/alice/Downloads/**'" in command
     assert "'!repo/Downloads/**'" not in command
@@ -173,8 +174,8 @@ def test_rg_scoped_multi_root_terminates_options_before_dash_prefixed_root(monke
     result = ops.search("*.txt", path="., --version", target="files")
 
     command = _rg_files_commands(env.commands)[0]
-    assert "cd '/' &&" in command
-    assert " -- '.' '--version' | head -n " in command
+    assert "(cd -- '/' &&" in command
+    assert " -- '.' '--version') | head -n " in command
     assert result.error is None
 
 
@@ -185,8 +186,8 @@ def test_real_ripgrep_does_not_descend_into_protected_folder(tmp_path, monkeypat
     protected = home / "Downloads"
     safe.mkdir(parents=True)
     protected.mkdir()
-    (safe / "visible.txt").write_text("needle")
-    (protected / "protected.txt").write_text("needle")
+    (safe / "visible.txt").write_text("needle", encoding="utf-8")
+    (protected / "protected.txt").write_text("needle", encoding="utf-8")
     monkeypatch.setattr(file_operations, "_HOME", str(home))
     ops = ShellFileOperations(LocalEnvironment(cwd=str(home)))
 

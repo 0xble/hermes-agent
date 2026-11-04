@@ -40,7 +40,24 @@ whose directory components are only `**`, retain the directory supplement so
 empty and nested directories remain discoverable. Other path globs and brace
 alternation exceed that supplement's basename-only syntax. Shell status
 propagation lets the environment wrapper finish capturing status, saving its
-snapshot, and reporting the observed working directory.
+snapshot, and reporting the observed working directory. The shared session cwd
+must stay at the caller's directory after successful, empty, or failed searches.
+`_run_rg_bounded` scopes its shell transport's explicit cwd in `(cd -- ... && ... )`,
+not in the wrapper shell. The native transport scopes only its subprocess cwd.
+This protects the directory supplement within a call as well as subsequent
+relative search/read operations. Expand a tilde cwd using the backend's HOME
+before translating coordinates; never use the controller's home. If a cwd cannot
+be resolved to an absolute POSIX path, unanchored searches keep the original
+unscoped operands, and anchored searches fail explicitly rather than guessing.
+
+Cwd-mutation audit: `file_operations_search.py`'s filename rg builder was the only
+bare `cd` command. The shared bounded-rg transport now owns its isolation. The
+content rg/grep builders, pruned grep pipeline, find filename fallback,
+directory-supplement find, zero-match hint `ls`, and `file_operations.py`'s read,
+read-probe, byte-exact/hex, Python-snippet, atomic-write, patch, move/delete, and
+not-found suggestion `ls` builders contain no directory-changing shell command.
+`file_operations_common.py`, `file_operations_native.py`, and
+`file_operations_lint.py` contain no directory-changing shell commands either.
 
 ## Provenance and patch
 
@@ -113,6 +130,18 @@ and the previously recursive `./` interpretation. GREEN through `heavy-slot` and
 platform skips; the filename-glob module passes all 294 cases, including four
 file-operand checks. The directory supplement's results are normalized into the
 same absolute output coordinates as ripgrep before deduplication.
+
+The cwd-preservation regression module `tests/tools/test_search_cwd_preservation.py`
+first ran at `0ed0708b9304` and produced **9 failed / 5 passed**: all three shell
+variants moved cwd or lost the relative directory supplement; unresolved cwd
+coordinates either scoped to a literal tilde or raised mixed-root `commonpath`.
+The corrected 18-case module keeps one environment across repeated relative
+filename/content searches and read/missing-read operations (no cwd repair between
+calls), compares shell/native directory results, checks diagnostic failures, and
+covers backend-expanded tilde cwd with mixed absolute/relative roots. The full
+21-module search/file-operation run passes **698 tests, 0 failures, 13 platform
+skips**, using `scripts/run_tests.sh --file-retries 0` under `heavy-slot` with
+per-command sandbox homes and an explicit scratch test interpreter.
 
 Also run the relevant broader tools tests through the canonical runner.
 Recovery verification through machine-wide `heavy-slot` admission observed:

@@ -399,7 +399,7 @@ def test_off_path_windows_rg_miss_is_reprobed_then_success_is_cached(
 
     assert ops._resolve_command("rg") is None
     candidate.parent.mkdir(parents=True)
-    candidate.write_text("")
+    candidate.write_text("", encoding="utf-8")
     expected = str(candidate).replace("\\", "/")
     assert ops._resolve_command("rg") == expected
     assert ops._resolve_command("rg") == expected
@@ -484,8 +484,8 @@ def test_modified_multi_path_search_preserves_exact_order_request():
     assert result.files == ["/two/new.py", "/one/old.py"]
     assert len(env.rg_commands) == 1
     assert "--sortr=modified" in env.rg_commands[0]
-    assert "cd '/' &&" in env.rg_commands[0]
-    assert " -- 'one' 'two' | head -n " in env.rg_commands[0]
+    assert "(cd -- '/' &&" in env.rg_commands[0]
+    assert " -- 'one' 'two') | head -n " in env.rg_commands[0]
 
 
 def test_comma_delimited_file_roots_preserve_internal_spaces_in_one_search():

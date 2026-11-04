@@ -284,6 +284,13 @@ def _filename_search_coordinates(
             raise ValueError("Root-anchored filename globs require POSIX search roots and cwd.")
         return None, [glob], roots
 
+    # A backend (notably SSH before its first cwd marker) may still report '~'.
+    # Never interpret that relative token in the controller's namespace, mix it
+    # with absolute roots in commonpath, or pass a quoted '~' to cd.
+    if not posixpath.isabs(cwd):
+        if anchored:
+            raise ValueError("Root-anchored filename globs require an absolute POSIX backend cwd.")
+        return None, [glob], roots
     absolute_roots = [posixpath.normpath(posixpath.join(cwd, root)) for root in roots]
     # Parents also work for explicitly selected FILE operands: never cd into a file.
     common = posixpath.commonpath(map(posixpath.dirname, absolute_roots))
@@ -503,10 +510,15 @@ class SearchMixin:
         """Run an rg command (shell-quoted words) and keep the first ``fetch_limit``
         lines: natively on a local POSIX host, else through the backend shell as
         ``<prefix><words> | head -n N``. ``native_ok=False`` keeps shell-only
-        forms; ``native_cwd`` mirrors an explicit ``cd`` in ``shell_prefix``."""
+        forms; ``native_cwd`` scopes either transport without changing the
+        enclosing environment wrapper's observed working directory."""
         if native_ok and self._native_read_enabled():
             return self._run_rg_native(words, fetch_limit, timeout, merge_stderr=merge_stderr,
                                        capture_stderr=capture_stderr, cwd=native_cwd)
+        if native_cwd:
+            # The environment records pwd after this command. A bare cd would
+            # relocate the shared terminal and break later relative operations.
+            words = [f"(cd -- {self._escape_shell_arg(native_cwd)} && {' '.join(words)})"]
         if capture_stderr:
             return self._run_rg_shell_with_stderr(words, fetch_limit, timeout, shell_prefix)
         stderr = "" if merge_stderr else " 2>/dev/null"
@@ -1051,6 +1063,8 @@ class SearchMixin:
         ordering is explicit because it scans globally."""
         roots = [path] if isinstance(path, str) else path
         cwd = getattr(self.env, "cwd", None) or self.cwd
+        if cwd.startswith("~"):
+            cwd = self._expand_path(cwd)  # backend HOME, never the controller's
         try:
             scoped_common, glob_patterns, command_roots = _filename_search_coordinates(pattern, roots, cwd)
         except ValueError as exc:
@@ -1073,7 +1087,6 @@ class SearchMixin:
         rg = self._quote_executable(rg_executable)
         sort_arg = " --sortr=modified" if order == "modified" else ""
         root_args = " ".join(self._escape_native_tool_arg(root) for root in command_roots)
-        cd_prefix = f"cd {self._escape_shell_arg(scoped_common)} && " if scoped_common else ""
         # A silent no-match walk can otherwise fan out over every available CPU.
         walker_threads = max(1, min(4, (os.cpu_count() or 1) // 4))
         # ``--`` terminates options so a dash-prefixed root is never parsed as a flag.
@@ -1082,7 +1095,7 @@ class SearchMixin:
                   f"{exclusion_args} -- {root_args}")
         result = self._run_rg_bounded([rg_cmd], fetch_limit, timeout=60,
                                       native_cwd=scoped_common,
-                                      shell_prefix=f"set -o pipefail; {cd_prefix}", capture_stderr=True)
+                                      shell_prefix="set -o pipefail; ", capture_stderr=True)
         stdout, limit_reason = _search_stdout_and_limit(result)
         all_files = [f for f in stdout.splitlines() if f]
         if scoped_common:
