@@ -47,9 +47,9 @@ def search(tmp_path, local_env, monkeypatch, request):
 @pytest.mark.parametrize("pattern,expected", [
     (
         "{lefthook.yml,lefthook.yaml,.lefthook.yml,.lefthook.yaml,.githooks/*}",
-        # Slash-bearing globs are passed verbatim: rg anchors them to the matched
-        # path, so sub/lefthook.yaml is not a hit. Explicit globs select dotfiles.
-        {"lefthook.yml", ".lefthook.yml"},
+        # Unanchored unions match a suffix relative to every root. Explicit
+        # alternatives select dotfiles, but do not opt into hidden directories.
+        {"lefthook.yml", "sub/lefthook.yaml", ".lefthook.yml"},
     ),
     ("*.py", {"sub/main.py"}),
     ("lefthook.yml", {"lefthook.yml", ".lefthook.yml"}),
@@ -139,7 +139,7 @@ def test_multiroot_anchored_globs_keep_each_root_and_absolute_identity(
     assert result.error is None, result.to_dict()
     actual = {Path(ops.env.cwd, file).resolve().relative_to(root.resolve()).as_posix() for file in result.files}
     assert actual == expected
-    assert native_calls == ([str(root)] if native_enabled else [])
+    assert native_calls == ([str(root)] * (1 if "{root}" in pattern else 2) if native_enabled else [])
 
 
 def test_multiroot_anchored_globs_escape_literal_root_names(search):
@@ -228,17 +228,20 @@ def _walk_oracle(pattern, roots, cwd=None, operands=None):
             for name in files:
                 candidate = Path(directory, name)
                 relative = candidate.relative_to(root).as_posix()
-                matched_path = relative
+                variants = list(alternatives)
                 if not anchored:
-                    matched_path = (Path(operand) / candidate.relative_to(root)).as_posix()
-                    if Path(operand).is_absolute() and candidate.is_relative_to(cwd):
-                        matched_path = candidate.relative_to(cwd).as_posix()
-                for alternative in alternatives:
-                    if not anchored and "/" not in suffix and "{" not in suffix:
+                    prefixes = {operand, os.path.relpath(root, cwd), root.name}
+                    prefixes.update(root.as_posix()[index + 1:] for index, char in enumerate(root.as_posix())
+                                    if char == "/")
+                    for prefix in prefixes - {"."}:
+                        if pattern.startswith(prefix.rstrip("/") + "/"):
+                            variants.append(pattern[len(prefix.rstrip("/")) + 1:])
+                for alternative in variants:
+                    if not anchored and "/" not in pattern and "{" not in pattern:
                         matches = fnmatch.fnmatchcase(name, "*" + alternative)
                     else:
-                        glob = alternative
-                        matches = _oracle_glob(matched_path.split("/"), glob.split("/"))
+                        glob = alternative if anchored else "**/" + alternative
+                        matches = _oracle_glob(relative.split("/"), glob.split("/"))
                     if matches:
                         expected.add(candidate.resolve())
     return expected
@@ -293,7 +296,7 @@ def test_filename_coordinate_matrix(search, root_count, location, spelling, patt
     actual = {Path(cwd, file).resolve() for file in result.files}
     assert actual == _walk_oracle(pattern, roots, cwd, operands)
     assert bool(native_calls) == ops._native_read_enabled()
-    assert len(native_calls) <= 1
+    assert len(native_calls) <= root_count
     if root_count == 2:
         single = ops.search(pattern, operands[0], target="files", limit=200)
         assert single.error is None, single.to_dict()
@@ -346,3 +349,57 @@ def test_filename_file_operand_never_becomes_cwd(search, absolute_pattern):
     result = ops.search(pattern, str(selected), target="files")
     assert result.error is None, result.to_dict()
     assert {Path(root, file).resolve() for file in result.files} == {selected.resolve()}
+
+
+@pytest.mark.parametrize("pattern_kind", [
+    "basename", "path", "brace", "lefthook", "recursive", "repeat-full",
+    "repeat-basename", "dot-anchor", "slash-anchor", "absolute-anchor",
+])
+def test_filename_invariants_across_cwd_spelling_and_extra_roots(search, pattern_kind, monkeypatch):
+    _, base, ops = search
+    root = base / "workspace/repo"
+    extra = base / "unrelated"
+    unrelated_cwd = base / "caller"
+    unrelated_cwd.mkdir()
+    for selected in (root, extra):
+        for name in ("src/a.py", "nested/src/b.py", "main.py", "nested/main.py",
+                     "lefthook.yml", "nested/lefthook.yaml", ".lefthook.yml",
+                     ".githooks/pre-commit", "other.txt"):
+            file = selected / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text("fixture\n", encoding="utf-8")
+    patterns = {
+        "basename": "*.py", "path": "src/*.py", "brace": "{src/*.py,main.py}",
+        "lefthook": "{lefthook.yml,lefthook.yaml,.lefthook.yml,.lefthook.yaml,.githooks/*}",
+        "recursive": "**/src/*.py", "repeat-full": "workspace/repo/src/*.py",
+        "repeat-basename": "repo/*.py", "dot-anchor": "./src/*.py",
+        "slash-anchor": "/src/*.py", "absolute-anchor": str(root / "main.py"),
+    }
+    pattern = patterns[pattern_kind]
+    expected = _walk_oracle(pattern, [root], base, ["repo"])
+    assert expected, pattern
+    native = ops._run_rg_native
+    native_calls = []
+    def record_native(*args, **kwargs):
+        result = native(*args, **kwargs)
+        assert result is not None, "property must not silently use shell fallback"
+        native_calls.append(kwargs.get("cwd"))
+        return result
+    monkeypatch.setattr(ops, "_run_rg_native", record_native)
+    failures = []
+    for cwd in (root, root.parent, unrelated_cwd):
+        for absolute in (False, True):
+            for roots in ([root], [root, extra]):
+                ops.cwd = ops.env.cwd = str(cwd)
+                operands = [str(item) if absolute else os.path.relpath(item, cwd) for item in roots]
+                result = ops.search(pattern, ", ".join(operands), target="files", limit=200)
+                actual = {Path(cwd, file).resolve() for file in result.files}
+                under_root = {file for file in actual if file.is_relative_to(root.resolve())}
+                # Check the entire result too: an unrelated root may add only its own matches.
+                all_expected = expected | _walk_oracle(pattern, roots[1:], base, ["unrelated"])
+                if result.error or under_root != expected or actual != all_expected:
+                    failures.append((str(cwd), absolute, len(roots), result.error,
+                                     sorted(map(str, actual - all_expected)),
+                                     sorted(map(str, all_expected - actual))))
+    assert bool(native_calls) == ops._native_read_enabled()
+    assert not failures, failures

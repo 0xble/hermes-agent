@@ -66,12 +66,13 @@ def test_search_preserves_cwd_across_relative_operations(tmp_path, monkeypatch, 
 @pytest.mark.parametrize("roots", [["sub"], ["/external", "sub"]])
 def test_filename_coordinates_never_scope_to_an_unresolved_cwd(cwd, roots):
     if not cwd.startswith("/"):
-        with pytest.raises(ValueError, match="absolute POSIX backend cwd"):
-            _filename_search_coordinates("./main.py", roots, cwd)
-    scoped, _, operands = _filename_search_coordinates("*.py", roots, cwd)
-    # Basename globs keep base operands and never use an unresolved cwd for cd.
-    assert scoped is None
-    assert operands == roots
+        for pattern in ("./main.py", "*.py"):
+            with pytest.raises(ValueError, match="absolute POSIX backend cwd"):
+                _filename_search_coordinates(pattern, roots, cwd)
+    else:
+        jobs = _filename_search_coordinates("*.py", roots, cwd)
+        assert len(jobs) == len(roots)
+        assert all(parent.startswith("/") for parent, _, _ in jobs)
 
 
 @pytest.mark.parametrize("native", ["0", "1"], ids=["shell", "native"])

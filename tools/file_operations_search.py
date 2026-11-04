@@ -262,51 +262,55 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
 
 def _filename_search_coordinates(
     pattern: str, roots: list[str], cwd: str,
-) -> tuple[Optional[str], list[str], list[str]]:
-    """Translate explicit root anchors into one rg cwd, glob union and operand list.
+) -> list[tuple[str, list[str], str]]:
+    """One independent parent cwd/glob/operand job per root, including file roots.
 
-    Unanchored globs retain base ripgrep coordinates exactly: the caller's cwd
-    and original root operands. Common-parent translation exists only for explicit
-    per-root anchoring, so it must not affect ordinary path globs.
+    Use the parent instead of probing whether each remote operand is a file.
+    Literal prefixes keep a glob inside its root without a common-parent frame.
     """
     anchored = pattern.startswith(('/', './'))
-    dot_anchored = pattern.startswith('./')
-    while pattern.startswith('./'):
-        pattern = pattern[2:]
-    if not anchored:
-        if '/' not in pattern:
-            pattern = pattern if pattern.startswith('*') else f'*{pattern}'
-        return None, [pattern], roots
-    posix = all(not re.match(r"^[A-Za-z]:", value) and "\\" not in value
-                for value in [cwd, *roots])
-    if not posix:
+    windows_paths = any(re.match(r"^[A-Za-z]:[\\/]", value) for value in [cwd, *roots])
+    if windows_paths and anchored:
         raise ValueError("Root-anchored filename globs require POSIX search roots and cwd.")
-    # A backend (notably SSH before its first cwd marker) may still report '~'.
-    # Never interpret that relative token in the controller's namespace, mix it
-    # with absolute roots in commonpath, or pass a quoted '~' to cd.
-    if not posixpath.isabs(cwd):
-        raise ValueError("Root-anchored filename globs require an absolute POSIX backend cwd.")
-    absolute_roots = [posixpath.normpath(posixpath.join(cwd, root)) for root in roots]
-    # Parents also work for explicitly selected FILE operands: never cd into a file.
-    common = posixpath.commonpath(map(posixpath.dirname, absolute_roots))
-    operands = [posixpath.relpath(root, common) for root in absolute_roots]
-    candidates = [(root, pattern.lstrip('/')) for root in absolute_roots]
-    if not dot_anchored:
-        for root in sorted(absolute_roots, key=len, reverse=True):
-            prefix = root.rstrip('/') + '/'
-            if pattern == root:
-                candidates = [(root, '')]
-                break
-            if pattern.startswith(prefix):
-                candidates = [(root, pattern[len(prefix):])]
-                break
-    globs = []
-    for root, suffix in candidates:
-        relative = posixpath.relpath(root, common)
-        literal = re.sub(r"([\\*?{}\[\]])", lambda match: "\\" + match.group(0), relative)
-        rooted = (literal + '/' if relative != '.' else '') + suffix if suffix else literal
-        globs.append('/' + rooted)
-    return common, globs, operands
+    if not windows_paths and any("\\" in value for value in [cwd, *roots]):
+        raise ValueError("Filename globs require POSIX search roots and cwd.")
+    cwd = cwd.replace("\\", "/") if windows_paths else cwd
+    roots = [root.replace("\\", "/") for root in roots] if windows_paths else roots
+    if not posixpath.isabs(cwd) and not re.match(r"^[A-Za-z]:/", cwd):
+        raise ValueError("Filename globs require an absolute POSIX backend cwd.")
+    absolute_roots = [posixpath.normpath(root if re.match(r"^[A-Za-z]:/", root)
+                                       else posixpath.join(cwd, root)) for root in roots]
+    owner = None
+    if pattern.startswith('/'):
+        owner = next((root for root in sorted(absolute_roots, key=len, reverse=True)
+                      if pattern == root or pattern.startswith(root.rstrip('/') + '/')), None)
+    jobs = []
+    for original, root in zip(roots, absolute_roots):
+        if owner and owner != root:
+            continue
+        parent, operand = posixpath.dirname(root), posixpath.basename(root)
+        parent, operand = parent or '/', operand or '.'
+        if re.fullmatch(r"[A-Za-z]:", parent):
+            parent += '/'
+        literal = re.sub(r"([\\*?{}\[\]])", lambda match: "\\" + match.group(0), operand)
+        prefix = '' if operand == '.' else literal + '/'
+        if anchored:
+            suffix = pattern[len(root):].lstrip('/') if owner else pattern.removeprefix('./').lstrip('/')
+            globs = ['/' + prefix + suffix if suffix else '/' + literal]
+        elif '/' not in pattern and not any(char in pattern for char in '{}'):
+            globs = [pattern if pattern.startswith('*') else '*' + pattern]
+        else:
+            variants = [pattern]
+            # Accept repeated root paths regardless of caller cwd or root spelling.
+            # A root's literal basename is the shortest such path.
+            prefixes = {original, posixpath.relpath(root, cwd), posixpath.basename(root)}
+            prefixes.update(root[index + 1:] for index, char in enumerate(root) if char == '/')
+            for repeated in sorted(prefixes - {'.', ''}, key=len, reverse=True):
+                if pattern.startswith(repeated.rstrip('/') + '/'):
+                    variants.append(pattern[len(repeated.rstrip('/')) + 1:])
+            globs = list(dict.fromkeys('/' + prefix + '**/' + variant for variant in variants))
+        jobs.append((parent, globs, operand))
+    return jobs
 
 
 def _posix_roots(roots: list[str]) -> bool:
@@ -912,7 +916,7 @@ class SearchMixin:
             # Try without -printf (BSD find compatibility -- macOS)
             cmd_simple = (
                 f"find -H {escaped_path} -mindepth 1 {hidden_prune} -o -type d "
-                f"! -name '.*' -name {escaped_pattern} 2>/dev/null"
+                f"! -name '.*' -name {escaped_pattern} -print 2>/dev/null"
             )
             result = self._exec(cmd_simple, timeout=30)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -1058,25 +1062,9 @@ class SearchMixin:
         if cwd.startswith("~"):
             cwd = self._expand_path(cwd)  # backend HOME, never the controller's
         try:
-            scoped_common, glob_patterns, command_roots = _filename_search_coordinates(pattern, roots, cwd)
+            jobs = _filename_search_coordinates(pattern, roots, cwd)
         except ValueError as exc:
             return SearchResult(error=str(exc))
-        # Base macOS protected multi-root behavior is independent of glob anchoring:
-        # search from the roots' common ancestor and express exclusions relative to it.
-        effective_exclusions = self._effective_macos_search_exclusions(roots)
-        if effective_exclusions and len(roots) > 1 and _posix_roots(roots) and scoped_common is None:
-            absolute_roots = [
-                posixpath.normpath(root if posixpath.isabs(root) else posixpath.join(cwd, root))
-                for root in roots]
-            scoped_common = posixpath.commonpath(absolute_roots)
-            command_roots = [posixpath.relpath(root, scoped_common) for root in absolute_roots]
-        anchored = pattern.startswith(('/', './'))
-        fetch_limit = limit + offset + 1
-        exclusion_terms = [
-            f"--glob {self._escape_shell_arg('!' + (posixpath.relpath(absolute, scoped_common) if scoped_common else relative) + '/**')}"
-            for _r, relative, absolute in effective_exclusions]
-        exclusion_globs = " ".join(dict.fromkeys(exclusion_terms))
-        exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""
         rg_executable = rg_executable or self._resolve_command("rg")
         if not rg_executable:
             return SearchResult(error="File search requires ripgrep (rg).")
@@ -1084,58 +1072,72 @@ class SearchMixin:
             capability_error = self._modified_rg_capability_error(rg_executable)
             if capability_error:
                 return SearchResult(error=capability_error)
-        rg = self._quote_executable(rg_executable)
+        fetch_limit = limit + offset + 1
+        all_files = []
+        seen = set()
+        limit_reason = None
+        deadline = time.monotonic() + 60
+        for parent, globs, operand in jobs:
+            remaining = fetch_limit if order == "modified" else fetch_limit - len(all_files)
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                limit_reason = "search_timeout"
+                break
+            result = self._search_filename_root(
+                pattern, parent, globs, operand, remaining, order, rg_executable, max(1, int(timeout)))
+            if result.error:
+                return result
+            for file in result.files:
+                if file not in seen:
+                    all_files.append(file)
+                    seen.add(file)
+            limit_reason = limit_reason or result.limit_reason
+            if limit_reason or (order == "discovery" and len(all_files) >= fetch_limit):
+                break
+        if order == "modified":
+            all_files = self._sort_paths_by_mtime(all_files)
+        return SearchResult(
+            files=all_files[offset:offset + limit], total_count=len(all_files),
+            truncated=len(all_files) > offset + limit or bool(limit_reason), limit_reason=limit_reason)
+
+    def _search_filename_root(self, pattern, parent, globs, operand, fetch_limit,
+                              order, rg_executable, timeout):
+        root = posixpath.normpath(posixpath.join(parent, operand))
+        exclusions = self._effective_macos_search_exclusions([root])
+        exclusion_globs = [
+            '!/' + re.sub(r"([\\*?{}\[\]])", lambda match: "\\" + match.group(0),
+                          posixpath.relpath(absolute, parent)) + '/**'
+            for _r, _relative, absolute in exclusions]
+        glob_args = " ".join(f"-g {self._escape_shell_arg(glob)}" for glob in [*globs, *exclusion_globs])
         sort_arg = " --sortr=modified" if order == "modified" else ""
-        root_args = " ".join(self._escape_native_tool_arg(root) for root in command_roots)
-        # A silent no-match walk can otherwise fan out over every available CPU.
         walker_threads = max(1, min(4, (os.cpu_count() or 1) // 4))
-        # ``--`` terminates options so a dash-prefixed root is never parsed as a flag.
-        glob_args = " ".join(f"-g {self._escape_shell_arg(glob)}" for glob in glob_patterns)
-        rg_cmd = (f"{rg} --files{sort_arg} --threads {walker_threads} {glob_args}"
-                  f"{exclusion_args} -- {root_args}")
-        result = self._run_rg_bounded([rg_cmd], fetch_limit, timeout=60,
-                                      native_cwd=scoped_common,
+        cmd = (f"{self._quote_executable(rg_executable)} --files{sort_arg} --threads {walker_threads} "
+               f"{glob_args} -- {self._escape_native_tool_arg(operand)}")
+        result = self._run_rg_bounded([cmd], fetch_limit, timeout=timeout, native_cwd=parent,
                                       shell_prefix="set -o pipefail; ", capture_stderr=True)
         stdout, limit_reason = _search_stdout_and_limit(result)
-        all_files = [f for f in stdout.splitlines() if f]
-        if scoped_common:
-            all_files = [
-                f if posixpath.isabs(f) else posixpath.normpath(posixpath.join(scoped_common, f))
-                for f in all_files]
-        bounded_sigpipe = result.exit_code == 141 and len(all_files) >= fetch_limit
+        files = [posixpath.normpath(file if re.match(r"^[A-Za-z]:/", file)
+                                    else posixpath.join(parent, file))
+                 for file in stdout.splitlines() if file]
+        bounded_sigpipe = result.exit_code == 141 and len(files) >= fetch_limit
         if result.exit_code not in {0, 1, 124} and not bounded_sigpipe:
             diagnostic = result.stderr.strip()[:4096]
             operation = "Exact modification-time order" if order == "modified" else "File search"
             return SearchResult(error=(
                 f"{operation} failed while running ripgrep (exit {result.exit_code})."
                 + (f" {diagnostic}" if diagnostic else "")))
-        # rg --files lists files only; supplement with matching directories so
-        # empty directories stay discoverable (#54347). Skip the extra traversal
-        # when rg already timed out — partial file results must not be presented
-        # as a coherent page. Only the single-root path supplements (a multi-root
-        # walk is already the merged view across roots).
-        # A path made only of recursive ** components is still a basename
-        # search. Other path globs and brace alternation exceed find -name.
-        directory_parts = pattern.split('/')
-        if (limit_reason != "search_timeout" and isinstance(path, str)
-                and not anchored and not any(char in pattern for char in '{}')
-                and all(part == '**' for part in directory_parts[:-1]) and self._has_command("find")):
-            basename = directory_parts[-1]
-            directory_glob = basename if basename.startswith('*') else f"*{basename}"
-            dirs, directory_limit_reason = self._search_directories_with_find(directory_glob, path, fetch_limit)
+        parts = pattern.split('/')
+        # find's directory supplement supports basename globs, not path/brace globs.
+        if (limit_reason != "search_timeout" and not pattern.startswith(('/', './'))
+                and not any(char in pattern for char in '{}')
+                and all(part == '**' for part in parts[:-1]) and self._has_command("find")):
+            basename = parts[-1]
+            directory_glob = basename if basename.startswith('*') else '*' + basename
+            dirs, directory_limit = self._search_directories_with_find(directory_glob, root, fetch_limit)
             if dirs:
-                if scoped_common:
-                    dirs = [posixpath.normpath(posixpath.join(cwd, directory)) for directory in dirs]
-                existing = set(all_files)
-                merged_entries = self._sort_paths_by_mtime(
-                    all_files + [d for d in dirs if d not in existing])
-                # Under exact modified order rg is authoritative for files;
-                # the merged view keeps the newest-first contract globally.
-                all_files = merged_entries
-                limit_reason = limit_reason or directory_limit_reason
-        return SearchResult(
-            files=all_files[offset:offset + limit], total_count=len(all_files),
-            truncated=len(all_files) > offset + limit or bool(limit_reason), limit_reason=limit_reason)
+                files = self._sort_paths_by_mtime(list(dict.fromkeys([*files, *dirs])))[:fetch_limit]
+                limit_reason = limit_reason or directory_limit
+        return SearchResult(files=files, total_count=len(files), limit_reason=limit_reason)
 
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
