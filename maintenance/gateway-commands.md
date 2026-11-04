@@ -55,8 +55,10 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   `e169810be1581` and upstream `6696c7b0a404a` still lose ownership during creation.
 - Proof surface: `tests/gateway/test_exec_quick_command_tree.py` gates real transport readiness
   with an Event and verifies the original shell and child identities stop within 10 s, alongside
-  after-creation cancellation, timeout and genuine spawn-error controls. Fixture cleanup owns
-  failure-path survivors independently of the production cleanup.
+  after-creation cancellation, timeout and genuine spawn-error controls. The portable spawn-error
+  assertion accepts `OSError` (missing cwd is `FileNotFoundError` on POSIX but `NotADirectoryError`
+  on Windows), with injected `NotADirectoryError` coverage for both the reply and cancellation paths.
+  Fixture cleanup owns failure-path survivors independently of the production cleanup.
 - Retire when upstream drains creation ownership through cancellation with equivalent process
   cleanup. Roll back by reverting the commit carrying this identity.
 
