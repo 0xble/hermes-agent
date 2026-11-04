@@ -15,25 +15,49 @@ def test_ledger_first_open_is_not_quarantined_by_sessiondb(tmp_path, monkeypatch
     This is the competing opener in the session-end CI flake; [process] there
     describes a notification type, not a subprocess.
     """
+    import contextlib
     import importlib
     import hermes_state as hs
+    from hermes_cli.sqlite_safe_read import _TrackingMixin
 
     ledger = importlib.import_module(module)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     path = tmp_path / "state.db"
     monkeypatch.setattr(ledger, "_db_path", lambda: path)
     connected, release, peer_started, peer_finished = (threading.Event() for _ in range(4))
-    connect = sqlite3.connect
+    connect, tracked_connect = sqlite3.connect, hs._connect_tracked_db
+    startup_lock = hs.quarantine_cross_process_lock
+
+    def pause(conn):
+        assert path.stat().st_size == 0
+        connected.set()
+        assert release.wait(10), "ledger initializer was not released"
+        return conn
 
     def paused_connect(database, *args, **kwargs):
         conn = connect(database, *args, **kwargs)
-        if str(database) == str(path) and not connected.is_set():
-            assert path.stat().st_size == 0
-            connected.set()
-            assert release.wait(10), "ledger initializer was not released"
+        # Keep the old untracked opener reproducible too, without ever pausing
+        # inside connect_tracked's global probe-safety lock.
+        if str(database) == str(path) and not isinstance(conn, _TrackingMixin) and not connected.is_set():
+            pause(conn)
         return conn
 
+    def paused_tracked_connect(database, *args, **kwargs):
+        conn = tracked_connect(database, *args, **kwargs)
+        if str(database) == str(path) and not connected.is_set():
+            pause(conn)
+        return conn
+
+    @contextlib.contextmanager
+    def observed_lock(database, *args, **kwargs):
+        if connected.is_set():
+            peer_started.set()
+        with startup_lock(database, *args, **kwargs) as acquired:
+            yield acquired
+
     monkeypatch.setattr(sqlite3, "connect", paused_connect)
+    monkeypatch.setattr(hs, "_connect_tracked_db", paused_tracked_connect)
+    monkeypatch.setattr(hs, "quarantine_cross_process_lock", observed_lock)
 
     def open_ledger():
         conn = ledger._connect()
@@ -45,7 +69,6 @@ def test_ledger_first_open_is_not_quarantined_by_sessiondb(tmp_path, monkeypatch
             conn.close()
 
     def open_session():
-        peer_started.set()
         try:
             db = hs.SessionDB(db_path=path)
             try:
