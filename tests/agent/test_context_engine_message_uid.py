@@ -467,9 +467,13 @@ def test_micro_compactions_adjacent_user_merge_records_the_witness():
     second = {"role": "user", "content": "two", "message_uid": "2" * UID_LEN}
     merged = MicroCompactionMixin._merge_adjacent_user_turns(SimpleNamespace(), [first, second])
 
-    assert merged == [first] and first["content"] == "one\n\ntwo"
-    assert first["message_uid"] == "1" * UID_LEN
-    assert first["_absorbed_message_uids"] == ["2" * UID_LEN]
+    assert len(merged) == 1 and merged[0]["content"] == "one\n\ntwo"
+    assert merged[0]["message_uid"] == "1" * UID_LEN
+    assert merged[0]["_absorbed_message_uids"] == ["2" * UID_LEN]
+    # The archive is tentative until durable admission; held rows stay unchanged
+    # so a capacity rejection cannot persist a partially merged transcript.
+    assert first == {"role": "user", "content": "one", "message_uid": "1" * UID_LEN}
+    assert second == {"role": "user", "content": "two", "message_uid": "2" * UID_LEN}
 
 
 def test_an_assistant_merge_rewrite_persists_the_unioned_tool_call_uids(db):

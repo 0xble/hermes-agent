@@ -2,6 +2,7 @@
 import gzip
 import io
 import json
+import zlib
 
 from agent.runtime_session_store import WorkerPersistenceError
 
@@ -36,11 +37,14 @@ def read_journal(path, max_bytes):
         try:
             with gzip.GzipFile(fileobj=io.BytesIO(encoded)) as source:
                 encoded = source.read(limit + 1)
-        except (EOFError, gzip.BadGzipFile) as exc:
+        except (EOFError, gzip.BadGzipFile, zlib.error) as exc:
             raise WorkerPersistenceError('outbox_corrupt') from exc
         if len(encoded) > limit:
             raise WorkerPersistenceError('outbox_full')
-    return json.loads(encoded.decode('utf-8-sig'))
+    try:
+        return json.loads(encoded.decode('utf-8-sig'))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise WorkerPersistenceError('outbox_corrupt') from exc
 
 
 def check_worker_frame(scope, entry):
