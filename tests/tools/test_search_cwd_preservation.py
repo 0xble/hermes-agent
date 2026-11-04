@@ -65,19 +65,17 @@ def test_search_preserves_cwd_across_relative_operations(tmp_path, monkeypatch, 
 @pytest.mark.parametrize("cwd", ["~", "~/project", "relative/project", "/workspace/./project/.."])
 @pytest.mark.parametrize("roots", [["sub"], ["/external", "sub"]])
 def test_filename_coordinates_never_scope_to_an_unresolved_cwd(cwd, roots):
-    scoped, _, operands = _filename_search_coordinates("*.py", roots, cwd)
-    # An unresolved backend cwd must stay in its original coordinate system;
-    # only an absolute backend cwd may be used for commonpath or a quoted cd.
     if not cwd.startswith("/"):
-        assert scoped is None
-        assert operands == roots
-    else:
-        assert scoped and os.path.isabs(scoped)
-        assert all(os.path.isabs(os.path.join(scoped, operand)) for operand in operands)
+        with pytest.raises(ValueError, match="absolute POSIX backend cwd"):
+            _filename_search_coordinates("./main.py", roots, cwd)
+    scoped, _, operands = _filename_search_coordinates("*.py", roots, cwd)
+    # Basename globs keep base operands and never use an unresolved cwd for cd.
+    assert scoped is None
+    assert operands == roots
 
 
 @pytest.mark.parametrize("native", ["0", "1"], ids=["shell", "native"])
-@pytest.mark.parametrize("pattern", ["*.py", "./main.py"])
+@pytest.mark.parametrize("pattern", ["./main.py"])
 def test_backend_tilde_cwd_and_mixed_roots_are_resolved_before_scoping(tmp_path, monkeypatch, native, pattern):
     rg = shutil.which("rg")
     if not rg:

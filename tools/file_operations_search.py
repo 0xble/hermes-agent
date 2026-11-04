@@ -1061,11 +1061,19 @@ class SearchMixin:
             scoped_common, glob_patterns, command_roots = _filename_search_coordinates(pattern, roots, cwd)
         except ValueError as exc:
             return SearchResult(error=str(exc))
+        # Base macOS protected multi-root behavior is independent of glob anchoring:
+        # search from the roots' common ancestor and express exclusions relative to it.
+        effective_exclusions = self._effective_macos_search_exclusions(roots)
+        if effective_exclusions and len(roots) > 1 and _posix_roots(roots) and scoped_common is None:
+            absolute_roots = [
+                posixpath.normpath(root if posixpath.isabs(root) else posixpath.join(cwd, root))
+                for root in roots]
+            scoped_common = posixpath.commonpath(absolute_roots)
+            command_roots = [posixpath.relpath(root, scoped_common) for root in absolute_roots]
         anchored = pattern.startswith(('/', './'))
         fetch_limit = limit + offset + 1
-        effective_exclusions = self._effective_macos_search_exclusions(roots)
         exclusion_terms = [
-            f"--glob {self._escape_shell_arg('!' + (posixpath.relpath(absolute, scoped_common or cwd) if scoped_common or len(roots) == 1 else relative) + '/**')}"
+            f"--glob {self._escape_shell_arg('!' + (posixpath.relpath(absolute, scoped_common) if scoped_common else relative) + '/**')}"
             for _r, relative, absolute in effective_exclusions]
         exclusion_globs = " ".join(dict.fromkeys(exclusion_terms))
         exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""

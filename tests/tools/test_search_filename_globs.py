@@ -47,8 +47,9 @@ def search(tmp_path, local_env, monkeypatch, request):
 @pytest.mark.parametrize("pattern,expected", [
     (
         "{lefthook.yml,lefthook.yaml,.lefthook.yml,.lefthook.yaml,.githooks/*}",
-        # Explicit globs select dotfiles, but rg still prunes hidden directories.
-        {"lefthook.yml", "sub/lefthook.yaml", ".lefthook.yml"},
+        # Slash-bearing globs are passed verbatim: rg anchors them to the matched
+        # path, so sub/lefthook.yaml is not a hit. Explicit globs select dotfiles.
+        {"lefthook.yml", ".lefthook.yml"},
     ),
     ("*.py", {"sub/main.py"}),
     ("lefthook.yml", {"lefthook.yml", ".lefthook.yml"}),

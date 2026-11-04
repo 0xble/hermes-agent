@@ -154,7 +154,7 @@ def test_rg_multi_root_scopes_protected_globs_and_restores_absolute_paths(monkey
 
 @pytest.mark.platforms("macos")
 def test_rg_scoped_multi_root_terminates_options_before_dash_prefixed_root(monkeypatch):
-    # With the parent-coordinate translator, '/' keeps --version a bare operand.
+    # With base multi-root protected scoping, '/' keeps --version a bare operand.
     env = RecordingEnvironment("/")
     ops = ShellFileOperations(env)
     monkeypatch.setattr(file_operations, "_HOME", "/Users/alice")
