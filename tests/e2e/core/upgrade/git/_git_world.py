@@ -227,7 +227,9 @@ def world(root: Path, *, base: str, installer_ref: str | None = None,
         script.write_text(installer_script(installer_ref), encoding="utf-8")
         # The served repo publishes commits on main and no release tags: install main (N-1's
         # installer ignores the variable and installs main anyway).
-        cp = sb.run(["bash", str(script), "--non-interactive"], timeout=1800, input="",
+        # These worlds assert Git install/update behavior, not optional browser provisioning.
+        # Use the real installers' supported seam; the independent fresh-install test stays cold.
+        cp = sb.run(["bash", str(script), "--non-interactive", "--skip-browser"], timeout=1800, input="",
                     env={**sb.env, "HERMES_INSTALL_CHANNEL": "main"})
         assert cp.returncode == 0, f"install ({installer_ref or 'HEAD'} installer, base {base[:12]}) failed:\n{w.diag(cp)}"
         head = w.head()
