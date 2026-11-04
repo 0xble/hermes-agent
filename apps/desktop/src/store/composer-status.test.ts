@@ -56,6 +56,27 @@ describe('reconcileBackgroundProcesses', () => {
     expect(items()[2]!.exitCode).toBe(1)
   })
 
+  it.each([
+    { exit_code: null },
+    { exit_code: undefined },
+    { exit_code: 0, completion_reason: 'lost' },
+    { exit_code: 0, termination_source: 'checkpoint.exit_uncollected' },
+    { exit_code: 0, termination_source: 'survivor_lost' }
+  ])('keeps unknown exit %j non-successful in rows and native notifications', provenance => {
+    reconcileBackgroundProcesses(SID, [running('unknown')])
+    vi.mocked(dispatchNativeNotification).mockClear()
+    reconcileBackgroundProcesses(SID, [{ ...exited('unknown'), ...provenance }])
+
+    expect(items()[0]?.state).toBe('unknown')
+    expect(items()[0]?.title).toContain('exit status unknown')
+    expect(dispatchNativeNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: expect.stringMatching(/exit status unknown/i),
+        body: expect.stringMatching(/exit status unknown/i)
+      })
+    )
+  })
+
   it('keeps row order stable when a process flips state or the snapshot reorders', () => {
     reconcileBackgroundProcesses(SID, [running('a'), running('b')])
     // Snapshot arrives reordered AND `a` has exited — rows must not move.
@@ -186,7 +207,7 @@ describe('reconcileBackgroundProcesses', () => {
 
     expect(dispatchNativeNotification).toHaveBeenCalledWith(
       expect.objectContaining({
-        body: 'task-x\nline1\nline2\nline3'
+        body: 'task-x — finished, exit status unknown\nline1\nline2\nline3'
       })
     )
   })

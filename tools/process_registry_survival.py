@@ -213,6 +213,19 @@ class ProcessSurvivalMixin:
                 and (getattr(session, "notify_on_complete", False) or getattr(session, "watcher_interval", 0) > 0)
                 and self._survivor_delivery_pending(session))
 
+    def _retain_drain_completion(self, session: ProcessSession) -> bool:
+        """Carry a persistent job's collected result through the existing checkpoint handoff.
+
+        The gateway may have cancelled its queue consumer before agents drain.
+        This is a one-startup result handoff, not a restart-safe delivery lease.
+        """
+        stopped = getattr(self, "_survivor_pollers_stopped", None)
+        return (stopped is not None and stopped.is_set()
+                and getattr(session, "persist_on_release", False)
+                and not is_restart_safe(session) and has_exit_marker(session)
+                and getattr(session, "notify_on_complete", False)
+                and session.id not in self._completion_consumed)
+
     def _survivor_delivery_pending(self, session: ProcessSession) -> bool:
         """Read-only producer check: a queued event is not delivered and may replay after a crash."""
         return self._survivor_delivery_state(session) != "delivered"

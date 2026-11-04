@@ -64,9 +64,25 @@ Fork patch identity: `terminal-background-survival`.
   exactly-once delivery. Ordinary jobs retain their existing lifecycle kill
   policy. Legacy detached jobs whose PID is gone are retained as completed
   results, with `exit_code=null`, an explicit
-  `exited, status unknown (not collected)` completion when notification was
+  `finished, exit status unknown` completion when notification was
   requested, and any available log tail. Preserve explicit notification opt-outs.
   No missing status is inferred to be success or silently pruned.
+- Missing status (`null`/absent), `lost` completion provenance, and the
+  `checkpoint.exit_uncollected` / `survivor_lost` sources are explicitly unknown,
+  not success or a fabricated numeric failure. Concise gateway notices use a
+  warning marker and retain the output tail. Both watcher branches deliver
+  unknown outcomes in `error` mode, including busy-turn receipts; `off` stays off.
+  CLI/TUI shared transcript titles and model notices, classic CLI and React TUI
+  docks, and desktop status rows/native notices must not paint unknown as green.
+  Telegram and Slack use the shared gateway formatter/filter, not adapter forks.
+- A `persist_on_release` notify job can finish while agents drain after the
+  gateway queue consumer stops. Keep that finished job's existing checkpoint and
+  exit-marker/log result through shutdown so the successor restores its route,
+  enqueues the collected outcome and tail, and removes the one-startup handoff.
+  This reuses the checkpoint-backed saved-result recovery path, not a new outbox
+  or a `survive_restart` lease: no new running-job exemption, delivered marker,
+  or exactly-once promise for ordinary persistent jobs. Pollers still drain in
+  the old gateway; shutdown fencing must not add synchronous receipt IO.
 - Only explicitly opted-in local non-PTY background commands may survive a
   gateway restart. The wrapper owns `out.log`, an exit file, and a delivered
   marker in a profile-local directory; it starts a new session and never carries
@@ -176,12 +192,18 @@ Fork patch identity: `terminal-background-survival`.
   it leaves a pending checkpoint and no old-gateway offer, so the successor delivers.
 - Compatibility is additive: new checkpoint and receipt keys have safe absence
   behavior so an older release can roll back without a destructive migration.
-- Do not touch `gateway/platforms/event.py`, `response_filters.py`, locales, or
-  `gateway/lifecycle_ledger.py`; those surfaces are owned elsewhere.
+- Do not touch `gateway/platforms/event.py`, `response_filters.py`, or
+  `gateway/lifecycle_ledger.py`; those surfaces are owned elsewhere. Exit-status
+  notification wording owns only its additive English fallback keys in locales.
 
 ## Verification
 
-Contract tests: `tests/tools/test_process_registry_exit_marker_semantics.py` `tests/tools/test_process_registry_login_rc.py` `tests/tools/test_process_registry_shutdown_drain.py` `tests/tools/test_process_registry_survivor_boundaries.py`
+Contract tests: `tests/tools/test_process_registry_exit_marker_semantics.py` `tests/tools/test_process_registry_login_rc.py` `tests/tools/test_process_registry_shutdown_drain.py` `tests/tools/test_process_registry_survivor_boundaries.py` `tests/tools/test_unknown_process_exit_notifications.py` `tests/gateway/test_background_process_notifications.py`
+
+Unknown-status renderer regressions also live in `tests/hermes_cli/test_process_dock.py`,
+`ui-tui/src/__tests__/processDock.test.tsx`, and
+`apps/desktop/src/store/composer-status.test.ts`. Exercise the Node workspace tests
+alongside the pinned Python contracts when changing those projections.
 
 Run the focused process-registry and terminal proof surfaces with the canonical
 FIFO runner, then run Ruff and `scripts/check_fork_patches.py --source-only`.

@@ -15,7 +15,6 @@ from tools.process_registry_notifications import format_process_notification
 
 @pytest.mark.platforms("posix")
 def test_persistent_local_exit_survives_spawner(tmp_path, monkeypatch):
-    persist = True
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -26,12 +25,11 @@ def test_persistent_local_exit_survives_spawner(tmp_path, monkeypatch):
 import os
 from tools.process_registry import ProcessRegistry
 registry = ProcessRegistry()
-session = registry.spawn_local(COMMAND, persist_on_release=PERSIST)
+session = registry.spawn_local(COMMAND, persist_on_release=True)
 session.notify_on_complete = True
 registry._write_checkpoint()
 os._exit(0)
-""".replace("COMMAND", repr("sleep 1; printf 'durable-tail\\n'; exit 37" if persist else "sleep 1; exit 37"))
-       .replace("PERSIST", repr(persist)), encoding="utf-8")
+""".replace("COMMAND", repr("sleep 1; printf 'durable-tail\\n'; exit 37")), encoding="utf-8")
     spawned = subprocess.run([sys.executable, str(script)], env={**os.environ, "PYTHONPATH": str(Path.cwd())},
                              capture_output=True, text=True, timeout=15, check=False)
     assert spawned.returncode == 0, spawned.stderr
@@ -46,10 +44,7 @@ os._exit(0)
     assert successor.recover_from_checkpoint() == 1
     result = successor.wait(entry["session_id"], timeout=10)
     assert result["exit_code"] == 37
-    if persist:
-        assert "durable-tail" in result["output"]
-    else:
-        assert not entry["log_path"] and not result["output"]
+    assert "durable-tail" in result["output"]
     assert successor.completion_queue.get(timeout=5)["exit_code"] == 37
 
 
@@ -91,6 +86,6 @@ def test_legacy_gone_exit_is_retained_and_announced(tmp_path, monkeypatch, recov
     assert result["exit_code"] is None
     event = registry.completion_queue.get_nowait()
     assert "legacy-tail" in event["output"]
-    assert "exited, status unknown (not collected)" in (format_process_notification(event) or "")
+    assert "finished, exit status unknown" in (format_process_notification(event) or "")
     registry.poll(session.id)
     assert registry.completion_queue.empty()

@@ -1016,3 +1016,39 @@ async def test_raw_output_modes_are_human_facing(monkeypatch, tmp_path):
         assert "proc_deadbeef" not in text and "[Background process" not in text and "~" not in text
         assert "\x1b[" not in text
         assert "make -j8 all" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [Platform.TELEGRAM, Platform.SLACK])
+@pytest.mark.parametrize("mode", ["concise", "all", "result", "error"])
+@pytest.mark.parametrize("agent_notify", [False, True])
+@pytest.mark.parametrize("exit_code,reason,source", [
+    (None, "exited", "checkpoint.exit_uncollected"),
+    (None, "lost", "survivor_lost"),
+    (0, "lost", "survivor_lost"),
+])
+async def test_unknown_exit_is_not_success_and_error_mode_delivers(
+    monkeypatch, tmp_path, platform, mode, agent_notify, exit_code, reason, source,
+):
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="last collected output\n", exited=True, exit_code=exit_code,
+        completion_reason=reason, termination_source=source, command="build", started_at=None,
+    )
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry([session]))
+    runner = _build_runner(monkeypatch, tmp_path, mode)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    runner.adapters[platform] = adapter
+    runner._launching_turn_active = AsyncMock(return_value=True)
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+    watcher = {**_watcher_dict(), "platform": platform.value, "notify_on_complete": agent_notify,
+               "session_key": f"agent:main:{platform.value}:dm:123"}
+
+    await runner._run_process_watcher(watcher)
+
+    adapter.send.assert_awaited_once()
+    text = adapter.send.await_args.args[1]
+    assert "exit status unknown" in text.lower(), text
+    assert "✅" not in text and "❌" not in text, text
+    assert "last collected output" in text

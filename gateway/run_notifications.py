@@ -3075,10 +3075,13 @@ class GatewayNotificationsMixin(
         _started = getattr(session, "started_at", None)
         _dur = max(0.0, time.time() - _started) if isinstance(_started, (int, float)) else None
         command = _redact_gateway_user_facing_secrets(getattr(session, "command", "") or "")
+        provenance = {"completion_reason": getattr(session, "completion_reason", ""),
+                      "termination_source": getattr(session, "termination_source", "")}
         if notify_mode == "concise":
             return _format_concise_process_notification(session_id, command, session.exit_code, new_output,
-                                                        duration_seconds=_dur)
-        header = _format_concise_process_notification(session_id, command, session.exit_code, "", duration_seconds=_dur)
+                                                        duration_seconds=_dur, **provenance)
+        header = _format_concise_process_notification(session_id, command, session.exit_code, "",
+                                                      duration_seconds=_dur, **provenance)
         return t("gateway.background.final_output", header=header, output=new_output.strip()) if new_output.strip() else header
 
     def _format_process_running_message(self, session) -> str:
@@ -3168,6 +3171,10 @@ class GatewayNotificationsMixin(
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
             if session.exited:
+                from tools.process_registry_notifications import process_exit_unknown
+                non_success = session.exit_code != 0 or process_exit_unknown(
+                    session.exit_code, getattr(session, "completion_reason", ""),
+                    getattr(session, "termination_source", ""))
                 # Durable delivery suppresses replay, not a consumer's render/wait/log snapshot.
                 # Claim before admission; while a live peer gateway holds the claim, wait so
                 # this watcher can reclaim the completion if that peer dies before delivering.
@@ -3193,7 +3200,7 @@ class GatewayNotificationsMixin(
                     # queued follow-up, or a held fan-in batch), and the chat would stay mute that long
                     # (#112033): send the concise receipt now, once, without waiting for the wake.
                     if turn_busy and not busy_receipt_sent and (notify_mode in {"concise", "all", "result"} or (
-                        notify_mode == "error" and session.exit_code not in {0, None}
+                        notify_mode == "error" and non_success
                     )):
                         busy_receipt_sent = True
                         message_text = self._format_process_final_message(session_id, session, "concise")
@@ -3244,7 +3251,7 @@ class GatewayNotificationsMixin(
                         process_registry._mark_survivor_delivered(session)
                     break
                 if notify_mode in {"concise", "all", "result"} or (
-                    notify_mode == "error" and session.exit_code not in {0, None}
+                    notify_mode == "error" and non_success
                 ):
                     message_text = self._format_process_final_message(session_id, session, notify_mode)
                     from gateway.warning_notifications import present_notification
@@ -3258,7 +3265,7 @@ class GatewayNotificationsMixin(
                     async with self._completion_event_scope(watcher):
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                         await present_notification(send_final, platform=platform_name,
-                                                   diagnostic=session.exit_code not in {0, None})
+                                                   diagnostic=non_success)
                     if sent is False and is_restart_safe(session):
                         process_registry.release_survivor_completion(session_id)
                         # Keep one offer alive until shutdown cancels the watcher, even if

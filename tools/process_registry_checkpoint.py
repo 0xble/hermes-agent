@@ -28,10 +28,10 @@ class ProcessCheckpointMixin:
                 entries = []
                 pending_survivors = [
                     s for s in self._finished.values()
-                    if self._retain_survivor_completion(s)
+                    if self._retain_survivor_completion(s) or self._retain_drain_completion(s)
                 ]
                 for s in (*self._running.values(), *pending_survivors):
-                    if s.exited and not is_restart_safe(s):
+                    if s.exited and not is_restart_safe(s) and not self._retain_drain_completion(s):
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
