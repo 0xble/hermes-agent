@@ -54,10 +54,20 @@ def test_equivalent_to_original_on_producer_and_malformed_corpus():
     for outer in (FILE, IMAGE, REPLY):
         corpus.extend(outer[:cut] + FILE + '\n\n' + outer[cut:]
                       for cut in range(len(outer)))
+    # An opener completed by deleting a reply must win before the inner image.
+    corpus.extend(OPEN.rstrip('\n') + '[Replying to: ""]\n\n' + '\n' + image
+                  for image in (IMAGE, IMAGE + '\n\ncaption'))
     rng = random.Random(526)
     corpus.extend(''.join(rng.choices(atoms, k=8)) for _ in range(1000))
+    from agent.recall_context import _program, _regex_strip, _strip_bounded
+
+    program = _program(_RECALL_CONTEXT_PREFIXES)
     for text in corpus:
-        assert _strip_recall_context(text) == _original_strip(text), repr(text)
+        expected = _original_strip(text)
+        assert _strip_bounded(text, _RECALL_CONTEXT_PREFIXES, program) == expected, repr(text)
+        fast = _regex_strip(text, _RECALL_CONTEXT_PREFIXES, program.openers, program.opener_fragments)
+        assert fast is None or fast == expected, repr(text)
+        assert _strip_recall_context(text) == expected, repr(text)
 
 
 @pytest.mark.parametrize("shape", ["pure", "mixed", "same_line", "trigger"])
@@ -96,7 +106,7 @@ def test_adversarial_work_scales_with_input_size(shape):
     assert large_steps <= small_steps * (len(large) / len(small)) * 1.25
 
 
-@pytest.mark.parametrize('with_note', [False, True])
+@pytest.mark.parametrize('with_note', ['none', 'before', 'after'])
 def test_bracket_dense_json_does_not_allocate_bounded_states(monkeypatch, with_note):
     from agent import recall_context
 
@@ -107,9 +117,11 @@ def test_bracket_dense_json_does_not_allocate_bounded_states(monkeypatch, with_n
     payload = json.dumps({'values': [[1, 2], {'array': [3, 4]}]}) + '\n'
     text = payload * (1_000_000 // len(payload))
     original = text
-    if with_note:
+    if with_note == 'before':
         text = FILE + '\n\n' + text
-    expected = original.strip() if with_note else original
+    elif with_note == 'after':
+        text += '\n\n' + FILE
+    expected = original.strip() if with_note != 'none' else original
     assert _strip_recall_context(text) == (expected, [])
 
 

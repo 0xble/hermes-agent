@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 
 _DOCUMENT_FRAME = re.compile(
-    r"(?:\A|(?<=\n\n))(?:\[[^\n]*\] )?"
+    r"(?:\A|(?<=\n\n)|(?<=\[New message\]\n))(?:\[[^\n]*\] )?"
     r"(?P<frame>\[Inline document content: (?P<count>[0-9]{1,20}) characters\]\n)"
 )
 # Shared with the producers: keep the complete prelude, including trust notices,
@@ -42,32 +42,52 @@ def format_document_content(display_name: str, content: str) -> str:
     return f"[Inline document content: {len(block)} characters]\n{block}"
 
 
+# Structural tokens are visited only outside accepted counted document spans.
+_STRUCTURE = re.compile(
+    _DOCUMENT_FRAME.pattern
+    + r'|(?P<channel>(?:\A|(?<=\n))(?:'
+    + '|'.join(map(re.escape, CHANNEL_CONTEXT_HEADERS.values())) + r')(?=\n|$))'
+    + r'|(?P<boundary>(?:\A|(?<=\n))\[New message\](?:\n|$)|'
+    + re.escape(THREAD_CONTEXT_END) + ')'
+)
+
+
 def strip_inbound_recall_context(text: str) -> str:
-    """Remove only complete producer frames, leaving model input and retention alone."""
-    # Resolve channel provenance before interpreting counts in untrusted history.
-    starts = [text.find(header) for header in CHANNEL_CONTEXT_HEADERS.values()]
-    start = min((offset for offset in starts if offset >= 0), default=-1)
-    # Producers wrap channel context outside document injection. A header found
-    # after a document starts is quoted file text, not a channel prelude.
-    first_document = _DOCUMENT_FRAME.search(text)
-    if first_document is not None and first_document.start() < start:
-        start = -1
-    boundary = text.rfind(CHANNEL_MESSAGE_BOUNDARY) if start >= 0 else -1
-    if boundary > start:
-        text = text[boundary + len(CHANNEL_MESSAGE_BOUNDARY):]
-    parts: list[str] = []
-    position = 0
-    for match in _DOCUMENT_FRAME.finditer(text):
-        if match.start() < position:
+    """Visit producer frames in order, never interpreting tokens inside a file.
+
+    Counts in channel backfill have no producer provenance. Ignore them until a
+    message boundary; thereafter exact, complete document spans are opaque to
+    channel-boundary discovery as well as recall extraction.
+    """
+    cursor, channel, boundary = 0, None, None
+    documents = []
+    while match := _STRUCTURE.search(text, cursor):
+        cursor = match.end()
+        if match['frame'] is not None:
+            if channel is not None and boundary is None:
+                continue
+            size = int(match['count'])
+            end = match.end() + size
+            if (size < len('[Content of ]:\n') or end > len(text)
+                    or not text.startswith('[Content of ', match.end())
+                    or (end != len(text) and not text.startswith('\n\n', end))):
+                continue
+            documents.append((match.start('frame'), end))
+            cursor = end
+        elif match['channel'] is not None:
+            if channel is None:
+                channel = match.start()
+        elif channel is not None:
+            boundary = match.end()
+
+    # Without a boundary preserve the legacy text, rather than guessing where
+    # the caption starts. Complete document spans can still be excluded.
+    cursor = boundary or 0
+    parts = []
+    for start, end in documents:
+        if start < cursor:
             continue
-        size = int(match['count'])
-        end = match.end() + size
-        if (size < len('[Content of ]:\n') or end > len(text)
-                or not text.startswith('[Content of ', match.end())):
-            continue
-        parts.append(text[position:match.start('frame')])
-        position = end
-    if parts:
-        parts.append(text[position:])
-        text = ''.join(parts).strip()
-    return text
+        parts.append(text[cursor:start])
+        cursor = end
+    parts.append(text[cursor:])
+    return ''.join(parts)

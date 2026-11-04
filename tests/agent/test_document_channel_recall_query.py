@@ -24,6 +24,22 @@ def test_document_caption_not_document_body_drives_recall(filename, placement):
     assert f'[Content of {filename}]:\n{body}' in model_input
 
 
+@pytest.mark.parametrize('marker', [
+    '[New message]', '[Recent channel messages]',
+    '[Context around the replied-to message]',
+    '[Thread context — prior messages in this thread (not yet in conversation history):]',
+    '[End of thread context]',
+])
+@pytest.mark.parametrize('speaker', ['', '[Brian] '])
+def test_channel_boundaries_inside_counted_documents_are_not_boundaries(marker, speaker):
+    document = speaker + format_document_content('notes.txt', '\n' + marker + '\n\n' + 'file body ' * 120)
+    text = ('[Recent channel messages]\nSomeone: old context\n[New message]\n'
+            + document + '\n\n' + CAPTION)
+    expected = speaker + '\n\n' + CAPTION if speaker else CAPTION
+    assert auto_recall_query(text) == expected
+    assert flatten_message_text(text) == text
+
+
 def test_channel_history_is_recall_only_context():
     history = '[Recent channel messages]\n' + 'Person: old context\n' * 100
     text = f'{history}\n[New message]\n{CAPTION}'

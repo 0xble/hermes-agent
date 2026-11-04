@@ -45,6 +45,8 @@ class _Program:
             else:
                 prefixes.add(prefix)
         self.openers = re.compile('|'.join(map(re.escape, sorted(prefixes))))
+        self.opener_fragments = tuple({prefix[:cut] for prefix in prefixes
+                                       for cut in range(1, len(prefix))})
 
     def add(self, operation, argument, successor):
         self.nodes.append((operation, argument, successor))
@@ -216,7 +218,7 @@ def _program(patterns):
     return _Program(patterns)
 
 
-def _regex_strip(text, patterns, openers):
+def _regex_strip(text, patterns, openers, opener_fragments):
     """Try each original regex once per opener, never search a failed suffix twice.
 
     Complete disjoint notes need no per-character state. A failed opener or a
@@ -230,7 +232,14 @@ def _regex_strip(text, patterns, openers):
                       if (match := pattern.match(text, opener.start(), limit))), None)
         if match is None:
             return None
-        parts.append(text[cursor:match.start()])
+        retained = text[cursor:match.start()]
+        # A deletion can complete an earlier, partial opener before the next
+        # complete note. Checking only the final result loses that match order
+        # (and its image description). Only a suffix that is a partial literal
+        # opener can form this seam; ordinary brackets keep the cheap path.
+        if retained.endswith(opener_fragments):
+            return None
+        parts.append(retained)
         if 'description' in match.re.groupindex and (description := match['description'].strip()):
             descriptions.append(description)
         cursor = match.end()
@@ -249,7 +258,7 @@ def strip_recall_context(
     text: str, patterns: tuple[re.Pattern[str], ...],
 ) -> tuple[str, list[str]]:
     program = _program(patterns)
-    fast = _regex_strip(text, patterns, program.openers)
+    fast = _regex_strip(text, patterns, program.openers, program.opener_fragments)
     if fast is not None:
         return fast
     return _strip_bounded(text, patterns, program)
