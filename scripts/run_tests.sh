@@ -347,10 +347,28 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # Download-only caches are explicit runner inputs, not installed/user state. Historical
 # installer fixtures need the portable lane's primed downloads; dropping these at env -i
 # silently makes every independent N-1 install redownload the same artifacts.
+# Resolve symlinks against the OS account home, never the sandbox HOME. Refuse live
+# Hermes/default caches and relative paths; an unresolvable account is fail-closed.
 # Do not forward UV_PROJECT_ENVIRONMENT, HERMES_HOME, or HERMES_RUNTIME_DIR here.
 TEST_ENV=()
-for _test_var in UV_CACHE_DIR UV_PYTHON_INSTALL_DIR npm_config_cache \
-  HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
+for _cache_var in UV_CACHE_DIR UV_PYTHON_INSTALL_DIR npm_config_cache; do
+  if [ -n "${!_cache_var:-}" ] && "$PYTHON" -c '
+import os, sys
+from pathlib import Path
+try:
+    import pwd
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    cache = Path(sys.argv[1])
+    protected = (home / ".hermes", home / ".cache/uv", home / ".npm", home / ".local/share/uv")
+    safe = cache.is_absolute() and not any(cache.resolve().is_relative_to(p.resolve()) for p in protected)
+except (ImportError, KeyError, OSError, RuntimeError, ValueError):
+    safe = False
+raise SystemExit(0 if safe else 1)
+' "${!_cache_var}"; then
+    TEST_ENV+=("$_cache_var=${!_cache_var}")
+  fi
+done
+for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
   HERMES_TEST_SCRATCH_ROOT PLAYWRIGHT_BROWSERS_PATH SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \

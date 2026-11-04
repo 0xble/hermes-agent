@@ -12,7 +12,15 @@ The shell runner must forward only `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, and 
 across its `env -i` boundary: otherwise the portable lane's already-primed downloads silently
 vanish before the file worker starts. The runner regression also proves installed/runtime/user
 state and credentials remain scrubbed; do not widen this to a generic environment passthrough.
-N-1 receives a private copy of the runner's actual uv, avoiding an unrelated Astral bootstrap.
+Only absolute explicit cache paths are eligible. Resolve symlinks and refuse descendants of
+`.hermes`, `.cache/uv`, `.npm` and `.local/share/uv` under the OS password-database home, even
+when `HOME` names a sandbox. Failure to resolve that account also drops these inputs.
+N-1 receives a private copy of the runner's actual uv, avoiding repeated Astral bootstrap.
+Cold real installer download coverage remains in
+`test_install_fresh.py::test_fresh_install_serves_head_and_runs_a_turn`: its `installed` fixture
+starts with an empty machine home, does not use `InstallCache` or copy uv/runtime artifacts,
+and runs the real installer against its pinned download sources. This PR does not preseed that
+separate cold path; all three git worlds retain the download-sharing optimization.
 
 `test_upgrade_path` uses the same download-only fixture for its repeated N-1/update legs. Its
 bare origin advertises only the subject branch, like `_install_helpers.make_origin`, rather than
