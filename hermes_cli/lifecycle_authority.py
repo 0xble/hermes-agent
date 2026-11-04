@@ -27,11 +27,9 @@ class LifecycleAuthority(str, Enum):
 
     @classmethod
     def for_edit(cls, actor, *, autonomous=False):
-        try:
-            value = cls(actor)
-        except (TypeError, ValueError):
+        if actor not in ("agent", "user"):
             return None
-        return cls.AUTONOMY if value is cls.AGENT and autonomous else value
+        return cls.USER if actor == "user" else cls.AUTONOMY if autonomous else cls.AGENT
 
 
 def agent_owned(state) -> bool:
