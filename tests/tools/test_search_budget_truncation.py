@@ -47,7 +47,9 @@ def test_timeout_helper_strips_only_trailing_marker():
 @pytest.mark.parametrize(
     ("target", "output_mode", "raw", "expected"),
     [
-        ("files", "content", timeout_output("src/a.py", "src/b.py"), ["src/a.py", "src/b.py"]),
+        # Filename rg runs in / with relative operand big; results are rebased
+        # to absolute paths before partial-timeout handling returns them.
+        ("files", "content", timeout_output("big/src/a.py", "big/src/b.py"), ["/big/src/a.py", "/big/src/b.py"]),
         ("content", "files_only", timeout_output("src/a.py", "src/b.py"), ["src/a.py", "src/b.py"]),
         ("content", "content", timeout_output("src/a.py:10:foo", "src/b.py:20:foo"), ["src/a.py", "src/b.py"]),
     ],

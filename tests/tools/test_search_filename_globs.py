@@ -1,5 +1,7 @@
 """Filename globs retain brace/path syntax and engine failures stay out of paths."""
 
+import fnmatch
+import os
 import shlex
 import shutil
 import sys
@@ -78,10 +80,10 @@ def test_recursive_basename_globs_include_nested_and_empty_directories(search, p
 
 
 @pytest.mark.parametrize("pattern,expected", [
-    ("./hooks/*", {"hooks/pre-commit", "nested/hooks/decoy"}),
+    ("./hooks/*", {"hooks/pre-commit"}),
     ("/hooks/*", {"hooks/pre-commit"}),
     ("{root}/hooks/*", {"hooks/pre-commit"}),
-    ("./main.py", {"main.py", "sub/main.py"}),
+    ("./main.py", {"main.py"}),
     ("/main.py", {"main.py"}),
     ("{root}/main.py", {"main.py"}),
 ])
@@ -188,3 +190,140 @@ def test_filename_failures_report_bounded_diagnostics_separate_from_paths(search
     assert len(transport.stderr) == 4096
     if not ops._native_read_enabled():
         assert executions[-1]["cwd_observed"] is True
+
+
+def _oracle_glob(parts, pattern):
+    """Independent segment matcher: '*' never crosses '/', '**' may cross it."""
+    if not pattern:
+        return not parts
+    if pattern[0] == "**":
+        return (_oracle_glob(parts, pattern[1:])
+                or bool(parts) and _oracle_glob(parts[1:], pattern))
+    return bool(parts) and fnmatch.fnmatchcase(parts[0], pattern[0]) and _oracle_glob(parts[1:], pattern[1:])
+
+
+def _walk_oracle(pattern, roots):
+    # This oracle walks independently of rg, its cwd and the production translator.
+    absolute_owner = next((root for root in sorted(roots, key=lambda p: len(str(p)), reverse=True)
+                           if pattern.startswith(str(root) + "/")), None)
+    anchored = pattern.startswith(("/", "./"))
+    suffix = pattern[len(str(absolute_owner)) + 1:] if absolute_owner else pattern
+    while suffix.startswith("./"):
+        suffix = suffix[2:]
+    suffix = suffix.lstrip("/")
+    alternatives = [suffix]
+    if "{" in suffix:
+        before, choices = suffix.split("{", 1)
+        choices, after = choices.split("}", 1)
+        alternatives = [before + choice + after for choice in choices.split(",")]
+    expected = set()
+    for root in roots:
+        if absolute_owner and root != absolute_owner:
+            continue
+        for directory, dirs, files in os.walk(root):
+            dirs[:] = [name for name in dirs if not name.startswith(".")]
+            for name in files:
+                candidate = Path(directory, name)
+                relative = candidate.relative_to(root).as_posix()
+                for alternative in alternatives:
+                    if not anchored and "/" not in suffix and "{" not in suffix:
+                        matches = fnmatch.fnmatchcase(name, "*" + alternative)
+                    else:
+                        glob = alternative if anchored or alternative.startswith("**/") else "**/" + alternative
+                        matches = _oracle_glob(relative.split("/"), glob.split("/"))
+                    if matches:
+                        expected.add(candidate.resolve())
+    return expected
+
+
+@pytest.mark.parametrize("root_count", [1, 2])
+@pytest.mark.parametrize("location", ["cwd", "subdir", "outside"])
+@pytest.mark.parametrize("spelling", ["relative", "absolute"])
+@pytest.mark.parametrize("pattern_kind", [
+    "root-file", "root-subdir", "absolute-inside", "absolute-outside",
+    "basename", "recursive-dir", "brace", "dot-root",
+])
+def test_filename_coordinate_matrix(search, root_count, location, spelling, pattern_kind, monkeypatch):
+    _, base, ops = search
+    cwd = base / "caller"
+    cwd.mkdir()
+    first = {"cwd": cwd, "subdir": cwd / "a", "outside": base / "external"}[location]
+    roots = [first]
+    if root_count == 2:
+        roots.append(first / "b" if location == "cwd" else first.with_name(first.name + "-peer"))
+    for root in roots:
+        for name in ("x", "prefix-x", "y", "sub/x", "sub/y", "sub/deep/x", "dir/x", "nested/dir/x", "nested/x"):
+            file = root / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text("fixture\n", encoding="utf-8")
+    outside = base / "unselected/x"
+    outside.parent.mkdir()
+    outside.write_text("decoy\n", encoding="utf-8")
+    patterns = {
+        "root-file": "/x", "root-subdir": "/sub/*", "absolute-inside": str(first / "x"),
+        "absolute-outside": str(outside), "basename": "x", "recursive-dir": "**/dir/x",
+        "brace": "{x,sub/y}", "dot-root": "./x",
+    }
+    pattern = patterns[pattern_kind]
+    ops.cwd = ops.env.cwd = str(cwd)
+    operands = [os.path.relpath(root, cwd) if spelling == "relative" else str(root) for root in roots]
+    native_calls = []
+    native = ops._run_rg_native
+
+    def record_native(*args, **kwargs):
+        native_calls.append(kwargs.get("cwd"))
+        result = native(*args, **kwargs)
+        assert result is not None, "matrix must exercise native rg without shell fallback"
+        return result
+
+    monkeypatch.setattr(ops, "_run_rg_native", record_native)
+    result = ops.search(pattern, ", ".join(operands), target="files", limit=200)
+    assert result.error is None, result.to_dict()
+    actual = {Path(cwd, file).resolve() for file in result.files}
+    assert actual == _walk_oracle(pattern, roots)
+    assert bool(native_calls) == ops._native_read_enabled()
+    assert len(native_calls) <= 1
+
+
+@pytest.mark.parametrize("case", range(6))
+def test_single_root_review_reproductions(search, case):
+    # Verbatim review repros, cwd=D with D/a/main.py and D/a/sub/main.py:
+    # search('/main.py','a'), search('/main.py','D/a'), search('/sub/*','a'),
+    # search('D/a/main.py','a'), search('D/a/main.py','D/a'), search('/main.py','D').
+    _, D, ops = search
+    for name in ("main.py", "a/main.py", "a/sub/main.py"):
+        file = D / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("fixture\n", encoding="utf-8")
+    pattern, root = [
+        ("/main.py", "a"), ("/main.py", str(D / "a")), ("/sub/*", "a"),
+        (str(D / "a/main.py"), "a"), (str(D / "a/main.py"), str(D / "a")),
+        ("/main.py", str(D)),
+    ][case]
+    result = ops.search(pattern, root, target="files")
+    assert result.error is None, result.to_dict()
+    assert {Path(D, file).resolve() for file in result.files} == _walk_oracle(pattern, [Path(D, root)])
+
+
+def test_non_posix_anchoring_never_changes_shell_directory(search, monkeypatch):
+    _, _, ops = search
+    calls = []
+    def forbid_execution(*args, **kwargs):
+        calls.append(kwargs)
+        raise AssertionError(f"non-POSIX anchoring must fail before execution: {kwargs}")
+
+    monkeypatch.setattr(ops, "_run_rg_bounded", forbid_execution)
+    result = ops._search_files_rg("/x", ["C:/project", "D:/other"], 50, 0)
+    assert result.error and "POSIX" in result.error
+    assert calls == []
+
+
+@pytest.mark.parametrize("absolute_pattern", [False, True])
+def test_filename_file_operand_never_becomes_cwd(search, absolute_pattern):
+    _, root, ops = search
+    selected = root / "main.py"
+    selected.write_text("fixture\n", encoding="utf-8")
+    pattern = str(selected) if absolute_pattern else "main.py"
+    result = ops.search(pattern, str(selected), target="files")
+    assert result.error is None, result.to_dict()
+    assert {Path(root, file).resolve() for file in result.files} == {selected.resolve()}

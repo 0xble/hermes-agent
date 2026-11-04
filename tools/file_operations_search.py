@@ -260,25 +260,54 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     )
 
 
-def _rooted_filename_globs(pattern: str, roots: list[str], common: str) -> list[str]:
-    """Anchor to each operand, but keep an absolute pattern's selected root identity.
+def _filename_search_coordinates(
+    pattern: str, roots: list[str], cwd: str,
+) -> tuple[Optional[str], list[str], list[str]]:
+    """Translate every root count into one rg cwd, glob union and operand list.
 
-    rg anchors multi-root globs to its working directory, not each operand. The
-    caller runs from ``common`` with relative operands in both transports.
+    rg's slash anchors use its cwd, NOT each operand. Keep all POSIX searches
+    in one coordinate system so transport and root count cannot change meaning.
+    Root prefixes are literals; only the user's suffix is glob syntax.
     """
-    candidates = [(root, pattern.lstrip('/')) for root in roots]
-    for root in sorted(roots, key=len, reverse=True):
-        prefix = root.rstrip('/') + '/'
-        if pattern.startswith(prefix):
-            candidates = [(root, pattern[len(prefix):])]
-            break
+    anchored = pattern.startswith(('/', './'))
+    dot_anchored = pattern.startswith('./')
+    while pattern.startswith('./'):
+        pattern = pattern[2:]
+    posix = all(not re.match(r"^[A-Za-z]:", value) and "\\" not in value
+                for value in [cwd, *roots])
+    if '/' in pattern:
+        glob = pattern if pattern.startswith('**/') else f"**/{pattern}"
+    else:
+        glob = pattern if pattern.startswith('*') else f"*{pattern}"
+    if not posix:
+        if anchored:
+            raise ValueError("Root-anchored filename globs require POSIX search roots and cwd.")
+        return None, [glob], roots
+
+    absolute_roots = [posixpath.normpath(posixpath.join(cwd, root)) for root in roots]
+    # Parents also work for explicitly selected FILE operands: never cd into a file.
+    common = posixpath.commonpath(map(posixpath.dirname, absolute_roots))
+    operands = [posixpath.relpath(root, common) for root in absolute_roots]
+    if not anchored:
+        return common, [glob], operands
+
+    candidates = [(root, pattern.lstrip('/')) for root in absolute_roots]
+    if not dot_anchored:
+        for root in sorted(absolute_roots, key=len, reverse=True):
+            prefix = root.rstrip('/') + '/'
+            if pattern == root:
+                candidates = [(root, '')]
+                break
+            if pattern.startswith(prefix):
+                candidates = [(root, pattern[len(prefix):])]
+                break
     globs = []
     for root, suffix in candidates:
         relative = posixpath.relpath(root, common)
-        # Root names are literals, while the user's suffix retains glob syntax.
         literal = re.sub(r"([\\*?{}\[\]])", lambda match: "\\" + match.group(0), relative)
-        globs.append('/' + (literal + '/' if relative != '.' else '') + suffix)
-    return globs
+        rooted = (literal + '/' if relative != '.' else '') + suffix if suffix else literal
+        globs.append('/' + rooted)
+    return common, globs, operands
 
 
 def _posix_roots(roots: list[str]) -> bool:
@@ -1022,48 +1051,16 @@ class SearchMixin:
         ordering is explicit because it scans globally."""
         roots = [path] if isinstance(path, str) else path
         cwd = getattr(self.env, "cwd", None) or self.cwd
-        absolute_roots = [posixpath.normpath(posixpath.join(cwd, root)) for root in roots]
-        while pattern.startswith('./'):
-            pattern = pattern[2:]
-        rooted_pattern = pattern
-        anchored = pattern.startswith('/')
-        if anchored:
-            for root in sorted(absolute_roots, key=len, reverse=True):
-                prefix = root.rstrip('/') + '/'
-                if pattern.startswith(prefix):
-                    pattern = pattern[len(prefix):]
-                    break
-            pattern = pattern.lstrip('/')
-
-        # Preserve the recursive basename-search intent of find -name. Slashes
-        # inside brace alternatives are syntax, not a basename separator. rg
-        # matches slash-bearing globs against emitted paths (including absolute
-        # root operands), so allow their complete suffix at any depth. rg's
-        # leading slash anchors even a bare basename to the selected root.
-        if anchored:
-            glob_pattern = f"/{pattern}"
-        elif '/' in pattern:
-            glob_pattern = pattern if pattern.startswith('**/') else f"**/{pattern}"
-        else:
-            glob_pattern = f"*{pattern}" if not pattern.startswith('*') else pattern
+        try:
+            scoped_common, glob_patterns, command_roots = _filename_search_coordinates(pattern, roots, cwd)
+        except ValueError as exc:
+            return SearchResult(error=str(exc))
+        anchored = pattern.startswith(('/', './'))
         fetch_limit = limit + offset + 1
         effective_exclusions = self._effective_macos_search_exclusions(roots)
-        scoped_common = None
-        command_roots = roots
-        if len(roots) > 1 and (anchored or (effective_exclusions and _posix_roots(roots))):
-            # Several roots: rg globs are root-relative, so cd to the common ancestor
-            # and express roots + exclusions relative to it.
-            scoped_common = posixpath.commonpath(absolute_roots)
-            command_roots = [posixpath.relpath(root, scoped_common) for root in absolute_roots]
-            exclusion_terms = [
-                f"--glob {self._escape_shell_arg(f'!{posixpath.relpath(absolute, scoped_common)}/**')}"
-                for _r, _rel, absolute in effective_exclusions]
-        else:
-            exclusion_terms = [
-                f"--glob {self._escape_shell_arg(f'!{relative}/**')}"
-                for _r, relative, _abs in effective_exclusions]
-        glob_patterns = (_rooted_filename_globs(rooted_pattern, absolute_roots, scoped_common)
-                         if anchored and scoped_common else [glob_pattern])
+        exclusion_terms = [
+            f"--glob {self._escape_shell_arg('!' + (posixpath.relpath(absolute, scoped_common) if scoped_common else relative) + '/**')}"
+            for _r, relative, absolute in effective_exclusions]
         exclusion_globs = " ".join(dict.fromkeys(exclusion_terms))
         exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""
         rg_executable = rg_executable or self._resolve_command("rg")
@@ -1084,7 +1081,7 @@ class SearchMixin:
         rg_cmd = (f"{rg} --files{sort_arg} --threads {walker_threads} {glob_args}"
                   f"{exclusion_args} -- {root_args}")
         result = self._run_rg_bounded([rg_cmd], fetch_limit, timeout=60,
-                                      native_ok=not scoped_common or anchored, native_cwd=scoped_common,
+                                      native_cwd=scoped_common,
                                       shell_prefix=f"set -o pipefail; {cd_prefix}", capture_stderr=True)
         stdout, limit_reason = _search_stdout_and_limit(result)
         all_files = [f for f in stdout.splitlines() if f]
@@ -1114,6 +1111,8 @@ class SearchMixin:
             directory_glob = basename if basename.startswith('*') else f"*{basename}"
             dirs, directory_limit_reason = self._search_directories_with_find(directory_glob, path, fetch_limit)
             if dirs:
+                if scoped_common:
+                    dirs = [posixpath.normpath(posixpath.join(cwd, directory)) for directory in dirs]
                 existing = set(all_files)
                 merged_entries = self._sort_paths_by_mtime(
                     all_files + [d for d in dirs if d not in existing])

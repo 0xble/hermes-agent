@@ -11,13 +11,20 @@ thread. Content searches keep their existing ripgrep command and parallelism.
 Filename globs retain their complete path and brace syntax in both ripgrep
 transports. Unanchored slash-bearing patterns match the complete suffix at any
 depth within the selected roots, while ordinary basename globs keep their
-existing matching. Leading `./` is removed. Absolute patterns within a search
-root become root-relative, and other leading `/` patterns anchor to each selected
-root independently. Multi-root anchored patterns are translated into a common
-ancestor's coordinates; an absolute pattern retains its selected root instead of
-matching the same suffix under sibling roots. Both transports run the same single
-bounded ripgrep invocation from that ancestor, preserving global modified order
-and pagination. Literal root names are escaped separately from user glob syntax.
+existing matching. Leading `./` and `/` anchor to each selected root independently;
+`./hooks/*` therefore excludes `nested/hooks/*`. Absolute patterns within a search
+root retain that root's identity instead of matching the same suffix under sibling
+roots. Other leading `/` patterns are interpreted as root-relative glob syntax.
+One translation maps `(pattern, roots, cwd)` to `(rg cwd, globs, operands)` for all
+POSIX searches, with no anchoring branch based on root count. Its working directory
+is the common ancestor of the operands' parents, so file operands never become a
+`cd` target. Single roots, multiple roots, relative and absolute operands, and
+roots outside the caller's cwd all use the same coordinates in both transports.
+Each search remains one bounded ripgrep invocation, preserving global modified
+order and pagination. Literal root names are escaped separately from user glob
+syntax. Non-POSIX (drive-letter or backslash-shaped) roots/cwd retain the existing
+unanchored search path; anchored globs fail explicitly before traversal rather
+than passing those paths through POSIX commonpath or a shell `cd`.
 The historical basename reduction belongs only to the `find -name` fallback,
 whose parser does not support ripgrep's path and brace syntax. That fallback was
 the original reason for the reduction (`533c064269417`), not a requirement to
@@ -91,6 +98,21 @@ exercised, and native execution is asserted rather than silently falling back.
 The corrected filename-glob module passes all 84 cases. The expanded GREEN run
 through `heavy-slot` and `scripts/run_tests.sh` passes 452 tests across 17 search
 and file-operations modules with 0 failures and 12 platform skips.
+
+The round-3 coordinate matrix uses a pure-Python per-root walk oracle and real
+ripgrep in both transports. Its 192 cells cover root count (1/2), root location
+(cwd/subdirectory/outside), spelling (relative/absolute), and eight pattern forms:
+`/x`, `/sub/*`, absolute inside/outside paths, basename, `**/dir/x`, brace union,
+and `./x`. It asserts exact normalized path sets and native execution, with 12
+additional cases for the reviewer's six single-root reproductions and two
+non-POSIX fail-before-execution cases. Against `6cc7b62c1893`, the new cases give
+60 failed, 146 passed, and 84 deselected. Of these, the matrix alone gives 48
+failed and 144 passed. The failures establish missing single-root coordinates
+and the previously recursive `./` interpretation. GREEN through `heavy-slot` and
+`scripts/run_tests.sh` passes 669 tests across 20 files with 0 failures and 13
+platform skips; the filename-glob module passes all 294 cases, including four
+file-operand checks. The directory supplement's results are normalized into the
+same absolute output coordinates as ripgrep before deduplication.
 
 Also run the relevant broader tools tests through the canonical runner.
 Recovery verification through machine-wide `heavy-slot` admission observed:

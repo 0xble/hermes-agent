@@ -484,8 +484,8 @@ def test_modified_multi_path_search_preserves_exact_order_request():
     assert result.files == ["/two/new.py", "/one/old.py"]
     assert len(env.rg_commands) == 1
     assert "--sortr=modified" in env.rg_commands[0]
-    assert "'/one'" in env.rg_commands[0]
-    assert "'/two'" in env.rg_commands[0]
+    assert "cd '/' &&" in env.rg_commands[0]
+    assert " -- 'one' 'two' | head -n " in env.rg_commands[0]
 
 
 def test_comma_delimited_file_roots_preserve_internal_spaces_in_one_search():

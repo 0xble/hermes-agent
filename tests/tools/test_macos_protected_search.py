@@ -153,7 +153,8 @@ def test_rg_multi_root_scopes_protected_globs_and_restores_absolute_paths(monkey
 
 @pytest.mark.platforms("macos")
 def test_rg_scoped_multi_root_terminates_options_before_dash_prefixed_root(monkeypatch):
-    env = RecordingEnvironment("/Users/alice")
+    # With the parent-coordinate translator, '/' keeps --version a bare operand.
+    env = RecordingEnvironment("/")
     ops = ShellFileOperations(env)
     monkeypatch.setattr(file_operations, "_HOME", "/Users/alice")
 
@@ -172,7 +173,7 @@ def test_rg_scoped_multi_root_terminates_options_before_dash_prefixed_root(monke
     result = ops.search("*.txt", path="., --version", target="files")
 
     command = _rg_files_commands(env.commands)[0]
-    assert "cd '/Users/alice' &&" in command
+    assert "cd '/' &&" in command
     assert " -- '.' '--version' | head -n " in command
     assert result.error is None
 
