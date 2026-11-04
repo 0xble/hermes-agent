@@ -576,6 +576,30 @@ complete-suite gap or proves an installed runtime.
 Retire fixture adaptations when the accepted release tests already cover the maintained
 behavior. Retire superseded hosted orchestration after its replacement qualifies.
 
+## API admission thread-affinity proof
+
+The API held-writer test measures the actual blocking write's thread, not the
+maximum gap between owner-loop ticks. The old 0.5-second tick budget included
+unrelated callbacks and shared-runner descheduling: injecting one unrelated
+0.6-second callback reproduced the failure with the already off-loop admission
+driver unchanged (`gateway/session_api.py::run_steps_off_loop` and
+`gateway/session_runtime_workers.py::tracked_write`). The production off-loop
+fix originated in upstream commit `47b24028dd8`.
+
+For Chat Completions, Responses and Runs, the test guards the real
+`SessionDB._execute_write` against the owner thread and observes a real SQLite
+busy retry while another connection retains `BEGIN IMMEDIATE`. An event must
+reach the owner loop while the request remains pending; only then does the test
+release the writer and require the original successful HTTP status. The event
+and request watchdogs bound deadlocks, not admission latency. No production
+path, skip, timeout or performance threshold is relaxed.
+
+Contract tests: `tests/gateway/test_api_admission_off_loop.py`.
+
+Retire this `fork-ci-reliability` adaptation when the accepted upstream test
+uses equivalent causal thread-affinity and real-contention evidence rather
+than a subsecond wall-clock scheduling budget.
+
 ## Portable source gate migration
 
 The `fork-ci-reliability` implementation now has a repository-owned `bin/ci`
