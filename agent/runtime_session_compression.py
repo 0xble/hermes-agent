@@ -70,7 +70,8 @@ class RuntimeSessionCompressionMixin:
 
     def archive_and_compact(self, session_id, compacted_messages, model_config_patch=None,
                             watermark=None, lock_holder=None, tail_count=0, carried_messages=None,
-                             covered_ids=None, unresolved_held=None, held_messages=None, held_for_cas=None):
+                             covered_ids=None, unresolved_held=None, held_messages=None, held_for_cas=None,
+                             *, best_effort=False):
         self._session(session_id)
         # A carried message names an exact durable original (its _row_id) to rewind rather than
         # archive (#118900); the owner resolves identities against its own store. Held-row
@@ -90,7 +91,7 @@ class RuntimeSessionCompressionMixin:
             tail_count=tail_count, carried_messages=carried, covered_ids=covered_ids,
             unresolved_held=unresolved,
             held_messages=None if held_messages is None else _handoff_rows(held_messages),
-        held_for_cas=cas))
+        held_for_cas=cas), best_effort=best_effort)
         if 'stale_held_history' in result:
             from agent.context_compressor import StaleHeldHistory
             raise StaleHeldHistory(result['stale_held_history'])
@@ -100,6 +101,10 @@ class RuntimeSessionCompressionMixin:
         from hermes_state_identity import _newest_message_uid_rows
         compacted_messages[:] = _newest_message_uid_rows(compacted_messages)
         return result['value']
+
+    def archive_and_compact_best_effort(self, *args, **kwargs):
+        """Optional prune only: an unsent capacity rejection must not poison the turn."""
+        return self.archive_and_compact(*args, **kwargs, best_effort=True)
 
     def publish_compression_child(self, *, parent_session_id, child_session_id, source, messages,
             model=None, model_config=None, system_prompt=None, cwd=None, profile_name=None,

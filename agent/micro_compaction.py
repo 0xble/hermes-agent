@@ -437,7 +437,7 @@ class MicroCompactionMixin:
                 watermark = _cc()._archive_watermark_for(session_db, session_id, held, start_watermark)
                 from agent.conversation_compression_archive import coverage_for_commit
                 covered_ids, unresolved_held = coverage_for_commit(session_db, session_id, held)
-            session_db.archive_and_compact(
+            getattr(session_db, 'archive_and_compact_best_effort', session_db.archive_and_compact)(
                 session_id, compacted_messages, carried_messages=carried_messages, watermark=watermark,
                 covered_ids=covered_ids, unresolved_held=unresolved_held, held_for_cas=held,
                 **({"held_messages": held} if held is not None else {}))
@@ -455,7 +455,11 @@ class MicroCompactionMixin:
             # commit. Same disposition as a stale generation — nothing written, the pass is discarded.
             logger.info("Micro-compaction commit skipped, %s", exc)
             return False
-        except Exception:
+        except Exception as exc:
+            from agent.runtime_session_journal import OutboxCapacityError
+            if isinstance(exc, OutboxCapacityError):
+                logger.warning("Micro-compaction archive rejected; keeping the original transcript: %s", exc)
+                return False
             logger.info(
                 "Micro-compaction DB sync failed — resume will double-load "
                 "compacted messages until the next batch compression"
