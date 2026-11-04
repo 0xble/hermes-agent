@@ -1006,6 +1006,7 @@ def _bind_control_result(record: dict[str, Any], result: dict[str, Any], cursor)
 def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
                 reason: str, payload: Optional[dict[str, Any]], authority: dict[str, Any],
                 status: str, now: float, expires_at: Optional[float], affected_text: str, cursor=None) -> dict[str, Any]:
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
     return {
         "id": uuid.uuid4().hex[:12], "kind": kind, "action": action,
         "target_session_id": target_sid, "requester_session_id": requester_sid,
@@ -1013,6 +1014,7 @@ def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
         "reason": reason or "session-control", "payload": dict(payload or {}),
         "affected_text": affected_text,
         "authority": dict(authority), "status": status, "created_at": now,
+        "lifecycle_authority": LifecycleAuthority.from_control(authority).value,
         "expires_at": expires_at, "resolved_at": None, "error": None,
         "request_posted": status != "pending", "request_skipped": False,
         "target_notice_sent": False, "target_notice_skipped": False,
@@ -1189,8 +1191,6 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         raw = _meta_value(conn, _definition_key(kind, target_sid))
         affected_before = _affected_text(kind, action, raw, payload)
         conn.execute(f"SAVEPOINT {savepoint}")
-        from hermes_cli.lifecycle_authority import LifecycleAuthority
-        authority = {**authority, "lifecycle_authority": LifecycleAuthority.from_control(authority).value}
         result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload,
                                 authority=authority, cursor=conn)
         manager_result = result.get("result")
@@ -1328,7 +1328,8 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[di
             record["status"], record["resolved_at"] = "expired", now
             _save_record(record, cursor=conn)
             return record
-        record["authority"] = {"via": "button", "lifecycle_authority": "user", "user_id": str(user_id)}
+        record["authority"] = {"via": "button", "user_id": str(user_id)}
+        record["lifecycle_authority"] = "user"
         record["resolved_at"] = now
         if decision == "deny":
             record["status"] = "denied"
