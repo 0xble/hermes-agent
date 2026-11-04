@@ -1,6 +1,7 @@
 """The compressed fallback keeps the original private-journal resource bounds."""
 import gzip
 import json
+import os
 import stat
 
 import pytest
@@ -40,7 +41,8 @@ def test_journal_reopen_codec_and_resource_bounds(tmp_path, kind):
         try:
             assert store.journal == journal
             store.queue_token_counts('s', input_tokens=1)
-            assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+            if os.name == 'posix':
+                assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
         finally:
             store.close()
     # Failed opens must release owner.lock too.

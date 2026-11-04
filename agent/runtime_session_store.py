@@ -385,7 +385,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             candidate['next_sequence'] += 1
             from agent.runtime_session_journal import OutboxCapacityError, check_worker_frame
             try:
-                check_worker_frame(self.scope, entry)
+                check_worker_frame(self.scope, candidate['pending'][-1])
                 self._save(candidate)
             except OutboxCapacityError:
                 # No send or disk mutation occurred: best-effort compression may
