@@ -39,7 +39,7 @@ from tools.process_registry_notifications import (
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_termination import ProcessTerminationMixin
-from tools.process_registry_survival import ProcessSurvivalMixin
+from tools.process_registry_survival import ProcessSurvivalMixin, is_restart_safe
 from tools.process_registry_results import (
     load_completed_results,
     prune_completed_results,
@@ -1239,15 +1239,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release, survive_restart=survive_restart)
-        log = None if survive_restart else worker_output_log(session.id)
-        if survive_restart or (persist_on_release and not use_pty and not _IS_WINDOWS and log is None):
+        log = None if is_restart_safe(session) else worker_output_log(session.id)
+        if is_restart_safe(session) or (persist_on_release and not use_pty and not _IS_WINDOWS and log is None):
             if use_pty:
                 raise ValueError("survive_restart is only supported for non-PTY commands")
             # Durable output remains opt-in. Ordinary jobs keep their bounded pipe;
             # only persistent jobs require stdout to outlive its original reader.
             try:
                 return self._spawn_local_survivor(
-                    session, safe_command, env_vars, restart_safe=survive_restart)
+                    session, safe_command, env_vars, restart_safe=is_restart_safe(session))
             except Exception:
                 self._remove_survivor_run_dir(session)
                 raise
@@ -1484,7 +1484,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 logger.warning("%s wait failed; leaving process tracked: %s", label, e)
                 return
             logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        code = exit_code()
+        code = self._local_exit_code(session, exit_code())
         self._record_local_wait_status(session, code)
         self._finish_exited(session, code)
 
@@ -1666,7 +1666,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             self._write_checkpoint()
         if was_running and session.notify_on_complete:
             # Enqueueing is not delivery: only a consumer claims (before render) and acks (after).
-            if session.survive_restart and not self._survivor_delivery_pending(session):
+            if is_restart_safe(session) and not self._survivor_delivery_pending(session):
                 return
             notification = {
                 "type": "completion",
@@ -1685,7 +1685,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 "started_at": session.started_at,
             }
             _redact_process_result(notification)
-            if session.survive_restart:
+            if is_restart_safe(session):
                 self._queue_survivor_completion(notification)
             else:
                 self.completion_queue.put(notification)
@@ -1967,7 +1967,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 if evt.get("type") == "completion":
                     session = self.get(_evt_sid)
                     # Claim BEFORE handing the event to a renderer; the consumer acks after render.
-                    if session is not None and session.survive_restart and not self._claim_survivor_delivery(session):
+                    if session is not None and is_restart_safe(session) and not self._claim_survivor_delivery(session):
                         # A live peer holds the claim: keep our copy so we can reclaim if it dies.
                         if self._survivor_delivery_pending(session):
                             requeue.append(evt)
@@ -2327,7 +2327,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
                 session.termination_source = source
-            if session.survive_restart:
+            if is_restart_safe(session):
                 self._write_survivor_termination(session, session.completion_reason, source)
             refresh_completed_result(session, self._move_to_finished(session), prune=deadline is None)
             if deadline is None or time.monotonic() < deadline:
@@ -2556,7 +2556,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 entry["notify_on_complete"] = True
             if s.persist_on_release:
                 entry["persist_on_release"] = True
-            if s.survive_restart:
+            if is_restart_safe(s):
                 entry["survive_restart"] = True
             if s.exited:
                 entry["exit_code"] = s.exit_code
@@ -2697,14 +2697,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 s for s in all_sessions
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
-                and not (lifecycle and (s.persist_on_release or s.survive_restart))
-                and not (source == "gateway_shutdown" and s.survive_restart)
+                and not (lifecycle and (s.persist_on_release or is_restart_safe(s)))
+                and not (source == "gateway_shutdown" and is_restart_safe(s))
             ]
             targets = [s for s in candidates if not s.exited]
             restart_survivors = [
                 s for s in all_sessions
                 if (task_id is None or s.owner_task_id == task_id)
-                and s.id not in exclude_ids and not s.exited and s.survive_restart
+                and s.id not in exclude_ids and not s.exited and is_restart_safe(s)
             ]
             # Finished sessions whose systemd scope did not stop: retry only the scope stop.
             scope_retries = [s for s in candidates if s.exited]

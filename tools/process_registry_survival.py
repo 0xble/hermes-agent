@@ -23,6 +23,20 @@ logger = logging.getLogger(__name__)
 _LIVE_CLAIM_NONCES: set[str] = set()
 
 
+def is_restart_safe(entry_or_session) -> bool:
+    """Only an explicit opt-in grants restart-safe lifecycle and delivery semantics."""
+    if isinstance(entry_or_session, dict):
+        return bool(entry_or_session.get("survive_restart", False))
+    return bool(getattr(entry_or_session, "survive_restart", False))
+
+
+def has_exit_marker(entry_or_session) -> bool:
+    """An exit receipt is a collection capability, not a restart-survival claim."""
+    if isinstance(entry_or_session, dict):
+        return bool(entry_or_session.get("exit_path"))
+    return bool(getattr(entry_or_session, "exit_path", ""))
+
+
 class ProcessSurvivalMixin:
     """Share durable I/O without granting ordinary jobs restart-safe lifecycle semantics."""
 
@@ -45,9 +59,9 @@ class ProcessSurvivalMixin:
         session.survive_restart = restart_safe
         session.log_path = str(run_dir / "out.log")
         session.exit_path = str(run_dir / "exit")
-        session.delivered_path = str(run_dir / "delivered") if restart_safe else ""
+        session.delivered_path = str(run_dir / "delivered") if is_restart_safe(session) else ""
         wrapped = self._local_exit_wrapper(session, safe_command)
-        if restart_safe:
+        if is_restart_safe(session):
             command_argv = [registry._find_shell(), "-lic", f"set +m; {wrapped}"]
             dispatch = registry.restart_safe_gateway_child_argv(
                 command_argv,
@@ -103,16 +117,27 @@ class ProcessSurvivalMixin:
         # EXIT honors inherited errexit. Only the private temp marker is forcibly
         # overwritten under noclobber; rename publishes it. bash exposes 258 to
         # the trap on parser failure but its real exit is 2.
+        normalize_signal = ""
+        if not session.log_path and not is_restart_safe(session):
+            normalize_signal = 'if [ "$rc" -gt 128 ] && [ "$rc" -lt 193 ]; then rc=$((128 - rc)); fi; '
         exit_trap = (
-            f"rc=$(($? & 255)); printf '%s\\n' \"$rc\" >| {q(session.exit_path + '.tmp')}; "
+            f"rc=$(($? & 255)); {normalize_signal}printf '%s\\n' \"$rc\" >| {q(session.exit_path + '.tmp')}; "
             f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}"
         )
         redirect = f" >> {q(session.log_path)} 2>&1" if session.log_path else ""
         return f"trap {q(exit_trap)} EXIT\n(\n{safe_command}\n){redirect}"
 
+    @staticmethod
+    def _local_exit_code(session: ProcessSession, code):
+        """Undo the ordinary EXIT wrapper's shell encoding of a signal wait status."""
+        if has_exit_marker(session) and not session.log_path and not is_restart_safe(session):
+            if isinstance(code, int) and 128 < code < 193:
+                return 128 - code
+        return code
+
     def _record_local_wait_status(self, session: ProcessSession, code) -> None:
         """The original parent can collect SIGKILL even when EXIT never ran."""
-        if not session.exit_path or code is None or self._recorded_survivor_exit(session.exit_path) is not None:
+        if not has_exit_marker(session) or code is None or self._recorded_survivor_exit(session.exit_path) is not None:
             return
         try:
             from utils import atomic_write_text
@@ -211,7 +236,7 @@ class ProcessSurvivalMixin:
     def _retain_survivor_completion(self, session: ProcessSession) -> bool:
         """Keep both agent and text-watcher results until their delivery is settled."""
         # Prune paths also see foreign/legacy session objects without the survival fields.
-        return (getattr(session, "survive_restart", False)
+        return (is_restart_safe(session)
                 and (getattr(session, "notify_on_complete", False) or getattr(session, "watcher_interval", 0) > 0)
                 and self._survivor_delivery_pending(session))
 
@@ -254,12 +279,12 @@ class ProcessSurvivalMixin:
     def claim_survivor_completion(self, session_id: str) -> bool:
         """Fence a consumer before rendering/admission; ordinary completions need no lease."""
         session = self.get(session_id)
-        return session is None or not session.survive_restart or self._claim_survivor_delivery(session)
+        return session is None or not is_restart_safe(session) or self._claim_survivor_delivery(session)
 
     def release_survivor_completion(self, session_id: str) -> bool:
         """Return failed delivery to pending, only while we still own its lease."""
         session = self.get(session_id)
-        if session is None or not session.survive_restart or not session.delivered_path:
+        if session is None or not is_restart_safe(session) or not session.delivered_path:
             return False
         try:
             mine = self._survivor_claim_owner()
@@ -297,7 +322,7 @@ class ProcessSurvivalMixin:
 
     def acknowledge_survivor_completion(self, session_id: str) -> None:
         session = self.get(session_id)
-        if session is not None and session.survive_restart:
+        if session is not None and is_restart_safe(session):
             self._mark_survivor_delivered(session)
 
     def _consume_survivor_completion(self, session_id: str) -> None:
@@ -378,17 +403,17 @@ class ProcessSurvivalMixin:
     @staticmethod
     def _file_backed(session: ProcessSession) -> bool:
         """Collect from files only when no live pipe reader owns this session's output."""
-        return bool(session.survive_restart or (session.exit_path and (session.log_path or session.detached)))
+        return has_exit_marker(session) and bool(session.log_path or session.detached)
 
     def prune_survivor_run_dir(self, session: ProcessSession) -> None:
         """Prune an aged survivor only after its completion was delivered.
 
         A file-backed persist_on_release job has no delivery marker: its run directory
         goes when the finished session itself is pruned."""
-        if getattr(session, "survive_restart", False):
+        if is_restart_safe(session):
             if self._survivor_delivery_state(session) == "delivered":
                 self._remove_survivor_run_dir(session)
-        elif getattr(session, "exit_path", ""):
+        elif has_exit_marker(session):
             self._remove_survivor_run_dir(session)
 
     def _prune_delivered_survivor_runs(self) -> None:
@@ -467,7 +492,7 @@ class ProcessSurvivalMixin:
     def _survivor_poller_stopped(self, session: ProcessSession) -> bool:
         """Only restart-safe jobs have a successor responsible for shutdown completions."""
         stopped = getattr(self, "_survivor_pollers_stopped", None)
-        return session.survive_restart and stopped is not None and stopped.is_set()
+        return is_restart_safe(session) and stopped is not None and stopped.is_set()
 
     def _finish_survivor_if_allowed(self, session: ProcessSession, exit_code, reason: str, source: str) -> bool:
         """Fence restart-safe finalization only; ordinary drain results belong here."""
@@ -476,6 +501,23 @@ class ProcessSurvivalMixin:
         # Shutdown can win during receipt IO. Publication rechecks under its short fence,
         # leaving the checkpoint pending for the successor instead of blocking teardown.
         self._finish_survivor(session, exit_code, reason, source)
+        return True
+
+    def _poll_ordinary_detached(self, session: ProcessSession) -> bool:
+        """Apply ordinary PID/scope recovery even when its receipt needs a file poller."""
+        if not session.detached or is_restart_safe(session):
+            return False
+        fate = self._detached_host_fate(session.pid, session.host_start_time)
+        if fate == "running":
+            return False
+        if fate == "reused":
+            self._close_reused_detached(session)
+            return True
+        from tools.process_registry import _stop_systemd_unit
+        if session.systemd_unit and not _stop_systemd_unit(session.systemd_unit):
+            return True  # Keep ownership/checkpoint and retry; never lose a live scope.
+        self._read_survivor_log(session, final=True)
+        self._finish_recovered_exit(session, fate, self._recorded_survivor_exit(session.exit_path), {})
         return True
 
     def _survivor_poller_loop(self, session: ProcessSession):
@@ -490,13 +532,17 @@ class ProcessSurvivalMixin:
                 time.sleep(0.05)
                 continue
             try:
+                if self._poll_ordinary_detached(session):
+                    if not session.exited:
+                        time.sleep(0.1)
+                    continue
                 exit_text = ""
                 if exit_path.exists():
                     exit_text = exit_path.read_text(encoding="utf-8-sig", errors="replace").strip()
                 self._read_survivor_log(session)
                 if exit_text:
                     try:
-                        exit_code = int(exit_text.splitlines()[-1])
+                        exit_code = self._local_exit_code(session, int(exit_text.splitlines()[-1]))
                     except ValueError:
                         exit_code = -1
                     if not self._finish_survivor_if_allowed(session, exit_code, "exited", ""):
@@ -522,12 +568,15 @@ class ProcessSurvivalMixin:
                             atomic_write_text(session.exit_path, f"{code}\n", mode=0o600, fsync_dir=True)
                         if not self._finish_survivor_if_allowed(
                             session, code, "exited" if code is not None else "lost",
-                            "" if code is not None else "survivor_lost",
+                            "" if code is not None else ("survivor_lost" if is_restart_safe(session) else "checkpoint.exit_uncollected"),
                         ):
                             return
                         return
             except OSError:
-                self._finish_survivor_if_allowed(session, None, "lost", "survivor_lost")
+                self._finish_survivor_if_allowed(
+                    session, None, "lost",
+                    "survivor_lost" if is_restart_safe(session) else "checkpoint.exit_uncollected",
+                )
                 return
             time.sleep(0.1)
 
@@ -575,7 +624,7 @@ class ProcessSurvivalMixin:
             atomic_json_write(path, payload, mode=0o600, fsync_dir=True)
             # A killed wrapper may be SIGKILLed before it can write its own exit marker.
             # Persist the operator's result as the durable fallback for recovery too.
-            if session.exit_path:
+            if has_exit_marker(session):
                 atomic_write_text(
                     session.exit_path, f"{session.exit_code}\n", mode=0o600, fsync_dir=True,
                 )
@@ -586,7 +635,9 @@ class ProcessSurvivalMixin:
         """A published wrapper result wins over a later kill of its already-reaped PID."""
         if session.exited:
             return True
-        exit_code = self._recorded_survivor_exit(session.exit_path)
+        if not has_exit_marker(session):
+            return False
+        exit_code = self._local_exit_code(session, self._recorded_survivor_exit(session.exit_path))
         if exit_code is None:
             return False
         if not self._file_backed(session):
@@ -599,7 +650,7 @@ class ProcessSurvivalMixin:
                 with session._lock:
                     session.mark_exited(exit_code)
             return True
-        termination = self._recorded_survivor_termination(session.exit_path)
+        termination = self._recorded_survivor_termination(session.exit_path) if is_restart_safe(session) else {}
         previous_deadline = session._kill_deadline
         if deadline is not None:
             session._kill_deadline = deadline
