@@ -63,7 +63,8 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
                 query, type=search_type, num_results=limit, contents={"highlights": True},
             )
             result = search_ok([
-                web_hit(r.url or "", r.title or "", " ".join(r.highlights or []), i + 1)
+                web_hit(r.url or "", r.title or "", " ".join(r.highlights or []), i + 1,
+                        image=getattr(r, "image", None))
                 for i, r in enumerate(response.results or [])
             ])
             result["data"].update(search_type=search_type, search_type_reason=reason)

@@ -42,8 +42,12 @@ def search_fail(error: str) -> dict[str, Any]:
     return {"success": False, "error": error}
 
 
-def web_hit(url: str, title: str, description: str, position: int) -> dict[str, Any]:
-    return {"url": url, "title": title, "description": description, "position": position}
+def web_hit(url: str, title: str, description: str, position: int, *, image: Optional[str] = None) -> dict[str, Any]:
+    """Search row; ``image`` is the page's preview image URL when the backend reports one."""
+    hit = {"url": url, "title": title, "description": description, "position": position}
+    if image:
+        hit["image"] = image
+    return hit
 
 
 def title_hit(title: str, url: str, description: str, position: int) -> dict[str, Any]:
