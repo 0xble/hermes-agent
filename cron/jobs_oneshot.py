@@ -57,6 +57,37 @@ def _record_miss(d, cause: str) -> str:
     return error
 
 
+def occurrence_started(job: dict) -> bool:
+    """Evidence belongs to this arm, never to the job's historical last_run_at.
+
+    Re-arm resets the budget and fire claim. A due-scan run claim or a queued /
+    missed ledger row is only admission, not evidence of possible side effects.
+    """
+    from cron.executions import _transaction
+    from cron.occurrences import scheduled_instant
+
+    if (job.get("repeat") or {}).get("completed", 0) > 0 or job.get("fire_claim"):
+        return True
+    instant = scheduled_instant(job.get("next_run_at") or (job.get("schedule") or {}).get("run_at"))
+    if instant is None:
+        return False
+    with _transaction() as conn:
+        return conn.execute(
+            "SELECT 1 FROM executions WHERE job_id=? AND scheduled_instant=? "
+            "AND started_at IS NOT NULL LIMIT 1", (str(job["id"]), instant),
+        ).fetchone() is not None
+
+
+def occurrence_finished(job: dict) -> bool:
+    """Completion must also belong to this arm, not a retained history stamp."""
+    from cron.occurrences import completed_occurrence, scheduled_instant
+
+    if job.get("state") == "completed":
+        return True
+    instant = scheduled_instant(job.get("next_run_at") or (job.get("schedule") or {}).get("run_at"))
+    return instant is not None and occurrence_started(job) and completed_occurrence(job, instant)
+
+
 def retire_expired_oneshot(d) -> bool:
     """Keep overdue never-started payloads held; continuity is provenance, not send approval."""
     from cron import jobs
@@ -74,7 +105,7 @@ def retire_expired_oneshot(d) -> bool:
         d.job["run_claim"] = claim = None
     # A consumed dispatch is interrupted, not a never-started scheduler miss.
     # Preserve main's partial-effects diagnostic and never replay it after a stall.
-    if (d.job.get("repeat") or {}).get("completed", 0) > 0 or d.job.get("last_run_at"):
+    if occurrence_started(d.job):
         if not (claim or d.job.get("fire_claim")):
             jobs._write_retired_oneshot_diagnostic(d.job, d.next_run)
             d.scan.retire(d.job["id"])

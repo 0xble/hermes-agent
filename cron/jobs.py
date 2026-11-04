@@ -2773,11 +2773,13 @@ def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
     """Trace for a wedged one-shot removal: dispatch was claimed but mark_job_run never ran
     (interrupted mid-run); removing it silently would leave no output, error, or record.
 
-    A spent dispatch without ``last_run_at`` may have partial effects. Leave an alert
+    A spent dispatch without a current-arm completion may have partial effects. Leave an alert
     and local trace when recovery retires it, rather than replaying it (#73973).
     """
-    if job.get("last_run_at") is not None:
-        return  # a prior run was recorded — normal completion race, not a wedge
+    from cron.jobs_oneshot import occurrence_finished, occurrence_started
+
+    if not occurrence_started(job) or occurrence_finished(job):
+        return  # Only a current-arm interrupted dispatch needs a partial-effects warning.
     repeat = job.get("repeat") or {}
     claim = job.get("run_claim") or {}
     written = _write_oneshot_diagnostic(
@@ -2789,7 +2791,7 @@ def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
         f"- run claimed at: {claim.get('at', 'unknown')} by {claim.get('by', 'unknown')}\n"
         f"- removed at: {_hermes_now().isoformat()}\n\n"
         "This one-shot job's dispatch was claimed, but the run never "
-        "completed (`last_run_at` was never written) — the scheduler "
+        "completed for this occurrence (no current completion stamp) — the scheduler "
         "process was most likely killed or restarted mid-execution. The "
         "job has been removed to stop it re-firing; recreate it to run "
         "again.\n",
@@ -2805,7 +2807,9 @@ def _write_retired_oneshot_diagnostic(
     job: dict[str, Any], next_run: str, *, dispatch_limit: bool = False,
 ) -> None:
     """Route both retirement gates through the same interrupted-versus-unrun diagnostic."""
-    if (job.get("repeat") or {}).get("completed", 0) > 0 and job.get("last_run_at") is None:
+    from cron.jobs_oneshot import occurrence_finished, occurrence_started
+
+    if occurrence_started(job) and not occurrence_finished(job):
         # A consumed, unfinished dispatch may already have side effects.
         _write_wedged_oneshot_diagnostic(job)
         return
@@ -2842,8 +2846,12 @@ def claim_dispatch(job_id: str) -> bool:
         completed = repeat.get("completed", 0)
         label = job.get("name", job.get("id", "?"))
         if completed >= times:
-            if job.get("last_run_at") is not None:
-                # A prior run completed normally (mark_job_run raced this tick). Retain the terminal
+            from cron.jobs_oneshot import occurrence_finished
+
+            finished = (occurrence_finished(job) if job.get("schedule", {}).get("kind") == "once"
+                        else job.get("last_run_at") is not None)
+            if finished:
+                # The relevant run completed normally (mark_job_run raced this tick). Retain the terminal
                 # record, as mark_job_run's repeat-limit branch does, instead of deleting the
                 # status.
                 _complete_job_record(job)
@@ -3144,7 +3152,7 @@ def _sweep_completed_oneshots(
 
 # --- Due scan ---
 
-def get_due_jobs(*, adapters=None, loop=None) -> list[dict[str, Any]]:
+def get_due_jobs() -> list[dict[str, Any]]:
     """Return all jobs due now. A recurring job more than one period stale (gateway down, or a run
     overran the interval) has its backlog collapsed — next_run_at fast-forwards so nothing
     burst-fires — but still fires ONCE now (via mark_job_run, consuming one ``repeat.times`` run),
@@ -3235,8 +3243,10 @@ def _recover_missing_next_run(job: dict[str, Any], scan: _DueScan) -> Optional[s
     to 'scheduled', otherwise they would be silently skipped forever."""
     schedule = job.get("schedule", {})
     kind = schedule.get("kind")
-    recovered_next = _recoverable_oneshot_run_at(
-        schedule, scan.now, last_run_at=job.get("last_run_at"))
+    # Restore the slot, not eligibility: the normal occurrence/grace gates below
+    # must hold never-started misses and retire spent dispatches, including old arms.
+    run_at = _parse_aware(schedule.get("run_at")) if kind == "once" else None
+    recovered_next = schedule["run_at"] if run_at is not None else None
     recovery_kind = "one-shot" if recovered_next else None
     if not recovered_next and kind in {"cron", "interval"}:
         recovered_next = compute_next_run(schedule, scan.now.isoformat(), job.get("timezone"))
@@ -3448,7 +3458,9 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
     repeat = job.get("repeat") or {}
     times = repeat.get("times")
     completed = repeat.get("completed", 0)
-    if times is None or times <= 0 or completed < times:
+    from cron.jobs_oneshot import occurrence_started
+
+    if times is None or times <= 0 or (completed < times and not occurrence_started(job)):
         return False
     name = job.get("name", job.get("id", "?"))
     # A live run must never have its job record deleted underneath it (#62002): a run that outlives the
@@ -3456,25 +3468,16 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
     # expired-claim condition as a dead tick, but mark_job_run() still needs the record to land last_run_at
     # / last_status / last_delivery_error. If this process is still running the job, it is slow, not stale —
     # keep the entry and skip.
-    if _job_running_in_this_process(job.get("id", "")):
+    if job.get("fire_claim") or _job_running_in_this_process(job.get("id", "")):
         logger.info(
-            "Job '%s': dispatch limit reached (%d/%d) but its run is still in flight in this "
+            "Job '%s': dispatch limit reached (%d/%d) but its run is still claimed or in flight in this "
             "process — keeping entry",
             name, completed, times)
         return True
-    if job.get("last_run_at") is not None:
-        # A record with last_run_at completed a real run and was re-armed without a budget reset
-        # (old build or hand edit) — not the dead-tick case; warn so the removal leaves a trace.
-        logger.warning(
-            "Job '%s': one-shot dispatch limit reached (%d/%d) on a record that already completed "
-            "a run (last_run_at=%s) — removing it WITHOUT firing. This record was re-armed "
-            "without a budget reset (pre-#93615 store or hand edit); re-run it with "
-            "'hermes cron resume <job> --run-now' (#93524).",
-            name, completed, times, job.get("last_run_at"))
-    else:
-        logger.info(
-            "Job '%s': one-shot dispatch limit reached (%d/%d) — removing stale due entry",
-            name, completed, times)
+    logger.warning(
+        "Job '%s': one-shot dispatch limit reached (%d/%d) — removing stale due entry "
+        "WITHOUT firing. To explicitly re-arm it, use 'hermes cron resume <job> --run-now'.",
+        name, completed, times)
     # Queue before mutating the scan: enqueue failure must not retire the job.
     _write_retired_oneshot_diagnostic(job, job.get("next_run_at") or "unknown", dispatch_limit=True)
     scan.retire(job["id"])
@@ -3575,14 +3578,12 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         # fixed window is not enough for a run that outlives a tick. The other process sees the
         # fresh claim and skips; mark_job_run() clears it. The TTL only covers a tick that DIES.
         claim = {"at": now.isoformat(), "by": _machine_id()}
-        if _elapsed_seconds(now, d.next_run_dt) > ONESHOT_GRACE_SECONDS:  # scheduler/store interruption catch-up
-            claim["outage"] = True
         job["run_claim"] = claim
         scan.persist(job["id"], run_claim=claim)
 
     # Missed-run visibility: persist scheduled-vs-actual timing so separate CLI processes can show a
-    # late catch-up. Recurring only — expired one-shots were retired above; manual triggers aren't
-    # late.
+    # late catch-up. Recurring only — overdue never-started one-shots are held above;
+    # manual triggers aren't late.
     if not manual_run and recurring:
         lateness = max(0.0, _elapsed_seconds(now, d.next_run_dt))
         # See #99879.

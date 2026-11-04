@@ -103,7 +103,7 @@ def test_due_scan_accounts_for_miss_or_dispatches(store, monkeypatch, late, scan
         receipt = delivery_queue.get_status(f"oneshot-missed:{job['id']}:{due_at}")
         assert receipt is not None
         assert "Payload kept" in receipt["content"]
-        jobs.get_due_jobs(adapters=adapters, loop=loop)
+        jobs.get_due_jobs()
         assert delivery_queue.get_status(receipt["execution_id"]) == receipt
         deliver.assert_not_called()
 

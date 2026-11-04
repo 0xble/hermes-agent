@@ -140,6 +140,17 @@ interrupted/partial-effects diagnostic and must not be replayed. Keep claimed
 and on-time behavior unchanged. The implementation belongs in
 `cron/jobs_oneshot.py`, not the jobs facade.
 
+An explicit re-arm resets the occurrence's dispatch budget and claims but keeps
+historical `last_run_at`. Never use that history as evidence that the new arm
+started: share the per-occurrence predicate across grace retirement and dispatch
+retirement/diagnostics, including recovered missing slots. Slot recovery only
+restores the scheduled instant; it delegates eligibility to those same gates.
+A consumed current-arm budget
+or a started ledger row for its exact scheduled instant proves partial-effects
+risk; queued or never-started missed rows and previous occurrences do not.
+
+`tests/cron/test_oneshot_occurrence.py` covers CLI `--at`/`--run-now` re-arms,
+held payloads/origin notices, and interrupted/completed occurrence handling.
 `tests/cron/test_oneshot_missed.py` covers actual single/multiplex provider
 stalls, startup/downtime evidence, on-time grace, and accounting/incident/save
 failure retries through real temp-home stores. `test_oneshot_person_hold.py`

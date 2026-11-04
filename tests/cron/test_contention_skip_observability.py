@@ -19,7 +19,7 @@ def test_already_running_skip_persists_reason(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
     monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
     monkeypatch.setattr(scheduler, "_hermes_home", home)
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda **_kw: [])
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [])
 
     script = home / "scripts" / "probe.py"
     script.parent.mkdir()

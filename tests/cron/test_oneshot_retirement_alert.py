@@ -203,9 +203,10 @@ def test_rearmed_oneshot_keeps_a_queued_alert_and_local_trace(store, lateness):
     receipt = delivery_queue.get_status(f"oneshot-retired:{job['id']}")
     assert receipt is not None, "retired re-armed job vanished without an owner alert"
     assert receipt["status"] == "pending"
-    assert "Job not run; recreate to run" in receipt["content"]
+    # completed belongs to the current arm; yesterday's completion cannot mask a crash.
+    assert "interrupted" in receipt["content"] and "partial effects" in receipt["content"]
     outputs = list((store / "cron/output" / job["id"]).glob("*.md"))
-    assert outputs and "removed before firing" in outputs[0].read_text()
+    assert outputs and "completed for this occurrence" in outputs[0].read_text()
 
 
 def test_run_body_outbox_failure_preserves_retirement_for_retry(store, monkeypatch):
