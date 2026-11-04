@@ -1,0 +1,23 @@
+# Command-only queue: the lander attests the exact reviewed, gated PR head,
+# then comments @mergifyio queue. No auto-queueing or review carry-forward.
+# Keep the original heads unchanged; test their combined result on a draft PR.
+queue_rules:
+  - name: default
+    batch_size: 2
+    batch_max_wait_time: 1 min
+    max_checks_retries: 0
+    merge_method: fast-forward
+    branch_protection_injection_mode: merge
+    queue_conditions:
+      - base = main
+      - -draft
+      - check-success = qualification
+      - check-success = landing/reviewed-gated
+    merge_conditions:
+      # Check conditions here read the temporary batch PR, not its members.
+      # The review attestation belongs only on each original head at entry.
+      - check-success = qualification
+
+merge_queue:
+  mode: serial
+  max_parallel_checks: 1

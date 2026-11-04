@@ -1,6 +1,9 @@
 name: Repository gate
 on:
   pull_request:
+    # Mergify tests cumulative queue heads through temporary draft PRs.
+    # Keep drafts enabled; GitHub's merge_group event is not used by Mergify.
+    types: [opened, synchronize, reopened, ready_for_review]
 permissions:
   contents: read
 concurrency:
