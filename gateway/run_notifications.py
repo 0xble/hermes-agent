@@ -3163,8 +3163,11 @@ class GatewayNotificationsMixin(
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
                 if session.exited:
-                    if is_restart_safe(session) and process_registry._claim_survivor_delivery(session):
-                        process_registry._mark_survivor_delivered(session)
+                    if is_restart_safe(session):
+                        if process_registry._claim_survivor_delivery(session):
+                            process_registry._mark_survivor_delivered(session)
+                    else:
+                        acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
                     break
                 continue
             current_output_len = len(session.output_buffer)
@@ -3250,6 +3253,7 @@ class GatewayNotificationsMixin(
                     if is_restart_safe(session):
                         process_registry._mark_survivor_delivered(session)
                     break
+                settled = True
                 if notify_mode in {"concise", "all", "result"} or (
                     notify_mode == "error" and non_success
                 ):
@@ -3266,6 +3270,7 @@ class GatewayNotificationsMixin(
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                         await present_notification(send_final, platform=platform_name,
                                                    diagnostic=non_success)
+                    settled = sent is not False
                     if sent is False and is_restart_safe(session):
                         process_registry.release_survivor_completion(session_id)
                         # Keep one offer alive until shutdown cancels the watcher, even if
@@ -3275,8 +3280,8 @@ class GatewayNotificationsMixin(
                         continue
                 # Presented, or deliberately suppressed by the notification mode: either way the
                 # claimed survivor completion is settled and must not replay on a successor.
-                if is_restart_safe(session):
-                    process_registry.acknowledge_survivor_completion(session_id)
+                if settled:
+                    acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers

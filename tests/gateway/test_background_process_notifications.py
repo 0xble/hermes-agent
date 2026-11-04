@@ -1052,3 +1052,18 @@ async def test_unknown_exit_is_not_success_and_error_mode_delivers(
     assert "exit status unknown" in text.lower(), text
     assert "✅" not in text and "❌" not in text, text
     assert "last collected output" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["concise", "error", "off"])
+async def test_text_watcher_settles_persistent_notification_handoff(monkeypatch, tmp_path, mode):
+    import tools.process_registry as pr_module
+    from unittest.mock import Mock
+
+    session = SimpleNamespace(output_buffer="ok\n", exited=True, exit_code=0, command="build", started_at=None)
+    registry = _FakeRegistry([session])
+    registry.acknowledge_survivor_completion = Mock()
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    runner = _build_runner(monkeypatch, tmp_path, mode)
+    await runner._run_process_watcher(_watcher_dict())
+    registry.acknowledge_survivor_completion.assert_called_once_with("proc_test")
