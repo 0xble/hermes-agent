@@ -585,6 +585,30 @@ OS/integration/release lanes. The candidate removes hosted orchestration while
 remote enforcement remains until replacement qualification and cutover. A partial
 lane or a Linux pass cannot establish all-platform coverage.
 
+## Trailing-amp reader home isolation
+
+The `fork-ci-reliability` identity covers the real-process tests in
+`tests/tools/test_terminal_trailing_amp_auto_background.py`. Their reader threads
+can finish after a later test changes process-global `HERMES_HOME`.
+`_track_started` already copies the producer's context, but an environment-only
+home has no context-local binding to copy. A delayed `_publish_finished` can then
+write `processes.json` into the incognito refusal test's home despite neither
+acquiring an environment nor spawning a process there. Hosted run 41755656382,
+attempt 1, exposed this race.
+
+A module-local autouse fixture binds the existing temporary home with
+`set_hermes_home_override` as well as `HERMES_HOME`, so real reader callbacks keep
+their producer's home. An event-held real reader completion deterministically
+crosses a subsequent home change and must checkpoint only in its original home.
+The incognito no-acquire, no-spawn and no-checkpoint assertions stay intact. No
+production behavior, timeout, retry or checkpoint persistence is relaxed.
+Upstream guidance was checked at `29a61cb7ab509cda0c376bf3860edb87210b0755`;
+[merged PR #140317](https://github.com/NousResearch/hermes-agent/pull/140317)
+is related origin, not a fix for callback test isolation. Retire this adaptation
+when released upstream binds these real-process tests to fixture-owned homes.
+
+Contract tests: `tests/tools/test_terminal_trailing_amp_auto_background.py`
+
 ## Release-sync scope
 
 A release sync merges thousands of upstream commits. Fork policy checks classify
