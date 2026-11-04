@@ -482,17 +482,16 @@ async def test_invalid_hold_does_not_keep_previous_automatic_attended_route(lane
 
 
 @pytest.mark.asyncio
-async def test_compression_exhaustion_reset_does_not_reacquire_its_route_lock(lane, monkeypatch, armed_loop_guard):
+async def test_compression_exhaustion_keeps_role_without_reacquiring_route_lock(lane, monkeypatch, armed_loop_guard):
     runner = lane.runner
     await runner._set_session_model_role(lane.key, "fast")
-    monkeypatch.setattr(runner, "_sync_telegram_topic_binding", lambda *a, **k: None)
-    monkeypatch.setattr(runner.session_store, "set_session_yolo", lambda *a: None)
-    response, entry = await asyncio.wait_for(runner._hmwa_compression_exhaustion_reset(
-        {"compression_exhausted": True}, "", lane.entry, lane.key, lane.source), 2)
-    assert entry.session_id != lane.entry.session_id
+    async with runner._session_model_override_lock(lane.key):
+        response, entry = await asyncio.wait_for(runner._hmwa_compression_exhaustion_reset(
+            {"compression_exhausted": True}, "", lane.entry, lane.key, lane.source), 2)
+    assert entry is lane.entry
     assert response
-    assert await asyncio.to_thread(runner.session_store.get_model_role, lane.key) is None
-    assert runner._session_state(lane.key).conversation.model_role is None
+    assert await asyncio.to_thread(runner.session_store.get_model_role, lane.key) == "fast"
+    assert runner._session_state(lane.key).conversation.model_role == "fast"
 
 
 @pytest.mark.asyncio
