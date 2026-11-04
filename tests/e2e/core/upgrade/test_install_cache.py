@@ -74,6 +74,46 @@ def test_cache_refuses_an_unrelated_existing_directory(tmp_path):
     assert (unrelated / "preserve").read_text() == "user cache\n"
 
 
+def test_upgrade_leg_keeps_two_argument_callers_and_private_downloads(tmp_path, monkeypatch):
+    from tests.e2e.core.upgrade import test_upgrade_path as upgrade
+
+    source = tmp_path / "source"
+    source.mkdir()
+    git_env = {**os.environ, "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+               "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_COUNT": "0"}
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(source), *args], env=git_env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    (source / "pyproject.toml").write_text('[project]\nrequires-python = ">=3.11"\n')
+    git("add", ".")
+    git("commit", "-qm", "fixture")
+    base = git("rev-parse", "HEAD")
+    uv = tmp_path / "fixture-uv"
+    uv.write_text("#!/bin/sh\nexit 0\n")
+    uv.chmod(0o755)
+    monkeypatch.setattr(H, "WORKTREE", source)
+    monkeypatch.setattr(upgrade, "_refs", lambda: upgrade._Refs(base, "fixture", base))
+    monkeypatch.setattr(upgrade, "_real_uv", lambda: str(uv))
+
+    # Match pm/test_configured_features.py's unchanged public helper call exactly.
+    legs = [upgrade.make_leg(tmp_path / name, None) for name in ("one", "two")]
+    for leg in legs:
+        for key in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "HERMES_RUNTIME_DIR", "npm_config_cache"):
+            assert Path(leg.env[key]).is_relative_to(leg.root / "downloads")
+        assert Path(leg.env["HERMES_HOME"]) == leg.hermes_home
+        assert upgrade._git("rev-parse", "HEAD", cwd=leg.install) == base
+    assert legs[0].env["UV_CACHE_DIR"] != legs[1].env["UV_CACHE_DIR"]
+
+    shared = InstallCache(tmp_path / "explicit-downloads")
+    explicit = upgrade.make_leg(tmp_path / "three", None, shared)
+    assert explicit.env["UV_CACHE_DIR"] == str(shared.root / "uv")
+    assert explicit.env["HERMES_RUNTIME_DIR"] == str(shared.root / "runtime")
+
+
 def test_upgrade_origin_advertises_only_the_local_subject_branch(tmp_path, monkeypatch):
     from tests.e2e.core.upgrade import test_upgrade_path as upgrade
 
