@@ -116,6 +116,7 @@ async def test_deferred_sweep_replays_final_under_a_clean_outbound_class(tmp_pat
         await _schedule_retry(store, adapter)
     await _until(lambda: not outbox._SWEEPS)
 
+    assert adapter.daily.messages("c") == 10  # the replay must still be under quota pressure
     assert adapter.labels == [OUTBOUND_FINAL]
     assert adapter.sends == ["final"]
     assert store.pending() == []

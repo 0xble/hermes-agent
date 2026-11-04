@@ -80,6 +80,27 @@ helper and thresholds instead of carrying a second copy.
 **Proof surface:** `tests/gateway/test_goal_status_notice.py` plus the existing
 cron live-delivery confirmation and goal verdict/parked-wake suites.
 
+Gateway quota-pressure tests use the autouse `fixed_daily_quota_wall` fixture
+in `tests/gateway/conftest.py`. It supplies one fixed `DailyQuota.wall` only
+when the constructor caller omits a clock, covering direct quota construction
+and adapter/limiter-created ledgers without freezing global time. Explicit
+rollover/penalty clocks still win. The deferred outcome flood-retry test uses
+this shared default, so its 11-message pressure survives the real short wait.
+The `_spend` / `_spend_calls` helpers assert their message/call pressure was
+actually established; the outbox replay also checks its pressure remains.
+
+This is a test-input correction, not a quota or cooldown behavior change:
+`DailyQuota` intentionally starts an empty window at UTC midnight by default,
+and a short penalty does not move that anchor (see
+`test_window_rolls_at_the_anchor_and_starts_empty` and
+`test_short_penalty_does_not_move_the_window`). `ChatOutboundBudget` uses a
+separate monotonic slot clock, and durable flood deadlines remain unchanged.
+The original test's real wall could cross midnight during `RetryAfter(1)`,
+correctly reset the daily count, and fail its unchanged `== 11` assertion.
+A scratch default-wall probe advances 23:59:59 to 00:00:01 at the real flood
+handler: both original parametrizations fail with `0 == 11`; the explicit
+fixed wall keeps the same pressure, two Bot API attempts, and task cleanup.
+
 **Upstream prior art:** The request names fork commit `7b78199d51` (#290), which
 is the covering implementation and was inspected before adaptation. No separate
 upstream search is required for this fork-only adaptation; any later search
