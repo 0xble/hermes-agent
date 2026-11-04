@@ -201,6 +201,7 @@ class MicroCompactionMixin:
     def _reset_micro_failure_tracking(self) -> None:
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
+        self._consecutive_archive_capacity_failures = 0
 
     def _micro_compact(
         self, messages: list[dict[str, Any]], *, turn_session_id: Optional[str] = None,
@@ -209,7 +210,7 @@ class MicroCompactionMixin:
         (possibly modified) list and syncs the session DB via ``archive_and_compact`` (the
         append-only flush alone would double-load on resume). ``turn_session_id`` is the session the
         caller's turn started in; it parents the pass's Relay mark when this session has no scope yet."""
-        if not self._micro_compact_enabled:
+        if not self._micro_compact_enabled or self._summary_failure_cooldown_until > time.monotonic():
             return messages
 
         # Cadence gate: each pass breaks prompt cache once. Counted per invocation so a no-op turn
@@ -252,6 +253,7 @@ class MicroCompactionMixin:
             return messages
         # Pre-pass state, restored when the commit finds a compaction landed during the summary call.
         _pre_cursor, _pre_summary = self._micro_compact_cursor, self._micro_compact_rolling_summary
+        _pre_flush_invalidated = self._flush_scan_cursor_invalidated
 
         # Defrag rewrites summary text/marker in place (no splice, no cursor move) instead of
         # absorbing this turn.
@@ -259,15 +261,19 @@ class MicroCompactionMixin:
             _marker = next((e for e in reversed(messages) if _is_micro_marker(e)), None)
             _pre_marker = dict(_marker) if _marker is not None else None
             defragged = self._defrag_rolling_summary(messages)
-            if defragged and not self._sync_micro_compact_to_db(
+            sync_outcome = self._sync_micro_compact_to_db(
                 messages, held=_held, start_watermark=_start_watermark,
-            ):
-                # Stale generation: undo the in-place rewrite so the finalizer never persists it.
+            ) if defragged else None
+            if sync_outcome:
+                # Undo the tentative rewrite so the finalizer never persists a refused pass.
                 self._micro_compact_rolling_summary = _pre_summary
+                self._flush_scan_cursor_invalidated = _pre_flush_invalidated
                 if _marker is not None:
                     _marker.clear()
                     _marker.update(_pre_marker)
-                _telemetry("stale_generation", messages, tokens_after=_tokens_before)
+                if sync_outcome == "archive_capacity":
+                    self._record_micro_failure(exchange_start, exchange_end, outcome=sync_outcome)
+                _telemetry(sync_outcome, messages, tokens_after=_tokens_before)
                 return messages
             if defragged:
                 self._reset_micro_failure_tracking()
@@ -288,24 +294,33 @@ class MicroCompactionMixin:
 
         self._micro_compact_rolling_summary = updated_summary
         self._micro_compact_cursor = exchange_end
-        self._reset_micro_failure_tracking()
 
         result = self._splice_micro_compact_result(messages, exchange_start, exchange_end, supersede=_cumulative)
         self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
-        if not self._sync_micro_compact_to_db(result, held=_held, start_watermark=_start_watermark):
+        sync_outcome = self._sync_micro_compact_to_db(result, held=_held, start_watermark=_start_watermark)
+        if sync_outcome:
             # Another compaction committed during the summary call. A true no-op: returning the spliced
             # list would let finalize_turn persist its unmarked summary row beside the winning generation.
             self._micro_compact_cursor, self._micro_compact_rolling_summary = _pre_cursor, _pre_summary
-            _telemetry("stale_generation", messages, tokens_after=_tokens_before)
+            self._flush_scan_cursor_invalidated = _pre_flush_invalidated
+            if sync_outcome == "archive_capacity":
+                self._record_micro_failure(exchange_start, exchange_end, outcome=sync_outcome)
+            _telemetry(sync_outcome, messages, tokens_after=_tokens_before)
             return messages
+        self._reset_micro_failure_tracking()
         _telemetry(
             "absorbed", result, tokens_after=estimate_messages_tokens_rough(result), exchange_tokens=_exchange_tokens,
         )
         return result
 
-    def _record_micro_failure(self, exchange_start: int, exchange_end: int) -> str:
-        """Count a summarize failure at this cursor; skip the exchange after too many in a row."""
-        # Track consecutive failures at the same cursor to avoid busy-looping every turn.
+    def _record_micro_failure(self, exchange_start: int, exchange_end: int, *, outcome: str = "summarize_failed") -> str:
+        """Count a failure at this cursor; capacity backs off without skipping healthy material."""
+        if outcome == "archive_capacity":
+            self._record_compression_failure_cooldown(
+                _cc()._next_timeout_cooldown(self, "_consecutive_archive_capacity_failures"),
+                outcome, persist=False)
+            return outcome
+        # Summary failures alone may classify an exchange as poison and skip it.
         same_cursor = exchange_start == self._micro_compact_last_failure_cursor
         self._micro_compact_consecutive_failures = self._micro_compact_consecutive_failures + 1 if same_cursor else 1
         self._micro_compact_last_failure_cursor = exchange_start
@@ -412,14 +427,14 @@ class MicroCompactionMixin:
     def _sync_micro_compact_to_db(
         self, compacted_messages: list[dict[str, Any]], *, held: Optional[list[dict[str, Any]]] = None,
         start_watermark: Optional[int] = None,
-    ) -> bool:
+    ) -> Optional[str]:
         """Persist the micro-compacted set to the session DB atomically and stamp rows persisted.
         Without this the old exchange rows stay ``active=1`` and a resume double-loads both the
-        summary and the originals. Returns False only when *held* turned out to be a stale generation
-        (nothing written); the caller must then discard the pass. Any other outcome returns True."""
+        summary and the originals. Returns a refusal outcome (``stale_generation`` or
+        ``archive_capacity``) when the caller must discard the pass; otherwise None."""
         session_db, session_id = getattr(self, "_session_db", None), getattr(self, "_session_id", "")
         if not session_db or not session_id:
-            return True
+            return None
         from hermes_state_errors import HeldRowRewrittenError
         try:
             # Micro-compaction is prefix + marker + suffix, not a contiguous tail. Identify the exact
@@ -437,7 +452,8 @@ class MicroCompactionMixin:
                 watermark = _cc()._archive_watermark_for(session_db, session_id, held, start_watermark)
                 from agent.conversation_compression_archive import coverage_for_commit
                 covered_ids, unresolved_held = coverage_for_commit(session_db, session_id, held)
-            getattr(session_db, 'archive_and_compact_best_effort', session_db.archive_and_compact)(
+            from agent.conversation_compression_archive import optional_archive_method
+            optional_archive_method(session_db)(
                 session_id, compacted_messages, carried_messages=carried_messages, watermark=watermark,
                 covered_ids=covered_ids, unresolved_held=unresolved_held, held_for_cas=held,
                 **({"held_messages": held} if held is not None else {}))
@@ -449,22 +465,22 @@ class MicroCompactionMixin:
             # holds the winning generation. The caller discards the pass (original list, pre-pass cursor
             # and summary); otherwise finalize_turn would append the unmarked summary row beside the winner.
             logger.info("Micro-compaction commit skipped, %s", exc)
-            return False
+            return "stale_generation"
         except HeldRowRewrittenError as exc:
             # The in-transaction CAS fence tripped: a held row changed between the precheck and the
             # commit. Same disposition as a stale generation — nothing written, the pass is discarded.
             logger.info("Micro-compaction commit skipped, %s", exc)
-            return False
+            return "stale_generation"
         except Exception as exc:
             from agent.runtime_session_journal import OutboxCapacityError
             if isinstance(exc, OutboxCapacityError):
                 logger.warning("Micro-compaction archive rejected; keeping the original transcript: %s", exc)
-                return False
+                return "archive_capacity"
             logger.info(
                 "Micro-compaction DB sync failed — resume will double-load "
                 "compacted messages until the next batch compression"
             )
-        return True
+        return None
 
     def _splice_micro_compact_result(
         self, messages: list[dict[str, Any]], splice_start: int, splice_end: int, supersede: bool = True,
@@ -517,7 +533,11 @@ class MicroCompactionMixin:
         merged: list[dict[str, Any]] = []
         for msg in result:
             prev = merged[-1] if merged else None
-            if _plain_user(msg) and _plain_user(prev):
+            if _plain_user(msg) and isinstance(prev, dict) and _plain_user(prev):
+                # Archive admission may reject this candidate. Never mutate a held
+                # user row before its replacement has durably committed.
+                prev = dict(prev)
+                merged[-1] = prev
                 prev["content"] = "\n\n".join(c for c in (prev["content"], msg["content"]) if c)
                 drop_stale_api_content(prev)  # merged content invalidates the api_content sidecar
                 # The originals stay in display history as compacted rows; showing the join too

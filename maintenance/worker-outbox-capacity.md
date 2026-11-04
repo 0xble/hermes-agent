@@ -66,8 +66,8 @@ uncertain RPC outcomes. No mandatory call site needs a separate return-value rul
 
 | Call site | Class | Capacity behavior |
 | --- | --- | --- |
-| `context_compressor_prune.prune_tool_results_only` archive fallback | Best effort | Explicit capability; retain original transcript and prune state, continue |
-| `micro_compaction._sync_micro_compact_to_db` archive | Best effort | Explicit capability; return `False` so caller discards tentative compaction |
+| `context_compressor_prune.prune_tool_results_only` archive fallback | Best effort | Explicit capability; retain original transcript and prune state, cool down on `archive_capacity`, continue |
+| `micro_compaction._sync_micro_compact_to_db` archive | Best effort | Explicit capability; return `archive_capacity` so caller discards tentative compaction, reports the real outcome and backs off |
 | `conversation_compression_publication._commit_compaction` in-place archive and rotated `publish_compression_child` | Mandatory | Default sticky; do not report successful publication |
 | `conversation_compression._adopt_grown_durable_parent` preflush and `_publish_rotated_compaction` follow-up | Mandatory | Transcript append stays sticky |
 | `turn_context._persist_turn_start` / `_ensure_and_persist`; `build_turn_context` flush | Mandatory | Turn-start user row stays sticky |
@@ -92,7 +92,7 @@ Prior art: upstream open PR #146198 addresses the unrelated on-loop refusal
 poisoning boundary and deliberately retains outbox_full as sticky. No upstream
 outbox-capacity fix or fork PR was found by exact-term search on 2026-11-04.
 
-Contract tests: `tests/agent/test_worker_outbox_capacity.py`, `tests/agent/test_worker_outbox_codec.py`, `tests/agent/test_worker_outbox_io_failure.py`, `tests/agent/test_worker_prune_capacity.py`, `tests/agent/test_worker_mandatory_capacity.py`
+Contract tests: `tests/agent/test_worker_outbox_capacity.py`, `tests/agent/test_worker_outbox_codec.py`, `tests/agent/test_worker_outbox_io_failure.py`, `tests/agent/test_worker_prune_capacity.py`, `tests/agent/test_worker_mandatory_capacity.py`, `tests/agent/test_worker_archive_followups.py`
 
 Verification: RED on the unchanged baseline raised `outbox_full` on both large
 snapshot paths and proved the failure latched; 3 tests failed. GREEN exercises
@@ -100,3 +100,36 @@ real-owner receipt deduplication after lost ack, compressed reopen, resource-bou
 refusals, malformed journals, owner lock release, disk/ack-save errors and the
 actual proactive-prune fallback followed by usage/lease persistence. This is
 source delivery only; live incident data was read but never changed.
+
+## Review follow-ups
+
+`read_journal` reports `outbox_corrupt` for malformed deflate bodies, JSON and
+UTF-8 in either the plain or gzip representation, preserving the original
+exception as its cause. Resource overflows stay `outbox_full`; filesystem errors
+and sticky mandatory-write behavior are unchanged.
+
+The shared `optional_archive_method` statically checks for a declared best-effort
+capability before binding it. Dynamic mock children and `__getattr__` proxies do
+not advertise a capability, while explicitly assigned and real store methods do.
+Both optional archive paths use this helper; mandatory callers still use their
+original method.
+
+Micro-compaction distinguishes `archive_capacity` from `stale_generation`, undoes
+all tentative changes, and records a capacity failure instead of crediting a
+successful summary. Proactive prune reports `prune:archive_capacity`. Both reuse
+the compression failure cooldown ladder (60/300/900 seconds), locally only: a
+mandatory cooldown write could itself fill the bounded outbox. Capacity refusal
+must not spend an LLM call again on the next turn, increment summary-poison
+strikes, skip healthy material, or poison mandatory usage/lease/finalization.
+Capacity streaks reset with the session and successful recovery. Growth alone
+does not lift this cooldown. A stale-generation refusal remains an immediate
+no-op without a capacity strike.
+
+RED on `5ef030d5e9e36dacb5a6aa13e5711c00fe663864`: 12 failures (five codec cases,
+three optional caller capacity/retry cases, and four dynamic capability cases),
+with nine existing/explicit-capability cases passing. The follow-up regressions
+also exercise cumulative-marker rollback, mixed failure classes and session reset.
+GREEN: 24 files, 330 tests passed, 0 failed through `scripts/run_tests.sh` under
+heavy-slot with isolated HOME/HERMES_HOME/HERMES_RUNTIME_DIR; worker/store,
+proactive pruning, micro-compaction, owner compaction, restart safety, concurrent
+fork, rotation-state and progress-timeout suites included.

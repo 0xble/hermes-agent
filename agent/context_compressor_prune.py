@@ -10,6 +10,7 @@ module, and every origin-module symbol is read through ``_cc()`` at call time so
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger("agent.context_compressor")
@@ -47,6 +48,8 @@ class ProactivePruneMixin:
         recent-tail protection applies to passes (2) and (3); pass (1) is tail-agnostic by design because
         dedup is lossless.
         """
+        if self._last_summary_error == "archive_capacity" and self._summary_failure_cooldown_until > time.monotonic():
+            return messages, 0
         if self.proactive_prune_tokens <= 0 or (
             current_tokens is not None and current_tokens < self.proactive_prune_tokens
         ):
@@ -94,9 +97,9 @@ class ProactivePruneMixin:
                 rewritten = self._rewrite_pruned_rows_in_place(
                     session_db, session_id, messages, pruned_msgs, model_config_patch)
                 if rewritten is None:
-                    from agent.conversation_compression_archive import coverage_for_commit
+                    from agent.conversation_compression_archive import coverage_for_commit, optional_archive_method
                     covered_ids, unresolved_held = coverage_for_commit(session_db, session_id, messages)
-                    getattr(session_db, 'archive_and_compact_best_effort', session_db.archive_and_compact)(
+                    optional_archive_method(session_db)(
                         session_id, pruned_msgs,
                         model_config_patch=model_config_patch,
                         watermark=watermark,
@@ -115,6 +118,12 @@ class ProactivePruneMixin:
                 self._warn_reclamation_no_op("prune:stale_generation", current_tokens, before=before)
                 return messages, 0
             except Exception as exc:  # health: allow BLE001 -- the commit boundary keeps the original transcript on any store failure (#124102)
+                from agent.runtime_session_journal import OutboxCapacityError
+                if isinstance(exc, OutboxCapacityError):
+                    self._record_compression_failure_cooldown(
+                        _cc()._next_timeout_cooldown(self, "_consecutive_archive_capacity_failures"),
+                        "archive_capacity", persist=False)
+                    self._warn_reclamation_no_op("prune:archive_capacity", current_tokens, before=before)
                 logger.warning("Proactive tool-result prune DB commit failed; keeping the original transcript: %s", exc)
                 return messages, 0
             # Shared post-commit stamp site with the in-place commit and micro-compaction sync.
@@ -127,6 +136,7 @@ class ProactivePruneMixin:
                 stamp_db_persisted_markers([
                     replacement for original, replacement in zip(messages, pruned_msgs)
                     if original.get(_DB_PERSISTED_MARKER)])
+        self._consecutive_archive_capacity_failures = 0
         self._proactive_prune_rearm_tokens = next_rearm_tokens
         # Reclamation just ran: let a future lockout warn again.
         self._last_reclaim_block_warn = None

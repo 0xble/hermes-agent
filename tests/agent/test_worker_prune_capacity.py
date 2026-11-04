@@ -30,7 +30,7 @@ def test_proactive_prune_keeps_original_and_persistence_healthy(tmp_path, monkey
             assert result is messages and count == 0 and messages == original
             assert 'keeping the original transcript: outbox_full' in caplog.text
         else:
-            assert compressor._sync_micro_compact_to_db(messages, held=messages) is False
+            assert compressor._sync_micro_compact_to_db(messages, held=messages) == 'archive_capacity'
             assert messages == original
         assert calls == [] and store.failure is None
         assert store.journal['pending'] == [] and store.journal['next_sequence'] == 1

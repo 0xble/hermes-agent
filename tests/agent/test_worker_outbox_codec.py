@@ -9,6 +9,31 @@ import pytest
 from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
 
 
+@pytest.mark.parametrize('encoding', ['plain', 'gzip'])
+@pytest.mark.parametrize('payload', [b'{not json}', b'\xff'])
+def test_invalid_journal_text_is_classified_as_corrupt(tmp_path, encoding, payload):
+    from agent.runtime_session_journal import read_journal
+
+    path = tmp_path / 'pending.json'
+    path.write_bytes(gzip.compress(payload) if encoding == 'gzip' else payload)
+    with pytest.raises(WorkerPersistenceError, match='^outbox_corrupt$') as error:
+        read_journal(path, 500)
+    assert isinstance(error.value.__cause__, (json.JSONDecodeError, UnicodeDecodeError))
+
+
+def test_invalid_deflate_body_is_classified_as_corrupt(tmp_path):
+    import zlib
+    from agent.runtime_session_journal import read_journal
+
+    valid = gzip.compress(b'{}', mtime=0)
+    # BFINAL=1, BTYPE=3 is an invalid deflate block, independently of zlib version.
+    path = tmp_path / 'pending.json'
+    path.write_bytes(valid[:10] + b'\x07' + valid[-8:])
+    with pytest.raises(WorkerPersistenceError, match='^outbox_corrupt$') as error:
+        read_journal(path, 500)
+    assert isinstance(error.value.__cause__, zlib.error)
+
+
 @pytest.mark.parametrize('kind', ['plain', 'gzip', 'bomb', 'truncated', 'bad_crc', 'scope', 'over_disk'])
 def test_journal_reopen_codec_and_resource_bounds(tmp_path, kind):
     scope = {'session_id': 's'}

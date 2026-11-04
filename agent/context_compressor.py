@@ -2603,12 +2603,19 @@ class ContextCompressor(
             "error": self._last_summary_error,
         }
 
-    def _record_compression_failure_cooldown(self, cooldown_seconds: float, error: Optional[str]) -> None:
+    def _record_compression_failure_cooldown(
+        self, cooldown_seconds: float, error: Optional[str], *, persist: bool = True,
+    ) -> None:
         # Never shorten a longer live deadline; record the latest error text only.
         self._summary_failure_cooldown_until = max(self._summary_failure_cooldown_until, time.monotonic() + float(cooldown_seconds))
         # A later stall or timeout records the latest error text but keeps the later of the two clocks. See
         # #96775.
         self._last_summary_error = error
+        if not persist:
+            # Capacity refusal is definitely unsent: do not risk poisoning the same
+            # bounded outbox with a mandatory cooldown write. Preserve local on refresh.
+            self._cooldown_persist_failed = True
+            return
         cooldown_until = time.time() + max(0.0, self._summary_failure_cooldown_until - time.monotonic())
         if not getattr(self, "_session_db", None) or not getattr(self, "_session_id", ""):
             return
@@ -2637,6 +2644,7 @@ class ContextCompressor(
             logger.info("Skipping compression cooldown clear: host already cancelled this compression attempt")
             return
         self._summary_failure_cooldown_until, self._last_summary_error = 0.0, None
+        self._consecutive_archive_capacity_failures = 0
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
         self._cooldown_persist_failed = False
         ContextCompressor._durable_write(self, "clear_compression_failure_cooldown", "compression failure cooldown clear")
@@ -3343,6 +3351,7 @@ class ContextCompressor(
         at 0) would be silent (#101889).
         """
         self._proactive_prune_rearm_tokens = 0
+        self._consecutive_archive_capacity_failures = 0
         self._last_reclaim_block_warn = None
 
     def _billed_basis_over_threshold(self, current_tokens: int | None) -> bool:
