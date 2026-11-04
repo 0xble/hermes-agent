@@ -26,6 +26,14 @@ def _cc():
 class ProactivePruneMixin:
     """``ContextCompressor`` mixin: the deterministic, no-LLM tool-result prune and its commit."""
 
+    def _record_optional_archive_capacity_failure(self) -> None:
+        """Back off optional rewrites only; mandatory full compaction must stay available.
+
+        Keep this local: writing the refusal to the bounded outbox could itself poison it.
+        """
+        seconds = _cc()._next_timeout_cooldown(self, "_consecutive_archive_capacity_failures")
+        self._optional_archive_cooldown_until = max(self._optional_archive_cooldown_until, time.monotonic() + seconds)
+
     def prune_tool_results_only(
         self, messages: list[dict[str, Any]], current_tokens: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -48,7 +56,7 @@ class ProactivePruneMixin:
         recent-tail protection applies to passes (2) and (3); pass (1) is tail-agnostic by design because
         dedup is lossless.
         """
-        if self._last_summary_error == "archive_capacity" and self._summary_failure_cooldown_until > time.monotonic():
+        if self._optional_archive_cooldown_until > time.monotonic():
             return messages, 0
         if self.proactive_prune_tokens <= 0 or (
             current_tokens is not None and current_tokens < self.proactive_prune_tokens
@@ -120,9 +128,7 @@ class ProactivePruneMixin:
             except Exception as exc:  # health: allow BLE001 -- the commit boundary keeps the original transcript on any store failure (#124102)
                 from agent.runtime_session_journal import OutboxCapacityError
                 if isinstance(exc, OutboxCapacityError):
-                    self._record_compression_failure_cooldown(
-                        _cc()._next_timeout_cooldown(self, "_consecutive_archive_capacity_failures"),
-                        "archive_capacity", persist=False)
+                    self._record_optional_archive_capacity_failure()
                     self._warn_reclamation_no_op("prune:archive_capacity", current_tokens, before=before)
                 logger.warning("Proactive tool-result prune DB commit failed; keeping the original transcript: %s", exc)
                 return messages, 0
@@ -137,6 +143,7 @@ class ProactivePruneMixin:
                     replacement for original, replacement in zip(messages, pruned_msgs)
                     if original.get(_DB_PERSISTED_MARKER)])
         self._consecutive_archive_capacity_failures = 0
+        self._optional_archive_cooldown_until = 0.0
         self._proactive_prune_rearm_tokens = next_rearm_tokens
         # Reclamation just ran: let a future lockout warn again.
         self._last_reclaim_block_warn = None

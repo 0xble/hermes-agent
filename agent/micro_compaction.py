@@ -202,6 +202,7 @@ class MicroCompactionMixin:
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
         self._consecutive_archive_capacity_failures = 0
+        self._optional_archive_cooldown_until = 0.0
 
     def _micro_compact(
         self, messages: list[dict[str, Any]], *, turn_session_id: Optional[str] = None,
@@ -210,7 +211,7 @@ class MicroCompactionMixin:
         (possibly modified) list and syncs the session DB via ``archive_and_compact`` (the
         append-only flush alone would double-load on resume). ``turn_session_id`` is the session the
         caller's turn started in; it parents the pass's Relay mark when this session has no scope yet."""
-        if not self._micro_compact_enabled or self._summary_failure_cooldown_until > time.monotonic():
+        if not self._micro_compact_enabled or self._optional_archive_cooldown_until > time.monotonic():
             return messages
 
         # Cadence gate: each pass breaks prompt cache once. Counted per invocation so a no-op turn
@@ -316,9 +317,7 @@ class MicroCompactionMixin:
     def _record_micro_failure(self, exchange_start: int, exchange_end: int, *, outcome: str = "summarize_failed") -> str:
         """Count a failure at this cursor; capacity backs off without skipping healthy material."""
         if outcome == "archive_capacity":
-            self._record_compression_failure_cooldown(
-                _cc()._next_timeout_cooldown(self, "_consecutive_archive_capacity_failures"),
-                outcome, persist=False)
+            self._record_optional_archive_capacity_failure()
             return outcome
         # Summary failures alone may classify an exchange as poison and skip it.
         same_cursor = exchange_start == self._micro_compact_last_failure_cursor

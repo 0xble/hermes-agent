@@ -134,6 +134,7 @@ def test_capacity_failure_is_not_a_summary_failure():
 def test_capacity_streak_restarts_after_recovery_or_session_change(reset):
     compressor = _prune_compressor()
     compressor._consecutive_archive_capacity_failures = 3
+    compressor._optional_archive_cooldown_until = float("inf")
     if reset == 'new_session':
         compressor.on_session_reset()
     elif reset == 'rebind':
@@ -141,3 +142,4 @@ def test_capacity_streak_restarts_after_recovery_or_session_change(reset):
     else:
         compressor._clear_compression_failure_cooldown()
     assert compressor._consecutive_archive_capacity_failures == 0
+    assert compressor._optional_archive_cooldown_until == 0.0

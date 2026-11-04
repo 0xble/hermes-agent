@@ -92,7 +92,7 @@ Prior art: upstream open PR #146198 addresses the unrelated on-loop refusal
 poisoning boundary and deliberately retains outbox_full as sticky. No upstream
 outbox-capacity fix or fork PR was found by exact-term search on 2026-11-04.
 
-Contract tests: `tests/agent/test_worker_outbox_capacity.py`, `tests/agent/test_worker_outbox_codec.py`, `tests/agent/test_worker_outbox_io_failure.py`, `tests/agent/test_worker_prune_capacity.py`, `tests/agent/test_worker_mandatory_capacity.py`, `tests/agent/test_worker_archive_followups.py`
+Contract tests: `tests/agent/test_worker_outbox_capacity.py`, `tests/agent/test_worker_outbox_codec.py`, `tests/agent/test_worker_outbox_io_failure.py`, `tests/agent/test_worker_prune_capacity.py`, `tests/agent/test_worker_mandatory_capacity.py`, `tests/agent/test_worker_archive_followups.py`, `tests/agent/test_worker_archive_cooldown.py`
 
 Verification: RED on the unchanged baseline raised `outbox_full` on both large
 snapshot paths and proved the failure latched; 3 tests failed. GREEN exercises
@@ -116,14 +116,22 @@ original method.
 
 Micro-compaction distinguishes `archive_capacity` from `stale_generation`, undoes
 all tentative changes, and records a capacity failure instead of crediting a
-successful summary. Proactive prune reports `prune:archive_capacity`. Both reuse
-the compression failure cooldown ladder (60/300/900 seconds), locally only: a
-mandatory cooldown write could itself fill the bounded outbox. Capacity refusal
-must not spend an LLM call again on the next turn, increment summary-poison
-strikes, skip healthy material, or poison mandatory usage/lease/finalization.
-Capacity streaks reset with the session and successful recovery. Growth alone
-does not lift this cooldown. A stale-generation refusal remains an immediate
-no-op without a capacity strike.
+successful summary. Proactive prune reports `prune:archive_capacity`. Both use a
+separate `_optional_archive_cooldown_until` deadline and capacity-only streak,
+reusing only the ladder's 60/300/900-second durations. This state is local: a
+mandatory cooldown write could itself fill the bounded outbox. Only proactive
+prune and micro-compaction read this deadline. Optional refusal never changes
+`_summary_failure_cooldown_until`, `_last_summary_error`, the full-compaction
+preflight warning, or eligibility for proactive full compaction. Conversely,
+unrelated summary timeout/stall cooldowns do not suspend micro-compaction.
+Capacity refusal must not spend an LLM call again on the next turn, increment
+summary-poison strikes, skip healthy material, or poison mandatory
+usage/lease/finalization. Capacity state resets with the session and successful
+recovery; full-attempt rollback restores it with other attempt bookkeeping.
+Growth or diagnostic-text changes alone do not lift this cooldown. A
+stale-generation refusal remains an immediate no-op without a capacity strike.
+`compaction_events.failure_class` preserves `archive_capacity` rather than
+collapsing it into `other`.
 
 RED on `5ef030d5e9e36dacb5a6aa13e5711c00fe663864`: 12 failures (five codec cases,
 three optional caller capacity/retry cases, and four dynamic capability cases),
@@ -133,3 +141,20 @@ GREEN: 24 files, 330 tests passed, 0 failed through `scripts/run_tests.sh` under
 heavy-slot with isolated HOME/HERMES_HOME/HERMES_RUNTIME_DIR; worker/store,
 proactive pruning, micro-compaction, owner compaction, restart safety, concurrent
 fork, rotation-state and progress-timeout suites included.
+
+Cooldown-separation RED on PR #1084 head
+`3bb42b564c5941f55e8b685ebcdc677f027551a1`: four behavioral failures — both
+optional paths incorrectly changed full-compaction eligibility to
+`(False, "cooldown:60")`, a summary timeout suppressed micro-compaction, and
+`archive_capacity` became `other`. The new regression also runs the unforced
+full-compaction pipeline and checks cross-caller retry suppression independent
+of diagnostic text.
+
+Upstream guidance refresh: root/subsystem instructions and contribution guide
+at `ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df`. The independent hypothesis is
+a fork-introduced coupling, best fixed by extending the existing capacity-only
+streak with its own local deadline rather than changing summary backoff. Exact
+`archive_capacity` open/closed PR searches found no upstream equivalent; an
+`optional archive` issue search found only unrelated workflow orchestration.
+The selected fix preserves upstream summary behavior and introduces no service,
+configuration, or public API.
