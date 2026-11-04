@@ -35,13 +35,25 @@ def reconcile_pending_background(*, allow_connect=True):
             del _recovery_futures[finished]
         if key in _recovery_futures:
             return
-        if _recovery_pool is None:
-            _recovery_pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix='cron-receipt-recovery')
-        context = contextvars.copy_context()
-        # Pin even env-selected homes; another ticker's profile scope must not leak here.
-        context.run(set_hermes_home_override, home)
-        future = _recovery_pool.submit(context.run, reconcile_pending, allow_connect=allow_connect)
+        if _recovery_pool is None and _recovery_futures:
+            # A failed pool may still be finishing a pass for another home.
+            return
+        try:
+            if _recovery_pool is None:
+                _recovery_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix='cron-receipt-recovery')
+            context = contextvars.copy_context()
+            # Pin even env-selected homes; another ticker's profile scope must not leak here.
+            context.run(set_hermes_home_override, home)
+            future = _recovery_pool.submit(context.run, reconcile_pending, allow_connect=allow_connect)
+        except (OSError, RuntimeError):
+            # submit can enqueue before failing to start a thread. Discard that
+            # queue without waiting; durable journals retry after the pool drains.
+            if _recovery_pool is not None:
+                _recovery_pool.shutdown(wait=False, cancel_futures=True)
+                _recovery_pool = None
+            logging.getLogger(__name__).warning('Cron receipt recovery submission deferred', exc_info=True)
+            return
         _recovery_futures[key] = future
         future.add_done_callback(_observe_recovery_result)
 

@@ -149,19 +149,21 @@ class TestEAGAINCreateExecutionLeak:
 
         # First tick: pool.submit raises EAGAIN (thread exhaustion). The claim
         # is released and the run recorded as failed.
-        real_submit = S.concurrent.futures.ThreadPoolExecutor.submit
+        pool = S._get_parallel_pool(S._resolve_max_parallel_workers())
+        real_submit = pool.submit
         state = {"n": 0}
-        def flaky(self, *a, **k):
+        def flaky(*a, **k):
             state["n"] += 1
             if state["n"] == 1:
                 raise OSError(11, "Resource temporarily unavailable")
-            return real_submit(self, *a, **k)
-        monkeypatch.setattr(S.concurrent.futures.ThreadPoolExecutor, "submit", flaky)
+            return real_submit(*a, **k)
+        monkeypatch.setattr(pool, "submit", flaky)
 
         with mock.patch("cron.jobs.load_jobs", return_value=[job]):
             S.tick(verbose=False, sync=True)
 
         # Claim released; job still scheduled.
+        assert state["n"] == 1
         assert job_id not in S.get_running_job_ids()
 
         # Second tick (substrate recovered): job re-dispatches and completes.

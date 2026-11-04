@@ -165,6 +165,8 @@ def test_no_agent_jobs_still_fire_without_a_gateway(cron_home, monkeypatch):
     from cron import scheduler_worker_env
     monkeypatch.setattr(scheduler_worker_env, "_committed_dependency_site_packages",
                         lambda root: Path(httpx.__file__).resolve().parent.parent)
+    # A scratch source test is not the gateway's inherited immutable release.
+    monkeypatch.setattr(S.immutable_releases, "LOADED_RELEASE_ROOT", None)
     counter = cron_home / "fires.txt"
     script = cron_home / "scripts" / "fire.sh"
     script.write_text(f"#!/bin/sh\necho fired >> {counter}\necho fired\n", encoding="utf-8")
@@ -177,4 +179,5 @@ def test_no_agent_jobs_still_fire_without_a_gateway(cron_home, monkeypatch):
     _make_due(job["id"])
 
     assert S.tick(verbose=False, headless=True) == 1
+    assert counter.exists(), J.get_job(job["id"])
     assert counter.read_text(encoding="utf-8").count("fired") == 1

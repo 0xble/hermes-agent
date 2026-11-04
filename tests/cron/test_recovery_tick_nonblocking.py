@@ -239,3 +239,96 @@ def test_recovery_lock_preserves_cross_ticker_serialization(tmp_path, monkeypatc
         scheduler._release_tick_lock(held)
     _request(home).result(timeout=5)
     assert entered == [True]
+
+
+@pytest.mark.parametrize('failure_point', ['create', 'start'])
+@pytest.mark.parametrize('error', [OSError(11, 'Resource temporarily unavailable'),
+                                 RuntimeError("can't start new thread")])
+def test_recovery_launch_failure_keeps_due_scan_and_journal_retryable(
+        tmp_path, monkeypatch, caplog, failure_point, error):
+    home = tmp_path / 'home'
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    _quiet_tick(monkeypatch)
+    scanned = threading.Event()
+    calls, pools = [], []
+    journal = home / 'cron' / 'admissions' / 'pending.json'
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({'receipt': {'admission_id': 'keep-me'}}))
+    original = journal.read_bytes()
+    real_factory = authority.concurrent.futures.ThreadPoolExecutor
+    real_start = threading.Thread.start
+
+    def unavailable(*args, **kwargs):
+        raise error
+
+    def create_pool(*args, **kwargs):
+        pool = real_factory(*args, **kwargs)
+        pools.append(pool)
+        return pool
+
+    def due_scan():
+        scanned.set()
+        return []
+
+    monkeypatch.setattr(scheduler, 'get_due_jobs', due_scan)
+    monkeypatch.setattr(authority, 'reconcile_pending',
+                        lambda **kwargs: calls.append(get_hermes_home()))
+    monkeypatch.setattr(authority.concurrent.futures, 'ThreadPoolExecutor',
+                        unavailable if failure_point == 'create' else create_pool)
+    if failure_point == 'start':
+        # Exercise real submit: the work item is queued before Thread.start fails.
+        monkeypatch.setattr(threading.Thread, 'start', unavailable)
+    with jobs.use_cron_store(home):
+        assert scheduler.tick(verbose=False, sync=False) == 0
+    assert scanned.is_set()
+    assert 'Cron receipt recovery submission deferred' in caplog.text
+    assert calls == []
+    assert journal.read_bytes() == original
+    assert authority._recovery_pool is None
+    assert authority._recovery_futures == {}
+    assert all(pool._shutdown for pool in pools)
+
+    monkeypatch.setattr(threading.Thread, 'start', real_start)
+    monkeypatch.setattr(authority.concurrent.futures, 'ThreadPoolExecutor', real_factory)
+    _request(home).result(timeout=5)
+    assert calls == [home]
+    assert journal.read_bytes() == original
+
+
+def test_failed_pool_drains_running_pass_before_replacement(tmp_path, monkeypatch):
+    home_a, home_b = tmp_path / 'a', tmp_path / 'b'
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def recover(**kwargs):
+        calls.append(get_hermes_home())
+        if get_hermes_home() == home_a:
+            entered.set()
+            assert release.wait(60)
+
+    monkeypatch.setattr(authority, 'reconcile_pending', recover)
+    first = _request(home_a)
+    try:
+        assert entered.wait(5)
+        failed_pool = authority._recovery_pool
+
+        def unavailable(*args, **kwargs):
+            raise OSError(11, 'Resource temporarily unavailable')
+
+        monkeypatch.setattr(failed_pool, 'submit', unavailable)
+        token = set_hermes_home_override(home_b)
+        try:
+            authority.reconcile_pending_background()
+            assert authority._recovery_pool is None
+            assert not first.done()
+            for _ in range(12):
+                authority.reconcile_pending_background()
+                assert authority._recovery_pool is None
+            assert calls == [home_a]
+        finally:
+            reset_hermes_home_override(token)
+    finally:
+        release.set()
+    first.result(timeout=5)
+    _request(home_b).result(timeout=5)
+    assert calls == [home_a, home_b]

@@ -169,6 +169,31 @@ def test_freshness_subprocess_cannot_fail_open(stdout, monkeypatch):
     assert run_freshness_script({"script": "check.py"}, {})["stale"] is True
 
 
+@pytest.mark.parametrize("sender", [None, "fixture-sender"])
+def test_freshness_reader_preserves_optional_sender_contract(sender, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from cron.scheduled_send import run_freshness_script
+
+    spec = {"script": "check.py", "channel": "imessage", "conversation": "42",
+            "recipient": "fixture-recipient", "approved_at": NOW.isoformat()}
+    if sender is not None:
+        spec["sender"] = sender
+    captured = {}
+
+    def reader(*args, **kwargs):
+        captured.update(json.loads(kwargs["input"]))
+        return SimpleNamespace(returncode=0, stdout='{"checked": true, "stale": false}', stderr="")
+
+    monkeypatch.setattr("cron.scheduled_send.subprocess.run", reader)
+    result = run_freshness_script(spec, {"id": "fixture-job", "next_run_at": NOW.isoformat()})
+    assert result["checked"] is True and result["stale"] is False
+    assert captured == {
+        **{key: value for key, value in spec.items() if key != "script"},
+        "job_id": "fixture-job", "scheduled_at": NOW.isoformat(),
+    }
+
+
 @pytest.mark.parametrize("stale", [True, False])
 def test_stale_snapshot_cannot_hold_reapproved_job(store, monkeypatch, stale):
     job = {
@@ -236,3 +261,26 @@ def test_freshness_invalid_target_is_rejected_before_saving(store, changes):
     assert jobs.load_jobs() == []
 
 
+@pytest.mark.parametrize("channel,conversation,recipient,extra", [
+    ("imessage", "42", "+15551234567", {}),
+    ("telegram", "42", "99", {"account": "personal"}),
+    ("email", "abcdef", "family@example.com", {"account": "personal", "reviewed_message_ids": ["123abc"]}),
+    ("quo", "PNexample", "+15551234567", {"account": "business"}),
+])
+def test_non_slack_sends_need_no_invented_shared_slack_binding(store, tmp_path,
+                                                               channel, conversation, recipient, extra):
+    reader = tmp_path / "reader.py"
+    reader.write_text("pass\n")
+    spec = {"channel": channel, "conversation": conversation, "recipient": recipient,
+            "approved_at": NOW.isoformat(), "script": str(reader), **extra}
+    made = jobs.create_job(prompt="approved family reply", schedule="in 10m", send_freshness=spec)
+    assert jobs.get_job(made["id"])["send_freshness"] == spec
+
+
+def test_declared_but_incomplete_shared_activity_context_is_rejected(store, tmp_path):
+    reader = tmp_path / "reader.py"
+    reader.write_text("pass\n")
+    with pytest.raises(ValueError, match="activity_context"):
+        jobs.create_job(prompt="approved reply", schedule="in 10m", send_freshness={
+            "channel": "imessage", "conversation": "42", "recipient": "+15551234567",
+            "approved_at": NOW.isoformat(), "script": str(reader), "activity_context": {}})

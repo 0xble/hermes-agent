@@ -737,7 +737,7 @@ class TestRunJobSessionPersistence:
             "id": "empty-job",
             "name": "empty-test",
             "prompt": "do something",
-            "schedule": "every 1h",
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
