@@ -4,8 +4,10 @@ A turn lost across an owner restart is fenced ``unknown`` and pauses its session
 only the person who sent it knows whether to resend it. An automation delivery has no such person:
 a cron run (``CRON_PRINCIPAL_ID``), a process completion or heartbeat (``automation:<route>``,
 ``local_automation_v1``, a native envelope's ``automation`` block) or a webhook delivery
-(``webhook_delivery``) or a Kanban card attempt (``kanban_card_v1``, set by the dispatcher). Pausing on it stalls every message queued behind it until an operator
-notices (a Bot Chat sat ten hours behind one).
+(``webhook_delivery``), a Kanban card attempt (``kanban_card_v1``, set by the dispatcher),
+or a trusted native synthetic producer descriptor without attended human activity.
+Pausing on it stalls every message queued behind it until an operator notices
+(a Bot Chat sat ten hours behind one).
 
 Such a row settles through the same fenced resolution a person's Discard uses
 (``resolve_unknown_session_input``): terminal ``interrupted``, never requeued or replayed, with a
@@ -20,6 +22,30 @@ from hermes_state_keys import CRON_PRINCIPAL_ID
 logger = logging.getLogger(__name__)
 
 
+def _trusted_native_synthetic(native) -> bool:
+    synthetic = native.get('synthetic')
+    if not isinstance(synthetic, dict):
+        return False
+    if type(synthetic.get('internal')) is not bool:
+        return False
+    metadata = synthetic.get('metadata')
+    if not isinstance(metadata, dict):
+        return False
+    # A merged human receipt always wins, even if a trusted synthetic head survives.
+    if 'attended_activity' in native:
+        return False
+    origin = metadata.get('notification_origin')
+    return (
+        metadata.get('goal_continuation') is True
+        or metadata.get('loop_wakeup') is True
+        or metadata.get('hermes_loop_wakeup') is True
+        or (isinstance(origin, str) and origin in {
+            'process_registry_synthetic', 'delegation_result',
+            'relay_delivery', 'cron_delivery',
+        })
+    )
+
+
 def is_unattended(row) -> bool:
     """True for an admission no person submitted (so nobody can be asked to resend it)."""
     principal = row.get('principal_id') or ''
@@ -31,7 +57,8 @@ def is_unattended(row) -> bool:
     # A Kanban card attempt (#134889 KB-8): the dispatcher's marker, committed only by
     # ``SessionAuthority.submit(_kanban_card=...)``; a card row main minted without it still pauses.
     return ('local_automation_v1' in payload or 'kanban_card_v1' in payload
-            or 'automation' in native or 'webhook_delivery' in native)
+            or 'automation' in native or 'webhook_delivery' in native
+            or _trusted_native_synthetic(native))
 
 
 def _unattended_unknown(rows):

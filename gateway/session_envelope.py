@@ -101,10 +101,17 @@ def _adapter_event(event, **changes):
     # Each absorbed input owns its stamp task. Do not replace the head's live clock: a task
     # already persisting that clock could then mark a newer, unpersisted receipt as complete.
     # Only the durable projection represents the newest receipt still needing a retry.
-    unmarked = [candidate for candidate in (event, *getattr(event, '_hermes_absorbed_events', ()))
-                if getattr(candidate, '_attended_activity_received_at', None) is not None
-                and not getattr(candidate, '_attended_activity_marked', False)]
-    receipt = max(unmarked, key=lambda candidate: candidate._attended_activity_received_at) if unmarked else event
+    # A marked human follower must survive too: a synthetic head has no receipt of its own.
+    # Otherwise retain the head's marked clock; each absorbed receipt already persisted itself.
+    stamped = [candidate for candidate in (event, *getattr(event, '_hermes_absorbed_events', ()))
+               if getattr(candidate, '_attended_activity_received_at', None) is not None]
+    unmarked = [candidate for candidate in stamped
+                if not getattr(candidate, '_attended_activity_marked', False)]
+    receipt = event
+    if unmarked:
+        receipt = max(unmarked, key=lambda candidate: candidate._attended_activity_received_at)
+    elif stamped and getattr(event, '_attended_activity_received_at', None) is None:
+        receipt = max(stamped, key=lambda candidate: candidate._attended_activity_received_at)
     if receipt is not event and projected is event:
         projected = copy(event)
     for name in ('_attended_activity_received_at', '_attended_activity_marked'):

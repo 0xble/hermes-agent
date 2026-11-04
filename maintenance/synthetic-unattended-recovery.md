@@ -34,14 +34,18 @@ Existing cron, automation, webhook, and Kanban checks remain unchanged.
 
 Producer fields were checked in `gateway/run_goals.py` (the real goal event
 factory), `hermes_cli/session_controls.py` and `gateway/run_loop_wake.py`
-(`loop_wakeup`), `gateway/run_notifications.py` (`process_registry_synthetic`),
-and `gateway/platforms/event.py` / `gateway/session_synthetic.py` (the remaining
-supported loop/notification identities). No allowlist spelling changes.
+and `gateway/run_notifications.py` (`process_registry_synthetic`). The full
+allowlist matches the supported external-event identities in `gateway/run_goals.py`
+and turn-origin handling in `gateway/platforms/event.py`; `hermes_loop_wakeup`
+is the legacy loop stamp consumed by `gateway/run_loop_wake.py`. Modern process
+notices can already carry the older `automation` proof; this patch also covers
+private native descriptors without that block. No allowlist spelling changes.
 
 Safety detail exposed by RED coverage: an already-marked human follower merged
 into a synthetic head previously lost its attended-activity marker in the native
-codec. Preserve the newest stamped merged receipt when there is no unmarked one;
-retain the existing priority for the newest unmarked receipt. This is necessary
+codec. If the head has no receipt and there is no unmarked one, preserve the
+newest stamped merged receipt; otherwise retain the existing head clock and
+priority for the newest unmarked receipt. This is necessary
 for the conservative veto to work in both merge orders, not broader recovery.
 
 ## Tests and rollout
