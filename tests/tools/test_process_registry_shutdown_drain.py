@@ -119,7 +119,8 @@ def test_shutdown_collects_published_exit_before_signalling_delayed_reader(
 
 
 @pytest.mark.platforms("posix")
-def test_persistent_completion_during_shutdown_drain_reaches_successor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("prune_expired", [False, True])
+def test_persistent_completion_during_shutdown_drain_reaches_successor(tmp_path, monkeypatch, prune_expired):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     registry = ProcessRegistry()
     session, gate = _spawn_gated(registry, tmp_path, persist_on_release=True)
@@ -134,6 +135,12 @@ def test_persistent_completion_during_shutdown_drain_reaches_successor(tmp_path,
         assert not session._reader_thread.is_alive()
         assert session.exited
         assert session._completion_event.is_set()
+        if prune_expired:
+            # A long-running job can already exceed normal finished-result TTL
+            # when it exits. Another drain operation must not erase its handoff.
+            monkeypatch.setattr("tools.process_registry.FINISHED_TTL_SECONDS", -1)
+            with registry._lock:
+                registry._prune_if_needed()
         assert registry.kill_all(source="gateway_shutdown", deadline=time.monotonic() + 5) == 0
 
         successor = ProcessRegistry()
