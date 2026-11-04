@@ -37,6 +37,16 @@ when the parent leaves it unset; an empty value still autoloads built-in
 cmdlets from `$PSHOME\Modules` in both Windows PowerShell 5.1 and pwsh 7
 (native run 38399052622), and
 `tests/scripts/ci/test_portable_windows_environment.py` pins that contract.
+Common AppData's registry default is `%SystemDrive%\ProgramData`. Both
+`portable.environment()` and `scripts/run_tests.sh` keep `SystemDrive`,
+`SystemRoot`, `ProgramData`, and `ALLUSERSPROFILE` so that expansion lands
+outside the checkout. Stripping the drive makes shell components create a
+literal `%SystemDrive%` directory in the checkout (`Microsoft/Windows/Caches`,
+WER, Defender scan caches). `source_unchanged` still rejects those files;
+the allowlist is what keeps them from appearing. Per-user AppData stays in
+the disposable home. The uv-shim suite
+`scripts/tests/test-install-ps1-uv-shim-validation.ps1` must exist: the
+native lane names it under both `powershell` and `pwsh`.
 
 The full gate runs all selected lanes and returns nonzero if any fails. Within
 static checks and container lint, independent commands also aggregate failures.

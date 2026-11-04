@@ -53,6 +53,8 @@ class NativeOsLaneTests(unittest.TestCase):
             for call in installer.call_args_list:
                 self.assertEqual(call.args[0][1:5], ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File'])
                 self.assertEqual(call.kwargs['env'], env)
+                relative = call.args[0][-1]
+                self.assertTrue((ci.ROOT / relative).is_file(), f'Native lane names missing suite: {relative}')
 
 
 if __name__ == '__main__':
