@@ -6,7 +6,7 @@ import contextlib
 import threading
 import time
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +20,7 @@ class _Unavailable:
     next_retry_at: float = 0.0
     in_flight: bool = False
     error: str = ""
+    completed: threading.Event = field(default_factory=threading.Event)
 
 
 class _HealthSource:
@@ -86,10 +87,12 @@ class RecoverableHandleCache:
         self, path: Path, opener: Callable[[], Any], *, raise_on_error: bool = False,
         on_recovered: Callable[[], None] | None = None,
         non_cacheable: Callable[[Exception], bool] | None = None,
+        wait_for_open: bool = False,
     ) -> Any:
         """Return a cached handle or make one bounded, single-flight open attempt; None while
-        a retry is in flight or backing off.  ``non_cacheable`` exceptions (e.g. a live-system
-        guard) are re-raised without recording a failure so the next call retries at once."""
+        a retry is in flight or backing off. Required worker callers can ``wait_for_open`` to join
+        the current attempt (not retry it); optional fallback reads remain nonblocking.
+        ``non_cacheable`` exceptions (e.g. a live-system guard) are re-raised without caching."""
         path = Path(path)
         with self.lock:
             if path in self.handles:
@@ -102,11 +105,27 @@ class RecoverableHandleCache:
                 del self.handles[path]
                 self._registry_backed.discard(path)
             unavailable = self._unavailable.setdefault(path, _Unavailable())
-            if unavailable.in_flight or self._clock() < unavailable.next_retry_at:
+            pending = unavailable.in_flight
+            if pending and not wait_for_open:
+                return None
+            if not pending and self._clock() < unavailable.next_retry_at:
                 return None
             unavailable.in_flight = True
             was_unavailable = unavailable.failures > 0
             generation = self._generation
+            if not pending:
+                unavailable.completed = threading.Event()
+            completed = unavailable.completed
+        if pending:
+            return self._join_open(path, completed, generation)
+        try:
+            return self._open_attempt(path, opener, unavailable, generation, was_unavailable,
+                                      raise_on_error, on_recovered, non_cacheable)
+        finally:
+            completed.set()
+
+    def _open_attempt(self, path, opener, unavailable, generation, was_unavailable,
+                      raise_on_error, on_recovered, non_cacheable):
         if was_unavailable:
             _publish_health(self._health_source, path, "retrying")
 
@@ -151,6 +170,17 @@ class RecoverableHandleCache:
         if was_unavailable and on_recovered is not None:
             on_recovered()
         return handle
+
+    def _join_open(self, path: Path, completed: threading.Event, generation: int) -> Any:
+        """Required worker callers join this attempt, never retry it or wait out backoff."""
+        from hermes_loop_guard import check
+        check("SessionDB open completion")
+        completed.wait()
+        with self.lock:
+            handle = self.handles.get(path) if generation == self._generation else None
+            if path in self._registry_backed and handle is not None and not _registry_owned(handle):
+                return None
+            return handle
 
     def last_error(self, path: Path) -> str:
         """The exception the latest failed open of *path* raised (``''`` when none is recorded)."""

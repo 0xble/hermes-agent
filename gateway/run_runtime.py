@@ -41,8 +41,8 @@ async def _build_profile_authority(runner, name, home, *, register, claim=True):
     instance_id = runner.session_runtime_descriptor['instance_id']
     # Each home's store resolves through the runner's scope-following handle cache, exactly
     # the handle every later scoped read of that profile uses (one writer per state.db).
+    db = await asyncio.to_thread(open_profile_store, runner, home)
     with _profile_runtime_scope(home, hydrate_secrets=False):
-        db = getattr(runner._session_db, '_db', runner._session_db)
         if db is None:
             raise RuntimeError(_store_open_failure(runner, home))
         if (await asyncio.to_thread(Path(db.db_path).resolve)).parent != home:
@@ -56,6 +56,22 @@ async def _build_profile_authority(runner, name, home, *, register, claim=True):
             raise
     registry.replace(home, authority)
     return authority
+
+
+def open_profile_store(runner, home):
+    """Resolve once off-loop under the owning scope; a pending open is not a broken store."""
+    from gateway.run import _profile_runtime_scope, _SESSION_DB_UNPINNED
+    from gateway.session import SessionStore
+    from gateway.session_persistence import _DB_UNPINNED
+    with _profile_runtime_scope(home, hydrate_secrets=False):
+        store = getattr(runner, "session_store", None)
+        pinned = getattr(runner, "_session_db_pinned", _SESSION_DB_UNPINNED)
+        if isinstance(store, SessionStore) and pinned is _SESSION_DB_UNPINNED:
+            db = store._pinned_db()
+            return (store._open_session_db_for_active_scope(wait_for_open=True)
+                    if db is _DB_UNPINNED else db)
+        wrapper = runner._session_db
+        return getattr(wrapper, "_db", wrapper)
 
 
 def _store_open_failure(runner, home):
