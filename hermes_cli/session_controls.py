@@ -597,7 +597,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         code = f"nothing_to_{action}"
         return {"result": {"ok": False, "error_code": code, "error": code}, "state": state}
     receipt = {"result": result, "state": state}
-    if (kind, action) == ("goal", "pause") and (authority or {}).get("via") == "autonomy":
+    if (kind, action) == ("goal", "pause") and caller is LifecycleAuthority.AUTONOMY:
         seconds = state.waiting_seconds
         duration = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} sec"
         receipt.update(

@@ -8,6 +8,7 @@ from typing import Any
 
 from hermes_cli.session_controls import REPLACEMENT_MAX_CHARS
 from hermes_cli.goal_notices import lifecycle_cards_hidden, notice_level
+from hermes_cli.lifecycle_authority import LifecycleAuthority
 
 logger = logging.getLogger(__name__)
 
@@ -451,23 +452,25 @@ class GatewaySessionControlsMixin:
             await self._mark_control(session_controls, request_id, "outbox_done")
 
     async def _settle_quiet_autonomy_notices(self, session_controls, record):
-        """Settle only cosmetic delivery of goal and loop outcomes that their notices hide.
+        """Settle cosmetic delivery without suppressing continuation admission or cleanup.
 
-        Runs even offline. Continuation admission and cleanup still own progress, supersession
-        and recovery. With notices off, only autonomous outcomes are settled, and explicit
-        authorities (quote, button, session) keep their replies. With ``notices: hidden``, the
-        target's chat receipt is settled for every authority, while the requester's outcome
-        still reaches it unless the control was autonomous (its tool result already reported it).
+        Agent callers already received their self-control's tool result; injecting it again
+        would start a redundant turn, regardless of notice visibility. Cross-session quiet
+        outcomes retain the existing policy, while explicit user authorities keep their replies.
         """
         kind = record.get("kind")
         if kind not in {"goal", "loop"}:
             return record
         level = notice_level(f"{kind}s")
-        autonomous = (record.get("authority") or {}).get("via") == "autonomy"
-        if level == "all" or (level == "quiet" and not autonomous):
-            return record
-        flags = [("target_notice_sent", "target_notice_skipped")]
-        if autonomous:
+        caller = LifecycleAuthority.from_control(record.get("authority"))
+        agent = caller.actor == "agent"
+        self_control = bool(record.get("requester_session_id")) and (
+            record["requester_session_id"] == record.get("target_session_id")
+        )
+        flags = []
+        if level == "hidden" or (level == "quiet" and agent):
+            flags.append(("target_notice_sent", "target_notice_skipped"))
+        if agent and (self_control or level != "all"):
             flags.append(("requester_notified", "requester_notification_skipped"))
         for sent, skipped in flags:
             if not record.get(sent) and not record.get(skipped):
@@ -507,7 +510,9 @@ class GatewaySessionControlsMixin:
     def _approval_notice(authority: dict) -> tuple[str, str]:
         """Target/requester wording must claim approval only for a recorded approval source."""
         return {
-            "autonomy": ("applied autonomously without approval", "autonomously without approval"),
+            LifecycleAuthority.AGENT: ("applied by the owning agent without approval",
+                                       "by the owning agent without approval"),
+            LifecycleAuthority.AUTONOMY: ("applied autonomously without approval", "autonomously without approval"),
             "button": ("approved in Telegram", "after Telegram approval"),
         }.get(str(authority.get("via") or ""),
               ("authority source not recorded", "(authority source not recorded)"))
@@ -547,7 +552,7 @@ class GatewaySessionControlsMixin:
                 f"⊘ {kind.title()} {verb} by {requester} "
                 f"(applied by session {session_id} without approval){change}"
             )
-        if quote and authority.get("via") != "autonomy":
+        if quote and LifecycleAuthority.from_control(authority).actor == "user":
             message = str(authority.get("message") or "")
             full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
                     if message and message != quote else "")

@@ -45,6 +45,15 @@ Hermes homes. The core lineage controls alone do not prove plugin permission.
   Owned goal/loop pauses record `paused_by="agent"`; neither owned nor opted-in controls can
   relabel or lift a user/system pause. Owned loop stop finishes rather than clears, and an
   agent resume retains the full cadence floor. Hidden approval cards cannot block owned controls.
+- Gateway lifecycle decisions use `LifecycleAuthority`, not a comparison against the legacy
+  `via: autonomy` spelling alone. Owned `agent` controls and opted-in `autonomy` controls
+  never inject a requester outcome into their own target session: the tool result already
+  reported it. Hidden/quiet notices settle their cosmetic receipts durably without changing
+  continuation admission or cleanup; visible owned receipts name the owning agent without
+  claiming approval. Quote/button/session provenance keeps its explicit-authority wording.
+  `tests/gateway/test_session_control_owned_notices.py` covers pause/resume/stop, autonomy
+  on/off and hidden/false/true notices, plus legacy self/cross-session autonomy receipts.
+  Unknown revision/replacement actors return a structured refusal without changing state.
 - A current user-quoted stop-condition addition becomes user-owned even when an agent applies it.
   Goal and loop revise/replace bind both direct and relay quotes again under the commit write lock,
   including the source session, current source message and receipt. A newer refusal rolls back the

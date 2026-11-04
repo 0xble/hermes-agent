@@ -27,7 +27,10 @@ class LifecycleAuthority(str, Enum):
 
     @classmethod
     def for_edit(cls, actor, *, autonomous=False):
-        value = cls(actor)
+        try:
+            value = cls(actor)
+        except (TypeError, ValueError):
+            return None
         return cls.AUTONOMY if value is cls.AGENT and autonomous else value
 
 
@@ -72,7 +75,7 @@ def apply_owned_control(kind, action, target_sid, requester_sid, reason, user_qu
         live = owned_control_state(kind, action, target_sid, requester_sid, cursor=conn)
         if live is None or live.to_json() != state.to_json():
             return {"ok": False, "error_code": "state_changed"}
-        return commit(conn, {"via": "agent", "session_id": requester_sid}, "session_control_owned")
+        return commit(conn, {"via": LifecycleAuthority.AGENT.value, "session_id": requester_sid}, "session_control_owned")
 
     return _db()._execute_write(apply)
 

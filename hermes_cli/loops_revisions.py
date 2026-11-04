@@ -183,6 +183,9 @@ class LoopRevisionsMixin:
             )
         from hermes_cli.lifecycle_authority import LifecycleAuthority
         caller = LifecycleAuthority.for_edit(actor, autonomous=loop_autonomy_enabled())
+        if caller is None:
+            return {"ok": False, "error_code": "invalid_actor",
+                    "error": "actor must be agent, autonomy or user"}
         actor = caller.actor
         autonomous = caller is LifecycleAuthority.AUTONOMY
         quote, quote_error, quote_detail = self._revision_quote(
@@ -299,6 +302,9 @@ class LoopRevisionsMixin:
                            (state.until != (until or "").strip() and user_stop_condition(state)))
         from hermes_cli.lifecycle_authority import LifecycleAuthority
         caller = LifecycleAuthority.for_edit(actor, autonomous=loop_autonomy_enabled())
+        if caller is None:
+            return {"ok": False, "error_code": "invalid_actor",
+                    "error": "actor must be agent, autonomy or user"}
         autonomous = caller is LifecycleAuthority.AUTONOMY
         quote, quote_error, quote_detail = self._revision_quote(
             state, user_quote, user_messages, required=needs_authority and caller.actor == "agent" and not autonomous
