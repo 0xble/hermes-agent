@@ -431,8 +431,13 @@ a worker deadlocked on a lock stops stamping and is released once the bound
 passes. Unknown attempts are audit records and are never automatically rerun.
 
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
-`history`). Terminal history is bounded; active attempts are never pruned. The
-ledger is included in quick backups.
+`history`). Terminal history defaults to 8 elapsed days after finish, with a
+100,000-row backstop and at most 500 deletions per terminal transition. Set
+`cron.execution_retention_days` in `config.yaml` to change the window, or `0`
+to disable age expiration while keeping the row backstop. Active attempts,
+each job's latest attempt, unsettled deliveries, and attempts with admission
+journals are preserved even beyond these bounds. The ledger is included in
+quick backups.
 
 Scheduled attempts also record their exact scheduled instant, separately from
 the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence
