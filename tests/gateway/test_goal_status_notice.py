@@ -236,14 +236,9 @@ async def test_goal_notice_real_daily_quota_pressure(tmp_path, message, kind, pr
 @pytest.mark.parametrize("message", ["✓ Goal achieved: verified", "⏸ Goal blocked — paused: needs input"])
 async def test_deferred_outcome_keeps_protection_through_flood_retry(tmp_path, message):
     from telegram.error import RetryAfter
-    from plugins.platforms.telegram.daily_quota import DailyQuota
-    from tests.gateway.test_telegram_daily_quota import CHAT, Wall, _adapter, _spend, _utc
+    from tests.gateway.test_telegram_daily_quota import CHAT, _adapter, _spend
 
     transport = _adapter(tmp_path)
-    # Hold quota pressure through the real retry wait; UTC-midnight rollover is intentional.
-    transport._telegram_daily_quota = DailyQuota(
-        soft_ceiling=10, profile_dir=tmp_path, wall=Wall(_utc("2026-11-03 23:59:59")),
-    )
     _spend(transport, 11)
     transport._bot.send_message.side_effect = [RetryAfter(1), SimpleNamespace(message_id=222)]
     runner = GatewayRunner.__new__(GatewayRunner)

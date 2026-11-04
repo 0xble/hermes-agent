@@ -80,9 +80,16 @@ helper and thresholds instead of carrying a second copy.
 **Proof surface:** `tests/gateway/test_goal_status_notice.py` plus the existing
 cron live-delivery confirmation and goal verdict/parked-wake suites.
 
-The deferred outcome flood-retry test injects `DailyQuota.wall` to keep its
-11-message pressure in one Telegram day while the real short retry waits. This
-is a test-input correction, not a quota or cooldown behavior change:
+Gateway quota-pressure tests use the autouse `fixed_daily_quota_wall` fixture
+in `tests/gateway/conftest.py`. It supplies one fixed `DailyQuota.wall` only
+when the constructor caller omits a clock, covering direct quota construction
+and adapter/limiter-created ledgers without freezing global time. Explicit
+rollover/penalty clocks still win. The deferred outcome flood-retry test uses
+this shared default, so its 11-message pressure survives the real short wait.
+The `_spend` / `_spend_calls` helpers assert their message/call pressure was
+actually established; the outbox replay also checks its pressure remains.
+
+This is a test-input correction, not a quota or cooldown behavior change:
 `DailyQuota` intentionally starts an empty window at UTC midnight by default,
 and a short penalty does not move that anchor (see
 `test_window_rolls_at_the_anchor_and_starts_empty` and
