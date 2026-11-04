@@ -5,6 +5,31 @@ becomes agent ownership merely because an agent requests a later edit.
 """
 from __future__ import annotations
 
+from enum import Enum
+
+
+class LifecycleAuthority(str, Enum):
+    """Authority is not provenance: both owned and opted-in controls are agent acts."""
+    AGENT = "agent"
+    AUTONOMY = "autonomy"
+    USER = "user"
+
+    @property
+    def actor(self):
+        return "user" if self is self.USER else "agent"
+
+    @classmethod
+    def from_control(cls, authority):
+        if isinstance(authority, cls):
+            return authority
+        value = (authority or {}).get("lifecycle_authority", (authority or {}).get("via"))
+        return cls(value) if value in {cls.AGENT, cls.AUTONOMY, cls.USER} else cls.USER
+
+    @classmethod
+    def for_edit(cls, actor, *, autonomous=False):
+        value = cls(actor)
+        return cls.AUTONOMY if value is cls.AGENT and autonomous else value
+
 
 def agent_owned(state) -> bool:
     return state is not None and getattr(state, "created_by", "") == "agent"

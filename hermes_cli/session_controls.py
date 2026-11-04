@@ -542,8 +542,12 @@ def _save_record(record: dict[str, Any], *, cursor=None) -> None:
 def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                    payload: Optional[dict[str, Any]] = None,
                    authority: Optional[dict[str, Any]] = None, cursor=None) -> dict[str, Any]:
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
     payload = dict(payload or {})
     handler = CONTROLS.get((kind, action))
+    if kind == "goal" and action == "clear" and caller.actor == "agent":
+        return {"result": {"ok": False, "error_code": "user_only"}}
     if action == "replace" and kind == "goal":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid, cursor=cursor)
@@ -553,7 +557,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 goal=str(payload.get("goal") or ""),
                 max_turns=payload.get("max_turns"),
                 contract=payload.get("contract"),
-                actor="agent" if (authority or {}).get("via") in {"autonomy", "agent"} else "user",
+                actor=caller,
                 user_quote=str((authority or {}).get("quote") or ""),
             )
         continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
@@ -570,7 +574,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
-        autonomous = (authority or {}).get("via") in {"autonomy", "agent"}
+        autonomous = caller.actor == "agent"
         if autonomous and manager.state.paused_by != "agent":
             # A /goal pause, /stop, Ctrl+C, quoted or system pause is the user's to lift.
             return {"result": _user_paused(manager.state, "goal"), "state": manager.state}
@@ -1091,6 +1095,12 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
                              reason=reason, payload=payload)
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
+    payload = _check_payload(kind, action, payload)
+    target_sid = resolve_target(target_sid)
+    from hermes_cli.lifecycle_authority import owned_control_state
+    if owned_control_state(kind, action, target_sid, requester_sid) is not None:
+        return apply_control(kind, action, target_sid, requester_sid=requester_sid,
+                             reason=reason, payload=payload)
     from hermes_cli.goal_notices import lifecycle_cards_hidden
     if lifecycle_cards_hidden(kind):
         # Nobody would see the card, so a pending request could only expire. Refuse now so the
@@ -1098,12 +1108,6 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
         return {"ok": False, "error_code": "approval_cards_hidden",
                 "error": (f"{kind} approval cards are hidden ({kind}s.notices: hidden). Ask the user "
                           "in chat, then pass their exact words as user_quote")}
-    payload = _check_payload(kind, action, payload)
-    target_sid = resolve_target(target_sid)
-    from hermes_cli.lifecycle_authority import owned_control_state
-    if owned_control_state(kind, action, target_sid, requester_sid) is not None:
-        return apply_control(kind, action, target_sid, requester_sid=requester_sid,
-                             reason=reason, payload=payload)
     if not _has_gateway_route(target_sid):
         return {"ok": False, "error_code": "target_unroutable", "error": "target_unroutable"}
     if not _has_approval_surface(target_sid):
@@ -1185,6 +1189,8 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         raw = _meta_value(conn, _definition_key(kind, target_sid))
         affected_before = _affected_text(kind, action, raw, payload)
         conn.execute(f"SAVEPOINT {savepoint}")
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
+        authority = {**authority, "lifecycle_authority": LifecycleAuthority.from_control(authority).value}
         result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload,
                                 authority=authority, cursor=conn)
         manager_result = result.get("result")
@@ -1322,7 +1328,7 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[di
             record["status"], record["resolved_at"] = "expired", now
             _save_record(record, cursor=conn)
             return record
-        record["authority"] = {"via": "button", "user_id": str(user_id)}
+        record["authority"] = {"via": "button", "lifecycle_authority": "user", "user_id": str(user_id)}
         record["resolved_at"] = now
         if decision == "deny":
             record["status"] = "denied"
@@ -1496,13 +1502,14 @@ def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[dict[
 def _pause_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
 
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
     manager = GoalManager(sid, cursor=cursor)
-    autonomous = (authority or {}).get("via") == "autonomy"
     # Mark explicit controls separately from migratable legacy judge/budget pauses.
     # Model-supplied reason text must not accidentally opt this pause into migration.
     # Record the agent as owner of its own pause so it may later lift it, as for loops.
     return manager.pause(reason="session-control: " + (reason or "paused"),
-                         by="agent" if autonomous else "user")
+                         by=caller.actor)
 
 
 
@@ -1538,18 +1545,21 @@ def _clear_goal(sid, reason, payload, authority, cursor=None):
 def _pause_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.loops import LoopManager
 
-    autonomous = (authority or {}).get("via") == "autonomy"
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
     # An agent pause applies only to an active loop and records the agent as its owner.
     return LoopManager(sid, cursor=cursor).pause(
-        reason=reason or "session-control", by="agent" if autonomous else "user")
+        reason=reason or "session-control", by=caller.actor)
 
 
 def _resume_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.loops import LoopManager
 
     manager = LoopManager(sid, cursor=cursor)
-    if (authority or {}).get("via") != "autonomy":
-        return manager.resume()
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
+    if caller.actor == "user":
+        return manager.resume(by=caller.actor)
     state = manager.state
     if state is not None and state.status == "paused" and state.paused_by != "agent":
         # A user, Ctrl+C or tick-budget pause is the user's to lift.
@@ -1561,7 +1571,9 @@ def _stop_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.loops import LoopManager
 
     manager = LoopManager(sid, cursor=cursor)
-    if (authority or {}).get("via") != "autonomy":
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
+    if caller.actor == "user":
         return manager.clear()
     state = manager.state
     if state is not None and state.status == "paused" and state.paused_by != "agent":
