@@ -324,9 +324,14 @@ def test_both_completion_children_run_in_utf8_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(update_completion, "_settle_after_commit", lambda *a: 0)
     request = {"source": str(tmp_path), "receipt": {"update_id": "u1"}, "bytecode_cache": str(tmp_path / "bc")}
     update_completion._prepare(request, tmp_path / "request.json", tmp_path / "result.json")
-    monkeypatch.setattr(update_completion.sys, "platform", "win32")  # skip the Linux libatomic pre-install
-    with pytest.raises(OSError):
+    # Capture the bootstrap completion, not its ASCII-only POSIX death watcher.
+    # Stub auxiliary work at its boundary instead of faking the host platform.
+    monkeypatch.setattr(update_completion, "_owner_death_watch", lambda *a: None)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: None)  # libatomic pre-install
+    with pytest.raises(OSError, match="stop after capturing the argv"):
         update_completion.run_completion({**request, "home": str(tmp_path)})
     assert len(calls) == 2
+    assert "--prepared" in calls[0] and "--prepared" not in calls[1]
     for command in calls:
+        assert str(tmp_path / "hermes_cli/update_completion.py") in command, command
         assert command[command.index("-I"):].count("utf8") == 1 and "-X" in command, command
