@@ -199,7 +199,8 @@ Fork patch identity: `terminal-background-survival`.
   behavior so an older release can roll back without a destructive migration.
 - Do not touch `gateway/platforms/event.py`, `response_filters.py`, or
   `gateway/lifecycle_ledger.py`; those surfaces are owned elsewhere. Exit-status
-  notification wording owns only its additive English fallback keys in locales.
+  notification wording owns only its additive unknown-exit keys in locale catalogs;
+  preserve catalog/placeholder parity in every supported language.
 
 ## Verification
 
