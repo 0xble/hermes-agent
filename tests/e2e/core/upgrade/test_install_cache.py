@@ -33,6 +33,23 @@ def test_repeated_installs_share_only_downloads(tmp_path):
     assert envs[0]["XDG_RUNTIME_DIR"] != envs[1]["XDG_RUNTIME_DIR"]
 
 
+def test_explicit_runner_caches_do_not_inherit_installed_or_user_state(tmp_path):
+    downloads = {key: str(tmp_path / "runner" / name) for key, name in
+                 (("UV_CACHE_DIR", "uv"), ("UV_PYTHON_INSTALL_DIR", "python"), ("npm_config_cache", "npm"))}
+    runner = {**downloads, "HERMES_HOME": str(tmp_path / "foreign-home"),
+              "HERMES_RUNTIME_DIR": str(tmp_path / "foreign-runtime"),
+              "UV_PROJECT_ENVIRONMENT": str(tmp_path / "foreign-venv")}
+    cache = InstallCache(tmp_path / "fixture", runner)
+    sb = I.new_sandbox(tmp_path / "install")
+    env = cache.environment(sb.env)
+    assert {key: env[key] for key in downloads} == downloads
+    assert env["HERMES_HOME"] == str(sb.hermes_home)
+    assert env["HERMES_RUNTIME_DIR"] == str(tmp_path / "fixture" / "runtime")
+    assert "UV_PROJECT_ENVIRONMENT" not in env
+    assert not any((tmp_path / name).exists() for name in
+                   ("foreign-home", "foreign-runtime", "foreign-venv"))
+
+
 def test_managed_uv_is_a_private_copy(tmp_path):
     uv = tmp_path / "fixture-uv"
     uv.write_text("#!/bin/sh\nprintf 'fixture uv\\n'\n")

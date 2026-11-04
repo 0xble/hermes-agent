@@ -344,8 +344,13 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # credential can leak" property stays auditable at a glance.
 # Admission state is deliberately scrubbed: the helper recognizes held ancestors
 # after env -i, while tests must still exercise terminal promotion as unheld.
+# Download-only caches are explicit runner inputs, not installed/user state. Historical
+# installer fixtures need the portable lane's primed downloads; dropping these at env -i
+# silently makes every independent N-1 install redownload the same artifacts.
+# Do not forward UV_PROJECT_ENVIRONMENT, HERMES_HOME, or HERMES_RUNTIME_DIR here.
 TEST_ENV=()
-for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
+for _test_var in UV_CACHE_DIR UV_PYTHON_INSTALL_DIR npm_config_cache \
+  HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
   HERMES_TEST_SCRATCH_ROOT PLAYWRIGHT_BROWSERS_PATH SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \

@@ -74,3 +74,30 @@ def test_shell_runner_preserves_powershell_analysis_cache_path(tmp_path):
         cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.platforms("posix")
+def test_shell_runner_preserves_only_explicit_download_caches(tmp_path):
+    """Historical installs may reuse downloads, never the runner's installed/user state."""
+    case = tmp_path / "test_download_cache_paths.py"
+    caches = {key: str(tmp_path / key) for key in
+              ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "npm_config_cache")}
+    forbidden = {key: str(tmp_path / key) for key in
+                 ("UV_PROJECT_ENVIRONMENT", "HERMES_HOME", "HERMES_RUNTIME_DIR", "OPENAI_API_KEY")}
+    case.write_text(
+        "import os\n"
+        "def test_download_caches():\n"
+        f"    assert {{key: os.environ.get(key) for key in {tuple(caches)!r}}} == {caches!r}\n"
+        f"    assert all(key not in os.environ for key in {tuple(forbidden)!r})\n",
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, **caches, **forbidden, "HERMES_PYTHON": sys.executable,
+           "HOME": str(tmp_path / "home"), "HERMES_TEST_FILE_RETRIES": "0"}
+    Path(env["HOME"]).mkdir()
+    env.pop("__HERMES_ACTIVATED", None)
+    result = subprocess.run(
+        ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
