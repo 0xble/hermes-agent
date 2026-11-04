@@ -4,6 +4,7 @@ from pathlib import Path
 import shlex
 import threading
 import time
+import shutil
 
 import pytest
 
@@ -38,6 +39,11 @@ def _assert_normal_completion(registry, session, caplog):
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("kind", ["ordinary", "persist_on_release", "survive_restart"])
 def test_shutdown_fence_only_leaves_restart_safe_exit_for_adoption(tmp_path, monkeypatch, caplog, kind):
+    # Bash -lic emits logout on explicit exit on both Linux and macOS.
+    # Use zsh to keep the exact output assertion on command output, not shell noise.
+    shell = shutil.which("zsh")
+    assert shell is not None
+    monkeypatch.setattr("tools.process_registry._find_shell", lambda: shell)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     registry = ProcessRegistry()
     session, gate = _spawn_gated(registry, tmp_path, **({kind: True} if kind != "ordinary" else {}))
@@ -45,7 +51,10 @@ def test_shutdown_fence_only_leaves_restart_safe_exit_for_adoption(tmp_path, mon
         registry.stop_survivor_pollers()
         gate.touch()
         assert session.process.wait(timeout=5) == 0
-        assert Path(session.exit_path).read_text(encoding="utf-8-sig").strip() == "0"
+        if kind == "ordinary":
+            assert not session.exit_path
+        else:
+            assert Path(session.exit_path).read_text(encoding="utf-8-sig").strip() == "0"
         session._reader_thread.join(5)
         assert not session._reader_thread.is_alive()
         if kind == "survive_restart":
@@ -64,20 +73,20 @@ def test_shutdown_fence_only_leaves_restart_safe_exit_for_adoption(tmp_path, mon
         gate.touch()
         session.process.wait(timeout=5)
         registry._survivor_pollers_stopped.clear()
-        registry._survivor_poller_loop(session)
+        if session.exit_path:
+            registry._survivor_poller_loop(session)
         session._reader_thread.join(5)
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize("persist", [False, True], ids=["ordinary", "persist_on_release"])
 @pytest.mark.parametrize("sweep", ["bounded", "unbounded", "explicit"])
 def test_shutdown_collects_published_exit_before_signalling_delayed_reader(
-    tmp_path, monkeypatch, caplog, persist, sweep,
+    tmp_path, monkeypatch, caplog, sweep,
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     registry = ProcessRegistry()
     release_reader = threading.Event()
-    reader_name = "_survivor_poller_loop" if persist else "_reader_loop"
+    reader_name = "_survivor_poller_loop"
     real_poller = getattr(registry, reader_name)
 
     def delayed_poller(session):
@@ -85,7 +94,7 @@ def test_shutdown_collects_published_exit_before_signalling_delayed_reader(
         real_poller(session)
 
     monkeypatch.setattr(registry, reader_name, delayed_poller)
-    session, gate = _spawn_gated(registry, tmp_path, persist_on_release=persist)
+    session, gate = _spawn_gated(registry, tmp_path, persist_on_release=True)
     try:
         registry.stop_survivor_pollers()
         gate.touch()

@@ -14,8 +14,8 @@ from tools.process_registry_notifications import format_process_notification
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize("persist", [False, True], ids=["status-only", "durable-output"])
-def test_ordinary_local_exit_survives_spawner(tmp_path, monkeypatch, persist):
+def test_persistent_local_exit_survives_spawner(tmp_path, monkeypatch):
+    persist = True
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -36,7 +36,7 @@ os._exit(0)
                              capture_output=True, text=True, timeout=15, check=False)
     assert spawned.returncode == 0, spawned.stderr
     entry, = json.loads(checkpoint.read_text(encoding="utf-8-sig"))
-    assert entry["exit_path"], "ordinary jobs must record an exit outside their spawner"
+    assert entry["exit_path"], "persistent jobs must record an exit outside their spawner"
     deadline = time.monotonic() + 15
     while not Path(entry["exit_path"]).exists():
         assert time.monotonic() < deadline
@@ -57,7 +57,7 @@ os._exit(0)
 def test_killed_wrapper_persists_its_wait_status(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     registry = ProcessRegistry()
-    session = registry.spawn_local("sleep 30", cwd=str(tmp_path))
+    session = registry.spawn_local("sleep 30", cwd=str(tmp_path), persist_on_release=True)
     try:
         assert session.pid is not None
         os.killpg(session.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only test

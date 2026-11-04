@@ -1,4 +1,4 @@
-"""Ordinary exit receipts do not widen durable output; survivor adoption is a tail snapshot."""
+"""Ordinary jobs keep pipes; outliving-job adoption reads a bounded tail snapshot."""
 from pathlib import Path
 import shlex
 import sys
@@ -30,7 +30,7 @@ def test_chatty_ordinary_job_has_no_on_disk_output(tmp_path, monkeypatch):
         assert not session.log_path and not session.output_log
         assert not list(tmp_path.rglob("out.log"))
         assert session.process.stdout is not None
-        assert session.exit_path, "exit publication must not depend on durable output"
+        assert not session.exit_path, "ordinary attached jobs must not create receipts"
     finally:
         registry.kill_process(session.id)
 

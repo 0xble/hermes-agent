@@ -15,6 +15,7 @@ import psutil
 import pytest
 from unittest.mock import ANY, MagicMock, patch
 
+from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
@@ -1892,6 +1893,48 @@ class TestFinishedHandleRelease:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+    def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["env"] = kwargs["env"]
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        fake_thread = MagicMock()
+
+        with patch.dict(os.environ, {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "USER": "tester",
+            "TELEGRAM_BOT_TOKEN": "bot-secret",
+            "FIRECRAWL_API_KEY": "fc-secret",
+        }, clear=True), \
+            patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", side_effect=fake_popen), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_local(
+                "echo hello",
+                cwd="/tmp",
+                env_vars={
+                    "MY_CUSTOM_VAR": "keep-me",
+                    "TELEGRAM_BOT_TOKEN": "drop-me",
+                    f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN": "forced-bot-token",
+                },
+            )
+
+        env = captured["env"]
+        assert env["MY_CUSTOM_VAR"] == "keep-me"
+        assert env["TELEGRAM_BOT_TOKEN"] == "forced-bot-token"
+        assert "FIRECRAWL_API_KEY" not in env
+        assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
+        assert env["PYTHONUNBUFFERED"] == "1"
+
     def test_spawn_via_env_checks_returncode_when_wrapper_fails(self, registry):
         class FakeEnv:
             def __init__(self):
@@ -3297,11 +3340,8 @@ class TestSystemdCgroupIsolation:
         assert "--" in argv, "systemd-run argv must use -- to separate command"
         sep_idx = argv.index("--")
         assert "/bin/bash" in argv[sep_idx:]
-        # The recoverable wrapper retains both the exact command and its status.
-        wrapper = argv[-1]
-        assert wrapper.startswith("set +m; trap ")
-        assert not session.log_path and session.exit_path in wrapper
-        assert wrapper.endswith(" EXIT\n(\necho hello\n)")
+        assert "set +m; echo hello" in argv[sep_idx:]
+        assert not session.exit_path and not session.log_path
         assert captured["stdout"] == subprocess.PIPE
         # systemd-run --scope gives the worker a new cgroup but NOT a new
         # session (#70716 regression: start_new_session was False, so the
@@ -3337,8 +3377,7 @@ class TestSystemdCgroupIsolation:
 
         argv = captured["argv"]
         # No systemd-run wrapping — direct shell invocation.
-        assert argv[:2] == ["/bin/bash", "-lic"], argv
-        assert argv[2].startswith("set +m; trap ") and argv[2].endswith("\necho hello\n)"), argv
+        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
         assert captured["stdout"] == subprocess.PIPE
         assert captured["start_new_session"] is True
 
@@ -3365,8 +3404,7 @@ class TestSystemdCgroupIsolation:
             registry.spawn_local("echo hello", cwd="/tmp")
 
         argv = captured["argv"]
-        assert argv[:2] == ["/bin/bash", "-lic"], argv
-        assert argv[2].startswith("set +m; trap ") and argv[2].endswith("\necho hello\n)"), argv
+        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
         assert captured["stdout"] == subprocess.PIPE
         assert captured["start_new_session"] is True
 
@@ -3409,9 +3447,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"][:2] == ["/bin/bash", "-lic"]
-            assert captured["argv"][2].startswith("set +m; trap ")
-            assert captured["argv"][2].endswith("\necho hello\n)")
+            assert captured["argv"] == ["/bin/bash", "-lic", "set +m; echo hello"]
             assert captured["stdout"] == subprocess.PIPE
             assert captured["start_new_session"] is True
 
@@ -3461,9 +3497,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"][:2] == ["/bin/bash", "-lic"]
-            assert captured["argv"][2].startswith("set +m; trap ")
-            assert captured["argv"][2].endswith("\necho hello\n)")
+            assert captured["argv"] == ["/bin/bash", "-lic", "set +m; echo hello"]
             assert captured["stdout"] == subprocess.PIPE
             assert captured["start_new_session"] is True
 

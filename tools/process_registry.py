@@ -408,7 +408,7 @@ class GatewayChildDispatch(NamedTuple):
     """
 
     mode: Literal["in_process", "scoped", "detached", "degraded"]
-    argv: list[str]
+    argv: List[str]
 
 
 def scoped_spawn_lost_user_bus(spawn_env: dict[str, str]) -> bool:
@@ -1239,7 +1239,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release, survive_restart=survive_restart)
-        log = None if is_restart_safe(session) else worker_output_log(session.id)
+        log = None if survive_restart else worker_output_log(session.id)
         if is_restart_safe(session) or (persist_on_release and not use_pty and not _IS_WINDOWS and log is None):
             if use_pty:
                 raise ValueError("survive_restart is only supported for non-PTY commands")
@@ -1271,11 +1271,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         # Pipe path (non-PTY or PTY fallback).
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
-        if log:
-            safe_command = record_exit_command(log, safe_command)
-        elif not _IS_WINDOWS:
-            safe_command = self._local_exit_wrapper(session, safe_command)
-        spawn_argv = self._scope_argv(session, safe_command, unit_suffix, "Local")
+        spawn_argv = self._scope_argv(session, record_exit_command(log, safe_command) if log else safe_command,
+                                      unit_suffix, "Local")
         spawn_env = self._spawn_env(env_vars)
         if session.systemd_unit:
             spawn_env = systemd_user_bus_env(spawn_env)
@@ -1290,9 +1287,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
                 errors="replace", stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 start_new_session=True, **_popen_kwargs)
-        except Exception:
-            self._remove_survivor_run_dir(session)
-            raise
         finally:
             if log:
                 os.close(output)
@@ -1303,7 +1297,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             self._track_started(session, self._log_reader_loop if log else self._reader_loop, f"proc-reader-{session.id}")
         except Exception:
             self._reap_untracked(session, proc)
-            self._remove_survivor_run_dir(session)
             raise
         return session
 
@@ -1484,9 +1477,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 logger.warning("%s wait failed; leaving process tracked: %s", label, e)
                 return
             logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        code = self._local_exit_code(session, exit_code())
-        self._record_local_wait_status(session, code)
-        self._finish_exited(session, code)
+        self._finish_exited(session, exit_code())
 
     _log_delta_command = staticmethod(log_delta_command)
 
@@ -1926,8 +1917,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             reoffer_unresolved_completions(self.completion_queue)
         except Exception as exc:
             logger.warning("Could not re-offer unresolved async delegation completions: %s", exc)
-        results: list[tuple[dict, str]] = []
-        requeue: list[dict] = []
+        results: "list[tuple[dict, str]]" = []
+        requeue: "list[dict]" = []
         # delegation.surface_child_process_notifications, read at most once per drain
         # and only when an sa- event shows up.
         surface_child: bool | None = None

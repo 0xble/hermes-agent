@@ -3,77 +3,51 @@
 Load this unit when changing terminal background-process checkpointing, gateway
 shutdown cut receipts, restart adoption, or exactly-once completion delivery.
 
-## Design decision: narrow exit publication (B)
+## Design decision: wrap only jobs that can outlive the gateway (C)
 
-PR #939 fixes a detached job losing its real wait status after its registry
-owner exits. A durable numeric exit receipt solves that problem; durable stdout
-for every command is neither required nor an ordinary-job contract. Keep the
-base pipe reader for ordinary local jobs and wrap only the exit publication.
-Use the full existing log-backed wrapper only for `survive_restart`,
-`persist_on_release`, and the separate pre-existing managed-worker handoff.
-This avoids making every dev server an unlimited disk logger and avoids routing
-ordinary output through concurrent file readers or replaying it on adoption.
-It does not promise an ordinary writer can keep printing after its pipe owner
-exits; select one of the existing persistent modes for that requirement.
+Ordinary attached local jobs use the base Popen/PTY path unchanged: no shell
+wrapper, exit marker, `process-runs` directory, or checkpoint `exit_path`.
+Popen's wait status is authoritative, including explicit exits 129–192 and
+negative signal statuses. Kill uses the base local process-tree path.
 
-For retained full log-backed jobs, serialize reads/decoder updates with a
-per-session reader lock. Adoption seeds at most `max_output_chars` bytes from
-the log tail without live-output or watch hooks, resumes at that snapshot's end,
-and preserves the checkpointed lifetime watch counters. Unseen historical bytes
-are a history snapshot, not fresh watch events. Live reads still ingest every
-new byte in bounded chunks (not a bounded total tail). Finished-log recovery
-performs only the one bounded tail read, never a synchronous full replay.
+Only `persist_on_release`, `survive_restart`, and the pre-existing detached
+managed-worker handoff publish file-backed exit status. A recorded marker is
+read **before** checking PID liveness/start-time reuse and settles the original
+job without adopting or signalling the current PID or stopping its old scope.
+An unrecorded ordinary checkpoint retains base PID-reuse discard/no-signal and
+gone-scope reap/retry behavior. Missing status is never invented as success.
+
+### Why ordinary jobs are not wrapped
+
+Eight review rounds exposed ordinary-wrapper regressions in explicit high exit
+codes versus negative signal status, simple-command exec/kill latency, login-rc
+`noclobber`/`errexit`, shutdown draining and reader ownership, PID reuse/scope
+reaping, and new run-directory retention. None is needed to preserve a detached
+job's result. Design C removes that extra protocol instead of normalizing native
+wait results or repairing ordinary lifecycle behavior around a wrapper.
 
 ## Exit-marker and restart-safe predicate audit
 
-`is_restart_safe(entry_or_session)` means **only** explicit `survive_restart`.
-`has_exit_marker(entry_or_session)` means an `exit_path` collection capability.
-Neither implies the other. `_file_backed` further requires no live ordinary pipe
-owner (`log_path` or detached adoption). Never infer restart-safe lifecycle from
-an exit file, log file, poller name, or `persist_on_release`.
+`has_exit_marker` == can-outlive-gateway collection capability (`exit_path`).
+`is_restart_safe` means **only** explicit `survive_restart`; neither persistent
+files nor a poller grant restart-safe lifecycle or delivery semantics.
 
-| Call site (owner) | Predicate / boundary | Purpose |
-|---|---|---|
-| `process_registry.spawn_local` | `is_restart_safe(session)`; independent `persist_on_release` / managed-worker policy | Choose restart-safe dispatch versus ordinary pipe or existing durable stdout. |
-| `survival._spawn_local_survivor` | `is_restart_safe(session)` after storing the explicit argument | Restart-safe scope and delivery marker only for opt-ins. `restart_safe` is an input, not inferred from files. |
-| `survival._local_exit_wrapper`, `_local_exit_code`, `_record_local_wait_status` | Marker publication / `has_exit_marker`; ordinary normalization also excludes log-backed and opted-in jobs | Publish/collect status without granting survival. Ordinary shell `128+N` statuses (129–192) normalize to `-N` in the marker and public result. |
-| `checkpoint._write_checkpoint` | `is_restart_safe`, via `_retain_survivor_completion` | Only opted-in pending deliveries remain checkpointed after completion. `exit_path`/`survive_restart` in `_CHECKPOINT_FIELDS` are serialized data, not predicates. |
-| `checkpoint.recover_from_checkpoint`: PID eligibility | `is_restart_safe(entry)` / `has_exit_marker(entry)` separately | A marker may settle an exit without a signalable PID; it never permits adoption of a positively reused ordinary PID. |
-| `checkpoint.recover_from_checkpoint`: reused PID, dead-wrapper scope reap and retry | `is_restart_safe(entry)` | Ordinary entries keep base discard/no-signal behavior on reuse. Gone ordinary wrappers stop their persisted systemd scope; failed stops retain the exact entry for retry, even if an exit marker exists. |
-| `checkpoint._read_recovery_receipts` | `has_exit_marker(entry)` / `is_restart_safe(entry)` respectively | Every marker supplies status; only opt-ins have survivor operator-kill receipts and recorded-exit-on-reuse semantics. |
-| `checkpoint._finish_recovered_exit` | `is_restart_safe(session)` plus independently collected status | Ordinary missing status uses `checkpoint.exit_uncollected`, not `survivor_lost`; recorded ordinary status finishes normally after scope cleanup. |
-| `checkpoint.recover_from_checkpoint`: historical tail and reader routing | `log_path` for history; `_file_backed` for file collection | A reader capability does not change PID/scope/lifecycle policy. |
-| `registry._refresh_detached_session`, `_sync_file_backed_result`, `poll` note | `_file_backed` = `has_exit_marker` and (`log_path` or `detached`) | Defer exit collection to the existing file reader, not the dead parent's pipe; ordinary live pipes keep their original sole final-drain owner. |
-| `survival._poll_ordinary_detached` | Detached and **not** `is_restart_safe` | Post-adoption death/reuse takes the same scope reap/retry, base discard and unknown-status path as startup recovery. |
-| `survival._survivor_poller_loop` | Marker for collection; `_poll_ordinary_detached` / `is_restart_safe` for fate and lost provenance | Sharing a poller does not share survivor lifecycle. |
-| `survival._collect_recorded_exit` | `has_exit_marker` for exit; `_file_backed` for drain owner; `is_restart_safe` for termination metadata | Kill observes a completed status before signalling, without taking ownership away from a live ordinary pipe reader. |
-| `survival._survivor_poller_stopped`, `_finish_survivor_if_allowed`, `_finish_survivor` | `is_restart_safe` via the shutdown fence | Only opt-in completion publication is fenced; ordinary drains finish during shutdown. |
-| `registry._publish_finished` | `is_restart_safe` | Only opt-ins consult delivery markers or use fenced survivor queue publication. |
-| `registry.drain_notifications` | `is_restart_safe` | Claim the survivor lease only for opt-in completion events. |
-| `registry.list_processes` | `is_restart_safe` | Expose explicit opt-in metadata, not an exit-path-derived survival claim. |
-| `registry.kill_process` | `is_restart_safe` | Write survivor operator-kill receipt only for opted-in jobs. |
-| `registry.kill_all` | `is_restart_safe`; independent `persist_on_release` release policy | Filter lifecycle/shutdown targets before cut receipts or signals. Exit markers never exempt ordinary jobs from shutdown. |
-| `survival._retain_survivor_completion`, `claim_survivor_completion`, `release_survivor_completion`, `acknowledge_survivor_completion` | `is_restart_safe` | Retention and consumer lease entry points are opt-in only. `_consume_survivor_completion`, termination-mixin consumers and notification acknowledgements route through these entry points. |
-| `survival.prune_survivor_run_dir` | `is_restart_safe` for acknowledged delivery; otherwise `has_exit_marker` | Ordinary marker directories expire with normal results; no delivery lease is required. |
-| `survival._prune_delivered_survivor_runs` | Durable marker state and checkpoint ownership | Directory inventory/retention only; creates no adoption or lifecycle classification. |
-| `survival._survivor_run_dir`, `_remove_survivor_run_dir` | Stored paths only | Resource cleanup for either wrapper; no survival decision. |
-| `survival._read_survivor_log`, `_read_survivor_log_locked`, `_adopt_survivor_log_tail`, `_ingest_survivor_output` | `log_path` / reader lock / live versus historical bytes | Shared output plumbing, not survivor semantics. |
-| `survival._read_survivor_marker`, `_survivor_delivery_state`, `_survivor_delivery_pending`, `_claim_survivor_delivery`, `_mark_survivor_delivered`, delivery lock/claim owner/liveness helpers | Existing delivered-marker IO behind opt-in consumer entry points | Low-level lease mechanism does not classify a session by `exit_path`. |
-| `survival._recorded_survivor_exit`, `_survivor_termination_path`, `_recorded_survivor_termination`, `_write_survivor_termination` | Path codecs; callers use marker versus opt-in predicate | Parsing/path construction is not adoption. Exit-file fallback publication uses `has_exit_marker`. |
-| `survival.stop_survivor_pollers`, `_queue_survivor_completion`; checkpoint recovery global stopped guard | Registry fence; entry decisions above use `is_restart_safe` | Never start new adoption during teardown; only opted-in completions use the survivor publication fence. |
-| `gateway.run_notifications._run_process_watcher` (silent, lease, retry/refund, consumed, text send, acknowledgement) | `is_restart_safe` at every survivor-delivery branch | Ordinary marker jobs never acquire survivor delivery semantics. |
-| `gateway.run_shutdown` | Calls `stop_survivor_pollers`; job exemptions stay in `kill_all` | No file-derived survival decision in the gateway shutdown owner. |
-| `process_registry_output_log` / checkpoint managed-worker handoff; environment poller | Separate existing output-log/remote exit protocol | Their `_exit_path` / local `exit_path` names are not the session's survivor opt-in. |
-| `gateway.run` / `run_shutdown` cron restart-safe counts, `restart_loop_guard` planned exit path, `update_notifications` updater exit paths | Separate cron/update protocols, unchanged | No process-session survival classification. |
+| Owner / call sites | Predicate and boundary |
+|---|---|
+| `spawn_local`, `_spawn_local_survivor`, managed-worker output handoff | Only outliving jobs are wrapped. Ordinary pipe/PTY commands stay native. |
+| Checkpoint write / recovery | Omit ordinary `exit_path`; read recorded markers before PID fate. No marker: retain base ordinary reuse/discard and scope reap/retry. |
+| `_finish_recovered_exit`, `_poll_persistent_detached` | Ordinary/persistent missing status uses `checkpoint.exit_uncollected`; opt-in lost status uses `survivor_lost`. |
+| `_file_backed`, `_refresh_detached_session`, `_sync_file_backed_result`, `poll` | File-reader routing is a marker capability, never a lifecycle exemption. |
+| `_survivor_poller_loop`, `_collect_recorded_exit`, kill partition | Collect receipt first; only then consider unrecorded PID fate/signals. |
+| `_survivor_poller_stopped`, `_finish_survivor_if_allowed`, `_finish_survivor`, `_publish_finished` | Only `is_restart_safe` completion publication is shutdown-fenced; other readers drain normally. |
+| `kill_process`, `kill_all` | Survivor kill receipts/exemptions require `is_restart_safe`; persist-on-release keeps its separate base release policy. |
+| Completion retention, claim/release/acknowledgement, drain, gateway watcher | Only explicit opt-ins acquire the delivered-marker lease. Notification opt-outs still settle without admission. |
+| Directory pruning, path codecs, log reads | Resource handling only, not survival classification. No ordinary attached job creates artifacts to prune. |
 
-The shell protocol cannot distinguish an explicit `exit 137` from a subshell
-killed by SIGKILL; ordinary status-only wrappers treat 129–192 as signal-style
-statuses. Log-backed persistent jobs retain their pre-existing encoding.
-`tools/terminal_tool_result.py::_interpret_signal_exit` already accepts both negative
-signal numbers and shell `128+N` codes; callers in the process/gateway delivery
-paths otherwise use zero/nonzero or the completion reason. The negative public
-wait status and marker are tested with a real self-SIGKILL command. No consumer
-is changed to assume only one encoding for the pre-existing persistent modes.
+Retained log-backed jobs serialize reads/decoder updates per session. Adoption
+seeds at most `max_output_chars` bytes without live-output/watch callbacks and
+preserves watch counters; live polling drains every new byte in bounded chunks.
+Finished recovery reads only that historical tail, never a full replay.
 
 ## Required behavior
 
@@ -83,10 +57,9 @@ Fork patch identity: `terminal-background-survival`.
   sweep. They are additive JSON records and do not mutate the live session state.
 - Cut receipts use their own age and count retention budget; they are not evicted
   by the normal completed-result cap.
-- Every local POSIX non-PTY job atomically publishes its exit status outside the
-  gateway process. Ordinary jobs keep the existing memory-bounded pipe output:
-  they do not create an `out.log`, and their output is not promised after the
-  pipe owner exits. Managed workers retain their existing output-log handoff.
+- Only jobs that can outlive the gateway atomically publish exit markers.
+  Ordinary attached jobs keep the base memory-bounded pipe/Popen path with no
+  marker or run directory. Managed workers retain their output-log handoff.
   Only explicitly opted-in background commands claim restart-safe dispatch and
   exactly-once delivery. Ordinary jobs retain their existing lifecycle kill
   policy. Legacy detached jobs whose PID is gone are retained as completed
@@ -140,11 +113,9 @@ Fork patch identity: `terminal-background-survival`.
   Run directories are pruned after acknowledged-result retention
   expires, and immediately on spawn failure. Directory sweeps are throttled to
   at most once per minute per profile to bound registry-lock IO; in-memory result
-  expiry still runs normally. Sweep completed ordinary run directories too when
-  they have an exit file older than the result TTL and are absent from both the
-  current registry and its on-disk checkpoint; a startup sweep must not delete
-  output that adoption has not read yet. Preserve pending survivor markers and
-  fail closed on unreadable checkpoint ownership. Recovery reads a bounded
+  expiry still runs normally. Preserve pending survivor markers. No ordinary
+  attached artifacts exist, so no ordinary directory inventory is needed.
+  Recovery reads a bounded
   historical tail without watch/live callbacks; live polling drains all new
   bytes in bounded chunks into a memory-bounded tail.
 - Login rc options must not defeat file-backed supervision. Append to the

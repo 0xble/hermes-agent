@@ -107,43 +107,16 @@ class ProcessSurvivalMixin:
         return session
 
     def _local_exit_wrapper(self, session: ProcessSession, safe_command: str) -> str:
-        """Publish status independently of stdout; durable output is a separate opt-in."""
-        from tools import process_registry as registry
-
-        run_dir = registry.get_hermes_home() / "process-runs" / session.id
-        run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        session.exit_path = str(run_dir / "exit")
+        """Publish an outliving job's status atomically, independently of its reader."""
         q = shlex.quote
         # EXIT honors inherited errexit. Only the private temp marker is forcibly
         # overwritten under noclobber; rename publishes it. bash exposes 258 to
         # the trap on parser failure but its real exit is 2.
-        normalize_signal = ""
-        if not session.log_path and not is_restart_safe(session):
-            normalize_signal = 'if [ "$rc" -gt 128 ] && [ "$rc" -lt 193 ]; then rc=$((128 - rc)); fi; '
         exit_trap = (
-            f"rc=$(($? & 255)); {normalize_signal}printf '%s\\n' \"$rc\" >| {q(session.exit_path + '.tmp')}; "
+            f"rc=$(($? & 255)); printf '%s\\n' \"$rc\" >| {q(session.exit_path + '.tmp')}; "
             f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}"
         )
-        redirect = f" >> {q(session.log_path)} 2>&1" if session.log_path else ""
-        return f"trap {q(exit_trap)} EXIT\n(\n{safe_command}\n){redirect}"
-
-    @staticmethod
-    def _local_exit_code(session: ProcessSession, code):
-        """Undo the ordinary EXIT wrapper's shell encoding of a signal wait status."""
-        if has_exit_marker(session) and not session.log_path and not is_restart_safe(session):
-            if isinstance(code, int) and 128 < code < 193:
-                return 128 - code
-        return code
-
-    def _record_local_wait_status(self, session: ProcessSession, code) -> None:
-        """The original parent can collect SIGKILL even when EXIT never ran."""
-        if not has_exit_marker(session) or code is None or self._recorded_survivor_exit(session.exit_path) is not None:
-            return
-        try:
-            from utils import atomic_write_text
-            atomic_write_text(session.exit_path, f"{code}\n", mode=0o600, fsync_dir=True)
-        except OSError:
-            logger.warning("Could not persist collected exit for %s", session.id, exc_info=True)
+        return f"trap {q(exit_trap)} EXIT\n(\n{safe_command}\n) >> {q(session.log_path)} 2>&1"
 
     @staticmethod
     def _survivor_run_dir(session: ProcessSession) -> Path | None:
@@ -403,7 +376,7 @@ class ProcessSurvivalMixin:
     @staticmethod
     def _file_backed(session: ProcessSession) -> bool:
         """Collect from files only when no live pipe reader owns this session's output."""
-        return has_exit_marker(session) and bool(session.log_path or session.detached)
+        return has_exit_marker(session)
 
     def prune_survivor_run_dir(self, session: ProcessSession) -> None:
         """Prune an aged survivor only after its completion was delivered.
@@ -417,7 +390,7 @@ class ProcessSurvivalMixin:
             self._remove_survivor_run_dir(session)
 
     def _prune_delivered_survivor_runs(self) -> None:
-        """Bound completed artifacts after restart, preserving checkpointed results."""
+        """Bound delivered artifacts even if their registry died before TTL pruning."""
         from tools import process_registry as registry
         run_root = registry.get_hermes_home() / "process-runs"
         # This sweep also runs under the registry lock during spawn/drain. Bound its
@@ -432,17 +405,6 @@ class ProcessSurvivalMixin:
         sweep_times[run_root] = sweep_now
         now = time.time()
         tracked = self._running.keys() | self._finished.keys()
-        # Startup sweeps precede adoption. An old exit without a delivered marker
-        # may still be a pending survivor (or an ordinary result awaiting adoption).
-        try:
-            entries = json.loads(registry._checkpoint_path().read_text(encoding="utf-8-sig"))
-        except FileNotFoundError:
-            entries = []
-        except (OSError, ValueError):
-            return  # Unreadable ownership is not permission to delete output.
-        if not isinstance(entries, list):
-            return
-        tracked |= {entry.get("session_id") for entry in entries if isinstance(entry, dict)}
         try:
             for run_dir in run_root.iterdir():
                 if (run_dir.is_symlink() or not run_dir.is_dir()
@@ -450,17 +412,11 @@ class ProcessSurvivalMixin:
                     continue
                 marker = run_dir / "delivered"
                 try:
-                    if marker.exists():
-                        if now - marker.stat().st_mtime <= registry.FINISHED_TTL_SECONDS:
-                            continue
-                        payload = json.loads(marker.read_text(encoding="utf-8-sig"))
-                        if not isinstance(payload, dict) or not self._marker_delivered(payload):
-                            continue
-                    elif now - (run_dir / "exit").stat().st_mtime <= registry.FINISHED_TTL_SECONDS:
+                    if now - marker.stat().st_mtime <= registry.FINISHED_TTL_SECONDS:
                         continue
-                    # No marker and no checkpoint means an ordinary completed job,
-                    # not a pending survivor. Running jobs have no exit file.
-                    shutil.rmtree(run_dir)
+                    payload = json.loads(marker.read_text(encoding="utf-8-sig"))
+                    if isinstance(payload, dict) and payload.get("delivered") is True:
+                        shutil.rmtree(run_dir)
                 except (OSError, ValueError, TypeError):
                     continue
         except OSError:
@@ -503,8 +459,8 @@ class ProcessSurvivalMixin:
         self._finish_survivor(session, exit_code, reason, source)
         return True
 
-    def _poll_ordinary_detached(self, session: ProcessSession) -> bool:
-        """Apply ordinary PID/scope recovery even when its receipt needs a file poller."""
+    def _poll_persistent_detached(self, session: ProcessSession) -> bool:
+        """Apply base PID/scope recovery to an unrecorded persistent job."""
         if not session.detached or is_restart_safe(session):
             return False
         fate = self._detached_host_fate(session.pid, session.host_start_time)
@@ -532,22 +488,22 @@ class ProcessSurvivalMixin:
                 time.sleep(0.05)
                 continue
             try:
-                if self._poll_ordinary_detached(session):
-                    if not session.exited:
-                        time.sleep(0.1)
-                    continue
                 exit_text = ""
                 if exit_path.exists():
                     exit_text = exit_path.read_text(encoding="utf-8-sig", errors="replace").strip()
                 self._read_survivor_log(session)
                 if exit_text:
                     try:
-                        exit_code = self._local_exit_code(session, int(exit_text.splitlines()[-1]))
+                        exit_code = int(exit_text.splitlines()[-1])
                     except ValueError:
                         exit_code = -1
                     if not self._finish_survivor_if_allowed(session, exit_code, "exited", ""):
                         return
                     return
+                if self._poll_persistent_detached(session):
+                    if not session.exited:
+                        time.sleep(0.1)
+                    continue
                 alive = (
                     session.process.poll() is None
                     if session.process is not None
@@ -637,19 +593,9 @@ class ProcessSurvivalMixin:
             return True
         if not has_exit_marker(session):
             return False
-        exit_code = self._local_exit_code(session, self._recorded_survivor_exit(session.exit_path))
+        exit_code = self._recorded_survivor_exit(session.exit_path)
         if exit_code is None:
             return False
-        if not self._file_backed(session):
-            # The pipe reader remains the sole output/finalization owner. Never
-            # run a competing read or close its pipe from the kill path.
-            session._reader_finish_requested.set()
-            wait = 1.0 if deadline is None else min(1.0, max(0.0, deadline - time.monotonic()))
-            session._completion_event.wait(wait)
-            if not session._completion_event.is_set():
-                with session._lock:
-                    session.mark_exited(exit_code)
-            return True
         termination = self._recorded_survivor_termination(session.exit_path) if is_restart_safe(session) else {}
         previous_deadline = session._kill_deadline
         if deadline is not None:
