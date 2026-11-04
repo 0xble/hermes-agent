@@ -83,22 +83,26 @@ class TestOneShotGraceDueScan:
         # Still stored (dispatch proceeds normally).
         assert [j["id"] for j in load_jobs()] == ["recent"]
 
-    def test_stale_with_claim_skipped_but_record_kept(self, cron_store):
-        # A (possibly stale) run_claim means a run may still be in flight in
-        # another process — the due-scan must not fire OR retire the record,
-        # so mark_job_run can still land.
+    @pytest.mark.parametrize("live", [True, False])
+    def test_stale_with_claim_requires_live_owner(self, cron_store, live):
+        # A fresh remote run may still be in flight; an expired remote claim
+        # cannot pin a consumed dispatch or suppress its interrupted alert.
         claimed = _oneshot(
             "claimed",
             FIXED_NOW - timedelta(hours=3),
             completed=1,
-            run_claim={"at": (FIXED_NOW - timedelta(hours=3)).isoformat(), "by": "other"},
+            run_claim={"at": (FIXED_NOW if live else FIXED_NOW - timedelta(hours=3)).isoformat(),
+                       "by": "other"},
         )
         save_jobs([claimed])
 
         due = get_due_jobs()
         assert [d["id"] for d in due] == []
-        # Record preserved (not retired) despite being beyond grace.
-        assert [j["id"] for j in load_jobs()] == ["claimed"]
+        assert [j["id"] for j in load_jobs()] == (["claimed"] if live else [])
+        if not live:
+            from cron import delivery_queue
+            receipt = delivery_queue.get_status("oneshot-retired:claimed")
+            assert receipt and "partial effects" in receipt["content"]
 
     def test_retriggered_stale_oneshot_is_due(self, cron_store):
         # A user can still explicitly re-run a stale one-shot: trigger_job

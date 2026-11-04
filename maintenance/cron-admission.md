@@ -122,7 +122,8 @@ but neither authorizes an overdue person-facing send.
 scripts can send to people even with `deliver=local`, so never infer replay
 permission from the output lane. Keep every overdue never-started one-shot
 payload disabled with `state=missed`, its original schedule and payload intact,
-and a durable per-occurrence origin decision notice. No scheduler-continuity or
+and a durable per-occurrence owner decision notice. Preserve non-local
+`failure_deliver`; local/unset failure lanes fall back to origin/home. No scheduler-continuity or
 store-outage catch-up path may bypass that hold. An owner must approve a new
 time/run-now or remove the job. Consumed/ambiguous dispatches retain the separate
 interrupted/partial-effects retirement contract. This supersedes this PR's prior
@@ -156,6 +157,22 @@ stalls, startup/downtime evidence, on-time grace, and accounting/incident/save
 failure retries through real temp-home stores. `test_oneshot_person_hold.py`
 proves the hold applies to local agent prompts and declared/non-local sends.
 No execution-status migration or live-store change is needed.
+
+Claim presence is not liveness: only `_claim_is_live` may protect a run/fire
+claim as in flight, including the started predicate and both retirement gates.
+Dead same-host owners and expired leases must settle consumed dispatches with
+an interrupted/partial-effects retirement receipt, inside and beyond grace.
+The beyond-grace stale-claim wedge also existed on the base and is fixed by the
+same liveness rule. Consumed budgets and started ledger rows remain independent
+current-arm evidence; never replay those dispatches.
+
+`missed` is terminal for automatic scheduling, not a completed run. Default CLI
+list, doctor and dashboard overdue helpers surface the held payload as needing
+owner action even disabled. A stale ticker is not blamed for an intentional hold.
+Completion retention only prunes `completed`, never `missed`: keep held payloads
+until the owner explicitly rearms or removes them. `test_oneshot_claim_recovery.py`,
+`tests/hermes_cli/test_cron_missed_state.py` and the web cron-job suite cover these
+contracts. Shared isolated one-shot fixtures live in `tests/cron/oneshot_helpers.py`.
 
 ## Dispatch Diagnostics
 

@@ -57,16 +57,19 @@ def _record_miss(d, cause: str) -> str:
     return error
 
 
-def occurrence_started(job: dict) -> bool:
+def occurrence_started(job: dict, *, now: datetime | None = None) -> bool:
     """Evidence belongs to this arm, never to the job's historical last_run_at.
 
     Re-arm resets the budget and fire claim. A due-scan run claim or a queued /
     missed ledger row is only admission, not evidence of possible side effects.
     """
+    from cron import jobs
     from cron.executions import _transaction
     from cron.occurrences import scheduled_instant
 
-    if (job.get("repeat") or {}).get("completed", 0) > 0 or job.get("fire_claim"):
+    if ((job.get("repeat") or {}).get("completed", 0) > 0
+            or jobs._claim_is_live(job.get("fire_claim"), now or jobs._hermes_now(),
+                                   jobs.FIRE_CLAIM_TTL_SECONDS)):
         return True
     instant = scheduled_instant(job.get("next_run_at") or (job.get("schedule") or {}).get("run_at"))
     if instant is None:
@@ -98,20 +101,24 @@ def retire_expired_oneshot(d) -> bool:
     covered = jobs.store_health.outage_covers(
         jobs._current_cron_store().cron_dir, d.next_run_dt.timestamp(), jobs.ONESHOT_GRACE_SECONDS)
     claim = d.job.get("run_claim")
-    # An outage-covered admission that never acquired a fire claim never started.
+    fire_live = jobs._claim_is_live(d.job.get("fire_claim"), d.scan.now, jobs.FIRE_CLAIM_TTL_SECONDS)
+    # An outage-covered admission that never acquired a live fire claim never started.
     # Keep its payload, but do not treat recovery as permission for a stale send.
-    if isinstance(claim, dict) and claim.get("outage") and not d.job.get("fire_claim"):
+    if isinstance(claim, dict) and claim.get("outage") and not fire_live:
         d.scan.persist(d.job["id"], run_claim=None)
         d.job["run_claim"] = claim = None
+    in_flight = (fire_live
+                 or jobs._claim_is_live(claim, d.scan.now, jobs._oneshot_run_claim_ttl_seconds())
+                 or jobs._job_running_in_this_process(d.job["id"]))
     # A consumed dispatch is interrupted, not a never-started scheduler miss.
-    # Preserve main's partial-effects diagnostic and never replay it after a stall.
-    if occurrence_started(d.job):
-        if not (claim or d.job.get("fire_claim")):
+    # Dead/expired claims cannot pin its record, but local live runners must keep it.
+    if occurrence_started(d.job, now=d.scan.now):
+        if not in_flight:
             jobs._write_retired_oneshot_diagnostic(d.job, d.next_run)
             d.scan.retire(d.job["id"])
             d.scan.on_saved.append(lambda job=d.job: jobs.record_cron_missed(job))
         return True
-    if not (claim or d.job.get("fire_claim")):
+    if not in_flight:
         cause = ("scheduler scan stalled with continuity" if _stall_covers(d) else
                  "store outage covered run time" if covered else "without scheduler continuity")
         error = _record_miss(d, cause)

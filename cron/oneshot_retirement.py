@@ -80,12 +80,11 @@ def queue_retirement_alert(job: dict, diagnostic: str, reason: str, *, now: date
     notice = dict(job)
     for field in ("review", "output_local_only", "execution_id"):
         notice.pop(field, None)
-    if held:
-        notice.pop("failure_deliver", None)
-        notice["deliver"] = "origin"
     if (not notice.get("failure_deliver")
             or _normalize_deliver_value(notice["failure_deliver"]).strip().lower() == "local"):
         notice.pop("failure_deliver", None)
+    if held and not notice.get("failure_deliver"):
+        notice["deliver"] = "origin"
     if _normalize_deliver_value(notice.get("deliver")).strip().lower() == "local":
         notice["deliver"] = "origin"
     # Retain the normal incident sink even on profiles with no configured chat.

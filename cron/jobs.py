@@ -548,14 +548,14 @@ def _has_pause_marker(job: dict[str, Any]) -> bool:
 def is_job_runnable(job: dict[str, Any]) -> bool:
     """True iff the scheduler may fire this job: ``enabled`` plus pause markers as a second gate so
     a contradictory half-paused record never fires even before self-heal runs."""
-    return bool(job.get("enabled", True)) and not _has_pause_marker(job)
+    return bool(job.get("enabled", True)) and job.get("state") != "missed" and not _has_pause_marker(job)
 
 
 def effective_job_state(job: dict[str, Any]) -> str:
     """Operator-facing state derived from ``enabled``: an enabled job must never display as paused
     (list looked frozen while jobs kept firing). Terminal states are preserved regardless."""
     stored = _coerce_job_text(job.get("state")).strip()
-    if stored in {"completed", "error"}:
+    if stored in {"completed", "error", "missed"}:
         return stored
     if not job.get("enabled", True):
         if _has_pause_marker(job) or stored == "paused":
@@ -568,8 +568,8 @@ def effective_job_state(job: dict[str, Any]) -> str:
 
 
 def is_terminal_job(job: dict[str, Any]) -> bool:
-    """Return whether a job record is in a terminal scheduler state."""
-    return job.get("state") in {"completed", "error"}
+    """Terminal for automatic scheduling; a missed hold still needs an owner decision."""
+    return job.get("state") in {"completed", "error", "missed"}
 
 
 def _is_recoverable_error_job(job: dict[str, Any]) -> bool:
@@ -2222,9 +2222,11 @@ def _reject_terminal_activation(job: dict[str, Any], updated: dict[str, Any], jo
         is_terminal_job(job)
         and not _is_recoverable_error_job(job)
         and (
-            updated.get("state") not in {"completed", "error"}
+            updated.get("state") not in {"completed", "error", "missed"}
             or updated.get("enabled") is True
-            or updated.get("next_run_at") is not None
+            or (updated.get("next_run_at") is not None
+                and (job.get("state") != "missed"
+                     or updated["next_run_at"] != job.get("next_run_at")))
         )
     ):
         raise ValueError(
@@ -3119,7 +3121,7 @@ def _sweep_completed_oneshots(
     """Prune completed one-shot records past retention (in place; True when anything was removed).
     Removed ids go into *removed_ids* so save_jobs's shrink-merge guard allows the delete. Age is
     measured from ``last_run_at``; a record without a parseable one is kept (never guess into
-    deletion)."""
+    deletion). Missed holds are not completed and stay until explicit owner action."""
     retention_days = _completed_oneshot_retention_days()
     if retention_days <= 0:
         return False
@@ -3460,7 +3462,7 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
     completed = repeat.get("completed", 0)
     from cron.jobs_oneshot import occurrence_started
 
-    if times is None or times <= 0 or (completed < times and not occurrence_started(job)):
+    if times is None or times <= 0 or (completed < times and not occurrence_started(job, now=scan.now)):
         return False
     name = job.get("name", job.get("id", "?"))
     # A live run must never have its job record deleted underneath it (#62002): a run that outlives the
@@ -3468,7 +3470,8 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
     # expired-claim condition as a dead tick, but mark_job_run() still needs the record to land last_run_at
     # / last_status / last_delivery_error. If this process is still running the job, it is slow, not stale —
     # keep the entry and skip.
-    if job.get("fire_claim") or _job_running_in_this_process(job.get("id", "")):
+    if (_claim_is_live(job.get("fire_claim"), scan.now, FIRE_CLAIM_TTL_SECONDS)
+            or _job_running_in_this_process(job.get("id", ""))):
         logger.info(
             "Job '%s': dispatch limit reached (%d/%d) but its run is still claimed or in flight in this "
             "process — keeping entry",

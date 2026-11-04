@@ -4,7 +4,7 @@ from datetime import timedelta
 import pytest
 
 from cron import executions, jobs, jobs_oneshot
-from tests.cron.test_oneshot_missed import NOW, store
+from tests.cron.oneshot_helpers import NOW, store
 
 
 @pytest.mark.parametrize("person_fields", [

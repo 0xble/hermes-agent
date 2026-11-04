@@ -7,7 +7,7 @@ import pytest
 
 from cron import delivery_queue, executions, jobs
 from hermes_cli.cron import cron_resume
-from tests.cron.test_oneshot_missed import NOW, store
+from tests.cron.oneshot_helpers import NOW, store
 
 
 @pytest.mark.parametrize("arm,started", [

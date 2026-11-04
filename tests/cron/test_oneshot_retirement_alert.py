@@ -267,13 +267,14 @@ def test_run_body_outbox_failure_preserves_retirement_for_retry(store, monkeypat
 
 
 @pytest.mark.parametrize("lanes,expected", [
-    ({"deliver": "telegram:-1001:17"}, ("-1001", "17")),
+    ({"deliver": "telegram:-1001:17"}, ("owner-chat", "owner-topic")),
+    ({"deliver": "telegram:-1001:17", "failure_deliver": "local"}, ("owner-chat", "owner-topic")),
     ({"deliver": "local", "failure_deliver": "telegram:-1002:29"},
      ("-1002", "29")),
     ({"deliver": "telegram:-1001:17",
       "failure_deliver": "telegram:-1002:29"}, ("-1002", "29")),
 ])
-def test_missed_decision_always_reaches_origin(store, lanes, expected):
+def test_missed_decision_preserves_failure_lane_or_falls_back_to_origin(store, lanes, expected):
     job = dict(oneshot(), **lanes)
     jobs.save_jobs([job])
     assert jobs.get_due_jobs() == []
@@ -283,4 +284,4 @@ def test_missed_decision_always_reaches_origin(store, lanes, expected):
         assert scheduler.drain_delivery_queue({}, None) == 1
         assert send.call_count == 1
         target = send.call_args.args[0]
-        assert (target.chat_id, target.thread_id) == ("owner-chat", "owner-topic")
+        assert (target.chat_id, target.thread_id) == expected
