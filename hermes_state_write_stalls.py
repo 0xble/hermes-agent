@@ -27,7 +27,6 @@ _STAMP = struct.Struct("=QdQ8s")
 _SLOT_SIZE = 2048
 _SLOTS = 64
 _COOLDOWN_S = 600.0
-current_observation: contextvars.ContextVar[WriteObservation] = contextvars.ContextVar("state_write_observation")
 
 
 class WriteStallWatchdog:
@@ -48,9 +47,13 @@ class WriteStallWatchdog:
         self._read_fd, self._stop_fd = os.pipe()
         self._thread = None
         self._ready = threading.Event()
+        self._closed = False
+        self._helper_exited = threading.Event()
 
     def reserve(self, operation, directory=None):
         """Reserve metadata before taking any database or writer lock."""
+        if self._closed:
+            return None
         if directory is None:
             from hermes_constants import get_hermes_home
             directory = get_hermes_home() / "logs" / "write-stalls"
@@ -58,21 +61,29 @@ class WriteStallWatchdog:
         if len(metadata) > _SLOT_SIZE - _STAMP.size:
             return None
         with self._lock:
+            if self._closed:
+                return None
             index = next((i for i in range(_SLOTS) if i not in self._slots), None)
             if index is None:
                 return None
-            self._slots.add(index)
             offset = index * _SLOT_SIZE + _STAMP.size
-            self._map[offset:offset + _SLOT_SIZE - _STAMP.size] = metadata.ljust(_SLOT_SIZE - _STAMP.size, b"\0")
+            try:
+                self._map[offset:offset + _SLOT_SIZE - _STAMP.size] = metadata.ljust(_SLOT_SIZE - _STAMP.size, b"\0")
+            except (ValueError, OSError):
+                return None
+            self._slots.add(index)
         return index
 
     def phase(self, slot, phase):
-        if slot is not None:
-            offset = slot * _SLOT_SIZE
-            self._map[offset:offset + 8] = b"\0" * 8
-            stamp = _STAMP.pack(next(self._sequence), time.monotonic(), threading.get_native_id(), phase.encode("ascii"))
-            self._map[offset + 8:offset + _STAMP.size] = stamp[8:]
-            self._map[offset:offset + 8] = stamp[:8]
+        if slot is not None and not self._closed:
+            try:
+                offset = slot * _SLOT_SIZE
+                self._map[offset:offset + 8] = b"\0" * 8
+                stamp = _STAMP.pack(next(self._sequence), time.monotonic(), threading.get_native_id(), phase.encode("ascii"))
+                self._map[offset + 8:offset + _STAMP.size] = stamp[8:]
+                self._map[offset:offset + 8] = stamp[:8]
+            except (ValueError, OSError):
+                pass  # close() may unmap between the flag check and publication.
 
     def begin(self, phase, operation):
         slot = self.reserve(operation)
@@ -80,11 +91,16 @@ class WriteStallWatchdog:
         return slot
 
     def end(self, slot):
-        if slot is not None:
-            offset = slot * _SLOT_SIZE
-            self._map[offset:offset + 8] = b"\0" * 8
+        if slot is not None and not self._closed:
+            try:
+                offset = slot * _SLOT_SIZE
+                self._map[offset:offset + 8] = b"\0" * 8
+            except (ValueError, OSError):
+                pass  # Teardown cannot escape into transaction settlement.
 
     def release(self, slot):
+        if self._closed:
+            return
         self.end(slot)
         with self._lock:
             self._slots.discard(slot)
@@ -151,21 +167,30 @@ class WriteStallWatchdog:
                 self._ready.set()
                 if child.wait() != 0:
                     logger.warning("state.db native stack capture failed: pid=%d error_type=HelperExit", self.pid)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             logger.warning("state.db native stack capture failed: pid=%d error_type=%s", self.pid, type(error).__name__)
         finally:
+            self._helper_exited.set()
             self._ready.set()
             if read_fd is not None:
                 os.close(read_fd)
                 self._read_fd = None
 
     def close(self):
-        if self._stop_fd is not None:
-            os.close(self._stop_fd)
-            self._stop_fd = None
+        global _watchdog
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if _watchdog is self:
+                _watchdog = None
+            if self._stop_fd is not None:
+                os.close(self._stop_fd)
+                self._stop_fd = None
         if self._thread is not None and self._thread.ident is not None:
-            self._thread.join(timeout=6)
-        if self._read_fd is not None:
+            self._thread.join(timeout=0.5)
+        # A live serving thread owns read_fd until its Popen attempt finishes.
+        if self._read_fd is not None and (self._thread is None or not self._thread.is_alive()):
             os.close(self._read_fd)
             self._read_fd = None
         self._map.close()
@@ -201,7 +226,10 @@ def _get_watchdog():
         return None
     with _watchdog_lock:
         if _watchdog is not None and _watchdog.pid == os.getpid():
-            return _watchdog
+            if not _watchdog._helper_exited.is_set():
+                return _watchdog
+            _watchdog.close()
+            _start_failure_at = time.monotonic()
         if time.monotonic() - _start_failure_at < _COOLDOWN_S:
             return None
         candidate = None
@@ -220,6 +248,34 @@ def _get_watchdog():
             return None
 
 
+def observe_safely(callback, *args):
+    """Diagnostics are dispensable; never change a transaction's result or error."""
+    try:
+        return callback(*args)
+    # health: allow BLE001 -- Observation failures must not affect state writes or mask their original error.
+    except Exception:
+        return None
+
+
+class NoopObservation:
+    operation = "unknown"
+
+    def phase(self, phase):
+        pass
+
+    def end(self):
+        pass
+
+    def flush(self):
+        pass
+
+    def finish(self):
+        pass
+
+    def warn(self, warning_logger, message, args):
+        pass
+
+
 class WriteObservation:
     def __init__(self, db_path, fn):
         name = getattr(fn, "__qualname__", type(fn).__qualname__)
@@ -227,8 +283,8 @@ class WriteObservation:
         self.operation = (operation if isinstance(operation, str) else name.split(".<locals>.")[0])[:160]
         self.wal_path = Path(str(db_path) + "-wal")
         self.warnings = []
-        self.watchdog = _get_watchdog()
-        self.slot = self.watchdog.reserve(self.operation) if self.watchdog is not None else None
+        self.watchdog = observe_safely(_get_watchdog)
+        self.slot = observe_safely(self.watchdog.reserve, self.operation) if self.watchdog is not None else None
 
     def phase(self, phase):
         if self.watchdog is not None:
@@ -237,6 +293,9 @@ class WriteObservation:
     def end(self):
         if self.watchdog is not None:
             self.watchdog.end(self.slot)
+
+    def warn(self, warning_logger, message, args):
+        self.warnings.append((warning_logger, message, args))
 
     def flush(self):
         warnings, self.warnings = self.warnings, []
@@ -251,8 +310,12 @@ class WriteObservation:
 
     def finish(self):
         if self.watchdog is not None:
-            self.watchdog.release(self.slot)
-        self.flush()
+            observe_safely(self.watchdog.release, self.slot)
+        observe_safely(self.flush)
+
+
+current_observation: contextvars.ContextVar[WriteObservation | NoopObservation] = contextvars.ContextVar(
+    "state_write_observation", default=NoopObservation())
 
 
 @contextmanager
@@ -260,18 +323,18 @@ def write_attempt():
     try:
         yield
     finally:
-        current_observation.get().flush()
+        observe_safely(current_observation.get().flush)
 
 
 @contextmanager
 def observe_write(db_path, fn):
-    observation = WriteObservation(db_path, fn)
+    observation = observe_safely(WriteObservation, db_path, fn) or NoopObservation()
     token = current_observation.set(observation)
     try:
         yield
     finally:
         current_observation.reset(token)
-        observation.finish()
+        observe_safely(observation.finish)
 
 
 if __name__ == "__main__":

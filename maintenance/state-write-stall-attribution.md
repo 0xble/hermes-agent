@@ -7,6 +7,7 @@ targets:
   - ../tests/hermes_state/test_commit_tail_attribution.py
   - ../tests/hermes_state/test_write_stall_sampling.py
   - ../tests/hermes_state/test_write_stall_native.py
+  - ../tests/hermes_state/test_write_stall_lifecycle.py
 maintenance:
   mode: local
 ---
@@ -77,6 +78,14 @@ zero; inaccessible WAL is `unknown`. The native helper can read stamps without
 the target interpreter's GIL, and a parent-owned pipe bounds its lifetime.
 Sample files have mode 0600 under the active profile's `logs/write-stalls`;
 only the `write-stall-*.txt` namespace participates in twenty-file retention.
+
+Shutdown marks the watchdog closed before unmapping and clears the process
+singleton. Closed slots and close/publication races are inert. Every optional
+observation call on the write path is isolated from transaction outcomes; the
+ContextVar defaults to a stateless no-op outside an observed write. Exit waits
+at most 0.5 seconds for the daemon serving thread, never for an in-progress
+sample to finish. A helper exit invalidates the singleton on the next lookup
+and consumes the existing ten-minute startup cooldown before replacement.
 The sampler has a five-second timeout and records only exception type on
 failure, never payload/error text. Capture warnings identify PID, native TID,
 phase, operation and the sample path.
@@ -100,6 +109,7 @@ No checkpoint, synchronous, or fullfsync setting is changed by this patch.
 Contract tests: `tests/hermes_state/test_commit_tail_attribution.py`,
   `tests/hermes_state/test_write_stall_sampling.py`,
   `tests/hermes_state/test_write_stall_native.py`,
+  `tests/hermes_state/test_write_stall_lifecycle.py`,
   `tests/hermes_state/test_transcript_write_diagnostics.py`.
 
 Regression files above cover warning fields, worker receipt identity, stalled
