@@ -253,7 +253,11 @@ to run that setup when the inherited `HERMES_HOME` is a live runtime home, or
 resolves to one. The same check runs inside `hermes_sync` in
 `scripts/_activation.sh`, so sourcing activation and calling `hermes_ensure_env`
 or `hermes_sync` directly cannot bypass it. Both entry points use the single
-read-only guard in `scripts/_setup_guard.sh`. Live means a `current` release pointer, `gateway_state.json`,
+read-only guard in `scripts/_setup_guard.sh`. It asks `scripts/setup_guard.py`
+for the real runtime home and PM destinations, in setup's repo cwd, with its
+sanitized Python environment and the exact interpreter passed to setup. There
+is no shell path-resolution fallback: no interpreter or an import error refuses.
+Live means a `current` release pointer, `gateway_state.json`,
 a gateway pid `kill -0` can see (including EPERM), or any path under the OS
 account default. A profile under that default, or under another live root
 (`<root>/profiles/<name>`), is live even when the profile directory itself has
@@ -262,8 +266,9 @@ directory is a symlink. As with `Path(home)`, empty and `.` components are
 removed before reading that parent; `..` remains lexical. Canonicalization matches Python
 `Path.resolve(strict=False)`, including a missing suffix under a symlinked
 ancestor. If that canonical root differs from the lexical root, either live
-root refuses. A resolution error is live. The account-default lookup uses the password
-database, not `/usr/bin/python3`; if it fails, the home is treated as live. Rebuild the
+root refuses. Every lexical and resolved path is checked, even if equal. A
+resolution error is live. The account-default lookup uses the real runtime
+function, never a PATH Python or macOS stub. Rebuild the
 checkout venv with the command above, or set `HERMES_HOME` to a scratch
 directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1` overrides the refusal only when
 setup against that home is deliberate.

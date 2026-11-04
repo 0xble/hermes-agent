@@ -18,9 +18,13 @@ def runner(tmp_path):
     entry = scripts / "run_tests.sh"
     shutil.copy2(ROOT / "scripts/run_tests.sh", entry)
     shutil.copy2(ROOT / "scripts/_setup_guard.sh", scripts / "_setup_guard.sh")
+    shutil.copy2(ROOT / "scripts/setup_guard.py", scripts / "setup_guard.py")
+    shutil.copy2(ROOT / "hermes_constants.py", scripts.parent / "hermes_constants.py")
+    shutil.copytree(ROOT / "pm", scripts.parent / "pm", ignore=shutil.ignore_patterns("__pycache__"))
     log = tmp_path / "events.jsonl"
     scripts.joinpath("_activation.sh").write_text(
         f"printf '%s\\n' '\"activation\"' >> '{log}'\n"
+        f'hermes_bootstrap_python() {{ printf "%s\\n" "{sys.executable}"; }}\n'
         'hermes_activation_current() { [ "${__HERMES_ACTIVATED:-}" = 1 ]; }\n'
     )
     scripts.joinpath("run-in-hermes-env").write_text(

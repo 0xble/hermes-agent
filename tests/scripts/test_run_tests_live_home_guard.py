@@ -11,6 +11,8 @@ import os
 import shutil
 import subprocess
 import sys
+import json
+import shlex
 
 import pytest
 
@@ -37,9 +39,16 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "checkout"
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("run_tests.sh", "run-in-hermes-env", "_activation.sh", "_setup_guard.sh"):
+    for name in ("run_tests.sh", "run-in-hermes-env", "_activation.sh", "_setup_guard.sh", "setup_guard.py"):
         shutil.copy2(ROOT / "scripts" / name, scripts / name)
     (scripts / "run-in-hermes-env").chmod(0o755)
+    # Admission imports the same runtime as setup, before any provisioning.
+    shutil.copy2(ROOT / "hermes_constants.py", root / "hermes_constants.py")
+    shutil.copytree(ROOT / "pm", root / "pm", ignore=shutil.ignore_patterns("__pycache__"))
+    python = root / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
+    python.chmod(0o755)
     setup = root / "setup-hermes.sh"
     setup.write_text(
         "#!/bin/bash\n"
@@ -73,6 +82,7 @@ def _run(
     *,
     home_text: str | None = None,
     activation_entry: str | None = None,
+    cwd: Path | None = None,
 ):
     env = {
         "PATH": str(commands),
@@ -94,7 +104,7 @@ def _run(
         ]
     return subprocess.run(
         argv,
-        cwd=root,
+        cwd=cwd or root,
         env=env,
         capture_output=True,
         text=True,
@@ -517,6 +527,8 @@ def test_account_default_lookup_failure_refuses_without_writing(tmp_path):
         link = commands / name
         if link.is_symlink() or link.exists():
             link.unlink()
+    with (root / "hermes_constants.py").open("a") as stream:
+        stream.write("\ndef account_default_hermes_home():\n    raise OSError('account lookup failed')\n")
     home = tmp_path / "scratch-home"
     _mark(home, "scratch")
     before = _snapshot(home)
@@ -570,18 +582,6 @@ def _assert_outside_account_default(path: Path) -> None:
     account = (_passwd_account_home() / ".hermes").resolve()
     resolved = path.resolve()
     assert resolved != account and account not in resolved.parents, resolved
-
-
-def _lexical_root(home_text: str) -> Path:
-    text = home_text[:-1] if len(home_text) > 1 and home_text.endswith("/") else home_text
-    parent = Path(text).parent
-    if parent.name == "profiles":
-        return parent.parent
-    return Path(text)
-
-
-def _canonical_root(home_text: str) -> Path:
-    return _lexical_root(str(Path(home_text).resolve()))
 
 
 def _resolution_input(tmp_path: Path, name: str) -> tuple[str, Path | None]:
@@ -704,7 +704,7 @@ def _guard_home(base: Path, name: str) -> str:
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("case", RESOLUTION_CASES)
 def test_resolve_path_matches_python(tmp_path, case):
-    """hermes_resolve_path matches Path.resolve(strict=False) on each layout."""
+    """The source-only predicate delegates canonicalization to real pathlib."""
     _assert_outside_account_default(tmp_path)
     raw, cwd = _resolution_input(tmp_path, case)
     expected = str((cwd / raw).resolve() if cwd is not None else Path(raw).resolve())
@@ -721,8 +721,9 @@ def test_guard_matrix_refuses_either_root_and_writes_nothing(tmp_path, layout, m
     root, commands = _checkout(tmp_path)
     base = tmp_path / "layout"
     home_text = _guard_home(base, layout)
-    lexical = _lexical_root(home_text)
-    canonical = _canonical_root(home_text)
+    paths = _runtime_oracle(root, home_text)
+    lexical = paths["root"]
+    canonical = paths["canonical_root"]
     if marker == "lexical":
         marked = lexical
     elif marker == "canonical":
@@ -737,10 +738,13 @@ def test_guard_matrix_refuses_either_root_and_writes_nothing(tmp_path, layout, m
         home_text = os.path.relpath(home_text, root)
     result = _run(root, commands, Path(home_text), home_text=home_text, activation_entry=entry)
     output = result.stdout + result.stderr
-    if marker == "neither":
+    candidates = [candidate for value in paths.values() for candidate in (value, value.resolve())]
+    expected_admission = not any((path / "gateway_state.json").exists() for path in candidates)
+    assert ("SETUP_RAN" in output) == expected_admission, output
+    if expected_admission:
         assert "SETUP_RAN" in output, output
         assert "refusing" not in output.lower(), output
-        assert (result.returncode == 0) == (entry == "hermes_sync"), output
+        assert (result.returncode == 0) == (entry is not None), output
         return
     assert result.returncode != 0, output
     assert "refusing" in output.lower(), output
@@ -766,3 +770,176 @@ def test_symlink_loop_resolution_error_refuses_without_writing(tmp_path, entry):
     assert "resolution failed" in output.lower(), output
     assert "SETUP_RAN" not in output
     assert _snapshot(base) == before
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("entry", [None, "hermes_sync", "hermes_ensure_env"])
+@pytest.mark.parametrize("failure", ["no_interpreter", "broken_interpreter", "import_error"])
+@pytest.mark.parametrize("override", [False, True])
+def test_runtime_resolver_failure_is_closed(tmp_path, entry, failure, override):
+    root, commands = _checkout(tmp_path)
+    if failure == "no_interpreter":
+        (root / ".venv" / "bin" / "python").unlink()
+    elif failure == "broken_interpreter":
+        (root / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 1\n")
+    else:
+        (root / "hermes_constants.py").write_text("raise ImportError('probe failure')\n")
+    home = tmp_path / "scratch-home"
+    _mark(home, "scratch")
+    before = _snapshot(home)
+    result = _run(root, commands, home, activation_entry=entry,
+                  extra_env={"HERMES_ALLOW_LIVE_HOME_SETUP": "1"} if override else {})
+    output = result.stdout + result.stderr
+    assert ("SETUP_RAN" in output) == override, output
+    assert ("refusing" in output.lower()) != override, output
+    if not override:
+        assert _snapshot(home) == before
+
+
+@pytest.mark.platforms("posix")
+def test_setup_interpreter_cwd_and_python_environment_match_admission(tmp_path):
+    root, commands = _checkout(tmp_path)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    home = root / "quiet"
+    _mark(home, "scratch")
+    python = root / ".venv" / "bin" / "python"
+    setup = root / "setup-hermes.sh"
+    setup.write_text(
+        'test "$3" = ' + shlex.quote("--bootstrap-python=" + str(python)) + ' || exit 61\n'
+        'test "$PWD" = ' + shlex.quote(str(root)) + ' || exit 62\n'
+        'test -z "${PYTHONHOME+x}${PYTHONPATH+x}${VIRTUAL_ENV+x}" || exit 63\n'
+        'echo SETUP_RAN\n'
+    )
+    result = _run(root, commands, home, home_text="quiet", cwd=caller,
+                  activation_entry="hermes_sync",
+                  extra_env={"PYTHONHOME": "poison", "PYTHONPATH": "poison", "VIRTUAL_ENV": "poison"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SETUP_RAN" in result.stdout + result.stderr
+
+
+def _runtime_oracle(root, raw, extra=None):
+    """Ask runtime owners directly, not the admission entrypoint or shell helpers."""
+    env = {"HOME": str(root.parent / "account-home"), "HERMES_HOME": raw,
+           "HERMES_RUNTIME_DIR": str(root.parent / "runtime"), **(extra or {})}
+    probe = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import json; from pathlib import Path; "
+         "from hermes_constants import get_hermes_home, get_default_hermes_root; "
+         "from pm.environments import dependency_home_root, store_root; "
+         "home=get_hermes_home(); root=get_default_hermes_root(); "
+         "print(json.dumps({key: str(path.absolute()) for key, path in "
+         "dict(home=home, root=root, dependency=dependency_home_root(), "
+         "canonical_root=get_default_hermes_root(home=home.resolve()), "
+         "store=store_root(Path.cwd()).parent).items()}))"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    return {key: Path(value) for key, value in json.loads(probe.stdout).items()}
+
+
+RUNTIME_LAYOUTS = ("tilde", "variable", "whitespace", "missing_dotdot", "repo_relative",
+                   "caller_relative", "symlink_ancestor", "profile", "variable_profile", "tilde_profile")
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("entry", [None, "hermes_sync", "hermes_ensure_env"])
+@pytest.mark.parametrize("layout", RUNTIME_LAYOUTS)
+@pytest.mark.parametrize("marker", ["home", "root", "canonical_root", "neither"])
+def test_runtime_oracle_admission_matrix(tmp_path, layout, marker, entry):
+    root, commands = _checkout(tmp_path)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    live = root / "live"
+    live.mkdir()
+    extra = {"LIVE_ROOT": str(live)}
+    if layout.startswith("tilde"):
+        live = tmp_path / "account-home" / ".hermes"
+        live.mkdir(parents=True)
+        raw = "~/.hermes" + ("/profiles/dev" if layout.endswith("profile") else "")
+    elif layout.startswith("variable"):
+        raw = "${LIVE_ROOT}" + ("/profiles/dev" if layout.endswith("profile") else "")
+    elif layout == "whitespace":
+        raw = " \t" + str(live) + " \t"
+    elif layout == "missing_dotdot":
+        raw = str(live) + "/missing/.."
+    elif layout == "repo_relative":
+        raw = "live"
+    elif layout == "caller_relative":
+        # Quiet from the repo, marked from caller cwd: setup must use the repo.
+        (caller / "live").mkdir()
+        (caller / "live" / "gateway_state.json").write_text("{}\n")
+        raw = "live"
+    elif layout == "symlink_ancestor":
+        (live / "profiles").mkdir()
+        (root / "quiet").mkdir()
+        (root / "quiet" / "profiles").symlink_to(live / "profiles")
+        raw = str(root / "quiet" / "profiles" / "dev")
+    else:
+        raw = str(live / "profiles" / "dev")
+    paths = _runtime_oracle(root, raw, extra)
+    if marker != "neither":
+        marked = paths[marker].resolve()
+        marked.mkdir(parents=True, exist_ok=True)
+        (marked / "gateway_state.json").write_text("{}\n")
+    # Independent oracle: every actual home/PM destination and both path forms.
+    candidates = [path for value in paths.values() for path in (value, value.resolve())]
+    expected_admission = not any((path / "gateway_state.json").exists() for path in candidates)
+    for directory in ("account-home", "runtime", "tmp"):
+        (tmp_path / directory).mkdir(exist_ok=True)
+    (root / "setup-hermes.sh").write_text(
+        f'cd {shlex.quote(str(root))} || exit 1\n'
+        f'exec {shlex.quote(sys.executable)} -B -c '
+        + shlex.quote("from hermes_constants import get_hermes_home; "
+                      "from pm.environments import dependency_home_root; "
+                      "home=get_hermes_home().resolve(); home.mkdir(parents=True, exist_ok=True); "
+                      "(home/'setup-wrote').write_text('setup\\n'); "
+                      "root=dependency_home_root().resolve(); root.mkdir(parents=True, exist_ok=True); "
+                      "(root/'pm-setup-wrote').write_text('setup\\n'); print('SETUP_RAN')") + "\n"
+    )
+    before = _snapshot(tmp_path)
+    result = _run(root, commands, paths["home"], extra_env=extra, home_text=raw,
+                  activation_entry=entry, cwd=caller)
+    output = result.stdout + result.stderr
+    assert ("SETUP_RAN" in output) == expected_admission, output
+    assert ("refusing" not in output.lower()) == expected_admission, output
+    if not expected_admission:
+        assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("entry", [None, "hermes_sync", "hermes_ensure_env"])
+@pytest.mark.parametrize("case", ["missing_dotdot", "repo_relative", "tilde", "variable", "whitespace"])
+def test_round4_runtime_resolution_repros_refuse(tmp_path, case, entry):
+    """Review round 4's literal inputs, with setup's repo cwd (not caller cwd).
+
+    HERMES_HOME=<live>/missing/.. (missing absent)
+    HERMES_HOME=live (caller elsewhere; setup cd's to the repo)
+    HERMES_HOME=~/.hermes or ${LIVE_ROOT}/profiles/dev
+    """
+    root, commands = _checkout(tmp_path)
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    live = root / "live"
+    extra = {}
+    if case == "missing_dotdot":
+        raw = str(live) + "/missing/.."
+    elif case == "repo_relative":
+        raw = "live"
+    elif case == "tilde":
+        live = tmp_path / "account-home" / ".hermes"
+        raw = "~/.hermes"
+    elif case == "variable":
+        raw = "${LIVE_ROOT}/profiles/dev"
+        extra["LIVE_ROOT"] = str(live)
+    else:
+        raw = "  " + str(live) + "  "
+    _mark(live, "gateway-state")
+    before = _snapshot(live)
+    result = _run(root, commands, live, extra_env=extra, home_text=raw,
+                  activation_entry=entry, cwd=caller)
+    output = result.stdout + result.stderr
+    assert "SETUP_RAN" not in output, output
+    assert result.returncode != 0, output
+    assert "refusing" in output.lower(), output
+    assert _snapshot(live) == before

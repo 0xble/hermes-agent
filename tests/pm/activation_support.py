@@ -162,14 +162,14 @@ def isolated_checkout(tmp_path: Path) -> Path:
     shutil.copytree(REPO_ROOT / "pm", root / "pm", ignore=shutil.ignore_patterns("__pycache__"))
     (root / "hermes_cli").mkdir()
     (root / "scripts").mkdir()
-    for relative in ("activate", "activate.fish", "activate.ps1", "scripts/_activation.sh", "scripts/_setup_guard.sh",
+    for relative in ("activate", "activate.fish", "activate.ps1", "scripts/_activation.sh", "scripts/_setup_guard.sh", "scripts/setup_guard.py",
                      "hermes_constants.py", "hermes_cli/__init__.py",
                      "pm/environments.py", "hermes_cli/runtime_state.py"):
         shutil.copy2(REPO_ROOT / relative, root / relative)
     # Environment-only tests do not exercise provisioning; the runtime tests
     # replace these stubs with a publisher that records and applies each sync.
     (root / "setup-hermes.sh").write_text(
-        'test "$#" = 2 && test "$1" = --runtime-only && case "$2" in --test-environment*) ;; *) exit 2 ;; esac\n',
+        'test "$#" = 3 && test "$1" = --runtime-only && case "$2" in --test-environment*) ;; *) exit 2 ;; esac\n',
         encoding="utf-8",
     )
     (root / "setup-hermes.ps1").write_text(
@@ -255,10 +255,16 @@ def sync_checkout(tmp_path: Path):
         binary.parent.mkdir(parents=True)
         binary.write_text(f"#!/bin/sh\nexec {shlex.quote(str(python))} \"$@\"\n", encoding="utf-8")
         binary.chmod(0o755)
+    # A managed tool interpreter lets cold setup keep .venv absent until sync.
+    # Guarded activation is deliberately fail-closed without any interpreter.
+    if os.name != "nt":
+        bootstrap = Path(env["HERMES_RUNTIME_DIR"]) / "python-fixture" / "bin"
+        bootstrap.mkdir(parents=True)
+        shutil.copy2(root / "prepared-bootstrap" / "bin" / "python", bootstrap / "python")
     # Activation's contract with setup is the runtime-only switch; setup
     # itself maps that to PM's --trust-recorded install.
     (root / "setup-hermes.sh").write_text(
-        'test "$#" = 2 && test "$1" = --runtime-only && test "$2" = --test-environment || exit 2\n'
+        'test "$#" = 3 && test "$1" = --runtime-only && test "$2" = --test-environment || exit 2\n'
         f'cd {shlex.quote(str(root))} || exit 3\n'
         f'exec {shlex.quote(str(python))} sync.py runtime-only --trust-recorded --test-environment\n', encoding="utf-8",
     )

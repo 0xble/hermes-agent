@@ -120,7 +120,7 @@ else
       exit 1
     fi
     # Fail before re-exec; hermes_sync also enforces this shared admission check.
-    hermes_require_safe_setup || exit 1
+    hermes_require_safe_setup "$REPO_ROOT" || exit 1
     echo "▶ environment missing or stale for $REPO_ROOT — re-running under run-in-hermes-env" >&2
     export __HERMES_TESTS_REEXEC=1
     exec "$SCRIPT_DIR/run-in-hermes-env" "$BASH" "${BASH_SOURCE[0]}" "$@"

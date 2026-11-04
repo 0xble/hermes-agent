@@ -13,7 +13,8 @@ refuses to re-exec `run-in-hermes-env` (and therefore refuses `setup-hermes.sh`
 and pm) if the inherited home is a live runtime home. `hermes_sync` also calls
 the same `hermes_require_safe_setup` check before invoking setup, so direct
 `hermes_sync` and `hermes_ensure_env` calls cannot bypass the runner's refusal.
-The predicates, canonicalizer and refusal live only in `scripts/_setup_guard.sh`.
+`scripts/_setup_guard.sh` owns marker checks and refusal. Its read-only Python
+bridge, `scripts/setup_guard.py`, calls the actual runtime path owners.
 Sourcing that library changes no shell options and performs no writes.
 A home is live when any of these hold on the home itself or on a root it resolves to. The profiles parent
 is lexical. When the lexical and canonical roots differ, either live root counts:
@@ -24,18 +25,19 @@ is lexical. When the lexical and canonical roots differ, either live root counts
   EPERM from another user's gateway
 - the home is the OS account default, or any path under it
 
-Resolution matches `hermes_constants._hermes_root_of`: a home under the account
-default resolves to that default; otherwise the profiles parent is lexical, so
-`<root>/profiles/<name>` resolves to `<root>` even when that profile directory
-is a symlink. Match `Path(home)` before reading that parent: discard empty and
-`.` components but preserve lexical `..`. Canonicalization matches Python
-`Path.resolve(strict=False)`,
-including a missing suffix under a symlinked ancestor. If that names a
-different root, the home is live when either root is. A resolution error is
-live. PM writes the lexical root's `tools/`
-(`pm/environments.store_root`).
-The account default comes from the password database (`getent`, `dscl`, or
-`~user`), not `$HOME` and not `/usr/bin/python3`. A failed lookup is live.
+The bridge calls `get_hermes_home()`, `get_default_hermes_root()`,
+`account_default_hermes_home()`, and PM's `dependency_home_root()` / `store_root()`.
+It also checks setup's pre-PM uv store. It runs in the repo cwd setup uses, after
+the same Python environment sanitization, with the interpreter activation passes
+to setup via `--bootstrap-python`. Tilde, environment expansion, whitespace and
+profile rules therefore belong only to runtime code, not a shell imitation.
+Every lexical and resolved path is checked for markers, without equality skips;
+symlinked profile ancestors retain both root interpretations. Account-default
+containment uses the runtime function and pathlib. Resolution, interpreter or
+import failure refuses. Python 3.13+ lenient resolution can retain a symlink loop;
+the bridge probes path ancestors so ELOOP and access errors still fail closed.
+There is no pre-bootstrap shell fallback; an intentional
+first bootstrap without a usable interpreter requires the explicit opt-in.
 
 The refusal writes nothing to that home or its resolved root. It tells the caller to rebuild the
 checkout-local venv with
