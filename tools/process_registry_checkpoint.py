@@ -199,15 +199,7 @@ class ProcessCheckpointMixin:
                     "notify_on_complete": session.notify_on_complete,
                     "parent_session_id": session.parent_session_id,
                 })
-            if fate == "gone" and not survivor and not session.output_log:
-                self._prune_uncollected_detached(session)
-                continue
-            if not pid or recorded_exit is not None:
-                self._finish_survivor(
-                    session, recorded_exit,
-                    recorded_termination.get("completion_reason", "exited") if recorded_exit is not None else "lost",
-                    recorded_termination.get("termination_source", "") if recorded_exit is not None else "survivor_lost",
-                )
+            if self._finish_recovered_exit(session, fate, survivor, recorded_exit, recorded_termination):
                 continue
             if self._file_backed(session):
                 from contextvars import copy_context
@@ -221,3 +213,17 @@ class ProcessCheckpointMixin:
                 poller.start()
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered
+
+    def _finish_recovered_exit(self, session, fate, survivor, recorded_exit, recorded_termination) -> bool:
+        """Settle a dead recovery before scheduling readers for still-live processes."""
+        if fate == "gone" and not survivor and not session.output_log:
+            self._prune_uncollected_detached(session)
+            return True
+        if session.pid and recorded_exit is None:
+            return False
+        self._finish_survivor(
+            session, recorded_exit,
+            recorded_termination.get("completion_reason", "exited") if recorded_exit is not None else "lost",
+            recorded_termination.get("termination_source", "") if recorded_exit is not None else "survivor_lost",
+        )
+        return True

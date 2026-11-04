@@ -60,7 +60,17 @@ Fork patch identity: `terminal-background-survival`.
   Run directories are pruned after acknowledged-result retention
   expires, and immediately on spawn failure. Directory sweeps are throttled to
   at most once per minute per profile to bound registry-lock IO; in-memory result
-  expiry still runs normally. Log polls read only a bounded tail.
+  expiry still runs normally. Sweep completed ordinary run directories too when
+  they have an exit file older than the result TTL and are absent from both the
+  current registry and its on-disk checkpoint; a startup sweep must not delete
+  output that adoption has not read yet. Preserve pending survivor markers and
+  fail closed on unreadable checkpoint ownership. Log polls read only a bounded tail.
+- Login rc options must not defeat file-backed supervision. Append to the
+  pre-created output log under `noclobber`, and use an outer EXIT trap so
+  `errexit` cannot bypass atomic exit publication without changing command
+  semantics. Force-overwrite only the wrapper's private temporary exit marker
+  before rename (including the managed-worker handoff). Native bash/zsh login-rc
+  tests verify output and status before any parent wait-status fallback.
 - The owning profile's effective `display.background_process_notifications: off`
   suppresses gateway process completion turns, including explicit
   `notify_on_complete=true` watchers. A suppressed survivor settles its delivery
@@ -117,6 +127,8 @@ Fork patch identity: `terminal-background-survival`.
   `gateway/lifecycle_ledger.py`; those surfaces are owned elsewhere.
 
 ## Verification
+
+Contract tests: `tests/tools/test_process_registry_login_rc.py`
 
 Run the focused process-registry and terminal proof surfaces with the canonical
 FIFO runner, then run Ruff and `scripts/check_fork_patches.py --source-only`.

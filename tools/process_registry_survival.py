@@ -47,12 +47,18 @@ class ProcessSurvivalMixin:
         session.exit_path = str(run_dir / "exit")
         session.delivered_path = str(run_dir / "delivered") if restart_safe else ""
         q = shlex.quote
-        # Return the saved status without exiting the interactive login shell
-        # explicitly: bash otherwise appends a synthetic "logout" diagnostic.
+        # The log is already opened for outer-shell diagnostics. Append so a
+        # user's noclobber rc option cannot reject it. EXIT also records status
+        # under errexit without disabling that option for the user's command.
+        # Only our private temp marker is forcibly overwritten; rename publishes it.
+        # bash's parser exposes 258 in EXIT traps but exits with status 2.
+        exit_trap = (
+            f"rc=$(($? & 255)); printf '%s\\n' \"$rc\" >| {q(session.exit_path + '.tmp')}; "
+            f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}"
+        )
         wrapped = (
-            f"(\n{safe_command}\n) > {q(session.log_path)} 2>&1\n"
-            f"rc=$?; printf '%s\\n' \"$rc\" > {q(session.exit_path + '.tmp')}; "
-            f"mv -f -- {q(session.exit_path + '.tmp')} {q(session.exit_path)}; (exit \"$rc\")"
+            f"trap {q(exit_trap)} EXIT\n"
+            f"(\n{safe_command}\n) >> {q(session.log_path)} 2>&1"
         )
         if restart_safe:
             command_argv = [registry._find_shell(), "-lic", f"set +m; {wrapped}"]
@@ -336,7 +342,7 @@ class ProcessSurvivalMixin:
             self._remove_survivor_run_dir(session)
 
     def _prune_delivered_survivor_runs(self) -> None:
-        """Bound delivered artifacts even if their registry died before TTL pruning."""
+        """Bound completed artifacts after restart, preserving checkpointed results."""
         from tools import process_registry as registry
         run_root = registry.get_hermes_home() / "process-runs"
         # This sweep also runs under the registry lock during spawn/drain. Bound its
@@ -351,6 +357,17 @@ class ProcessSurvivalMixin:
         sweep_times[run_root] = sweep_now
         now = time.time()
         tracked = self._running.keys() | self._finished.keys()
+        # Startup sweeps precede adoption. An old exit without a delivered marker
+        # may still be a pending survivor (or an ordinary result awaiting adoption).
+        try:
+            entries = json.loads(registry._checkpoint_path().read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            entries = []
+        except (OSError, ValueError):
+            return  # Unreadable ownership is not permission to delete output.
+        if not isinstance(entries, list):
+            return
+        tracked |= {entry.get("session_id") for entry in entries if isinstance(entry, dict)}
         try:
             for run_dir in run_root.iterdir():
                 if (run_dir.is_symlink() or not run_dir.is_dir()
@@ -358,11 +375,17 @@ class ProcessSurvivalMixin:
                     continue
                 marker = run_dir / "delivered"
                 try:
-                    if now - marker.stat().st_mtime <= registry.FINISHED_TTL_SECONDS:
+                    if marker.exists():
+                        if now - marker.stat().st_mtime <= registry.FINISHED_TTL_SECONDS:
+                            continue
+                        payload = json.loads(marker.read_text(encoding="utf-8-sig"))
+                        if not isinstance(payload, dict) or not self._marker_delivered(payload):
+                            continue
+                    elif now - (run_dir / "exit").stat().st_mtime <= registry.FINISHED_TTL_SECONDS:
                         continue
-                    payload = json.loads(marker.read_text(encoding="utf-8-sig"))
-                    if isinstance(payload, dict) and payload.get("delivered") is True:
-                        shutil.rmtree(run_dir)
+                    # No marker and no checkpoint means an ordinary completed job,
+                    # not a pending survivor. Running jobs have no exit file.
+                    shutil.rmtree(run_dir)
                 except (OSError, ValueError, TypeError):
                     continue
         except OSError:
