@@ -24,7 +24,8 @@ def test_hard_wall_sweeps_double_forked_orphan(tmp_path):
         "if os.fork(): sys.exit(0)\n"
         "os.setsid()\n"
         "if os.fork(): os._exit(0)\n"
-        "with open(sys.argv[1], 'w') as f: f.write(str(os.getpid()))\n"
+        "with open(sys.argv[1] + '.pending', 'w') as f: f.write(str(os.getpid()))\n"
+        "os.replace(sys.argv[1] + '.pending', sys.argv[1])\n"
         "time.sleep(60)\n"
     )
     env = dict(os.environ, _HERMES_CRON_EXTERNAL_WORKER=execution_id)
