@@ -723,6 +723,7 @@ def _valid_heavy_slot_wait(value: str) -> bool:
 _HEAVY_SLOT_VALUE_OPTIONS: dict[str, Callable[[str], bool]] = {
     "--label": lambda value: True,
     "--max-wait": _valid_heavy_slot_wait,
+    "--urgency": lambda value: value in {"incident", "urgent", "normal"},
     "--gate-fd": lambda value: re.fullmatch(r"[0-9]+", value) is not None,
 }
 _HEAVY_SLOT_FLAG_OPTIONS = frozenset({"-h", "--help"})
