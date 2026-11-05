@@ -452,9 +452,10 @@ def complete_primary_recovery(agent) -> bool:
     agent._rate_limited_until = 0
     agent._fallback_episode_cooled = False
     with contextlib.suppress(Exception):
-        agent._emit_diagnostic_status(
-            ContextNotice(f"✅ Primary model restored: {record.get('model') or route[2]} via "
-            f"{record.get('provider') or route[0]}; fallback is no longer active."))
+        if not getattr(agent, "_provider_fallback_silent_retry", False):
+            agent._emit_diagnostic_status(
+                ContextNotice(f"✅ Primary model restored: {record.get('model') or route[2]} via "
+                f"{record.get('provider') or route[0]}; fallback is no longer active."))
     return True
 
 
