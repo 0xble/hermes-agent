@@ -12,7 +12,7 @@ from hermes_constants import hermes_home_key
 logger = logging.getLogger("cron.scheduler")
 _reserved_pools: dict[str, concurrent.futures.ThreadPoolExecutor] = {}
 _lane_pools: dict[str, dict[str, concurrent.futures.ThreadPoolExecutor]] = {
-    "reserved": _reserved_pools, "script": {},
+    "reserved": _reserved_pools, "script": {}, "person-send": {},
 }
 _reserved_claims: dict[str, tuple[str, object]] = {}
 _loaded_protected: dict[str, tuple[str, ...]] = {}
@@ -24,6 +24,50 @@ _SLOT_WAKE_CHECK_SECONDS = 0.25
 
 class AgentAdmissionRequired(Exception):
     """The persisted fire requires agent capacity, not the script-only lane."""
+
+    lane = "general"
+
+
+class ScriptAdmissionRequired(AgentAdmissionRequired):
+    """A queued person-send no longer qualifies for its dedicated lane."""
+
+    lane = "script"
+
+
+PERSON_SEND_MARKER = b"# hermes: person-send"
+
+
+def is_person_send(job: dict) -> bool:
+    """Author opt-in for frozen one-shot sends, never a name/path heuristic.
+
+    This scheduling declaration is not authorization or a sandbox. Existing
+    script timeout, lifecycle guard and provider-side send checks still apply.
+    Read only a bounded first line inside this profile's validated scripts root.
+    """
+    schedule = job.get("schedule")
+    if (not job.get("no_agent") or job.get("deliver") != "local"
+            or not isinstance(schedule, dict) or schedule.get("kind") != "once"):
+        return False
+    from pathlib import Path
+    from cron import scheduler
+    from cron.lifecycle_guard import _on_cloud_path
+
+    try:
+        root = (scheduler._get_hermes_home() / "scripts").resolve()
+        raw = Path(job.get("script") or "").expanduser()
+        path = (raw if raw.is_absolute() else root / raw).resolve()
+        if not path.is_relative_to(root) or _on_cloud_path(path) or not path.is_file():
+            return False
+        with path.open("rb") as script:
+            return script.readline(len(PERSON_SEND_MARKER) + 2).rstrip(b"\r\n") == PERSON_SEND_MARKER
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return False
+
+
+def script_pool(home, lane="script"):
+    """Share the existing profile-owned auxiliary-pool lifecycle for script classes."""
+    with _lock:
+        return _get_lane_pool(hermes_home_key(home), lane)
 
 
 def reserved_job_id(jobs: list[dict], home) -> str | None:
@@ -76,10 +120,9 @@ def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
             continue
         # Only no_agent guarantees no model work. Monitor/pre-run scripts may wake an agent.
         if job.get("no_agent"):
-            with _lock:
-                script_pool = _get_lane_pool(hermes_home_key(home), "script")
+            lane = "person-send" if is_person_send(job) else "script"
             future = scheduler._submit_with_guard(
-                job, script_pool, process_job, dispatch_lane="script")
+                job, script_pool(home, lane), process_job, dispatch_lane=lane)
         else:
             future = scheduler._submit_with_guard(job, pool, process_job)
         if future is not None:

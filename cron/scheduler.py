@@ -4840,21 +4840,26 @@ def _submit_with_guard(
     def _run_and_release(ctx=_ctx):
         try:
             return ctx.run(run_dispatched_job, process_job, dispatched_job)
-        except AgentAdmissionRequired:
+        except AgentAdmissionRequired as admission_required:
+            target_lane = admission_required.lane
             def handoff():
                 # Pool identity, capacity, and the failure ledger all belong to the
                 # captured profile, not the executor thread's default/launch home.
-                general_ctx = dispatch_context("general", execution.get("code_sha"))
+                target_ctx = dispatch_context(target_lane, execution.get("code_sha"))
                 try:
-                    return _get_parallel_pool(_resolve_max_parallel_workers()).submit(
-                        _run_and_release, general_ctx)
+                    if target_lane == "script":
+                        from cron.scheduler_admission import script_pool
+                        target_pool = script_pool(_get_hermes_home())
+                    else:
+                        target_pool = _get_parallel_pool(_resolve_max_parallel_workers())
+                    return target_pool.submit(_run_and_release, target_ctx)
                 except BaseException as exc:
                     settle_unstarted_execution(
-                        execution["id"], job_id, f"Agent admission handoff failed: {exc}")
+                        execution["id"], job_id, f"{target_lane} admission handoff failed: {exc}")
                     raise
             return ctx.run(handoff)
         finally:
-            if dispatch_lane != "script":
+            if dispatch_lane not in {"script", "person-send"}:
                 release_running_job(job_id, home=_claim_home, owner=registration_owner)
 
     def _complete(done):
@@ -4873,7 +4878,7 @@ def _submit_with_guard(
     try:
         _ctx.run(note_dispatch_stage, dispatched_job, "executor_queued")
         fut = pool.submit(_run_and_release)
-        if dispatch_lane == "script":
+        if dispatch_lane in {"script", "person-send"}:
             completion.set_running_or_notify_cancel()
             fut.add_done_callback(_complete)
         else:
