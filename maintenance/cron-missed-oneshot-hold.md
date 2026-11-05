@@ -49,16 +49,30 @@ worker, one pending pass per home, with captured home context. Keep journals as
 the durable retry queue and observe/log errors. Headless recovery still cannot
 connect or spawn a gateway. Do not occupy a job-dispatch worker.
 
-### Integration blocker
+### Current-occurrence canonical recovery ownership
 
-The merged #968 expiry owner can retire a dead-owner, started one-shot while
-its off-tick canonical receipt observation is pending. The isolated barrier
-regression `test_current_arm_receipt_survives_concurrent_expiry_scan` preserves
-this failure: the job disappears before `mark_job_run` can land. The receipt
-may settle its execution row, but that is not coherent job/canonical settlement.
-Do not treat a green subset or the prior branch's hosted success as qualification.
-Resolve receipt-versus-retirement ownership with the parent before activation;
-no automatic historical replay is permitted.
+Expiry, due-scan dispatch limits and direct dispatch claims share the same local
+recovery-obligation check. Only the current scheduled instant's execution and
+its deterministic canonical admission link can suppress both redispatch and
+destructive retirement. `unknown` remains recoverable. Capture import alone
+(`canonical_settled`) does not prove the scheduler tail is finished; completed
+or failed canonical bookkeeping does. No-journal dead partial-effects retirement
+keeps #968's existing policy.
+Queued/admission-only evidence is never promoted to actual payload-start proof.
+Unreadable or corrupt current links stay held with a deduplicated incident.
+
+Canonical observation stays off tick and outside the due-scan jobs lock. A late
+old-arm receipt settles its original execution and preserves its document, but
+never sends or changes the replacement arm's budget, status, claims or schedule.
+The common completion reducer also checks this occurrence fence; output/send
+fences recheck it under the jobs lock against concurrent operator rearm. No new
+registry, lifecycle flag, automatic replay or historical journal scan is added.
+
+The barrier regression `test_current_arm_receipt_survives_concurrent_expiry_scan`
+and `test_oneshot_recovery_ownership` qualify the target through terminal job,
+execution and canonical-link settlement. This is source/disposable-state proof,
+not loaded-runtime or person-transport proof. Hosted qualification and activation
+remain separate parent-owned gates.
 
 ## Source and proof
 

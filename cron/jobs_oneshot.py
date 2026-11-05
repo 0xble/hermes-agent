@@ -81,6 +81,69 @@ def occurrence_started(job: dict, *, now: datetime | None = None) -> bool:
         ).fetchone() is not None
 
 
+def completion_matches_occurrence(job: dict, execution_id: str) -> bool:
+    """A canonical completion can reduce only the arm recorded on its execution.
+
+    Legacy/manual rows without an occurrence identity retain their existing policy.
+    Callers mutating the schedule hold the jobs lock while checking this fence.
+    """
+    if (job.get('schedule') or {}).get('kind') != 'once':
+        return True
+    from cron.executions import get_execution
+    row = get_execution(execution_id)
+    if row is None:
+        return True
+    from cron.occurrences import scheduled_instant
+    instant = scheduled_instant(job.get('next_run_at') or (job.get('schedule') or {}).get('run_at'))
+    return (row['job_id'] == job['id'] and
+            (not instant or not row.get('scheduled_instant') or row['scheduled_instant'] == instant))
+
+
+def occurrence_recovery_pending(job: dict) -> bool:
+    """Keep the exact canonical bookkeeping target, without observing its owner.
+
+    This is NOT evidence that the payload started. Only a current-arm ledger row
+    linked to an admission can retain this target; no historical journal scan or
+    owner RPC belongs on a dispatch/due scan. Unknown is still recoverable. Even
+    canonical_settled only proves capture import, not the scheduler's terminal tail.
+    """
+    if (job.get('schedule') or {}).get('kind') != 'once':
+        return False
+    from cron.occurrences import scheduled_instant
+    instant = scheduled_instant(job.get('next_run_at') or (job.get('schedule') or {}).get('run_at'))
+    if not instant:
+        return False
+    import json
+    from cron.executions import _transaction
+    from cron.scheduler_authority import journal_path
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT id FROM executions WHERE job_id=? AND scheduled_instant=? "
+            "AND status NOT IN ('completed','failed')", (job['id'], instant)).fetchall()
+    for row in rows:
+        if row['id'] in (job.get('canonical_completions') or []):
+            continue
+        try:
+            record = json.loads(journal_path(job['id'], row['id']).read_text(encoding='utf-8-sig'))
+            params = record.get('params') if isinstance(record, dict) else None
+            if not isinstance(params, dict) or (params.get('job_id'), params.get('request_id')) != (job['id'], row['id']):
+                raise ValueError('canonical admission identity does not match its execution')
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            # A damaged link is not negative evidence. Keep it visible and held;
+            # the incident deduplicates repeated scans without a new lifecycle flag.
+            from cron.incidents import upsert_incident
+            _, created = upsert_incident(
+                job_id=job['id'], job_name=job.get('name'),
+                error=f'One-shot recovery evidence unavailable for {row["id"]}: {exc}')
+            if created:
+                logger.warning("Job '%s': recovery evidence unavailable for %s; retaining occurrence: %s",
+                               job['id'], row['id'], exc)
+        return True
+    return False
+
+
 def occurrence_finished(job: dict) -> bool:
     """Completion must also belong to this arm, not a retained history stamp."""
     from cron.occurrences import completed_occurrence, scheduled_instant
@@ -113,7 +176,7 @@ def retire_expired_oneshot(d) -> bool:
     # A consumed dispatch is interrupted, not a never-started scheduler miss.
     # Dead/expired claims cannot pin its record, but local live runners must keep it.
     if occurrence_started(d.job, now=d.scan.now):
-        if not in_flight:
+        if not in_flight and not occurrence_recovery_pending(d.job):
             jobs._write_retired_oneshot_diagnostic(d.job, d.next_run)
             d.scan.retire(d.job["id"])
             d.scan.on_saved.append(lambda job=d.job: jobs.record_cron_missed(job))

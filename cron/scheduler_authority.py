@@ -340,6 +340,26 @@ def reconcile_pending(*, allow_connect=True):
         _release_tick_lock(lock_fd)
 
 
+def _recovery_fence(job, execution_id):
+    """Recheck the arm at output/send, not only before possibly slow receipt composition."""
+    from contextlib import contextmanager
+    from cron.jobs import _jobs_lock, get_job
+    from cron.jobs_oneshot import completion_matches_occurrence
+    from cron.scheduler import _FireOwnership
+
+    class RecoveryFence(_FireOwnership):
+        def lost(self):
+            current = get_job(job['id'])
+            return current is not None and not completion_matches_occurrence(current, execution_id)
+
+        @contextmanager
+        def side_effect_fence(self):
+            with _jobs_lock():
+                yield not self.lost()
+
+    return RecoveryFence(dict(job, fire_claim=None))
+
+
 def _reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
 
@@ -351,7 +371,7 @@ def _reconcile_pending(*, allow_connect=True):
     from hermes_cli.gateway_client import connect_gateway
     from cron.executions import execution_owner_live, get_execution
     from cron.jobs import get_job
-    from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
+    from cron.scheduler import (_RunDelivery, _apply_agent_failure_marker,
                                 _save_compose_deliver)
     from cron.scheduler_bookkeeping import fail_empty_response, finish_completed_run
     import logging
@@ -421,9 +441,30 @@ def _reconcile_pending(*, allow_connect=True):
             # blank answer are failures, whichever process books them.
             success, error, declared = _apply_agent_failure_marker(job, success, error, answer)
             delivery = _RunDelivery(job, success, error, agent_declared=declared)
+            from cron.jobs import _jobs_lock, save_job_output
+            from cron.jobs_oneshot import completion_matches_occurrence
+            from cron.executions import recover_receipted_execution
+            with _jobs_lock():
+                latest = get_job(params['job_id'])
+                if latest is not None and not completion_matches_occurrence(latest, params['request_id']):
+                    # Preserve the old receipt locally, but never apply its output or
+                    # terminal schedule tail to the operator's replacement arm.
+                    fail_empty_response(delivery, answer)
+                    if output.strip():
+                        save_job_output(params['job_id'], output)
+                    settled = recover_receipted_execution(
+                        params['request_id'], params['job_id'], success=delivery.success,
+                        error=delivery.error, delivery_outcome='suppressed')
+                    if settled is not None:
+                        if _capture_unsettled(journal, record, pending_canonical, received):
+                            _set_aside_unsettled(journal)
+                        else:
+                            journal.unlink(missing_ok=True)
+                        journal.with_suffix('.cancel').unlink(missing_ok=True)
+                    continue
             # The canonical receipt supplies the result; a dead scheduler's fire claim does not
             # authorize replay and must not prevent finishing its durable bookkeeping.
-            fence = _FireOwnership(dict(job, fire_claim=None))
+            fence = _recovery_fence(job, params['request_id'])
             _save_compose_deliver(delivery, fence, answer, output if output.strip() else None, adapters=None, loop=None,
                                  verbose=False, execution_token=None)
             fail_empty_response(delivery, answer)
