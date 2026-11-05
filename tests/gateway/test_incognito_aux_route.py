@@ -35,8 +35,12 @@ class _Clients:
             self.requests.append(request)
             self.calls.append((str(base_url).rstrip("/"), api_key))
             if self.fail_private and str(base_url).rstrip("/") == PRIVATE_URL:
-                raise RuntimeError("private route unavailable")
-            return _mock_response(content="summary")
+                import httpx
+                import openai
+                raise openai.APIStatusError("Insufficient credits", body=None, response=httpx.Response(
+                    402, request=httpx.Request("POST", str(base_url) + "/chat/completions")))
+            response = _mock_response(content="summary")
+            return iter([response]) if request.get("stream") else response
 
         def create(**request):
             return respond(**request)
@@ -115,11 +119,19 @@ async def test_async_private_auxiliary_call_uses_the_incognito_route(private_rou
 @pytest.mark.asyncio
 async def test_failing_private_route_never_falls_back_to_another_provider(private_route, tmp_path, monkeypatch):
     runner, _store, _entry, config, event, _db = private_route
+    import hermes_yaml
+    from hermes_cli.config import load_config_readonly
     configure(config, tmp_path)
-    config["auxiliary"]["compression"]["fallback_chain"] = [{"provider": "custom:main", "model": "normal-model"}]
-    configure(config, tmp_path)
+    chain = [{"provider": "custom:main", "model": "normal-model"}]
+    config["auxiliary"]["compression"].update(provider="custom:private", model="private-model", fallback_chain=chain)
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    assert load_config_readonly()["auxiliary"]["compression"]["fallback_chain"] == chain
     recorder = _Clients(fail_private=True)
     monkeypatch.setattr("agent.auxiliary_client.OpenAI", recorder)
+    # The same persisted chain works publicly, but is forbidden for the private call.
+    aux("compression", runner, event)
+    assert recorder.calls == [(PRIVATE_URL, "private-key"), (MAIN_URL, "main-key")]
+    recorder.calls.clear()
     assert "private-model" in await e2e.incognito(runner, event, "/incognito on")
     with pytest.raises(Exception):
         aux("compression", runner, event)
@@ -449,7 +461,8 @@ async def test_recovery_preserves_the_private_model_without_disabling_auth_refre
     configure(config, tmp_path)
     config["providers"] = deepcopy(config["providers"])
     url = "https://inference-api.nousresearch.com/v1"
-    config["providers"]["private"]["base_url"] = url
+    named_url = "https://inference-api.nousresearch.com/private-proxy/v1"
+    config["providers"]["private"].update(base_url=named_url, api_key="named-private-key")
     config["providers"]["nous"] = {**config["providers"]["private"], "name": "nous"}
 
     (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
@@ -460,7 +473,7 @@ async def test_recovery_preserves_the_private_model_without_disabling_auth_refre
     monkeypatch.setattr("hermes_cli.models.get_nous_recommended_aux_model", lambda **kw: "other-recommended-model")
     monkeypatch.setattr("agent.auxiliary_client._nous_portal_account_has_fresh_paid_access", lambda: True)
     monkeypatch.setattr("hermes_cli.auth.resolve_nous_runtime_credentials",
-                        lambda **kw: {"api_key": "refreshed-private-key" if kw.get("force_refresh") else "private-key",
+                        lambda **kw: {"api_key": "refreshed-builtin-key" if kw.get("force_refresh") else "builtin-key",
                                       "base_url": url})
     sid = "model-pinned-private"
     register_session(sid, True)
@@ -469,7 +482,8 @@ async def test_recovery_preserves_the_private_model_without_disabling_auth_refre
         kwargs: dict[str, Any] = dict(task="compression", provider=provider, model="private-model",
                       messages=[{"role": "user", "content": "private summary input"}], timeout=5)
         # Named custom entries cannot borrow the host provider's refreshed credential either.
-        must_refuse = private and (status == 404 or provider.startswith("custom:"))
+        named = provider.startswith("custom:")
+        must_refuse = (status == 404 and (private or named)) or (named and (private or status == 401))
         error = {404: "Model not found", 401: "Unauthorized", 402: "Insufficient credits"}[status]
         failure = None
         with incognito_scope(True, sid) if private else nullcontext():
@@ -489,12 +503,18 @@ async def test_recovery_preserves_the_private_model_without_disabling_auth_refre
             assert not private_route_active()
     finally:
         register_session(sid, False)
+    first = (named_url, "named-private-key", "private-model") if provider.startswith("custom:") else (
+        url, "builtin-key", "private-model")
     if must_refuse:
-        expected = [(url, "private-key", "private-model")]
+        expected = [first]
+    elif named:
+        # Public payment fallback is still allowed; it is not a credential refresh
+        # of the saved entry. Private calls above never reach this route.
+        expected = [first, (MAIN_URL, "main-key", "normal-model")]
     elif status == 404:
-        expected = [(url, "private-key", "private-model"), (url, "private-key", "other-recommended-model")]
+        expected = [first, (url, "builtin-key", "other-recommended-model")]
     else:
-        expected = [(url, "private-key", "private-model"), (url, "refreshed-private-key", "private-model")]
+        expected = [first, (url, "refreshed-builtin-key", "private-model")]
     assert recorder.calls == expected
     if must_refuse:
         assert failure is not None and failure.status_code == status and error in str(failure)
@@ -503,9 +523,10 @@ async def test_recovery_preserves_the_private_model_without_disabling_auth_refre
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
+@pytest.mark.parametrize("name", ["private", "nous", "openrouter", "codex", "main", "auto", "moa", "kimi", "llamacpp"])
 async def test_named_private_responses_route_owns_its_key_model_and_wire_mode(
-        private_route, tmp_path, monkeypatch, asynchronous):
+        private_route, tmp_path, monkeypatch, mode, name):
     """The named entry, not task/main/env settings, supplies the private credential and transport."""
     from copy import deepcopy
     import hermes_yaml
@@ -515,13 +536,18 @@ async def test_named_private_responses_route_owns_its_key_model_and_wire_mode(
     _runner, _store, _entry, config, _event, _db = private_route
     configure(config, tmp_path)
     config["providers"] = deepcopy(config["providers"])
-    config["providers"]["private"]["api_mode"] = "codex_responses"
+    config["providers"][name] = {**config["providers"]["private"], "api_mode": "codex_responses"}
     config["auxiliary"]["compression"].update(api_key="task-key", api_mode="chat_completions")
     (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
     monkeypatch.setenv("OPENAI_API_KEY", "unrelated-openai-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "builtin-openrouter-key")
+    monkeypatch.setattr("hermes_cli.auth.resolve_nous_runtime_credentials",
+                        lambda **kw: {"api_key": "builtin-nous-key", "base_url": "https://builtin.invalid/v1"})
+    monkeypatch.setattr("hermes_cli.auth.resolve_codex_runtime_credentials",
+                        lambda **kw: {"api_key": "builtin-codex-key", "base_url": "https://builtin.invalid/v1"})
     calls = []
 
-    def boundary(*, api_key=None, base_url=None, **kw):
+    def boundary(*, api_key=None, base_url=None, _async=False, **kw):
         def responses(**request):
             calls.append((str(base_url).rstrip("/"), api_key, request["model"], "responses"))
             return _FakeCreateStream([
@@ -533,25 +559,76 @@ async def test_named_private_responses_route_owns_its_key_model_and_wire_mode(
 
         def chat(**request):
             calls.append((str(base_url).rstrip("/"), api_key, request["model"], "chat"))
-            return _mock_response(content="summary")
+            response = _mock_response(content="summary")
+            return iter([response]) if request.get("stream") else response
+
+        async def async_chat(**request):
+            return chat(**request)
 
         return SimpleNamespace(responses=SimpleNamespace(create=responses), api_key=api_key, base_url=base_url,
-                               chat=SimpleNamespace(completions=SimpleNamespace(create=chat)), close=lambda: None)
+                               chat=SimpleNamespace(completions=SimpleNamespace(
+                                   create=async_chat if _async else chat)), close=lambda: None)
 
     monkeypatch.setattr("agent.auxiliary_client.OpenAI", boundary)
+    _install_async_boundary(monkeypatch, lambda **kw: boundary(_async=True, **kw))
     sid = "responses-private"
     register_session(sid, True)
     try:
-        set_private_route([sid], {"provider": "custom:private", "model": "private-model"})
+        set_private_route([sid], {"provider": f"custom:{name}", "model": "private-model"})
+        result = None
         with incognito_scope(True, sid):
             kwargs: dict[str, Any] = dict(task="compression", messages=[{"role": "user", "content": "private summary input"}],
                           api_key="caller-key", timeout=5,
                           main_runtime={"provider": "custom:main", "model": "normal-model", "api_key": "main-key",
                                         "base_url": MAIN_URL, "api_mode": "chat_completions"})
-            if asynchronous:
+            if mode == "async":
                 await async_call_llm(**kwargs)
             else:
-                call_llm(**kwargs, api_mode="chat_completions")
+                result = call_llm(**kwargs, api_mode="chat_completions", stream=(mode == "stream"))
+        if mode == "stream":
+            # The real Responses adapter currently materializes the stream into a completion.
+            assert result is not None
+            assert result.choices if hasattr(result, "choices") else list(result)
     finally:
         register_session(sid, False)
     assert calls == [(PRIVATE_URL, "private-key", "private-model", "responses")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["sync", "async", "stream"])
+@pytest.mark.parametrize("entry", [None, {"enabled": False, "base_url": PRIVATE_URL, "api_key": "private-key"},
+                                  {"api_key": "private-key"}], ids=["missing", "disabled", "missing-endpoint"])
+async def test_unusable_named_private_route_never_dispatches_a_builtin(
+        private_route, tmp_path, monkeypatch, mode, entry):
+    """An explicit saved-entry identity is never permission to fall through to its built-in namesake."""
+    from copy import deepcopy
+    import hermes_yaml
+    from agent.auxiliary_client import call_llm, async_call_llm
+    from agent.incognito import incognito_scope, register_session, set_private_route
+    _runner, _store, _entry, config, _event, _db = private_route
+    configure(config, tmp_path)
+    config["providers"] = deepcopy(config["providers"])
+    if entry is not None:
+        config["providers"]["nous"] = entry
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    monkeypatch.setattr("hermes_cli.auth.resolve_nous_runtime_credentials",
+                        lambda **kw: {"api_key": "builtin-key", "base_url": "https://builtin.invalid/v1"})
+    recorder = _Clients(asynchronous=(mode == "async"))
+    monkeypatch.setattr("agent.auxiliary_client.OpenAI", recorder if mode != "async" else _Clients())
+    _install_async_boundary(monkeypatch, recorder)
+    sid = "missing-named-private"
+    register_session(sid, True)
+    try:
+        set_private_route([sid], {"provider": "custom:nous", "model": "private-model"})
+        with pytest.raises(RuntimeError):
+            with incognito_scope(True, sid):
+                kwargs = dict(task="compression", messages=[{"role": "user", "content": "private summary"}], timeout=5)
+                if mode == "async":
+                    await async_call_llm(**kwargs)
+                else:
+                    result = call_llm(**kwargs, stream=(mode == "stream"))
+            if mode == "stream":
+                list(result)
+    finally:
+        register_session(sid, False)
+    assert recorder.calls == []

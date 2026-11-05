@@ -577,7 +577,8 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
         suffix = normalized.split(":", 1)[1].strip()
         if not suffix:
             return "custom"
-        normalized = suffix
+        # A saved entry owns this identity even when its name is a built-in or alias.
+        return f"custom:{suffix}"
     if normalized == "codex":
         return "openai-codex"
     if normalized == "main":
@@ -5765,6 +5766,15 @@ def resolve_provider_client(
             if explicit_base_url and str(explicit_base_url).lower().startswith("moa://"):
                 explicit_base_url = None
                 explicit_api_key = None
+    if provider.startswith("custom:"):
+        # Resolve saved entries before built-ins, aliases, auto discovery, and model
+        # defaults. Missing/disabled entries must not borrow a namesake's route.
+        req = _ResolveRequest(
+            provider, original_provider, model, async_mode, raw_codex,
+            explicit_base_url, explicit_api_key, api_mode, main_runtime, is_vision, task,
+        )
+        result = _resolve_named_custom_branch(req)
+        return result if result is not None else (None, None)
     from agent.auxiliary_local_runtime import bare_llamacpp_endpoint
     local = bare_llamacpp_endpoint(original_provider, explicit_base_url, explicit_api_key)
     if local is not None:
@@ -8273,8 +8283,9 @@ def _aux_recovery_ladder(
         return resp
     client_is_nous = (resolved_provider == "nous"
                       or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
-    if private_route_active() and resolved_provider != "nous":
-        # A named custom entry can use a Nous hostname without authorizing Nous account keys.
+    if (resolved_provider.startswith("custom:")
+            or (private_route_active() and resolved_provider != "nous")):
+        # Saved entries own credentials and model policy even when hosted on Nous.
         client_is_nous = False
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
