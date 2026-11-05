@@ -3,6 +3,7 @@
 While private the judge would send the private reply to the auxiliary goal_judge provider, and
 state.db withholds every goal write, so judging, reviving and waking a goal are all skipped.
 """
+import asyncio
 import json
 import logging
 import secrets
@@ -20,7 +21,7 @@ private_route = e2e.private_route
 
 @pytest.fixture
 def goal_topic(private_route, monkeypatch):
-    runner, store, entry, config, event, db = private_route
+    runner, _store, entry, _config, event, db = private_route
     e2e.started(runner, db)
     provider = e2e._ProviderBoundary()
     monkeypatch.setattr("agent.process_bootstrap.OpenAI", provider)
@@ -75,7 +76,7 @@ async def test_private_turns_skip_the_judge_and_leave_the_goal_untouched(goal_to
 
 @pytest.mark.asyncio
 async def test_blocked_goal_is_revived_only_by_a_public_user_turn(goal_topic, caplog):
-    runner, entry, event, provider, judged, turn = goal_topic
+    runner, entry, event, provider, _judged, turn = goal_topic
     sid = entry.session_id
 
     def block(state):
@@ -111,3 +112,144 @@ async def test_parked_goal_is_not_woken_into_a_private_topic(goal_topic, monkeyp
     await runner._goal_wakeup_fire_one(entry.session_id)
     assert checked == [entry.session_id]
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["barrier", "route", "admission"])
+async def test_goal_wakeup_defers_if_incognito_begins_during_scan(harness, monkeypatch, boundary):
+    from tests.gateway import test_goal_parked_idle_wake as parked
+    from gateway.incognito import transition_pending, transition_scope
+    from hermes_cli import goals
+
+    runner, store, entry, _config, event, _db = harness
+    adapter = parked._Adapter()
+    runner.__dict__.update(parked._real_runner(adapter, store, entry).__dict__)
+    manager = goals.GoalManager(entry.session_id)
+    manager.set("Finish the report")
+    manager.wait_for_seconds(1, reason="wait for a result")
+    monkeypatch.setattr(goals.GoalManager, "lifted_barrier_prompt", lambda self: "Continue the report")
+    before = goal_row(entry.session_id)
+    execute = runner._run_in_executor_with_context
+    triggered = []
+
+    async def enable():
+        assert "ON" in await runner._handle_incognito_command(event("/incognito on"))
+        triggered.append(True)
+
+    async def executor(fn, *args):
+        result = await execute(fn, *args)
+        if boundary == "barrier" and fn.__name__ == "_check":
+            await enable()
+        return result
+
+    async def route(*args):
+        if boundary == "route":
+            await enable()
+        return True
+
+    monkeypatch.setattr(runner, "_run_in_executor_with_context", executor)
+    monkeypatch.setattr("gateway.wake.automatic_route_available", route)
+    if boundary == "admission":
+        # A transition that has not published its private flag must fence admission too.
+        with transition_scope(entry.session_key):
+            assert transition_pending(entry.session_key)
+            await runner._goal_wakeup_fire_one(entry.session_id)
+    else:
+        await runner._goal_wakeup_fire_one(entry.session_id)
+        assert triggered == [True]
+    assert adapter.handled == [], "goal continuation admitted after the privacy boundary"
+    assert goal_row(entry.session_id) == before
+
+
+@pytest.mark.asyncio
+async def test_goal_admission_serializes_with_incognito_switch(harness, monkeypatch):
+    from tests.gateway import test_goal_parked_idle_wake as parked
+    from hermes_cli import goals
+
+    runner, store, entry, _config, event, _db = harness
+    adapter = parked._Adapter()
+    runner.__dict__.update(parked._real_runner(adapter, store, entry).__dict__)
+    manager = goals.GoalManager(entry.session_id)
+    manager.set("Finish the report")
+    manager.wait_for_seconds(1, reason="wait for a result")
+    monkeypatch.setattr(goals.GoalManager, "lifted_barrier_prompt", lambda self: "Continue the report")
+    clearing, release, switching = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    dispatched_private = []
+    clear = runner._clear_stale_resume_pending
+
+    async def held_clear(*args):
+        clearing.set()
+        await release.wait()
+        return await clear(*args)
+
+    async def accept(incoming):
+        # Inline slash-command dispatch takes this lock itself. Admission must not own it.
+        async with runner._session_model_override_lock(entry.session_key):
+            dispatched_private.append(entry.incognito)
+            incoming._gateway_accepted = True
+
+    async def toggle():
+        switching.set()
+        return await runner._handle_incognito_command(event("/incognito on"))
+
+    monkeypatch.setattr(runner, "_clear_stale_resume_pending", held_clear)
+    adapter.handle_message = accept
+    wake = asyncio.create_task(runner._goal_wakeup_fire_one(entry.session_id))
+    await asyncio.wait_for(clearing.wait(), 2)
+    switch = asyncio.create_task(toggle())
+    try:
+        await asyncio.wait_for(switching.wait(), 2)
+        reply = await asyncio.wait_for(asyncio.shield(switch), 2)
+        assert "not changed" in reply and not entry.incognito
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(wake, switch), 2)
+    assert dispatched_private == [False]
+    assert "ON" in await toggle()
+
+
+def test_admission_fence_outlives_expiry_claim_and_early_release(monkeypatch):
+    from gateway.replay_scheduler import BackgroundTurnGate
+
+    clock = [0.0]
+    claimed = [False]
+    monkeypatch.setattr("gateway.replay_scheduler.time.monotonic", lambda: clock[0])
+    gate = BackgroundTurnGate(1, set, claimed_since=lambda *_: claimed[0], reservation_s=30)
+    token = gate.try_reserve("topic")
+    with gate.admitting(token):
+        clock[0] = 60
+        claimed[0] = True
+        gate.release(token)  # adapter refusal must not expose the caller's remaining cleanup
+        assert gate.admission_pending("topic")
+        assert gate.load() == 1
+        assert gate.try_reserve("other") is None
+    assert not gate.admission_pending("topic")
+    assert gate.load() == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_goal_admission_releases_privacy_fence(harness, monkeypatch):
+    from tests.gateway import test_goal_parked_idle_wake as parked
+    from hermes_cli import goals
+
+    runner, store, entry, _config, event, _db = harness
+    adapter = parked._Adapter()
+    runner.__dict__.update(parked._real_runner(adapter, store, entry).__dict__)
+    manager = goals.GoalManager(entry.session_id)
+    manager.set("Finish the report")
+    manager.wait_for_seconds(1)
+    monkeypatch.setattr(goals.GoalManager, "lifted_barrier_prompt", lambda self: "Continue the report")
+    clearing = asyncio.Event()
+
+    async def held_clear(*_args):
+        clearing.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_clear_stale_resume_pending", held_clear)
+    wake = asyncio.create_task(runner._goal_wakeup_fire_one(entry.session_id))
+    await asyncio.wait_for(clearing.wait(), 2)
+    assert runner._background_admission_pending(entry.session_key)
+    wake.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wake
+    assert not runner._background_admission_pending(entry.session_key)
+    assert "ON" in await runner._handle_incognito_command(event("/incognito on"))

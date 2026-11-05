@@ -33,11 +33,13 @@ class GatewayIncognitoCommandsMixin:
         key = self._session_key_for_source(source)
         # No await between reading the active-turn slot and taking the switch lock.
         # /status is safe mid-turn, toggles never mutate an in-flight agent.
-        if action != "status" and getattr(self, "_running_agents", {}).get(key) is not None:
+        if action != "status" and (getattr(self, "_running_agents", {}).get(key) is not None
+                                  or self._background_admission_pending(key)):
             return "Incognito was not changed. Wait for the active turn to finish, then retry."
         async with self._model_switch_lock():
             async with self._session_model_override_lock(key):
-                if action != "status" and getattr(self, "_running_agents", {}).get(key) is not None:
+                if action != "status" and (getattr(self, "_running_agents", {}).get(key) is not None
+                                          or self._background_admission_pending(key)):
                     return "Incognito was not changed. Wait for the active turn to finish, then retry."
                 from contextvars import Context
                 entry = await asyncio.to_thread(Context().run, self.session_store.get_or_create_session, source)
@@ -47,7 +49,8 @@ class GatewayIncognitoCommandsMixin:
                 enabled = not entry.incognito if not action else action == "on"
                 if enabled == entry.incognito:
                     return self._incognito_reply(entry)
-                if getattr(self, "_running_agents", {}).get(key) is not None or self._queue_depth(key, adapter=adapter):
+                if (getattr(self, "_running_agents", {}).get(key) is not None
+                        or self._queue_depth(key, adapter=adapter) or self._background_admission_pending(key)):
                     return "Incognito was not changed. Wait for the active turn and queued messages to finish, then retry."
                 from gateway.incognito import transition_scope
                 with transition_scope(key):

@@ -46,8 +46,16 @@ def _goal_suspended_while_private(session_entry) -> bool:
     The judge would send the private reply to the auxiliary goal_judge provider, and every goal
     write is withheld from state.db while private anyway.
     """
-    from agent.incognito import is_incognito
-    return bool(getattr(session_entry, "incognito", False)) or is_incognito(getattr(session_entry, "session_id", None))
+    return bool(getattr(session_entry, "incognito", False)) or session_private(
+        getattr(session_entry, "session_id", None), getattr(session_entry, "session_key", None),
+    )
+
+
+def session_private(*identities) -> bool:
+    """Suspend background work for private sessions, including an in-flight privacy switch."""
+    from agent.incognito import is_registered
+    from gateway.incognito import transition_pending
+    return any(is_registered(identity) or transition_pending(identity) for identity in identities)
 
 
 def _goal_notice_kind(message: str) -> str:
@@ -1351,6 +1359,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         if not await automatic_route_available(self, source):
             return
+        # Recheck after every async eligibility probe. The existing background reservation
+        # then fences /incognito through claim/admission without holding a reentrant route lock.
+        if _goal_suspended_while_private(entry):
+            return
         # A marker absent from the initial snapshot may be created while the barrier check runs.
         # The live SessionEntry is the generation fence for that narrow race: defer to the next
         # scan without clearing the fresh marker or admitting a continuation under stale fences.
@@ -1372,34 +1384,35 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         reservation = self._reserve_background_turn(key, event)
         if reservation is None:
             return  # background turn limit reached: keep the barrier for a later scan
-        if not await self._clear_stale_resume_pending(key, resume_marker, sid, "goal wakeup"):
-            self._release_background_turn(reservation)
-            return  # marker changed or the session disappeared; retry on the next scan
-        from gateway.wake import WakeNotAccepted, admit_internal_event
+        with self._get_replay_scheduler().gate.admitting(reservation):
+            if not await self._clear_stale_resume_pending(key, resume_marker, sid, "goal wakeup"):
+                self._release_background_turn(reservation)
+                return  # marker changed or the session disappeared; retry on the next scan
+            from gateway.wake import WakeNotAccepted, admit_internal_event
 
-        try:
-            # A normal return from handle_message is not admission (routing refusal, session-key
-            # mismatch); only the adapter's receipt proves a continuation was scheduled.
-            await admit_internal_event(adapter, event)
-        except WakeNotAccepted:
-            logger.info("goal wakeup: continuation for session %s not admitted; barrier kept for retry", sid)
-            return
-        # The lifted-barrier path dispatches before the continuation turn's evaluator runs. Stamp
-        # this accepted wake now so a CONTINUE result cannot immediately dispatch a second one.
-        # Admission may rebind the continuation to a compression successor, so stamp the live
-        # destination from the event metadata rather than the pre-admission manager.
-        accepted_sid = str(event.metadata.get("goal_continuation_session_id") or sid)
-        anchor_mgr = mgr if accepted_sid == sid else GoalManager(
-            session_id=accepted_sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
-        )
-        await self._run_in_executor_with_context(
-            lambda: anchor_mgr.mark_automatic_continuation_dispatched(
-                expected_instance=event.metadata.get("goal_continuation_instance"),
-                expected_fingerprint=event.metadata.get("goal_continuation_fingerprint"),
+            try:
+                # A normal return from handle_message is not admission (routing refusal, session-key
+                # mismatch); only the adapter's receipt proves a continuation was scheduled.
+                await admit_internal_event(adapter, event)
+            except WakeNotAccepted:
+                logger.info("goal wakeup: continuation for session %s not admitted; barrier kept for retry", sid)
+                return
+            # The lifted-barrier path dispatches before the continuation turn's evaluator runs. Stamp
+            # this accepted wake now so a CONTINUE result cannot immediately dispatch a second one.
+            # Admission may rebind the continuation to a compression successor, so stamp the live
+            # destination from the event metadata rather than the pre-admission manager.
+            accepted_sid = str(event.metadata.get("goal_continuation_session_id") or sid)
+            anchor_mgr = mgr if accepted_sid == sid else GoalManager(
+                session_id=accepted_sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
             )
-        )
-        # Resuming is silent: the continuation turn itself is the visible signal.
-        await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
+            await self._run_in_executor_with_context(
+                lambda: anchor_mgr.mark_automatic_continuation_dispatched(
+                    expected_instance=event.metadata.get("goal_continuation_instance"),
+                    expected_fingerprint=event.metadata.get("goal_continuation_fingerprint"),
+                )
+            )
+            # Resuming is silent: the continuation turn itself is the visible signal.
+            await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups and resume lifted /goal waits for idle gateway sessions: a coarse

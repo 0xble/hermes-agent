@@ -17,6 +17,7 @@ import heapq
 import itertools
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
@@ -39,6 +40,15 @@ class ReplayItem:
     on_drop: Optional[Callable[[], Any]] = field(compare=False, default=None)
     gated: bool = field(compare=False, default=False)
     enqueued_at: float = field(compare=False, default=0.0)
+
+
+@dataclass
+class _Reservation:
+    key: Any
+    granted_at: float
+    expires_at: float
+    admitting: bool = False
+    released: bool = False
 
 
 class BackgroundTurnGate:
@@ -70,18 +80,19 @@ class BackgroundTurnGate:
         self.closing = closing
         self._spacing_s = max(0.0, float(spacing_s))
         self._reservation_s = float(reservation_s)
-        # token -> (session key, granted wall time, expiry)
-        self._reserved: dict[object, tuple[Any, float, float]] = {}
+        # A reservation carries both capacity expiry and its caller's admission lifetime.
+        self._reserved: dict[object, _Reservation] = {}
         self._next_grant_at = 0.0
 
     def load(self) -> int:
         now = time.monotonic()
         claimed = self._claimed_since or (lambda _key, _since: False)
         self._reserved = {
-            token: (key, granted, until) for token, (key, granted, until) in self._reserved.items()
-            if until > now and not claimed(key, granted)
+            token: reservation for token, reservation in self._reserved.items()
+            if reservation.admitting or (reservation.expires_at > now
+                                         and not claimed(reservation.key, reservation.granted_at))
         }
-        return len(set(self._running_keys()) | {key for key, _granted, _until in self._reserved.values()})
+        return len(set(self._running_keys()) | {reservation.key for reservation in self._reserved.values()})
 
     def retry_after(self) -> Optional[float]:
         """None when a queued background turn may start now, else seconds until the next check."""
@@ -98,13 +109,38 @@ class BackgroundTurnGate:
         """A reservation token for ``key`` if a background turn may start now, else None."""
         return self._reserve(key) if self.load() < self.limit else None
 
+    def admission_pending(self, key: str) -> bool:
+        """An active caller still owns claim/admission work for this route."""
+        return any(reservation.key == key and reservation.admitting
+                   for reservation in self._reserved.values())
+
+    @contextmanager
+    def admitting(self, token: object):
+        """Keep the existing reservation alive through claim, admission and settlement awaits.
+
+        An admitted turn can finish before its caller's bookkeeping does. Neither a turn claim
+        nor the ordinary reservation timeout may release this privacy fence early.
+        """
+        reservation = self._reserved[token]
+        reservation.admitting = True
+        try:
+            yield
+        finally:
+            reservation.admitting = False
+            if reservation.released:
+                self._reserved.pop(token, None)
+
     def release(self, token: object) -> None:
         """Return a reservation whose admission was refused before any turn claimed it."""
-        self._reserved.pop(token, None)
+        reservation = self._reserved.get(token)
+        if reservation is not None and reservation.admitting:
+            reservation.released = True
+        else:
+            self._reserved.pop(token, None)
 
     def _reserve(self, key: Any) -> object:
         token = object()
-        self._reserved[token] = (key, time.time(), time.monotonic() + self._reservation_s)
+        self._reserved[token] = _Reservation(key, time.time(), time.monotonic() + self._reservation_s)
         return token
 
 
