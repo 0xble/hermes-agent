@@ -332,3 +332,65 @@ def test_failed_pool_drains_running_pass_before_replacement(tmp_path, monkeypatc
     first.result(timeout=5)
     _request(home_b).result(timeout=5)
     assert calls == [home_a, home_b]
+
+
+def test_current_arm_receipt_survives_concurrent_expiry_scan(tmp_path, monkeypatch):
+    """A pending canonical result must not lose its job to partial-effects retirement.
+
+    The replacement scheduler observes a dead owner's started one-shot off-tick.
+    Until that exact receipt settles, expiry cannot delete its bookkeeping target.
+    No payload or provider transport is invoked by this regression.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from gateway import session_cron
+    from hermes_cli import gateway_client
+
+    home = tmp_path / 'home'
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    clock = [datetime(2026, 11, 4, 12, tzinfo=UTC)]
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: clock[0])
+    monkeypatch.setattr(session_cron, 'owner_for_home', lambda home: None)
+    entered, release = threading.Event(), threading.Event()
+
+    class Peer:
+        async def rpc(self, method, **params):
+            assert method == 'cron.recover'
+            entered.set()
+            assert release.wait(60), 'test did not release canonical receipt'
+            return {'status': 'terminal', 'job': started,
+                    'result': [True, 'captured document', 'captured answer', None]}
+
+    @asynccontextmanager
+    async def connected():
+        yield Peer()
+
+    monkeypatch.setattr(gateway_client, 'connect_gateway', connected)
+    with jobs.use_cron_store(home):
+        job = jobs.create_job(prompt='fixture', schedule='in 1m', deliver='local')
+        clock[0] += timedelta(minutes=1)
+        assert jobs.claim_dispatch(job['id'])
+        started = jobs.get_job(job['id'])
+        assert started is not None
+        fire = executions.create_execution(job['id'], source='test',
+                                            scheduled_instant=started['next_run_at'])['id']
+        executions.mark_execution_running(fire)
+        journal = _foreign_journal(started, fire)
+        clock[0] += timedelta(minutes=10)
+        future = _request(home)
+        try:
+            assert entered.wait(5), 'canonical observation did not start'
+            assert jobs.get_due_jobs() == []
+            scanned = jobs.get_job(job['id'])
+            assert journal.exists()
+        finally:
+            release.set()
+            future.result(timeout=10)
+        completed = jobs.get_job(job['id'])
+        result = executions.get_execution(fire)
+        assert scanned is not None, 'expiry deleted the canonical receipt target'
+        assert completed is not None and completed['state'] == 'completed'
+        assert completed['canonical_completions'] == [fire]
+        assert result is not None and result['status'] == 'completed'
+        assert not journal.exists()
+        assert jobs.get_due_jobs() == []
