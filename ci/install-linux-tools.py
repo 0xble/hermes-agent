@@ -3,11 +3,14 @@
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import random
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
@@ -89,17 +92,57 @@ def extract_archive(source: tarfile.TarFile, destination: Path) -> None:
             raise RuntimeError(f'Archive link chain escapes extraction root: {name}')
 
 
-def main(architecture: str) -> None:
+def download(url: str, archive: Path) -> None:
+    """Retry transient transport failures, with five attempts and a 180s budget."""
+    deadline = time.monotonic() + 180
+    for attempt in range(1, 6):
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f'Download budget exhausted: {url}')
+            # Each retry truncates any partial body left by a failed read.
+            with urllib.request.urlopen(url, timeout=min(120, remaining)) as response, archive.open('wb') as target:
+                shutil.copyfileobj(response, target)
+            return
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError) as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+                if not (error.code == 429 or 500 <= error.code < 600):
+                    raise
+            remaining = deadline - time.monotonic()
+            if attempt == 5 or remaining <= 0:
+                raise
+            delay = min(2 ** attempt + random.uniform(0, 1), remaining)
+            if delay >= remaining:
+                raise
+            print(f'Download retry {attempt}/4: {url}: {type(error).__name__}: {error}; waiting {delay:.2f}s',
+                  file=sys.stderr, flush=True)
+            time.sleep(delay)
+
+
+def main(architecture: str, cache_directory: Path | None = None) -> None:
     artifacts = json.loads((HERE / 'linux-artifacts.json').read_text(encoding='utf-8'))[architecture]
     for artifact in artifacts:
         with tempfile.TemporaryDirectory(prefix='hermes-ci-tool-') as directory:
             scratch = Path(directory)
-            archive = scratch / 'download'
-            with urllib.request.urlopen(artifact['url'], timeout=120) as response, archive.open('wb') as target:
-                shutil.copyfileobj(response, target)
+            cached = cache_directory / artifact['sha256'] if cache_directory is not None else None
+            cache_hit = cached is not None and cached.is_file()
+            archive = cached if cache_hit else scratch / 'download'
+            if not cache_hit:
+                download(artifact['url'], archive)
             actual = hashlib.sha256(archive.read_bytes()).hexdigest()
             if actual != artifact['sha256']:
                 raise RuntimeError(f"Checksum mismatch: {artifact['url']}")
+            # Restored archives are untrusted: verification above is unconditional.
+            if cached is not None and not cache_hit:
+                cache_directory.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(dir=cache_directory, delete=False) as staged:
+                    staged_path = Path(staged.name)
+                try:
+                    shutil.copyfile(archive, staged_path)
+                    staged_path.replace(cached)
+                finally:
+                    staged_path.unlink(missing_ok=True)
             kind = artifact['kind']
             if kind == 'hadolint':
                 target = Path('/usr/local/bin/hadolint')
@@ -122,4 +165,4 @@ def main(architecture: str) -> None:
 
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    main(sys.argv[1], Path(sys.argv[2]) if len(sys.argv) > 2 else None)
