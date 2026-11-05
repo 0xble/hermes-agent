@@ -391,7 +391,7 @@ def _rewrite_browser_exec(td: dict[str, Any], available: set) -> Optional[dict[s
     if "terminal" not in available:
         return None
     from tools.vision_tools import _should_use_native_vision_fast_path
-    if "vision_analyze" in available and not _should_use_native_vision_fast_path():
+    if "vision_analyze" in available and not _should_use_native_vision_fast_path(allow_network=False):
         fn = td["function"]
         return _fn_def({**fn, "description": fn.get("description", "")
                         + " For images, pass its capture_screenshot() path to vision_analyze."})

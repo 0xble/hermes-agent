@@ -545,7 +545,11 @@ def test_browser_exec_points_at_vision_analyze_only_when_the_session_has_it(monk
     from model_tools import _apply_dynamic_schemas
     from tools import browser_use_cli as bu_cli
 
-    monkeypatch.setattr("tools.vision_tools._should_use_native_vision_fast_path", lambda: native)
+    def native_vision(*, allow_network):
+        assert allow_network is False
+        return native
+
+    monkeypatch.setattr("tools.vision_tools._should_use_native_vision_fast_path", native_vision)
     monkeypatch.setattr("tools.vision_tools.check_vision_requirements", lambda: True)
     monkeypatch.setattr("tools.browser_tool_lightpanda_fallback.lightpanda_engine_status", lambda: (False, ""))
     exec_def = {"type": "function", "function": {"name": "browser_exec", **bu_cli._dynamic_schema_overrides()}}
