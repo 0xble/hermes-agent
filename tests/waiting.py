@@ -71,14 +71,14 @@ def process_children(process_or_pid) -> list:
         return []
 
 
-def process_cmdline(process) -> list[str]:
+def process_cmdline(process) -> list[str] | None:
     """Read a diagnostic/matching command line without racing a child's reap."""
     import psutil
 
     try:
         return process.cmdline()
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return []
+        return None
 
 
 def _timed_out(what: str | None, timeout: float) -> AssertionError:
