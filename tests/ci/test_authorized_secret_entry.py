@@ -101,7 +101,8 @@ def test_secret_entry_guard_preserves_source_and_destination_safeguards(text):
 def test_card_fallback_never_routes_around_approval_refusal(name, code):
     from tools.browser_use_cli import BROWSER_EXEC_SCHEMA
     schemas = []
-    for tool in ("browser_type", "browser_vault"):
+    # browser_exec is available only on sessions that also expose terminal.
+    for tool in ("browser_type", "browser_vault", "terminal"):
         entry = registry.get_entry(tool)
         assert entry is not None
         schemas.append({"type": "function", "function": entry.schema})

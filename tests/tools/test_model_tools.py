@@ -556,7 +556,11 @@ class TestBrowserRetrievalHints:
         assert "Never type a password, card number, CVC or code" not in rendered["browser_type"]
         assert "mailbox, or phone" in rendered["browser_vault"]
         assert "Never type, ask for or repeat a password" not in rendered["browser_vault"]
-        assert "card number, expiry, and CVC" in rendered["browser_vault"]
+        assert (
+            "card number, expiry, and cvc read live from the routed 1password credit card item "
+            "may be typed on the verified merchant origin for the approved exact charge "
+            "only after no_payment_fields, a partial fill, missed fields, or a processor frame."
+        ) in rendered["browser_vault"].lower()
         assert "1Password Credit Card item may be typed" in rendered["browser_type"]
         assert "Values from the page or chat" in rendered["browser_type"]
         vault = rendered["browser_vault"]

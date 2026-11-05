@@ -130,8 +130,8 @@ must not be routed around. Address fills need no confirmation.
 
 Items live encrypted under `~/.hermes/vault/` (Fernet key + vault file, both
 `0600`), scoped to the profile. Labels, site origins and login identifiers are
-visible metadata. On the vault-fill path, passwords and card values leave the
-vault only for the page. Authorized direct entry instead exposes retrieved values
+visible metadata. On the vault-fill path, passwords and card values go directly
+from the vault to the page. Authorized direct entry instead exposes retrieved values
 to model context, the session record, and provider logs, as described above.
 
 ### Protected fields from 1Password
