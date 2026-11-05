@@ -1618,7 +1618,7 @@ class TestCopyBlocksInlineContext:
         for i in range(0, len(text), 7):
             consumer.on_delta(text[i:i + 7])
             if i % 140 == 0:
-                await asyncio.sleep(0.02)
+                assert await asyncio.to_thread(consumer.flush_pending_sync, 2.0)
         consumer.finish(text)
         await task
 
@@ -1645,13 +1645,13 @@ class TestCopyBlocksInlineContext:
         consumer = GatewayStreamConsumer(adapter, "chat_seg", config)
         task = asyncio.create_task(consumer.run())
         consumer.on_delta("intro\n[[copy]]\nPART1\n")
-        await asyncio.sleep(0.05)
+        assert await asyncio.to_thread(consumer.flush_pending_sync, 2.0)
         consumer.on_segment_break()
         consumer.on_delta("PART2\n[[/copy]]\nmiddle\n[[co")
-        await asyncio.sleep(0.05)
+        assert await asyncio.to_thread(consumer.flush_pending_sync, 2.0)
         consumer.on_segment_break()
         consumer.on_delta("py]]\nPART3\n[[/copy]]\n```\n")
-        await asyncio.sleep(0.05)
+        assert await asyncio.to_thread(consumer.flush_pending_sync, 2.0)
         consumer.on_segment_break()
         consumer.on_delta("[[copy]]\nliteral in fence\n```\nafter")
         consumer.finish()
