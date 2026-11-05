@@ -7,7 +7,38 @@ concurrency:
   group: repository-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 jobs:
+  plan:
+    name: Freeze candidate gate mode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      upstream_base: ${{ steps.mode.outputs.upstream_base }}
+    # Policy is carried by the workflow merge revision, like the existing fork gate.
+    # Candidate-controlled executable presence never selects the weaker mode.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Freeze upstream history and classify immutable ancestry
+        id: mode
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git -C candidate fetch --no-tags https://github.com/NousResearch/hermes-agent.git main
+          upstream=$(git -C candidate rev-parse FETCH_HEAD)
+          python3 scripts/ci/candidate_mode.py candidate "$HEAD_SHA" "$upstream"
   linux:
+    needs: plan
+    if: needs.plan.outputs.mode == 'fork'
+    timeout-minutes: 60
     name: Static and Node gate
     runs-on: ubuntu-latest
     container:
@@ -22,6 +53,16 @@ jobs:
       - name: Configure Git safe directory
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Checkout frozen trusted fork harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: gate-harness
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Keep harness outside the candidate checkout
+        shell: bash
+        run: mv gate-harness "$RUNNER_TEMP/gate-harness"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -35,21 +76,26 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
       - name: Install pinned Linux toolchain and platform libraries
+        if: needs.plan.outputs.mode == 'fork'
         shell: bash
         run: |
           apt-get update
           apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libx11-dev libxi-dev libxdo-dev libssl-dev libffi-dev patchelf
-          python3 ci/install-linux-tools.py amd64
+          python3 "$RUNNER_TEMP/gate-harness/ci/install-linux-tools.py" amd64
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
           uv python install 3.14.7
           npm install --global npm@12.0.0
       - name: Exact-SHA static and Node gate
+        if: needs.plan.outputs.mode == 'fork'
         shell: bash
         run: |
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
   python-shard:
+    needs: plan
+    if: needs.plan.outputs.mode == 'fork'
+    timeout-minutes: 90
     name: Python and e2e (${{ matrix.shard }}/10)
     runs-on: ubuntu-latest
     strategy:
@@ -68,6 +114,16 @@ jobs:
       - name: Configure Git safe directory
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Checkout frozen trusted fork harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: gate-harness
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Keep harness outside the candidate checkout
+        shell: bash
+        run: mv gate-harness "$RUNNER_TEMP/gate-harness"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -77,18 +133,21 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
       - name: Install pinned Linux toolchain and platform libraries
+        if: needs.plan.outputs.mode == 'fork'
         shell: bash
         run: |
           apt-get update
           apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev tmux unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
-          python3 ci/install-linux-tools.py amd64
+          python3 "$RUNNER_TEMP/gate-harness/ci/install-linux-tools.py" amd64
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
           uv python install 3.14.7
           npm install --global npm@12.0.0
       - name: Verify tmux for e2e coverage
+        if: needs.plan.outputs.mode == 'fork'
         shell: bash
         run: tmux -V
       - name: Exact-SHA Python shard
+        if: needs.plan.outputs.mode == 'fork'
         shell: bash
         env:
           HERMES_E2E_REQUIRE_TUI: "1"
@@ -96,26 +155,272 @@ jobs:
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
+  upstream-static:
+    name: Upstream blocking lint, JS and Rust
+    needs: plan
+    if: needs.plan.outputs.mode == 'upstream'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout frozen trusted fork harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: gate-harness
+          persist-credentials: false
+      - run: mv gate-harness "$RUNNER_TEMP/gate-harness"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Assert exact upstream candidate
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+      - name: Install upstream Linux prerequisites
+        if: needs.plan.outputs.mode == 'upstream'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev tmux ripgrep unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libx11-dev libxi-dev libxdo-dev libssl-dev libffi-dev patchelf bubblewrap
+      - name: Install upstream-pinned ripgrep
+        run: |
+          version=15.1.0
+          archive="ripgrep-${version}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "https://github.com/BurntSushi/ripgrep/releases/download/${version}/$archive"
+          echo "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          sudo install "$RUNNER_TEMP/ripgrep-${version}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+      - name: Set up candidate-owned locked PM and test environment
+        if: needs.plan.outputs.mode == 'upstream'
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain", "messaging"]'
+          test-environment: 'true'
+          cache: 'false'
+          cache-python: 'false'
+          cache-node: 'false'
+      - name: Require WAL-capable SQLite
+        if: needs.plan.outputs.mode == 'upstream'
+        shell: bash
+        run: '"$HERMES_PYTHON" -c "import sqlite3, hermes_state_wal as w; print(sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"'
+      - name: Full candidate-owned blocking lint
+        env:
+          UPSTREAM_BASE: ${{ needs.plan.outputs.upstream_base }}
+        run: python scripts/check --base "$UPSTREAM_BASE"
+      - name: Full candidate-owned JS and TypeScript suites
+        if: success() || failure()
+        run: |
+          npm ci
+          node scripts/build/electron-runtime.mjs --source .
+          npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/whatsapp-bridge
+          node .github/scripts/run-workspace-checks.mjs --concurrency 2
+      - name: Full candidate-owned WhatsApp Node suite
+        if: success() || failure()
+        run: node --test scripts/whatsapp-bridge/*.test.mjs
+      - name: Candidate-owned Rust bootstrap suite
+        if: success() || failure()
+        working-directory: apps/bootstrap-installer/src-tauri
+        run: cargo test --lib
+      - name: Assert unchanged exact candidate source
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+  upstream-python:
+    name: Upstream Python (${{ matrix.shard }}/10)
+    needs: plan
+    if: needs.plan.outputs.mode == 'upstream'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - name: Checkout frozen trusted fork harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: gate-harness
+          persist-credentials: false
+      - run: mv gate-harness "$RUNNER_TEMP/gate-harness"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Assert exact upstream candidate
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+      - name: Install upstream Linux prerequisites
+        if: needs.plan.outputs.mode == 'upstream'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev tmux ripgrep unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libx11-dev libxi-dev libxdo-dev libssl-dev libffi-dev patchelf bubblewrap
+      - name: Install upstream-pinned ripgrep
+        run: |
+          version=15.1.0
+          archive="ripgrep-${version}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "https://github.com/BurntSushi/ripgrep/releases/download/${version}/$archive"
+          echo "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          sudo install "$RUNNER_TEMP/ripgrep-${version}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+      - name: Set up candidate-owned locked PM and test environment
+        if: needs.plan.outputs.mode == 'upstream'
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain", "messaging"]'
+          test-environment: 'true'
+          cache: 'false'
+          cache-python: 'false'
+          cache-node: 'false'
+      - name: Require WAL-capable SQLite
+        if: needs.plan.outputs.mode == 'upstream'
+        shell: bash
+        run: '"$HERMES_PYTHON" -c "import sqlite3, hermes_state_wal as w; print(sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"'
+      - name: Full candidate-owned Python suite (all slices required)
+        env:
+          HERMES_TEST_SLICE: ${{ matrix.shard }}/10
+          HERMES_TEST_WORKERS: '4'
+          HERMES_TEST_FILE_TIMEOUT: '600'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: scripts/run_tests.sh
+      - name: Assert unchanged exact candidate source
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+  upstream-e2e:
+    name: Upstream E2E (${{ matrix.shard }}/10)
+    needs: plan
+    if: needs.plan.outputs.mode == 'upstream'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - name: Checkout frozen trusted fork harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: gate-harness
+          persist-credentials: false
+      - run: mv gate-harness "$RUNNER_TEMP/gate-harness"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Assert exact upstream candidate
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+      - name: Install upstream Linux prerequisites
+        if: needs.plan.outputs.mode == 'upstream'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev tmux ripgrep unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libx11-dev libxi-dev libxdo-dev libssl-dev libffi-dev patchelf bubblewrap
+      - name: Install upstream-pinned ripgrep
+        run: |
+          version=15.1.0
+          archive="ripgrep-${version}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "https://github.com/BurntSushi/ripgrep/releases/download/${version}/$archive"
+          echo "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          sudo install "$RUNNER_TEMP/ripgrep-${version}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+      - name: Set up candidate-owned locked PM and test environment
+        if: needs.plan.outputs.mode == 'upstream'
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain", "messaging"]'
+          test-environment: 'true'
+          cache: 'false'
+          cache-python: 'false'
+          cache-node: 'false'
+      - name: Require WAL-capable SQLite
+        if: needs.plan.outputs.mode == 'upstream'
+        shell: bash
+        run: '"$HERMES_PYTHON" -c "import sqlite3, hermes_state_wal as w; print(sqlite3.sqlite_version); assert not w.is_sqlite_wal_reset_vulnerable()"'
+      - name: Prepare real TUI for all candidate E2E suites
+        run: |
+          npm ci --workspace ui-tui --ignore-scripts --no-audit --no-fund
+          npm run build --workspace ui-tui
+          tmux -V
+      - name: Full candidate-owned E2E suite (including upgrade)
+        env:
+          HERMES_TEST_SLICE: ${{ matrix.shard }}/10
+          HERMES_TEST_WORKERS: '2'
+          HERMES_TEST_FILE_TIMEOUT: '3000'
+          HERMES_TEST_FILE_RETRIES: '0'
+          HERMES_E2E_REQUIRE_TUI: '1'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          python -c "from tests.e2e.core.upgrade._helpers import BWRAP_OK; assert BWRAP_OK, 'bwrap unusable'"
+          scripts/run_tests.sh --include-integration tests/e2e
+      - name: Messaging-gated gateway contracts (no skipped coverage)
+        if: matrix.shard == 1 && (success() || failure())
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/messaging-gateway.log"
+          scripts/run_tests.sh -rs tests/gateway/test_native_role_reauthorization.py tests/gateway/test_native_telegram_startup_recovery.py tests/gateway/test_native_pause_notice.py tests/gateway/test_native_reply_crash_recovery.py | tee "$log"
+          summary=$(grep '^=== Summary:' "$log")
+          case "$summary" in *skipped*) echo "Messaging contracts skipped: $summary" >&2; exit 1 ;; esac
+      - name: Assert unchanged exact candidate source
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
   prompt-surface:
+    needs: plan
     name: Prompt surface diff
     uses: ./.github/workflows/prompt-surface-diff.yml
     permissions:
       contents: read
   qualification:
     if: always()
-    needs: [linux, python-shard, prompt-surface]
+    needs: [plan, linux, python-shard, upstream-static, upstream-python, upstream-e2e, prompt-surface]
     runs-on: ubuntu-latest
     steps:
       - name: Require every gate job
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           DRAFT_PR: ${{ github.event.pull_request.draft }}
+          MODE: ${{ needs.plan.outputs.mode }}
         run: |
           python3 - <<'PY'
           import json, os, sys
           results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
           print(results)
-          if results and all(result == 'success' for result in results.values()):
+          common = ['plan', 'prompt-surface']
+          modes = {'fork': ['linux', 'python-shard'],
+                   'upstream': ['upstream-static', 'upstream-python', 'upstream-e2e']}
+          mode = os.environ['MODE']
+          required = common + modes.get(mode, [])
+          inactive = set(results) - set(required)
+          valid = (mode in modes and all(results.get(name) == 'success' for name in required)
+                   and all(results[name] == 'skipped' for name in inactive))
+          if valid:
               sys.exit(0)
           not_run = [name for name, result in results.items() if result != 'success']
           only_skipped = bool(not_run) and all(results[name] == 'skipped' for name in not_run)
