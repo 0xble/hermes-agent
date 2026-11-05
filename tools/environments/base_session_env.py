@@ -237,10 +237,12 @@ def relay_parent_export_line(address: str) -> str:
     return f"export RELAY_PARENT_ADDRESS={shlex.quote(address)}"
 
 
-def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None:
-    """Locate the last ``marker<path>marker`` pair in *output*. Returns
-    ``(cwd_path_or_None, output_without_marker_line)``, or ``None`` when no complete pair
-    exists. The stripped span runs from the ``\\n`` the wrapper injected before the marker
+def _split_cwd_marker(output: str, marker: str, *, validate_cwd: bool = True) -> tuple[str | None, str] | None:
+    """Locate the last ``marker<body>marker`` pair in *output*. Returns
+    ``(body_or_None, output_without_marker_line)``, or ``None`` when no complete pair
+    exists. CWD bodies must be absolute, single-line paths; ``validate_cwd=False``
+    keeps the generic body for other wrapper markers such as PIPESTATUS.
+    The stripped span runs from the ``\\n`` the wrapper injected before the marker
     through the end of the marker line."""
     last = output.rfind(marker)
     if last == -1:
@@ -250,7 +252,7 @@ def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None
     if first == -1 or first == last:
         return None
     cwd_path = output[first + len(marker) : last].removesuffix("\n")
-    if not cwd_path.startswith("/") or "\n" in cwd_path or "\r" in cwd_path:
+    if validate_cwd and (not cwd_path.startswith("/") or "\n" in cwd_path or "\r" in cwd_path):
         cwd_path = None
     line_start = output.rfind("\n", 0, first)
     if line_start == -1:

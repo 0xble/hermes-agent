@@ -21,10 +21,13 @@ substitution in `eval`. Parse the eval and its complete epilogue as 1 brace grou
 after sourcing the snapshot so aliases and shell options still apply. Keep
 PIPESTATUS capture inside the existing eval. Emit `pwd -P` between marker
 delimiters without command substitution, suppress its diagnostics, and reject
-non-absolute or multiline marker bodies without replacing the previous cwd.
+non-absolute or multiline cwd marker bodies without replacing the previous cwd.
+Apply path validation only to cwd: PIPESTATUS keeps its generic numeric body,
+so piped verifier results retain per-segment attribution.
 
 Contract tests: `tests/tools/test_terminal_bash_parser_recovery.py`,
-`tests/tools/test_terminal_pipeline_status.py`, `tests/tools/test_base_environment.py`.
+`tests/tools/test_terminal_pipeline_status.py`, `tests/tools/test_base_environment.py`,
+`tests/tools/test_terminal_marker_extraction.py`.
 The real-shell regressions preserve Bash 3.2's exit 1 and modern Bash's exit 2
 without accepting a signal, retain snapshots and aliases, and recover after a
 command removes its own working directory. Retire only when released upstream
