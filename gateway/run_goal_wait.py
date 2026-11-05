@@ -45,7 +45,7 @@ def goal_wait_guard(authority, event):
             raise RuntimeStoreError('admission_conflict', field='goal_wait')
         # All reads and writes use this connection. Never a nested GoalManager save.
         state.last_automatic_continuation_at = max(state.last_automatic_continuation_at, time())
-        state.clear_wait()
+        state.clear_wait(preserve_notice_key=True)
         from uuid import uuid4
         state.mutation_id = uuid4().hex
         conn.execute('UPDATE state_meta SET value=? WHERE key=?', (state.to_json(), _meta_key(entry.session_id)))
@@ -69,11 +69,10 @@ def _retry_later(runner, sid, identity):
 
 async def dispatch_goal_wait(runner, adapter, source, key, sid, manager, prompt, resume_marker):
     from gateway.session_authorities import active_authority
-    from gateway.session_route_wake import admit_route_wake_receipt
     authority = active_authority(runner)
     managed = authority is not None or hasattr(runner, 'session_authority') or hasattr(runner, 'session_authorities')
     state = manager.state
-    identity = goal_wait_identity(authority, sid, state)
+    identity = await runner._run_in_executor_with_context(goal_wait_identity, authority, sid, state)
     if not _retry_due(runner, sid, identity):
         return
     event = runner._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True,
@@ -84,7 +83,12 @@ async def dispatch_goal_wait(runner, adapter, source, key, sid, manager, prompt,
     reservation = runner._reserve_background_turn(key, event)
     if reservation is None:
         return
-    if not await runner._clear_stale_resume_pending(key, resume_marker, sid, 'goal wakeup'):
+    try:
+        cleared = await runner._clear_stale_resume_pending(key, resume_marker, sid, 'goal wakeup')
+    except BaseException:
+        runner._release_background_turn(reservation)
+        raise
+    if not cleared:
         runner._release_background_turn(reservation)
         return
     # The admission owns the reservation even if its observer is cancelled while
@@ -127,11 +131,12 @@ async def _dispatch_reserved(runner, authority, managed, adapter, source, key, s
         if authority is not None:
             import asyncio
             from hermes_state_runtime import find_session_admission
-            row = await asyncio.to_thread(find_session_admission, authority.db,
-                principal_id='automation:' + key, session_id=authority.logical_owner(sid), request_id=identity)
+            row = await asyncio.to_thread(lambda: find_session_admission(authority.db,
+                principal_id='automation:' + key, session_id=authority.logical_owner(sid), request_id=identity))
             admitted = row is not None
         _retry_later(runner, sid, identity)
-        logger.info('goal wakeup: continuation for session %s refused (%s); barrier kept for retry', sid, exc)
+        logger.info('goal wakeup: continuation for session %s refused (%s); retrying admission',
+                    sid, exc, exc_info=True)
     finally:
         if not admitted:
             runner._release_background_turn(reservation)
