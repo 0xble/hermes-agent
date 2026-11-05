@@ -14,8 +14,10 @@ The immutable fork gate ancestor is
 Every descendant must run the existing static/Node gate and all ten Python/E2E
 shards. Deleting `bin/ci` fails planning; it cannot select upstream mode. Missing
 history, wrong SHA, an unknown gate lineage, and absent upstream entrypoints also
-fail closed. The planner executes policy from the workflow's merge revision;
-it does not execute candidate code to choose a mode.
+fail closed. The planner executes policy from the frozen base checkout, never
+the candidate or merge revision. For bases predating the policy file, the rollout
+uses the explicit `988caf4adf1cbf3a4eef579708e619961699f7af` selector pin. Candidate
+edits to the selector cannot change mode selection.
 
 Each execution job checks out `pull_request.base.sha` separately, moves that
 harness outside the candidate tree, then checks out and asserts `head.sha`.
@@ -42,6 +44,10 @@ GitHub-hosted Ubuntu runners:
 
 WAL-capable SQLite is required rather than accepting silent WAL coverage skips.
 PM reads the candidate's locks and installs both development and test groups.
+The prepared PM test environment is exposed through checkout `.venv`, the path
+required by the upgrade migration oracle. Upgrade setup fetches upstream CalVer
+tags and records the exact historical baseline, and separately requires working
+bubblewrap network namespaces instead of allowing hostile-network coverage skips.
 Native macOS/Windows, Docker backends, release publishing, credentials-dependent
 live tests, and visual release checks remain separate lanes, as with the fork
 source gate. This is not a claim to reproduce all upstream release CI.

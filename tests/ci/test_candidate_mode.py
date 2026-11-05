@@ -68,6 +68,15 @@ def test_fork_candidate_keeps_full_fork_gate(graph):
     assert mode.select(root, candidate, upstream) == ("fork", "")
 
 
+def test_candidate_selector_tampering_cannot_change_fork_classification(graph):
+    root, _, commit, upstream, _ = graph
+    candidate = commit("tampered selector", {
+        "scripts/ci/candidate_mode.py": "raise RuntimeError('candidate policy executed')\n",
+    })
+    # Execute the loaded trusted policy, not the candidate's replacement file.
+    assert mode.select(root, candidate, upstream) == ("fork", "")
+
+
 def test_deleting_gate_cannot_downgrade_fork(graph):
     root, _, commit, upstream, _ = graph
     candidate = commit("delete gate", {"bin/ci": None})
