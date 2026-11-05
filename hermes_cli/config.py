@@ -946,6 +946,7 @@ def get_missing_skill_config_vars() -> list[dict[str, Any]]:
 # defaults are accepted automatically. These optional/legacy roots are valid on disk but
 # intentionally absent from DEFAULT_CONFIG (omitted when unused / alternate schema forms).
 _EXTRA_KNOWN_ROOT_KEYS = {
+    "model_presets",    # named static routes expanded by hermes_cli.model_presets at runtime
     "custom_providers",  # legacy list form; modern equivalent is providers: {}
     "fallback_model",    # optional single dict or chain list; omitted when disabled
     "mcp_servers",       # MCP server definitions written by setup/tools flows
@@ -1501,58 +1502,6 @@ def _env_ref_snapshot(obj, snapshot=None):
     return snapshot
 
 
-def _items_by_unique_name(items):
-    """Return a name-indexed dict only when all items have unique string names."""
-    if not isinstance(items, list):
-        return None
-    indexed = {}
-    for item in items:
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-            return None
-        name = item["name"]
-        if name in indexed:
-            return None
-        indexed[name] = item
-    return indexed
-
-
-def _preserve_env_ref_templates(current, raw, loaded_expanded=None):
-    """Restore raw ``${VAR}`` templates where the value is otherwise unchanged, so persisting a
-    loaded (expanded) config never writes the plaintext secret back to ``config.yaml``."""
-    if isinstance(current, str) and isinstance(raw, str) and _ENV_REF_RE.search(raw):
-        if current in (raw, loaded_expanded) or _expand_env_vars(raw) == current:
-            return raw
-        return current
-
-    if isinstance(current, dict) and isinstance(raw, dict):
-        return {
-            key: _preserve_env_ref_templates(
-                value, raw.get(key),
-                loaded_expanded.get(key) if isinstance(loaded_expanded, dict) else None)
-            for key, value in current.items()}
-
-    if isinstance(current, list) and isinstance(raw, list):
-        # Match named objects (e.g. custom_providers) by name so reordering keeps templates;
-        # with duplicate names fall back to positional matching rather than shadowing an entry.
-        current_by_name = _items_by_unique_name(current)
-        raw_by_name = _items_by_unique_name(raw)
-        loaded_by_name = _items_by_unique_name(loaded_expanded)
-        if current_by_name is not None and raw_by_name is not None:
-            return [
-                _preserve_env_ref_templates(
-                    item, raw_by_name.get(item.get("name")),
-                    loaded_by_name.get(item.get("name")) if loaded_by_name is not None else None)
-                for item in current]
-        return [
-            _preserve_env_ref_templates(
-                item,
-                raw[index] if index < len(raw) else None,
-                loaded_expanded[index]
-                if isinstance(loaded_expanded, list) and index < len(loaded_expanded)
-                else None)
-            for index, item in enumerate(current)]
-
-    return current
 
 
 def _explicit_config_paths(config: dict[str, Any]) -> set[tuple[str, ...]]:
@@ -2259,6 +2208,10 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
 
+                # Expand authoring-time model routes before defaults are merged: a default empty
+                # fallback list must not look like an inline override of a named preset.
+                from hermes_cli.model_presets import expand_model_presets
+                user_config = expand_model_presets(user_config)
                 config = _deep_merge(config, user_config)
                 from hermes_cli.moa_config import apply_user_moa_presets
                 apply_user_moa_presets(config, user_config)
@@ -2268,6 +2221,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 from hermes_cli.config_backups import backup_config
                 backup_config(config_path, "good")
             except Exception as e:
+                from hermes_cli.model_presets import ModelPresetError
+                if isinstance(e, ModelPresetError):
+                    raise
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
                 if lkg_copy is not None:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
@@ -2393,6 +2349,9 @@ def save_config(
 
         normalized = current_normalized = _canonicalize_config(config)
         if _raw_for_paths:
+            from hermes_cli.model_presets import preserve_model_preset_references
+            normalized = preserve_model_preset_references(normalized, _raw_for_paths)
+            from hermes_cli.config_env_templates import _preserve_env_ref_templates
             normalized = _preserve_env_ref_templates(
                 normalized, _canonicalize_config(_raw_for_paths),
                 _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))

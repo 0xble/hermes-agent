@@ -33,7 +33,8 @@ _EFFECTIVE_CACHE: dict[str, tuple[Any, ...]] = {}
 def _effective(raw: dict[str, Any]) -> dict[str, Any]:
     expanded = _config._expand_env_vars(raw)
     merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
-    return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
+    from hermes_cli.model_presets import expand_model_presets
+    return expand_model_presets(_config._normalize_root_model_keys(merged if isinstance(merged, dict) else {}))
 
 
 def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[str, Any]:
