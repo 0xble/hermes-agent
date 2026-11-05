@@ -9,7 +9,8 @@ from hermes_state_runtime import RuntimeStoreError
 
 
 async def admit_route_wake_receipt(runner, adapter, source, text, producer, metadata=None, *,
-                                   event=None, identity=None, _authorize_write=None):
+                                   event=None, identity=None, _authorize_write=None,
+                                   _authorize_write_factory=None):
     """Return a committed receipt, or None without borrowing a classic adapter path.
 
     Strict producers keep their original session pin. On a transient route miss, refresh
@@ -24,12 +25,23 @@ async def admit_route_wake_receipt(runner, adapter, source, text, producer, meta
         return None
     identity = identity or json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
     for attempt in range(2):
-        wake = await asyncio.to_thread(_capture, authority, adapter, source, text, key, identity,
+        # LiveSession publication belongs to this loop, not the capture worker.
+        captured_source = source
+        if source.platform == Platform.LOCAL:
+            live = authority.sessions.get(source.chat_id)
+            if live is None or live.route != key:
+                return None
+            captured_source = live.source
+        wake = await asyncio.to_thread(_capture, authority, adapter, captured_source, text, key, identity,
                                        metadata, event)
         if wake is None:
             return None
         try:
-            kwargs = {'authorize_write': _authorize_write} if _authorize_write is not None else {}
+            # Refresh the immutable guard snapshot for each route retry, outside
+            # the writer. The transaction will reject any later durable change.
+            guard = (await asyncio.to_thread(_authorize_write_factory)
+                     if _authorize_write_factory is not None else _authorize_write)
+            kwargs = {'authorize_write': guard} if guard is not None else {}
             return await authority.admit_automation(adapter, wake, identity, **kwargs)
         except RuntimeStoreError as exc:
             if exc.reason != 'not_found' or attempt:
@@ -45,12 +57,7 @@ def _capture(authority, adapter, source, text, key, identity, metadata, event):
     entry = runner.session_store.lookup_by_session_key(key)
     if entry is None:
         return None
-    if source.platform == Platform.LOCAL:
-        live = authority.sessions.get(source.chat_id)
-        if live is None or live.route != key:
-            return None
-        source = live.source
-    else:
+    if source.platform != Platform.LOCAL:
         envelope = committed_route_envelope(authority, entry)
         if envelope is None:
             return None

@@ -23,19 +23,29 @@ def goal_wait_guard(authority, event):
     effects and may run again on SQLite retry; a failed insert rolls it back too.
     """
     metadata = copy.deepcopy(event.metadata)
-    runner = authority.runner
+    store = authority.runner.session_store
     key = metadata.get('gateway_session_key')
     waiting_since = metadata.get('goal_waiting_since', 0)
+    # Routing saves take Store -> DB. Snapshot BEFORE entering the DB writer;
+    # the callback below must never acquire the Store (or any other live lock).
+    with store._lock:
+        entry = store._entry_locked(key)
+        session_id = entry.session_id if entry is not None else None
+        suspended = bool(entry.suspended) if entry is not None else True
+    scope = store._routing_scope()
 
     def acknowledge(conn):
         from hermes_cli.goals import GoalState, _meta_key
         from hermes_cli.session_controls import _definition_fingerprint, _wake_session_matches
         stamped = metadata.get('goal_continuation_session_id')
-        entry = runner.session_store.lookup_by_session_key(key)
-        if (entry is None or entry.suspended or not stamped
-                or not _wake_session_matches(stamped, entry.session_id, cursor=conn)):
+        row = conn.execute('SELECT entry_json FROM gateway_routing WHERE scope=? AND session_key=?',
+                           (scope, key)).fetchone()
+        route = json.loads(row[0]) if row else {}
+        if (not session_id or suspended or route.get('session_id') != session_id
+                or bool(route.get('suspended', False)) != suspended or not stamped
+                or not _wake_session_matches(stamped, session_id, cursor=conn)):
             raise RuntimeStoreError('admission_conflict', field='goal_session')
-        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (_meta_key(entry.session_id),)).fetchone()
+        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (_meta_key(session_id),)).fetchone()
         raw = row[0] if row else None
         state = GoalState.from_json(raw) if raw else None
         if (state is None or state.status != 'active'
@@ -48,7 +58,7 @@ def goal_wait_guard(authority, event):
         state.clear_wait(preserve_notice_key=True)
         from uuid import uuid4
         state.mutation_id = uuid4().hex
-        conn.execute('UPDATE state_meta SET value=? WHERE key=?', (state.to_json(), _meta_key(entry.session_id)))
+        conn.execute('UPDATE state_meta SET value=? WHERE key=?', (state.to_json(), _meta_key(session_id)))
     return acknowledge
 
 
@@ -115,7 +125,7 @@ async def _dispatch_reserved(runner, authority, managed, adapter, source, key, s
                 return
             receipt = await admit_route_wake_receipt(
                 runner, adapter, source, prompt, 'goal-wait', event=event, identity=identity,
-                _authorize_write=goal_wait_guard(authority, event))
+                _authorize_write_factory=lambda: goal_wait_guard(authority, event))
             if receipt is None:
                 _retry_later(runner, sid, identity)
                 return
@@ -131,9 +141,12 @@ async def _dispatch_reserved(runner, authority, managed, adapter, source, key, s
         if authority is not None:
             import asyncio
             from hermes_state_runtime import find_session_admission
-            row = await asyncio.to_thread(lambda: find_session_admission(authority.db,
-                principal_id='automation:' + key, session_id=authority.logical_owner(sid), request_id=identity))
-            admitted = row is not None
+            try:
+                row = await asyncio.to_thread(lambda: find_session_admission(authority.db,
+                    principal_id='automation:' + key, session_id=authority.logical_owner(sid), request_id=identity))
+                admitted = row is not None
+            except Exception:
+                logger.debug('goal wakeup: receipt lookup failed for session %s', sid, exc_info=True)
         _retry_later(runner, sid, identity)
         logger.info('goal wakeup: continuation for session %s refused (%s); retrying admission',
                     sid, exc, exc_info=True)
