@@ -159,8 +159,9 @@ async def test_private_goal_receipt_is_idempotent_and_metadata_is_not_a_capabili
     # A separately observed retry has a new wall-clock producer stamp, and may
     # start from a compression successor; neither changes the durable identity.
     child = sid + '-compressed'
-    authority.db.create_session(child, 'discord', parent_session_id=sid)
-    authority.db.end_session(sid, 'context_compressed')
+    authority.db.publish_compression_child(parent_session_id=sid, child_session_id=child,
+        source='discord', messages=[{'role': 'user', 'content': 'summary'}],
+        require_compression_lease=False)
     runner.session_store.advance_compression_session(key, sid, child)
     newer = captured_event(runner, source, child, manager)
     newer.metadata['goal_continuation_created_at'] += 100
@@ -297,12 +298,15 @@ async def test_duplicate_watchers_and_new_wait_generation_admit_once_each(parked
     monkeypatch.setattr(authority, '_schedule', type(authority)._schedule.__get__(authority))
     from gateway.session_contract import SessionRef
     authority._schedule(SessionRef(authority.profile_id, sid))
-    await async_wait_until(lambda: rows()[0]['status'] == 'terminal', timeout=20,
-                           what='first wait generation terminal')
+    await async_wait_until(lambda: rows()[0]['status'] == 'terminal'
+                           and not runner._is_session_running(key)
+                           and (authority.sessions[sid].task is None or authority.sessions[sid].task.done()),
+                           timeout=20, what='first wait generation fully released')
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     fresh = goals.GoalManager(sid)
     fresh.wait_for_seconds(1, reason='second wait generation')
-    monkeypatch.setattr(goals.time, 'time', lambda: fresh.state.waiting_until + 600)
+    monkeypatch.setattr(goals.time, 'time', lambda: fresh.state.waiting_until
+                        + goals.DEFAULT_MIN_CONTINUATION_GAP_SECONDS + 10)
     monkeypatch.setattr('gateway.run_goal_wait.monotonic', lambda: 1e12)
     await asyncio.gather(*(runner._goal_wakeup_fire_one(sid) for _ in range(3)))
     assert len(rows()) == 2
