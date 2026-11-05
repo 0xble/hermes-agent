@@ -201,3 +201,18 @@ def test_prepare_refuses_candidate_workflow_activation_before_publication(graph)
     policy = overlay(git, commit, upstream)
     with pytest.raises(ValueError, match="do not publish"):
         mode.prepare_staging(root, candidate, upstream, policy)
+
+
+@pytest.mark.parametrize("workflow_support", ["README.md", "scripts/helper.py"])
+def test_prepare_strips_upstream_workflow_support_files(graph, workflow_support):
+    root, git, commit, upstream, _ = graph
+    git("reset", "--hard", upstream)
+    path = f".github/workflows/{workflow_support}"
+    upstream = commit("workflow support", {path: "upstream workflow support\n"})
+    candidate = commit("candidate", {"implementation": "candidate change\n"})
+    policy = overlay(git, commit, upstream)
+    git("reset", "--hard", candidate)
+    staging = mode.prepare_staging(root, candidate, upstream, policy)
+    assert git("ls-tree", staging, path) == ""
+    assert git("show", f"{candidate}:{path}") == "upstream workflow support"
+    assert mode.select(root, candidate, upstream, staging) == ("upstream", upstream)

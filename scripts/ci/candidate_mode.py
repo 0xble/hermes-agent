@@ -81,8 +81,9 @@ def check_staging(root: Path, head: str, base: str, staging: str) -> None:
         changes = git(root, "diff-tree", "--no-commit-id", "--name-status", "-z",
                       "--no-renames", "-r", f"{commit}^1", commit).rstrip("\0").split("\0")
         for status, path in zip(changes[::2], changes[1::2], strict=True):
-            workflow_deletion = (status == "D" and Path(path).parent.as_posix()
-                                 == ".github/workflows" and path.endswith((".yml", ".yaml")))
+            # Strip the complete upstream workflow tree, including README and
+            # nested helpers. Only deletions here are policy overlay changes.
+            workflow_deletion = status == "D" and path.startswith(".github/workflows/")
             if path not in OVERLAY_PATHS and not workflow_deletion:
                 raise ValueError(f"Contaminated staging base: {commit} changes {path}")
     workflows = git(root, "ls-tree", "-r", "--name-only", staging, ".github/workflows").splitlines()

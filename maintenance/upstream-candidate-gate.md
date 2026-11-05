@@ -87,7 +87,8 @@ files from the frozen policy commit:
 - `.github/workflows/prompt-surface-diff.yml`
 - `scripts/ci/candidate_mode.py`
 
-All other upstream workflow files are **deleted in the staging overlay only**
+All other upstream workflow-tree files (including README and nested helpers)
+are **deleted in the staging overlay only**
 to prevent accidentally activating paid Blacksmith runners. The exact candidate
 checkout retains its original workflows and candidate-owned entrypoints.
 Before returning a staging SHA for publication, the helper computes the merge
@@ -97,8 +98,8 @@ not re-add upstream workflows or replace policy workflow bytes on the merge ref.
 Before selecting upstream mode, the planner refuses unless the staging/head
 merge-base equals `B` (candidate) or `B^1` (baseline), the staging base descends
 from that anchor, and every overlay commit is single-parent and changes only
-those three paths or deletes other direct `.github/workflows/*.{yml,yaml}`
-files. It checks **each commit**, not just the net diff: implementation commits,
+those three paths or deletes other files under `.github/workflows/`.
+It checks **each commit**, not just the net diff: implementation commits,
 reverted off-path changes, overlay merge commits, and added/modified unrelated
 workflows all fail closed. The final staging tree must contain exactly the two
 free policy workflows. Missing history also fails. Ordinary fork ancestry keeps
