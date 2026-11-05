@@ -1110,6 +1110,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         first and only falls back to user_id on a route miss, so carrying both never
         overrides routing-table resolution."""
         meta: dict[str, Any] = dict(metadata or {})
+        meta.pop("_draft_id", None)  # Native ownership is gateway-local, never wire metadata.
         # ``getattr``: relay tests build bare adapters via ``__new__`` without ``__init__``.
         for key, cache in (
             ("scope_id", self._scope_by_chat), ("user_id", self._dm_user_by_chat),

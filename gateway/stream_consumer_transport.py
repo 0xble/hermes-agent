@@ -221,9 +221,13 @@ class StreamTransportMixin:
         if getattr(type(self.adapter), "abandon_open_draft", None) is None:
             return
         try:
-            await self.adapter.abandon_open_draft(
+            result = await self.adapter.abandon_open_draft(
                 self.chat_id, self._last_sent_text or self._clean_for_display(self._accumulated),
-                metadata=self._draft_metadata())
+                metadata={**(self._draft_metadata() or {}), "_draft_id": self._draft_id})
+            if getattr(result, "success", False) and getattr(result, "message_id", None):
+                # A sealed preview is editable, not yet a confirmed final.
+                self._message_id = result.message_id
+                self._abandoned_draft_message_id = result.message_id
         except Exception as e:
             logger.debug("abandon_open_draft failed (best-effort): %s", e)
 

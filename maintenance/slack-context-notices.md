@@ -82,6 +82,11 @@ one attributed payload per result. `tests/gateway/test_slack_native_streaming.py
 rejects equal-text finalization without the owning draft identity, including a
 stale turn. Its real stream-consumer fixture posts an equal background body
 without touching the foreground stream, then commits the owning final in place.
+`tests/gateway/test_slack_stream_fallback.py` kills a real consumer after its
+preview: its owning draft is sealed and the complete gateway fallback edits the
+same message, without a duplicate post or a live orphan. Consumer failure never
+claims partial text as the final. Relay egress drops the native-only `_draft_id`
+after local ownership handling (`tests/gateway/relay/test_draft_identity_metadata.py`).
 
 `tests/gateway/test_telegram_ingress_nonblocking.py` drives busy acknowledgements
 through the native ingress-consumer boundary with a real `MessageEvent` and

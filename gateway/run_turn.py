@@ -5494,6 +5494,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 _sk, _streamed, _previewed, _content_delivered,
             )
             response["already_sent"] = True
+        elif _sc is not None and getattr(_sc, "_abandoned_draft_message_id", None):
+            # A dead consumer sealed its owned preview: finish that message, never infer
+            # ownership from thread metadata or post a duplicate beside the orphan.
+            await self._run_agent_edit_streamed_message(
+                _sc, source, response, _final, _sk=_sk,
+                ok=("Reconciled abandoned draft for session %s in message %s.", _sk, _sc.message_id),
+                fail_result="Abandoned-draft edit failed for session %s (%s); sending final normally.",
+                fail_exc="Abandoned-draft edit failed for session %s: %s; sending final normally.",
+            )
         elif not _transformed and _stale_finalized and _sc is not None:
             # Stale finalize: edit the streamed message up to the complete response (on failure the
             # normal send delivers). Not for split delivery — message_id is only the LAST chunk.

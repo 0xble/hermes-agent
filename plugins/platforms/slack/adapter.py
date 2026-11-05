@@ -2642,6 +2642,20 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
                 "[Slack] chat.stopStream failed for %s/%s: %s", chat_id, stream.get("ts"), e)
             return False
 
+    async def abandon_open_draft(
+        self, chat_id: str, content: str = "", metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Seal only this consumer's orphan and return its editable message identity."""
+        md = metadata or {}
+        key = self._stream_key(chat_id, md)
+        stream = self._active_streams.get(key) if key else None
+        if stream is None or md.get("_draft_id") is None or md["_draft_id"] != stream.get("draft_id"):
+            return None
+        if not await self._seal_stream(key, stream):
+            return SendResult(success=False, error="Could not seal orphaned Slack stream")
+        self._active_streams.pop(key, None)
+        return SendResult(success=True, message_id=stream["ts"])
+
     async def _try_finalize_stream(
         self, chat_id: str, content: str, metadata: Optional[dict[str, Any]] = None
     ) -> Optional[SendResult]:
