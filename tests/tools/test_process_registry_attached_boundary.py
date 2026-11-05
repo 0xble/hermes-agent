@@ -36,7 +36,14 @@ def test_attached_explicit_high_exit_is_not_a_signal(local_registry, tmp_path, c
 
 
 def _sleep_started(parent):
-    return any(p.name() == "sleep" for p in [parent, *parent.children(recursive=True)])
+    for process in [parent, *parent.children(recursive=True)]:
+        try:
+            if process.name() == "sleep":
+                return True
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            # A login-shell child can be reaped after the snapshot.
+            continue
+    return False
 
 
 @pytest.mark.parametrize("error", [psutil.NoSuchProcess, psutil.ZombieProcess])
