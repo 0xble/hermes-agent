@@ -40,6 +40,8 @@ from tui_gateway.turn_marker import (
     record_turn_start,
 )
 
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
+
 
 _REAL_THREAD = threading.Thread
 

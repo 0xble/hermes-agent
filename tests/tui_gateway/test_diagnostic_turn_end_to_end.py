@@ -7,6 +7,8 @@ import pytest
 from tui_gateway import server
 from tests.tui_gateway.test_auto_continue import turn_env, marker_home, _session
 
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
+
 
 @pytest.mark.parametrize("suppress", [False, True])
 def test_diagnostic_turn_runs_but_never_echoes_on_wire(turn_env, marker_home, monkeypatch, suppress):

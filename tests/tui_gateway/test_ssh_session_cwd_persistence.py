@@ -14,6 +14,8 @@ import pytest
 from tui_gateway import server
 from hermes_state import SessionDB
 
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
+
 
 class _ImmediateThread:
     def __init__(self, *, target, **_kwargs):
