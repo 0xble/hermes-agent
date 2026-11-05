@@ -44,7 +44,7 @@ def _redact_terminal_error_text(value: Any) -> str:
 from tools.registry import tool_error
 from tools.terminal_tool_lifecycle import (
     _cleanup_inactive_envs, _create_configured_env,
-    _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
+    _evict_environment_for_task, _local_shell_owner, cleanup_all_environments, ensure_task_env,
 )
 from tools.terminal_tool_config import (
     _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
@@ -414,7 +414,7 @@ def register_container_alias(child_task_id: str, parent_task_id: Optional[str]) 
 def register_run_scoped_task(task_id: str) -> None:
     """Give session-less *task_id* (a cron run) its own local terminal environment.
 
-    Its delegate_task children still share it through the container alias."""
+    Its delegate_task children own separate local export snapshots."""
     if task_id:
         with _container_alias_lock:
             _run_scoped_tasks.add(task_id)
@@ -423,15 +423,6 @@ def register_run_scoped_task(task_id: str) -> None:
 def clear_run_scoped_task(task_id: str) -> None:
     with _container_alias_lock:
         _run_scoped_tasks.discard(task_id)
-
-
-def _run_scoped_owner(task_id: Optional[str]) -> Optional[str]:
-    """The registered run that owns *task_id* (itself or via aliases), else None."""
-    if not task_id:
-        return None
-    owner = _resolve_container_alias(task_id)
-    with _container_alias_lock:
-        return owner if owner in _run_scoped_tasks else None
 
 
 def _resolve_container_alias(task_id: str) -> str:
@@ -558,33 +549,37 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
 
     1. Image/``env_type`` overrides (RL/benchmark rollouts) key their own sandbox;
        CWD-only overrides (ACP workspace tracking) are NOT isolation signals.
-    2. Per-session isolation (docker + ``container_persistent: false``): each
+    2. Local delegated children and registered runs own separate shell snapshots,
+       even when a child's inherited session key or container alias names its parent.
+       Other backends retain their shared-container contract.
+    3. Per-session isolation (docker + ``container_persistent: false``): each
        session's task_id is its own key (a fresh chat gets a fresh sandbox with only
        ITS mounts); delegate_task children follow the alias registry to the parent.
        Routed profiles qualify the key (:func:`_qualify_task_key`, #123989).
-    3. Session key present (WebUI per-session, gateway per-message): persistent
+    4. Session key present (WebUI per-session, gateway per-message): persistent
        Docker is PROFILE-scoped — ``shared:<key>`` opt-in, else ``profile:<name>``,
        with the default profile staying literally ``"default"`` so CLI and
        default-profile gateway sessions share ONE container; other backends key
        ``session:<key>`` so switching profiles can't reuse another profile's
        SSHEnvironment on the wrong host.
-    4. No session key (CLI, cron): ``shared:<key>`` when opted in (else a CLI run of a
+    5. No session key (CLI, cron): ``shared:<key>`` when opted in (else a CLI run of a
        keyed profile would split from its gateway sessions); a routed multiplexed profile
-       keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
-       on the local backend a registered run (cron) keys itself so one job's shell exports
-       cannot reach another; else ``"default"``, which subagent ids collapse onto to share
-       the parent's container. Sandboxed backends keep their shared-container contract.
+       keys its own home (``profile:<name>`` under persistent Docker, matching branch 4);
+       otherwise ``"default"``. Sandboxed backends keep their shared-container contract.
     """
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
+    shell_owner = _local_shell_owner(task_id) if scope.env_type == "local" else None
+    if shell_owner:
+        return _qualify_task_key(shell_owner)
     if task_id and scope.session_isolated:
         return _qualify_task_key(_resolve_container_alias(task_id))
     # Per-session isolation: when a session key is present (the WebUI streaming layer sets it per-session,
     # the gateway per-message via contextvars), scope the container to it so switching profiles can't reuse
     # a previous profile's SSHEnvironment and silently run commands on the wrong remote host. Subagents
-    # inherit the same session key, so they still collapse onto the parent's container (the #16177
-    # shared-container intent). CLI mode has no session key and falls through to "default", behaviour
+    # on non-local backends inherit the same session key and share the parent's container (#16177).
+    # Local children already resolved above. CLI mode has no session key and falls through to "default", behaviour
     # unchanged. See commit e00f940a9. This runs *after* the isolation-override and
     # docker/container_persistent branches above: those paths already key containers per task_id, so they
     # stay authoritative where they apply and this only covers the cases that would otherwise collapse to
@@ -596,8 +591,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         # ONE container/cache slot (and sandbox dir) regardless of profile name (#84671).
         return f"shared:{shared}"
     if not session_key:
-        run_owner = _run_scoped_owner(task_id) if scope.env_type == "local" else None
-        return run_owner or _routed_home_task_key(scope.docker_profile_scoped) or "default"
+        return _routed_home_task_key(scope.docker_profile_scoped) or "default"
     if not scope.docker_profile_scoped:
         return _qualify_task_key(f"session:{session_key}")
     profile = _container_profile()
