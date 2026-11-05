@@ -971,6 +971,10 @@ class ToolRegistry:
             if is_incognito(kwargs.get("session_id")):
                 return tool_error("This plugin tool is unavailable in incognito mode.")
         try:
+            from tools.lifecycle_approval import lifecycle_approval
+            blocked = lifecycle_approval(entry.name, args)
+            if blocked is not None:
+                return json.dumps(blocked)
             # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
             # plugin handler is not broken by every field the dispatcher injects (#68318).

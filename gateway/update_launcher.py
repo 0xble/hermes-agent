@@ -232,6 +232,15 @@ def make_agent_update_handler(
             entry = platform_registry.get(platform.value)
             if not entry or not entry.allow_update_command:
                 return {"accepted": False, "error": "update requires a messaging session"}
+        # This socket verb is the agent-facing `hermes gateway update --reason` route,
+        # not human `hermes update`, `/update`, or the scheduled native updater.
+        from tools.lifecycle_approval import maintenance_window_open
+        if not maintenance_window_open():
+            # The control socket has a short RPC deadline, not a human-wait channel.
+            # Never launch work after that caller timed out or expand its timeout.
+            return {"accepted": False, "status": "approval_required",
+                    "error": "Outside 2–6 AM America/Los_Angeles; use request_update "
+                             "to show the native Approve/Deny card. Nothing was updated or restarted."}
         pending = {
             "platform": route["source"], "chat_id": route["chat_id"],
             "chat_type": route.get("chat_type"), "user_id": route.get("user_id"),
