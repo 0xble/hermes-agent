@@ -369,3 +369,35 @@ def test_observer_argument_does_not_select_a_hermes_profile(tmp_path, monkeypatc
     assert "-pgate_test_evidence" in commands[0]
     assert "-p" not in commands[0]
     assert commands[0][0] == "scripts/run_tests.sh"
+
+
+@pytest.mark.parametrize("failing", [False, True])
+def test_observer_handles_unittest_subtests_without_duplicate_parent_phases(tmp_path, failing):
+    test = tmp_path / "test_subtests.py"
+    test.write_text(
+        "import unittest\nclass TestSubtests(unittest.TestCase):\n"
+        "    def test_values(self):\n"
+        "        for i in range(3):\n"
+        "            with self.subTest(i=i):\n"
+        f"                self.assertLess(i, {2 if failing else 3})\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence"
+    plugin = Path(__file__).resolve().parents[2] / "scripts/ci"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test), "-q", "-pgate_test_evidence",
+         f"--gate-evidence-dir={output}"],
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(plugin)},
+        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
+    )
+    assert result.returncode == int(failing), result.stdout + result.stderr
+    sessions = list(output.glob("*.json"))
+    assert len(sessions) == 1
+    session = json.loads(sessions[0].read_text(encoding="utf-8"))
+    if failing and session["errors"]:
+        with pytest.raises(ValueError, match="Collection/harness"):
+            equivalence.session_nodes(session)
+    else:
+        failures, called = equivalence.session_nodes(session)
+        assert len(called) == 1
+        assert bool(failures) == failing

@@ -58,6 +58,10 @@ bubblewrap network namespaces instead of allowing hostile-network coverage skips
 Native macOS/Windows, Docker backends, release publishing, credentials-dependent
 live tests, and visual release checks remain separate lanes, as with the fork
 source gate. This is not a claim to reproduce all upstream release CI.
+Before upstream suites, free Ubuntu runner images shed only unused preinstalled
+Android/.NET/Haskell/Boost/CodeQL toolchains and must have at least 20 GiB free.
+Disk exhaustion remains an infra failure, never baseline-equivalent; no upgrade
+coverage is removed to fit a runner.
 
 ## PR merge-ref constraint and baseline-first staging
 
@@ -208,6 +212,9 @@ file list through `scripts/run_tests.sh --files-from` with retries disabled.
 A frozen pytest observer records exact `item.nodeid` values (including parameter
 IDs), collection, setup/call/teardown outcomes, exception class and session exit
 status. This is machine-readable pytest evidence, not scraped logs or counts.
+Passing unittest subtest reports are not extra collected nodes; their single parent
+phase is recorded once. Failing/skipped subtests have no separately collected node
+ID and fail closed, rather than being silently folded into an inherited failure.
 The observer is added to the disposable PM test venv via a `.pth`, not to candidate
 sources. Slice manifests, selected files and per-file sessions are uploaded to
 run-scoped artifacts. Source-integrity assertions still run after test failure.

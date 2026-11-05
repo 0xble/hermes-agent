@@ -35,10 +35,22 @@ def pytest_collectreport(report):
 def pytest_runtest_makereport(item, call):
     result = yield
     report = result.get_result()
+    report._gate_category = call.excinfo.typename if call.excinfo else ""
+
+
+def pytest_runtest_logreport(report):
     if _STATE is not None:
+        # Pytest invokes makereport for each unittest subTest *and* its parent.
+        # Observe the final emitted report instead: subreports have context,
+        # while the parent has exactly one setup/call/teardown. Failing/skipped
+        # subtests have no independent collected node ID and fail closed.
+        if hasattr(report, "context"):
+            if report.outcome != "passed":
+                _STATE["errors"].append(f"Non-passing subtest: {report.nodeid}")
+            return
         _STATE["reports"].append({
             "node": report.nodeid, "phase": report.when, "outcome": report.outcome,
-            "category": call.excinfo.typename if call.excinfo else "",
+            "category": getattr(report, "_gate_category", ""),
         })
 
 
