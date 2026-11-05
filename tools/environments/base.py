@@ -691,7 +691,7 @@ class BaseEnvironment(ABC):
         command: str,
         cwd: str = "",
         *,
-        timeout: int | None = None,
+        timeout: int | float | None = None,
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
@@ -717,7 +717,11 @@ class BaseEnvironment(ABC):
         if rewrite_compound_background:
             from tools.terminal_tool_sudo import _rewrite_compound_background
             exec_command = _rewrite_compound_background(exec_command)
-        effective_timeout = timeout or self.timeout
+        # SDKs such as Modal (protobuf int64) and Daytona require whole seconds.
+        # Floor a fractional budget rather than extending its deadline; one second
+        # is the smallest portable backend timeout. Strict-deadline callers must
+        # skip dispatch themselves when less than one second remains.
+        effective_timeout = max(1, int(timeout or self.timeout))
         effective_cwd = cwd or self.cwd
 
         # Merge sudo stdin with caller stdin.

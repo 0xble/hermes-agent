@@ -1,9 +1,24 @@
 """Shared helpers for disposable immutable-release tests."""
 from __future__ import annotations
 
+import json
 import sysconfig
 import venv
 from pathlib import Path
+
+
+def _fake_release_generation(release: Path, extras: list[str]) -> Path:
+    """Commit an empty generation whose Python can execute real metadata probes."""
+    from pm.environments import install_state_dir, runtime_facts_path
+
+    environment = install_state_dir(release) / "environments" / "generation" / "venv"
+    # An empty cfg + a symlink to sys.executable loses the base stdlib when
+    # the runner's interpreter is a copied venv executable. Let venv record
+    # the base interpreter instead; do not inherit the runner's packages.
+    venv.EnvBuilder(with_pip=False).create(environment)
+    runtime_facts_path(release).write_text(json.dumps({"schema": 1, "packages": {"venv": {
+        "environment": str(environment), "extras": extras}}}), encoding="utf-8")
+    return environment
 
 
 def _build_test_venv(release: Path, **_kwargs) -> None:
