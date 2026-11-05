@@ -63,9 +63,11 @@ def _epoch(conn, epoch):
         raise RuntimeStoreError('stale_epoch')
 
 
-def _session(conn, session_id):
+def _session(conn, session_id, *, generation_only=False):
     from hermes_state_mutation_retirement import retired_in
-    row = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+    query = ('SELECT runtime_generation FROM sessions WHERE id=?' if generation_only
+             else 'SELECT * FROM sessions WHERE id=?')
+    row = conn.execute(query, (session_id,)).fetchone()
     # Reclamation may lag the retirement commit. Resolve visibility on this
     # transaction, not a separate preflight read or the physical row alone.
     if row is None or retired_in(conn, session_id):
@@ -779,19 +781,21 @@ def _worker_assignment(conn, execution_id, session_id, generation):
     if row['session_id'] != session_id:
         raise RuntimeStoreError('permission_denied')
     if (type(generation) is not int or row['generation'] != generation
-            or _session(conn, session_id)['runtime_generation'] != generation):
+            or _session(conn, session_id, generation_only=True)['runtime_generation'] != generation):
         raise RuntimeStoreError('stale_generation')
     return row
 
 
 def _linked_worker_admission(conn, session_id, generation, owner_epoch, statuses):
     placeholders = ','.join('?' for _ in statuses)
+    # Filter the narrow covering index before fetching historical payload/lineage rows.
     rows = conn.execute(f"""SELECT * FROM session_admissions
-        WHERE generation=? AND owner_epoch=? AND status IN ({placeholders})
+        WHERE seq IN (SELECT seq FROM session_admissions WHERE status IN ({placeholders}))
+          AND generation=? AND owner_epoch=?
           AND (target_session_id=? OR EXISTS (
               SELECT 1 FROM json_each(session_admissions.lineage_json) WHERE value=?
           )) ORDER BY seq""",
-        (generation, owner_epoch, *statuses, session_id, session_id)).fetchall()
+        (*statuses, generation, owner_epoch, session_id, session_id)).fetchall()
     if len(rows) > 1:
         raise RuntimeStoreError('admission_conflict')
     return rows[0] if rows else None
