@@ -106,7 +106,7 @@ def live_gateway(tmp_path_factory):
     try:
         if not _wait(lambda: proc.poll() is not None or identify_gateway(home, timeout=2.0), 180):
             pytest.fail("gateway never answered identify")
-        assert proc.poll() is None, (root / "gateway.log").read_text(encoding="utf-8", errors="replace")[-3000:]
+        assert proc.poll() is None, (root / "gateway.log").read_text(encoding="utf-8-sig", errors="replace")[-3000:]
         answer = reload_gateway_plugins(home) or {}
         missing = set(_HEADS) - set(answer.get("plugins") or ())
         assert not missing, f"gateway did not load {missing}: {answer}"
@@ -125,11 +125,11 @@ def test_uninstall_while_gateway_has_plugin_loaded(live_gateway, name):
 
     assert proc.poll() is None, (
         f"the gateway died during uninstall (rc={proc.returncode}):\n"
-        + (home.parent.parent / "gateway.log").read_text(encoding="utf-8", errors="replace")[-12000:]
+        + (home.parent.parent / "gateway.log").read_text(encoding="utf-8-sig", errors="replace")[-12000:]
     )
     assert result.returncode == 0, f"uninstall failed: {result.stdout[-800:]} {result.stderr[-800:]}"
     leftovers = sorted(str(p.relative_to(home / "plugins")) for p in (home / "plugins").rglob("plugin.yaml"))
     assert not any(name in p for p in leftovers), f"a loadable copy stayed under plugins/: {leftovers}"
     listing = _hermes(home, "plugins", "list")
     assert name not in listing.stdout, f"the next process still sees {name}:\n{listing.stdout[-1500:]}"
-    assert name not in (home / "config.yaml").read_text(encoding="utf-8")
+    assert name not in (home / "config.yaml").read_text(encoding="utf-8-sig")
