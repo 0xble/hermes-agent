@@ -93,7 +93,7 @@ def test_expiry_never_clicks_submit_reset_or_default_buttons(bridge, target, ele
     ready, call = bridge
     call("load", kind="native")
     def tag(attributes, text):
-        return '<' + element + ' ' + attributes + '>' + ('' if element.startswith('input') else text + '</button>')
+        return '<' + element + ' ' + attributes + (' value=' + text if element.startswith('input') else '') + '>' + ('' if element.startswith('input') else text + '</button>')
     trigger = tag('role=combobox aria-label="Expiry month" aria-controls=months', 'Month') if target == 'trigger' else '<button type=button role=combobox aria-label="Expiry month" aria-controls=months>Month</button>'
     option = tag('role=option', 'July') if target == 'option' else '<div role=option>July</div>'
     html = '<form><input autocomplete=cc-number>' + trigger + '<div id=months role=listbox>' + option + '</div></form>'
@@ -209,3 +209,11 @@ def test_async_secret_rejection_contained_before_transport_logging(bridge, monke
     monkeypatch.setattr(camofox,'_post',post)
     result=vault._eval_js_secret('fixture','Promise.reject(new Error("synthetic-secret"))')
     assert not result['success'] and 'synthetic-secret' not in json.dumps(result)
+
+
+def test_native_expiry_controls_use_local_group_labels(bridge):
+    ready, call = bridge
+    call('load',kind='native')
+    html='<input autocomplete=cc-number><fieldset><legend>Expiration</legend><select name=Month><option>Month</option><option value=07>July</option></select><select name=Year><option>Year</option><option value=2029>2029</option></select></fieldset><input aria-label=CVC>'
+    result=fill_html(call,ready['origin'],html)
+    assert result['success'], result

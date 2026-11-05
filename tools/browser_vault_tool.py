@@ -851,7 +851,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
         try:
             inspect = _eval_js(browser_key, build_inspection_js(nonce))
-        except Exception:  # health: allow BLE001 - page-controlled inspection errors are normalized, never echoed
+        except Exception:  # health: allow BLE001 -- page-controlled inspection errors are normalized, never echoed
             return inspection_failure()
         if not isinstance(inspect, dict) or not inspect.get("success"):
             return inspection_failure()
