@@ -4008,6 +4008,7 @@ def _prepare_same_provider_retry(
         effective_provider = _effective_provider_for_client(retry_client, resolved_provider)
     if retry_client is None:
         raise RuntimeError(f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery")
+    retry_model = _recovery_model(final_model, retry_model)
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     if rebuild is not None:
         # The selected destination owns recovery, not the unavailable primary.
@@ -7999,6 +8000,11 @@ def _ladder_parameter_rungs(
     return None, first_err, kwargs
 
 
+def _recovery_model(pinned_model: Optional[str], candidate: Optional[str]) -> Optional[str]:
+    """Credential/connection recovery may not replace a private route's chosen model."""
+    return pinned_model if private_route_active() else candidate
+
+
 def _refreshed_nous_step(route: _LadderRoute, kwargs: dict[str, Any], message: str) -> Optional[_LadderStep]:
     """Rebuild the Nous client after a credential event; None when nothing refreshed."""
     refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
@@ -8011,6 +8017,7 @@ def _refreshed_nous_step(route: _LadderRoute, kwargs: dict[str, Any], message: s
     if refreshed_client is None:
         return None
     logger.info(message, route.task or "call", route.tag)
+    refreshed_model = _recovery_model(route.final_model, refreshed_model)
     if refreshed_model and refreshed_model != kwargs.get("model"):
         kwargs["model"] = refreshed_model
     return _LadderStep("call", (refreshed_client, kwargs))
@@ -8024,7 +8031,7 @@ def _ladder_nous_rungs(
     client, task, tag = route.client, route.task, route.tag
     # A long-lived process can pin a Portal model since dropped from the catalog (every call
     # 404s); force a fresh Portal fetch and retry once.
-    if _is_model_not_found_error(first_err) and client_is_nous:
+    if _is_model_not_found_error(first_err) and client_is_nous and not private_route_active():
         healed_model = _refresh_nous_recommended_model(
             vision=(task == "vision"), stale_model=kwargs.get("model"))
         if healed_model and healed_model != kwargs.get("model"):
@@ -8065,6 +8072,7 @@ def _ladder_credential_rungs(
     auth_refresh_provider = _auth_refresh_provider_for_route(
         resolved_provider, route.base_info, _effective_provider_for_client(client, ""))
     if (_is_auth_error(first_err) and auth_refresh_provider not in {"auto", "", None}
+            and not (private_route_active() and str(resolved_provider or "").startswith("custom:"))
             and not client_is_nous):
         refresh_kwargs = ({"failed_api_key": getattr(client, "api_key", "")}
                           if auth_refresh_provider == "anthropic" else {})
@@ -8265,6 +8273,9 @@ def _aux_recovery_ladder(
         return resp
     client_is_nous = (resolved_provider == "nous"
                       or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
+    if private_route_active() and resolved_provider != "nous":
+        # A named custom entry can use a Nous hostname without authorizing Nous account keys.
+        client_is_nous = False
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
         return resp

@@ -28,6 +28,8 @@ def scoped_fallback_policy(policy: CallFallbackPolicy):
         _policy.reset(token)
 
 
+BARE_CUSTOM_ROUTE_REFUSAL = "incognito.model must use a named provider (e.g. custom:venice)"
+
 # Run outside any conversation (dashboard, CLI, cron), so they never carry private turn content.
 CONTENT_FREE_TASKS = frozenset({
     "profile_describer", "kanban_estimator", "kanban_decomposer", "triage_specifier", "monitor",
@@ -60,10 +62,12 @@ def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[di
     if not (route and route.get("provider") and route.get("model")):
         yield kwargs
         return
-    # A bare ``custom`` route is only its endpoint; a named provider resolves its own.
-    endpoint = route.get("base_url") if route["provider"] == "custom" else None
+    if route["provider"] == "custom":
+        # A bare custom route names no provider entry to take its key from, so resolution would
+        # pair the endpoint with some other entry's credential. Only named providers are routed.
+        raise RuntimeError(BARE_CUSTOM_ROUTE_REFUSAL)
     routed = {**kwargs, "provider": route["provider"], "model": route["model"],
-              "base_url": endpoint, "api_key": None, "main_runtime": None}
+              "base_url": None, "api_key": None, "main_runtime": None}
     if sync:
         routed.update(api_mode=None, fallback_chain=[])
     token = _private_routed.set(True)
@@ -164,14 +168,17 @@ def scoped_fallback_stream(stream: Any, policy: CallFallbackPolicy, progress_hoo
     """Bind only while advancing/closing, never while control belongs to its consumer."""
     from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT, aux_progress_hook, scoped_runtime_main
     relay_context = _RELAY_AUX_CALL_CONTEXT.get()
+    private_routed = _private_routed.get()
 
     @contextmanager
     def scope():
         token = _RELAY_AUX_CALL_CONTEXT.set(relay_context)
+        private_token = _private_routed.set(private_routed)
         try:
             with scoped_fallback_policy(policy), aux_progress_hook(progress_hook), scoped_runtime_main(main_runtime):
                 yield
         finally:
+            _private_routed.reset(private_token)
             _RELAY_AUX_CALL_CONTEXT.reset(token)
 
     def advance():
