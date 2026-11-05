@@ -11,8 +11,10 @@ import json
 import logging
 import time
 import uuid
+import threading
+import weakref
+from dataclasses import dataclass, field
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Any
 
 from gateway.attended_model import is_genuine_user_message
@@ -25,15 +27,29 @@ logger = logging.getLogger(__name__)
 class ReplyReceipt:
     identity: dict[str, Any]
     home: Path
+    private: bool = False
     started: bool = False
     replied: bool = False
+    no_reply: bool = False
+    absorbed: tuple[ReplyReceipt, ...] = ()
+    lock: Any = field(default_factory=threading.Lock, repr=False)
 
 
 _current: contextvars.ContextVar[ReplyReceipt | None] = contextvars.ContextVar(
     "gateway_reply_receipt", default=None)
 
 
+# Share live event copies without keeping completed receipts alive forever.
+_live: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+
 def _emit(receipt: ReplyReceipt, event: str, timestamp: float) -> None:
+    from agent.incognito import is_incognito
+    # Decide on the calling context, before crossing to a context-free disk worker.
+    # A private receipt stays private even when its delivery outlives that scope.
+    if receipt.private or is_incognito():
+        receipt.private = True
+        return
     payload = {**receipt.identity, "event": event, "timestamp": timestamp}
     try:
         from gateway.reply_latency_sink import append_event
@@ -55,10 +71,13 @@ def stamp_received(event: Any) -> float | None:
         return None
     if not getattr(event, "_reply_latency_receipt_id", None):
         event._reply_latency_receipt_id = uuid.uuid4().hex
-    stamp = getattr(event, "_attended_activity_received_at", None)
+    stamp = getattr(event, "_reply_latency_received_at", None)
+    if stamp is None:
+        stamp = getattr(event, "_attended_activity_received_at", None)
     if stamp is None:
         stamp = time.time()
         event._attended_activity_received_at = stamp
+    event._reply_latency_received_at = stamp
     return stamp
 
 
@@ -86,6 +105,14 @@ def record_received(event: Any) -> ReplyReceipt | None:
         inbound = [profile, platform, str(source.chat_id),
                    str(thread_id) if thread_id is not None else None,
                    str(message_id) if message_id is not None else None]
+        home = proven_runtime_home(source) or get_hermes_home()
+        key = (str(home), tuple(inbound) if message_id is not None else event._reply_latency_receipt_id)
+        if existing := _live.get(key):
+            from agent.incognito import is_incognito
+            existing.private = existing.private or is_incognito()
+            event._reply_latency_receipt = existing
+            return existing
+        from agent.incognito import is_incognito
         receipt = ReplyReceipt({
             "inbound_identity": inbound,
             "receipt_id": event._reply_latency_receipt_id,
@@ -98,13 +125,56 @@ def record_received(event: Any) -> ReplyReceipt | None:
             "profile": profile,
             "chat_id": str(source.chat_id),
             "thread_id": str(thread_id) if thread_id is not None else None,
-        }, home=proven_runtime_home(source) or get_hermes_home())
+        }, home=home, private=is_incognito())
+        _live[key] = receipt
         event._reply_latency_receipt = receipt
         _emit(receipt, "received", stamp)
         return receipt
     except Exception:
         logger.debug("Could not build reply latency receipt", exc_info=True)
         return None
+
+
+def snapshot_inputs(event: Any) -> list[dict[str, Any]]:
+    """Content-free merged receipt provenance, independent of attended's newest clock."""
+    inputs = []
+    seen = set()
+    for candidate in (event, *getattr(event, '_hermes_absorbed_events', ())):
+        prior = getattr(candidate, '_reply_latency_inputs', None)
+        rows = prior or [{'message_id': getattr(candidate, 'message_id', None),
+                          'received_at': getattr(candidate, '_reply_latency_received_at',
+                                                 getattr(candidate, '_attended_activity_received_at', None)),
+                          'receipt_id': getattr(candidate, '_reply_latency_receipt_id', None)
+                                        if getattr(candidate, 'message_id', None) is None else None}]
+        for row in rows:
+            key = (row['message_id'], row.get('receipt_id'))
+            if key not in seen:
+                inputs.append(dict(row))
+                seen.add(key)
+    return inputs
+
+
+def restore_inputs(event: Any, inputs: list[dict[str, Any]]) -> None:
+    from dataclasses import replace
+    import math
+    if (not isinstance(inputs, list) or not inputs
+            or any(not isinstance(item, dict) or 'message_id' not in item
+                   or not isinstance(item.get('received_at'), (int, float))
+                   or isinstance(item.get('received_at'), bool)
+                   or not math.isfinite(item['received_at']) for item in inputs)):
+        return
+    event._reply_latency_inputs = inputs
+    event._hermes_absorbed_events = []
+    for index, item in enumerate(inputs):
+        candidate = event if index == 0 else replace(event, message_id=item['message_id'])
+        if item.get('received_at') is not None:
+            candidate._reply_latency_received_at = item['received_at']
+            if index:
+                candidate._attended_activity_received_at = item['received_at']
+        if item.get('receipt_id'):
+            candidate._reply_latency_receipt_id = item['receipt_id']
+        if index:
+            event._hermes_absorbed_events.append(candidate)
 
 
 def bind_agent_start(event: Any) -> None:
@@ -114,10 +184,16 @@ def bind_agent_start(event: Any) -> None:
     receipt rather than logging this text as an answer to the chain head.
     """
     receipt = record_received(event)
+    if receipt is not None:
+        receipt.absorbed = tuple(r for candidate in getattr(event, '_hermes_absorbed_events', ())
+                                 if (r := record_received(candidate)) is not None and r is not receipt)
     _current.set(receipt)  # synthetic turns must clear an inherited human clock
-    if receipt is not None and not receipt.started:
-        receipt.started = True
-        _emit(receipt, "agent_start", time.time())
+    if receipt is not None:
+        for item in (receipt, *receipt.absorbed):
+            with item.lock:
+                if not item.started:
+                    item.started = True
+                    _emit(item, "agent_start", time.time())
 
 
 def current_receipt() -> ReplyReceipt | None:
@@ -131,11 +207,53 @@ def restore_receipt(receipt: ReplyReceipt | None) -> None:
 
 def record_first_reply(receipt: ReplyReceipt | None, text: str, result: Any = None) -> None:
     """Call only at a confirmed transport success, never a journal/optimistic mark."""
-    if receipt is None or receipt.replied or not text.strip():
+    if receipt is None or not text.strip():
         return
     if result is not None:
         raw = getattr(result, "raw_response", None)
         if getattr(result, "success", False) is not True or (isinstance(raw, dict) and raw.get("skipped")):
             return
-    receipt.replied = True
-    _emit(receipt, "first_reply", time.time())
+    _record_terminal(receipt, "first_reply")
+
+
+def _record_terminal(receipt: ReplyReceipt | None, event: str) -> None:
+    if receipt is None:
+        return
+    stamp = time.time()
+    for item in (receipt, *receipt.absorbed):
+        with item.lock:
+            if item.replied or item.no_reply:
+                continue
+            if event == "first_reply":
+                item.replied = True
+            else:
+                item.no_reply = True
+            _emit(item, event, stamp)
+
+
+def record_no_reply(receipt: ReplyReceipt | None) -> None:
+    """A deliberate silent ending settles the input without inventing a delivery."""
+    _record_terminal(receipt, "no_reply")
+
+
+def event_receipt(event: Any) -> ReplyReceipt | None:
+    return getattr(event, "_terminal_reply_latency_receipt",
+                   getattr(event, "_reply_latency_receipt", None))
+
+
+def hand_over_receipt(source: Any, target: Any) -> None:
+    """Execution and transport waiters own different events, but one delivery clock."""
+    for name in ("_reply_latency_receipt", "_terminal_reply_latency_receipt"):
+        if hasattr(source, name):
+            setattr(target, name, getattr(source, name))
+
+
+def record_tool_reply(platform: str, chat_id: Any, thread_id: Any = None) -> None:
+    """Only a successful delivery to this turn's destination answers its input."""
+    receipt = current_receipt()
+    if receipt is None:
+        return
+    identity = receipt.identity
+    if (identity['platform'] == platform and identity['chat_id'] == str(chat_id)
+            and identity['thread_id'] == (str(thread_id) if thread_id is not None else None)):
+        record_first_reply(receipt, "delivery")

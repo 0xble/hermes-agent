@@ -137,6 +137,58 @@ async def test_slow_writer_never_blocks_delivery_loop_and_overflow_breaks_covera
     assert any(row['coverage_start'] == row['timestamp'] for row in checkpoints[1:])
 
 
+def test_alias_homes_share_writer_and_sequence(tmp_path):
+    from gateway.reply_latency_sink import sink_for_home
+    real = tmp_path / 'real'
+    real.mkdir()
+    alias = tmp_path / 'alias'
+    alias.symlink_to(real, target_is_directory=True)
+    first = sink_for_home(real, 'default')
+    second = sink_for_home(alias, 'named')
+    assert first is second
+    first.write({'event': 'received', 'profile': 'default', 'timestamp': 1})
+    second.write({'event': 'first_reply', 'profile': 'named', 'timestamp': 2})
+    second.flush()
+    records = rows(real)
+    assert len({row['process_id'] for row in records}) == 1
+    assert [row['sequence'] for row in records] == list(range(1, len(records) + 1))
+
+
+def test_shutdown_drains_queue_stops_threads_and_reaps_registry(tmp_path):
+    from gateway import reply_latency_sink as sinks
+    instance = sinks.sink_for_home(tmp_path)
+    for index in range(8):
+        instance.write({'event': 'received', 'profile': 'default', 'timestamp': index})
+    assert sinks.shutdown_sinks(timeout=2)
+    assert not instance.worker.is_alive()
+    assert not sinks._sinks
+    records = [json.loads(line) for p in instance.root.glob('*.jsonl') for line in p.read_text().splitlines()]
+    assert len([row for row in records if row['event'] == 'received']) == 8
+
+
+def test_shutdown_slow_disk_wait_is_bounded_and_can_be_reaped_later(tmp_path, monkeypatch):
+    from gateway import reply_latency_sink as sinks
+    instance = sinks.sink_for_home(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    append = instance._append
+    def slow(*args):
+        entered.set()
+        assert release.wait(5)
+        append(*args)
+    monkeypatch.setattr(instance, '_append', slow)
+    instance.checkpoint()
+    try:
+        assert entered.wait(2)
+        assert not sinks.shutdown_sinks(timeout=0)
+        assert instance.closed.is_set()
+        assert instance.worker.is_alive()
+        assert sinks.sink_for_home(tmp_path) is instance
+    finally:
+        release.set()
+    assert sinks.shutdown_sinks(timeout=2)
+    assert not instance.worker.is_alive()
+
+
 def test_pre_initialization_overflow_cannot_be_healed_by_old_queued_event(tmp_path):
     from gateway.reply_latency_sink import ReplyLatencySink
     instance = ReplyLatencySink(tmp_path)

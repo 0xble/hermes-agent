@@ -90,7 +90,11 @@ async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs)
     """``bot.send_message`` with bounded retries on transient failures."""
     for attempt in range(attempts):
         try:
-            return await bot.send_message(**kwargs)
+            result = await bot.send_message(**kwargs)
+            if result is not None:
+                from gateway.reply_latency import record_tool_reply
+                record_tool_reply("telegram", kwargs['chat_id'], kwargs.get('message_thread_id'))
+            return result
         except Exception as exc:
             delay = _telegram_retry_delay(exc, attempt)
             if delay is None or attempt >= attempts - 1:
@@ -197,7 +201,11 @@ async def _telegram_send_media(bot, chat_id, f, ext, is_voice, force_document, *
     kind = next((k for exts, k in ((() if force_document else _IMAGE_EXTS, "photo"), (_VIDEO_EXTS, "video"),
                                     (_VOICE_EXTS if is_voice else (), "voice"), (_TELEGRAM_SEND_AUDIO_EXTS, "audio"))
                  if ext in exts), "document")
-    return await getattr(bot, f"send_{kind}")(chat_id=chat_id, **{kind: f}, **kwargs)
+    result = await getattr(bot, f"send_{kind}")(chat_id=chat_id, **{kind: f}, **kwargs)
+    if result is not None:
+        from gateway.reply_latency import record_tool_reply
+        record_tool_reply("telegram", chat_id, kwargs.get('message_thread_id'))
+    return result
 
 
 async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, text_kwargs):
@@ -301,6 +309,8 @@ async def _send_telegram_copy_document(token, chat_id, message, thread_id=None):
     msg = await bot.send_document(
         chat_id=normalize_telegram_chat_id(chat_id), document=doc, filename="copy.txt",
         **_telegram_thread_kwargs(thread_id))
+    from gateway.reply_latency import record_tool_reply
+    record_tool_reply("telegram", chat_id, thread_id)
     return _success("telegram", chat_id, [], message_id=str(getattr(msg, "message_id", "")))
 
 
@@ -360,6 +370,8 @@ async def _send_telegram_rich(bot, chat_id, message, thread_kwargs, *, disable_l
             logger.warning("Telegram rich send failed (no legacy resend): %s", _sanitize_error_text(error))
             return _error(f"Telegram rich send failed: {error}")
 
+    from gateway.reply_latency import record_tool_reply
+    record_tool_reply("telegram", chat_id, thread_kwargs.get('message_thread_id'))
     if isinstance(response, dict):
         message_id = response.get("message_id")
         if message_id is None:

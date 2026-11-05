@@ -5164,6 +5164,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         def _record_attachment(result):
             nonlocal attachment_delivered
             record_delivery(result)
+            from gateway.reply_latency import event_receipt, record_first_reply
+            if result is not None:
+                record_first_reply(event_receipt(event), "attachment", result)
             attachment_delivered = attachment_delivered or bool(getattr(result, "success", False))
         if images:
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))

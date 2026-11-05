@@ -213,13 +213,15 @@ def _handle_react(args, remove=False):
         return json.dumps(_error(f"Reaction failed: {e}"))
     if result is False:
         return tool_error(f"Platform '{platform_name}' does not support this reaction or delivery failed.")
-    delivered = result.get("success") is True if isinstance(result, dict) else result is True
+    delivered = (result.get("success") is True and not result.get("skipped")) if isinstance(result, dict) else result is True
     if not remove and delivered:
         from gateway.session_context import acknowledge_current_message_reaction
         target = (platform_name, str(chat_id), str(message_id))
         current = tuple(get_session_env(f"HERMES_SESSION_{key}") for key in ("PLATFORM", "CHAT_ID", "MESSAGE_ID"))
         if target == current:
             acknowledge_current_message_reaction()
+            from gateway.reply_latency import record_tool_reply
+            record_tool_reply(platform_name, chat_id, _thread_id)
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
 
 
@@ -298,6 +300,10 @@ def _handle_send(args):
         result = _run_async(_send_to_platform(platform, pconfig, chat_id, cleaned_message, thread_id=thread_id,
                                               media_files=media_files, force_document=force_document_attachments,
                                               **handler_args))
+        if (isinstance(result, dict) and result.get("success") is True
+                and not result.get("skipped")):
+            from gateway.reply_latency import record_tool_reply
+            record_tool_reply(platform_name, chat_id, thread_id)
         if isinstance(result, dict) and result.get("success"):
             if used_home_channel:
                 result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
@@ -537,6 +543,9 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
             detail = _bounded_send_error(exc)
         else:
             if last_result.success:
+                from gateway.reply_latency import record_tool_reply
+                if platform := getattr(adapter, 'platform', None):
+                    record_tool_reply(getattr(platform, 'value', str(platform)), chat_id, thread_id)
                 continue
             detail = _bounded_send_error(last_result.error or "media send failed")
         return {"error": f"Adapter media send failed after {index}/{total} files: {detail}"}
@@ -612,7 +621,7 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
                       f"expected a dict with 'success' or 'error' keys, got {type(result).__name__}")}
 
 
-async def _send_chunks(chunks, send_one):
+async def _send_chunks(chunks, send_one, on_sent=None):
     """``send_one(chunk, is_last)`` in order; stop at the first error dict, else last result."""
     result = None
     # --- Matrix: route ALL sends through the native adapter so text is encrypted in E2EE rooms too (issue:
@@ -621,6 +630,9 @@ async def _send_chunks(chunks, send_one):
     # encryption-aware ephemeral adapter for standalone/cron. ---
     for i, chunk in enumerate(chunks):
         result = await send_one(chunk, i == len(chunks) - 1)
+        if (on_sent is not None and isinstance(result, dict) and result.get("success") is True
+                and not result.get("skipped")):
+            on_sent()
         if isinstance(result, dict) and result.get("error"):
             break
     return result
@@ -702,6 +714,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
+    from gateway.reply_latency import record_tool_reply
+    confirm = lambda: record_tool_reply(platform_name, chat_id, thread_id)
     if platform_name == "weixin":  # plugin standalone sender only: no other plugin's import can block it
         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, [message], media_files,
                                              thread_id=thread_id, max_len=None, force_document=force_document)
@@ -725,7 +739,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if route is not None and (media_files or not route[0]):
         _, empty_media, sender = route
         return await _send_chunks(chunks, lambda chunk, is_last: sender(
-            platform, pconfig, chat_id, chunk, media_files if is_last else empty_media, thread_id, force_document))
+            platform, pconfig, chat_id, chunk, media_files if is_last else empty_media, thread_id, force_document), confirm)
 
     # Generic path: text only. Buzz delivers media natively via _send_via_adapter, so no warning.
     warning = None
@@ -752,7 +766,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         # Plugin platform: live gateway adapter if available, else standalone_sender_fn.
         send_one = lambda chunk, is_last: _via_adapter_route(
             platform, pconfig, chat_id, chunk, media_files if is_last else [], thread_id, force_document)
-    last_result = await _send_chunks(chunks, send_one)
+    last_result = await _send_chunks(chunks, send_one, confirm)
     if (warning and isinstance(last_result, dict) and last_result.get("success")
             and not last_result.get("media_delivered")):
         last_result["warnings"] = [*last_result.get("warnings", []), warning]

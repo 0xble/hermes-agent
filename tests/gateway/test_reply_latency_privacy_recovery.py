@@ -1,8 +1,6 @@
 """Privacy and shutdown-spool provenance survive the gateway's event copies."""
 from types import SimpleNamespace
 
-import pytest
-
 from agent.incognito import incognito_scope
 from gateway import reply_latency as latency
 from gateway.run_pending_recovery import _recovered_followup_event
@@ -49,6 +47,25 @@ def test_idless_receipt_and_clock_survive_shutdown_spool(tmp_path, monkeypatch):
     second = latency.record_received(restored)
     assert second.identity['receipt_id'] == first.identity['receipt_id']
     assert latency.stamp_received(restored) == 100
+
+
+def test_merged_receipts_survive_spool_and_subsequent_merge(tmp_path, monkeypatch):
+    from gateway.platforms.base import merge_pending_message_event
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    adapter = Adapter()
+    first, second, third = (event(adapter, None) for _ in range(3))
+    for index, incoming in enumerate((first, second, third)):
+        incoming._attended_activity_received_at = 100 + index * 10
+        latency.record_received(incoming)
+    pending = {'route': first}
+    merge_pending_message_event(pending, 'route', second, merge_text=True)
+    data = _serialise_value(first)
+    restored = _recovered_followup_event(data, first.source, 'human')
+    pending = {'route': restored}
+    merge_pending_message_event(pending, 'route', third, merge_text=True)
+    snapshot = latency.snapshot_inputs(restored)
+    assert [row['received_at'] for row in snapshot] == [100, 110, 120]
+    assert len({row['receipt_id'] for row in snapshot}) == 3
 
 
 def test_projected_reply_uuid_keeps_its_original_clock(tmp_path, monkeypatch):

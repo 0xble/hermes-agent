@@ -507,5 +507,8 @@ class GatewayVoiceMixin:
         thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
         thread_meta["notify"] = True
         for path in audio_paths:
-            await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
-                             metadata=thread_meta)
+            result = await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
+                                      metadata=thread_meta)
+            from gateway.reply_latency import event_receipt, record_first_reply
+            if result is not None:
+                record_first_reply(event_receipt(event), "voice", result)

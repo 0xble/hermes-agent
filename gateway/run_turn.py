@@ -2913,6 +2913,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
+            from gateway.reply_latency import event_receipt, record_no_reply
+            record_no_reply(event_receipt(event))
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 

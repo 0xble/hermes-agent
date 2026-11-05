@@ -469,6 +469,8 @@ class GatewayNotificationsMixin(
         Returns True when at least one upload was confirmed delivered.
         """
         from urllib.parse import quote as _quote
+        from gateway.reply_latency import event_receipt, record_first_reply
+        receipt = event_receipt(event)
         delivered_any = False
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
@@ -510,6 +512,8 @@ class GatewayNotificationsMixin(
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
                     images.extend(url_images)
                     _res = await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    if _res is not None:
+                        record_first_reply(receipt, "attachment", _res)
                     delivered_any = delivered_any or _media_send_succeeded(_res)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
@@ -527,6 +531,8 @@ class GatewayNotificationsMixin(
                     else:
                         _res = await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
                         delivered_any = delivered_any or _media_send_succeeded(_res)
+                    if _res is not None:
+                        record_first_reply(receipt, "attachment", _res)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
         return delivered_any
@@ -552,6 +558,8 @@ class GatewayNotificationsMixin(
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
         note_event = MessageEvent(text="", source=source, message_id=event_message_id)
+        from gateway.reply_latency import current_receipt
+        note_event._reply_latency_receipt = current_receipt()
         delivered_confirmed = text_already_delivered
         from gateway.copy_blocks import split_copy_blocks_for
         _, copy_blocks = split_copy_blocks_for(adapter, response)
@@ -661,7 +669,7 @@ class GatewayNotificationsMixin(
         # Attachments come only from text outside copy blocks: a body is literal text.
         from gateway.copy_blocks import strip_copy_blocks
         media_delivered = await self._deliver_media_from_response(
-            strip_copy_blocks(response), MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+            strip_copy_blocks(response), note_event, adapter,
             thread_metadata=metadata,
         )
         # Attachment-only answer: no text was sent, so the note is reconciled only once an upload

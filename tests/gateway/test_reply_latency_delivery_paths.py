@@ -55,11 +55,12 @@ async def test_native_waiter_and_busy_copy_share_executed_receipt(monkeypatch, c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('restore', [False, True])
-async def test_merged_inputs_all_own_first_visible_delivery(monkeypatch, tmp_path, caplog, restore):
+@pytest.mark.parametrize('identified', [False, True])
+async def test_merged_inputs_all_own_first_visible_delivery(monkeypatch, tmp_path, caplog, restore, identified):
     from gateway.session_envelope import _adapter_event, _snapshot_native, restore_native
     caplog.set_level('INFO', logger='gateway.reply_latency')
     adapter = Adapter()
-    first, second = event(adapter, 'one'), event(adapter, 'two')
+    first, second = event(adapter, 'one' if identified else None), event(adapter, 'two' if identified else None)
     first._attended_activity_received_at = 100
     second._attended_activity_received_at = 110
     latency.record_received(first)
@@ -71,12 +72,16 @@ async def test_merged_inputs_all_own_first_visible_delivery(monkeypatch, tmp_pat
         runner = SimpleNamespace(session_store=SimpleNamespace(_generate_session_key=lambda source: 'route'))
         payload = _snapshot_native(runner, _adapter_event(incoming), None,
                                   encoded_source={**incoming.source.to_dict(), 'is_bot': False})
+        latency._live.clear()  # emulate native restoration after a process restart
+        caplog.clear()
         incoming = restore_native(payload)
     latency.bind_agent_start(incoming)
     await adapter.send_final_ledgered(incoming, 'route', 'answer to both', {}, reply_to=None)
     await adapter.send_final_ledgered(incoming, 'route', 'another answer', {}, reply_to=None)
     replies = [r for r in records(caplog) if r['event'] == 'first_reply']
-    assert sorted(r['message_id'] for r in replies) == ['one', 'two']
+    assert sorted(r['message_id'] or '' for r in replies) == (['one', 'two'] if identified else ['', ''])
+    if restore:
+        assert sorted(r['timestamp'] for r in records(caplog) if r['event'] == 'received') == [100, 110]
     assert {r['timestamp'] for r in replies}.__len__() == 1
 
 
@@ -127,13 +132,15 @@ def test_send_message_only_current_route_and_confirmed_delivery(monkeypatch, cap
     monkeypatch.setattr(tool, '_authorize_relay_target', lambda *args, **kwargs: None)
     monkeypatch.setattr(tool, '_mirror_sent_message', lambda *args: False)
     monkeypatch.setattr(tool, '_maybe_skip_cron_duplicate_send', lambda *args: None)
-    success = False
+    success, skipped = False, False
     async def send(*args, **kwargs):
-        return {'success': success}
+        return {'success': success, 'skipped': skipped}
     monkeypatch.setattr(tool, '_send_to_platform', send)
     monkeypatch.setattr(model_tools, '_run_async', asyncio.run)
     tool._handle_send({'target': 'chat', 'message': 'failed'})
-    success = True
+    success, skipped = True, True
+    tool._handle_send({'target': 'chat', 'message': 'skipped'})
+    skipped = False
     tool._handle_send({'target': 'other', 'message': 'not an answer here'})
     assert not [r for r in records(caplog) if r['event'] == 'first_reply']
     tool._handle_send({'target': 'chat', 'message': 'answer'})
@@ -156,3 +163,64 @@ async def test_attachment_only_success_counts_as_visible_reply(caplog):
     adapter._send_image_batch = images
     await adapter._deliver_attachments(incoming, extracted, {}, anything_sent=False, record_delivery=lambda r: None)
     assert incoming._reply_latency_receipt.replied
+
+
+@pytest.mark.asyncio
+async def test_tool_first_chunk_is_recorded_before_later_failure(caplog):
+    from tools.send_message_tool import _send_chunks
+    caplog.set_level('INFO', logger='gateway.reply_latency')
+    incoming = event(Adapter(), 'chunked-tool')
+    latency.bind_agent_start(incoming)
+    sent = 0
+    async def send(chunk, is_last):
+        nonlocal sent
+        sent += 1
+        if is_last:
+            assert incoming._reply_latency_receipt.replied
+            return {'error': 'second chunk failed'}
+        return {'success': True}
+    result = await _send_chunks(['first', 'second'], send,
+                               lambda: latency.record_tool_reply('telegram', 'chat'))
+    assert result['error'] == 'second chunk failed'
+    assert len([r for r in records(caplog) if r['event'] == 'first_reply']) == 1
+
+
+def test_terminal_receipt_is_atomic_and_silence_never_overwrites_delivery(caplog):
+    from concurrent.futures import ThreadPoolExecutor
+    caplog.set_level('INFO', logger='gateway.reply_latency')
+    incoming = event(Adapter(), 'atomic')
+    receipt = latency.record_received(incoming)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: latency.record_first_reply(receipt, 'delivered'), range(16)))
+    latency.record_no_reply(receipt)
+    assert [r['event'] for r in records(caplog)] == ['received', 'first_reply']
+
+
+@pytest.mark.asyncio
+async def test_voice_delivery_counts_only_confirmed_success(caplog):
+    from gateway.run_voice import GatewayVoiceMixin
+    caplog.set_level('INFO', logger='gateway.reply_latency')
+    incoming = event(Adapter(), 'voice')
+    latency.bind_agent_start(incoming)
+    adapter = SimpleNamespace(send_voice=AsyncMock(side_effect=[None, SendResult(success=False), SendResult(success=True)]))
+    runner = SimpleNamespace(_delivery_adapter_for=lambda source: adapter, _get_guild_id=lambda e: None,
+                             _reply_anchor_for_event=lambda e: None, _thread_metadata_for_source=lambda *a: {})
+    await GatewayVoiceMixin._deliver_voice_reply(runner, incoming, ['one', 'two', 'three'])
+    assert [r['event'] for r in records(caplog)] == ['received', 'agent_start', 'first_reply']
+
+
+@pytest.mark.asyncio
+async def test_streaming_tts_uses_captured_receipt_at_first_audible_chunk(monkeypatch, caplog):
+    from gateway.streaming_tts_consumer import StreamingTTSConsumer
+    caplog.set_level('INFO', logger='gateway.reply_latency')
+    incoming = event(Adapter(), 'stream-voice')
+    latency.bind_agent_start(incoming)
+    monkeypatch.setattr('tools.tts_streaming.resolve_streaming_provider', lambda c: None)
+    adapter = SimpleNamespace(write_streaming_tts=AsyncMock())
+    consumer = StreamingTTSConsumer(adapter, 'chat', {}, asyncio.get_running_loop())
+    consumer._streamer = SimpleNamespace(stream=lambda text: iter([b'audio', b'more']))
+    consumer._handle = SimpleNamespace(aborted=False, audible=False)
+    consumer._strip_markdown = lambda text: text
+    latency.restore_receipt(None)
+    await consumer._synthesise_and_write('spoken answer')
+    assert [r['event'] for r in records(caplog)] == ['received', 'agent_start', 'first_reply']

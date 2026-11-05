@@ -1,11 +1,14 @@
 # Durable reply-latency evidence
 
 Fork patch identity: `reply-latency-sink`.
+Contract tests: `tests/gateway/test_reply_latency_sink.py`, `tests/gateway/test_reply_latency_logs.py`, `tests/gateway/test_reply_latency_followups.py`, `tests/gateway/test_reply_latency_delivery_paths.py`, `tests/gateway/test_reply_latency_privacy_recovery.py`.
 
 ## Intent and ownership
 
 Extend [reply-latency metrics](reply-latency-metrics.md) without changing its
-receipt clock, genuine-user classification or confirmed-text-send boundary.
+receipt clock or genuine-user classification. Confirmed visible text, media and
+reactions settle first reply once; deliberate NO_REPLY/[SILENT] settles `no_reply`
+without inventing a delivery or latency sample.
 The scripts factory scorecard is the concrete consumer. Ordinary gateway.log
 rotation must not delete sparse measurement evidence. This is local private
 instrumentation, independent of shared-telemetry consent; no content or outbound
@@ -20,12 +23,17 @@ prune only date-named JSONL files once per day. Existing log records remain.
 
 `inbound_identity` is `[profile, platform, chat_id, thread_id, message_id]`;
 `turn_id` remains diagnostic only. A missing message ID remains null; a private
-receipt UUID survives native envelope restoration so concurrent ID-less inputs
+receipt UUID and original reply clock survive native and shutdown-spool restoration so concurrent ID-less inputs
 cannot collide and a restored receipt does not create false unanswered rows. All events carry process UUID,
 sequence, observation timestamp and process instrumentation start timestamp.
-A bounded 1024-item per-profile daemon writer keeps append/fsync/retention off
+Incognito receipts never enter this sink, even when delivered after the private
+scope ends; decide privacy on the caller context before enqueueing. Canonical
+realpath homes share one writer and process sequence. A bounded 1024-item per-home daemon writer keeps append/fsync/retention off
 intake and delivery. Overflow or failed I/O interrupts coverage, rate-limits a
-warning and never blocks delivery. Abrupt exit may lose queued records; FIFO
+warning and never waits for disk writes on delivery. Canonicalize each new home
+alias once and cache it for subsequent intake/delivery. Shutdown closes admission,
+drains FIFO and stops writers under a shared 2-second deadline; slow daemons remain
+closed until reaped. Abrupt exit may lose queued records; FIFO
 checkpoints attest only their captured enqueue time, never future/pending data.
 `instrumentation_start` is written on first initialization and daily rollover,
 including process restarts and idle profiles. Coverage checkpoints run every

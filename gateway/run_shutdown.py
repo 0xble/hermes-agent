@@ -2947,6 +2947,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
             shutdown_cached_clients()
 
         GatewayShutdownMixin._quiet_step("shutdown_cached_clients error", _reap_aux_clients)
+        # Agents/adapters are quiescent and the coverage watcher is cancelled.
+        # Evidence is best-effort: one global deadline, never an unbounded queue.join.
+        from gateway.reply_latency_sink import shutdown_sinks
+        await asyncio.to_thread(shutdown_sinks, 2.0)
 
     def _stop_quiesce_and_close_session_dbs(self, timeout: float, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Quiesce the executor, then close SessionDB handles only if no worker is still live."""

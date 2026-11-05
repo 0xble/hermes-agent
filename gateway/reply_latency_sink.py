@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 import uuid
+import weakref
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,6 +18,8 @@ RETENTION_DAYS = 14
 CHECKPOINT_SECONDS = 30
 _sinks: dict[Path, ReplyLatencySink] = {}
 _sinks_lock = threading.Lock()
+_aliases: dict[Path, Path] = {}
+_instances: weakref.WeakSet = weakref.WeakSet()
 
 
 class ReplyLatencySink:
@@ -32,13 +35,21 @@ class ReplyLatencySink:
         self.lock = threading.Lock()
         self.pending: queue.Queue = queue.Queue(maxsize=1024)
         self.interrupted = threading.Event()
+        self.closed = threading.Event()
+        self.enqueue_lock = threading.Lock()
         self.unproven_until = 0.0
         self.worker = threading.Thread(target=self._drain, name="reply-latency-sink", daemon=True)
+        _instances.add(self)
         self.worker.start()
 
     def _drain(self) -> None:
         while True:
-            payload, observed_at = self.pending.get()
+            try:
+                payload, observed_at = self.pending.get(timeout=0.1)
+            except queue.Empty:
+                if self.closed.is_set() and self.pending.empty():
+                    return
+                continue
             try:
                 if self.interrupted.is_set():
                     self.interrupted.clear()
@@ -51,15 +62,25 @@ class ReplyLatencySink:
 
     def write(self, payload: dict | None = None) -> None:
         # Intake and confirmed delivery never wait for the disk or its writer lock.
-        try:
-            self.pending.put_nowait((payload, time.time()))
-        except queue.Full:
-            self.interrupted.set()
-            # The writer emits the rate-limited diagnostic off the delivery loop.
+        with self.enqueue_lock:
+            if self.closed.is_set():
+                return
+            try:
+                self.pending.put_nowait((payload, time.time()))
+            except queue.Full:
+                self.interrupted.set()
+                # The writer emits the rate-limited diagnostic off the delivery loop.
 
     def flush(self) -> None:
         """Test/process-boundary barrier; never called by delivery."""
         self.pending.join()
+
+    def stop(self, timeout: float = 2.0) -> bool:
+        """Close admission and drain FIFO within a bounded process-boundary wait."""
+        with self.enqueue_lock:
+            self.closed.set()
+        self.worker.join(timeout=max(0.0, timeout))
+        return not self.worker.is_alive()
 
     def _append(self, payload: dict, now: float) -> None:
         self.sequence += 1
@@ -132,13 +153,41 @@ class ReplyLatencySink:
 
 
 def sink_for_home(home: Path, profile: str = "default") -> ReplyLatencySink:
-    # Homes arrive from resolved runtime identity. Lexical normalization only:
-    # Path.resolve/stat would put filesystem latency back on the delivery loop.
-    home = Path(os.path.abspath(home))
+    # Cache canonical identity once per lexical home, never re-stat an established
+    # delivery route. Alias homes share the writer, process UUID and sequence.
+    alias = Path(os.path.abspath(home))
     with _sinks_lock:
-        if home not in _sinks:
-            _sinks[home] = ReplyLatencySink(home, profile)
-        return _sinks[home]
+        canonical = _aliases.get(alias)
+        if canonical is None:
+            canonical = alias.resolve()
+            _aliases[alias] = canonical
+        if canonical not in _sinks:
+            _sinks[canonical] = ReplyLatencySink(canonical, profile)
+        return _sinks[canonical]
+
+
+def shutdown_sinks(timeout: float = 2.0) -> bool:
+    """Drain all local writers under one deadline, including directly owned test sinks.
+
+    A slow daemon remains closed and registered until it finishes: do not let a new
+    writer race its undrained queue. A later shutdown call can reap it.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _sinks_lock:
+        sinks = tuple(_instances)
+        for sink in sinks:
+            with sink.enqueue_lock:
+                sink.closed.set()
+    complete = True
+    for sink in sinks:
+        complete = sink.stop(max(0.0, deadline - time.monotonic())) and complete
+    with _sinks_lock:
+        for home, sink in list(_sinks.items()):
+            if not sink.worker.is_alive():
+                del _sinks[home]
+        if not _sinks:
+            _aliases.clear()
+    return complete
 
 
 def append_event(home: Path, payload: dict) -> None:
