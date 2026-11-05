@@ -93,15 +93,19 @@ async def admit_process_notice(runner, authority, adapter, event, evt):
         from gateway.session_envelope import restore_native
         from gateway.session_identity import replace_source
 
-        entry = await asyncio.to_thread(_owner, runner, event, authority)
-        envelope = await asyncio.to_thread(committed_route_envelope, authority, entry)
-        if envelope is not None and not route_rebound(entry, envelope):
-            restored = restore_native({'text': event.text, 'native_text_v1': {
-                key: value for key, value in envelope.items() if key != 'media'}}, runner)
-            if (runner.session_store._generate_session_key(restored.source) != entry.session_key
-                    or runner._adapter_for_source(restored.source) is not adapter):
-                raise RuntimeStoreError('admission_conflict')
-            event.source = replace_source(restored.source, message_id=None)
+        from gateway.admission_canary import refusal_evidence
+
+        # Preparation can refuse before the authority call; it owes the same canary evidence.
+        with refusal_evidence('automation', identity):
+            entry = await asyncio.to_thread(_owner, runner, event, authority)
+            envelope = await asyncio.to_thread(committed_route_envelope, authority, entry)
+            if envelope is not None and not route_rebound(entry, envelope):
+                restored = restore_native({'text': event.text, 'native_text_v1': {
+                    key: value for key, value in envelope.items() if key != 'media'}}, runner)
+                if (runner.session_store._generate_session_key(restored.source) != entry.session_key
+                        or runner._adapter_for_source(restored.source) is not adapter):
+                    raise RuntimeStoreError('admission_conflict')
+                event.source = replace_source(restored.source, message_id=None)
     if evt.get('type') == 'heartbeat':
         # The tick's raw output rides its stored admission: a later tick folds from the ledger.
         event.metadata['heartbeat_tick'] = {'output': str(evt.get('output') or ''),

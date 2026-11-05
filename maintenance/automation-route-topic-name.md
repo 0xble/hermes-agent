@@ -16,7 +16,10 @@ pin, then restores the live committed source before ordinary admission. The stor
 labels or first speaker may be stale on a shared route; they must not strand process
 completions. This exception is private to `admit_process_notice`, not an `internal` metadata
 flag available to arbitrary callers. Per-user route drift, wrong connector/adapter, reset
-sessions and direct foreign-sender automation remain refused.
+sessions and direct foreign-sender automation remain refused. Preparation refusals
+are counted by the admission canary under the same producer identity as ordinary
+admission, including their reason/field; retries count once per retention window.
+The ordered admission preparation still rechecks route, session and provenance.
 
 ## Source
 

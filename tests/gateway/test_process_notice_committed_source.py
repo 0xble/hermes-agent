@@ -2,10 +2,12 @@
 
 import pytest
 
+from gateway import admission_canary
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session_identity import replace_source
-from hermes_state_runtime import list_session_admissions
+from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from tests.gateway.test_admission_canary import refusal_evidence as canary_evidence
 from tests.gateway.test_automation_notification_category import _SOURCE, _authority, _native_owner
 
 
@@ -30,7 +32,7 @@ async def test_wake_admits_as_the_committed_turn_when_the_origin_drifted(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_process_notice_refuses_stale_origin_on_a_per_user_route(tmp_path, monkeypatch):
+async def test_process_notice_refuses_stale_origin_on_a_per_user_route(tmp_path, monkeypatch, canary_evidence):
     from gateway.session_ingress_context import native_callback, register_transport_home
     from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -57,8 +59,49 @@ async def test_process_notice_refuses_stale_origin_on_a_per_user_route(tmp_path,
                'platform': 'discord', 'chat_id': '42', 'chat_type': 'group', 'exit_code': 0,
                'output': 'done', 'started_at': 2.0, 'parent_session_id': sid}
         assert await runner._inject_watch_notification('[done]', evt) is False
+        assert [clause for _, clause in admission_canary.snapshot()['refusals']] == [
+            'automation: admission_conflict']
         assert list_session_admissions(authority.db, session_id=authority.logical_owner(sid),
                                        pending_only=False) == before
     finally:
         authority.db.close()
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('drift', 'reason', 'field'), [
+    ('missing-route', 'not_found', 'automation_route_unavailable'),
+    ('thread', 'admission_conflict', None),
+    ('session-pin', 'admission_conflict', None),
+    ('adapter', 'admission_conflict', None),
+])
+async def test_process_notice_prevalidation_refusals_reach_canary(
+        tmp_path, monkeypatch, canary_evidence, drift, reason, field):
+    from gateway.session_automation import admit_process_notice
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'human-1')
+    try:
+        route, sid = metadata['gateway_session_key'], metadata['gateway_session_id']
+        before = list_session_admissions(authority.db, session_id=authority.logical_owner(sid),
+                                         pending_only=False)
+        if drift == 'missing-route':
+            metadata['gateway_session_key'] += '-missing'
+        elif drift == 'thread':
+            source = replace_source(source, thread_id='other-thread')
+        elif drift == 'session-pin':
+            metadata['gateway_session_id'] = 'unrelated-session'
+        else:
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture', typing_indicator=False))
+        event = MessageEvent(text='notice', source=source, internal=True, metadata=metadata)
+        evt = {'type': 'completion', 'session_id': 'proc_x', 'started_at': 1.0, 'session_key': route}
+        assert admission_canary.snapshot()['refusals'] == []
+        clause = f'automation: {reason}' + (f' ({field})' if field else '')
+        for _ in range(3):
+            with pytest.raises(RuntimeStoreError) as refused:
+                await admit_process_notice(runner, authority, adapter, event, evt)
+            assert (refused.value.reason, refused.value.field) == (reason, field)
+            assert [value for _, value in admission_canary.snapshot()['refusals']] == [clause]
+        assert list_session_admissions(authority.db, session_id=authority.logical_owner(sid),
+                                       pending_only=False) == before
+    finally:
+        authority.db.close()
