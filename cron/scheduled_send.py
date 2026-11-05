@@ -159,7 +159,8 @@ def _resolve_freshness_script(script: str) -> Path:
         error, skill_dir, _skill_md = locate_skill(
             "communications", None, get_skill_search_roots(include_project=False))
         expected = (skill_dir.resolve() / "scripts/send_freshness.py") if skill_dir else None
-        if (error or expected is None or not requested.is_absolute()
+        if (error or skill_dir is None or expected is None or not requested.is_absolute()
+                or requested not in {skill_dir / "scripts/send_freshness.py", expected}
                 or requested.resolve() != expected or expected.resolve() != expected):
             raise ValueError(
                 "send_freshness.script must be inside HERMES_HOME/scripts or the installed "
