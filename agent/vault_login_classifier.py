@@ -30,7 +30,7 @@ LOGIN_AUTOFILL_TOKENS = ("username", "email", "tel", "current-password")
 # Payment / address autocomplete tokens (WHATWG) the checkout fill targets. ``cc-exp`` (combined
 # MM/YY) is derived at fill time from exp_month + exp_year. Field-name/label heuristics below back
 # up sites that omit autocomplete attributes.
-PAYMENT_AUTOFILL_TOKENS = ("cc-number", "cc-name", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc")
+PAYMENT_AUTOFILL_TOKENS = ("cc-number", "cc-name", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc", "cc-type")
 ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "address-level1",
                            "postal-code", "country-name", "country")
 PROTECTED_FIELD_TOKENS = ("bday", "bday-day", "bday-month", "bday-year")
@@ -38,9 +38,10 @@ _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan)\b"), "cc-number"),
     (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname)\b"), "cc-name"),
     (re.compile(r"\b(?:cvc|cvv|csc|security\s*code|card\s*code)\b"), "cc-csc"),
+    (re.compile(r"\b(?:card|credit\s*card)\s*(?:type|brand)\b"), "cc-type"),
     (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth)\b"), "cc-exp-month"),
     (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear)\b"), "cc-exp-year"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy|valid\s*thru)\b"), "cc-exp"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy(?:yy)?|valid\s*thru)\b"), "cc-exp"),
     (re.compile(r"\b(?:address\s*(?:line\s*)?2|apt|suite|unit)\b"), "address-line2"),
     (re.compile(r"\b(?:address(?:\s*line\s*1)?|street)\b"), "address-line1"),
     (re.compile(r"\b(?:city|town|locality)\b"), "address-level2"),
@@ -264,7 +265,14 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
             return ClassifiedLoginControl(control, 100, "country-name" if token == "country" else token)
     if control.type == "email":
         return None
-    searchable = _normalize_text(" ".join(part for part in (control.name, control.label) if part))
+    if set(tokens) & {"one-time-code", "current-password", "new-password", "username"}:
+        return None
+    metadata = " ".join(part for part in (control.name, control.label) if part)
+    # Camel-case identifiers are common in Angular/Vue forms (CVVNumber,
+    # ExpirationYear). Preserve word boundaries before normalization.
+    metadata = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", metadata)
+    metadata = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", metadata)
+    searchable = _normalize_text(metadata)
     for pattern, token in _CHECKOUT_HEURISTICS:
         if pattern.search(searchable):
             # Narrow guards adapted from upstream PRs 136639 and 134723.
@@ -273,7 +281,28 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
             if control.type == "password" and token != "cc-csc":
                 continue
             return ClassifiedLoginControl(control, 70, token)
+    if control.label.strip() in {"###", "####"} and control.type in {"text", "tel", "number"}:
+        return ClassifiedLoginControl(control, 60, "cc-csc")
+    if control.type in {"combobox", "select"}:
+        token = {"mm": "cc-exp-month", "yyyy": "cc-exp-year", "yy": "cc-exp-year"}.get(searchable)
+        if token:
+            return ClassifiedLoginControl(control, 60, token)
     return None
+
+
+def _payment_brand(number: str) -> str:
+    number = re.sub(r"[\s-]", "", number)
+    if not re.fullmatch(r"[0-9]{13,19}", number):
+        return ""
+    if number.startswith("4"):
+        return "visa"
+    if number.startswith(("34", "37")):
+        return "amex"
+    if 51 <= int(number[:2]) <= 55 or 2221 <= int(number[:4]) <= 2720:
+        return "mastercard"
+    if number.startswith(("6011", "65")) or 644 <= int(number[:3]) <= 649:
+        return "discover"
+    return ""
 
 
 def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict[str, str],
@@ -286,13 +315,21 @@ def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict
     score then DOM order.
     """
     values: dict[str, str] = {tok: secret[f] for f, tok in field_tokens.items() if secret.get(f)}
+    if brand := _payment_brand(secret.get("card_number", "")):
+        values["cc-type"] = brand
     if "cc-exp-month" in values and "cc-exp-year" in values:
         values["cc-exp"] = f"{values['cc-exp-month'].zfill(2)}/{values['cc-exp-year'][-2:]}"
     fills: list[dict[str, Any]] = []
     for token, value in values.items():
         candidates = sorted((c for c in classified if c.token == token), key=lambda c: (-c.score, c.control.index))
         if candidates:
-            fills.append({"index": candidates[0].control.index, "token": token, "value": value})
+            control = candidates[0].control
+            if token == "cc-exp" and "cc-exp-month" in values and re.search(r"yyyy", control.label, re.I):
+                separator = " / " if " / " in control.label else "/"
+                value = values['cc-exp-month'].zfill(2) + separator + values['cc-exp-year']
+            elif token == "cc-exp-year" and control.max_length == 2:
+                value = value[-2:]
+            fills.append({"index": control.index, "token": token, "value": value})
     if any(f["token"] == "cc-exp" for f in fills):
         fills = [f for f in fills if f["token"] not in ("cc-exp-month", "cc-exp-year")]
     return fills
@@ -445,7 +482,7 @@ def build_inspection_js(nonce: str) -> str:
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
   __QUERY_ALL__
-  const elements = queryAll("input, select");
+  const elements = queryAll("input, select, [role=combobox]");
   const forms = queryAll("form");
   const containerIds = new WeakMap();
   let nextContainerId = 0;
@@ -471,10 +508,19 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.matches(":disabled") || element.readOnly) return [];
-    if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
+    const combo = element.getAttribute("role") === "combobox";
+    if (["hidden", "submit", "reset", "file", "image", "checkbox", "radio"].includes(element.type) ||
+        (element.type === "button" && !combo)) return [];
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
+    // Some Vue forms render an unassociated sibling label. Read only a tight
+    // one-control container; never inherit a whole form's payment/address text.
+    if (!labels.length && element.parentElement &&
+        element.parentElement.querySelectorAll('input, select, [role=combobox]').length === 1) {
+      labels.push(...Array.from(element.parentElement.children)
+        .filter((n) => n.tagName === 'LABEL').map((n) => n.textContent || ''));
+    }
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
       .map((id) => { const n = element.getRootNode().getElementById(id); return n ? (n.textContent || "") : ""; })
@@ -502,10 +548,11 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
         element.getAttribute("aria-label") || "",
         ariaText,
         element.getAttribute("placeholder") || "",
+        combo ? ((element.querySelector('input[placeholder]') || {}).placeholder || (element.textContent || "").trim()) : "",
         element.getAttribute("title") || "",
       ].join(" "),
       name: [element.name, element.id].join(" "),
-      type: element.tagName === "SELECT" ? "select" : (element.type || ""),
+      type: combo ? "combobox" : element.tagName === "SELECT" ? "select" : (element.type || ""),
     }];
   });
   return JSON.stringify(out);
@@ -535,7 +582,7 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
             .replace("__FILLS__", payload))
 
 
-_FILL_JS_TEMPLATE = """(() => {
+_FILL_JS_TEMPLATE = """(async () => {
   const expectedOrigin = __EXPECTED_ORIGIN__;
   if (window.location.origin !== expectedOrigin) {
     return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
@@ -547,36 +594,71 @@ _FILL_JS_TEMPLATE = """(() => {
   let filled = 0;
   const selectedOptions = [];
   const norm = (t) => String(t || "").trim().toLowerCase();
+  const choose = (options, f) => {
+    const want = norm(f.value);
+    const same = (t) => norm(t) === want || norm(t) === want.replace(/^0/, "");
+    let hits;
+    if (["bday-month", "cc-exp-month"].includes(f.token)) {
+      const names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+      const monthOf = (t) => names.findIndex((n) => new RegExp("(^|[^a-z])" + n).test(norm(t)));
+      const named = options.filter((o) => monthOf(o.textContent) >= 0);
+      hits = named.length ? named.filter((o) => monthOf(o.textContent) === parseInt(want, 10) - 1)
+                          : options.filter((o) => same(o.textContent));
+    } else if (f.token === "cc-exp-year") {
+      hits = options.filter((o) => [o.value, o.textContent].some((t) =>
+        /^\\d{2}(\\d{2})?$/.test(norm(t)) && norm(t).slice(-2) === want.slice(-2)));
+    } else if (f.token === "cc-type") {
+      const brand = (t) => ({visa:"visa", mastercard:"mastercard", amex:"amex",
+        americanexpress:"amex", discover:"discover"})[norm(t).replace(/[^a-z]/g, "")];
+      // Trust the human-readable brand, not an opaque provider option value.
+      hits = options.filter((o) => brand(o.textContent) === want);
+    } else {
+      hits = options.filter((o) => [o.value, o.textContent].some(same));
+    }
+    return hits.length === 1 ? hits[0] : null;
+  };
+  const usable = (el, f) => window.location.origin === expectedOrigin && el.isConnected &&
+    el.getAttribute("data-hermes-vault-slot") === nonce + ':' + f.index &&
+    !el.matches(":disabled,[aria-disabled=true]") && !el.readOnly &&
+    getComputedStyle(el).visibility !== "hidden" && el.getClientRects().length > 0;
   for (const f of fills) {
     const el = stamped.find((n) => n.getAttribute("data-hermes-vault-slot") === nonce + ':' + f.index);
-    if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    if (!el || !usable(el, f) || (f.token === "current-password" && el.type !== "password")) continue;
     try {
-      if (el.tagName === "SELECT") {
-        const want = norm(f.value);
-        const options = Array.from(el.options);
-        const same = (t) => norm(t) === want || norm(t) === want.replace(/^0/, "");
-        let opt;
-        if (f.token === "bday-month") {
-          // Month option values are often zero-based ("3" = April): trust visible
-          // text, by month name when present, and never guess from a bare value.
-          const names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-          const monthOf = (t) => names.findIndex((n) => new RegExp("(^|[^a-z])" + n).test(norm(t)));
-          const named = options.filter((o) => monthOf(o.textContent) >= 0);
-          if (named.length) {
-            const hits = named.filter((o) => monthOf(o.textContent) === parseInt(want, 10) - 1);
-            opt = hits.length === 1 ? hits[0] : undefined;
-          } else {
-            const byText = options.filter((o) => same(o.textContent));
-            opt = byText.length === 1 ? byText[0] : undefined;
-          }
-        } else {
-          opt = options.find((o) => [o.value, o.textContent].some(same));
+      if (el.getAttribute("role") === "combobox" && ["cc-exp-month", "cc-exp-year", "cc-type"].includes(f.token)) {
+        // Only an explicitly associated listbox may be used. Never click a
+        // page-wide text match or a submit button to make a payment field work.
+        const listId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
+        if (!listId || /\\s/.test(listId) || (el.tagName === "BUTTON" && el.type !== "button")) continue;
+        el.click();
+        let list;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          if (!usable(el, f)) break;
+          list = el.getRootNode().getElementById(listId);
+          if (list && list.getAttribute("role") === "listbox" && list.getClientRects().length) break;
+          list = null;
         }
+        if (!list || !usable(el, f)) continue;
+        const opt = choose(Array.from(list.querySelectorAll('[role=option]')).filter((o) =>
+          !o.matches(':disabled,[aria-disabled=true]') && o.getClientRects().length &&
+          !(o.tagName === "BUTTON" && o.type !== "button")), f);
+        if (!opt) continue;
+        const chosen = norm(opt.textContent);
+        opt.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (usable(el, f) && (opt.getAttribute('aria-selected') === 'true' ||
+            norm(el.value) === chosen || norm(el.textContent) === chosen)) filled += 1;
+        continue;
+      }
+      if (el.tagName === "SELECT") {
+        const opt = choose(Array.from(el.options).filter((o) => !o.disabled), f);
         if (opt) {
           el.value = opt.value;
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true }));
           el.dispatchEvent(new Event("change", { bubbles: true }));
-          selectedOptions.push({ token: f.token, value: opt.value, label: opt.textContent });
-          filled += 1;
+          if (f.token.startsWith("bday-")) selectedOptions.push({ token: f.token, value: opt.value, label: opt.textContent });
+          if (el.value === opt.value) filled += 1;
         }
         continue;
       }

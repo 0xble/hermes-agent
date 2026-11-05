@@ -1,0 +1,18 @@
+<!doctype html><form>
+<label>Card number<input data-test=number autocomplete=cc-number></label>
+<div><label>CVC</label><input data-test=cvc placeholder="###" maxlength=3></div>
+<label>Expiration month<button type=button role=combobox aria-controls=months data-test=month>MM</button></label>
+<div id=months role=listbox hidden><div role=option>06</div><div role=option>07</div></div>
+<label>Expiration year<button type=button role=combobox aria-controls=years data-test=year>YYYY</button></label>
+<div id=years role=listbox hidden><div role=option>2028</div><div role=option>2029</div></div>
+<label>Street<input data-test=street name=billingStreet></label>
+<label>ZIP<input data-test=postal autocomplete=postal-code></label>
+</form><script>
+for (const combo of document.querySelectorAll('[role=combobox]')) {
+ const list = document.getElementById(combo.getAttribute('aria-controls'));
+ combo.onclick = () => { list.hidden = false; combo.setAttribute('aria-expanded', 'true'); };
+ for (const option of list.children) option.onclick = () => {
+  combo.textContent = option.textContent; list.hidden = true; combo.setAttribute('aria-expanded', 'false');
+ };
+}
+</script>

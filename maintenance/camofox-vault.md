@@ -3,7 +3,14 @@
 Load this unit when changing named Camofox browser accounts, vault login classification,
 the browser vault fill tool, or the 1Password backends.
 
-- Fork patch identity: `vault-origin-aliases`.
+- Fork patch identities: `vault-origin-aliases`, `vault-checkout-controls`.
+- Contract tests: `tests/agent/test_vault_checkout_controls.py`,
+  `tests/tools/test_vault_checkout_controls_live.py`.
+- `vault-checkout-controls` has no upstream PR in this change. The inspected
+  upstream revision `1fcc57e6d23052e46265efc30b57c7e9a971e08b` still lacks the
+  CamelCase, custom-combobox and brand-selection handling. Retire this adaptation
+  only when an accepted upstream release passes these fixtures with equivalent
+  consent, origin/nonce and secret-output boundaries. Roll back its commit alone.
 
 ## Required behavior
 
@@ -62,6 +69,17 @@ the browser vault fill tool, or the 1Password backends.
   ask. After consent the page is inspected again with a fresh nonce, and only those stamps are
   written. Card consent is one-shot: the prompt offers Allow Once and Deny, and a session or
   permanent answer never approves or consumes it (adopted from upstream PR 118429).
+- Checkout discovery recognizes CVC/CVV/CSC metadata across names, IDs, placeholders,
+  accessible labels and tight sibling labels, including CamelCase framework identifiers.
+  Split expiry supports native selects, text inputs and explicitly associated ARIA combobox
+  listboxes. Month selects follow visible month labels, not zero-based provider values;
+  years accept two-/four-digit options. Card-brand selects derive Visa/Mastercard/Amex/Discover
+  from the selected card, never an arbitrary default. Ambiguous or unassociated options are
+  not clicked. Combined expiry preserves an explicit `MM / YYYY` placeholder.
+  PAN/CVC and payment select labels are never returned by injection. Async Camofox evaluation
+  catches promise rejections before its server can log secret-bearing exceptions.
+  These are compatibility changes only: nonce/origin checks, active top-level user-turn
+  admission, origin-scoped one-shot consent and the no-cross-origin-frame boundary remain.
 - A declined or unanswered card prompt blocks further card-fill prompts on that exact origin
   in the same approval session for 10 minutes, regardless of card handle. The in-memory,
   profile-scoped guard is bounded to 256 entries and expires by monotonic time; a later
@@ -227,7 +245,10 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
 first-429 stop and cross-process cooldown),
 `tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and
-`tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome), and for card consent
+`tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome),
+`tests/tools/test_vault_checkout_controls_live.py` (synthetic Northwest-style Vue and
+Washington-style Angular form HTML, fake cards only; install Chromium with
+`python -m playwright install chromium`), and for card consent
 `tests/gateway/test_mcp_consent_scope.py` and `tests/tools/test_mcp_trust_gating.py`. Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.
 

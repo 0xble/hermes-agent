@@ -223,7 +223,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
             if not tab["tab_id"]:
                 return {"success": False, "error_type": "eval_failed", "error": "No browser session. Call browser_navigate first."}
             # Catch page exceptions in-page too: the REST server logs JS error messages.
-            wrapped = "(() => { try { return (" + expression + "); } catch (_) { return {vault_eval_failed:true}; } })()"
+            wrapped = "(async () => { try { return await (" + expression + "); } catch (_) { return {vault_eval_failed:true}; } })()"
             response = _post(f"/tabs/{tab['tab_id']}/evaluate", body={
                 "expression": wrapped, "userId": tab["user_id"]}, allow_redirects=False)
             if (isinstance(response, dict) and "result" in response and not response.get("error")
