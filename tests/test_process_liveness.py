@@ -14,7 +14,13 @@ def test_descendant_snapshot_tolerates_reap(error, probe):
     process = Mock(spec=psutil.Process)
     getattr(process, probe).side_effect = error(123)
     helper = waiting.process_children if probe == "children" else waiting.process_cmdline
-    assert helper(process) == []
+    assert helper(process) == ([] if probe == "children" else None)
+
+
+def test_empty_live_command_line_is_not_a_disappearance():
+    process = Mock(spec=psutil.Process)
+    process.cmdline.return_value = []
+    assert waiting.process_cmdline(process) == []
 
 
 @pytest.mark.parametrize("error", [psutil.NoSuchProcess, psutil.ZombieProcess])
