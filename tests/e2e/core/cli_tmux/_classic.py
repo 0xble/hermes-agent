@@ -8,10 +8,10 @@ run's exact ``HERMES_HOME`` (never a pattern kill).
 
 Driver rule (the CLI reads an Enter processed within 50 ms of the last buffer change as a pasted
 newline): type with ``send-keys -l``, wait until the composer shows the text, pause, then send
-``Enter`` separately. Ordinary input echoes as ``❯ {text}``. A slash command opens the completion
-menu, and that redraw can leave the buffer on its own line with the prompt glyph no longer
-adjacent; that exact line is still acknowledgement. A menu row that only names the command is not:
-a prefix can surface the full name before the buffer has it. Each step waits for its needle, then
+``Enter`` separately. A completion redraw after interruption can leave the buffer beside old
+chrome instead of the prompt glyph. A fresh occurrence ending at the insertion cursor is still
+acknowledgement; a menu row or ghost suffix is not, even if it already shows the full command.
+Each step waits for its needle, then
 until the screen (digits masked) has been static for ``quiet`` seconds.
 
 Stale output never counts: every ``submit``/``keys``/``launch`` snapshots the scrollback first, and
@@ -75,18 +75,6 @@ def new_needle(needles: list[str], before: str, after: str) -> str | None:
         if after.count(needle) > before.count(needle):
             return needle
     return None
-
-
-def buffer_line_grew(text: str, before: str, after: str) -> bool:
-    """A new line whose only content is *text* (capture-pane padding ignored).
-
-    The completion menu's suggestion row keeps a description after the name, so it
-    does not count. Trailing spaces from ``capture-pane`` without ``-T`` do.
-    """
-    def lines(blob: str) -> int:
-        return sum(line.strip() == text for line in blob.splitlines())
-
-    return lines(after) > lines(before)
 
 
 def home_pids(hermes_home: Path) -> set[int]:
@@ -300,6 +288,31 @@ class Pane:
     def scrollback(self) -> str:
         return self.tmux("capture-pane", "-p", "-J", "-t", "p", "-S", "-", "-E", "-")
 
+    def cursor_row(self) -> str:
+        """Visible text before the insertion cursor, not completion/ghost text.
+
+        Capture cells and cursor coordinates in one tmux command queue so the
+        row uses the same viewport (no joined lines or scrollback offsets).
+        """
+        lines = self.tmux("capture-pane", "-p", "-t", "p", ";",
+                          "display-message", "-p", "-t", "p",
+                          "#{cursor_x} #{cursor_y}").splitlines()
+        if not lines:
+            return ""
+        x, y = map(int, lines.pop().split())
+        if y >= len(lines):
+            return ""
+        # Cursor x counts terminal cells, not Unicode code points.
+        from wcwidth import wcwidth
+
+        cells, prefix = 0, []
+        for char in lines[y]:
+            cells += max(wcwidth(char), 0)
+            if cells > x:
+                break
+            prefix.append(char)
+        return "".join(prefix)
+
     def dead(self) -> bool:
         return self.tmux("display-message", "-p", "-t", "p", "#{pane_dead}").strip() == "1"
 
@@ -308,11 +321,11 @@ class Pane:
         self.tmux("send-keys", "-t", "p", *k)
 
     def wait(self, needles: list[str], timeout: float = 60.0, *, since: str | None = None,
-             exact_line: str | None = None) -> str | None:
+             composer_text: str | None = None) -> str | None:
         """The first needle that appeared after the latest input (or after *since*), None on timeout/exit.
 
-        *exact_line* also accepts a new line whose only content is that text. Slash-command
-        completion redraws the prompt glyph off the buffer line; the menu suggestion does not match.
+        *composer_text* requires a fresh occurrence ending at the insertion cursor.
+        Completion menus, ghost text and stale transcript occurrences cannot satisfy it.
         """
         before = self.baseline if since is None else since
         end = time.monotonic() + timeout
@@ -321,8 +334,10 @@ class Pane:
             hit = new_needle(needles, before, after)
             if hit is not None:
                 return hit
-            if exact_line is not None and buffer_line_grew(exact_line, before, after):
-                return exact_line
+            if (composer_text is not None
+                    and new_needle([composer_text], before, after) is not None
+                    and self.cursor_row().endswith(composer_text)):
+                return composer_text
             if self.dead():
                 return None
             time.sleep(0.25)
@@ -350,7 +365,7 @@ class Pane:
     def submit(self, text: str) -> None:
         self.baseline = self.scrollback()
         self.tmux("send-keys", "-t", "p", "-l", text)
-        assert self.wait([f"{PROMPT} {text}"], 10, since=self.baseline, exact_line=text), (
+        assert self.wait([], 10, since=self.baseline, composer_text=text), (
             f"composer never showed {text!r} within 10s:\n{self.screen()}\n{self.ch.diagnostics()}")
         self.paste_gap()
         self.tmux("send-keys", "-t", "p", "Enter")
