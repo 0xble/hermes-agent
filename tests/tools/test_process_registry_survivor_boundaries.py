@@ -16,14 +16,33 @@ def _checkpoint(tmp_path, monkeypatch):
 
 
 @pytest.mark.platforms("posix")
-def test_chatty_ordinary_job_has_no_on_disk_output(tmp_path, monkeypatch):
+@pytest.mark.parametrize("split_newline", [False, True])
+def test_chatty_ordinary_job_has_no_on_disk_output(tmp_path, monkeypatch, split_newline):
     _checkpoint(tmp_path, monkeypatch)
     registry = ProcessRegistry()
     ready = threading.Event()
-    registry.on_output = lambda session, chunk: ready.set() if "READY" in chunk else None
+    # Pipe reads need not preserve print() boundaries, including its newline.
+    registry.on_output = lambda session, chunk: ready.set() if session.output_buffer.endswith("READY\n") else None
+    prefix_ingested, release_newline = threading.Event(), threading.Event()
+    ingest = registry._ingest_output
+
+    def ingest_with_split_newline(session, text):
+        if split_newline and (session.output_buffer + text).endswith("READY\n"):
+            ingest(session, text[:-1])
+            prefix_ingested.set()
+            assert release_newline.wait(10)
+            ingest(session, text[-1:])
+        else:
+            ingest(session, text)
+
+    monkeypatch.setattr(registry, "_ingest_output", ingest_with_split_newline)
     source = "import sys,time; print('x'*2000000); print('READY',flush=True); time.sleep(30)"
     session = registry.spawn_local(f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}")
     try:
+        if split_newline:
+            assert prefix_ingested.wait(10)
+            assert not ready.is_set(), "readiness must include the marker's final newline"
+            release_newline.set()
         assert ready.wait(10)
         assert session.output_buffer.endswith("READY\n")
         assert len(session.output_buffer) <= session.max_output_chars
@@ -32,6 +51,7 @@ def test_chatty_ordinary_job_has_no_on_disk_output(tmp_path, monkeypatch):
         assert session.process.stdout is not None
         assert not session.exit_path, "ordinary attached jobs must not create receipts"
     finally:
+        release_newline.set()
         registry.kill_process(session.id)
 
 
