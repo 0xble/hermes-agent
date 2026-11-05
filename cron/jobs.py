@@ -2742,6 +2742,12 @@ def mark_job_run(
     repeat budget. Finite one-shots refund their preclaim and retry on the next tick.
     """
     def apply(jobs, _i, job):
+        if execution_id is not None:
+            from cron.jobs_oneshot import completion_matches_occurrence
+            if not completion_matches_occurrence(job, execution_id):
+                logger.info("Job %s: prior-arm execution %s settled without changing current occurrence",
+                            job_id, execution_id)
+                return True
         if execution_id is not None and execution_id in job.get("canonical_completions", []):
             return True
         if expected_fire_owner is not None:
@@ -2869,6 +2875,9 @@ def claim_dispatch(job_id: str) -> bool:
     crash: a self-destructing job fires at most ``repeat.times`` times (#38758).
     """
     def apply(jobs, i, job):
+        from cron.jobs_oneshot import occurrence_recovery_pending
+        if occurrence_recovery_pending(job):
+            return False
         repeat = job.get("repeat") or {}
         times = repeat.get("times")
         # Recurring jobs use advance_next_run(); no/infinite repeat limit always dispatches.
@@ -3565,8 +3574,10 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
     repeat = job.get("repeat") or {}
     times = repeat.get("times")
     completed = repeat.get("completed", 0)
-    from cron.jobs_oneshot import occurrence_started
+    from cron.jobs_oneshot import occurrence_recovery_pending, occurrence_started
 
+    if occurrence_recovery_pending(job):
+        return True  # Suppress redispatch while recovery still owns this exact target.
     if times is None or times <= 0 or (completed < times and not occurrence_started(job, now=scan.now)):
         return False
     name = job.get("name", job.get("id", "?"))
