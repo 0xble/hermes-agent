@@ -360,9 +360,14 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
             legacy = deepcopy(payload)
             legacy['native_text_v1'].pop('provenance')
             legacy['native_text_v1'].pop('attended_activity', None)
+            legacy['native_text_v1'].pop('absorbed_synthetic', None)
             for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
-                if row['request_id'] == event.message_id and row['payload'] == legacy:
-                    return legacy
+                prior = deepcopy(row['payload'])
+                if isinstance(prior.get('native_text_v1'), dict):
+                    prior['native_text_v1'].pop('attended_activity', None)
+                    prior['native_text_v1'].pop('absorbed_synthetic', None)
+                if row['request_id'] == event.message_id and prior == legacy:
+                    return row['payload']  # Preserve the original durable recovery evidence.
     return payload
 
 

@@ -68,6 +68,7 @@ async def test_stamped_loop_reply_settles_through_native_admission(tmp_path, mon
         await adapter.handle_message(MessageEvent(text='seed', source=source, message_id='seed'))
         await idle(1)
         owner = runner.session_store.peek_session_id(key)
+        assert owner is not None
         await runner._warm_goals_session_db('loop settlement fixture')
         manager = loops.LoopManager(owner)
         manager.set('check disposable work', interval_seconds=300, times=3, until='condition met', route={
@@ -86,6 +87,7 @@ async def test_stamped_loop_reply_settles_through_native_admission(tmp_path, mon
             from hermes_state_runtime import claim_session_input
 
             lost = claim_session_input(authority.db, epoch=authority.epoch, session_id=owner)
+            assert isinstance(lost, dict)
             assert lost['principal_id'] == f'automation:{key}'
             assert 'synthetic' in lost['payload']['native_text_v1']
             authority.db.append_message(owner, 'user', lost['payload']['text'])

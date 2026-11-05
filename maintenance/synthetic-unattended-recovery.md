@@ -5,9 +5,10 @@ Fork patch identity: `synthetic-unattended-recovery`.
 ## Ownership
 
 - Owner: gateway native admission / unknown-execution recovery.
-- Scope: `gateway/session_unattended_unknown.py`, the native attended-activity
-  projection in `gateway/session_envelope.py`, and
-  `tests/gateway/test_unknown_synthetic_settles.py`.
+- Scope: `gateway/session_unattended_unknown.py`, native recovery provenance in
+  `gateway/session_envelope.py` / `gateway/session_automation.py`, retry identity
+  in `hermes_state_keys.py` / `gateway/session_ingress_media.py`, and focused
+  synthetic recovery, native loop-tick and provenance retry tests.
 - Incident: a lost native goal continuation remained `unknown_execution` and
   paused the Hermes Reliability topic's FIFO for 68 hours until a human discarded it.
 
@@ -32,11 +33,19 @@ in `{process_registry_synthetic, delegation_result, relay_delivery, cron_deliver
 Presence of `native_text_v1.attended_activity` vetoes this additional predicate.
 The native codec also persists `absorbed_synthetic`: an empty list proves no
 absorbed inputs; each merged input contributes its private descriptor (or null
-without the capability). Recovery requires the head and every entry to identify
-a trusted producer. This veto precedes even older unattended shortcuts when a
-synthetic/absorbed descriptor is present; unmixed legacy automation remains unchanged.
-Restoring and re-merging an envelope retains its trail. A legacy synthetic row
-without the field has unknown merge history and conservatively pauses.
+without the capability). For messaging principals, recovery requires the head
+and every entry to identify a trusted producer, before marker-based unattended
+shortcuts. A legacy messaging synthetic row without the field has unknown merge
+history and conservatively pauses. Restoring and re-merging retains its trail.
+Automation/cron principals are a distinct producer-only admission path: their
+snapshots now persist an explicit empty trail because they never absorb merges.
+Legacy automation-principal snapshots without the field remain unattended;
+an attended-activity marker, malformed trail, or recorded non-synthetic absorbed
+member still vetoes settlement. Moving the messaging veto ahead of this principal
+rule had regressed real goal/loop wakes to paused unknowns; it is now corrected.
+The local `absorbed_synthetic` field, like `attended_activity`, is excluded from
+admission/ingress fingerprints and legacy exact-retry comparison. Retries retain
+the original durable recovery evidence; changed delivery content still conflicts.
 
 Producer fields were checked in `gateway/run_goals.py` (the real goal event
 factory), `hermes_cli/session_controls.py` and `gateway/run_loop_wake.py`
@@ -79,6 +88,18 @@ clock remains provenance only and never refreshes activity.
   `scripts/run_tests.sh` wrapper under the urgent heavy slot, including all 65
   synthetic-unknown cases (the original 43 plus 22 provenance regressions), the
   native codec, attended clocks, queue, automation, Kanban and cron recovery.
+- Automation-principal / retry RED `1310fbacf474d0305b87020565035601eca49fbb`:
+  5 expected failures / 80 passes across four files against `41c34afb`.
+  Failures cover the legacy automation principal, the real scheduler's native
+  lost loop tick, admission/ingress fingerprint normalization and exact legacy
+  snapshot retry. The explicit-empty-trail case and every prior human/mixed
+  safety case already pass. New coverage also pins attended/malformed automation
+  vetoes and preservation of original mixed recovery evidence on retry.
+- Automation-principal / retry GREEN: 369 passed / 0 failed / 1 host-platform skip
+  across 14 files through the official urgent-heavy-slot runner. All 69 synthetic
+  cases pass (the prior 65 plus four principal cases); the real lost native loop
+  tick settles interrupted with exactly `AUTOMATION_INTERRUPTED_NOTICE`, no replay,
+  and explicit empty absorbed provenance. Fingerprint and legacy retry checks pass.
 - Boot and in-owner drain recovery use disposable stores and a real native goal
   producer event; verify interrupted/no replay, exactly one notice, and one human
   follower execution. Human and mixed unknowns retain the pause.

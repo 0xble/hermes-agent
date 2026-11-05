@@ -46,7 +46,8 @@ def test_absorbed_provenance_is_not_delivery_identity(tmp_path, monkeypatch, bou
 
 
 @pytest.mark.asyncio
-async def test_exact_legacy_native_retry_ignores_new_absorbed_provenance(tmp_path, monkeypatch):
+@pytest.mark.parametrize('persisted_local', [False, True])
+async def test_exact_legacy_native_retry_ignores_new_absorbed_provenance(tmp_path, monkeypatch, persisted_local):
     store, runner = _runner(tmp_path, monkeypatch, [])
     _codec(runner)
     try:
@@ -56,6 +57,8 @@ async def test_exact_legacy_native_retry_ignores_new_absorbed_provenance(tmp_pat
         entry = store.get_or_create_session(event.source)
         legacy = snapshot_native(runner, event)
         legacy['native_text_v1'].pop('absorbed_synthetic')
+        if persisted_local:
+            legacy['native_text_v1'].update(absorbed_synthetic=[None], attended_activity={})
         args = dict(epoch=authority.epoch, principal_id='messaging:test',
                     session_id=entry.session_id, request_id=event.message_id)
         first = admit_session_input(authority.db, payload=legacy, **args)
@@ -67,6 +70,9 @@ async def test_exact_legacy_native_retry_ignores_new_absorbed_provenance(tmp_pat
 
         retry = snapshot()
         assert retry == legacy
+        if persisted_local:
+            from gateway.session_unattended_unknown import is_unattended
+            assert not is_unattended({'principal_id': 'messaging:test', 'payload': retry})
         assert admit_session_input(authority.db, payload=retry, **args) == first
         event.text += ' changed'
         changed = snapshot()

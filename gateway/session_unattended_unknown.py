@@ -46,7 +46,7 @@ def _synthetic_merge_veto(native) -> bool:
     if 'synthetic' not in native and 'absorbed_synthetic' not in native:
         return False
     # Receipts are incomplete: prefixes, edits, reactions and recovery may omit them.
-    # Require positive proof for the head AND every absorbed input, before any shortcut.
+    # Native ingress requires proof for the head AND every absorbed input before marker shortcuts.
     trail = native.get('absorbed_synthetic')
     return ('attended_activity' in native
             or not _trusted_synthetic_descriptor(native.get('synthetic'))
@@ -59,10 +59,14 @@ def is_unattended(row) -> bool:
     principal = row.get('principal_id') or ''
     payload = row.get('payload') or {}
     native = payload.get('native_text_v1') or {}
+    if principal == CRON_PRINCIPAL_ID or principal.startswith('automation:'):
+        # These producers never absorb native ingress merges. Legacy snapshots omitted
+        # the empty trail, but an explicit human receipt or non-synthetic member still vetoes.
+        trail = native.get('absorbed_synthetic', [])
+        return ('attended_activity' not in native and isinstance(trail, list)
+                and all(_trusted_synthetic_descriptor(item) for item in trail))
     if _synthetic_merge_veto(native):
         return False
-    if principal == CRON_PRINCIPAL_ID or principal.startswith('automation:'):
-        return True
     # A webhook delivery: the provider already got its 202 and nobody can be asked to resend it.
     # A Kanban card attempt (#134889 KB-8): the dispatcher's marker, committed only by
     # ``SessionAuthority.submit(_kanban_card=...)``; a card row main minted without it still pauses.
