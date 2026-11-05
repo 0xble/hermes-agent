@@ -54,8 +54,16 @@ strict timeout exception remains in hook delivery, not in skill command completi
 Gateway startup explicitly requests `require_complete=True` off-loop and lets a
 not-ready error abort startup before relay registration or adapter connection.
 Strict startup waits for the in-flight sweep to finish, logging progress every ten
-seconds; per-plugin load deadlines remain the upper bound. A worker failure or
-premature exit still raises rather than serving a partial registry.
+seconds; per-plugin load deadlines remain the upper bound. Once the background worker
+has exited, strict startup reads `_discovery_complete` while holding the manager's
+sweep lock. A concurrent control-socket force reload temporarily clears that flag;
+its in-flight state is not evidence that background discovery failed. Await the
+reload's verdict without weakening the refusal of a failed or incomplete sweep.
+A worker failure or premature exit still raises rather than serving a partial registry.
+
+Related patch identity: `windows-plugin-uninstall-gateway`.
+Contract tests: `tests/hermes_cli/test_plugin_startup_reload_barrier.py`,
+`tests/hermes_cli/test_plugin_reload_observers.py`.
 
 Synchronous hook calls on an event-loop thread must not wait on discovery.
 Observer-only hooks (`on_session_reset`, `agent_loop_stopped`, `pre_command`) use
