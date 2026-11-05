@@ -5024,6 +5024,17 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         await _await_with_thread_deadline(
             self._bot.edit_message_text(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
 
+    async def _edit_preview(self, chat_id: str, message_id: str, content: str) -> None:
+        """Ordinary previews stay raw; literal copy context must be formatted on every tick."""
+        from gateway.copy_blocks import _has_copy_markers
+        if _has_copy_markers(content):
+            content = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
+            await self._edit_markdown_or_plain(
+                chat_id, message_id, self.format_message(content), _strip_mdv2(content),
+                "[%s] Copy preview MarkdownV2 rejected, using plain text: %s")
+        else:
+            await self._edit_text(chat_id, message_id, content)
+
     async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
         """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
         skip further work); the fallback edit's exceptions propagate."""
@@ -5130,14 +5141,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             self._last_overflow_preview.pop(_preview_key, None)
         try:
             if not finalize:
-                from gateway.copy_blocks import _has_copy_markers
-                if _has_copy_markers(content):
-                    content = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
-                    await self._edit_markdown_or_plain(
-                        chat_id, message_id, self.format_message(content), _strip_mdv2(content),
-                        "[%s] Copy preview MarkdownV2 rejected, using plain text: %s")
-                else:
-                    await self._edit_text(chat_id, message_id, content)
+                await self._edit_preview(chat_id, message_id, content)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
