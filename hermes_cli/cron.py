@@ -129,6 +129,9 @@ def _next_run_row(job: dict[str, Any]) -> tuple[str, str]:
     user-visible trace of a dead scheduler; never present it as an upcoming run (#114309).
     """
     stamp = job.get("next_run_at", "?")
+    if job.get("state") == "missed":
+        return ("Missed", color(f"{stamp} — payload held; owner decision required "
+                               "(cron resume --run-now / --at, or remove)", Colors.YELLOW))
     overdue_s = _next_run_overdue_seconds(stamp)
     if (overdue_s is None or overdue_s <= _OVERDUE_GRACE_SECONDS
             or not job.get("enabled", True) or job.get("state") in {"paused", "completed"}):
@@ -171,7 +174,8 @@ def _unverified_targets(unverified) -> str:
     return ", ".join(map(str, unverified)) if isinstance(unverified, list) else str(unverified)
 
 
-_STATE_BADGES = {"paused": ("[paused]", Colors.YELLOW), "completed": ("[completed]", Colors.BLUE)}
+_STATE_BADGES = {"paused": ("[paused]", Colors.YELLOW), "completed": ("[completed]", Colors.BLUE),
+                 "missed": ("[missed]", Colors.YELLOW)}
 
 
 def cron_list(show_all: bool = False):
@@ -183,7 +187,7 @@ def cron_list(show_all: bool = False):
     if not show_all:
         jobs = [
             job for job in jobs
-            if job.get("enabled", True) or effective_job_state(job) == "paused"
+            if job.get("enabled", True) or effective_job_state(job) in {"paused", "missed"}
         ]
 
     from hermes_cli.profiles import get_active_profile_name
@@ -729,7 +733,10 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     if isinstance(fire_err := job.get("last_fire_error"), dict) and fire_err.get("detail"):
         # The handoff error survives next_run_at advancing beyond the failed dispatch.
         issues.append(_missed_fire_issue(job, fire_err))
-    if job.get("enabled", True) and job.get("state") not in {"paused", "completed"}:
+    if job.get("state") == "missed":
+        issues.append("missed one-shot payload held; owner decision required: "
+                      "cron resume --run-now / --at <ISO-8601>, or remove")
+    elif job.get("enabled", True) and job.get("state") not in {"paused", "completed"}:
         next_run = str(job.get("next_run_at") or "").strip()
         issue = _next_run_overdue_issue(next_run) if next_run else "active job has no next_run_at"
         if issue:
@@ -748,7 +755,8 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
 def cron_doctor() -> int:
     """Run read-only cron health checks and return a shell-friendly status."""
     from cron.jobs import list_jobs
-    jobs = list_jobs(include_disabled=False)
+    jobs = [job for job in list_jobs(include_disabled=True)
+            if job.get("enabled", True) or job.get("state") == "missed"]
     findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
     if not findings:
         print(color("✓ Cron doctor found no issues", Colors.GREEN))

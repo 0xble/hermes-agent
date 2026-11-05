@@ -366,6 +366,41 @@ def create_execution(
     return record  # type: ignore[return-value]
 
 
+def record_missed_execution(job_id: str, *, scheduled_instant: str, error: str) -> dict[str, Any]:
+    """Atomically persist a never-started miss once per occurrence, including save retries."""
+    from cron.occurrences import scheduled_instant as canonical_instant
+
+    instant = canonical_instant(scheduled_instant)
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _transaction() as conn:
+        # Serialize the occurrence lookup with insertion across processes too. A
+        # miss is born terminal: no crash or failed terminal write can strand a claim.
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM executions WHERE job_id=? AND source='scheduler-missed' "
+            "AND scheduled_instant=? AND status='failed' ORDER BY claimed_at, id LIMIT 1",
+            (str(job_id), instant),
+        ).fetchone()
+        if existing is not None:
+            return dict(existing)
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, process_started_at, status,
+                claimed_at, finished_at, scheduled_instant, error, code_sha,
+                execution_identity, owner_kind)
+               VALUES (?, ?, 'scheduler-missed', ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, 'gateway')""",
+            (execution_id, str(job_id), _PROCESS_ID, pid, _process_start_time(pid),
+             now, now, instant, str(error), running_code_sha(), execution_id),
+        )
+        _prune_unlocked(conn, keep_ids=(execution_id,))
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record)
+    record_cron_finish(record, None)
+    return record  # type: ignore[return-value]
+
+
 def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
     """Bind the store-claimed snapshot before a provider hands it to a worker."""
     from cron.occurrences import scheduled_instant
