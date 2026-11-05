@@ -80,14 +80,15 @@ def build_models_payload(
     capabilities: bool = False, featured: bool = False, force_fresh_nous_tier: bool = False,
     refresh: bool = False, probe_custom_providers: bool = True, probe_current_custom_provider: bool = False,
     for_picker: bool = False, max_models: int | None = None, non_blocking_catalogs: bool = False,
-    fast_custom_probe: bool | None = None,
+    fast_custom_probe: bool | None = None, registry_cache_only: bool = False,
 ) -> dict:
     """Build the ``{providers, model, provider}`` shape every consumer needs. ``explicit_only`` keeps
     only providers the user explicitly configured — hides ambient/auto-seeded credentials from
     desktop chat pickers. ``pricing_cache_only``: with ``pricing``, use only values already resident
     in process caches (normal picker opens, while a background worker warms cold endpoints).
     ``non_blocking_catalogs``: provider catalogs come from the disk cache only — a degraded provider
-    cannot stall the response (GUI picker opens). ``fast_custom_probe`` overrides the
+    cannot stall the response (GUI picker opens). ``registry_cache_only`` also skips models.dev
+    discovery for ACP attachment snapshots. ``fast_custom_probe`` overrides the
     custom-endpoint discovery budget ``for_picker`` otherwise implies (1.5s vs 5s) — ``None`` keeps
     the coupling, ``False`` retains the full 5s budget (#103843)."""
     from hermes_cli.model_switch import list_authenticated_providers
@@ -100,6 +101,7 @@ def build_models_payload(
         probe_current_custom_provider=probe_current_custom_provider, for_picker=for_picker,
         excluded_providers=ctx.excluded_providers or [],
         non_blocking_catalogs=non_blocking_catalogs, fast_custom_probe=fast_custom_probe,
+        registry_cache_only=registry_cache_only,
     )
 
     # Managed local runtime: staged GGUFs are selectable like any provider's models, but
@@ -137,7 +139,7 @@ def build_models_payload(
 
     # A local proxy serving a model also in an aggregator's catalog would show under both, and picking
     # the aggregator row silently breaks the call — aggregators only list models no specific provider has.
-    _strip_aggregator_overlaps(rows)
+    _strip_aggregator_overlaps(rows, allow_network=not registry_cache_only)
 
     if include_unconfigured:
         rows = list(rows) + _without_slug(_append_unconfigured_rows(rows, ctx), "moa")
@@ -170,7 +172,7 @@ def build_models_payload(
     return {"providers": rows, "model": ctx.current_model, "provider": ctx.current_provider}
 
 
-def _strip_aggregator_overlaps(rows: list[dict]) -> None:
+def _strip_aggregator_overlaps(rows: list[dict], *, allow_network: bool = True) -> None:
     """Drop models from TRUE routing aggregators (OpenRouter, custom:* proxies) that a user-defined
     provider also serves. The is_user_defined guard matters: is_routing_aggregator() is True for every
     custom:* slug, so without it the dedup would empty a user's own custom row. Flat-namespace
@@ -182,7 +184,7 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
 
     builtin_aggregators = {
         _slug(row) for row in rows
-        if not row.get("is_user_defined") and is_routing_aggregator(_slug(row))
+        if not row.get("is_user_defined") and is_routing_aggregator(_slug(row), allow_network=allow_network)
     }
 
     def _duplicates_builtin_aggregator(row: dict) -> bool:
@@ -210,7 +212,7 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
     if not user_models:
         return
     for row in rows:
-        if row.get("is_user_defined") or not is_routing_aggregator(row.get("slug", "")):
+        if row.get("is_user_defined") or not is_routing_aggregator(row.get("slug", ""), allow_network=allow_network):
             continue
         # Only strip overlaps from TRUE routing aggregators (OpenRouter, custom:* proxies). Flat-namespace
         # resellers (opencode-go / opencode-zen) serve every listed model as a first-party model, so their
