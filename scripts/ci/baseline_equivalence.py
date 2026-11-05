@@ -11,14 +11,21 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 from candidate_mode import OVERLAY_PATHS, check_staging, git, select
 
 SLICES = tuple(f"{suite}-{index}" for suite in ("python", "e2e") for index in range(1, 11))
+ALL_SLICES = (*SLICES, "messaging-1", "js-1")
+JS_STEP = "Full candidate-owned JS and TypeScript suites"
+STATIC_JOB = "Upstream blocking lint, JS and Rust"
 TEST_STEPS = {
+    JS_STEP,
     "Full candidate-owned Python suite (all slices required)",
     "Full candidate-owned E2E suite (including upgrade)",
     "Messaging-gated gateway contracts (no skipped coverage)",
@@ -72,6 +79,62 @@ def collect(suite: str, index: int, output: Path) -> int:
                 "runner": {path: git(root, "ls-tree", "HEAD", "--", path) for path in RUNNER_PATHS}}
     (output / "slice.json").write_text(json.dumps(manifest), encoding="utf-8")
     return rc
+
+
+def js_runner(root: Path, head: str) -> dict:
+    paths = git(root, "ls-tree", "-r", "--name-only", head).splitlines()
+    selected = [p for p in paths if Path(p).name in {"package.json", "package-lock.json"}
+                or Path(p).name.startswith("vitest.config.")
+                or p in {".github/scripts/run-workspace-checks.mjs", "scripts/build/electron-runtime.mjs"}]
+    return {p: git(root, "ls-tree", head, "--", p) for p in selected}
+
+
+def js_nodes(reports: list[dict], exit_code: int) -> tuple[dict, set]:
+    require(reports and exit_code in (0, 1), "Missing JS evidence/harness failure")
+    failures, called, seen = {}, set(), set()
+    for report in reports:
+        require(report.get("schema") == 1 and not report["infra"] and report["files"],
+                "JS setup/collection/teardown/harness failure")
+        for row in report["nodes"]:
+            node = row["node"]
+            require(node not in seen and row["state"] in {"pass", "fail", "skip", "todo"},
+                    "Duplicate/incomplete JS node")
+            seen.add(node)
+            if row["state"] in {"pass", "fail"}:
+                called.add(node)
+            if row["state"] == "fail":
+                require(row["category"], "Missing JS failure category")
+                failures[node] = row["category"]
+    require(called and ((exit_code == 1) == bool(failures)), "Unexplained JS check failure")
+    return failures, called
+
+
+def collect_js(output: Path) -> int:
+    """Keep the canonical workspace checks, including checks after failing tests."""
+    root = Path.cwd()
+    output.mkdir(parents=True, exist_ok=False)
+    observer = Path(__file__).with_name("gate_js_evidence.mjs").resolve()
+    npm, node = shutil.which("npm"), shutil.which("node")
+    require(npm and node, "Missing JS toolchain")
+    with tempfile.TemporaryDirectory(prefix="frozen-npm-") as directory:
+        proxy = Path(directory) / "npm"
+        proxy.write_text("#!/bin/sh\nexec " + " ".join(shlex.quote(str(p)) for p in (node, observer))
+                         + ' npm-proxy "$@"\n', encoding="utf-8")
+        proxy.chmod(0o755)
+        env = {**os.environ, "PATH": directory + os.pathsep + os.environ["PATH"],
+               "FROZEN_REAL_NPM": str(npm), "FROZEN_JS_ROOT": str(root), "FROZEN_JS_OUTPUT": str(output),
+               "FROZEN_JS_OBSERVE": "1",
+               "NODE_OPTIONS": os.environ.get("NODE_OPTIONS", "") + " --import " + shlex.quote(observer.as_uri())}
+        rc = subprocess.call([str(node), ".github/scripts/run-workspace-checks.mjs", "--concurrency", "2"], env=env)
+    reports = [json.loads(p.read_text(encoding="utf-8")) for p in output.glob("vitest-*.json")]
+    failed = any(n["state"] == "fail" for r in reports for n in r["nodes"])
+    # rc!=0 still means lint/build/setup failed: do not relabel it as a node failure.
+    exit_code = 2 if rc else int(failed)
+    manifest = {"schema": 1, "head": git(root, "rev-parse", "HEAD"), "suite": "js", "index": 1,
+                "exit": exit_code, "runner": js_runner(root, "HEAD")}
+    (output / "slice.json").write_text(json.dumps(manifest), encoding="utf-8")
+    js_nodes(reports, exit_code)
+    return exit_code
 
 
 def session_nodes(session: dict) -> tuple[dict, set]:
@@ -129,21 +192,24 @@ def slice_nodes(manifest: dict, sessions: list[dict], head: str) -> tuple[dict, 
 
 def compare(mode: str, candidate: dict, baseline: dict) -> list[str]:
     require(mode == "upstream", "Fork descendants require full green")
-    require(set(candidate) == set(baseline) == {*SLICES, "messaging-1"}, "Missing selected slice")
+    require(set(candidate) == set(baseline) == set(ALL_SLICES), "Missing selected slice")
     inherited = {}
     for name, c in candidate.items():
         b = baseline[name]
         require(c["runner"] == b["runner"], "Planner/runner identity differs")
         # Adding tests may legitimately repartition files. Compare node sets
         # across the whole suite below, not just within an LPT bucket.
-    for suite in ("python-", "e2e-", "messaging-"):
+    for suite in ("python-", "e2e-", "messaging-", "js-"):
         current = {n: cat for key, value in candidate.items() if key.startswith(suite) for n, cat in value["failures"].items()}
         previous = {n: cat for key, value in baseline.items() if key.startswith(suite) for n, cat in value["failures"].items()}
         called_c = set().union(*(v["called"] for k, v in candidate.items() if k.startswith(suite)))
         called_b = set().union(*(v["called"] for k, v in baseline.items() if k.startswith(suite)))
         require(called_b <= called_c, "Baseline-executed nodes removed or newly skipped")
-        require(all(previous.get(node) == category for node, category in current.items()),
-                f"Candidate-only failure/category: {sorted(n for n, cat in current.items() if previous.get(n) != cat)}")
+        def inherited_category(node, category):
+            old = previous.get(node)
+            return old == category or (suite == "js-" and isinstance(old, set) and category in old)
+        require(all(inherited_category(node, category) for node, category in current.items()),
+                f"Candidate-only failure/category: {sorted(n for n, cat in current.items() if not inherited_category(n, cat))}")
         inherited.update(current)
     return [f"{node} [{inherited[node]}]" for node in sorted(inherited)]
 
@@ -157,16 +223,18 @@ def api(repository: str, suffix: str, *, pages=False):
 
 def verify_jobs(jobs: list[dict]):
     expected = {f"Upstream {suite} ({i}/10)" for suite in ("Python", "E2E") for i in range(1, 11)}
-    required = expected | {"Freeze candidate gate mode", "Upstream blocking lint, JS and Rust", "Prompt surface diff / Prompt surface summary"}
+    required = expected | {"Freeze candidate gate mode", STATIC_JOB, "Prompt surface diff / Prompt surface summary"}
+    test_jobs = expected | {STATIC_JOB}
     rows = {job["name"]: job for job in jobs}
     require(len(rows) == len(jobs) and required <= rows.keys(), "Missing/duplicate selected job")
     for name in required:
         job = rows[name]
         require(job["status"] == "completed", "Incomplete selected job")
-        allowed = ("success", "failure") if name in expected else ("success",)
+        allowed = ("success", "failure") if name in test_jobs else ("success",)
         require(job["conclusion"] in allowed, f"Non-test or incomplete job: {name}")
-        if name in expected:
-            test_step = ("Full candidate-owned Python suite (all slices required)" if "Python" in name
+        if name in test_jobs:
+            test_step = (JS_STEP if name == STATIC_JOB else
+                         "Full candidate-owned Python suite (all slices required)" if "Python" in name
                          else "Full candidate-owned E2E suite (including upgrade)")
             step_names = [step["name"] for step in job["steps"]]
             require(step_names.count(test_step) == 1 and step_names.count("Upload complete test-node evidence") == 1,
@@ -175,7 +243,8 @@ def verify_jobs(jobs: list[dict]):
                 require(step_names.count("Messaging-gated gateway contracts (no skipped coverage)") == 1,
                         "Missing messaging step")
         for step in job["steps"]:
-            if step["name"] in TEST_STEPS and name in expected:
+            if ((name in expected and step["name"] in TEST_STEPS - {JS_STEP})
+                    or (name == STATIC_JOB and step["name"] == JS_STEP)):
                 # Messaging is selected only on E2E slice 1.
                 optional = step["name"].startswith("Messaging-") and name != "Upstream E2E (1/10)"
                 require(step["conclusion"] in (("skipped",) if optional else ("success", "failure")), "Missing test step")
@@ -225,7 +294,7 @@ def evidence(root: Path, repository: str, run: dict) -> dict:
     jobs = [j for page in api(repository, f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100", pages=True) for j in page["jobs"]]
     verify_jobs(jobs)
     artifacts = [a for p in api(repository, f"actions/runs/{run['id']}/artifacts?per_page=100", pages=True) for a in p["artifacts"] if a["name"].startswith("upstream-evidence-")]
-    expected = {f"upstream-evidence-{name}" for name in SLICES}
+    expected = {f"upstream-evidence-{name}" for name in (*SLICES, "js-1")}
     require({a["name"] for a in artifacts} == expected and len(artifacts) == len(expected), "Missing/duplicate evidence slice")
     result = {}
     for artifact in artifacts:
@@ -243,11 +312,21 @@ def evidence(root: Path, repository: str, run: dict) -> dict:
                     require(artifact["name"] == "upstream-evidence-e2e-1" and name == "messaging-1", "Misplaced messaging evidence")
                 else:
                     require(artifact["name"] == "upstream-evidence-" + name, "Wrong artifact/slice identity")
-                expected_runner = {p: git(root, "ls-tree", run['head_sha'], "--", p) for p in RUNNER_PATHS}
+                if name == "js-1":
+                    require(manifest["head"] == run["head_sha"] and manifest["schema"] == 1,
+                            "Wrong JS evidence head/schema")
+                    expected_runner = js_runner(root, run["head_sha"])
+                    reports = [json.loads(archive.read(n)) for n in archive.namelist()
+                               if n.startswith("vitest-") and n.endswith(".json")]
+                    failures, called = js_nodes(reports, manifest["exit"])
+                    steps = [s for j in jobs if j["name"] == STATIC_JOB for s in j["steps"] if s["name"] == JS_STEP]
+                    require(steps[0]["conclusion"] == ("failure" if failures else "success"), "JS step/evidence mismatch")
+                else:
+                    expected_runner = {p: git(root, "ls-tree", run['head_sha'], "--", p) for p in RUNNER_PATHS}
+                    failures, called = slice_nodes(manifest, sessions, run["head_sha"])
                 require(manifest["runner"] == expected_runner, "Forged planner/runner identity")
-                failures, called = slice_nodes(manifest, sessions, run["head_sha"])
                 result[name] = {"runner": manifest["runner"], "failures": failures, "called": called}
-    require(set(result) == {*SLICES, "messaging-1"}, "Missing selected slice evidence")
+    require(set(result) == set(ALL_SLICES), "Missing selected slice evidence")
     return result
 
 
@@ -265,7 +344,7 @@ def qualify(root: Path, policy: str, upstream: str, head: str, staging: str):
         return
     require(head != base, "Baseline has test failures (evidence retained, not qualified)")
     runs = [r for p in api(repository, f"actions/workflows/{current['workflow_id']}/runs?head_sha={base}&event=pull_request&status=completed&per_page=100", pages=True) for r in p["workflow_runs"]]
-    errors = []
+    errors, verified = [], []
     for baseline in sorted(runs, key=lambda r: r["id"], reverse=True):
         try:
             validate_run(baseline, base, current["workflow_id"], baseline=True)
@@ -273,12 +352,28 @@ def qualify(root: Path, policy: str, upstream: str, head: str, staging: str):
             verify_policy(root, baseline, policy, base)
             require(all(git(root, "ls-tree", head, "--", p) == git(root, "ls-tree", base, "--", p)
                         for p in RUNNER_PATHS), "Planner/runner changed: full green required")
-            inherited = compare(mode, candidate, evidence(root, repository, baseline))
+            proof = evidence(root, repository, baseline)
+            require(proof["js-1"]["runner"] == candidate["js-1"]["runner"],
+                    "JS planner/configuration changed: full green required")
+            verified.append((baseline["id"], proof))
         except (ValueError, KeyError, subprocess.CalledProcessError, zipfile.BadZipFile) as exc:
             errors.append(f"{baseline['id']}: {exc}")
+    js_failures, js_called = {}, set()
+    for _, proof in verified:
+        js_called.update(proof["js-1"]["called"])
+        for node, category in proof["js-1"]["failures"].items():
+            js_failures.setdefault(node, set()).add(category)
+    for run_id, proof in verified:
+        try:
+            combined = {**proof, "js-1": {**proof["js-1"], "failures": js_failures, "called": js_called}}
+            inherited = compare(mode, candidate, combined)
+        except ValueError as exc:
+            errors.append(f"{run_id}: {exc}")
             continue
         message = (f"## Baseline-equivalent (NOT fully green)\n\nCandidate run: {current['id']} ({head})\n\n"
-                   f"Baseline run: {baseline['id']} ({base})\n\nInherited failing nodes:\n" +
+                   f"Python/E2E baseline run: {run_id} ({base})\n\n"
+                   f"JS exact-B baseline runs (attempt 1): {', '.join(str(i) for i, _ in verified)} ({base})\n\n"
+                   f"Frozen policy SHA: {policy}\n\nInherited failing nodes:\n" +
                    "\n".join(f"- `{node}`" for node in inherited) + "\n")
         print(message)
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
@@ -294,12 +389,16 @@ def main():
     collect_parser.add_argument("suite", choices=("python", "e2e", "messaging"))
     collect_parser.add_argument("index", type=int, choices=range(1, 11))
     collect_parser.add_argument("output", type=Path)
+    js_parser = sub.add_parser("collect-js")
+    js_parser.add_argument("output", type=Path)
     qualification = sub.add_parser("qualify")
     for argument in ("root", "policy", "upstream", "head", "staging"):
         qualification.add_argument(argument)
     args = parser.parse_args()
     if args.action == "collect":
         sys.exit(collect(args.suite, args.index, args.output.resolve()))
+    if args.action == "collect-js":
+        sys.exit(collect_js(args.output.resolve()))
     qualify(Path(args.root), args.policy, args.upstream, args.head, args.staging)
 
 

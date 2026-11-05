@@ -2,6 +2,7 @@
 
 Fork patch identities: `fork-ci-reliability` (portable contributor gate extension),
   `upstream-candidate-gate` (exact-head upstream qualification and baseline equivalence).
+Contract tests: `tests/ci/test_candidate_mode.py`, `tests/ci/test_js_baseline_evidence.py`, `tests/ci/test_js_observer_live.py`.
 
 `gate.yml` tests the exact PR head, not GitHub's synthetic merge tree. Its
 `qualification` job succeeds only if the planner, prompt-surface check, and
@@ -226,7 +227,36 @@ pytest session. Missing phases, collection/setup/teardown errors, killed workers
 runner/session exit mismatch, empty messaging files, messaging skips, setup,
 harness or artifact-upload failures fail. Intentional platform/marker skips stay
 supported, but no node executed by the baseline may disappear or newly skip.
-All non-test jobs must pass outright; no lint/JS/Rust/build exemption exists.
+All non-test jobs must pass outright. JS relief applies only to structured Vitest
+**test-node** failures; JS prerequisite installs, Electron runtime build, workspace
+lint/typecheck/build, WhatsApp's Node-runner suite and Rust must pass outright.
+
+The frozen `gate_js_evidence.mjs` observer runs beside the unchanged candidate
+workspace-check entrypoint. A disposable npm proxy observes only pure `vitest run`
+scripts, preserving the default reporter and adding machine evidence. Once a
+finished test-only failure is recorded, the proxy lets that original `&&` chain
+continue so its remaining lint/build checks cannot silently disappear.
+
+Vitest's public API conflates callback and fixture errors. The observer therefore
+adds phase-only markers **in memory** through a worker-local Node load hook,
+accepting only the exact SHA-256-verified `@vitest/runner` 4.1.12 bytes. Neither
+candidate source nor installed dependencies are modified. The original callbacks,
+fixtures, hooks, retries and timeout implementation remain in place. Callback
+errors and timeouts after callback entry are distinguishable from fixture setup,
+fixture cleanup and completion-handler errors, including reused error objects.
+Unknown runner bytes remain untouched and receive no differential relief, rather
+than falling back to guessed categories; they may still qualify fully green.
+The frozen collector restores a failing test exit after the complete workspace run;
+any non-test command failure remains a hard failure. No suite, test filter or deadline
+is changed: the existing **15000 ms** deadline stays. Retries/repeats, collection,
+setup/teardown hooks, unhandled errors, interruptions, duplicate nodes, missing
+modules/results and unexplained exit status fail closed. Node identity includes
+the repository-relative file and full nested/parameterized test name. Runner,
+package/lock manifests and Vitest configuration must be independently identical
+at `B` and `C`, or full green is required. `test_js_observer_live.py` exercises
+actual pinned Vitest callbacks, timeouts, fixtures and completion handlers plus
+npm's remaining-check execution after a test failure. These live probes require
+checkout-owned npm setup; run them locally after `bin/ci gate <exact-head>`.
 
 If all candidate tests pass, qualification reports fully green. Otherwise the
 job discovers completed `gate.yml` pull-request runs on **exactly `B`** through
@@ -241,7 +271,7 @@ workflow ID/path, event, completed success/failure conclusion and unique live
 PR association. The reusable prompt workflow's **server-recorded merge-ref SHA**
 must match that PR number; its merge parents must be the API's frozen base and
 exact `B`. The baseline overlay ancestry is checked as policy-only, anchored at
-`B^1`; all five policy blobs on that base and actual workflow merge tree must
+`B^1`; all six policy blobs on that base and actual workflow merge tree must
 match the candidate's frozen policy byte-for-byte. This rejects a different
 workflow with the same check name, candidate-supplied artifact identity, and
 policy drift. No live PR association means fail closed; keep baseline refs until
@@ -250,11 +280,20 @@ also fail closed. Comparison checks the selected slice inventory and independent
 verified runner/planner Git blobs, not candidate claims about their hashes.
 Changed runner/planner code requires full green instead of differential relief.
 
-Candidate call-failure nodes must be a subset of baseline call-failure nodes,
-with the **same exception class**. New failures and category changes fail. New
-tests may repartition LPT buckets, so comparison is across each full suite while
-all 10 buckets remain required. An inherited failure list, both run IDs and both
-SHAs appear in the qualification log and job summary under **Baseline-equivalent
+Python/E2E candidate call-failure nodes must be a subset of one verified baseline
+run's call-failure nodes, with the **same exception class**, as before. For JS
+only, discovery verifies **every** preceding exact-`B`, original **attempt-1** run
+individually under the same frozen policy. Its baseline failure set is the union
+of the failing JS node/category pairs in those verified runs. A JS node is
+admitted only if it actually **failed at exact `B`** with that category in at
+least one such run; passing it in another verified `B` run does not erase the
+failure evidence. Candidate-only failures, a different `B`, wrong policy,
+non-original attempts, incomplete/harness-failed runs and unavailable artifacts
+cannot contribute. No candidate-supplied run IDs or failure-set input exists.
+Every run ID used, exact `B`/`C` and frozen policy SHA appear in the comparator
+output and job summary. New failures and category changes fail. New tests may
+repartition Python LPT buckets, so comparison is across each full suite while
+all 10 buckets remain required. The summary reports **Baseline-equivalent
 (NOT fully green)**. Selected test jobs and the overall workflow remain red when
 they really failed; only `qualification` becomes successful differential admission.
 `review_candidate` is not changed and still consumes that exact-head check.
@@ -265,10 +304,10 @@ they really failed; only `qualification` becomes successful differential admissi
   categories cheaply reject obvious changes, but equivalence is not proof of the
   same root cause. Review every inherited node and its trace when deciding to
   land; this gate never represents inherited failures as resolved.
-- A flaky baseline failure can mask a new same-node/same-category regression.
-  Both sides disable retries; a flaky candidate-only node blocks. Use fresh,
-  baseline-first paired runs, not an accumulating failure allowlist. The rule is
-  intentionally not statistical flake suppression or a guarantee of test quality.
+- A same-node/same-category regression can be hidden by baseline failure evidence.
+  All contributing runs must retain exact-`B`, original-attempt and identical-policy
+  verification; no evidence survives a change of `B` or policy. Candidate-only
+  failures block, and the rule is not a guarantee of test quality.
 - `B` is recomputed from frozen `U` in each run. When upstream main moves, an old
   baseline remains usable only if the independently computed exact `B` and frozen
   policy still match. Different `B`, changed policy/runner, incomplete runs or

@@ -28,6 +28,7 @@ OVERLAY_PATHS = frozenset({
     "scripts/ci/candidate_mode.py",
     "scripts/ci/baseline_equivalence.py",
     "scripts/ci/gate_test_evidence.py",
+    "scripts/ci/gate_js_evidence.mjs",
 })
 
 

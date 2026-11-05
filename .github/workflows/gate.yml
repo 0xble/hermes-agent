@@ -235,13 +235,23 @@ jobs:
         env:
           UPSTREAM_BASE: ${{ needs.plan.outputs.upstream_base }}
         run: python scripts/check --base "$UPSTREAM_BASE"
-      - name: Full candidate-owned JS and TypeScript suites
+      - name: Install and build candidate-owned JS prerequisites
         if: success() || failure()
         run: |
           npm ci
           node scripts/build/electron-runtime.mjs --source .
           npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/whatsapp-bridge
-          node .github/scripts/run-workspace-checks.mjs --concurrency 2
+      - name: Full candidate-owned JS and TypeScript suites
+        if: success() || failure()
+        run: python3 "$RUNNER_TEMP/gate-harness/scripts/ci/baseline_equivalence.py" collect-js "$RUNNER_TEMP/upstream-evidence-js-1"
+      - name: Upload complete test-node evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-evidence-js-1
+          path: ${{ runner.temp }}/upstream-evidence-js-1
+          if-no-files-found: error
+          retention-days: 14
       - name: Full candidate-owned WhatsApp Node suite
         if: success() || failure()
         run: node --test scripts/whatsapp-bridge/*.test.mjs

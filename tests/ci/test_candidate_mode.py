@@ -230,7 +230,7 @@ import baseline_equivalence as equivalence
 def paired_evidence():
     return {name: {"runner": {"scripts/run_tests.sh": "same"},
                    "failures": {}, "called": {"tests/a.py::test_existing"}}
-            for name in (*equivalence.SLICES, "messaging-1")}
+            for name in equivalence.ALL_SLICES}
 
 
 def test_baseline_equivalence_admits_subset_and_rejects_new_failure():
@@ -324,6 +324,10 @@ def test_missing_or_incomplete_hosted_slice_fails(incomplete):
         if job["name"] == "Upstream E2E (1/10)":
             job["steps"].append({"name": "Messaging-gated gateway contracts (no skipped coverage)",
                                  "conclusion": "success"})
+    for job in jobs:
+        if job["name"] == equivalence.STATIC_JOB:
+            job["steps"] = [{"name": equivalence.JS_STEP, "conclusion": "success"},
+                            {"name": "Upload complete test-node evidence", "conclusion": "success"}]
     jobs += [{"name": name, "conclusion": "skipped"} for name in (
         "Static and Node gate", "Python and e2e (${{ matrix.shard }}/10)",
     )]
