@@ -38,6 +38,38 @@ fetches during a local fixture clone). No source clone is redirected to external
 small local-repository regression proves the unrelated branch stays unadvertised; cache
 regressions prove user state and installed environments are not shared.
 
+## Fork upgrade release contract
+
+Git-world N-1 means the newest `origin` `deploy/nightly-*` promotion that is a strict
+ancestor of the candidate, not the nearest upstream CalVer tag. Discover refs using a bounded
+`ls-remote` and fetch a missing promotion object without changing `nightly.yml`. When those refs
+are unavailable, use the immutable `deploy/nightly-20261103` floor
+`002f8807dbdef3b9aa450980baa501c6e9920f58`; fail loudly if neither resolves. Ignore promotions
+before that floor. Both it and subsequent promotions contain upstream #126150's shallow healing
+fix (#123254), while upstream `v2026.9.24` performs an unfiltered `git fetch origin main` before
+swapping updater code. A depth-1 *install* does not make that later fetch depth-limited: the real
+smart-HTTP backend correctly sends hundreds of MB of historical blobs. This is a historical
+product defect, not a cache, browser, dumb-HTTP or fixed-pack fixture defect.
+
+Provision the genuine promoted runtime first, then seed its retained depth-1 Git metadata with a
+fresh real depth-1 smart-HTTP clone of the same commit. Modern bootstrap heals shallow clones at
+install time, so seeding before bootstrap cannot model retained legacy user state. Replace only
+the sandbox checkout's `.git`; never its source or installed dependencies. Record the real clone's
+shape and transfer baseline. Use this shared `World.seed_clone_shape` for partial cells too,
+asserting exact tree:0/blob:none/full input shapes so bootstrap cannot silently erase updater
+coverage. Keep the original shape, transfer, ancestry and two-update
+assertions. Current shallow-healer real-Git regressions remain independent of release selection;
+never truncate history, patch the historical updater or raise either timeout to make this pass.
+
+Local prerequisite: run historical upstream-tag suites from a tag-pinned object store rather than
+sharing mutable refs with other worktrees. A global `fetch.pruneTags=true` (with prune enabled)
+lets another fetch against the fork delete a just-hydrated upstream tag the fork does not publish,
+silently selecting August again. Verify the selected tag/SHA at execution time. This is separate
+from immutable object hydration needed for a partial developer checkout; hosted full-history,
+fresh-tag checkout is the arbiter for unchanged `test_upgrade_path.py`.
+
+Contract tests: `tests/e2e/core/upgrade/git/test_release_selection.py` `tests/hermes_cli/test_update_shallow_heal.py`
+
 Historical baseline: nightly 41454766643 completed shallow/partial/upgrade_path in 659.5/677.8/816.0
 seconds; 41834945580 timed out all three at 900 seconds. That establishes expensive successful
 runs, not a proven deadlock. Local process snapshots show installer dependency/runtime downloads
