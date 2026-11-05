@@ -550,7 +550,7 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
                       ensure_ascii=False)
 
 
-def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) -> str:
+def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, remember: bool = True) -> str:
     """Second factor: fill the one-time code the CURRENT page asks for. If the saved login (``handle``) has an
     authenticator seed, the code is minted server-side and nobody is asked. Otherwise the caller should fetch the
     newest matching code from the intended 1Password item, mailbox, or phone and type it with the browser input
@@ -676,7 +676,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
         return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     fills = build_otp_fills(otp_controls, code)
     result = _eval_js_secret(browser_key, build_fill_js(fills, expected_origin=origin, nonce=nonce,
-                                                            remember=_remember_login(effective_task_id)))
+                                                            remember=remember and _remember_login(effective_task_id)))
     del code
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
@@ -691,7 +691,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                        "source": source, "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
-def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
+def browser_vault_fill(handle: str, task_id: Optional[str] = None, remember: bool = True) -> str:
     """Fill the current page's password field from a vault handle.
 
     Password-only: the identifier is agent-visible metadata (see
@@ -985,7 +985,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     try:
         fill_result = _eval_js_secret(
             browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce,
-                                       remember=meta.kind == "login" and _remember_login(effective_task_id))
+                                       remember=meta.kind == "login" and remember and _remember_login(effective_task_id))
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
@@ -1035,26 +1035,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
-    filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
-    if meta.kind == "protected_field" and filled and int(filled) != len(fills):
-        # A partial date is a wrong date: report failure rather than a half-filled success.
-        return json.dumps({"success": False, "error_type": "partial_fill", "filled_fields": int(filled),
-                           "error": "Could not fill every birth-date part unambiguously; check the form "
-                                    "or use browser_handoff for the user to finish it."})
-
-    out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
-           "kind": meta.kind, "origin": page_origin}
-    if meta.kind == "login":
-        out["remembered"] = bool(parsed.get("remembered")) if isinstance(parsed, dict) else False
-        out["next"] = ("Submit. If the site then asks for a verification code, "
-                       + ("call browser_vault_enter_code with this handle (a code will be generated automatically)."
-                          if meta.has_otp else
-                          "fetch the newest matching code from the intended 1Password item, mailbox, or phone and "
-                          "type it with the browser input tool; call browser_vault_enter_code only when no such source "
-                          "exists."))
-    if meta.kind != "login":
-        out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
-    return json.dumps(out)
+    from tools.browser_vault_results import fill_result_reply
+    return fill_result_reply(meta, backend.name, parsed, fills, page_origin)
 
 
 def _payment_fill_refusal(decision: str, retry_key: tuple[str, str, str]) -> str:
@@ -1167,6 +1149,10 @@ BROWSER_VAULT_SCHEMA = {
             "kind": {"type": "string", "enum": ["login", "payment", "address", "protected_field"], "description": "list only: optional item kind filter."},
             "origin": {"type": "string", "description": "list only: optional exact origin filter."},
             "handle": {"type": "string", "description": "fill / enter_code: a handle from list."},
+            "remember": {"type": "boolean", "default": True, "description": (
+                "fill (login) / enter_code only: tick a safe Remember me / Trust this device box before input events, "
+                "unless disabled for this browser account. Set false for an explicit task-level don't-remember request; "
+                "never changes global settings or unchecks an already-checked box. Untick it first if needed.")},
             "backend": {"type": "string", "enum": ["onepassword", "bitwarden"], "description": "unlock only."},
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
         },
@@ -1217,7 +1203,8 @@ def _handle_vault_list(args: dict[str, Any], **kwargs) -> str:
 
 def _handle_vault_fill(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
-    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
+    return _fenced_page_op(tid, lambda: browser_vault_fill(
+        handle=str(args.get("handle") or ""), task_id=tid, remember=args.get("remember", True)))
 
 
 def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
@@ -1247,9 +1234,9 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
     if action == "unlock":
         return browser_vault_unlock(str(args.get("backend") or ""))
     page_ops = {
-        "fill": lambda: browser_vault_fill(handle=handle, task_id=tid),
+        "fill": lambda: browser_vault_fill(handle=handle, task_id=tid, remember=args.get("remember", True)),
         "save_login": lambda: browser_vault_save_login(label=label, task_id=tid),
-        "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid),
+        "enter_code": lambda: browser_vault_enter_code(handle=handle, task_id=tid, remember=args.get("remember", True)),
     }
     if action not in page_ops:
         return json.dumps({"success": False, "error": f"Unknown action {action!r}; use list, fill, save_login, "

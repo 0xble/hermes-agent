@@ -523,11 +523,8 @@ _RE_REMEMBER = re.compile(
 )
 _RE_REMEMBER_DECOY = re.compile(
     r"\b(?:newsletters?|marketing|promo\w*|offers?|deals|subscri\w*|updates|news|terms|conditions|"
-    r"consent\w*|privacy|polic\w*|agree\w*|accept\w*|cookies?|email\sme|send\sme|"
-    r"notif\w*|forget|not\smy|(?:don\s?t|do\snot|never)\sremember)\b|"
-    # "This is a public computer" declares the opposite. A caution such as "(not recommended on shared
-    # computers)" beside a real remember box does not.
-    r"(?:^|\bthis\sis\s(?:a\s)?|\bi\s?(?:am|m)\s(?:on|using)\s(?:a\s)?)(?:public|shared)\b"
+    r"consent\w*|privacy|polic\w*|agree\w*|accept\w*|cookies?|email\sme|send\sme|public|shared|"
+    r"notif\w*|forget|not\smy|(?:don\s?t|do\snot|never)\sremember)\b"
 )
 
 
@@ -544,10 +541,10 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     controls (country, state, expiry month) match an option by value or visible text. No marker is
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
 
-    ``remember`` (login and one-time-code fills only): after a successful write, tick one visible,
-    enabled "Remember me"-style checkbox in the filled field's own form (or, without a form, its tight
-    container), with a real click so site scripts register it. The result's ``remembered`` is true when
-    such a box is checked afterwards.
+    ``remember`` (login and one-time-code fills only): after setting a valid input, before its input
+    event, tick one visible, enabled "Remember me"-style checkbox in that field's form (or its tight
+    container without a form), with a real click so site scripts register it. The result's
+    ``remembered`` is true when such a box is checked afterwards.
     """
     payload = json.dumps(
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
@@ -572,8 +569,7 @@ _FILL_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
   __QUERY_ALL__
   const stamped = queryAll("[data-hermes-vault-slot]");
-  let filled = 0;
-  const filledEls = [];
+  let filled = 0, remembered = false, rememberAttempted = false;
   const selectedOptions = [];
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
@@ -624,17 +620,24 @@ _FILL_JS_TEMPLATE = """(() => {
             tokens.some((t) => ["username", "email", "tel", "new-password", "one-time-code"].includes(t)) ||
             new RegExp(__EXCLUDED_PASSWORD__).test(purpose) || new RegExp(__OTP_PATTERN__).test(purpose)) continue;
       }
+      if (f.token === "one-time-code") {
+        const style = getComputedStyle(el);
+        if (window.location.origin !== expectedOrigin || !el.isConnected || el.matches(":disabled") ||
+            el.readOnly || !["text", "tel", "number", "password"].includes(el.type) ||
+            style.display === "none" || style.visibility === "hidden" || el.getClientRects().length === 0) continue;
+      }
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
+      // Input/change may auto-submit a code: establish persistence before either event.
+      if (__REMEMBER__ && !rememberAttempted && el.value.length && window.location.origin === expectedOrigin) {
+        rememberAttempted = true;
+        try { remembered = tickRemember(el); } catch (e) { remembered = false; }
+      }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      if (el.value.length > 0) { filled += 1; filledEls.push(el); }
+      if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
-  }
-  let remembered = false;
-  if (__REMEMBER__ && filledEls.length && window.location.origin === expectedOrigin) {
-    try { remembered = tickRemember(filledEls[filledEls.length - 1]); } catch (e) { remembered = false; }
   }
   stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
   return JSON.stringify({ filled, selectedOptions, remembered });
@@ -675,9 +678,11 @@ _FILL_JS_TEMPLATE = """(() => {
     };
     // Styled checkboxes often hide the native input behind a visible label.
     const visible = (box) => shown(box) || Array.from(box.labels || []).some(shown);
-    const enabled = (box) => !box.matches(":disabled") && box.getAttribute("aria-disabled") !== "true";
+    const enabled = (box) => !box.matches(":disabled") && !box.closest('[aria-disabled="true"]');
+    const sameForm = (box) => (box.form || box.closest("form")) === field.form &&
+      (!field.form || field.form.contains(box));
     const checked = (box) => box.tagName === "INPUT" ? box.checked : box.getAttribute("aria-checked") === "true";
-    const eligible = boxes.filter((box) => isBox(box) && box !== field && visible(box) && enabled(box))
+    const eligible = boxes.filter((box) => isBox(box) && box !== field && sameForm(box) && visible(box) && enabled(box))
       .filter((box) => { const p = purpose(box); return rememberRe.test(p) && !decoyRe.test(p); });
     if (eligible.some(checked)) return true;
     const box = eligible[0];

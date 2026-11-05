@@ -156,7 +156,7 @@ def remember_logins_enabled(browser_account: str | None) -> bool:
     try:
         config = load_config_readonly() or {}
     except Exception as exc:
-        logger.warning("Using the default vault.remember_logins because config could not be read: %s", exc)
+        logger.warning("Using the default vault.remember_logins because config could not be read: %s", exc, exc_info=True)
         return True
     vault_config = config.get("vault") if isinstance(config, dict) else None
     value = vault_config.get("remember_logins", True) if isinstance(vault_config, dict) else True
