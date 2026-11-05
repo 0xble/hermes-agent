@@ -158,12 +158,22 @@ and not baseline attribution. Actual planner and lint logs both record
 `016b76da3a8a88e28775e08b6ca2846f471b8eda`; all candidate suites/partitions are
 base-independent. The staging gate bytes equal the reviewed gate bytes (the
 candidate has no gate file), so ancestry contamination did not change execution
-or workflow identity. The prompt-surface comparison used the staging tree, which
-already included implementation, not the full upstream-base prompt delta. The new
-staging-provenance contract was not checked and would reject that base. Re-run
-on a clean staging base to obtain full current-policy evidence; retain the old
-suite outcomes only under their actual head/policy, never call them a clean
-staging qualification. A baseline run is required regardless.
+or workflow identity. The prompt-surface comparison did use the staging tree,
+which already included implementation, but this did **not** change its result:
+`tests/fixtures/prompt_surface` has identical tree object
+`4eb8005a351f9f5a79254828b21236095adb7733` at upstream base, staging base,
+exact candidate and actual merge ref; its diff script is also identical
+(`92e9b43247258dae7a69f425b9bf529a231dd2c2`). The unchanged prompt result
+therefore stands for the full upstream-base comparison too.
+
+No part of the earlier **execution outcome** must be discarded or re-run solely
+for this ancestry mistake: preserve it as exact-candidate failure evidence under
+its actual policy. A clean candidate rerun is unnecessary for that conclusion.
+The new staging-provenance contract was not checked and would reject that old
+base; the old run is not proof of compliance with the new provenance contract,
+not baseline evidence, and not successful admission. Run the new exact baseline
+first before any baseline-versus-candidate attribution or subsequent candidate
+qualification. All future probes must use clean overlay-only staging.
 
 
 ## Residual maintenance
