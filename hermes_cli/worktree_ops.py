@@ -52,7 +52,10 @@ def _git(args, cwd, timeout: float = 10, *, tree_timeout: bool = False, **kwargs
             stdout, stderr = proc.communicate(timeout=timeout)
         except BaseException:
             kill_and_drain(proc, 10)
-            proc.wait(timeout=10)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.debug("git cleanup reap timed out; preserving original exception")
             raise
         result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if check:
@@ -119,7 +122,8 @@ def release_lsp_clients(wt_path: str) -> None:
 
 
 def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str,
-                                 *, branch_existed: bool = False) -> None:
+                                 *, branch_existed: bool = False,
+                                 branch_created: Optional[bool] = None) -> None:
     """Sweep the leftovers of a failed/timed-out ``git worktree add`` (fail-soft).
 
     ``worktree add`` is not transactional: killed mid-checkout it leaves the partial dir, an
@@ -130,10 +134,11 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
         # Unlock first: `worktree remove --force` refuses a locked tree.
         if not _unlock_owned_worktree(repo_root, str(wt_path), timeout=15, failed_add=True):
             return  # Another owner may have claimed this path after the failed add.
-        # An absent-at-admission branch is ours only if the reserved add acquired
-        # it. A competing creator makes git -b fail before this admin HEAD exists.
-        branch_created = False
-        if not branch_existed:
+        # Git can remove its admin HEAD on an ordinary checkout failure. The add
+        # caller supplies a confirmed ref-creation receipt independent of checkout.
+        # Older callers still require the reserved checkout's admin HEAD.
+        if branch_created is None and not branch_existed:
+            branch_created = False
             from hermes_cli._early_recovery import _git_dir
             try:
                 branch_created = (_git_dir(wt_path) / "HEAD").read_text(encoding="utf-8-sig").strip() == f"ref: refs/heads/{branch_name}"
@@ -148,7 +153,7 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
         _git_quiet(["worktree", "prune"], repo_root, timeout=15,
                    stdin=subprocess.DEVNULL, env=noninteractive_git_env())
         # A ref update runs the repository's reference-transaction hook (core.hooksPath).
-        if branch_created:
+        if branch_created and not branch_existed:
             _git_quiet(["branch", "-D", branch_name], repo_root, timeout=15,
                        stdin=subprocess.DEVNULL, env=noninteractive_git_env())
     except Exception as e:
@@ -431,11 +436,13 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
 
     owns_path = False
     branch_existed = True  # fail closed if a ref probe itself fails
+    branch_created = False
 
     def _add(cfg):
-        nonlocal owns_path, branch_existed
+        nonlocal owns_path, branch_existed, branch_created
         owns_path = False
         branch_existed = True
+        branch_created = False
         probe = _git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
                      repo_root, stdin=subprocess.DEVNULL, env=env)
         if probe.returncode not in (0, 1):
@@ -447,8 +454,16 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
         # initializing lock. A losing named launch must never clean this path.
         wt_path.mkdir(parents=True)
         owns_path = True
+        # Separate ref creation from checkout: a clean Git rollback must not erase
+        # ownership proof. Native branch creation preserves tracking setup and
+        # atomically refuses a name acquired by a concurrent launcher.
+        result = _git([*cfg, "branch", branch_name, base_ref], repo_root, timeout=120,
+                      stdin=subprocess.DEVNULL, env=env, tree_timeout=True)
+        if result.returncode != 0:
+            return result
+        branch_created = True
         # 120s: on a multi-agent box the ~10k-file checkout contends for disk (113s measured under load).
-        return _git([*cfg, "worktree", "add", str(wt_path), "-b", branch_name, base_ref], repo_root,
+        return _git([*cfg, "worktree", "add", str(wt_path), branch_name], repo_root,
                     timeout=120, stdin=subprocess.DEVNULL, env=env, tree_timeout=True)
 
     # checkout.workers parallelizes materialization; older git ignores unknown -c keys.
@@ -460,17 +475,20 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
                 logger.warning("worktree add from %s failed (%s); retrying from local HEAD",
                                base_ref, result.stderr.strip())
                 if owns_path:
-                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed)
+                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed,
+                                                 branch_created=branch_created)
                 base_ref, base_label = "HEAD", "HEAD (fallback — remote base failed)"
                 result = _add([])
             if result.returncode != 0:
                 if owns_path:
-                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed)
+                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed,
+                                                 branch_created=branch_created)
                 _cprint(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
                 return None
     except Exception as e:
         if owns_path:
-            _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed)
+            _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed,
+                                         branch_created=branch_created)
         _cprint(f"\033[31m✗ Failed to create worktree: {e}\033[0m")
         return None
     return base_ref, base_label
@@ -1024,6 +1042,10 @@ def _initializing_worktree_is_dead(worktree_path: str, before: Optional[float] =
 
     Call after validating the exact reason and repository identity. A sweep supplies its
     existing age cutoff; failed-add cleanup separately owns its exact in-progress add.
+    Windows deliberately fails closed: this POSIX holder probe cannot establish that
+    all checkout descendants are gone. A timed-out initializing checkout and its
+    branch remain reserved there; the owner must verify processes have exited before
+    explicitly unlocking/removing it and retrying the same name.
     """
     try:
         from hermes_cli._early_recovery import _git_dir, _held_open

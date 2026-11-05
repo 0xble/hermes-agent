@@ -102,12 +102,26 @@ holders and another launcher's Hermes lock are preserved.
 
 Each attempt records whether its branch already exists. An existing branch
 without a tree is refused with a clear "branch already exists" message, just as
-`_setup_worktree` refuses an existing named tree. Cleanup deletes a branch only
-when it was absent at admission and the reserved checkout's admin HEAD proves
-the add acquired it; a branch-name race that fails before admin creation is
-preserved too. A unique-commit regression covers both normal and HEAD-fallback
-bases. A live slow-smudge regression covers timeout cleanup of the path, admin
-entry, and new branch, no stray checkout descendants, and a same-name retry.
+`_setup_worktree` refuses an existing named tree. After reserving the directory,
+create the branch with native `git branch`, then check out that existing branch.
+Only a confirmed successful branch creation authorizes ref cleanup; a concurrent
+creator's branch is preserved even when it has the same base and no checkout yet.
+Do not infer ownership from ref presence, timestamps, or a surviving admin HEAD:
+an ordinary Git checkout failure can remove its own directory and admin entry
+while retaining the new branch. Native branch creation keeps Git's tracking setup.
+An uncertain/timed-out branch-creation command fails closed rather than deleting
+an unproven ref. Legacy cleanup callers without a creation receipt still need
+admin-HEAD proof. Unique-commit regressions cover normal and HEAD-fallback bases;
+real missing-blob regressions cover HEAD fallback and identical-name retry after
+an ordinary non-zero checkout. Slow-smudge regressions cover timeout cleanup of
+the path, admin entry, and branch and no stray descendants. Reap timeouts must
+preserve the original checkout exception.
+
+Windows deliberately keeps timed-out `initializing` checkouts and their branches:
+the POSIX holder probe cannot prove that checkout descendants have exited there.
+An owner must verify process exit before explicitly unlocking/removing a retained
+tree and retrying its name. The native Windows regression verifies this fail-closed
+contract without monkeypatching the host platform.
 
 Process-holder targets must be absolute paths. Linux `/proc/<pid>/fd` links also
 name `socket:[...]`, `pipe:[...]`, and `anon_inode:[...]`; resolving those against

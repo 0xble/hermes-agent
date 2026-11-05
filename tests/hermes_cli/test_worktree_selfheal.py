@@ -49,7 +49,7 @@ def repo(tmp_path):
 
 
 @contextmanager
-def _in_progress_add(repo, env=None, expected_reason="initializing"):
+def _in_progress_add(repo, env=None, expected_reason: str | None = "initializing", *, existing_branch=False):
     """Pause a real checkout in its smudge filter, while git holds index.lock."""
     marker = repo.parent / "checkout-started"
     slow_filter = repo.parent / "slow_filter.py"
@@ -63,9 +63,12 @@ def _in_progress_add(repo, env=None, expected_reason="initializing"):
     _git(repo, "commit", "-qm", "slow checkout")
     wt = repo / ".worktrees" / "hermes-dead00"
     command = f"{shlex.quote(sys.executable)} {shlex.quote(str(slow_filter))}"
+    if existing_branch:
+        _git(repo, "branch", "-f", "hermes/hermes-dead00", "HEAD")
+    branch_args = ["hermes/hermes-dead00"] if existing_branch else ["-b", "hermes/hermes-dead00"]
     proc = subprocess.Popen(
         ["git", "-c", f"filter.slow.smudge={command}", "worktree", "add", str(wt),
-         "-b", "hermes/hermes-dead00"], cwd=repo, start_new_session=True,
+         *branch_args], cwd=repo, start_new_session=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     admin = repo / ".git" / "worktrees" / wt.name
     try:
@@ -279,15 +282,18 @@ class TestCleanupFailedWorktreeAdd:
         reasons = []
 
         def killed_add(add_env):
-            with _in_progress_add(repo, add_env, expected_reason=None) as (_, admin, _):
+            with _in_progress_add(repo, add_env, expected_reason=None, existing_branch=action == "retry") as (_, admin, _):
                 reasons.append((admin / "locked").read_text().strip())
             return admin
 
         if action == "retry":
             git = ops._git
             attempts = []
+            bases = []
 
             def interrupt_first(args, cwd, **kwargs):
+                if "branch" in args and "-D" not in args:
+                    bases.append(args[-1])
                 if "add" in args and "worktree" in args:
                     attempts.append(args[-1])
                     if len(attempts) == 1:
@@ -297,7 +303,8 @@ class TestCleanupFailedWorktreeAdd:
 
             monkeypatch.setattr(ops, "_git", interrupt_first)
             assert ops._worktree_add(str(repo), wt, branch, "main", "main")
-            assert attempts == ["main", "HEAD"]
+            assert attempts == [branch, branch]
+            assert bases == ["main", "HEAD"]
             assert _git(wt, "status", "--porcelain").returncode == 0
         else:
             admin = killed_add(noninteractive_repo_git_env(repo))
@@ -413,7 +420,7 @@ class TestCleanupFailedWorktreeAdd:
 
         def create_competing_branch(args, cwd, **kwargs):
             nonlocal raced
-            creates_branch = "-b" in args or args[:1] == ["branch"]
+            creates_branch = "-b" in args or "branch" in args
             if not raced and creates_branch:
                 raced = True
                 if completed:
