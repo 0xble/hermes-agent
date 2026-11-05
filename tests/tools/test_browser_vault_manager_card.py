@@ -303,6 +303,16 @@ def test_card_retry_guard_expires_and_is_session_scoped():
         assert not vault._payment_retry_blocked(key)
 
 
+def test_manager_card_approval_unavailable_requires_exact_conversation_approval():
+    raw, prompts, secret_exprs = _run_fill("https://shop.test/checkout", decision="unavailable")
+    out = json.loads(raw)
+    assert out["success"] is False and out["error_type"] == "approval_unavailable"
+    assert "explicitly approved the merchant, amount, and selected card" in out["error"]
+    assert "this session's conversation" in out["error"]
+    assert "Otherwise route to the active top-level turn for fresh approval" in out["error"]
+    assert prompts == ["Fill payment card 'Amex' on https://shop.test"] and not secret_exprs
+
+
 def test_manager_card_declined_writes_nothing():
     raw, prompts, secret_exprs = _run_fill("https://shop.test/checkout", decision="decline")
     assert json.loads(raw)["error_type"] == "payment_declined"

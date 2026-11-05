@@ -671,7 +671,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             from gateway.copy_blocks import split_copy_blocks_for
             # Separate copy messages only where the adapter sends them plain; elsewhere the
             # recovered reply renders its blocks inline, as normal delivery does.
-            content, copy_blocks = split_copy_blocks_for(adapter, row["content"])
+            content, copy_blocks = split_copy_blocks_for(adapter, row["content"], inline_quotes=False)
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else {}

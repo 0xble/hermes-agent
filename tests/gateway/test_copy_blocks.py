@@ -378,10 +378,11 @@ async def test_queued_copy_blocks_keep_distinct_ledger_rows_and_never_resend_del
     # blocks each hold their own failed ledger row and are redelivered from there.
     assert delivered is True
     # Block 1 was refused, so block 2 is held unsent behind it instead of overtaking it.
-    assert [content for content, _metadata in sends] == ["same", "same"]
+    from gateway.copy_blocks import copy_free_text_for
+    assert [content for content, _metadata in sends] == [copy_free_text_for(adapter, response), "same"]
     copy_rows = [row for row in rows if row["content"] == "[[copy]]\nsame\n[[/copy]]"]
     assert len(copy_rows) == 2
-    reply_rows = [row for row in rows if row["content"] == "same"]
+    reply_rows = [row for row in rows if row["content"] != "[[copy]]\nsame\n[[/copy]]"]
     assert len({row["obligation_id"] for row in copy_rows + reply_rows}) == 3
 
 
@@ -407,9 +408,10 @@ def test_platforms_without_plain_copy_send_keep_blocks_inline() -> None:
     text = "Intro\n[[copy]]\n**exact** text\n[[/copy]]\nAfter\n"
     telegram = SimpleNamespace(platform="telegram")
     discord = SimpleNamespace(platform="discord")
-    assert split_copy_blocks_for(telegram, text) == ("Intro\nAfter\n", ["**exact** text"])
+    assert split_copy_blocks_for(telegram, text) == (copy_free_text_for(telegram, text), ["**exact** text"])
     assert split_copy_blocks_for(discord, text) == ("Intro\n**exact** text\nAfter\n", [])
-    assert copy_free_text_for(telegram, text) == "Intro\nAfter\n"
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    assert TelegramAdapter.format_message(None, copy_free_text_for(telegram, text)) == "Intro\n> \\*\\*exact\\*\\* text\nAfter\n"
     assert copy_free_text_for(discord, text) == "Intro\n**exact** text\nAfter\n"
 
 
@@ -530,7 +532,8 @@ async def test_interrupted_turn_keeps_partial_block_inline_and_literal() -> None
     )
     extracted = await adapter._extract_response_content(returned, event, "", is_ephemeral_response=True)
     assert extracted.copy_blocks == [] and extracted.images == []
-    assert extracted.text_content == "![paste this](https://example.com/literal.png)"
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    assert TelegramAdapter.format_message(None, extracted.text_content) == "> \\!\\[paste this\\]\\(https://example\\.com/literal\\.png\\)"
 
 
 def test_streaming_tts_never_speaks_copy_bodies() -> None:
@@ -595,7 +598,7 @@ def test_filter_reset_replays_complete_text_without_a_held_prefix() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interrupted_streamed_turn_shows_hidden_partial_copy_text() -> None:
+async def test_interrupted_streamed_turn_does_not_repeat_inline_partial_copy_text() -> None:
     runner = object.__new__(GatewayTurnMixin)
     sends = []
 
@@ -621,7 +624,7 @@ async def test_interrupted_streamed_turn_shows_hidden_partial_copy_text() -> Non
         "Before\n[[copy]]\npartial paste text", None, False,
     )
     assert returned is None
-    assert sends == ["partial paste text"]
+    assert sends == []  # the already-delivered preview contains the partial quote
 
 
 @pytest.mark.asyncio
@@ -775,7 +778,8 @@ async def test_fifo_delivery_sends_exact_incident_copy_block(monkeypatch) -> Non
     await deliver_response(adapter, event, "incident-session", _INCIDENT_REPLY)
     prose, blocks = extract_copy_blocks(_INCIDENT_REPLY)
     assert len(blocks) == 1
-    assert [item[0] for item in sent] == [prose.strip(), *blocks]
+    from gateway.copy_blocks import copy_free_text_for
+    assert [item[0] for item in sent] == [copy_free_text_for(adapter, _INCIDENT_REPLY).strip(), *blocks]
     assert blocks[0].startswith("@Alex")
     assert sent[0][2]["release_marker"] is False
     assert sent[1][1].items() >= {"thread_id": "topic", "notify": True,
