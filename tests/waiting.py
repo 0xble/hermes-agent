@@ -60,6 +60,17 @@ def kill_if_alive(process_or_pid, *, created: float | None = None, timeout: floa
         pass
 
 
+def terminate_if_alive(process) -> None:
+    """Gracefully stop an owned Process, tolerating a reap before/during TERM."""
+    import psutil
+
+    try:
+        if process_alive(process):
+            process.terminate()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        pass
+
+
 def process_children(process_or_pid) -> list:
     """Snapshot children of a test process; an already-reaped parent has none."""
     import psutil
@@ -69,6 +80,16 @@ def process_children(process_or_pid) -> list:
         return process.children(recursive=True)
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return []
+
+
+def process_name(process) -> str | None:
+    """Read a matching process name, or None if the child was reaped."""
+    import psutil
+
+    try:
+        return process.name()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return None
 
 
 def process_cmdline(process) -> list[str] | None:

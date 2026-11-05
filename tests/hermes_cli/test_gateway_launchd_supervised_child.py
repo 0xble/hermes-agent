@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
+from tests.waiting import terminate_if_alive
+
 import hermes_cli.gateway as gateway
 
 
@@ -172,6 +174,6 @@ def test_launchd_exclusion_protects_real_wrapped_process(tmp_path, monkeypatch):
         assert child.is_running()
     finally:
         monkeypatch.undo()
-        if child is not None and child.is_running():
-            child.terminate()
+        if child is not None:
+            terminate_if_alive(child)
         wrapper.wait(timeout=10)

@@ -9,11 +9,12 @@ from tests import waiting
 
 
 @pytest.mark.parametrize("error", [psutil.NoSuchProcess, psutil.ZombieProcess])
-@pytest.mark.parametrize("probe", ["children", "cmdline"])
+@pytest.mark.parametrize("probe", ["children", "cmdline", "name"])
 def test_descendant_snapshot_tolerates_reap(error, probe):
     process = Mock(spec=psutil.Process)
     getattr(process, probe).side_effect = error(123)
-    helper = waiting.process_children if probe == "children" else waiting.process_cmdline
+    helper = {"children": waiting.process_children, "cmdline": waiting.process_cmdline,
+              "name": waiting.process_name}[probe]
     assert helper(process) == ([] if probe == "children" else None)
 
 
@@ -77,22 +78,24 @@ def test_cleanup_preserves_recorded_identity_and_waits(monkeypatch):
 
 
 @pytest.mark.parametrize("state", ["live", "zombie", "gone", "reaped", "kill_race", "denied", "guard"])
-def test_cleanup_only_signals_live_processes(monkeypatch, state):
+@pytest.mark.parametrize("method", ["kill", "terminate"])
+def test_cleanup_only_signals_live_processes(monkeypatch, state, method):
     process = Mock(spec=psutil.Process)
     process.is_running.return_value = state != "gone"
     process.status.return_value = psutil.STATUS_ZOMBIE if state == "zombie" else psutil.STATUS_SLEEPING
     if state == "reaped":
         process.status.side_effect = psutil.NoSuchProcess(123)
     elif state == "kill_race":
-        process.kill.side_effect = psutil.NoSuchProcess(123)
+        getattr(process, method).side_effect = psutil.NoSuchProcess(123)
     elif state == "denied":
         process.status.side_effect = psutil.AccessDenied(123)
     elif state == "guard":
-        process.kill.side_effect = RuntimeError("outside the test process subtree")
+        getattr(process, method).side_effect = RuntimeError("outside the test process subtree")
     monkeypatch.setattr(psutil, "Process", Mock(return_value=process))
+    cleanup = (lambda: waiting.kill_if_alive(123)) if method == "kill" else (lambda: waiting.terminate_if_alive(process))
     if state in {"denied", "guard"}:
         with pytest.raises(psutil.AccessDenied if state == "denied" else RuntimeError):
-            waiting.kill_if_alive(123)
+            cleanup()
     else:
-        waiting.kill_if_alive(123)
-    assert process.kill.call_count == (state in {"live", "kill_race", "guard"})
+        cleanup()
+    assert getattr(process, method).call_count == (state in {"live", "kill_race", "guard"})
