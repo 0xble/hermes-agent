@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.waiting import process_alive
+
 from cron import delivery_queue, executions, scheduler
 from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
 
@@ -301,7 +303,7 @@ time.sleep(60)
         execution_id = idfile.read_text()
         grandchild_pid = int(pidfile.read_text())
         import psutil
-        assert not psutil.pid_exists(grandchild_pid) or psutil.Process(grandchild_pid).status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(grandchild_pid)
         token = _home(home)
         try:
             row = executions.get_execution(execution_id)

@@ -29,6 +29,58 @@ DEFAULT_TIMEOUT = 10.0  # a deadline, not a delay: only a hang ever waits this l
 DEFAULT_INTERVAL = 0.01
 
 
+def process_alive(process_or_pid, *, created: float | None = None) -> bool:
+    """A live non-zombie, or False if reaped at any point during the probe.
+
+    Accept an existing Process to retain its PID-reuse protection. ``created`` also
+    checks an identity recorded by another process. Access/guard errors still fail
+    the test: they are not evidence that a process exited.
+    """
+    import psutil
+
+    try:
+        process = psutil.Process(process_or_pid) if isinstance(process_or_pid, int) else process_or_pid
+        return (process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+                and (created is None or process.create_time() == created))
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+
+
+def kill_if_alive(process_or_pid, *, created: float | None = None, timeout: float | None = None) -> None:
+    """Clean up an owned test process, tolerating a reap before/during kill."""
+    import psutil
+
+    try:
+        process = psutil.Process(process_or_pid) if isinstance(process_or_pid, int) else process_or_pid
+        if process_alive(process, created=created):
+            process.kill()
+            if timeout is not None:
+                process.wait(timeout=timeout)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        pass
+
+
+def process_children(process_or_pid) -> list:
+    """Snapshot children of a test process; an already-reaped parent has none."""
+    import psutil
+
+    try:
+        process = psutil.Process(process_or_pid) if isinstance(process_or_pid, int) else process_or_pid
+        return process.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return []
+
+
+def process_cmdline(process) -> list[str]:
+    """Read a diagnostic/matching command line without racing a child's reap."""
+    import psutil
+
+    try:
+        return process.cmdline()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return []
+
+
 def _timed_out(what: str | None, timeout: float) -> AssertionError:
     return AssertionError(f"timed out after {timeout}s waiting for {what or 'the condition'}")
 

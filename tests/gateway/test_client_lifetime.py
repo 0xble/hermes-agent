@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from tests.waiting import wait_until
+from tests.waiting import wait_until, process_alive, kill_if_alive
 
 
 @pytest.mark.parametrize("argv,expected", [
@@ -81,8 +81,7 @@ threading.Event().wait(30)
         if with_tool:
             import psutil
             tool_pid = int(ready.with_suffix('.tool').read_text())
-            assert wait_until(lambda: not psutil.pid_exists(tool_pid) or
-                              psutil.Process(tool_pid).status() == psutil.STATUS_ZOMBIE, timeout=3)
+            assert wait_until(lambda: not process_alive(tool_pid), timeout=3)
     finally:
         if child.poll() is None:
             child.kill()
@@ -90,5 +89,4 @@ threading.Event().wait(30)
         if ready.with_suffix('.tool').exists():
             import psutil
             tool_pid = int(ready.with_suffix('.tool').read_text())
-            if psutil.pid_exists(tool_pid):
-                psutil.Process(tool_pid).kill()  # only the exact tool spawned by this test
+            kill_if_alive(tool_pid)  # only the exact tool spawned by this test

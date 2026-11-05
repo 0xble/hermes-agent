@@ -16,6 +16,8 @@ import time
 import psutil
 import pytest
 
+from tests.waiting import process_children
+
 
 def _free_port():
     with socket.socket() as sock:
@@ -28,7 +30,7 @@ def _await_ledger_row(ledger, proc, log, *, timeout=45):
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             break
-        pids = {proc.pid, *(c.pid for c in psutil.Process(proc.pid).children(recursive=True))}
+        pids = {proc.pid, *(c.pid for c in process_children(proc.pid))}
         try:
             rows = json.loads(ledger.read_text(encoding="utf-8"))
         except (OSError, ValueError):
