@@ -1,7 +1,7 @@
 # Bounded filename search
 
 Fork patch identity: `bounded-filename-search`.
-Contract tests: `tests/tools/test_search_filename_globs.py`, `tests/tools/test_search_cwd_preservation.py`, `tests/tools/test_search_files_engine_selection.py`, `tests/tools/test_search_budget_truncation.py`, `tests/tools/test_macos_protected_search.py`, `tests/tools/test_search_supplement_safety.py`.
+Contract tests: `tests/tools/test_search_filename_globs.py`, `tests/tools/test_search_cwd_preservation.py`, `tests/tools/test_search_files_engine_selection.py`, `tests/tools/test_search_budget_truncation.py`, `tests/tools/test_macos_protected_search.py`, `tests/tools/test_search_supplement_safety.py`, `tests/tools/test_search_timeout_diagnostics.py`, `tests/tools/environments/test_execute_timeouts.py`.
 
 ## Current contract
 
@@ -30,6 +30,12 @@ is unknown). Root admission, bounded result capture, pagination and the shared
 60-second search deadline remain in force. The directory supplement, BSD find
 retry, gitignore checks and all mtime stat passes share that deadline; exhaustion
 retains discovered paths with the existing `search_timeout` truncation notice.
+`BaseEnvironment.execute` floors timeout seconds to an integer with a minimum
+of one before SDK dispatch and waiting (Modal/Daytona reject fractional seconds).
+`None` still selects the environment default. Search keeps its precise remaining
+budget and skips new work below one second rather than rounding past the deadline.
+Docker delegates to this boundary; Managed Modal overrides it but already sends
+integer milliseconds and can represent fractional seconds without the SDK defect.
 Discovery stops at the page budget;
 modified order merges each root's bounded newest candidates globally. Native
 and shell transports keep bounded stderr separate from paths and report engine
@@ -46,6 +52,20 @@ exceed its basename syntax. The no-rg `find -name` fallback
 retains its historical basename-only syntax. Content matching is unchanged;
 BSD find-wrapped grep errors now surface diagnostics at exit 1 instead of being
 misreported as empty matches (a diagnostic-free grep exit 1 still means no matches).
+This intentionally includes an unreadable subdirectory with no usable match
+payload: it errors like ripgrep, rather than leaking `find: ... Permission denied`
+as a filename. Partial readable matches remain usable in all output modes.
+
+## Timeout provenance
+
+The shared execution boundary and every in-tree backend were checked before this
+normalization. Existing wait-backstop protection (`53e3c14f1d9`) bounds invalid
+timeouts but does not convert SDK timeout values. Upstream PR
+[#14699](https://github.com/NousResearch/hermes-agent/pull/14699) is open/unmerged
+and normalizes Modal-only preparation; it does not cover this checkout's shared
+dispatch. Remote process termination also computes fractional `env.execute`
+budgets in `tools/process_registry.py`; the same boundary makes those SDK calls
+integer-compatible without adding backend-specific conversions to each caller.
 
 ## Verification
 

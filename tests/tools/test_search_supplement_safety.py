@@ -59,7 +59,8 @@ def test_grep_error_under_explicit_hidden_root_is_not_silent(tmp_path):
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("native", ["0", "1"], ids=["shell", "native"])
 @pytest.mark.parametrize("phase", ["find", "bsd-find", "root-stat", "global-stat"])
-def test_filename_deadline_covers_supplement_and_metadata(tmp_path, monkeypatch, native, phase):
+@pytest.mark.parametrize("budget", [0.25, 1.25], ids=["subsecond-skip", "remaining-budget"])
+def test_filename_deadline_covers_supplement_and_metadata(tmp_path, monkeypatch, native, phase, budget):
     rg = shutil.which("rg")
     if not rg:
         pytest.skip("requires ripgrep")
@@ -78,8 +79,8 @@ def test_filename_deadline_covers_supplement_and_metadata(tmp_path, monkeypatch,
 
     def run_rg(*args, **kwargs):
         result = real_rg(*args, **kwargs)
-        # Leave a fraction of the shared minute for the supplement/stat pass.
-        elapsed[0] = 59.75
+        # Leave only the shared remainder for the supplement/stat pass.
+        elapsed[0] = 60 - budget
         return result
 
     real_exec = ops._exec
@@ -115,5 +116,10 @@ def test_filename_deadline_covers_supplement_and_metadata(tmp_path, monkeypatch,
     assert result.limit_reason == "search_timeout"
     assert all("[Command timed out" not in file for file in result.files)
     assert {str(root / "a-tests"), str(root / "b-tests")} <= set(result.files)
-    assert calls and all(0 < timeout <= 0.25 for _, timeout in calls), calls
-    assert elapsed[0] < 60.1, calls
+    if budget < 1:
+        # No SDK-compatible command fits in the final fractional second.
+        assert calls == [], calls
+        assert elapsed[0] == 60 - budget
+    else:
+        assert calls and all(0 < timeout <= budget for _, timeout in calls), calls
+        assert elapsed[0] <= 60, calls

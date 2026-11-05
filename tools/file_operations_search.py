@@ -149,7 +149,7 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
         if not line.strip():
             continue
         # Prefix check first: a match path can contain "-<digit>" (".../pytest-686/...").
-        if line.lstrip().startswith(("rg: ", "grep: ")):
+        if line.lstrip().startswith(("rg: ", "grep: ", "find: ")):
             diagnostics.append(line)
         elif line == "--" or _SEARCH_OUTPUT_RE.match(line):
             payload.append(line)
@@ -842,7 +842,8 @@ class SearchMixin:
     def _exec_before_deadline(self, command: str, deadline: float, **kwargs) -> ExecuteResult:
         """Use only the filename search's remaining wall-clock budget."""
         remaining = max(0, deadline - time.monotonic())
-        if remaining <= 0:
+        # Integer-second SDKs cannot start an honest subsecond command budget.
+        if remaining < 1:
             return ExecuteResult(stdout="", exit_code=124)
         kwargs["timeout"] = min(kwargs.get("timeout", 60), remaining)
         result = self._exec(command, **kwargs)
@@ -1119,7 +1120,7 @@ class SearchMixin:
         for parent, globs, operand in jobs:
             remaining = fetch_limit if order == "modified" else fetch_limit - len(all_files)
             timeout = deadline - time.monotonic()
-            if timeout <= 0:
+            if timeout < 1:
                 limit_reason = "search_timeout"
                 break
             result = self._search_filename_root(
@@ -1154,7 +1155,7 @@ class SearchMixin:
         cmd = (f"{self._quote_executable(rg_executable)} --files{sort_arg} --threads {walker_threads} "
                f"{glob_args} -- {self._escape_native_tool_arg(operand)}")
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if remaining < 1:
             return SearchResult(limit_reason="search_timeout")
         result = self._run_rg_bounded([cmd], fetch_limit, timeout=remaining, native_cwd=parent,
                                       shell_prefix="set -o pipefail; ", capture_stderr=True)
