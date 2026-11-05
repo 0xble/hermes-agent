@@ -47,7 +47,8 @@ def prepare_staging(root: Path, head: str, upstream: str, policy: str) -> str:
                 raise ValueError(f"Policy requires a regular overlay file: {path}")
             git(root, "update-index", "--add", "--cacheinfo", entry[0], entry[2], path, index=index)
         tree = git(root, "write-tree", index=index)
-    staging = git(root, "commit-tree", tree, "-p", anchor, "-m",
+    staging = git(root, "-c", "user.name=Fork qualification", "-c",
+                  "user.email=qualification@example.invalid", "commit-tree", tree, "-p", anchor, "-m",
                   "ci: temporary policy-only qualification base\n\nFork-Patch: evidence")
     check_staging(root, head, base, staging)
     # Check before publishing: GitHub can activate workflows as soon as a PR

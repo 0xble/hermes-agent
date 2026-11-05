@@ -162,7 +162,11 @@ def test_staging_rejects_contaminated_ancestry_not_just_final_tree(graph, contam
         mode.check_staging(root, candidate, upstream, staging)
 
 
-def test_prepare_candidate_preserves_checkout_index_and_branch(graph):
+def test_prepare_candidate_preserves_checkout_index_and_branch(graph, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    for name in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.delenv(name, raising=False)
     root, git, commit, upstream, _ = graph
     git("reset", "--hard", upstream)
     candidate = commit("candidate", {"implementation": "candidate change\n"})
