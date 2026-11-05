@@ -44,7 +44,13 @@ def isolated_store(request, tmp_path, monkeypatch):
         namespace = dict(jobs.__dict__)
         exec(compile(ast.Module(body=nodes, type_ignores=[]), source, "exec"), namespace)
         for name in names:
-            monkeypatch.setattr(jobs, name, namespace[name])
+            if name == "_retire_expired_oneshot":
+                # #968 moved the real due-scan owner out of the facade. Route
+                # the unchanged historical implementation through that seam.
+                from cron import jobs_oneshot
+                monkeypatch.setattr(jobs_oneshot, "retire_expired_oneshot", namespace[name])
+            else:
+                monkeypatch.setattr(jobs, name, namespace[name])
         request.node.add_marker(pytest.mark.xfail(strict=True, reason="verified pre-fix behavior"))
 
 

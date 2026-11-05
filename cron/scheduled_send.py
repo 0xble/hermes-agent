@@ -130,7 +130,7 @@ def validate_scheduled_send_inputs(
             or send_freshness.get("text_sha256") != send_freshness.get("payload_sha256")):
         raise ValueError("send_freshness has conflicting approved payload bindings.")
     try:
-        approved = datetime.fromisoformat(str(send_freshness["approved_at"]).replace("Z", "+00:00"))
+        approved = datetime.fromisoformat(str(send_freshness["approved_at"]))
         if approved.tzinfo is None:
             raise ValueError("timezone required")
     except ValueError as exc:

@@ -7,8 +7,9 @@ Fork patch identity: `cron-missed-oneshot-hold`.
 Never-started one-shots that miss the 120-second grace remain stored, disabled
 and marked `missed`, with their exact prompt/payload and timing evidence. Admit
 one durable decision notice per occurrence through the existing failure outbox,
-routed to the creating origin (configured-home fallback if absent), before
-committing the hold. The notice offers explicit `cron resume <id> --run-now` or
+preserving explicit non-local `failure_deliver`; unset/local lanes fall back to
+the creating origin then configured home. Admit that notice before committing
+the hold. The notice offers explicit `cron resume <id> --run-now` or
 `cron remove <id>`. Store-outage coverage explains the miss but never authorizes
 an hours-late send. Consumed/ambiguous dispatches retain their existing distinct
 retirement and partial-effects notice. `repeat.completed` counts consumption of
@@ -48,6 +49,17 @@ worker, one pending pass per home, with captured home context. Keep journals as
 the durable retry queue and observe/log errors. Headless recovery still cannot
 connect or spawn a gateway. Do not occupy a job-dispatch worker.
 
+### Integration blocker
+
+The merged #968 expiry owner can retire a dead-owner, started one-shot while
+its off-tick canonical receipt observation is pending. The isolated barrier
+regression `test_current_arm_receipt_survives_concurrent_expiry_scan` preserves
+this failure: the job disappears before `mark_job_run` can land. The receipt
+may settle its execution row, but that is not coherent job/canonical settlement.
+Do not treat a green subset or the prior branch's hosted success as qualification.
+Resolve receipt-versus-retirement ownership with the parent before activation;
+no automatic historical replay is permitted.
+
 ## Source and proof
 
 - `cron/jobs.py`, `cron/oneshot_retirement.py`, `cron/scheduled_send.py`,
@@ -63,6 +75,19 @@ connect or spawn a gateway. Do not occupy a job-dispatch worker.
   must pass. Source archives may skip only the historical Git-source reproduction.
 
 ## Upstream disposition and stack fit
+
+Merged #968 (`a62993bb50d8c00320e228cf5680b38380c99c57`) owns due-scan
+expiry, `occurrence_started`/`occurrence_finished`, claim liveness, atomic
+`record_missed_execution` accounting and its best-effort cap protection, and
+`held_outcome`/failure-lane routing. Keep those implementations rather than a
+second facade expiry/hold path. Admission failures remain immutable evidence;
+an overdue recovery adds one distinct, terminal never-started miss per
+occurrence, not another dispatch attempt. Protected current/newest ledger rows
+may exceed the retention cap; the shared 500-row cleanup budget is unchanged.
+
+The remaining fork delta owns create/update/reactivation validation, the
+shared worker-entry deadline/freshness fence, recovery-notice wording, and
+nonblocking canonical receipt recovery. These are not superseded by #968.
 
 Keep this fork patch until upstream preserves held payloads, durable decisions,
 full shared-runner deadline/freshness boundaries and nonblocking recovery. A fix
