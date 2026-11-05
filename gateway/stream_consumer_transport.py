@@ -212,10 +212,10 @@ class StreamTransportMixin:
         self._use_draft_streaming = False
         return False
 
-    async def _abandon_native_stream(self) -> None:
+    async def _abandon_native_stream(self, *, reconcile: bool = True) -> None:
         """Seal an orphaned draft stream on turn death (stale exit / cancel): else the live
         indicator stays forever and armed interception state leaks into the next turn.
-        Never sets delivery flags."""
+        Never sets delivery flags; stale exits must not expose a reconciliation target."""
         if not self._use_draft_streaming:
             return
         if getattr(type(self.adapter), "abandon_open_draft", None) is None:
@@ -224,7 +224,7 @@ class StreamTransportMixin:
             result = await self.adapter.abandon_open_draft(
                 self.chat_id, self._last_sent_text or self._clean_for_display(self._accumulated),
                 metadata={**(self._draft_metadata() or {}), "_draft_id": self._draft_id})
-            if getattr(result, "success", False) and getattr(result, "message_id", None):
+            if reconcile and getattr(result, "success", False) and getattr(result, "message_id", None):
                 # A sealed preview is editable, not yet a confirmed final.
                 self._message_id = result.message_id
                 self._abandoned_draft_message_id = result.message_id

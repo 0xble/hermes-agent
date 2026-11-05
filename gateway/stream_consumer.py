@@ -597,7 +597,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             while True:
                 # Session reset (/new, /stop): abandon rather than deliver stale deltas.
                 if not self._run_still_current():
-                    await self._abandon_native_stream()
+                    await self._abandon_native_stream(reconcile=False)
                     return
                 tick = self._drain_queue()
 
@@ -687,7 +687,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             logger.error("Stream consumer error: %s", e)
         finally:
             if not self._final_content_delivered:
-                await self._abandon_native_stream()
+                await self._abandon_native_stream(reconcile=self._run_still_current())
             self._wake_flush_waiters()
 
     # ── run() collaborators ─────────────────────────────────────────────

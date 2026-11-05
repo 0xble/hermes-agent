@@ -786,8 +786,10 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         claims nothing; otherwise the live indicator stays forever and the NEXT turn
         could inherit the armed interception state. Failure is reported, never raised."""
         draft_key = self._match_open_draft(str(chat_id), metadata)
-        if draft_key is None:
-            return SendResult(success=True)  # nothing armed — no-op
+        draft_id = (metadata or {}).get("_draft_id")
+        if (draft_key is None or draft_id is None
+                or self._open_draft_by_chat.get(draft_key) != draft_id):
+            return SendResult(success=True)  # no proven owned draft — no-op
         try:
             return await self._seal_open_draft(chat_id, content, metadata, draft_key=draft_key)
         except Exception as e:

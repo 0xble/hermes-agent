@@ -5495,6 +5495,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             )
             response["already_sent"] = True
         elif _sc is not None and getattr(_sc, "_abandoned_draft_message_id", None):
+            if not turn_ctx._run_still_current() or response.get("interrupted"):
+                return  # Do not fall through to plugin-transformed reconciliation either.
             # A dead consumer sealed its owned preview: finish that message, never infer
             # ownership from thread metadata or post a duplicate beside the orphan.
             await self._run_agent_edit_streamed_message(
