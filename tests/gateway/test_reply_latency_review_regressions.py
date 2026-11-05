@@ -158,6 +158,57 @@ async def test_shutdown_evidence_drain_uses_remaining_restart_budget(monkeypatch
     assert runner._shutdown_event.is_set()
 
 
+@pytest.mark.asyncio
+async def test_restart_does_not_wait_for_executor_admission(monkeypatch):
+    import gateway.run_shutdown as shutdown
+    from gateway.run import GatewayRunner
+    from gateway.reply_latency_sink import shutdown_sinks
+
+    async def final_kill(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(GatewayRunner, '_stop_kill_tool_subprocesses_off_loop', final_kill)
+    monkeypatch.setattr('agent.auxiliary_client.shutdown_cached_clients', lambda: None)
+    release = asyncio.Event()
+    real_to_thread = asyncio.to_thread
+
+    async def queued_worker(func, *args, **kwargs):
+        if func is shutdown_sinks:
+            await release.wait()  # A saturated default executor has not admitted this work.
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(shutdown.asyncio, 'to_thread', queued_worker)
+    runner = SimpleNamespace(
+        _background_tasks=set(), _stop_task=None, _restart_task=None, adapters={},
+        _running_agents={}, _running_agents_ts={}, _pending_messages={}, _pending_approvals={},
+        _shutdown_event=asyncio.Event(), _restart_requested=True,
+        _active_api_run_count=lambda: 0, _restart_shutdown_bound=lambda: 0.01,
+    )
+    task = asyncio.create_task(shutdown.GatewayShutdownMixin._stop_release_runtime_state(
+        runner, SimpleNamespace(elapsed=lambda: 0)))
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+    finally:
+        release.set()
+        await task
+
+
+def test_late_shutdown_worker_cannot_restart_its_wait_budget(monkeypatch):
+    import threading
+    import time
+    from gateway import reply_latency_sink as sinks
+    waits = []
+    fake = SimpleNamespace(enqueue_lock=threading.Lock(), closed=threading.Event(),
+                           stop=lambda timeout: waits.append(timeout) or True)
+    monkeypatch.setattr(sinks, '_instances', [fake])
+    try:
+        assert sinks.shutdown_sinks(2.0, deadline=time.monotonic() - 1.0)
+    finally:
+        monkeypatch.undo()
+    assert fake.closed.is_set()
+    assert waits == [0.0]
+
+
 def test_sink_recovers_same_day_after_evidence_directory_disappears(tmp_path):
     from gateway.reply_latency_sink import ReplyLatencySink
     sink = ReplyLatencySink(tmp_path)
