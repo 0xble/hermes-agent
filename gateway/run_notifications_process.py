@@ -98,25 +98,6 @@ class GatewayProcessNotificationsMixin:
             return False
         return True
 
-    async def _process_completion_committed(self, completion_evt: dict, session_id: str) -> bool:
-        """Recheck a possibly lost admission ACK before falling back to a plain notice."""
-        from gateway.run_notifications import asyncio, logger
-
-        if (getattr(self, 'session_authority', None) is not None
-                and self._completion_delivery_identity(completion_evt) is not None):
-            from gateway.session_automation import completion_admission
-            try:
-                # The owning profile's authority, as on the delivery path.
-                async with self._completion_event_scope(completion_evt):
-                    committed = await asyncio.to_thread(completion_admission, self, completion_evt) is not None
-            except Exception:
-                # Failing open sends the notice; a dead watcher would send nothing.
-                logger.debug("Process watcher: admission recheck failed for %s", session_id,
-                             exc_info=True)
-                committed = False
-            return committed
-        return False
-
     async def _finish_process_text_notification(
         self, session_id: str, session, notify_mode: str, non_success: bool, watcher: dict, *, route: tuple,
     ) -> bool:

@@ -74,19 +74,7 @@ def recover_left_core_at_gateway_start() -> None:
         recover_left_core_in(root)
 
 
-def _own_policy_envs(platform) -> Optional[tuple]:
-    """Return the platform's declared authorization environment names, if any.
-
-    The registry lookup is intentionally resolved at call time so plugin-provided
-    authorization policy remains effective even when a platform is loaded lazily.
-    """
-    from gateway.platform_env import authz_field
-    from gateway.platform_registry import platform_registry
-    entry = platform_registry.get(platform.value)
-    own = authz_field(platform.value, "own_policy_env", entry)
-    if not own:
-        return None
-    return (*own, authz_field(platform.value, "allow_all_env", entry))
+from gateway.run_startup_secrets import _own_policy_envs as _own_policy_envs
 
 
 class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
@@ -1721,6 +1709,43 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                     platform, adapter, platform_config, queued=False
                 )
         return connected_count
+
+    def _transient_exits_exhausted(self) -> bool:
+        """Has the restartable escape hatch been used too many times in a row?
+
+        Exiting restartably is right for a backend that is briefly slow, and wrong for one
+        that is permanently gone: the generated systemd unit disables the generic start
+        limiter and leans on the fatal-config exit code as its only backstop, so an
+        unbounded restartable exit would loop every RestartSec forever with no parked
+        state for an operator to find. After a few consecutive tries, park instead.
+        """
+        path = self._transient_exit_streak_path()
+        try:
+            previous = int(path.read_text(encoding="utf-8-sig").strip() or 0)
+        except Exception:  # noqa: BLE001 — absent or unreadable means no streak yet
+            previous = 0
+        # Clamp: a negative or absurd value in the file (corruption, a stray write, a
+        # directory in the way) must not buy an unbounded number of restarts, which is
+        # precisely the loop this bound exists to stop.
+        streak = min(max(previous, 0), _TRANSIENT_EXIT_STREAK_LIMIT) + 1
+        try:
+            path.write_text(str(streak), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            # Unwritable means the streak can never advance, so the bound silently fails
+            # open. Say so once rather than looping forever with no explanation.
+            logger.warning(
+                "Cannot record the secret-failure restart streak at %s (%s) — the restart "
+                "bound cannot advance and this may loop until the backend recovers.",
+                path, exc,
+            )
+        if streak < _TRANSIENT_EXIT_STREAK_LIMIT:
+            return False
+        logger.error(
+            "Secret-source failures have blocked startup %d times in a row — treating this "
+            "as a real configuration fault so the service parks visibly instead of "
+            "restart-looping. Fix the secrets backend, then restart.", streak,
+        )
+        return True
 
     def _startup_fail_fatal_config(self, reason: str) -> None:
         """Record a fatal-config startup failure (exit 78) and request a clean exit."""
