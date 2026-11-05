@@ -89,7 +89,12 @@ def websocket(home, desc, **kw):
 @contextmanager
 def daemon(root, home, env, *, barrier, fixture='local_recovery_daemon.py'):
     command = [sys.executable, str(root / 'tests/gateway/fixtures' / fixture)] if barrier else [sys.executable, '-m', 'gateway.run']
-    with (home / ('first.log' if barrier else 'restart.log')).open('w+') as log:
+    # Not every daemon consumer builds its environment with child_env().
+    # Both entrypoints use the same bounded private socket-directory helper.
+    with short_socket_dir('hermes-gw-' + 'x' * 16 + '.sock') as runtime, (home / ('first.log' if barrier else 'restart.log')).open('w+') as log:
+        # Callers may launch a CLI viewer alongside this daemon with the same
+        # environment; keep its temporary writes inside the owned runtime too.
+        env.update(TMPDIR=str(runtime), XDG_RUNTIME_DIR=str(runtime))
         proc = subprocess.Popen(command, cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 120
