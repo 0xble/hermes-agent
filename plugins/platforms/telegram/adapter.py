@@ -483,13 +483,17 @@ def _escape_mdv2(text: str) -> str:
 
 def _strip_mdv2(text: str) -> str:
     """Strip MarkdownV2 escapes and formatting markers for the plain-text fallback."""
+    from gateway.copy_blocks import protect_inline_copy_bodies, restore_inline_copy_bodies
+    text, bodies = protect_inline_copy_bodies(text)
+    from .copy_quotes import protect_quote_fallback
+    text, quote_bodies = protect_quote_fallback(text)
     cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)  # escape backslashes
     cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)  # **bold** BEFORE MarkdownV2 *bold*
     cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
     cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)  # italic; word-bounded so snake_case survives
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
-    return cleaned
+    return restore_inline_copy_bodies(cleaned, {**bodies, **quote_bodies})
 
 
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
@@ -545,7 +549,9 @@ def _rich_is_prose_line(line: str) -> bool:
         stripped,
     ):
         return False
-    if re.match(r"^</?(?:details|summary)(?:\s|>|$)", stripped, re.IGNORECASE):
+    # A raw HTML quote ends only at a blank line; a visual spacer would keep
+    # subsequent Markdown inside that HTML block, even after </blockquote>.
+    if re.search(r"^</?(?:details|summary|blockquote)(?:\s|>|$)|</blockquote\s*>$", stripped, re.IGNORECASE):
         return False
     return not bool(re.fullmatch(r"(?:[-*_]\s*){3,}", stripped))
 
@@ -652,8 +658,11 @@ def _normalize_dollar_entities(text: str) -> str:
     HTML-escaped its dollars to dodge LaTeX still reaches the user as ``$``."""
     if "&#" not in text:
         return text
-    return _RICH_DOLLAR_ENTITY_RE.sub(
-        lambda match: "$" if match.group(0).startswith("&#") else match.group(0), text)
+    from gateway.copy_blocks import map_outside_copy_blocks
+    return map_outside_copy_blocks(
+        text, lambda outside: _RICH_DOLLAR_ENTITY_RE.sub(
+            lambda match: "$" if match.group(0).startswith("&#") else match.group(0), outside),
+        keep_markers=True)
 
 
 _RICH_CURRENCY_AMOUNT_RE = re.compile(r"(?<![\\`\w])\$\d+(?:,\d{3})*(?:\.\d+)?")
@@ -1829,9 +1838,11 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
     def _rich_content_ok(self, content: str) -> bool:
         """Shape checks shared by rich sends and rich drafts (non-blank, no Desktop crash/garble
         shapes, under the cap, async-capable bot)."""
+        from gateway.copy_blocks import protect_inline_copy_bodies
+        prose, _ = protect_inline_copy_bodies(content)
         return bool(
             content and content.strip()
-            and not self._has_telegram_desktop_details_math_crash_shape(content)
+            and not self._has_telegram_desktop_details_math_crash_shape(prose)
             and (
                 getattr(self, "_allow_cjk_rich_messages", False)
                 or not self._has_telegram_desktop_cjk_rich_garble_shape(content)
@@ -4867,7 +4878,12 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
             content = _normalize_dollar_entities((metadata or {}).get("rich_fallback_content", content))
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)
+            from .copy_quotes import truncate_copy_source
+            copy_chunks = truncate_copy_source(
+                content, self.MAX_MESSAGE_LENGTH, utf16_len, self.CHUNK_INDICATOR_OVERHEAD, close_chunks=True)
+            chunks = ([self.format_message(chunk) for chunk in copy_chunks] if copy_chunks is not None else
+                      self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH,
+                                            len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD))
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
                 chunks = [
@@ -5009,6 +5025,17 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         await _await_with_thread_deadline(
             self._bot.edit_message_text(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
 
+    async def _edit_preview(self, chat_id: str, message_id: str, content: str) -> None:
+        """Ordinary previews stay raw; literal copy context must be formatted on every tick."""
+        from gateway.copy_blocks import _has_copy_markers
+        if _has_copy_markers(content):
+            content = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
+            await self._edit_markdown_or_plain(
+                chat_id, message_id, self.format_message(content), _strip_mdv2(content),
+                "[%s] Copy preview MarkdownV2 rejected, using plain text: %s")
+        else:
+            await self._edit_text(chat_id, message_id, content)
+
     async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
         """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
         skip further work); the fallback edit's exceptions propagate."""
@@ -5115,7 +5142,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             self._last_overflow_preview.pop(_preview_key, None)
         try:
             if not finalize:
-                await self._edit_text(chat_id, message_id, content)
+                await self._edit_preview(chat_id, message_id, content)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
@@ -5200,7 +5227,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
         reply anchor once on 'reply message not found'. Returns the sent message, a flood refusal, or None."""
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-        for use_markdown in (True, False) if finalize else (False,):
+        from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
+        has_copy = _has_copy_markers(chunk)
+        for use_markdown in (True, False) if (finalize or has_copy) else (False,):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
                 return _flood_cap_result(cooldown)
@@ -5209,7 +5238,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
-                    text = _strip_mdv2(chunk) if finalize else chunk
+                    text = _strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk)
                 return await _await_with_thread_deadline(
                     self._bot.send_message(
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
@@ -5227,7 +5256,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     try:
                         return await _await_with_thread_deadline(
                             self._bot.send_message(
-                            chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else chunk,
+                            chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk),
                             **retry_thread_kwargs, **base),
                             timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
                     except Exception as _retry_err:
@@ -5258,7 +5287,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     chat_id, message_id, _separate_chunk_indicator_from_fence(self.format_message(first_chunk)), _strip_mdv2(first_chunk),
                     "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s")
             else:
-                await self._edit_text(chat_id, message_id, first_chunk)
+                from gateway.copy_blocks import _has_copy_markers
+                if _has_copy_markers(first_chunk):
+                    await self._edit_markdown_or_plain(
+                        chat_id, message_id, self.format_message(first_chunk), _strip_mdv2(first_chunk),
+                        "[%s] Copy overflow preview MarkdownV2 rejected, using plain text: %s")
+                else:
+                    await self._edit_text(chat_id, message_id, first_chunk)
         except Exception as e:
             if "not modified" not in str(e).lower():  # identical first chunk still sends continuations
                 wait = _telegram_retry_after(e)
@@ -5378,14 +5413,18 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             content) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)[0]
         # Same MarkdownV2 conversion as ``send`` (MarkdownV2 then plain) so the draft doesn't snap at the end. Exception: a Rich
         # final with rich drafts disabled previews raw — the legacy formatter would turn pipe tables into bullets.
+        from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
+        has_copy = _has_copy_markers(text)
+        if has_copy:
+            text = self.truncate_message(text, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
         plain_rich_preview = bool(
-            getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
+            not has_copy and getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
             and self._needs_rich_rendering(text))
         draft_thread_kwargs = self._thread_kwargs_for_draft(chat_id, metadata)
         for use_markdown in ((False,) if plain_rich_preview else (True, False)):
             kwargs: dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
-                "text": self.format_message(text) if use_markdown else text}
+                "text": self.format_message(text) if use_markdown else render_copy_blocks_inline(text)}
             if use_markdown:
                 kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
             kwargs.update(draft_thread_kwargs)
@@ -6558,15 +6597,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
-        return caption[:1024] if caption else None
+        from gateway.copy_blocks import render_copy_blocks_inline
+        return render_copy_blocks_inline(caption)[:1024] if caption else None
 
     async def _send_voice_bubble(self, audio_file, chat_id, reply_to, metadata, caption, duration_secs):
         """sendVoice with caption variants: MarkdownV2 when it fits 1024 chars, plain fallback when the
         Bot API rejects the entities; anything else is a real error."""
-        # Render caption markdown (#32029): auto-TTS captions carry the agent's markdown reply, which showed
-        # literal *asterisks* and [links](...) without a parse_mode. Format to MarkdownV2 when it fits the
-        # 1024-char caption cap; fall back to the raw text (previous behaviour) when formatting would
-        # overflow or the Bot API rejects the entities.
+        # Keep formatted quotes when they fit; plain fallbacks must render display markers BEFORE
+        # truncating, which could otherwise bisect a sentinel and leak internal control text.
         _caption_variants: list[tuple] = []
         if caption:
             try:
@@ -6575,7 +6613,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     _caption_variants.append((_formatted_caption, ParseMode.MARKDOWN_V2))
             except Exception:
                 logger.debug("[%s] voice caption MarkdownV2 formatting failed; sending plain caption", self.name, exc_info=True)
-            _caption_variants.append((caption[:1024], None))
+            _caption_variants.append((self._caption_1024(caption), None))
         else:
             _caption_variants.append((None, None))
         _last_parse_error: Optional[Exception] = None
@@ -7237,6 +7275,16 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         as markup or a link."""
         return _progress_code_span(text)
 
+    @staticmethod
+    def truncate_message(content: str, max_length: int = 4096,
+                         len_fn: Optional[Callable[[str], int]] = None, *,
+                         indicator_overhead: int = 0) -> list[str]:
+        from .copy_quotes import truncate_copy_source
+        chunks = truncate_copy_source(content, max_length, len_fn or len, indicator_overhead)
+        if chunks is not None:
+            return chunks
+        return BasePlatformAdapter.truncate_message(content, max_length, len_fn, indicator_overhead=indicator_overhead)
+
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Telegram MarkdownV2: code is stashed behind placeholders first (never
         modified), markdown constructs become MarkdownV2 syntax, everything else is escaped."""
@@ -7257,7 +7305,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
 
         # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
         #    before the normal MarkdownV2 conversions run.
-        text = _wrap_markdown_tables(content)
+        from .copy_quotes import protect_copy_quotes
+        text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
         # 1a) CommonMark multi-backtick inline code (``a `b` c``, as format_progress_literal emits). MarkdownV2
         # has only single-backtick code, so re-emit the content as one with ` and \ escaped. Runs before the
         # fenced pass; spans inside a real fence stay that fence's content. Lead-in prose remains outside
