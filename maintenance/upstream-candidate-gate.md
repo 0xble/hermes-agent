@@ -18,9 +18,12 @@ shards. Deleting `bin/ci` fails planning; it cannot select upstream mode. Missin
 history, wrong SHA, an unknown gate lineage, and absent upstream entrypoints also
 fail closed. The planner executes policy from the frozen base checkout, never
 the candidate or merge revision. For bases predating the policy file, the rollout
-uses the explicit `ee5a11da4b5bdd61058bba8c9eb4c19fc3fe9585` selector pin for
-fork-lineage heads only; upstream heads without staging policy fail. Candidate
-edits to the selector cannot change mode selection.
+uses the explicit `cc68f1760a07e6328a673ce2b69e7455b989bce6` selector pin for
+fork-lineage heads only; upstream heads without staging policy fail. Its blob
+`b71b33d9107e32c4c1b6349679ab204b4cd5f4b7` is byte-identical to the
+pre-rebase `ee5a11da` selector and accepts the three frozen arguments. The reachable
+rebased commit is required in clean hosted clones. Candidate edits to the selector
+cannot change mode selection.
 
 Each execution job checks out `pull_request.base.sha` separately, moves that
 harness outside the candidate tree, then checks out and asserts `head.sha`.
@@ -150,6 +153,10 @@ the baseline probe open with both refs until candidate admission finishes: its
 server-side PR association is part of the proof. Close both evidence PRs, delete **both**
 base/head refs for each, then read back closed PR states and absent remote refs.
 Never add harness files to the candidate, rewrite its SHA, or retarget its real PR.
+Never move a published probe base or reopen it after changing policy: GitHub can
+retain a stale workflow merge-ref SHA while its API PR association updates. The
+verifier refuses that mismatch. Use new unique probe PRs/refs for each frozen
+policy revision, and create the candidate probe after the baseline completes.
 
 ### Earlier f57e556e evidence
 
