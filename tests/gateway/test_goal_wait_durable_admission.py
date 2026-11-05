@@ -130,7 +130,7 @@ async def test_refusal_keeps_exact_wait_then_retry_admits_once(parked, monkeypat
     current = goals.load_goal(sid)
     assert current.waiting_since == 0
     assert current.last_automatic_continuation_at > 0
-    assert runner._get_replay_scheduler().gate.load() == 0
+    assert runner._get_replay_scheduler().gate.load() == 1
 
 
 @pytest.mark.asyncio
@@ -150,7 +150,19 @@ async def test_private_goal_receipt_is_idempotent_and_metadata_is_not_a_capabili
             identity=identity, _authorize_write=guard)
 
     first, replay = await asyncio.gather(admit(), admit())
+    assert first is not None and replay is not None
     assert first.admission_id == replay.admission_id
+    # A separately observed retry has a new wall-clock producer stamp, and may
+    # start from a compression successor; neither changes the durable identity.
+    child = sid + '-compressed'
+    authority.db.create_session(child, 'discord', parent_session_id=sid)
+    authority.db.end_session(sid, 'context_compressed')
+    runner.session_store.sync_session_id(key, child)
+    newer = captured_event(runner, source, child, manager)
+    newer.metadata['goal_continuation_created_at'] += 100
+    assert goal_wait_identity(authority, child, manager.state) == identity
+    replay_after_compression = await admit(newer)
+    assert replay_after_compression.admission_id == first.admission_id
     assert len(rows()) == 1
     restored = restore_native(rows()[0]['payload'], runner)
     assert restored.internal is False
@@ -240,7 +252,7 @@ async def test_cancelled_observer_does_not_split_commit_from_goal_ack(parked, mo
         release.set()
     await async_wait_until(lambda: len(rows()) == 1, timeout=20, what='cancelled observer commit')
     assert goals.load_goal(sid).waiting_since == 0
-    assert runner._get_replay_scheduler().gate.load() == 0
+    assert runner._get_replay_scheduler().gate.load() == 1
     await runner._goal_wakeup_fire_one(sid)
     assert len(rows()) == 1
 
@@ -279,7 +291,7 @@ async def test_duplicate_watchers_and_new_wait_generation_admit_once_each(parked
     old_identity = rows()[0]['request_id']
     fresh = goals.GoalManager(sid)
     fresh.wait_for_seconds(1, reason='second wait generation')
-    monkeypatch.setattr(goals.time, 'time', lambda: fresh.state.waiting_until + 1)
+    monkeypatch.setattr(goals.time, 'time', lambda: fresh.state.waiting_until + 600)
     monkeypatch.setattr('gateway.run_goal_wait.monotonic', lambda: 1e12)
     await asyncio.gather(*(runner._goal_wakeup_fire_one(sid) for _ in range(3)))
     assert len(rows()) == 2
