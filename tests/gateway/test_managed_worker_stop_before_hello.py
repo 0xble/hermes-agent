@@ -9,7 +9,7 @@ import psutil
 import pytest
 
 from gateway.session_contract import Principal, SessionRef
-from tests.waiting import async_wait_until
+from tests.waiting import async_wait_until, process_alive
 
 
 @pytest.mark.platforms("linux")
@@ -45,7 +45,7 @@ def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch)
     assert authority.pending_results['adm']['result']['interrupted'] is True
     assert ref.session_id not in authority._managed_workers
     child = spawned[0]
-    assert child.poll() is not None and not psutil.pid_exists(child.pid) or psutil.Process(child.pid).status() == psutil.STATUS_ZOMBIE
+    assert child.poll() is not None and not process_alive(child.pid)
 
 
 CHILD = """import json, os, sys, psutil

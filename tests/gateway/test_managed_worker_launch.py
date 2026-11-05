@@ -13,12 +13,7 @@ import time
 import pytest
 
 from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
-from tests.waiting import async_wait_until
-
-
-def process_alive(pid):
-    import psutil
-    return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+from tests.waiting import async_wait_until, process_alive
 
 
 @pytest.mark.parametrize('error_name', ['NoSuchProcess', 'ZombieProcess'])
@@ -112,7 +107,7 @@ def _model_saw_tool(request, name):
 # (through its own daemon), but pid_exists() on it is outside pytest's subtree for the live guard.
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize('worker_action', ['detach', 'kill', 'controls', 'stop', 'history', 'background', 'mcp'])
-def test_ordinary_owner_launches_tool_worker_and_detach_does_not_cancel(tmp_path, worker_action, monkeypatch):
+def test_ordinary_owner_launches_tool_worker_and_detach_does_not_cancel(tmp_path, worker_action):
     root = Path(__file__).resolve().parents[2]
     home, user = tmp_path / 'state', tmp_path / 'user'
     home.mkdir(mode=0o700)
@@ -268,22 +263,6 @@ def test_ordinary_owner_launches_tool_worker_and_detach_does_not_cancel(tmp_path
             assert not psutil.pid_exists(pid), 'worker interpreter still alive after settlement'
             # The next admission's worker adopts it from the profile checkpoint (process_manage).
             assert started['pid'] in [e['pid'] for e in json.loads((home / 'processes.json').read_text())]
-            # Deterministically reap between the existence check and status read (the hosted flake).
-            real_exists, real_status = psutil.pid_exists, psutil.Process.status
-            raced = []
-
-            def status_after_reap(process):
-                if process.pid == background.pid:
-                    raced.append(process.pid)
-                    raise psutil.NoSuchProcess(process.pid)
-                return real_status(process)
-
-            with monkeypatch.context() as race:
-                race.setattr(psutil, 'pid_exists', lambda target: target == background.pid or real_exists(target))
-                race.setattr(psutil.Process, 'status', status_after_reap)
-                await async_wait_until(lambda: not process_alive(background.pid),
-                                       timeout=10, interval=.05, what='background process exited')
-            assert raced == [background.pid]
             gate.touch()
             await async_wait_until(lambda: not process_alive(background.pid),
                                    timeout=10, interval=.05, what='background process exited')

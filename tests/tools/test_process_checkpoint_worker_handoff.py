@@ -13,6 +13,8 @@ import time
 import psutil
 import pytest
 
+from tests.waiting import process_alive
+
 
 @pytest.mark.platforms("linux", "macos")
 def test_owner_checkpoint_write_keeps_a_live_worker_handoff(tmp_path, monkeypatch):
@@ -49,4 +51,4 @@ def test_owner_checkpoint_write_keeps_a_live_worker_handoff(tmp_path, monkeypatc
         for proc in (worker_proc, owner_proc):
             proc.kill()
             proc.wait(timeout=10)
-    assert not psutil.pid_exists(worker_proc.pid) or psutil.Process(worker_proc.pid).status() == psutil.STATUS_ZOMBIE
+    assert not process_alive(worker_proc.pid)

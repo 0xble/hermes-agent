@@ -10,6 +10,8 @@ import sys
 
 import pytest
 
+from tests.waiting import process_alive, kill_if_alive
+
 from scripts.build.launchers import write_launchers
 
 
@@ -95,11 +97,10 @@ def test_verifier_stops_detached_descendants_before_cleanup(tmp_path):
     try:
         stop_child_tree(child)
         assert child.poll() is not None
-        assert not descendant.is_running() or descendant.status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(descendant)
     finally:
         if child.poll() is None:
             child.kill()
-        if descendant.is_running() and descendant.status() != psutil.STATUS_ZOMBIE:
-            descendant.kill()
+        kill_if_alive(descendant)
         child.wait(timeout=10)
         child.stdout.close()
