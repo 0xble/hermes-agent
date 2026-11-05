@@ -475,37 +475,53 @@ class GatewaySessionControlsMixin:
         return record
 
     async def _admit_control_continuation(self, record, session_controls, source, adapter, key, prompt):
+        from gateway.run_background_admission import BACKGROUND_RESERVATION_ATTR
         from gateway.run_goals import session_private
         from gateway.wake import WakeNotAccepted, WakeSuperseded, admit_internal_event
 
         if session_private(record["target_session_id"], key):
             return record  # held, like an unaccepted wake, until the target leaves incognito
 
-        event = self._synthetic_prompt_event(
-            source, prompt, reply_expected=False, goal_continuation=True,
-            goal_session_id=record["target_session_id"],
-            goal_fingerprint=record.get("continuation_fingerprint", ""),
-            goal_instance=record.get("continuation_instance"),
-        )
-        event.metadata["gateway_session_key"] = key
-        event.metadata["gateway_session_id"] = record["target_session_id"]
-        event.metadata["gateway_session_strict"] = True
-        event.metadata["session_control_continuation_id"] = record["id"]
-        try:
-            await admit_internal_event(adapter, event)
-        except WakeSuperseded:
-            await self._run_in_executor_with_context(session_controls.continuation_is_current, record["id"])
-            return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
-        except WakeNotAccepted:
-            logger.info("session-control continuation for %s not accepted; retrying", record["id"])
+        reservation = self._reserve_background_turn(key)
+        if reservation is None:
             return record
-        except Exception:
-            logger.warning("session-control continuation admission failed for %s", record["id"], exc_info=True)
-            return record
-        if not getattr(event, "_gateway_accepted", False):
-            logger.info("session-control continuation for %s was not accepted; retrying", record["id"])
-            return record
-        return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
+
+        async def settle():
+            event = None
+            try:
+                event = self._synthetic_prompt_event(
+                    source, prompt, reply_expected=False, goal_continuation=True,
+                    goal_session_id=record["target_session_id"],
+                    goal_fingerprint=record.get("continuation_fingerprint", ""),
+                    goal_instance=record.get("continuation_instance"),
+                )
+                setattr(event, BACKGROUND_RESERVATION_ATTR, reservation)
+                event.metadata["gateway_session_key"] = key
+                event.metadata["gateway_session_id"] = record["target_session_id"]
+                event.metadata["gateway_session_strict"] = True
+                event.metadata["session_control_continuation_id"] = record["id"]
+                try:
+                    await admit_internal_event(adapter, event)
+                except WakeSuperseded:
+                    await self._run_in_executor_with_context(session_controls.continuation_is_current, record["id"])
+                    return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
+                except WakeNotAccepted:
+                    logger.info("session-control continuation for %s not accepted; retrying", record["id"])
+                    return record
+                except Exception:
+                    logger.warning("session-control continuation admission failed for %s", record["id"], exc_info=True)
+                    return record
+                if not getattr(event, "_gateway_accepted", False):
+                    logger.info("session-control continuation for %s was not accepted; retrying", record["id"])
+                    return record
+                return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
+            finally:
+                if not getattr(event, "_gateway_accepted", False):
+                    self._release_background_turn(reservation)
+
+        # Own the validation awaits, adapter handoff and durable receipt as one admission.
+        # Cancellation must wait for physical work; a capacity reservation alone is not a fence.
+        return await self._get_replay_scheduler().gate.settle_admission(reservation, settle())
 
     @staticmethod
     def _approval_notice(authority: dict) -> tuple[str, str]:
