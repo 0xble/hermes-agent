@@ -169,6 +169,8 @@ def test_native_synthetic_recovery_classification(tmp_path, monkeypatch, case, e
     ('roundtrip-then-merge', False), ('unknown-producer', False),
     ('legacy', False), ('legacy-roundtrip', False), ('malformed-trail', False),
     ('automation-mixed', False), ('automation-principal-mixed', False),
+    ('automation-principal-unmixed', True), ('automation-principal-legacy', True),
+    ('automation-principal-attended', False), ('automation-principal-malformed', False),
 ])
 def test_absorbed_provenance_requires_positive_synthetic_proof(tmp_path, monkeypatch, case, expected):
     store, runner = _runner(tmp_path, monkeypatch, [])
@@ -183,7 +185,9 @@ def test_absorbed_provenance_requires_positive_synthetic_proof(tmp_path, monkeyp
         else:
             follower = _unstamped_mixed('system-note-human')
         pending = {'route': event}
-        if case not in ('legacy', 'legacy-roundtrip', 'malformed-trail'):
+        if case not in ('legacy', 'legacy-roundtrip', 'malformed-trail',
+                        'automation-principal-unmixed', 'automation-principal-legacy',
+                        'automation-principal-attended', 'automation-principal-malformed'):
             merge_pending_message_event(pending, 'route', follower, merge_text=True)
         payload = snapshot_native(runner, pending['route'])
         if case.startswith('legacy'):
@@ -192,8 +196,14 @@ def test_absorbed_provenance_requires_positive_synthetic_proof(tmp_path, monkeyp
             payload['native_text_v1']['absorbed_synthetic'] = None
         elif case.startswith('automation'):
             payload['native_text_v1']['automation'] = {}
-            if case == 'automation-principal-mixed':
+            if case.startswith('automation-principal'):
                 principal = 'automation:test'
+            if case == 'automation-principal-legacy':
+                payload['native_text_v1'].pop('absorbed_synthetic')
+            elif case == 'automation-principal-attended':
+                payload['native_text_v1']['attended_activity'] = {}
+            elif case == 'automation-principal-malformed':
+                payload['native_text_v1']['absorbed_synthetic'] = None
         if case in ('roundtrip-human', 'roundtrip-then-merge', 'legacy-roundtrip'):
             restored = restore_native(payload, runner)
             if case == 'roundtrip-then-merge':
@@ -202,7 +212,7 @@ def test_absorbed_provenance_requires_positive_synthetic_proof(tmp_path, monkeyp
                 restored = pending['route']
             payload = snapshot_native(runner, restored)
         assert is_unattended({'principal_id': principal, 'payload': payload}) is expected
-        if 'human' in case or case == 'roundtrip-then-merge' or case.startswith('automation'):
+        if 'human' in case or case == 'roundtrip-then-merge' or case in ('automation-mixed', 'automation-principal-mixed'):
             assert 'HUMAN' in payload['text']
     finally:
         store.close_all_db_handles()

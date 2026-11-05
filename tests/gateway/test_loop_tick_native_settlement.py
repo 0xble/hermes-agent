@@ -16,7 +16,7 @@ from tests.waiting import async_wait_until
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('reply', ['LOOP_COMPLETE', 'NO_REPLY', '[SILENT]', 'condition met'])
+@pytest.mark.parametrize('reply', ['LOOP_COMPLETE', 'NO_REPLY', '[SILENT]', 'condition met', None])
 async def test_stamped_loop_reply_settles_through_native_admission(tmp_path, monkeypatch, reply):
     from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -75,7 +75,35 @@ async def test_stamped_loop_reply_settles_through_native_admission(tmp_path, mon
         })
         manager.state.next_due_at = 0
         manager._save()
+        if reply is None:
+            # Lose a genuinely admitted scheduler wake before inference, not a hand-built row.
+            authority._schedule = lambda ref: None
         await runner._loop_wakeup_fire_one(owner, manager.state, 1e12, set())
+        if reply is None:
+            from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
+            from gateway.session_contract import SessionRef
+            from gateway.session_settlement_recovery import recover_failed_settlement
+            from hermes_state_runtime import claim_session_input
+
+            lost = claim_session_input(authority.db, epoch=authority.epoch, session_id=owner)
+            assert lost['principal_id'] == f'automation:{key}'
+            assert 'synthetic' in lost['payload']['native_text_v1']
+            authority.db.append_message(owner, 'user', lost['payload']['text'])
+            await recover_failed_settlement(authority, lost)
+            del authority._schedule
+            authority._schedule(SessionRef('default', owner))
+            await async_wait_until(
+                lambda: all(live.task is None or live.task.done() for live in authority.sessions.values()),
+                timeout=20, what='lost scheduler wake recovery',
+            )
+            settled = admissions()[-1]
+            assert (settled['status'], settled['outcome']) == ('terminal', 'interrupted')
+            notices = [m['content'] for m in authority.db.get_messages(owner)
+                       if m.get('display_kind') == 'failed_turn']
+            assert notices == [AUTOMATION_INTERRUPTED_NOTICE]
+            assert settled['payload']['native_text_v1']['absorbed_synthetic'] == []
+            assert len(turns) == 1, 'the lost automatic wake must never replay'
+            return
         await idle(2)
         state = loops.load_loop(owner)
         tick = (state.created_at, 1)
