@@ -54,9 +54,6 @@ def test_live_browser_schemas_and_bundled_guidance_allow_authorized_secret_entry
     assert not BANNED.search(text), "bundled computer-use forbids authorized secret entry"
     for value in ("may be typed", "1Password", "card number", "expiry", "CVC", "password", "code"):
         assert value in text, value
-
-
-def test_guidance_hints_evals_and_docs_do_not_restore_secret_entry_bans():
     paths = [
         *ROOT.glob("tools/browser*.py"),
         ROOT / "evals/prefix_rediet/worker.py",
