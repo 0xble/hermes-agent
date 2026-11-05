@@ -183,6 +183,14 @@ def test_image_only_turn_keeps_a_meaningful_description_not_path_advice(enrich):
     assert auto_recall_query(enrich("")) == DESCRIPTION.strip()
 
 
+@pytest.mark.parametrize("caption", ["[Brian]", "[Brian | Slack user <@U123>]", "[Check my records]"])
+def test_bracket_only_suffix_does_not_hide_image_description_or_discard_caption(enrich, caption):
+    prompt = enrich(caption)
+    assert auto_recall_query(prompt) == DESCRIPTION.strip() + "\n\n" + caption
+    assert human_prompt_text(prompt) == prompt
+    assert auto_recall_query(caption) == caption
+
+
 def test_multiple_images_do_not_swallow_the_caption(enrich):
     assert auto_recall_query(enrich(REQUEST, [PATH, "/cache/images/controls.jpg"])) == REQUEST
     assert auto_recall_query(enrich("", [PATH, "/cache/images/controls.jpg"])) == (

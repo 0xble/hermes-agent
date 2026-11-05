@@ -2170,7 +2170,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.debug("Failed to restore one-turn model override", exc_info=True)
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
-        """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
+        """Attribute the sender in shared multi-user sessions."""
         _is_shared_multi_user = is_shared_multi_user_session(
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
@@ -2185,9 +2185,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if source.platform == Platform.SLACK and source.user_id:
                 _safe_user_name = f"{_safe_user_name} | Slack user <@{source.user_id}>"
             message_text = f"[{_safe_user_name}] {message_text}"
-        # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
-        if getattr(event, "channel_context", None):
-            message_text = event.channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY + message_text
         return message_text
 
     @staticmethod
@@ -2452,6 +2449,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
+        # Keep current media after the recall boundary, not among discarded backfill.
+        # Sender attribution stays inside enrichment as before.
+        if channel_context := getattr(event, "channel_context", None):
+            message_text = channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY + message_text
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
         from gateway.session_context_refs import turn_references
