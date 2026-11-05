@@ -22,6 +22,8 @@ async def test_pause_reports_client_ownership_without_claiming_a_drain(
 
     home = get_hermes_home()
     home.chmod(0o700)
+    # The legacy facade captures its home at import; each case owns a fresh socket.
+    monkeypatch.setattr(run, "_hermes_home", home)
     restart = Mock(return_value=accepted)
     runner = SimpleNamespace(
         _client_owned=client_owned,
