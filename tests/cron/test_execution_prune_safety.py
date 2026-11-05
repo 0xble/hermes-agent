@@ -75,7 +75,7 @@ def test_terminal_writes_survive_broken_retention_config(ledger, monkeypatch, co
     assert finished == NOW.isoformat()
 
 
-@pytest.mark.parametrize("protection", ["latest", "journal", "queued"])
+@pytest.mark.parametrize("protection", ["journal", "queued", "pending", "delivering", "provisional"])
 def test_protected_backlog_bounds_prune_work(ledger, monkeypatch, protection):
     from cron.scheduler_authority import journal_path
 
@@ -88,9 +88,13 @@ def test_protected_backlog_bounds_prune_work(ledger, monkeypatch, protection):
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, status, claimed_at, finished_at, delivery_outcome)
                VALUES (?, ?, 'builtin', 'seed', 1, 'completed', ?, ?, ?)""",
-            ((f"old-{i:04}", f"job-{i}" if protection == "latest" else "audit", stamp, stamp,
+            ((f"old-{i:04}", "audit", stamp, stamp,
               "queued" if protection == "queued" else None) for i in range(2000)),
         )
+        if protection in ("pending", "delivering"):
+            conn.execute("UPDATE executions SET delivery_status=?", (protection,))
+        if protection == "provisional":
+            conn.execute("UPDATE executions SET delivery_status_provisional=1")
     if protection == "journal":
         for i in range(2000):
             journal = journal_path("audit", f"old-{i:04}")
@@ -117,3 +121,56 @@ def test_protected_backlog_bounds_prune_work(ledger, monkeypatch, protection):
     assert steps < 20_000, f"protected backlog consumed {steps} SQLite steps"
     with sqlite3.connect(home / "cron" / "executions.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 2001
+
+    # These obligations have no guaranteed expiry. If their owner settles them,
+    # later bounded batches must actually drain the now-eligible backlog.
+    monkeypatch.setattr(executions, "_connect", connect)
+    if protection == "journal":
+        for i in range(2000):
+            journal_path("audit", f"old-{i:04}").unlink()
+    else:
+        with executions._transaction() as conn:
+            conn.execute("UPDATE executions SET delivery_outcome=NULL, delivery_status=NULL, "
+                         "delivery_status_provisional=0")
+    monkeypatch.setattr(executions, "TERMINAL_PRUNE_BATCH_SIZE", 500)
+    for i in range(5):
+        monkeypatch.setattr(executions, "_hermes_now", lambda i=i: NOW + timedelta(seconds=i))
+        trigger = executions.create_execution("trigger", source="builtin")
+        assert executions.finish_execution(trigger["id"], success=True)
+    with sqlite3.connect(home / "cron" / "executions.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("policy, expired_count", [("age", 30), ("backstop", 30), ("backstop", 1)])
+def test_pruning_converges_past_permanent_latest_attempts(ledger, monkeypatch, policy, expired_count):
+    executions, home = ledger
+    monkeypatch.setattr(executions, "TERMINAL_PRUNE_BATCH_SIZE", 10)
+    # More permanent latest rows than even a default 500-row batch's page.
+    # Singletons include one-shot/removed jobs: no future attempt releases them.
+    singleton_count = 2001
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS",
+                        100_000 if policy == "age" else singleton_count + 1)
+    if policy == "backstop":
+        (home / "config.yaml").write_text("cron:\n  execution_retention_days: 0\n", encoding="utf-8")
+    oldest = (NOW - timedelta(days=30)).isoformat()
+    expired = (NOW - timedelta(days=20)).isoformat()
+    with executions._transaction() as conn:
+        conn.executemany(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at, finished_at)
+               VALUES (?, ?, 'builtin', 'seed', 1, 'completed', ?, ?)""",
+            [(f"singleton-{i:04}", f"once-{i}", oldest, oldest) for i in range(singleton_count)]
+            + [(f"expired-{i:04}", "recurring", expired, expired) for i in range(expired_count)],
+        )
+    # The recurring job's latest attempt is live, so all its terminal rows qualify.
+    current = executions.create_execution("recurring", source="builtin")
+    for i in range(4):
+        monkeypatch.setattr(executions, "_hermes_now", lambda i=i: NOW + timedelta(seconds=i))
+        trigger = executions.create_execution("trigger", source="builtin")
+        assert executions.finish_execution(trigger["id"], success=True)
+    with sqlite3.connect(home / "cron" / "executions.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM executions WHERE id LIKE 'expired-%'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM executions WHERE id LIKE 'singleton-%'").fetchone()[0] == singleton_count
+        if policy == "backstop":
+            assert conn.execute("SELECT COUNT(*) FROM executions WHERE status='completed'").fetchone()[0] == singleton_count + 1
+    assert executions.get_execution(current["id"])["status"] == "claimed"

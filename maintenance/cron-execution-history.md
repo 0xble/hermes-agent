@@ -36,17 +36,22 @@ are eligible. Incidents retain their own error and output-file evidence in
 
 Keep cleanup in the shared terminal-transition path. Each call deletes at most
 500 rows across age expiration and ceiling trimming combined, oldest first.
-Each policy examines at most four times its deletion budget (2,000 candidates
-per pass, at most 4,000 per terminal transition), before latest-attempt,
-delivery, or journal eligibility checks. Protected rows consume that scan budget;
-an entirely protected oldest page may defer cleanup of eligible newer rows until
-those protections settle. This intentionally favors bounded terminal-write work
-over immediate ceiling convergence. An existing backlog converges over later
-terminal writes when the scanned page contains eligible rows, instead of requiring
-one large write transaction. The partial numeric-time index serves expiration,
-ordering, and bounded counting. A numeric per-job claim index serves the latest
-attempt exclusion without repeatedly sorting each job's history. Eligibility
-also checks delivery state and journal presence. Compute the cutoff in UTC before subtracting the duration,
+SQL excludes each job's latest attempt before applying the candidate limit.
+Latest attempts of one-shot or removed jobs may remain protected forever, but
+cannot fill the candidate page and prevent cleanup of other jobs' history.
+The partial numeric-time index serves expiration, ordering, and bounded counting;
+the numeric per-job claim index serves latest-attempt exclusion without repeatedly
+sorting each job's history. Finding candidates may scan past any number of latest
+attempts; the limit bounds the remaining eligibility checks, not all SQLite work.
+
+Each policy checks at most four times its deletion budget for delivery state,
+current-transition IDs, and journal presence (2,000 candidates per pass, at most
+4,000 per terminal transition). These protections consume that bounded page and
+have no guaranteed expiry: failed delivery/recovery may leave them indefinitely.
+An entirely protected oldest page can therefore defer cleanup of eligible newer
+rows indefinitely. This intentionally bounds non-SQL work rather than promising
+unconditional ceiling convergence. Once the scanned page contains eligible rows,
+later terminal writes drain the backlog in bounded batches. Compute the cutoff in UTC before subtracting the duration,
 and compare parsed instants so offset changes and DST do not move the window.
 The index is additive, preserving named-column reads/writes by older releases.
 
@@ -97,8 +102,10 @@ Contract tests: `tests/cron/test_execution_retention.py`,
 
 `tests/cron/test_execution_prune_safety.py` covers terminal durability under
 oversized retention, unknown model presets, and non-mapping cron config through
-all six terminal writers. Its protected-backlog cases bound SQLite VM work,
-including rows rejected by SQL eligibility (not just filesystem checks).
+all six terminal writers. Its protected-backlog cases bound SQLite VM work for
+delivery/journal pages and prove convergence after those protections release.
+Permanent singleton/latest backlogs cannot starve age or ceiling cleanup,
+including when the ceiling excess is only one row.
 
 `tests/cron/test_execution_retention.py` owns the time-window and bounded-cleanup
 invariants, including mixed offsets, DST, the cutoff boundary, missing finish
