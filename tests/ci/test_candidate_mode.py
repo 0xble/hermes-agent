@@ -188,3 +188,12 @@ def test_staging_cannot_leave_upstream_workflows_active(graph):
     # Correct merge-base and allowed changed paths alone are insufficient.
     with pytest.raises(ValueError, match="only the two free"):
         mode.check_staging(root, candidate, upstream, staging)
+
+
+def test_prepare_refuses_candidate_workflow_activation_before_publication(graph):
+    root, git, commit, upstream, _ = graph
+    git("reset", "--hard", upstream)
+    candidate = commit("candidate", {".github/workflows/new.yml": "paid workflow\n"})
+    policy = overlay(git, commit, upstream)
+    with pytest.raises(ValueError, match="do not publish"):
+        mode.prepare_staging(root, candidate, upstream, policy)

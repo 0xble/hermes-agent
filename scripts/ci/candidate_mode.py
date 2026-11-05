@@ -50,6 +50,12 @@ def prepare_staging(root: Path, head: str, upstream: str, policy: str) -> str:
     staging = git(root, "commit-tree", tree, "-p", anchor, "-m",
                   "ci: temporary policy-only qualification base\n\nFork-Patch: evidence")
     check_staging(root, head, base, staging)
+    # Check before publishing: GitHub can activate workflows as soon as a PR
+    # opens. Candidate workflow edits must not re-enable a paid upstream lane.
+    merged = git(root, "merge-tree", "--write-tree", staging, head)
+    merged_workflows = git(root, "ls-tree", "-r", merged, ".github/workflows")
+    if merged_workflows != git(root, "ls-tree", "-r", staging, ".github/workflows"):
+        raise ValueError("Candidate merge changes policy workflows; do not publish this probe")
     return staging
 
 

@@ -90,6 +90,9 @@ files from the frozen policy commit:
 All other upstream workflow files are **deleted in the staging overlay only**
 to prevent accidentally activating paid Blacksmith runners. The exact candidate
 checkout retains its original workflows and candidate-owned entrypoints.
+Before returning a staging SHA for publication, the helper computes the merge
+tree and refuses conflicts or any change to its workflow tree: a candidate may
+not re-add upstream workflows or replace policy workflow bytes on the merge ref.
 
 Before selecting upstream mode, the planner refuses unless the staging/head
 merge-base equals `B` (candidate) or `B^1` (baseline), the staging base descends
