@@ -48,7 +48,9 @@ def _cwd_marker_printf(marker: str) -> str:
     # Stream pwd instead of parsing $(pwd -P) after user eval. The parser
     # strips pwd's newline with the marker; a subshell still isolates any
     # user-defined pwd function, whose status must not replace the user's.
-    return f"printf '\\n{marker}'; ( pwd -P ) || true; printf '{marker}\\n'"
+    # Suppress diagnostics inside the marker: remote backends merge stderr
+    # into stdout, and pwd fails when a command removes its own directory.
+    return f"printf '\\n{marker}'; ( pwd -P ) 2>/dev/null || true; printf '{marker}\\n'"
 
 
 def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
@@ -217,7 +219,11 @@ def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None
     first = output.rfind(marker, search_start, last)
     if first == -1 or first == last:
         return None
-    cwd_path = output[first + len(marker) : last].strip() or None
+    # pwd emits one trailing newline. Remove only that delimiter, not
+    # arbitrary whitespace that could hide diagnostics or a multiline body.
+    cwd_path = output[first + len(marker) : last].removesuffix("\n")
+    if not cwd_path.startswith("/") or "\n" in cwd_path or "\r" in cwd_path:
+        cwd_path = None
     line_start = output.rfind("\n", 0, first)
     if line_start == -1:
         line_start = first

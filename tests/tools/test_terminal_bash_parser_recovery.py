@@ -1,5 +1,6 @@
 """Real-bash regressions for parser recovery and the session wrapper epilogue."""
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -33,7 +34,10 @@ def _run(script):
     if bash is None:
         pytest.skip("bash is required")
     return subprocess.run(
-        [bash, "--noprofile", "--norc", "-c", script],
+        # Resolve the binary but keep argv[0] short: its allocation, like
+        # the marker and cwd, can mask the affected Bash parser size class.
+        ["bash", "--noprofile", "--norc", "-c", script], executable=bash,
+        cwd="/", env={"PATH": os.defpath},
         capture_output=True, text=True, timeout=10, check=False,
     )
 
@@ -42,20 +46,46 @@ def _run(script):
 def test_unclosed_command_substitution_preserves_status_cwd_and_snapshot(tmp_path, snapshot_ready, persist_env):
     snapshot = tmp_path / "snapshot"
     snapshot.write_text("export RECOVERY_STATE=retained\n", encoding="utf-8")
+    # A short physical cwd, like the short marker, keeps Bash 5.2.15's
+    # allocation in the size class that exposes the parser heap corruption.
     result = _run(_script(
-        "echo $(echo unclosed", tmp_path, snapshot,
+        "echo $(echo unclosed", "/", snapshot,
         snapshot_ready=snapshot_ready, persist_env=persist_env,
     ))
-    assert result.returncode == 2, result
+    # Bash 3.2 returns 1 for this eval syntax error; modern Bash returns 2.
+    # Neither may crash (a direct signal or the shell's 128+signal status).
+    assert result.returncode > 0, result
+    assert result.returncode not in (133, 134), result
+    version = _run("printf '%s' \"${BASH_VERSINFO[0]}\"")
+    assert version.returncode == 0, version
+    if int(version.stdout) >= 4:
+        assert result.returncode == 2, result
     assert "unexpected EOF" in result.stderr
-    assert "free():" not in result.stderr
+    assert "free():" not in result.stdout + result.stderr
+    assert "malloc" not in (result.stdout + result.stderr).lower()
     assert "Aborted" not in result.stderr
-    assert _split_cwd_marker(result.stdout, MARKER) == (str(tmp_path.resolve()), "")
+    assert _split_cwd_marker(result.stdout, MARKER) == ("/", "")
     if snapshot_ready:
         replay = _run(f"source {shlex.quote(str(snapshot))}; printf '%s' \"$RECOVERY_STATE\"")
         assert replay.returncode == 0, replay
         assert replay.stdout == "retained"
     assert not list(tmp_path.glob("snapshot.tmp.*"))
+
+
+@pytest.mark.parametrize(
+    "body", ["", "relative/path", "pwd: error retrieving current directory", "/valid\nnot-a-path", "/valid\n\n", "/valid\rdiagnostic"],
+)
+def test_cwd_parser_rejects_non_path_marker_bodies(body):
+    assert _split_cwd_marker(f"before\n{MARKER}{body}{MARKER}\nafter\n", MARKER) == (
+        None, "beforeafter\n",
+    )
+
+
+@pytest.mark.parametrize("body", ["/physical directory ", "/physical directory \n"])
+def test_cwd_parser_preserves_path_spaces_and_strips_one_pwd_newline(body):
+    assert _split_cwd_marker(f"{MARKER}{body}{MARKER}\n", MARKER) == (
+        "/physical directory ", "",
+    )
 
 
 def test_pwd_function_cannot_exit_or_change_the_wrapper_shell(tmp_path):
