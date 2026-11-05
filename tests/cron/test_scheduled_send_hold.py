@@ -86,7 +86,8 @@ def test_send_freshness_requires_an_existing_script(store, tmp_path):
 
 
 def test_stale_freshness_holds_the_payload_and_does_not_autofire(store, monkeypatch):
-    script = store / "check.py"
+    script = store / "scripts/check.py"
+    script.parent.mkdir()
     script.write_text("print('ok')\n")
     run_at = (NOW - timedelta(seconds=30)).isoformat()
     job = {
@@ -114,7 +115,8 @@ def test_stale_freshness_holds_the_payload_and_does_not_autofire(store, monkeypa
 
 
 def test_send_now_still_rereads_the_target(store, monkeypatch):
-    script = store / "check.py"
+    script = store / "scripts/check.py"
+    script.parent.mkdir()
     script.write_text("print('ok')\n")
     run_at = NOW.isoformat()
     job = {
@@ -161,7 +163,10 @@ def test_create_rejects_malformed_declared_checksum(store, digest):
 
 
 @pytest.mark.parametrize("stdout", ["{}", '{"stale": false}', '{"stale": false, "checked": false}'])
-def test_freshness_subprocess_cannot_fail_open(stdout, monkeypatch):
+def test_freshness_subprocess_cannot_fail_open(store, stdout, monkeypatch):
+    script = store / "scripts/check.py"
+    script.parent.mkdir()
+    script.write_text("pass\n")
     from types import SimpleNamespace
     from cron.scheduled_send import run_freshness_script
     monkeypatch.setattr("cron.scheduled_send.subprocess.run", lambda *a, **k: SimpleNamespace(
@@ -170,7 +175,10 @@ def test_freshness_subprocess_cannot_fail_open(stdout, monkeypatch):
 
 
 @pytest.mark.parametrize("sender", [None, "fixture-sender"])
-def test_freshness_reader_preserves_optional_sender_contract(sender, monkeypatch):
+def test_freshness_reader_preserves_optional_sender_contract(store, sender, monkeypatch):
+    script = store / "scripts/check.py"
+    script.parent.mkdir()
+    script.write_text("pass\n")
     import json
     from types import SimpleNamespace
     from cron.scheduled_send import run_freshness_script
@@ -252,7 +260,8 @@ def test_rearm_cannot_reactivate_a_legacy_bad_checksum(store):
 @pytest.mark.parametrize("changes", [{"channel": "unsupported"}, {"account": ""},
     {"conversation": "not-a-slack-id"}, {"recipient": {}}, {"recipient": "name"}])
 def test_freshness_invalid_target_is_rejected_before_saving(store, changes):
-    script = store / "check.py"
+    script = store / "scripts/check.py"
+    script.parent.mkdir()
     script.write_text("print('ok')")
     spec = {"channel": "slack", "account": "lpg", "conversation": "C1", "recipient": "U1",
             "script": str(script), "approved_at": NOW.isoformat(), **changes}
@@ -269,7 +278,8 @@ def test_freshness_invalid_target_is_rejected_before_saving(store, changes):
 ])
 def test_non_slack_sends_need_no_invented_shared_slack_binding(store, tmp_path,
                                                                channel, conversation, recipient, extra):
-    reader = tmp_path / "reader.py"
+    reader = tmp_path / "scripts/reader.py"
+    reader.parent.mkdir()
     reader.write_text("pass\n")
     spec = {"channel": channel, "conversation": conversation, "recipient": recipient,
             "approved_at": NOW.isoformat(), "script": str(reader), **extra}
@@ -278,7 +288,8 @@ def test_non_slack_sends_need_no_invented_shared_slack_binding(store, tmp_path,
 
 
 def test_declared_but_incomplete_shared_activity_context_is_rejected(store, tmp_path):
-    reader = tmp_path / "reader.py"
+    reader = tmp_path / "scripts/reader.py"
+    reader.parent.mkdir()
     reader.write_text("pass\n")
     with pytest.raises(ValueError, match="activity_context"):
         jobs.create_job(prompt="approved reply", schedule="in 10m", send_freshness={

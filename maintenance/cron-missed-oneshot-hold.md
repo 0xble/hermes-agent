@@ -41,6 +41,47 @@ Do not duplicate account APIs or an exhaustive people-activity service in core.
 Unsupported providers and unavailable scoped signals must be reported explicitly,
 not represented as verified quiet.
 
+## Freshness checker process and path ownership
+
+Freshness checkers reuse the native fire secret scope and profile terminal policy
+before building their child environment with `build_subprocess_env` and
+`strip_launch_profile=True`. This applies before detached-worker handoff too;
+never inherit a multiplex launch profile's raw environment. Restore both scopes
+when building the environment finishes.
+
+`send_freshness.script` uses the ordinary `HERMES_HOME/scripts` confinement owner.
+The only compatibility exception is the installed `communications` skill's exact
+`scripts/send_freshness.py`, resolved through `get_skill_search_roots` and
+`locate_skill` with project discovery excluded. This preserves the deployed
+skill-directory symlink and configured installed roots without allowing arbitrary
+external Python, other resources, project-local overrides, traversal, or resource
+symlink escape. Apply `check_gateway_lifecycle` to both kinds at declaration and
+immediately before execution. Missing, changed or unscannable checkers hold with
+`checked=false`, never a fresh verdict. This is the existing heuristic script
+contract, not an OS sandbox or a claim of atomic protection against a concurrent
+filesystem writer.
+
+The P1 regression suite exercises a real synthetic A→B→A child with fake sentinel
+credentials, declaration/create/update rejection, mutation at fire, unavailable
+readers and dispatch suppression. Existing checker fixtures live under the same
+scripts owner; their delivery/payload assertions remain unchanged.
+
+Guidance reconciliation: pinned upstream `93ce7e34573aa942b6c44cfc17983a93dcd9d637`
+AGENTS/contribution/cron guidance favors profile-island tests and existing owners.
+Source prior art is `scheduler_script`, `_fire_secret_scope`, `terminal_scope`,
+`skill_utils` and `skills_tool`, not another registry or scheduler. Open upstream
+#94655 reinforces lifecycle scanning on update; it is related guidance, not a
+replacement for this fork-only freshness boundary. Credential/path hardening is
+within SECURITY.md's in-process heuristic posture, not a new isolation boundary.
+Detailed local RED/GREEN receipts and source/prior-art notes live in the source
+candidate handoff; hosted and loaded-runtime acceptance remain separate.
+
+Out-of-scope review follow-ups remain recorded, not repaired here: recovery
+jobs-lock across delivery (`scheduler_authority.py`), whole-claim comparison
+(`jobs.py`), duplicate freshness check (`scheduler.py`) and recovery logging
+(`scheduler_authority.py`). Preserve every existing failure-lane, per-leaf,
+authenticated-reader, loaded-canary and live-guard activation condition.
+
 ## Ticker recovery
 
 Admission-journal recovery can wait 20 seconds per remote receipt. It must not

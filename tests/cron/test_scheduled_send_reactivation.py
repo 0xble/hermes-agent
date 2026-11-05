@@ -105,7 +105,8 @@ def test_explicit_malformed_digests_cannot_persist_or_reactivate(store, field, v
 
 def test_checker_exception_holds_before_dispatch_and_records_terminal_evidence(store, monkeypatch):
     root, _clock = store
-    script = root / "reader.py"
+    script = root / "scripts/reader.py"
+    script.parent.mkdir()
     script.write_text("pass\n")
     job = jobs.create_job(prompt="approved body", schedule="in 1m",
                           origin={"platform": "telegram", "chat_id": "owner", "thread_id": "topic"},

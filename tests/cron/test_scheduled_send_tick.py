@@ -37,7 +37,7 @@ def test_full_tick_checks_before_local_payload(tmp_path, monkeypatch, stale):
     monkeypatch.setattr(scheduler.immutable_releases, 'LOADED_RELEASE_ROOT', None)
     monkeypatch.setattr(scheduler, '_running_job_ids', set())
     checked = home / 'checked.json'
-    checker = home / 'synthetic_reader.py'
+    checker = home / 'scripts/synthetic_reader.py'
     checker.write_text(
         'import json, pathlib, sys\n'
         'request = json.load(sys.stdin)\n'
