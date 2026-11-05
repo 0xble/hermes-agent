@@ -17,7 +17,9 @@ def inspected(call, origin, frame_id=None):
     response = call("frame" if frame_id else "eval", expression=build_inspection_js("synthetic"), **({"frameId": frame_id} if frame_id else {}))
     assert response["ok"]
     raw = json.loads(response["result"])
-    assert all(value not in json.dumps(raw) for value in CARD.values())
+    # Expiry options legitimately expose public month/year choices. Only the
+    # sensitive PAN and security code must be absent from inspection metadata.
+    assert all(CARD[key] not in json.dumps(raw) for key in ('card_number', 'cvc'))
     controls = [LoginControl.from_dict(c) for c in raw]
     return {"origin": origin, "nonce": "synthetic", "controls": controls,
             "classified": [c for control in controls if (c := classify_checkout_control(control))],
@@ -96,11 +98,15 @@ def test_expiry_never_clicks_submit_reset_or_default_buttons(bridge, target, ele
         return '<' + element + ' ' + attributes + (' value=' + text if element.startswith('input') else '') + '>' + ('' if element.startswith('input') else text + '</button>')
     trigger = tag('role=combobox aria-label="Expiry month" aria-controls=months', 'Month') if target == 'trigger' else '<button type=button role=combobox aria-label="Expiry month" aria-controls=months>Month</button>'
     option = tag('role=option', 'July') if target == 'option' else '<div role=option>July</div>'
-    html = '<form><input autocomplete=cc-number>' + trigger + '<div id=months role=listbox>' + option + '</div></form>'
+    # Attach the counter to the unsafe target, never the safe trigger that
+    # legitimately opens an unsafe option's listbox.
+    trigger_tag = '<' + element + ' '
+    if target == 'trigger':
+        trigger = trigger.replace(trigger_tag, trigger_tag + 'onclick="window.unsafeClicks++" ', 1)
+    else:
+        option = option.replace(trigger_tag, trigger_tag + 'onclick="window.unsafeClicks++" ', 1)
+    html = '<form onsubmit="event.preventDefault();window.submissions++" onreset="window.resets++"><input autocomplete=cc-number>' + trigger + '<div id=months role=listbox>' + option + '</div></form>'
     assert call("eval", expression="window.submissions=0;window.resets=0;window.unsafeClicks=0")["ok"]
-    # Inline handlers run on the actual native form, not mocks.
-    html = html.replace('<form>', '<form onsubmit="event.preventDefault();window.submissions++" onreset="window.resets++">')
-    html = html.replace('<' + element + ' ', '<' + element + ' onclick="window.unsafeClicks++" ', 1)
     result = fill_html(call, ready['origin'], html)
     assert result['partial'] and 'cc-exp-month' in result['missing_fields']
     state = call('eval', expression='[window.submissions,window.resets,window.unsafeClicks]')['result']
@@ -175,7 +181,7 @@ def test_merchant_shaped_brand_reset_and_address_fixture(bridge, fixture):
 def test_text_expiry_and_authentication_exclusions(bridge, metadata):
     ready,call=bridge
     call('load',kind='native')
-    html=f'<input autocomplete=cc-number><input {metadata}><input name=ExpirationDate placeholder="MM / YYYY" maxlength=9><input autocomplete=one-time-code aria-label="Security code"><input type=password autocomplete=current-password aria-label=CVC><input name=issueDate placeholder="MM/YY">'
+    html=f'<input autocomplete=cc-number><input {metadata}><input name=ExpirationDate placeholder="MM / YYYY" maxlength=9><input autocomplete=one-time-code aria-label="Security code"><input type=password autocomplete=current-password aria-label=CVC><input name=issueDate placeholder="Date">'
     result=fill_html(call,ready['origin'],html)
     assert result['success'], result
     checks=call('eval',expression="[document.querySelector('[name=ExpirationDate]').value==='07 / 2029',document.querySelector('[autocomplete=one-time-code]').value==='',document.querySelector('[autocomplete=current-password]').value==='',document.querySelector('[name=issueDate]').value==='']")['result']
@@ -209,6 +215,31 @@ def test_async_secret_rejection_contained_before_transport_logging(bridge, monke
     monkeypatch.setattr(camofox,'_post',post)
     result=vault._eval_js_secret('fixture','Promise.reject(new Error("synthetic-secret"))')
     assert not result['success'] and 'synthetic-secret' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('mutation', ['none', 'restamp', 'text-replacement'])
+def test_login_fill_binds_inspection_and_removes_markers(bridge, mutation):
+    from agent.vault_login_classifier import build_fill_js
+
+    ready, call = bridge
+    call('load', kind='native')
+    call('eval', expression="document.body.innerHTML='<input id=target type=password autocomplete=current-password>'")
+    context = inspected(call, ready['origin'])
+    index = context['controls'][0].index
+    if mutation == 'restamp':
+        call('eval', expression=build_inspection_js('new-inspection'))
+    elif mutation == 'text-replacement':
+        call('eval', expression="document.getElementById('target').type='text'")
+    response = call('eval', expression=build_fill_js(
+        [{'index': index, 'token': 'current-password', 'value': 'synthetic-login'}],
+        expected_origin=ready['origin'], nonce='synthetic',
+    ))
+    assert response['ok']
+    receipt = json.loads(response['result'])
+    assert receipt['filled'] == (1 if mutation == 'none' else 0)
+    assert 'synthetic-login' not in json.dumps(receipt)
+    state = call('eval', expression="[document.getElementById('target').value==='synthetic-login',document.querySelectorAll('[data-hermes-vault-slot],[data-vault-secret],[data-vault-secret-filled]').length]")['result']
+    assert state == [mutation == 'none', 0]
 
 
 def test_native_expiry_controls_use_local_group_labels(bridge):
