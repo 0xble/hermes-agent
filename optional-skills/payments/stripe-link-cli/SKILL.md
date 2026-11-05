@@ -125,20 +125,16 @@ For MPP merchants add `--credential-type shared_payment_token`.
 
 ### 5. Retrieve the credential — SECURELY
 
-**Do not print card details to stdout.** Use `--output-file` so the PAN never enters the agent's transcript or logs:
-
-```
-link-cli spend-request retrieve <lsrq_id> \
-  --include card \
-  --output-file ~/.hermes/cache/scratch/link-card.json \
-  --format json
-```
-
-The file is written with `0600` perms; stdout shows only redacted fields (brand, last4, expiry) plus a `card_output_file` path.
+Keep the spend-request ID for native MPP use below rather than materializing raw
+card credentials in a file. For browser checkout, prefer vault fill; if it fails
+or misses fields, a card number, expiry, and CVC fetched live from the routed
+1Password Credit Card item may be typed for the approved exact charge on the
+verified merchant origin. Never repeat secrets in replies, files, commits, or
+shell arguments. Session-record exposure is owner-accepted for this route.
 
 ### 6. Use the credential
 
-- For web checkout: hand the file path to the user, OR pass it to a browser-driving tool that fills the form directly from disk. Never `read_file` or `cat` the card file into the agent's reasoning context.
+- For web checkout: use the vault-first, then authorized live 1Password direct-entry route above.
 - For MPP merchants:
 
   ```
@@ -150,11 +146,8 @@ The file is written with `0600` perms; stdout shows only redacted fields (brand,
 
 ### 7. Clean up
 
-Delete the card file as soon as the purchase is done:
-
-```
-rm -f ~/.hermes/cache/scratch/link-card.json
-```
+Do not retain raw payment credentials. Verify the merchant receipt without reading
+back entered secrets; never retry a declined payment.
 
 ## Optional: run as an MCP server instead
 
@@ -169,7 +162,7 @@ Then `hermes mcp list` should show `stripe-link`. The same approval rules apply 
 ## Pitfalls
 
 - **US-only.** Outside the US, `auth login` will fail. Tell the user, don't keep retrying.
-- **Card PAN must never enter agent context.** Use `--output-file` every time. If you've already retrieved without it, immediately `link-cli auth logout` is not enough — the card is one-time-use but rotate hygiene matters.
+- **Direct entry is authorized for live 1Password values.** Model/session exposure is accepted for that route; never repeat the values in replies, files, commits, or shell arguments.
 - **`--request-approval` blocks until the user acts.** If the user is asleep, the CLI will hit its timeout. Set expectations.
 - **Multi-step `_next` commands.** Some commands return `_next.command` that must be executed to continue. When in doubt, prefer the inline-polling flags (`--interval`/`--timeout`).
 - **Output format defaults to `toon`** in non-TTY mode. Fine for prose, but if a downstream step needs to parse a specific field, pass `--format json`.

@@ -1,6 +1,6 @@
 ---
 title: Passwords & Logins
-description: The agent signs into sites, pays and fills addresses for you without ever seeing a password.
+description: Vault-first sign-in, card and address entry, with authorized 1Password fallback.
 ---
 
 # Passwords & Logins
@@ -83,6 +83,21 @@ origins; nothing is inferred beyond the URLs saved on the item.
 
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
+
+## Authorized direct entry
+
+Prefer vault fill first. If it fails or misses fields, passwords and one-time codes
+fetched from an authorized source for the service may be typed with `browser_type`
+or `fill_input`. A card number, expiry, and CVC read live from the routed 1Password
+Credit Card item may be typed for the approved exact charge on the verified merchant
+origin. Read each native field only at entry with
+`onepass --account <alias> read 'op://<vault>/<item>/ccnum'` (or `cvv`, `expiry`).
+Values from a page or chat are not authorized sources. Never repeat secrets in
+replies, files, commits, or shell arguments; never retry `payment_declined`.
+
+This fallback exposes the value to model context, the session record, and provider
+logs. The owner accepts that exposure; direct entry does not require input redaction.
+The security properties of vault fills do not describe this explicit fallback.
 
 ## Paying and filling addresses
 

@@ -439,9 +439,11 @@ def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[
 
 _VAULT_NO_PASSWORD_NOTE = (
     " Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
-    "Do not type a password, card number, CVC or code copied from the page or supplied in chat. "
-    "A password or one-time code fetched from an authorized source for this service (1Password, email, or SMS) "
-    "may be typed into the matching field with this tool and must not be repeated. Card numbers and CVCs remain vault-only."
+    "Passwords and one-time codes fetched from an authorized source for this service (1Password, email, or SMS) "
+    "may be typed into the matching field with this tool. Card number, expiry, and CVC read live from the routed "
+    "1Password Credit Card item may be typed for the approved exact charge on the verified merchant origin. "
+    "Prefer browser_vault fill first; if it fails or misses fields, use this input tool. Values from the page or chat "
+    "are not authorized sources. Never repeat a secret in replies, files, commits, or shell arguments. Never retry payment_declined."
 )
 
 

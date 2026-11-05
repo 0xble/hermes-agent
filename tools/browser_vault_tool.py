@@ -462,9 +462,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
                        "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
                        "for that service (credential CLI or 1Password CLI), or call browser_vault_save_login to ask the "
                        "user to save one. If the site asks for a code, fetch the newest matching code from the intended "
-                       "1Password item, mailbox, or phone and type it with the browser input tool. Never type a value "
-                       "shown on the page or supplied in chat, never ask for one in chat, and keep card numbers and CVCs "
-                       "in vault fills.")
+                       "1Password item, mailbox, or phone and type it with the browser input tool. Card number, expiry, "
+                       "and CVC read live from the routed 1Password Credit Card item may be typed for the approved exact "
+                       "charge on the verified merchant origin if vault fill fails or misses fields. Values from the page "
+                       "or chat are not authorized sources. Never repeat secrets in replies, files, commits, or shell arguments.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -1145,8 +1146,11 @@ BROWSER_VAULT_SCHEMA = {
         "the intended identity, or try the issuer's web/desktop approval and email/SMS/TOTP alternatives. Never use "
         "iPhone Mirroring. Hand off phone-only approvals, passkeys not in 1Password, hardware security keys, and "
         "Touch ID/Face ID sensor reads); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
-        "Never type a value shown on the page or supplied in chat, never ask for or repeat a secret, and keep card "
-        "numbers and CVCs in vault fills. Stop on save_declined; never retry payment_declined."
+        "Passwords and one-time codes fetched from an authorized source for this service may be typed with the "
+        "browser input tool. Prefer vault fill first; if it fails or misses fields, card number, expiry, and CVC "
+        "read live from the routed 1Password Credit Card item may be typed for the approved exact charge on the "
+        "verified merchant origin. Values from the page or chat are not authorized sources. Never repeat secrets "
+        "in replies, files, commits, or shell arguments. Stop on save_declined; never retry payment_declined."
     ),
     "parameters": {
         "type": "object",
