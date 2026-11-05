@@ -83,7 +83,7 @@ def checker_home(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("shape", ["relative", "profile-absolute", "installed", "deployed-link",
                                    "external", "traversal", "script-link", "checker-link",
-                                   "other-skill", "other-resource", "project-shadow"])
+                                   "other-skill", "other-resource", "project-shadow", "alias-link"])
 def test_checker_declaration_trust_boundary(checker_home, tmp_path, monkeypatch, shape):
     home = checker_home
     installed = tmp_path / "installed/communications"
@@ -119,6 +119,9 @@ def test_checker_declaration_trust_boundary(checker_home, tmp_path, monkeypatch,
         path = _checker(installed.parent / "other/scripts/send_freshness.py")
     elif shape == "other-resource":
         path = _checker(installed / "scripts/other.py")
+    elif shape == "alias-link":
+        path = tmp_path / "unregistered-checker.py"
+        path.symlink_to(shared)
     else:
         project = tmp_path / "project"
         (project / ".git").mkdir(parents=True)
@@ -147,9 +150,17 @@ def test_checker_declaration_trust_boundary(checker_home, tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize("mutation", ["lifecycle", "symlink", "missing"])
-def test_checker_is_rescanned_at_create_update_and_fire(checker_home, tmp_path, monkeypatch, mutation):
+@pytest.mark.parametrize("location", ["scripts", "installed"])
+def test_checker_is_rescanned_at_create_update_and_fire(checker_home, tmp_path, monkeypatch, mutation, location):
     home = checker_home
-    script = _checker(home / "scripts/check.py")
+    if location == "scripts":
+        script = _checker(home / "scripts/check.py")
+    else:
+        installed = tmp_path / "installed/communications"
+        script = _checker(installed / "scripts/send_freshness.py")
+        (installed / "SKILL.md").write_text("---\nname: communications\n---\n# Communications\n", encoding="utf-8")
+        (home / "config.yaml").write_text(
+            f"skills:\n  external_dirs: [{json.dumps(str(installed.parent))}]\n", encoding="utf-8")
     spec = _spec(script)
     job = jobs.create_job(prompt="fixture", schedule="in 1h", deliver="local", send_freshness=spec)
     if mutation == "lifecycle":
