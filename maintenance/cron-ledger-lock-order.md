@@ -16,7 +16,11 @@ two at head, with identical due output.
 
 Current claims are still rechecked under the jobs lock and per-job fire fence.
 Proven owner death may release a claim; live/unknown owners conservatively retain
-the claim until normal expiry. Facts are call/profile/thread-local, never a global
+the claim until normal expiry. Claim keys absent from preflight use the live local
+owner probe, so a newly published dead-owner lease is released without another tick.
+Prefetch filters raw records with `.get("id")`; an id-less legacy sibling must not
+abort scheduled or manual fire claims before locked repair can run.
+Facts are call/profile/thread-local, never a global
 or TTL cache. Do not introduce speculative mutations or CAS commits: notices,
 tombstones, missed-window receipts, repairs, claims, saves, and recovery-window
 changes retain their locked base ordering. Malformed UTC conversion during
@@ -30,7 +34,8 @@ runtime setting, lock ordering, cross-process fence, or lock-timeout fallback.
 ## Verification
 
 Contract tests: `tests/cron/test_jobs_ledger_contention.py`,
-`tests/cron/test_jobs_prefetch_freshness.py`, `tests/cron/test_scheduled_occurrence.py`,
+`tests/cron/test_jobs_prefetch_freshness.py`, `tests/cron/test_jobs_prefetch_legacy_claims.py`,
+`tests/cron/test_scheduled_occurrence.py`,
 `tests/cron/test_jobs_crossprocess_lock.py`, `tests/cron/test_due_scan_save_failure.py`.
 
 Run these through `scripts/run_tests.sh`, then the full `tests/cron/` suite.

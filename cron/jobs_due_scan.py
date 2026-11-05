@@ -90,10 +90,11 @@ def claim_owner_is_dead(claim):
     from cron import jobs
 
     facts = _facts.get()
-    if facts is None:
+    key = _claim_key(claim)
+    if facts is None or key not in facts.dead:
+        # A writer may publish a new claim after preflight; probe its local owner now.
         return jobs._claim_owner_is_dead(claim)
-    # Proven death can release a claim; live/unknown conservatively retains base's TTL.
-    return facts.dead.get(_claim_key(claim), False)
+    return facts.dead[key]
 
 
 def locked_scan():
@@ -149,10 +150,10 @@ def locked_scan():
     return due
 
 
-
 def with_prefetched_job(job_id, fn):
     from cron import jobs
 
-    record = jobs.get_job(job_id)
+    record = next((job for job in jobs.load_jobs()
+                   if isinstance(job, dict) and job.get("id") == job_id), None)
     with prefetched_facts([record] if record else []):
         return fn()
