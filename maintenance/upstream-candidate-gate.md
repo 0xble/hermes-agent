@@ -16,7 +16,8 @@ shards. Deleting `bin/ci` fails planning; it cannot select upstream mode. Missin
 history, wrong SHA, an unknown gate lineage, and absent upstream entrypoints also
 fail closed. The planner executes policy from the frozen base checkout, never
 the candidate or merge revision. For bases predating the policy file, the rollout
-uses the explicit `988caf4adf1cbf3a4eef579708e619961699f7af` selector pin. Candidate
+uses the explicit `ee5a11da4b5bdd61058bba8c9eb4c19fc3fe9585` selector pin for
+fork-lineage heads only; upstream heads without staging policy fail. Candidate
 edits to the selector cannot change mode selection.
 
 Each execution job checks out `pull_request.base.sha` separately, moves that
@@ -52,28 +53,112 @@ Native macOS/Windows, Docker backends, release publishing, credentials-dependent
 live tests, and visual release checks remain separate lanes, as with the fork
 source gate. This is not a claim to reproduce all upstream release CI.
 
-## PR merge-ref constraint and staging bases
+## PR merge-ref constraint and baseline-first staging
 
-GitHub obtains `pull_request` workflows from the PR **merge ref**, not solely
-from the base branch. It does not run this event for a conflicted PR. The refreshed
-upstream candidates inspected here conflict extensively with fork `main`.
-Changing `gate.yml` cannot create a merge ref for those PRs, and a
-`pull_request_target` run would report the base SHA, which the existing review
-admission correctly rejects.
+GitHub obtains `pull_request` workflows from the PR **merge ref** and does not
+run this event for conflicted PRs. Use qualification-only staging PRs for
+upstream candidates that conflict with fork `main`; never merge them. Do not
+use `pull_request_target` (wrong check SHA) or `workflow_dispatch`: [GitHub
+requires the dispatch workflow on the default branch](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch),
+so dispatch cannot prove this draft before landing it.
 
-For such candidates, use a qualification-only staging base descended from the
-candidate's upstream base, with the reviewed fork gate policy overlaid. Keep the
-candidate SHA untouched. In that staging base, retain only the gate and its free
-prompt-surface workflow: upstream's other workflow files select paid Blacksmith
-runners and must not be activated accidentally by a probe. The exact candidate
-checkout still contains its own original workflows and entrypoints. The staging
-base must contain `scripts/ci/candidate_mode.py` so the clean merge ref carries
-this policy. Ordinary fork PRs still target fork `main`.
+Freeze candidate `C` and upstream tip `U`, then compute `B = merge-base U C`
+independently of any staging ref. **Run the exact baseline `B` first.** Its
+staging anchor is `B^1`, not `B`: an overlay descended from `B` has zero head-only
+commits and GitHub cannot open the PR. For a merge-commit baseline `^1` means
+its first parent, never an arbitrary parent or the merge-base of its parents.
+The tested head stays exactly `B`, and `scripts/check --base B` stays unchanged.
+A root commit without a parent fails closed (unsupported baseline route).
 
-A staging qualification PR is evidence, **not** a request to merge that upstream
-head or the staging base into the fork. Close/delete temporary probe PRs and
-branches after preserving their run URLs. Never add fork harness files to the
-candidate or rewrite its commits simply to make CI runnable.
+After recording baseline results, qualify exact `C` against a separate staging
+base anchored directly on `B`. The planner computes the upstream comparison
+base from `U` and the exact head, **never** from the staging/head merge-base.
+Every suite and partition comes from the exact head and is independent of the
+staging base. No fork-main changes or candidate commits are required.
+
+### Policy-only construction and refusal
+
+Use `candidate_mode.py --prepare-staging POLICY_SHA` from the reviewed policy
+checkout. It uses a private temporary index and `commit-tree`, touching no
+checkout, real index, candidate branch or existing ref. It copies exactly three
+files from the frozen policy commit:
+
+- `.github/workflows/gate.yml`
+- `.github/workflows/prompt-surface-diff.yml`
+- `scripts/ci/candidate_mode.py`
+
+All other upstream workflow files are **deleted in the staging overlay only**
+to prevent accidentally activating paid Blacksmith runners. The exact candidate
+checkout retains its original workflows and candidate-owned entrypoints.
+
+Before selecting upstream mode, the planner refuses unless the staging/head
+merge-base equals `B` (candidate) or `B^1` (baseline), the staging base descends
+from that anchor, and every overlay commit is single-parent and changes only
+those three paths or deletes other direct `.github/workflows/*.{yml,yaml}`
+files. It checks **each commit**, not just the net diff: implementation commits,
+reverted off-path changes, overlay merge commits, and added/modified unrelated
+workflows all fail closed. The final staging tree must contain exactly the two
+free policy workflows. Missing history also fails. Ordinary fork ancestry keeps
+the full fork gate and does not require a staging base.
+
+### Coordinator procedure (each candidate)
+
+Run from the reviewed policy checkout, with full candidate/upstream/fork history
+present. Use full 40-character SHAs. Authenticate through the approved `gh-env.sh`
+and require `GH_USER=0xble`. Set `POLICY`, `C`, and a unique `probe` prefix first.
+The shell function below supplies the required per-command Git environment; it
+changes no global Git configuration or exported shell state.
+
+```bash
+g() { GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 git "$@"; }
+g fetch --no-tags https://github.com/NousResearch/hermes-agent.git main
+U=$(g rev-parse FETCH_HEAD)
+B=$(g merge-base "$U" "$C")
+# Baseline FIRST. stdout is only the new staging SHA; validation goes to stderr.
+S=$(python3 scripts/ci/candidate_mode.py . "$B" "$U" --prepare-staging "$POLICY")
+g push origin "$S:refs/heads/$probe-baseline-base" "$B:refs/heads/$probe-baseline-head"
+gh pr create -R 0xble/hermes-agent --draft --base "$probe-baseline-base" \
+  --head "$probe-baseline-head" --title 'Exact upstream baseline qualification' \
+  --body "Evidence only; never merge. Head=$B upstream=$U policy=$POLICY staging=$S"
+```
+
+Read back the PR head/base SHAs, mergeability and the `Repository gate` run.
+Prove the merge-ref gate bytes equal `$POLICY:.github/workflows/gate.yml`
+before interpreting the result. Preserve run URL, run `head_sha`, planner
+`upstream_base`, all job conclusions and concrete failing test names. Baseline
+failures are evidence, not a reason to omit suites or label qualification green.
+If upstream moves before a probe starts, verify the logged computed `B` still
+matches the frozen expected `B`; otherwise regenerate the paired evidence.
+
+Only after baseline evidence is complete, repeat construction/push/PR creation
+with head `$C` and fresh `-candidate-base`/`-candidate-head` refs. Compare actual
+failures with baseline before attributing a regression. A successful exact-SHA
+`qualification` is still required for admission; matching baseline failures do
+not turn a failed check into a pass. Close both evidence PRs, delete **both**
+base/head refs for each, then read back closed PR states and absent remote refs.
+Never add harness files to the candidate, rewrite its SHA, or retarget its real PR.
+
+### Earlier f57e556e evidence
+
+[Run 41956633238](https://github.com/0xble/hermes-agent/actions/runs/41956633238)
+tested exact `f57e556e347bb480cbe750b7e6324ee7d1ce4434`. Its staging base
+`ac60910951658ad72fcfa56c06215739c51d772e` incorrectly contained three candidate
+implementation commits before the three overlay commits; staging/head merge-base
+was `0cbcbb159ef11a68be7ba63e3050d86e9469b71c`, not upstream base
+`016b76da3a8a88e28775e08b6ca2846f471b8eda`.
+
+The **suite result remains valid exact-candidate failure evidence**, not a pass
+and not baseline attribution. Actual planner and lint logs both record
+`016b76da3a8a88e28775e08b6ca2846f471b8eda`; all candidate suites/partitions are
+base-independent. The staging gate bytes equal the reviewed gate bytes (the
+candidate has no gate file), so ancestry contamination did not change execution
+or workflow identity. The prompt-surface comparison used the staging tree, which
+already included implementation, not the full upstream-base prompt delta. The new
+staging-provenance contract was not checked and would reject that base. Re-run
+on a clean staging base to obtain full current-policy evidence; retain the old
+suite outcomes only under their actual head/policy, never call them a clean
+staging qualification. A baseline run is required regardless.
+
 
 ## Residual maintenance
 

@@ -33,16 +33,19 @@ jobs:
         id: mode
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           git -C candidate fetch --no-tags https://github.com/NousResearch/hermes-agent.git main
           upstream=$(git -C candidate rev-parse FETCH_HEAD)
           if test -f policy/scripts/ci/candidate_mode.py; then
-            selector=policy/scripts/ci/candidate_mode.py
+            python3 policy/scripts/ci/candidate_mode.py candidate "$HEAD_SHA" "$upstream" "$BASE_SHA"
           else
+            # Legacy rollout policy cannot validate upstream staging ancestry.
+            git -C candidate merge-base --is-ancestor d77a654d8605200b81aea26ab801dba3ea07cf7a "$HEAD_SHA"
             selector="$RUNNER_TEMP/candidate_mode.py"
-            git -C policy show 988caf4adf1cbf3a4eef579708e619961699f7af:scripts/ci/candidate_mode.py > "$selector"
+            git -C policy show ee5a11da4b5bdd61058bba8c9eb4c19fc3fe9585:scripts/ci/candidate_mode.py > "$selector"
+            python3 "$selector" candidate "$HEAD_SHA" "$upstream"
           fi
-          python3 "$selector" candidate "$HEAD_SHA" "$upstream"
   linux:
     needs: plan
     if: needs.plan.outputs.mode == 'fork'
