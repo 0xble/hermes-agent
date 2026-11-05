@@ -1,5 +1,6 @@
 """Literal inline context for separately delivered paste-ready blocks."""
 from collections.abc import Callable
+from html import escape as html_escape
 import re
 
 from gateway.copy_blocks import protect_inline_copy_bodies, _strip_one_adjacent_newline
@@ -25,6 +26,28 @@ def protect_copy_quotes(content: str, stash: Callable[[str], str], escape: Calla
     return text
 
 
+def protect_rich_copy_quotes(content: str) -> tuple[str, dict[str, str]]:
+    """Hide literal bodies until all rich Markdown shaping is finished.
+
+    Rich Markdown does not parse Markdown inside HTML blockquotes, but does
+    parse HTML tags/entities. Escape those once, then restore after the normal
+    blockquote Markdown-to-HTML converter so it cannot interpret the body.
+    """
+    text, bodies = protect_inline_copy_bodies(content)
+    quotes = {}
+    for token, body in bodies.items():
+        body = _strip_one_adjacent_newline(body, leading=True)
+        body = _strip_one_adjacent_newline(body, leading=False)
+        lines = body.splitlines() or [""]
+        key = f"HERMESRICHCOPY{len(quotes)}END"
+        while key in content:
+            key += "X"
+        expandable = " expandable" if len(lines) > 6 else ""
+        # Keep the placeholder inside an HTML block even within a details body.
+        # A Markdown quote placeholder would be rewritten there before restore.
+        text = text.replace(token, f"<blockquote{expandable}>{key}</blockquote>\n\n")
+        quotes[key] = "<br>".join(html_escape(line, quote=False) for line in lines)
+    return text, quotes
 
 
 def protect_quote_fallback(content: str) -> tuple[str, dict[str, str]]:

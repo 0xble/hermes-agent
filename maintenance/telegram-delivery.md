@@ -55,18 +55,32 @@ the former into additional copy sends, or give the latter an extra inline messag
 No schema migration is involved. A downgrade should drain pending display-sentinel
 reply rows before reverting, because older renderers do not understand them.
 
-The literal quote renderer deliberately selects MarkdownV2 for replies containing
-copy context, including rich-enabled draft/final/edit paths. Rich-only constructs
-elsewhere in that same reply therefore use the existing legacy degradation. Fences
-inside a body are quoted as escaped literal text, not nested pre entities. Large
-bodies may create extra main-reply overflow messages; all use existing admission,
-pacing, flood and ambiguity handling, without a new producer or retry loop.
+Rich-eligible copy-bearing replies retain native footnotes, details and tables on
+sends, rich drafts and final edits. Copy bodies are protected before all rich
+normalization and restored as HTML-escaped literal `<blockquote>` content, with
+`expandable` after six lines. Telegram's Rich Markdown does not parse Markdown
+inside HTML blockquotes; HTML escaping prevents tags/entities in the body from
+becoming markup. Literal details/math inside copy text cannot trigger the rich
+crash-shape guard; actual prose retains that guard and the CJK safety check.
+Rich-disabled, over-cap and unsupported-rich replies retain the MarkdownV2 quote
+fallback. Fences inside a body remain literal text, not nested pre entities.
+Large legacy bodies may create extra main-reply overflow messages; all use
+existing admission, pacing, flood and ambiguity handling, without a new producer
+or retry loop.
 
 Source: `gateway/copy_blocks.py`, stream filtering/fence/overflow owners, extraction,
 reconcile and recovery, and `plugins/platforms/telegram/copy_quotes.py`. Proof:
 `tests/gateway/test_copy_inline_quotes.py` and `test_copy_quote_wire.py` plus
 copy/stream/ledger regressions. Wire coverage includes interim/final edits,
 rich-enabled drafts, overflow continuations, parse fallbacks and ledger replay.
+`tests/gateway/test_telegram_rich_copy_quotes.py` additionally drives raw and
+stream-display content through rich sends/drafts/final edits (including copies
+inside details), preserves surrounding rich constructs and literal bodies, and
+covers rich-to-legacy rejection plus escaped-payload size limits and exact plain
+copies. This rich follow-up inspected upstream guidance at
+`8bee456a5a161010bd08b49095c5f3b86cca48ad` and the existing rich renderer/tests;
+upstream quote PRs concern general Markdown syntax, not this paired copy feature.
+The implementation extends the existing adapter owner without dependencies.
 Upstream inspected at `a5f20c5c04d52dd92a55c01e58dcc004896b52c2`; open PRs
 [#89997](https://github.com/NousResearch/hermes-agent/pull/89997) and
 [#145608](https://github.com/NousResearch/hermes-agent/pull/145608) concern generic

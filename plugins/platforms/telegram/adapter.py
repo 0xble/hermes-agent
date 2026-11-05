@@ -1836,12 +1836,11 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
     def _rich_content_ok(self, content: str) -> bool:
         """Shape checks shared by rich sends and rich drafts (non-blank, no Desktop crash/garble
         shapes, under the cap, async-capable bot)."""
+        from gateway.copy_blocks import protect_inline_copy_bodies
+        prose, _ = protect_inline_copy_bodies(content)
         return bool(
             content and content.strip()
-            # Copy quotes need literal MarkdownV2 on sends, edits, and drafts alike.
-            and "[[copy]]" not in content and "[[/copy]]" not in content
-            and "\x00HERMES_COPY_" not in content
-            and not self._has_telegram_desktop_details_math_crash_shape(content)
+            and not self._has_telegram_desktop_details_math_crash_shape(prose)
             and (
                 getattr(self, "_allow_cjk_rich_messages", False)
                 or not self._has_telegram_desktop_cjk_rich_garble_shape(content)

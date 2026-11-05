@@ -107,9 +107,6 @@ def test_copy_quote_routing_escaping_and_replay_do_not_promote_inline_copies():
     assert "Cost $5" in normalized and "*literal* &#36;5" in normalized
     assert "*literal* &#36;5" in _strip_mdv2(inline)
     for text in [raw, inline]:
-        assert not adapter._rich_content_ok(text)
-        assert not adapter._should_attempt_rich_draft(text)
-        assert not adapter._rich_eligible(text)
         assert "\x00" not in adapter.format_message(text)
 
 
