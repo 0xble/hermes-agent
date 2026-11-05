@@ -86,6 +86,8 @@ class LoginControl:
     container_has_password: bool = False
     nearby_text: str = ""
     context_truncated: bool = False
+    group_label: str = ""
+    group_candidate_count: int = 0
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> LoginControl:
@@ -107,6 +109,8 @@ class LoginControl:
             container_has_password=raw.get("containerHasPassword") is True,
             nearby_text=str(raw.get("nearbyText") or "")[:300],
             context_truncated=raw.get("contextTruncated") is True,
+            group_label=str(raw.get("groupLabel") or "")[:180],
+            group_candidate_count=int(raw.get("groupCandidateCount") or 0),
         )
 
 
@@ -264,7 +268,15 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
             return ClassifiedLoginControl(control, 100, "country-name" if token == "country" else token)
     if control.type == "email":
         return None
+    if (re.fullmatch(r"#{3,4}", control.label.strip())
+            and control.group_candidate_count == 1
+            and re.search(r"\b(?:cvc|cvv|csc|security\s*code|card\s*code)\b", _normalize_text(control.group_label))):
+        return ClassifiedLoginControl(control, 65, "cc-csc")
     searchable = _normalize_text(" ".join(part for part in (control.name, control.label) if part))
+    if (control.type in {"combobox", "listbox", "select"}
+            and re.search(r"\bexp(?:iry|iration)?\b", _normalize_text(control.group_label))
+            and searchable in {"month", "year"}):
+        return ClassifiedLoginControl(control, 70, "cc-exp-" + searchable)
     for pattern, token in _CHECKOUT_HEURISTICS:
         if pattern.search(searchable):
             # Narrow guards adapted from upstream PRs 136639 and 134723.
@@ -438,14 +450,17 @@ def build_form_probe_js(selector: str) -> str:
 
 
 def build_inspection_js(nonce: str) -> str:
+    from agent.vault_checkout_controls import INSPECT_HELPERS
     return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+            .replace("__PAYMENT_CONTEXT__", INSPECT_HELPERS)
             .replace("__QUERY_ALL__", _QUERY_ALL_JS))
 
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
   __QUERY_ALL__
-  const elements = queryAll("input, select");
+  __PAYMENT_CONTEXT__
+  const elements = queryAll("input, select, [role=combobox], [role=listbox]");
   const forms = queryAll("form");
   const containerIds = new WeakMap();
   let nextContainerId = 0;
@@ -471,7 +486,8 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.matches(":disabled") || element.readOnly) return [];
-    if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type)) return [];
+    if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type) &&
+        !["combobox", "listbox"].includes(element.getAttribute("role"))) return [];
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
@@ -484,7 +500,10 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     if (container && !containerIds.has(container)) containerIds.set(container, nextContainerId++);
     const context = contextFor(container);
     const rect = element.getBoundingClientRect();
+    const paymentContext = localPaymentContext(element);
     return [{
+      groupLabel: paymentContext.label,
+      groupCandidateCount: paymentContext.candidates,
       autocomplete: element.getAttribute("autocomplete") || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
       index,
@@ -505,7 +524,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
         element.getAttribute("title") || "",
       ].join(" "),
       name: [element.name, element.id].join(" "),
-      type: element.tagName === "SELECT" ? "select" : (element.type || ""),
+      type: element.tagName === "SELECT" ? "select" : (element.getAttribute("role") || element.type || ""),
     }];
   });
   return JSON.stringify(out);
@@ -524,6 +543,8 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     controls (country, state, expiry month) match an option by value or visible text. No marker is
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
     """
+    from agent.vault_checkout_controls import FILL_HELPERS
+
     payload = json.dumps(
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
     )
@@ -532,10 +553,11 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
             .replace("__QUERY_ALL__", _QUERY_ALL_JS)
             .replace("__EXCLUDED_PASSWORD__", json.dumps(_RE_EXCLUDED_PASSWORD.pattern))
             .replace("__OTP_PATTERN__", json.dumps(_RE_OTP.pattern))
-            .replace("__FILLS__", payload))
+            .replace("__FILLS__", payload)
+            .replace("__PAYMENT_FILL_HELPERS__", FILL_HELPERS))
 
 
-_FILL_JS_TEMPLATE = """(() => {
+_FILL_JS_TEMPLATE = """(async () => {
   const expectedOrigin = __EXPECTED_ORIGIN__;
   if (window.location.origin !== expectedOrigin) {
     return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
@@ -546,12 +568,30 @@ _FILL_JS_TEMPLATE = """(() => {
   const stamped = queryAll("[data-hermes-vault-slot]");
   let filled = 0;
   const selectedOptions = [];
+  const fieldResults = [];
   const norm = (t) => String(t || "").trim().toLowerCase();
+  __PAYMENT_FILL_HELPERS__
   for (const f of fills) {
+    const result = {token: f.token, status: "missing"};
+    fieldResults.push(result);
     const el = stamped.find((n) => n.getAttribute("data-hermes-vault-slot") === nonce + ':' + f.index);
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
     try {
+      if (!live(el)) continue;
+      if (['combobox', 'listbox'].includes(el.getAttribute('role'))) {
+        if (await fillAria(el, f)) { filled++; result.status = 'filled'; }
+        continue;
+      }
       if (el.tagName === "SELECT") {
+        if (f.token.startsWith('cc-exp')) {
+          const option = chooseOption(Array.from(el.options).filter(o => !o.disabled), f, false);
+          if (!option || !live(el)) continue;
+          el.value = option.value;
+          el.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          if (live(el) && el.value === option.value) { filled++; result.status = 'filled'; }
+          continue;
+        }
         const want = norm(f.value);
         const options = Array.from(el.options);
         const same = (t) => norm(t) === want || norm(t) === want.replace(/^0/, "");
@@ -576,7 +616,7 @@ _FILL_JS_TEMPLATE = """(() => {
           el.value = opt.value;
           el.dispatchEvent(new Event("change", { bubbles: true }));
           selectedOptions.push({ token: f.token, value: opt.value, label: opt.textContent });
-          filled += 1;
+          filled += 1; result.status = "filled";
         }
         continue;
       }
@@ -600,9 +640,11 @@ _FILL_JS_TEMPLATE = """(() => {
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      if (el.value.length > 0) filled += 1;
+      if (live(el) && String(el.value).replace(/[^a-z0-9]/gi, "") === String(f.value).replace(/[^a-z0-9]/gi, "")) {
+        filled += 1; result.status = "filled";
+      }
     } catch (e) { /* skip */ }
   }
   stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled, selectedOptions });
+  return JSON.stringify({ filled, selectedOptions, fieldResults });
 })()"""

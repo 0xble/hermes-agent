@@ -76,7 +76,9 @@ def _run_fill(page_url, decision="accept", focused=None, controls=_CONTROLS, aft
 
     def fake_eval_secret(task_id, expression):
         secret_exprs.append(expression)
-        return {"success": True, "result": json.dumps({"filled": 3})}
+        fills = json.loads(expression.split('const fills = ', 1)[1].split(';', 1)[0])
+        return {"success": True, "result": json.dumps({"filled": len(fills), "fieldResults": [
+            {"token": fill["token"], "status": "filled"} for fill in fills]})}
 
     def consent(message, description, **kw):
         order.append("prompt")
@@ -90,6 +92,7 @@ def _run_fill(page_url, decision="accept", focused=None, controls=_CONTROLS, aft
          patch.object(browser_vault_tool, "_focus_bound_origin", side_effect=fake_focus), \
          patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
          patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret), \
+         patch("tools.browser_vault_payment.inspect_frames", return_value=([], None)), \
          patch("tools.approval_prompt.request_elicitation_consent", side_effect=consent):
         raw = browser_vault_tool.browser_vault_fill("mg:card")
     _run_fill.focus_calls = focus_calls
@@ -168,7 +171,7 @@ def test_card_fill_does_not_write_expiry_to_issue_dates(label):
                 {"label": "Expiry (MM/YY)", "index": 2, "type": "text"}]
     try:
         raw, _, exprs = _run_fill("https://shop.test/checkout", controls=controls)
-        assert json.loads(raw)["success"]
+        assert json.loads(raw)["partial"]
         assert '"index": 1' not in exprs[0]
         assert '"index": 2' in exprs[0]
     finally:
@@ -407,3 +410,17 @@ def test_listing_marks_manager_card_available():
         out = json.loads(browser_vault_tool.browser_vault_list())
     (entry,) = [i for i in out["items"] if i["handle"] == "mg:card"]
     assert entry["available"] is True and entry["origin"] is None and entry["identifier"] == "1111"
+
+
+def test_pan_postal_fill_reports_missing_expiry_and_cvc():
+    from agent import redact
+    try:
+        raw, _, _ = _run_fill("https://shop.test/pay", controls=[
+            {"autocomplete": "cc-number", "index": 0, "type": "text"},
+            {"autocomplete": "postal-code", "index": 1, "type": "text"}])
+        result = json.loads(raw)
+        assert result["success"] is False and result["partial"] is True
+        assert result["missing_fields"] == ["cc-csc", "cc-exp-month", "cc-exp-year"]
+        assert result["field_results"]["cc-number"] == "filled"
+    finally:
+        redact.clear_vault_redaction_values()

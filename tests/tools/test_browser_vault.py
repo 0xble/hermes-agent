@@ -542,7 +542,8 @@ class TestBrowserVaultTools:
         finally:
             redact.clear_vault_redaction_values()
 
-    def test_payment_fill_requires_confirmation_then_fills_card_fields(self, store):
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_payment_fill_requires_confirmation_then_fills_card_fields(self, store, partial):
         """A card is written only after the user confirms (a prompt injection reaching a checkout must not be
         able to spend); the secret eval then targets the classified card controls and the result carries
         the field tokens but never a value."""
@@ -566,7 +567,9 @@ class TestBrowserVaultTools:
 
         def fake_eval_secret(task_id, expression):
             secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 3})}
+            return {"success": True, "result": json.dumps({"filled": 3, "fieldResults": [
+                {"token": token, "status": "missing" if partial and token != "cc-number" else "filled"}
+                for token in ("cc-number", "cc-exp", "cc-csc")]})}
 
         try:
             with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -584,7 +587,9 @@ class TestBrowserVaultTools:
                  patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
                 raw = browser_vault_tool.browser_vault_fill(meta.id)
             out = json.loads(raw)
-            assert out["success"] is True and out["fields"] == ["cc-csc", "cc-exp", "cc-number"]
+            assert out["success"] is (not partial) and out["partial"] is partial
+            assert out["fields"] == (["cc-number"] if partial else ["cc-csc", "cc-exp", "cc-number"])
+            assert out["missing_fields"] == (["cc-csc", "cc-exp-month", "cc-exp-year"] if partial else [])
             assert _CARD["card_number"] not in raw and _CARD["cvc"] not in raw
             assert len(secret_exprs) == 1 and _CARD["card_number"] in secret_exprs[0] and "07/29" in secret_exprs[0]
             assert '"index": 3' not in secret_exprs[0]  # the email box is never a card target
