@@ -351,6 +351,88 @@ async def test_admitted_goal_lost_head_settles_interrupted_not_human_loss(parked
 
 
 @pytest.mark.asyncio
+async def test_goal_ack_does_not_invert_routing_save_locks(parked, monkeypatch):
+    from gateway.run_goal_wait import goal_wait_guard
+    from hermes_state_runtime import admit_session_input
+
+    runner, _, authority, source, sid, key, manager, rows, _ = parked
+    store = runner.session_store
+    assert store._routing_db is authority.db
+    guard = goal_wait_guard(authority, captured_event(runner, source, sid, manager))
+    saving, writing = threading.Event(), threading.Event()
+    errors = []
+    lookup = store.lookup_by_session_key
+
+    def bounded_lookup(route):
+        # Bound the broken lock inversion so RED rolls back and fixture teardown
+        # can close the actual DB rather than leaving deadlocked daemon threads.
+        if not store._lock.acquire(timeout=3):
+            raise TimeoutError('goal acknowledgement blocked on SessionStore lock')
+        try:
+            return lookup(route)
+        finally:
+            store._lock.release()
+
+    monkeypatch.setattr(store, 'lookup_by_session_key', bounded_lookup)
+
+    def save():
+        try:
+            with store._lock:
+                saving.set()
+                assert writing.wait(5)
+                store._save()
+        except Exception as exc:
+            errors.append(exc)
+
+    def authorize(conn):
+        writing.set()
+        guard(conn)
+
+    def admit():
+        try:
+            assert saving.wait(5)
+            admit_session_input(authority.db, epoch=authority.epoch,
+                principal_id='automation:' + key, session_id=sid,
+                request_id='lock-order-wake', payload={'text': 'lock-order wake'},
+                _authorize_write=authorize)
+        except Exception as exc:
+            errors.append(exc)
+
+    saver = threading.Thread(target=save, daemon=True)
+    writer = threading.Thread(target=admit, daemon=True)
+    saver.start()
+    writer.start()
+    await asyncio.to_thread(writer.join, 5)
+    await asyncio.to_thread(saver.join, 5)
+    assert not writer.is_alive() and not saver.is_alive(), 'routing/admission deadlock'
+    assert errors == [], f'routing/admission lock inversion: {errors}'
+    assert len(rows()) == 1
+    assert goals.load_goal(sid).waiting_since == 0
+
+
+@pytest.mark.asyncio
+async def test_receipt_lookup_failure_still_backs_off_and_logs_refusal(parked, monkeypatch, caplog):
+    runner, _, authority, _, sid, _, _, rows, _ = parked
+    before = goals.load_goal(sid).to_json()
+
+    async def refuse(*args, **kwargs):
+        raise RuntimeStoreError('queue_full')
+
+    def unavailable(*args, **kwargs):
+        raise OSError('receipt lookup unavailable')
+
+    monkeypatch.setattr(authority, 'admit_automation', refuse)
+    monkeypatch.setattr('hermes_state_runtime.find_session_admission', unavailable)
+    with caplog.at_level('INFO', logger='gateway.run_goal_wait'):
+        await runner._goal_wakeup_fire_one(sid)
+    assert sid in getattr(runner, '_goal_wait_retries', {}), 'lookup failure skipped admission backoff'
+    assert 'queue_full' in caplog.text and 'retrying admission' in caplog.text
+    assert goals.load_goal(sid).to_json() == before
+    assert rows() == []
+    assert runner._get_replay_scheduler().gate.load() == 0
+
+
+@pytest.mark.asyncio
 async def test_receipt_loss_after_commit_cannot_admit_twice(parked, monkeypatch):
     runner, adapter, authority, source, sid, key, manager, rows, _ = parked
     original = authority.admit_automation
