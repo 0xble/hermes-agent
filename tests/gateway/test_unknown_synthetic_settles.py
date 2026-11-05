@@ -14,7 +14,7 @@ from gateway.session import SessionSource
 from gateway.session_authority import LiveSession
 from gateway.session_contract import SessionRef, Submission
 from gateway.session_controls import AuthorityConnection
-from gateway.session_envelope import snapshot_native
+from gateway.session_envelope import restore_native, snapshot_native
 from gateway.session_unattended_unknown import is_unattended, settle_recovered_unattended
 from hermes_state_runtime import (
     RuntimeStoreError, admit_session_input, claim_session_input,
@@ -85,6 +85,32 @@ def _mixed(order, marked):
     return pending['route']
 
 
+def _unstamped_mixed(kind):
+    human = _human()
+    if kind == 'important-human':
+        human.text = '[IMPORTANT: HUMAN request, not automation]'
+    elif kind == 'system-note-human':
+        human.text = '[System note: HUMAN request, not automation]'
+    elif kind == 'edit-human':
+        human.metadata = {'is_edit': True}
+        human.edit_revision = 'edit-2'
+    elif kind == 'reaction-human':
+        human.metadata = {'is_reaction': True}
+    elif kind == 'recovered-human':
+        human._hermes_recovered_followup = True
+    if kind != 'unstamped-human':
+        from gateway.reply_latency import stamp_received
+        assert stamp_received(human) is None
+    assert not hasattr(human, '_attended_activity_received_at')
+    pending = {'route': _producer('goal')}
+    merge_pending_message_event(pending, 'route', human, merge_text=True)
+    return pending['route']
+
+
+UNSTAMPED = [
+    'unstamped-human', 'important-human', 'system-note-human',
+    'edit-human', 'reaction-human', 'recovered-human',
+]
 CASES = [pytest.param(kind, True, id=kind) for kind in PRODUCERS]
 CASES += [pytest.param(kind, False, id=kind) for kind in (
     'human', 'quoted-goal', 'relay-text', 'forged-metadata', 'forged-private-field',
@@ -138,9 +164,53 @@ def test_native_synthetic_recovery_classification(tmp_path, monkeypatch, case, e
         store.close_all_db_handles()
 
 
+@pytest.mark.parametrize('case,expected', [
+    ('all-synthetic', True), ('nested-human', False), ('roundtrip-human', False),
+    ('roundtrip-then-merge', False), ('unknown-producer', False),
+    ('legacy', False), ('legacy-roundtrip', False), ('malformed-trail', False),
+    ('automation-mixed', False), ('automation-principal-mixed', False),
+])
+def test_absorbed_provenance_requires_positive_synthetic_proof(tmp_path, monkeypatch, case, expected):
+    store, runner = _runner(tmp_path, monkeypatch, [])
+    _codec(runner)
+    try:
+        event = _producer('goal')
+        principal = 'messaging:test'
+        if case == 'all-synthetic':
+            follower = _producer('loop_wakeup')
+        elif case == 'unknown-producer':
+            follower = _producer('unknown')
+        else:
+            follower = _unstamped_mixed('system-note-human')
+        pending = {'route': event}
+        if case not in ('legacy', 'legacy-roundtrip', 'malformed-trail'):
+            merge_pending_message_event(pending, 'route', follower, merge_text=True)
+        payload = snapshot_native(runner, pending['route'])
+        if case.startswith('legacy'):
+            payload['native_text_v1'].pop('absorbed_synthetic', None)
+        elif case == 'malformed-trail':
+            payload['native_text_v1']['absorbed_synthetic'] = None
+        elif case.startswith('automation'):
+            payload['native_text_v1']['automation'] = {}
+            if case == 'automation-principal-mixed':
+                principal = 'automation:test'
+        if case in ('roundtrip-human', 'roundtrip-then-merge', 'legacy-roundtrip'):
+            restored = restore_native(payload, runner)
+            if case == 'roundtrip-then-merge':
+                pending = {'route': _producer('goal')}
+                merge_pending_message_event(pending, 'route', restored, merge_text=True)
+                restored = pending['route']
+            payload = snapshot_native(runner, restored)
+        assert is_unattended({'principal_id': principal, 'payload': payload}) is expected
+        if 'human' in case or case == 'roundtrip-then-merge' or case.startswith('automation'):
+            assert 'HUMAN' in payload['text']
+    finally:
+        store.close_all_db_handles()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('recovery', ['boot', 'drain'])
-@pytest.mark.parametrize('kind', ['goal', 'human', 'human-first', 'synthetic-first'])
+@pytest.mark.parametrize('kind', ['goal', 'human', 'human-first', 'synthetic-first', *UNSTAMPED])
 async def test_lost_native_head_preserves_human_work_and_drains_only_synthetic(
     tmp_path, monkeypatch, recovery, kind,
 ):
@@ -154,7 +224,7 @@ async def test_lost_native_head_preserves_human_work_and_drains_only_synthetic(
     ref = SessionRef('p', 's')
     authority._schedule = lambda ref: None
     event = (_producer('goal') if kind == 'goal' else _human() if kind == 'human'
-             else _mixed(kind, True))
+             else _unstamped_mixed(kind) if kind in UNSTAMPED else _mixed(kind, True))
     payload = snapshot_native(runner, event)
     assert 'automation' not in payload['native_text_v1']
     head = admit_session_input(db, epoch=authority.epoch, principal_id='messaging:test',
@@ -194,6 +264,13 @@ async def test_lost_native_head_preserves_human_work_and_drains_only_synthetic(
             assert executed == ['FOLLOWER']
             assert len([m for m in db.get_messages('s') if m.get('display_kind') == 'failed_turn']) == 1
         else:
+            # The pause must preserve the entire human-containing admission, not settle it
+            # interrupted and silently omit the person's resend decision.
+            from hermes_state_runtime import list_session_admissions
+            saved = next(row for row in list_session_admissions(db, session_id='s', pending_only=False)
+                         if row['admission_id'] == head['admission_id'])
+            assert saved['payload']['text'] == event.text
+            assert 'HUMAN' in saved['payload']['text']
             assert statuses[head['admission_id']] == ('unknown', None)
             assert statuses[follower.admission_id] == ('queued', None)
             assert executed == [] and notices == []
