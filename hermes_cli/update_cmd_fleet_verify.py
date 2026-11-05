@@ -304,6 +304,23 @@ def _owed_restart_reason(restart, stopped, *, gateway_owed: bool, stale_serves: 
     return "; ".join(parts) or (_GATEWAY_OWED_REASON + _GATEWAY_RECOVERY)
 
 
+def _retain_verified_release(restart, update_complete):
+    """Prune immutable releases only after complete fleet and update verification."""
+    if not restart.incomplete and update_complete:
+        try:
+            from hermes_cli.immutable_releases import retain, resolved_release
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+            if resolved_release(home) is not None:
+                removed = retain(home)
+                from hermes_cli.update_receipt import record_step
+                record_step("release_retention", True, f"removed={len(removed)}: {', '.join(map(str, removed))}")
+        except Exception as exc:
+            logger.warning("Immutable release retention failed after verification: %s", exc, exc_info=True)
+            from hermes_cli.update_receipt import record_step
+            record_step("release_retention", False, str(exc))
+
+
 def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_resume, update_complete,
                                expected_sha: str | None = None, expected_root=None, rollback: bool = False):
     """Post-restart verification: legacy-unit warning, dashboard cleanup, stale serve
@@ -487,19 +504,7 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     # Destructive retention is the last update step: never prune on partial
     # health, a deferred restart, or an unverified candidate. A failed prune
     # records a warning without turning a healthy promotion into failure.
-    if not restart.incomplete and update_complete:
-        try:
-            from hermes_cli.immutable_releases import retain, resolved_release
-            from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            if resolved_release(home) is not None:
-                removed = retain(home)
-                from hermes_cli.update_receipt import record_step
-                record_step("release_retention", True, f"removed={len(removed)}: {', '.join(map(str, removed))}")
-        except Exception as exc:
-            logger.warning("Immutable release retention failed after verification: %s", exc, exc_info=True)
-            from hermes_cli.update_receipt import record_step
-            record_step("release_retention", False, str(exc))
+    _retain_verified_release(restart, update_complete)
     with _best_effort('Update receipt finalize failed: %s'):
         from hermes_cli.update_receipt import finalize_update_receipt
         # A False ``update_complete`` (unsafe SQLite runtime, owed tail work) never fails the

@@ -30,10 +30,7 @@ from hermes_state_deletion import finish_pending_deletes, stage_delete, visible_
 logger = logging.getLogger("hermes_state")
 
 
-def workspace_key(row: dict[str, Any]) -> Optional[str]:
-    """Workspace grouping key: git repo root, else cwd, else None (branch excluded: a checkout must not
-    fragment history)."""
-    return (row.get("git_repo_root") or "").strip() or (row.get("cwd") or "").strip() or None
+from hermes_state_sessions_workspace import workspace_key as workspace_key
 
 
 def _delegate_from_json(col: str = "model_config") -> str:

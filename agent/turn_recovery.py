@@ -101,16 +101,7 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return max_dimension if 512 <= max_dimension <= 8000 else None
 
 
-def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
-    """Refresh Nous runtime credentials after a fresh paid-entitlement check."""
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        if get_nous_portal_account_info(force_fresh=True).paid_service_access is not True:
-            return False
-        return agent._try_refresh_nous_client_credentials(force=True)
-    except Exception:
-        return False
+from agent.turn_recovery_entitlement import _try_refresh_nous_paid_entitlement_credentials as _try_refresh_nous_paid_entitlement_credentials
 
 
 def _repair_transport_credentials(agent: Any) -> bool:
