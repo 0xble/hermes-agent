@@ -26,13 +26,28 @@ general executor best-effort in its unchanged FIFO order. A long run holding
 the reservation must not occupy a general worker or overlap itself.
 
 Script-only (`no_agent`) jobs outside that selected reservation use a separate
-serial FIFO lane per profile, managed by the same admission pool lifecycle.
-They never queue behind detached agent waiters, even while the protected
-reservation is busy. Agent jobs, including monitor or pre-run scripts that may
-wake an agent, cannot enter this lane. This adds 1 script worker, not agent
-capacity: the general cap and the single protected reservation are unchanged.
-Script jobs can still wait behind another ordinary script, bounded by the existing
-script timeout. Frozen person-send wrappers can opt into a separate serial per-profile
+four-worker bounded executor per profile, managed by the same admission pool
+lifecycle. They never queue behind detached agent waiters, even while the
+protected reservation is busy. One slow script cannot by itself starve a due
+safety watchdog. Agent jobs, including monitor or pre-run scripts that may wake
+an agent, cannot enter this lane. This adds 4 script workers, not agent capacity:
+the general cap and the single protected reservation are unchanged. Enqueue-time
+per-job single-flight ownership covers running and queued scripts; duplicate
+submissions still log `already running — skipping`. Preserve the common execution
+journal, copied profile context, fire claims, cancellation and process-exit fences.
+Departure and shutdown reclaim both auxiliary lanes.
+
+History/rationale: `acd2204d1db` (#925) introduced the serial script lane to
+isolate scripts from detached agent waiters while preserving the one-worker
+protected reservation. `03106cf4a45` added protected-agent start ordering.
+Neither history nor this unit identifies script-to-script serialization as a
+shared-state safety boundary; the current no-agent path passes workdir as
+subprocess `cwd`, never `os.chdir()`. Only the script executor expands to four;
+the reserved executor stays serial. Four blocked scripts can still exhaust the
+bound: this prevents starvation from one slow script, not arbitrary saturation
+or a promise of watchdog priority.
+
+Frozen person-send wrappers can opt into a separate serial per-profile
 `person-send` lane with the exact first line `# hermes: person-send`, but only for
 `no_agent` jobs with a one-shot schedule and `deliver=local`. This is an author
 scheduling declaration, not send authorization or a sandbox. Do not infer eligibility

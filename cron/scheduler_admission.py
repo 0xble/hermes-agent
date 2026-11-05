@@ -131,12 +131,12 @@ def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
 
 
 def _get_lane_pool(key: str, lane: str) -> concurrent.futures.ThreadPoolExecutor:
-    """Called under _lock. Each workload lane is serial and belongs to one profile."""
+    """Called under _lock. Bound each profile's scripts; keep its reservation serial."""
     pools = _lane_pools[lane]
     pool = pools.get(key)
     if pool is None:
         pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"cron-{lane}")
+            max_workers=4 if lane == "script" else 1, thread_name_prefix=f"cron-{lane}")
         pools[key] = pool
     return pool
 
