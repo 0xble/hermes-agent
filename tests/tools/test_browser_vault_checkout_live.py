@@ -6,7 +6,9 @@ import pytest
 
 from agent.vault_login_classifier import LoginControl, build_inspection_js, classify_checkout_control
 from tools import browser_vault_payment as payment
-from tests.tools.vault_checkout_browser_fixture import bridge
+from tests.tools import vault_checkout_browser_fixture
+
+bridge = vault_checkout_browser_fixture.bridge
 
 CARD = {"card_number": "4111111111111111", "exp_month": "07", "exp_year": "2029", "cvc": "9876"}
 

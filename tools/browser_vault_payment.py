@@ -128,7 +128,7 @@ def fill(task_id: str, origin: str, selected: list[dict], ambiguous: set[str], e
         try:
             response = (evaluate_payment_frame(task_id, context["frame_id"], expression, origin, context["origin"], secret=True)
                         if context.get("frame_id") else eval_secret(task_id, expression))
-        except Exception:
+        except Exception:  # health: allow BLE001 - secret-bearing evaluation errors must never reach logs or receipts
             response = {"success": False}
         result = _parse(response.get("result")) if response.get("success") else None
         return result if isinstance(result, dict) and not result.get("refused") else None

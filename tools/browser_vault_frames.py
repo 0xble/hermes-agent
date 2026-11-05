@@ -97,7 +97,7 @@ def discover_payment_frames(task_id: str, merchant_origin: str) -> list[dict[str
         with _bindings_lock:
             _bindings[key] = frozenset((frame["frame_id"], merchant_origin, frame["origin"]) for frame in result)
         return result
-    except Exception:
+    except Exception:  # health: allow BLE001 - transport exceptions may retain secret request bodies; return only fixed errors
         # Deliberately no traceback/logging/chained requests exception; it may
         # retain the secret-bearing HTTP request body or expression.
         raise PaymentFrameError(_ERROR) from None
@@ -121,5 +121,5 @@ def evaluate_payment_frame(task_id: str, frame_id: str, expression: str,
             "merchantOrigin": merchant_origin, "frameOrigin": frame_origin,
         })
         return {"success": True, "result": result, "error": None}
-    except Exception:
+    except Exception:  # health: allow BLE001 - transport exceptions may retain secret request bodies; return only fixed errors
         return {"success": False, "result": None, "error": _ERROR}
