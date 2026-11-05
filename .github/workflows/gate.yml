@@ -45,7 +45,7 @@ jobs:
             # Legacy rollout policy cannot validate upstream staging ancestry.
             git -C candidate merge-base --is-ancestor d77a654d8605200b81aea26ab801dba3ea07cf7a "$HEAD_SHA"
             selector="$RUNNER_TEMP/candidate_mode.py"
-            git -C policy show ee5a11da4b5bdd61058bba8c9eb4c19fc3fe9585:scripts/ci/candidate_mode.py > "$selector"
+            git -C policy show cc68f1760a07e6328a673ce2b69e7455b989bce6:scripts/ci/candidate_mode.py > "$selector"
             python3 "$selector" candidate "$HEAD_SHA" "$upstream"
           fi
   linux:
