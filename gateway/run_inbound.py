@@ -2450,7 +2450,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         # Keep current media after the recall boundary, not among discarded backfill.
-        # Sender attribution stays inside enrichment as before.
+        # The sender prefix stays on the caption, after the media notes.
         if channel_context := getattr(event, "channel_context", None):
             message_text = channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY + message_text
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)

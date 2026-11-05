@@ -191,6 +191,19 @@ def test_bracket_only_suffix_does_not_hide_image_description_or_discard_caption(
     assert auto_recall_query(caption) == caption
 
 
+@pytest.mark.parametrize("caption", [
+    "[Brian] which plan should I pick [A or B]",
+    "[Brian | Slack user <@U1>] see [urgent]",
+])
+@pytest.mark.parametrize("include_synthetic", [False, True])
+def test_shared_caption_ending_in_brackets_stays_ahead_of_image_description(
+    enrich, caption, include_synthetic,
+):
+    prompt = enrich(caption)
+    assert auto_recall_query(prompt, include_synthetic=include_synthetic) == caption
+    assert human_prompt_text(prompt) == prompt
+
+
 def test_multiple_images_do_not_swallow_the_caption(enrich):
     assert auto_recall_query(enrich(REQUEST, [PATH, "/cache/images/controls.jpg"])) == REQUEST
     assert auto_recall_query(enrich("", [PATH, "/cache/images/controls.jpg"])) == (
@@ -367,7 +380,12 @@ def test_unpaired_description_note_is_never_stripped_as_attachment_metadata():
     assert auto_recall_query(prompt) == prompt
 
 
-def test_hindsight_receives_the_request_with_its_existing_input_cap(enrich):
+@pytest.mark.parametrize("caption", [
+    REQUEST,
+    "[Brian] which plan should I pick [A or B]",
+    "[Brian | Slack user <@U1>] see [urgent]",
+])
+def test_hindsight_receives_the_request_with_its_existing_input_cap(enrich, caption):
     from plugins.memory.hindsight import HindsightMemoryProvider
     from unittest.mock import Mock
 
@@ -375,8 +393,8 @@ def test_hindsight_receives_the_request_with_its_existing_input_cap(enrich):
     provider._recall_max_input_chars = 800
     provider._prefetch_method = "recall"
     provider._recall = Mock(return_value=[])
-    provider._do_recall(auto_recall_query(enrich(REQUEST)))
-    provider._recall.assert_called_once_with(REQUEST)
+    provider._do_recall(auto_recall_query(enrich(caption)))
+    provider._recall.assert_called_once_with(caption)
 
 
 def test_inline_document_body_and_transcribed_speech_are_not_discarded():

@@ -381,7 +381,7 @@ def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None
             # The request already ends the text, so move it rather than repeat it.
             rest = text[:-len(human)].rstrip() if text.endswith(human) else text
             return f"{human}\n\n{rest}" if rest else human
-    if descriptions and text and re.fullmatch(r"\[[^\n]*\]", text):
+    if descriptions and text and re.fullmatch(r"\[[^\]\n]*\]", text):
         # Image-only shared turns can leave just [sender]. Text cannot prove
         # attribution, so retain bracket-only captions too, after the description.
         descriptions.append(text)
