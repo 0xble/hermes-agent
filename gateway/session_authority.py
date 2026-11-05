@@ -461,11 +461,11 @@ class SessionAuthority:
             if waiter is not None and not waiter.done():
                 waiter.set_exception(RuntimeStoreError(reason))
 
-    async def admit_automation(self, adapter, event, identity, replaces=None):
+    async def admit_automation(self, adapter, event, identity, replaces=None, *, authorize_write=None):
         from gateway.admission_canary import refusal_evidence
         from gateway.session_automation import admit_automation
         with refusal_evidence('automation', identity):
-            return await admit_automation(self, adapter, event, identity, replaces)
+            return await admit_automation(self, adapter, event, identity, replaces, authorize_write=authorize_write)
 
     async def admit_native(self, event):
         """Await current connector policy, then commit before ACK or scheduling execution."""

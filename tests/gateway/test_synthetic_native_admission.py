@@ -95,7 +95,9 @@ async def test_lifted_goal_barrier_drives_real_native_admission(native_chat):
     manager.set('Finish the verification')
     manager.wait_on_session('proc-synthetic', reason='waiting for verifier')
     await runner._goal_wakeup_fire_one(entry.session_id)
-    await async_wait_until(lambda: not adapter._background_tasks, timeout=20, what='goal admission')
+    await async_wait_until(lambda: len(rows(authority, entry.session_id)) == 2
+                           and rows(authority, entry.session_id)[-1]['status'] == 'terminal',
+                           timeout=20, what='durable goal turn settlement')
     admitted = rows(authority, entry.session_id)
     assert len(admitted) == 2, (sent, admitted)
     restored = restore_native(admitted[-1]['payload'], runner)
