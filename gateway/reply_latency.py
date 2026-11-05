@@ -10,6 +10,8 @@ import contextvars
 import json
 import logging
 import time
+import uuid
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ReplyReceipt:
     identity: dict[str, Any]
+    home: Path
     started: bool = False
     replied: bool = False
 
@@ -31,9 +34,16 @@ _current: contextvars.ContextVar[ReplyReceipt | None] = contextvars.ContextVar(
 
 
 def _emit(receipt: ReplyReceipt, event: str, timestamp: float) -> None:
+    payload = {**receipt.identity, "event": event, "timestamp": timestamp}
+    try:
+        from gateway.reply_latency_sink import append_event
+        append_event(receipt.home, payload)
+    except Exception:
+        # Path/diagnostic setup failures are as non-fatal as append failures.
+        logger.debug("Could not access reply latency sink", exc_info=True)
     try:
         logger.info("gateway_reply_latency %s", json.dumps(
-            {**receipt.identity, "event": event, "timestamp": timestamp},
+            payload,
             separators=(",", ":"), sort_keys=True))
     except Exception:
         logger.debug("Could not emit reply latency record", exc_info=True)
@@ -43,6 +53,8 @@ def stamp_received(event: Any) -> float | None:
     """Preserve the arrival clock before admission, without logging unauthorized input."""
     if not is_genuine_user_message(event):
         return None
+    if not getattr(event, "_reply_latency_receipt_id", None):
+        event._reply_latency_receipt_id = uuid.uuid4().hex
     stamp = getattr(event, "_attended_activity_received_at", None)
     if stamp is None:
         stamp = time.time()
@@ -61,23 +73,32 @@ def record_received(event: Any) -> ReplyReceipt | None:
     try:
         from gateway.outbox import transport_id
         from hermes_cli.profiles import current_profile_name
+        from gateway.session_identity import proven_runtime_home
+        from hermes_constants import get_hermes_home
 
         source = getattr(event, "source", None)
         if source is None:
             return None
         message_id = getattr(event, "message_id", None)
         thread_id = getattr(source, "thread_id", None)
+        profile = str(getattr(source, "profile", None) or current_profile_name("default"))
+        platform = str(getattr(source.platform, "value", source.platform))
+        inbound = [profile, platform, str(source.chat_id),
+                   str(thread_id) if thread_id is not None else None,
+                   str(message_id) if message_id is not None else None]
         receipt = ReplyReceipt({
+            "inbound_identity": inbound,
+            "receipt_id": event._reply_latency_receipt_id,
             # Reuse transport identity already known at receipt. An outbox admission/active
             # token assigned later cannot identify the original queue wait without a new ID.
             "turn_id": transport_id(event),
             "message_id": str(message_id) if message_id is not None else None,
-            "platform": str(getattr(source.platform, "value", source.platform)),
+            "platform": platform,
             "origin": turn_origin_for_event(event),
-            "profile": str(getattr(source, "profile", None) or current_profile_name("default")),
+            "profile": profile,
             "chat_id": str(source.chat_id),
             "thread_id": str(thread_id) if thread_id is not None else None,
-        })
+        }, home=proven_runtime_home(source) or get_hermes_home())
         event._reply_latency_receipt = receipt
         _emit(receipt, "received", stamp)
         return receipt

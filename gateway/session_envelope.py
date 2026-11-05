@@ -136,6 +136,8 @@ def _adapter_event(event, **changes):
             setattr(projected, name, getattr(receipt, name))
     if unmarked:
         projected._attended_activity_marked = False
+    if hasattr(event, '_reply_latency_receipt_id'):
+        projected._reply_latency_receipt_id = event._reply_latency_receipt_id
     from gateway.session_synthetic import is_synthetic, mark_synthetic
     if is_synthetic(event):
         mark_synthetic(projected)
@@ -332,6 +334,9 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
         envelope['attended_activity'] = {
             'received_at': received_at, 'marked': bool(getattr(event, '_attended_activity_marked', False)),
         }
+    if event.message_id is None and (receipt_id := getattr(event, '_reply_latency_receipt_id', None)):
+        # ID-less events need the same content-free identity after queue/restart restore.
+        envelope['reply_latency_receipt_id'] = receipt_id
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -379,6 +384,7 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
             legacy['native_text_v1'].pop('provenance')
             legacy['native_text_v1'].pop('attended_activity', None)
             legacy['native_text_v1'].pop('absorbed_synthetic', None)
+            legacy['native_text_v1'].pop('reply_latency_receipt_id', None)
             for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
                 prior = deepcopy(row['payload'])
                 if isinstance(prior.get('native_text_v1'), dict):
@@ -420,6 +426,8 @@ def restore_native(payload, runner=None):
     if activity := envelope.get('attended_activity'):
         event._attended_activity_received_at = activity['received_at']
         event._attended_activity_marked = activity['marked']
+    if receipt_id := envelope.get('reply_latency_receipt_id'):
+        event._reply_latency_receipt_id = receipt_id
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):

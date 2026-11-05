@@ -1910,6 +1910,8 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             )
         self._spawn_supervised(self._hosted_room_worker_watcher, "hosted_room_worker")
         self._start_loop_heartbeat_task()
+        from gateway.reply_latency_sink import coverage_forever
+        self._spawn_supervised(lambda: coverage_forever(self), "reply_latency_coverage")
         from gateway.run_heartbeat_restore import restore_heartbeat_watches
         self._start_heartbeat_poller()  # Keep retrying even when the first scan is empty.
         await restore_heartbeat_watches(self)

@@ -19,9 +19,14 @@ files 0600 on POSIX. Retain the current UTC date and the preceding 13 dates;
 prune only date-named JSONL files once per day. Existing log records remain.
 
 `inbound_identity` is `[profile, platform, chat_id, thread_id, message_id]`;
-`turn_id` remains diagnostic only. A missing message ID remains null: consumers
-must not merge concurrent ID-less inputs. All events carry process UUID,
+`turn_id` remains diagnostic only. A missing message ID remains null; a private
+receipt UUID survives native envelope restoration so concurrent ID-less inputs
+cannot collide and a restored receipt does not create false unanswered rows. All events carry process UUID,
 sequence, observation timestamp and process instrumentation start timestamp.
+A bounded 1024-item per-profile daemon writer keeps append/fsync/retention off
+intake and delivery. Overflow or failed I/O interrupts coverage, rate-limits a
+warning and never blocks delivery. Abrupt exit may lose queued records; FIFO
+checkpoints attest only their captured enqueue time, never future/pending data.
 `instrumentation_start` is written on first initialization and daily rollover,
 including process restarts and idle profiles. Coverage checkpoints run every
 30 seconds for served profiles, off-loop. Each checkpoint attests a continuous
