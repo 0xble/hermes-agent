@@ -1,12 +1,12 @@
 """Private discovery must not assume another process shares its temp root."""
 import json
 import socket
-import tempfile
 import threading
 from pathlib import Path
 
 import pytest
 
+from tests.socket_paths import short_socket_dir
 from gateway.control_socket import _home_hash
 from hermes_cli.gateway_runtime_discovery import DiscoveryError, home_mode_unsafe, query_identify
 
@@ -93,7 +93,7 @@ def test_fallback_pointer_uses_owner_location_and_keeps_identity_checks(tmp_path
     home = tmp_path / 'profile'
     home.mkdir(mode=0o700)
     # The owner has a distinct TMPDIR, as a service or native app commonly does.
-    with tempfile.TemporaryDirectory(prefix='h-owner-') as root:
+    with short_socket_dir(f'hermes-gw-{_home_hash(home)}/control.sock') as root:
         directory = Path(root) / f'hermes-gw-{_home_hash(home)}'
         directory.mkdir(mode=0o700)
         target = directory / 'control.sock'
@@ -133,15 +133,13 @@ def test_fallback_pointer_uses_owner_location_and_keeps_identity_checks(tmp_path
 
 
 @pytest.mark.platforms("linux", "macos")
-def test_the_client_verdict_names_the_unsafe_node_and_its_fix(monkeypatch, request):
+def test_the_client_verdict_names_the_unsafe_node_and_its_fix(monkeypatch, short_sock_dir):
     """``Gateway inaccessible: <code> (<detail>)`` is what a client prints (``connect_gateway``): the
     detail must survive discovery and ensure, with the code unchanged for callers that match it."""
     import os
-    import shutil
     from hermes_cli.gateway_runtime import discover_gateway_endpoint, ensure_gateway_runtime
     # A short root: the socket path must fit AF_UNIX's limit.
-    root = Path(tempfile.mkdtemp(prefix='h-'))
-    request.addfinalizer(lambda: shutil.rmtree(root, ignore_errors=True))
+    root = short_sock_dir
     home = root / 'h'
     home.mkdir(mode=0o700)
     control = home / 'gateway.sock'
@@ -178,15 +176,13 @@ def test_the_client_verdict_names_the_unsafe_node_and_its_fix(monkeypatch, reque
 
 
 @pytest.mark.platforms("linux", "macos")
-def test_hermes_chat_prints_the_whole_repair_command(monkeypatch, request):
+def test_hermes_chat_prints_the_whole_repair_command(monkeypatch, short_sock_dir):
     """``hermes chat`` shows a failed attach through ``agent_init_failure_message``, whose 120-character
     summary cut the hint mid-path: the whole command must reach the user."""
     import asyncio
-    import shutil
     from hermes_cli.cli_chat_error_copy import agent_init_failure_message
     from hermes_cli.gateway_client import GatewayUnavailableError, connect_gateway
-    root = Path(tempfile.mkdtemp(prefix='h-'))
-    request.addfinalizer(lambda: shutil.rmtree(root, ignore_errors=True))
+    root = short_sock_dir
     home = root / ('profile-' + 'x' * 12)
     home.mkdir(mode=0o700)
     control = home / 'gateway.sock'
@@ -253,7 +249,7 @@ def test_a_permission_hint_runs_as_printed_for_a_path_with_spaces(tmp_path):
 def test_an_open_control_directory_names_its_path_and_mode(tmp_path):
     home = tmp_path / 'profile'
     home.mkdir(mode=0o700)
-    with tempfile.TemporaryDirectory(prefix='h-owner-') as root:
+    with short_socket_dir(f'hermes-gw-{_home_hash(home)}/control.sock') as root:
         directory = Path(root) / f'hermes-gw-{_home_hash(home)}'
         directory.mkdir(mode=0o755)
         pointer = home / 'gateway.sock.path'
