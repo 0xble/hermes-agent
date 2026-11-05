@@ -26,8 +26,6 @@ MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 def _kill_live_descendant(child) -> None:
     """A killed child may remain a zombie after its launcher exits, until init reaps it."""
-    import psutil
-
     if child is None:
         return
     kill_if_alive(child)
