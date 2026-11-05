@@ -64,7 +64,9 @@ pacing, flood and ambiguity handling, without a new producer or retry loop.
 
 Source: `gateway/copy_blocks.py`, stream filtering/fence/overflow owners, extraction,
 reconcile and recovery, and `plugins/platforms/telegram/copy_quotes.py`. Proof:
-`tests/gateway/test_copy_inline_quotes.py` plus copy/stream/ledger regressions.
+`tests/gateway/test_copy_inline_quotes.py` and `test_copy_quote_wire.py` plus
+copy/stream/ledger regressions. Wire coverage includes interim/final edits,
+rich-enabled drafts, overflow continuations, parse fallbacks and ledger replay.
 Upstream inspected at `a5f20c5c04d52dd92a55c01e58dcc004896b52c2`; open PRs
 [#89997](https://github.com/NousResearch/hermes-agent/pull/89997) and
 [#145608](https://github.com/NousResearch/hermes-agent/pull/145608) concern generic

@@ -485,13 +485,15 @@ def _strip_mdv2(text: str) -> str:
     """Strip MarkdownV2 escapes and formatting markers for the plain-text fallback."""
     from gateway.copy_blocks import protect_inline_copy_bodies, restore_inline_copy_bodies
     text, bodies = protect_inline_copy_bodies(text)
+    from .copy_quotes import protect_quote_fallback
+    text, quote_bodies = protect_quote_fallback(text)
     cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)  # escape backslashes
     cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)  # **bold** BEFORE MarkdownV2 *bold*
     cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
     cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)  # italic; word-bounded so snake_case survives
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
-    return restore_inline_copy_bodies(cleaned, bodies)
+    return restore_inline_copy_bodies(cleaned, {**bodies, **quote_bodies})
 
 
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
@@ -5128,7 +5130,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             self._last_overflow_preview.pop(_preview_key, None)
         try:
             if not finalize:
-                await self._edit_text(chat_id, message_id, content)
+                from gateway.copy_blocks import _has_copy_markers
+                if _has_copy_markers(content):
+                    content = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
+                    await self._edit_markdown_or_plain(
+                        chat_id, message_id, self.format_message(content), _strip_mdv2(content),
+                        "[%s] Copy preview MarkdownV2 rejected, using plain text: %s")
+                else:
+                    await self._edit_text(chat_id, message_id, content)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
@@ -5213,7 +5222,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
         reply anchor once on 'reply message not found'. Returns the sent message, a flood refusal, or None."""
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-        for use_markdown in (True, False) if finalize else (False,):
+        from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
+        has_copy = _has_copy_markers(chunk)
+        for use_markdown in (True, False) if (finalize or has_copy) else (False,):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
                 return _flood_cap_result(cooldown)
@@ -5222,7 +5233,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
-                    text = _strip_mdv2(chunk) if finalize else chunk
+                    text = _strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk)
                 return await _await_with_thread_deadline(
                     self._bot.send_message(
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
@@ -5240,7 +5251,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     try:
                         return await _await_with_thread_deadline(
                             self._bot.send_message(
-                            chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else chunk,
+                            chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk),
                             **retry_thread_kwargs, **base),
                             timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
                     except Exception as _retry_err:
@@ -5271,7 +5282,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     chat_id, message_id, _separate_chunk_indicator_from_fence(self.format_message(first_chunk)), _strip_mdv2(first_chunk),
                     "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s")
             else:
-                await self._edit_text(chat_id, message_id, first_chunk)
+                from gateway.copy_blocks import _has_copy_markers
+                if _has_copy_markers(first_chunk):
+                    await self._edit_markdown_or_plain(
+                        chat_id, message_id, self.format_message(first_chunk), _strip_mdv2(first_chunk),
+                        "[%s] Copy overflow preview MarkdownV2 rejected, using plain text: %s")
+                else:
+                    await self._edit_text(chat_id, message_id, first_chunk)
         except Exception as e:
             if "not modified" not in str(e).lower():  # identical first chunk still sends continuations
                 wait = _telegram_retry_after(e)
@@ -5391,14 +5408,18 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             content) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)[0]
         # Same MarkdownV2 conversion as ``send`` (MarkdownV2 then plain) so the draft doesn't snap at the end. Exception: a Rich
         # final with rich drafts disabled previews raw — the legacy formatter would turn pipe tables into bullets.
+        from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
+        has_copy = _has_copy_markers(text)
+        if has_copy:
+            text = self.truncate_message(text, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
         plain_rich_preview = bool(
-            getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
+            not has_copy and getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
             and self._needs_rich_rendering(text))
         draft_thread_kwargs = self._thread_kwargs_for_draft(chat_id, metadata)
         for use_markdown in ((False,) if plain_rich_preview else (True, False)):
             kwargs: dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
-                "text": self.format_message(text) if use_markdown else text}
+                "text": self.format_message(text) if use_markdown else render_copy_blocks_inline(text)}
             if use_markdown:
                 kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
             kwargs.update(draft_thread_kwargs)

@@ -25,6 +25,24 @@ def protect_copy_quotes(content: str, stash: Callable[[str], str], escape: Calla
     return text
 
 
+
+
+def protect_quote_fallback(content: str) -> tuple[str, dict[str, str]]:
+    """Unescape quoted bodies without interpreting their literal Markdown on parse fallback."""
+    bodies = {}
+
+    def stash(match):
+        key = f"HERMESCOPYFALLBACK{len(bodies)}END"
+        while key in content:
+            key += "X"
+        quote = match.group(0).removeprefix("**")
+        quote = re.sub(r"(?<!\\)\|\|$", "", quote)
+        bodies[key] = re.sub(r"\\([_*\[\]()~`>#\+\-=|{}.!\\])", r"\1", quote)
+        return key
+
+    return re.sub(r"(?m)^(?:\*\*)?> [^\n]*(?:\n> [^\n]*)*", stash, content), bodies
+
+
 def truncate_copy_source(content: str, max_length: int, len_fn, indicator_overhead: int, *, close_chunks: bool = False):
     """Split source, not encoded quotes: each API message gets a balanced quote.
 
