@@ -237,8 +237,8 @@ async def test_refused_watch_wake_logs_the_refusal_code(tmp_path, monkeypatch, c
     runner, authority, _adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'human')
     try:
         route = metadata['gateway_session_key']
-        # Point the routing entry at a renamed user: the wake's source no longer matches the commit.
-        runner.session_store._entries[route].origin = replace_source(source, user_name='renamed')
+        # A stored origin on another thread is routing drift, not a stale display label.
+        runner.session_store._entries[route].origin = replace_source(source, thread_id='other-thread')
         evt = {'type': 'completion', 'session_id': 'proc_x', 'session_key': route, 'platform': 'discord',
                'chat_id': '42', 'chat_type': 'dm', 'exit_code': 0, 'output': 'done', 'started_at': 1.0,
                'parent_session_id': metadata['gateway_session_id']}
