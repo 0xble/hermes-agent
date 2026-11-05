@@ -69,8 +69,9 @@ def protect_quote_fallback(content: str) -> tuple[str, dict[str, str]]:
 def truncate_copy_source(content: str, max_length: int, len_fn, indicator_overhead: int, *, close_chunks: bool = False):
     """Split source, not encoded quotes: each API message gets a balanced quote.
 
-    The conservative half-budget leaves room for worst-case MarkdownV2 escaping,
-    a reopened display marker, expandable wrappers and the normal chunk indicator.
+    The conservative half-budget covers MarkdownV2 escaping; an extra unit per
+    source line also reserves its quote prefix. Leave room for reopened markers,
+    expandable wrappers and the normal chunk indicator.
     Literal body fences are shielded from the ordinary source fence balancer.
     """
     from gateway.copy_blocks import (
@@ -81,7 +82,10 @@ def truncate_copy_source(content: str, max_length: int, len_fn, indicator_overhe
 
     if not _has_copy_markers(content):
         return None
-    if len_fn(content) * 2 + 8 <= max_length:
+    def source_length(text):
+        return len_fn(text) + len(text.splitlines())
+
+    if source_length(content) * 2 + 8 <= max_length:
         return [content]
     if "\x00HERMES_COPY_" not in content:
         stream = CopyMarkerStreamFilter(keep_markers=True)
@@ -92,7 +96,7 @@ def truncate_copy_source(content: str, max_length: int, len_fn, indicator_overhe
     shielded = {key: body.replace("`", tick).replace("~", tilde) for key, body in bodies.items()}
     content = restore_inline_copy_bodies(protected, shielded)
     chunks = BasePlatformAdapter.truncate_message(
-        content, max(64, max_length // 2 - 64), len_fn=len_fn, indicator_overhead=indicator_overhead)
+        content, max(64, max_length // 2 - 64), len_fn=source_length, indicator_overhead=indicator_overhead)
     parts = [re.sub(r" \(\d+/\d+\)$", "", chunk) for chunk in chunks]
     result = []
     for index, chunk in enumerate(balance_copy_quote_chunks(parts), 1):

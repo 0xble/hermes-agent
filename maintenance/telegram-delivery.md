@@ -66,7 +66,16 @@ Rich-disabled, over-cap and unsupported-rich replies retain the MarkdownV2 quote
 fallback. Fences inside a body remain literal text, not nested pre entities.
 Large legacy bodies may create extra main-reply overflow messages; all use
 existing admission, pacing, flood and ambiguity handling, without a new producer
-or retry loop.
+or retry loop. The shared source chunk budget counts quote-line prefixes as
+well as MarkdownV2 escaping, including CR/CRLF bodies, so short source lines
+cannot overflow a legacy send or streamed preview after encoding.
+
+Media captions render display-only sentinels to marker-free inline text before
+plain-caption truncation. Voice captions still try formatted quotes first; both
+over-cap and rejected-entity fallbacks use the same caption boundary as audio,
+documents, photos, video, animation and albums. Auto-TTS speech excludes the copy
+body independently of its visible caption. `tests/gateway/test_telegram_copy_captions.py`
+covers real extraction, synthesis dispatch and caption transport with fake media.
 
 Source: `gateway/copy_blocks.py`, stream filtering/fence/overflow owners, extraction,
 reconcile and recovery, and `plugins/platforms/telegram/copy_quotes.py`. Proof:

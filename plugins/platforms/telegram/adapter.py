@@ -6595,15 +6595,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
-        return caption[:1024] if caption else None
+        from gateway.copy_blocks import render_copy_blocks_inline
+        return render_copy_blocks_inline(caption)[:1024] if caption else None
 
     async def _send_voice_bubble(self, audio_file, chat_id, reply_to, metadata, caption, duration_secs):
         """sendVoice with caption variants: MarkdownV2 when it fits 1024 chars, plain fallback when the
         Bot API rejects the entities; anything else is a real error."""
-        # Render caption markdown (#32029): auto-TTS captions carry the agent's markdown reply, which showed
-        # literal *asterisks* and [links](...) without a parse_mode. Format to MarkdownV2 when it fits the
-        # 1024-char caption cap; fall back to the raw text (previous behaviour) when formatting would
-        # overflow or the Bot API rejects the entities.
+        # Keep formatted quotes when they fit; plain fallbacks must render display markers BEFORE
+        # truncating, which could otherwise bisect a sentinel and leak internal control text.
         _caption_variants: list[tuple] = []
         if caption:
             try:
@@ -6612,7 +6611,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     _caption_variants.append((_formatted_caption, ParseMode.MARKDOWN_V2))
             except Exception:
                 logger.debug("[%s] voice caption MarkdownV2 formatting failed; sending plain caption", self.name, exc_info=True)
-            _caption_variants.append((caption[:1024], None))
+            _caption_variants.append((self._caption_1024(caption), None))
         else:
             _caption_variants.append((None, None))
         _last_parse_error: Optional[Exception] = None

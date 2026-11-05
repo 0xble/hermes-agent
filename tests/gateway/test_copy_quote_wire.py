@@ -164,3 +164,33 @@ async def test_long_rich_draft_keeps_quote_and_encoded_length_bound(adapter):
     wire = adapter._bot.send_message_draft.call_args.kwargs
     assert wire["parse_mode"] == "MarkdownV2" and wire["text"].startswith("> \\*")
     assert "\x00" not in wire["text"] and utf16_len(wire["text"]) <= 4096
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "draft", "edit"])
+@pytest.mark.parametrize("internal", [False, True])
+@pytest.mark.parametrize("line_end", ["\n", "\r", "\r\n"])
+async def test_many_short_copy_lines_fit_encoded_wire_on_send_and_stream(adapter, operation, internal, line_end):
+    raw = "[[copy]]\n" + line_end.join(["*"] * 1000) + "\n[[/copy]]"
+    content = copy_free_text_for(adapter, raw) if internal else raw
+    if operation == "send":
+        async def chunks(chat_id, payloads, *_args):
+            for payload in payloads:
+                await adapter._send_chunk_markdown_or_plain(payload, {"chat_id": chat_id})
+            return SimpleNamespace(success=True, message_id="2")
+
+        adapter._send_chunks = chunks
+        result = await adapter._send_text_locked("123", content, None, None)
+        wires = [call.kwargs for call in adapter._bot.send_message.call_args_list]
+        assert len(wires) > 1
+    elif operation == "draft":
+        result = await adapter.send_draft("123", 1, content)
+        wires = [adapter._bot.send_message_draft.call_args.kwargs]
+    else:
+        result = await adapter._edit_message_locked("123", "1", content, finalize=False)
+        wires = [adapter._bot.edit_message_text.call_args.kwargs]
+    assert result.success
+    for wire in wires:
+        assert wire["parse_mode"] == "MarkdownV2"
+        assert wire["text"].startswith("**> \\*") and "||" in wire["text"]
+        assert "\x00" not in wire["text"] and utf16_len(wire["text"]) <= 4096
