@@ -14,7 +14,6 @@ timeout, so the loop is never blocked and a stuck teardown degrades gracefully.
 import asyncio
 import logging
 import threading
-import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -91,56 +90,53 @@ def _make_runner_with_cached_agent(close_fn):
 
 @pytest.mark.asyncio
 async def test_reset_does_not_block_event_loop_during_cleanup():
-    """#35994: a slow agent.close() must NOT block the event loop. A
-    concurrent loop task must keep ticking WHILE close() is still blocking
-    (proving cleanup was offloaded to a worker thread, not run inline on
-    the loop). With the pre-fix inline call, the loop is frozen for the
-    whole duration of close() and no ticks accumulate until it returns."""
-    close_started = threading.Event()
-    release = threading.Event()
+    """The loop must run while close() is blocked in its worker thread.
+
+    Rendezvous with close() itself, not a deadline for the reset's preceding
+    executor work. A loaded runner can legitimately delay that setup.
+    """
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    close_started = asyncio.Event()
+    release_close = threading.Event()
+    close_finished = threading.Event()
+    close_threads = []
 
     def slow_close():
-        close_started.set()
-        # Block the WORKER thread (not the loop) until released.
-        release.wait(timeout=5)
+        close_threads.append(threading.get_ident())
+        loop.call_soon_threadsafe(close_started.set)
+        # Only block a worker: an inline-cleanup regression must fail the
+        # thread assertion below, not deadlock the test's event loop.
+        if threading.get_ident() != loop_thread:
+            release_close.wait()
+        close_finished.set()
 
     runner = _make_runner_with_cached_agent(slow_close)
+    event = _make_event("/new")
+    reset_task = asyncio.create_task(runner._handle_reset_command(event))
+    started_task = asyncio.create_task(close_started.wait())
+    try:
+        # A reset that finishes (or raises) without invoking close() must fail,
+        # rather than leave the test waiting forever for the worker's signal.
+        done, _ = await asyncio.wait(
+            {started_task, reset_task}, return_when=asyncio.FIRST_COMPLETED)
+        if reset_task in done:
+            reset_task.result()
+        assert close_started.is_set(), "reset completed without calling close()"
+        assert close_threads[0] != loop_thread, "close() ran on the event-loop thread"
+        assert not close_finished.is_set(), "event loop only resumed after close() returned"
+        assert not reset_task.done(), "reset finished before close() was released"
+    finally:
+        # Always unblock and drain cleanup, including when an assertion fails.
+        release_close.set()
+        started_task.cancel()
+        await asyncio.gather(started_task, return_exceptions=True)
+        try:
+            result = await reset_task
+        finally:
+            runner._shutdown_executor()
 
-    ticks = {"n": 0}
-    stop = threading.Event()
-
-    async def _heartbeat():
-        while not stop.is_set():
-            ticks["n"] += 1
-            await asyncio.sleep(0.005)
-
-    hb = asyncio.create_task(_heartbeat())
-    reset_task = asyncio.create_task(
-        runner._handle_reset_command(_make_event("/new"))
-    )
-
-    # Wait until close() has actually started blocking in its worker thread.
-    for _ in range(200):
-        if close_started.is_set():
-            break
-        await asyncio.sleep(0.005)
-    assert close_started.is_set(), "close() never ran"
-
-    # Now sample ticks while close() is STILL blocking. If the loop were
-    # frozen (pre-fix inline call), this stays ~0.
-    ticks_at_block = ticks["n"]
-    await asyncio.sleep(0.1)
-    ticks_during_block = ticks["n"] - ticks_at_block
-
-    release.set()
-    await reset_task
-    stop.set()
-    await hb
-
-    assert ticks_during_block >= 5, (
-        f"event loop was blocked during agent cleanup (#35994): only "
-        f"{ticks_during_block} ticks while close() was running"
-    )
+    assert result is not None
     runner.session_store.reset_session.assert_called_once()
 
 

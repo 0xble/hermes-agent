@@ -35,6 +35,13 @@ local helper/reaper stubs, without importing Unix-only dependencies. All eight
 controlled cases remain unmarked for Linux, macOS and Windows. Native Linux
 regressions retain foreign-sibling refusal and detached cleanup.
 No test is skipped and no worker count or timeout is relaxed.
+The reset-cleanup liveness regression rendezvous with the actual worker via
+`call_soon_threadsafe` and an asyncio event, then holds cleanup until the loop
+releases it. Reset setup and executor admission have no separate one-second
+speed requirement; the test still rejects inline cleanup and a reset that
+omits cleanup. Every assertion path releases the worker, drains the reset task,
+and stops the fixture's executor. Loaded-runner scheduling must not be confused
+with an event-loop deadlock or repaired by widening a timeout.
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning
 clears only after a gateway serves the new commit.
