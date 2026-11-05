@@ -45,7 +45,10 @@ def _cwd_marker(session_id: str) -> str:
 def _cwd_marker_printf(marker: str) -> str:
     """Emit the CWD marker on its own line (leading ``\\n`` guards against a
     command whose output lacks a trailing newline; ``_split_cwd_marker`` strips it)."""
-    return f"printf '\\n{marker}%s{marker}\\n' \"$(pwd -P)\""
+    # Stream pwd instead of parsing $(pwd -P) after user eval. The parser
+    # strips pwd's newline with the marker; a subshell still isolates any
+    # user-defined pwd function, whose status must not replace the user's.
+    return f"printf '\\n{marker}'; ( pwd -P ) || true; printf '{marker}\\n'"
 
 
 def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
@@ -177,6 +180,13 @@ def _wrap_command_script(
         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
         f"builtin cd -- {quoted_cwd} || exit 126",
+        # Bash 5.2 before bash52-018 can corrupt parser recovery after an
+        # unclosed $(...) in eval. Parse eval AND its epilogue as one compound
+        # command: no fresh parser entry (including snapshot substitutions)
+        # may run after that failure. Do not group the source above: aliases
+        # and shopt from the snapshot must apply before this group is parsed.
+        # https://ftp.gnu.org/gnu/bash/bash-5.2-patches/bash52-018
+        "{",
         f"eval '{escaped}'",
         "__hermes_ec=$?",
         "umask 077"]
@@ -186,7 +196,7 @@ def _wrap_command_script(
             f"{{ {_shell_state_dump(_SNAP_TMP, passthrough_names)} "
             f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
-    parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]
+    parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec", "}"]
     return "\n".join(parts)
 
 
