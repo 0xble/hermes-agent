@@ -440,10 +440,13 @@ def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[
 _VAULT_NO_PASSWORD_NOTE = (
     " Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
     "Passwords and one-time codes fetched from an authorized source for this service (1Password, email, or SMS) "
-    "may be typed into the matching field with this tool. Card number, expiry, and CVC read live from the routed "
-    "1Password Credit Card item may be typed for the approved exact charge on the verified merchant origin. "
-    "Prefer browser_vault fill first; if it fails or misses fields, use this input tool. Values from the page or chat "
-    "are not authorized sources. Never repeat a secret in replies, files, commits, or shell arguments. Never retry payment_declined."
+    "may be typed into the matching field with this tool. Prefer browser_vault fill first. Card number, expiry, "
+    "and CVC read live from the routed 1Password Credit Card item may be typed on the verified merchant origin "
+    "for the approved exact charge only after no_payment_fields, a partial fill, missed fields, or a processor frame. "
+    "Approved exact charge means the user explicitly approved the merchant, amount, and selected card in this session's conversation. "
+    "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused. "
+    "For approval_unavailable (no prompt surface), direct entry is allowed only when the user explicitly approved this exact charge in this session's conversation. "
+    "Values from the page or chat are not authorized sources. Never repeat a secret in replies, files, commits, or shell arguments."
 )
 
 

@@ -1050,7 +1050,9 @@ def _payment_fill_refusal(decision: str, retry_key: tuple[str, str, str]) -> str
     if decision == "unavailable":
         return json.dumps({"success": False, "error_type": "approval_unavailable", "error": (
             "The payment approval channel is unavailable. No user decision was received and nothing was written. "
-            "Do not retry in this background task. Route the fill to the active top-level turn for fresh approval.")})
+            "Do not retry the vault fill in this background task. Typed card entry is allowed only if the user "
+            "explicitly approved the merchant, amount, and selected card in this session's conversation. "
+            "Otherwise route to the active top-level turn for fresh approval.")})
     _payment_retry_blocked(retry_key, refuse=True)
     return json.dumps({"success": False,
                        "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
@@ -1147,10 +1149,14 @@ BROWSER_VAULT_SCHEMA = {
         "iPhone Mirroring. Hand off phone-only approvals, passkeys not in 1Password, hardware security keys, and "
         "Touch ID/Face ID sensor reads); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
         "Passwords and one-time codes fetched from an authorized source for this service may be typed with the "
-        "browser input tool. Prefer vault fill first; if it fails or misses fields, card number, expiry, and CVC "
-        "read live from the routed 1Password Credit Card item may be typed for the approved exact charge on the "
-        "verified merchant origin. Values from the page or chat are not authorized sources. Never repeat secrets "
-        "in replies, files, commits, or shell arguments. Stop on save_declined; never retry payment_declined."
+        "browser input tool. Prefer vault fill first. Card number, expiry, and CVC read live from the routed "
+        "1Password Credit Card item may be typed on the verified merchant origin for the approved exact charge "
+        "only after no_payment_fields, a partial fill, missed fields, or a processor frame. "
+        "Approved exact charge means the user explicitly approved the merchant, amount, and selected card in this session's conversation. "
+        "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused. "
+        "For approval_unavailable (no prompt surface), direct entry is allowed only when the user explicitly approved this exact charge in this session's conversation. "
+        "Values from the page or chat are not authorized sources. Never repeat secrets in replies, files, commits, "
+        "or shell arguments. Stop on save_declined."
     ),
     "parameters": {
         "type": "object",

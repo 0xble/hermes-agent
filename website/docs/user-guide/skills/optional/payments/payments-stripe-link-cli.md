@@ -143,16 +143,28 @@ For MPP merchants add `--credential-type shared_payment_token`.
 
 ### 5. Retrieve the credential — SECURELY
 
-Keep the spend-request ID for native MPP use below rather than materializing raw
-card credentials in a file. For browser checkout, prefer vault fill; if it fails
-or misses fields, a card number, expiry, and CVC fetched live from the routed
-1Password Credit Card item may be typed for the approved exact charge on the
-verified merchant origin. Never repeat secrets in replies, files, commits, or
-shell arguments. Session-record exposure is owner-accepted for this route.
+Retrieve the approved Link one-time card, not a different card from a password
+manager. Use `--output-file` rather than printing the raw credential to stdout:
+
+```
+link-cli spend-request retrieve <lsrq_id> \
+  --include card \
+  --output-file ~/.hermes/cache/scratch/link-card.json \
+  --format json
+```
+
+The file is written with `0600` permissions; stdout contains redacted metadata and
+its path. Keep the spend-request ID for native MPP use below.
 
 ### 6. Use the credential
 
-- For web checkout: use the vault-first, then authorized live 1Password direct-entry route above.
+- For web checkout: use the retrieved Link one-time card for this approved charge
+  on the verified merchant checkout and its expected processor frame. A supported
+  disk-to-field fill is preferred; direct entry with `browser_type` or `fill_input`
+  is also authorized. Reading the retrieved card for direct entry exposes it to
+  model context, the session record and provider logs; the owner accepts that
+  exposure. Never repeat it in replies, commits, shell arguments or extra files.
+  Do not retry or route around a denied or unanswered Link approval.
 - For MPP merchants:
 
   ```
@@ -164,8 +176,14 @@ shell arguments. Session-record exposure is owner-accepted for this route.
 
 ### 7. Clean up
 
-Do not retain raw payment credentials. Verify the merchant receipt without reading
-back entered secrets; never retry a declined payment.
+Delete the retrieved card file as soon as the purchase is done:
+
+```
+rm -f ~/.hermes/cache/scratch/link-card.json
+```
+
+Verify the merchant receipt without reading back entered secrets; never retry a
+declined payment.
 
 ## Optional: run as an MCP server instead
 
@@ -180,7 +198,7 @@ Then `hermes mcp list` should show `stripe-link`. The same approval rules apply 
 ## Pitfalls
 
 - **US-only.** Outside the US, `auth login` will fail. Tell the user, don't keep retrying.
-- **Direct entry is authorized for live 1Password values.** Model/session exposure is accepted for that route; never repeat the values in replies, files, commits, or shell arguments.
+- **Use the approved Link credential.** Direct entry of the retrieved one-time card is authorized; model/session exposure is accepted for that route. Never substitute a password-manager card or repeat the values in replies, commits, shell arguments or extra files.
 - **`--request-approval` blocks until the user acts.** If the user is asleep, the CLI will hit its timeout. Set expectations.
 - **Multi-step `_next` commands.** Some commands return `_next.command` that must be executed to continue. When in doubt, prefer the inline-polling flags (`--interval`/`--timeout`).
 - **Output format defaults to `toon`** in non-TTY mode. Fine for prose, but if a downstream step needs to parse a specific field, pass `--format json`.
