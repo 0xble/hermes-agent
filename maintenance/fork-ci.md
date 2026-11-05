@@ -384,6 +384,18 @@ checkout, and fails on the previous probe order. Upstream main (after
 each worktree. Retire this probe when the fork adopts a released upstream
 runner with that activation.
 
+## Explicit-interpreter dependency paths
+
+The `fork-ci-reliability` identity covers `scripts/run_tests.sh` preserving the
+Nix devShell interpreter's inherited `PYTHONPATH` across its `env -i` boundary.
+Only the explicit, unactivated `HERMES_PYTHON` lane inherits this path; a normal
+checkout activation still starts with an empty extra path. If the live-gateway
+pytest guard is installed, append its directory instead of replacing the
+interpreter's dependency path. `tests/scripts/test_run_tests_shell.py` runs the
+real shell harness with an import available only through that inherited path,
+both with and without the guard. Retire this adaptation when the supported Nix
+interpreter no longer depends on `PYTHONPATH` for its locked environment.
+
 ## Hosted load-progress fixture isolation
 
 The `fork-ci-reliability` identity covers `tests/hermes_cli/test_load_progress.py`.
