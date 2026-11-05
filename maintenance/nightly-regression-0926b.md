@@ -42,6 +42,21 @@ bytes; SessionDB remains the sole recovery/provenance owner. Its fail-closed
 quarantine behavior and forensic backups are unchanged. Incognito RAM delivery
 continues to bypass on-disk startup.
 
+A failed first ledger open must not strand the newly created zero-byte primary:
+subsequent ledger opens would reject it as a damaged header and SessionDB would
+produce a spurious forensic backup. The shared opener creates the primary with
+`O_EXCL` under the startup lock and retains its device/inode identity. On open,
+initialization or commit failure it removes only that same still-empty primary
+and empty sidecars absent before this attempt, before releasing the lock. Existing,
+replaced or nonempty primaries, pre-existing sidecars and nonempty sidecars remain untouched.
+Retry/preservation regressions cover both ledgers and failures at connection and
+schema initialization. The session-end fixture waits on its recorded futures
+with a 10-second bound instead of an unbounded executor join.
+
+The valid-header ledger fast path remains a follow-up: an existing SQLite header
+alone does not establish that both ledger schemas exist, so this correctness
+repair retains startup locking and schema reconciliation on each connect.
+
 The event-controlled first-opener regression in
 `tests/hermes_state/test_delegation_startup_race.py` is RED before the product
 fix: the real SessionDB quarantines the paused ledger's zero-byte DB and the
