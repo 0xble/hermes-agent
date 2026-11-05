@@ -23,6 +23,23 @@ Guard surfaces: `tests/pm/test_legacy_tar_bootstrap.py`,
 `tests/hermes_cli/test_stale_root_module_bridge.py`, and
 `tests/e2e/core/upgrade/test_fresh_process_entrypoints.py`.
 
+## Nightly fixture boundaries
+
+The PM upgrade origins publish commits on `main`, not GitHub releases. When
+`tests/e2e/core/upgrade/pm/_pm.py` replaces installer config with fake-provider
+settings, it must reapply the per-install `channel: main` record with the
+existing metadata-only `pin_main_channel` helper; never change the product's
+stable channel default to accommodate this fixture. The regression in
+`tests/scripts/test_upgrade_pm_configuration.py` resolves the effective channel
+against an official-origin checkout and checks provider/extra settings too.
+
+The guardian rollback fixture reports synthetic launchd PIDs. Its process
+objects, including wait and kill, must be mocks even on machines where that PID
+happens to exist. `tests/hermes_cli/test_guardian_rollback_restore.py` exercises
+the real reaper's timeout/escalation with a fake process and fails if process
+discovery escapes to the host. Keep live-system and upgrade sandbox guards
+intact. These fixture rules remain until upstream carries equivalent coverage.
+
 Contribution decision: narrow fork repair for the nightly upgrade qualifier;
 no upstream publication is authorized here. Upstream disposition: not adopted
 in the accepted baseline. Fork delivery: draft PR, not runtime activation.
