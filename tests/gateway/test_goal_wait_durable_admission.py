@@ -42,6 +42,8 @@ async def parked(tmp_path, monkeypatch):
     manager.set('finish the disposable goal')
     manager.wait_for_seconds(1, 'wait for disposable evidence')
     manager.state.waiting_until = time.time() - 1
+    manager.state.last_wait_notice_key = 'unchanged-park-notice'
+    manager.state.last_continuation_notice_key = 'unchanged-continuation-notice'
     manager._save()
     # Leave admitted wakes queued so the assertions observe the commit, not a model verdict.
     monkeypatch.setattr(authority, '_schedule', lambda *args: None)
@@ -130,6 +132,8 @@ async def test_refusal_keeps_exact_wait_then_retry_admits_once(parked, monkeypat
     current = goals.load_goal(sid)
     assert current.waiting_since == 0
     assert current.last_automatic_continuation_at > 0
+    assert current.last_wait_notice_key == before.last_wait_notice_key
+    assert current.last_continuation_notice_key == before.last_continuation_notice_key
     assert runner._get_replay_scheduler().gate.load() == 1
 
 
@@ -157,7 +161,7 @@ async def test_private_goal_receipt_is_idempotent_and_metadata_is_not_a_capabili
     child = sid + '-compressed'
     authority.db.create_session(child, 'discord', parent_session_id=sid)
     authority.db.end_session(sid, 'context_compressed')
-    runner.session_store.sync_session_id(key, child)
+    runner.session_store.advance_compression_session(key, sid, child)
     newer = captured_event(runner, source, child, manager)
     newer.metadata['goal_continuation_created_at'] += 100
     assert goal_wait_identity(authority, child, manager.state) == identity
@@ -202,20 +206,19 @@ async def test_goal_ack_and_admission_are_one_fenced_transaction(parked, monkeyp
     runner, adapter, authority, source, sid, key, manager, rows, _ = parked
     event = captured_event(runner, source, sid, manager)
     identity = goal_wait_identity(authority, sid, manager.state)
-    if change == 'new_wait':
-        manager.wait_for_seconds(60, 'newer wait')
-    elif change == 'definition':
-        manager.set('replacement goal')
-    elif change == 'edit':
+    def edit():
         manager.state.goal = 'same instance but revised definition'
         manager._save()
-    elif change == 'pause':
-        manager.pause('user pause')
-    elif change == 'reset':
-        runner.session_store.reset_session(key)
-    elif change == 'insert_failure':
+
+    def refuse_insert():
         authority.db._execute_write(lambda conn: conn.execute('''CREATE TRIGGER refuse_goal_admission
             BEFORE INSERT ON session_admissions BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END'''))
+
+    {'new_wait': lambda: manager.wait_for_seconds(60, 'newer wait'),
+     'definition': lambda: manager.set('replacement goal'),
+     'edit': edit, 'pause': lambda: manager.pause('user pause'),
+     'reset': lambda: runner.session_store.reset_session(key),
+     'insert_failure': refuse_insert}[change]()
     before = goals.load_goal(sid).to_json()
     import sqlite3
     try:
@@ -289,6 +292,14 @@ async def test_duplicate_watchers_and_new_wait_generation_admit_once_each(parked
     await asyncio.gather(*(runner._goal_wakeup_fire_one(sid) for _ in range(3)))
     assert len(rows()) == 1
     old_identity = rows()[0]['request_id']
+    # Let the admitted row finish before arming a new wait; queued work correctly
+    # suppresses a second watcher dispatch for that route.
+    monkeypatch.setattr(authority, '_schedule', type(authority)._schedule.__get__(authority))
+    from gateway.session_contract import SessionRef
+    authority._schedule(SessionRef(authority.profile_id, sid))
+    await async_wait_until(lambda: rows()[0]['status'] == 'terminal', timeout=20,
+                           what='first wait generation terminal')
+    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     fresh = goals.GoalManager(sid)
     fresh.wait_for_seconds(1, reason='second wait generation')
     monkeypatch.setattr(goals.time, 'time', lambda: fresh.state.waiting_until + 600)
@@ -309,6 +320,30 @@ async def test_background_full_keeps_wait_without_admission(parked, monkeypatch)
     assert goals.load_goal(sid).to_json() == before
     assert rows() == []
     adapter_calls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admitted_goal_lost_head_settles_interrupted_not_human_loss(parked):
+    from gateway.session_contract import SessionRef
+    from gateway.session_settlement_recovery import recover_failed_settlement
+    from gateway.session_unattended_unknown import settle_unattended_unknown
+    from hermes_state_runtime import claim_session_input
+    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
+    runner, adapter, authority, source, sid, key, manager, rows, _ = parked
+    await runner._goal_wakeup_fire_one(sid)
+    claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=sid)
+    assert isinstance(claimed, dict)
+    authority.db.append_message(sid, 'user', claimed['payload']['text'])
+    await recover_failed_settlement(authority, claimed)
+    ref = SessionRef(authority.profile_id, sid)
+    assert rows()[0]['status'] == 'unknown'
+    assert await settle_unattended_unknown(authority, ref) is True
+    assert (rows()[0]['status'], rows()[0]['outcome']) == ('terminal', 'interrupted')
+    assert goals.load_goal(sid).waiting_since == 0
+    assert await settle_unattended_unknown(authority, ref) is False
+    notices = [m['content'] for m in authority.db.get_messages(sid)
+               if m.get('display_kind') == 'failed_turn']
+    assert notices == [AUTOMATION_INTERRUPTED_NOTICE]
 
 
 @pytest.mark.asyncio
