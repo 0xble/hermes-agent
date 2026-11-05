@@ -519,6 +519,14 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const raw = [heading, container.parentElement && container.parentElement.textContent || ""].join(" ").replace(/\\s+/g, " ").trim();
     return { text: raw.slice(0, 300), truncated: raw.length > 300 };
   };
+  // Wrapping labels include select options or a button's current value in
+  // textContent. Those are widget state, not semantic label evidence.
+  const labelText = (label) => {
+    const copy = label.cloneNode(true);
+    copy.querySelectorAll('input, select, textarea, button, [role=combobox], [role=listbox]')
+      .forEach(control => control.remove());
+    return copy.textContent || "";
+  };
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.matches(":disabled") || element.readOnly) return [];
@@ -526,11 +534,11 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
         !["combobox", "listbox"].includes(element.getAttribute("role"))) return [];
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
-    const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
+    const labels = element.labels ? Array.from(element.labels, labelText) : [];
     if (!labels.length && element.parentElement &&
         element.parentElement.querySelectorAll('input, select, [role=combobox], [role=listbox]').length === 1) {
       labels.push(...Array.from(element.parentElement.children)
-        .filter(n => n.tagName === "LABEL").map(n => n.textContent || ""));
+        .filter(n => n.tagName === "LABEL").map(labelText));
     }
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)

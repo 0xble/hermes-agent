@@ -162,6 +162,10 @@ def test_merchant_shaped_brand_reset_and_address_fixture(bridge, fixture):
     ctx=inspected(call, ready['origin'])
     card={**CARD, 'card_number':'5555555555554444', 'billing_postal_code':'98000'}
     selected, ambiguous=payment.plan([ctx],card)
+    assert {'cc-exp-month', 'cc-exp-year'} <= {c.token for c in ctx['classified']}
+    if fixture == 'northwest':
+        assert [c.control.label.strip() for c in ctx['classified']
+                if c.token in {'cc-exp-month', 'cc-exp-year'}] == ['Expiration month', 'Expiration year']
     def evaluate(task, expression):
         response=call('eval',expression=expression)
         return {'success':response['ok'],'result':response.get('result')}

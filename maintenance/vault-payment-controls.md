@@ -17,6 +17,8 @@ requirement; CamelCase identifiers do not loosen that gate. Native submit/reset/
 default-submit buttons (including ancestors) are never clicked for ARIA targets.
 Card brand is derived and selected before PAN/expiry to avoid framework resets.
 Secret evaluation contains rejected promises inside the page before transport.
+Wrapping-label evidence excludes descendant widget state (button text and select
+options), so `Expiration month` remains classifiable when its trigger displays `MM`.
 
 The existing Camofox evaluate route discovers direct processor frames using an
 exact-origin allowlist. Opaque IDs bind the current merchant and processor
