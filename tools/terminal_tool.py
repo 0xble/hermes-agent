@@ -44,10 +44,6 @@ def _redact_terminal_error_text(value: Any) -> str:
 from tools.registry import tool_error
 from tools.terminal_tool_lifecycle import (
     _call_in_flight, _cleanup_inactive_envs, _create_configured_env,
-    _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
-)
-from tools.terminal_tool_lifecycle import (
-    _cleanup_inactive_envs, _create_configured_env,
     _evict_environment_for_task, _local_shell_owner, cleanup_all_environments, ensure_task_env,
 )
 from tools.terminal_tool_config import (
