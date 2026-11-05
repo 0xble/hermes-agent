@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import errno
 import json
 import socket
-from threading import Thread
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,8 +26,14 @@ from agent.turn_retry_state import TurnRetryState
 
 
 @contextmanager
-def _server():
-    requests = []
+def _server(port=0):
+    class Requests(list):
+        status = 200
+        malformed = False
+        disconnect = False
+        read_timeout_models = frozenset()
+
+    requests = Requests()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -35,24 +41,52 @@ def _server():
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-            if not self.path.endswith('/chat/completions'):
+            if not self.path.endswith(('/chat/completions', '/responses')):
                 self.send_error(404)
                 return
             requests.append(body)
-            data = json.dumps({
+            if body['model'] in requests.read_timeout_models:
+                Event().wait(0.25)
+                return
+            if requests.disconnect:
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
+            if requests.status != 200:
+                self.send_error(requests.status)
+                return
+            if requests.malformed:
+                data = b'{"choices": []}'
+            else:
+                data = json.dumps({
                 'id': 'local', 'object': 'chat.completion', 'created': 1,
                 'model': body['model'],
                 'choices': [{'index': 0, 'finish_reason': 'stop',
                              'message': {'role': 'assistant', 'content': 'Grok actually answered.'}}],
                 'usage': {'prompt_tokens': 1, 'completion_tokens': 4, 'total_tokens': 5},
-            }).encode()
+                }).encode()
+            content_type = 'application/json'
+            if self.path.endswith('/responses') and not requests.malformed:
+                response = {
+                    'id': 'resp_local', 'object': 'response', 'created_at': 1,
+                    'status': 'completed', 'model': body['model'],
+                    'output': [{'id': 'msg_local', 'type': 'message', 'status': 'completed',
+                                'role': 'assistant', 'content': [{'type': 'output_text',
+                                'text': 'Grok actually answered.', 'annotations': []}]}],
+                    'usage': {'input_tokens': 1, 'output_tokens': 4, 'total_tokens': 5},
+                }
+                events = [{'type': 'response.output_text.delta', 'item_id': 'msg_local',
+                           'output_index': 0, 'content_index': 0, 'delta': 'Grok actually answered.'},
+                          {'type': 'response.completed', 'response': response}]
+                data = ''.join(f'event: {e["type"]}\ndata: {json.dumps(e)}\n\n' for e in events).encode()
+                content_type = 'text/event-stream'
             self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -77,15 +111,18 @@ def routes(monkeypatch):
         }, 'model': {'context_length': 256000}, 'agent': {'auto_recover': {'enabled': False}}}
         monkeypatch.setattr('hermes_cli.config.load_config', lambda: config)
         monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda: config)
+        monkeypatch.setattr('hermes_cli.config.read_raw_config_readonly', lambda: config)
         monkeypatch.setenv('XAI_BASE_URL', healthy)
         yield dead, healthy, config, requests
 
 
-def _agent(routes):
+def _agent(routes, *, responses=False):
     from run_agent import AIAgent
     dead, healthy, config, requests = routes
     chain = [{'provider': p, 'model': m} for p, m in [
         ('custom:claude', 'Claude'), ('custom:muse', 'Muse'), ('custom:sol', 'Sol'), ('xai-oauth', 'Grok')]]
+    if responses:
+        chain[-1]['api_mode'] = 'codex_responses'
     with patch('model_tools.get_tool_definitions', return_value=[]), \
             patch('model_tools.check_toolset_requirements', return_value={}):
         agent = AIAgent(provider='custom:sol', model='Sol', api_key='local-test-only', base_url=dead,
@@ -259,14 +296,14 @@ def test_next_turn_clears_failed_domain_and_primary_can_recover(routes):
     with _run_locally(agent, routes):
         first = agent.run_conversation('first')
         assert first['final_response'] == 'Grok actually answered.'
-        # Return the primary to a working socket between turns; the turn-local failure
-        # must not blacklist even the same provider or preserve the old attempt ledger.
-        agent._primary_runtime['base_url'] = routes[1]
-        agent._primary_runtime['client'] = openai.OpenAI(api_key='local-test-only', base_url=routes[1], max_retries=0)
-        second = agent.run_conversation('second')
+        # Bring back the exact previously refused socket, with no runtime/config edits.
+        from urllib.parse import urlsplit
+        with _server(port=urlsplit(routes[0]).port) as (_, recovered_requests):
+            second = agent.run_conversation('second')
+        assert [r['model'] for r in recovered_requests] == ['Sol']
     assert second['final_response'] == 'Grok actually answered.'
     assert agent.provider == 'custom:sol'
-    assert [r['model'] for r in routes[3]] == ['Grok', 'Sol']
+    assert [r['model'] for r in routes[3]] == ['Grok']
     assert getattr(agent, '_turn_failed_endpoints', []) == []
     assert [i.model for i in agent._turn_attempted_routes] == ['sol']
 
@@ -300,3 +337,102 @@ def test_full_turn_at_switch_cap_still_requests_the_independent_route(routes):
     assert result['final_response'] == 'Grok actually answered.'
     assert activated == ['xai-oauth']
     assert [r['model'] for r in routes[3]] == ['Grok']
+
+
+@pytest.mark.parametrize("malformed,streaming", [(False, False), (True, False), (False, True)])
+def test_reserved_route_failure_is_one_request_without_retry_or_further_activation(routes, malformed, streaming):
+    from functools import wraps
+    agent = _agent(routes)
+    routes[3].status = 200 if malformed else 503
+    routes[3].malformed = malformed
+    agent._disable_streaming = not streaming
+
+    @wraps(apply_retry_restarts)
+    def at_cap(agent, **kwargs):
+        if agent.model == 'Grok' and kwargs['_retry'].restart_with_rebuilt_messages:
+            kwargs['restart_count'] = 3
+        return apply_retry_restarts(agent, **kwargs)
+
+    with _run_locally(agent, routes) as activated, \
+            patch('agent.conversation_loop.apply_retry_restarts', new=at_cap):
+        result = agent.run_conversation('answer at the cap')
+    assert result['failed'] is True
+    assert activated == ['xai-oauth']
+    assert [r['model'] for r in routes[3]] == ['Grok']
+    assert [i.model for i in agent._turn_attempted_routes] == ['sol', 'grok']
+    if not malformed:
+        assert 'Requested routes: Sol via custom:sol, Grok via xai-oauth.' in result['final_response']
+
+
+def test_real_metadata_loader_projects_secrets_before_expansion(tmp_path, monkeypatch):
+    from agent.route_binding import resolve_route_identity
+    from hermes_cli import config as cfg
+    path = tmp_path / 'route-metadata.yaml'
+    path.write_text('providers:\n  shared:\n    base_url: http://127.0.0.1:8317/v1\n'
+                    '    api_key: ${UNRELATED_TOKEN}\n    key_env: NEVER_READ_TOKEN\n'
+                    'auxiliary:\n  compression:\n    api_key: ${OTHER_TOKEN}\n')
+    monkeypatch.setattr(cfg, 'get_config_path', lambda: path)
+    monkeypatch.setattr(cfg, 'read_raw_config_readonly', lambda: cfg._read_raw_config_impl(want_deepcopy=False))
+    monkeypatch.setattr(cfg.managed_scope, 'load_managed_config', lambda: {
+        'providers': {'shared': {'base_url': 'http://127.0.0.1:9999/v1', 'api_key': '${MANAGED_TOKEN}'}}})
+    lookup = cfg._env_ref_lookup
+
+    def no_credentials(key):
+        assert 'TOKEN' not in key, f'credential read: {key}'
+        return lookup(key)
+
+    monkeypatch.setattr(cfg, '_env_ref_lookup', no_credentials)
+    with patch('hermes_cli.runtime_provider_custom.get_secret_str', side_effect=AssertionError('credential read')), \
+            patch('agent.auxiliary_client.resolve_provider_client', side_effect=AssertionError('activation')):
+        identity = resolve_route_identity({'provider': 'custom:shared', 'model': 'Sol'})
+    assert identity.base_url == 'http://127.0.0.1:9999/v1'
+
+
+def test_connection_domain_is_socket_scoped_and_idempotent():
+    left = _identity('http://user:secret@example.test:443/one?token=secret').connection_domain()
+    right = _identity('https://example.test/two').connection_domain()
+    assert same_endpoint(left, right)
+    assert left.connection_domain() == left
+    assert 'secret' not in left.base_url
+    assert not same_endpoint(left, _identity('http://example.test').connection_domain())
+
+
+def test_real_read_timeout_still_requests_sibling_on_shared_socket(routes):
+    dead, healthy, config, requests = routes
+    for definition in config['providers'].values():
+        definition['base_url'] = healthy
+    local_routes = healthy, healthy, config, requests
+    requests.read_timeout_models = {'Sol'}
+    agent = _agent(local_routes)
+    agent._client_kwargs['timeout'] = httpx.Timeout(0.05)
+    with _run_locally(agent, local_routes) as activated:
+        result = agent.run_conversation('allow sibling after read timeout')
+    assert result['final_response'] == 'Grok actually answered.'
+    assert activated == ['custom:claude']
+    assert requests[-1]['model'] == 'Claude'
+    assert agent._turn_failed_endpoints == []
+
+
+
+
+@pytest.mark.parametrize('disconnect', [False, True])
+def test_independent_responses_route_has_one_physical_request_at_cap(routes, disconnect):
+    from functools import wraps
+    agent = _agent(routes, responses=True)
+    routes[3].disconnect = disconnect
+
+    @wraps(apply_retry_restarts)
+    def at_cap(agent, **kwargs):
+        if agent.model == 'Grok' and kwargs['_retry'].restart_with_rebuilt_messages:
+            kwargs['restart_count'] = 3
+        return apply_retry_restarts(agent, **kwargs)
+
+    with _run_locally(agent, routes) as activated, \
+            patch('agent.conversation_loop.apply_retry_restarts', new=at_cap):
+        result = agent.run_conversation('answer using the independent Responses route')
+    assert activated == ['xai-oauth']
+    assert [r['model'] for r in routes[3]] == ['Grok']
+    if disconnect:
+        assert result['failed'] is True
+    else:
+        assert result['final_response'] == 'Grok actually answered.'

@@ -1150,7 +1150,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
     transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ReadError, _httpx.ConnectError, ConnectionError)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    max_stream_retries, model = 1, api_kwargs.get("model")
+    max_stream_retries = 0 if getattr(agent, "_turn_independent_attempt_active", False) is True else 1
+    model = api_kwargs.get("model")
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
     # Retirement token for THIS request (installed by ``interruptible_api_call``). A watchdog that kills the

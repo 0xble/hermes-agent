@@ -1273,6 +1273,8 @@ def max_retries_exhausted_result(
             "happens when it writes a very large file in one go. Ask me to write the file in "
             "smaller sections (or via execute_code with Python's open())."
         )
+    from agent.fallback_endpoint_domain import append_attempt_summary
+    _final_response = append_attempt_summary(agent, _final_response)
     result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary)
     result.update({
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall
@@ -1826,7 +1828,9 @@ def route_classified_error(
     )
     from agent.conversation_loop import _arm_fallback_restart, _compression_deferred_result, _ra
     from agent.model_metadata import estimate_request_tokens_rough
+    from agent.fallback_endpoint_domain import note_endpoint_failure
 
+    note_endpoint_failure(agent, classified)
     _provider_overflow_recovery_pending = False
     is_rate_limited = False
     _wrapped_output_cap_budget = None

@@ -79,10 +79,12 @@ def handle_api_error(
     if agent.thinking_callback:
         agent.thinking_callback("")
 
-    _recovered, active_system_prompt = recover_before_classification(
-        agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
-        active_system_prompt=active_system_prompt,
-    )
+    _recovered = False
+    if getattr(agent, "_turn_independent_attempt_active", False) is not True:
+        _recovered, active_system_prompt = recover_before_classification(
+            agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
+            active_system_prompt=active_system_prompt,
+        )
     if _recovered:
         return _verdict("continue")
 
@@ -141,6 +143,19 @@ def handle_api_error(
         retry_count=retry_count, max_retries=max_retries, retryable=classified.retryable,
         reason=classified.reason.value,
     )
+
+    if getattr(agent, "_turn_independent_attempt_active", False) is True:
+        from agent.fallback_endpoint_domain import note_endpoint_failure
+        note_endpoint_failure(agent, classified)
+        _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        return _verdict("return", max_retries_exhausted_result(
+            agent, api_error, classified, attempts=1,
+            is_rate_limited=classified.reason == FailoverReason.rate_limit,
+            error_msg=str(api_error).lower(), api_kwargs=api_kwargs, api_messages=api_messages,
+            messages=messages, conversation_history=conversation_history, api_call_count=api_call_count,
+            approx_tokens=approx_tokens, provider=agent.provider, base_url=agent.base_url,
+            model=agent.model, delivered=_delivered,
+        ))
 
     _recovered, recovered_with_pool = recover_after_classification(
         agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,

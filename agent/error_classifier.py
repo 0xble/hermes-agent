@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
+from agent.backend_identity import FailureScope
+
 logger = logging.getLogger(__name__)
 
 # Synthetic code for the OpenAI SDK rejecting a provider's SSE ``data:`` field
@@ -123,6 +125,7 @@ class ClassifiedError:
     should_compress: bool = False
     should_rotate_credential: bool = False
     should_fallback: bool = False
+    failure_scope: FailureScope = FailureScope.MODEL
 
     @property
     def is_auth(self) -> bool:
@@ -1105,7 +1108,34 @@ def classify_api_error(
         if host:
             message = f"{message} (endpoint: {host})"
     base = {"status_code": status_code, "provider": provider, "model": model, "message": message}
-    return ClassifiedError(**{**base, **verdict})
+    scope = FailureScope.ENDPOINT if status_code is None and _proven_connect_failure(error) else FailureScope.MODEL
+    return ClassifiedError(**{**base, **verdict, "failure_scope": scope})
+
+
+def _proven_connect_failure(error: Exception) -> bool:
+    """Require transport evidence, not the SDK's generic 'Connection error'."""
+    import errno
+    import socket
+    nodes, seen = [], set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        nodes.append(current)
+        current = current.__cause__ or current.__context__
+    # Read timeouts and HTTP refusals prove the socket was reachable.
+    if any(type(e).__name__ in {"ReadTimeout", "ReadTimeoutError"} or
+           getattr(e, "status_code", None) is not None for e in nodes):
+        return False
+    connect_errnos = {errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH,
+                      getattr(errno, "EHOSTDOWN", errno.EHOSTUNREACH)}
+    markers = ("connection refused", "name or service not known", "nodename nor servname provided",
+               "temporary failure in name resolution", "getaddrinfo failed", "network is unreachable",
+               "host is unreachable", "host is down", "no route to host")
+    return any(isinstance(e, (socket.gaierror, ConnectionRefusedError)) or
+               (isinstance(e, OSError) and e.errno in connect_errnos) or
+               type(e).__name__ == "ConnectTimeout" or
+               (type(e).__name__ in {"ConnectError", "ConnectionError", "NewConnectionError", "APIConnectionError"}
+                and any(marker in str(e).lower() for marker in markers)) for e in nodes)
 
 
 def _off_route_host(c: _Ctx) -> str:

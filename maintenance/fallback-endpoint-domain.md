@@ -12,7 +12,9 @@ Contract tests: `tests/agent/test_fallback_endpoint_domain.py`.
 - Walk the configured chain monotonically. Explicit endpoint overrides and different ports
   remain independent routes.
 - Keep the normal rebuilt-message restart cap. At the cap, allow at most one bounded request
-  on an unvisited independent domain after a proven connection failure.
+  on an unvisited independent domain after a proven connection failure. Keep that allowance
+  through response validation; invalid 200s, streaming retries, Responses reconnects and
+  same-attempt transport repairs cannot turn it into another request/retry loop.
 - Reset domain failures and attempted-route evidence for the next turn. Attempt summaries
   name requested routes, not aliases merely activated, skipped, or configured.
 - Distinguish switch-limit termination from actual route exhaustion.

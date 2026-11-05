@@ -3673,7 +3673,7 @@ explainer:
     partial_stream_recovery: "streaming stopped early and only a partial response was recovered. Send `continue` to resume from where it stopped."
     fallback_prior_turn_content: "no new content was produced this turn; showing recovered prior context. Send `continue` to retry."
     redirect_restart_limit_exceeded: "the request was cancelled by a new correction on every attempt, so the turn stopped instead of retrying forever. Your last correction is queued as the next message."
-    rebuilt_restart_limit_exceeded: "every provider in the fallback chain kept failing over, so the turn stopped instead of retrying forever. Send `continue` or switch provider."
+    rebuilt_restart_limit_exceeded: "the route switch limit was reached. Requested routes: {routes}. Other configured routes may not have been tried. Send `continue` or switch provider."
     budget_exhausted: "the per-turn iteration/cost budget was exhausted before a final answer. Send `continue` to keep going."
     ollama_runtime_context_too_small: "the local model's context window was too small to finish. Increase the context size or use a larger model."
     pending_tool_result: "the turn stopped while a tool result was still pending and the model produced no follow-up text. Send `continue` to let it summarize."
@@ -3700,6 +3700,9 @@ explainer:
     failed: "failed"
   shared:
     and_more: "  • … and {count} more"
+    no_routes_requested: "none recorded"
+    attempted_routes: "Requested routes: {routes}."
+    chain_exhausted: "The fallback chain was exhausted; no eligible route remains."
     the_model: "The model"
 
 tips:

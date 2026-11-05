@@ -536,7 +536,10 @@ def apply_retry_restarts(
         return _verdict("continue")
 
     if _retry.restart_with_rebuilt_messages:
-        restart_count += 1
+        from agent.fallback_endpoint_domain import reserve_independent_attempt
+        _independent_attempt = restart_count >= max_retries and reserve_independent_attempt(agent)
+        if not _independent_attempt:
+            restart_count += 1
         if restart_count > max_retries:
             # A stall/failure keeps re-escalating to the fallback chain: stop refunding the
             # iteration budget and re-issuing, or a runaway turn holds the turn lease
