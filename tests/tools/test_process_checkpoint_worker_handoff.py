@@ -10,7 +10,6 @@ import subprocess
 import sys
 import time
 
-import psutil
 import pytest
 
 from tests.waiting import process_alive

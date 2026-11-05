@@ -87,6 +87,5 @@ threading.Event().wait(30)
             child.kill()
         child.wait(timeout=5)
         if ready.with_suffix('.tool').exists():
-            import psutil
             tool_pid = int(ready.with_suffix('.tool').read_text())
             kill_if_alive(tool_pid)  # only the exact tool spawned by this test

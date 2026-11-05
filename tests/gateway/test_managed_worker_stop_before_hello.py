@@ -5,7 +5,6 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-import psutil
 import pytest
 
 from gateway.session_contract import Principal, SessionRef

@@ -11,11 +11,11 @@ import sys
 import tempfile
 import threading
 import time
-import psutil
+from unittest.mock import ANY, MagicMock, patch
+
 import pytest
 
 from tests.waiting import process_alive
-from unittest.mock import ANY, MagicMock, patch
 
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
