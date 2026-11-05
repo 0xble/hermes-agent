@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
+from hermes_cli.plugin_injection import GatewayInjectionHandle
 from registration_lifecycle import replacement_coordinator
 from utils import env_var_enabled
 from hermes_cli.config import load_config_readonly
@@ -598,7 +599,8 @@ class PluginContext(PluginCapabilityCtxMixin):
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         origin: Mapping[str, Any] | None = None,
-    ) -> bool:
+        await_dispatch: bool = False, correlation_id: str | None = None,
+    ) -> bool | GatewayInjectionHandle:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
         CLI uses the attached REPL queues. Ink TUI and desktop use a separate injector
@@ -609,10 +611,16 @@ class PluginContext(PluginCapabilityCtxMixin):
         chat's session in THIS plugin's own profile and runs a turn there; the plugin cannot
         target another profile. Non-CLI injection needs ``session_key`` or ``origin`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
-        ``True`` means a host accepted the request, not that the turn completed.
+        By default ``True`` acknowledges scheduling, not durable admission. Opt in
+        with ``await_dispatch=True`` for an awaitable ``GatewayInjectionHandle``;
+        a worker thread may use ``handle.result(timeout=30)`` instead. Its result
+        carries ``accepted``, ``admission_id`` (under an authority), ``reason`` and
+        ``correlation_id``. Timeout/cancellation after possible commit is
+        indeterminate, never retry-safe. This waits for admission, not the turn.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin,
+                                     await_dispatch=await_dispatch, correlation_id=correlation_id)
 
     def session_cwd(self) -> str:
         """The calling session's recorded cwd, never the gateway's own (``plugin_session``)."""
@@ -1197,7 +1205,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """Return whether a live gateway can accept plugin-triggered turns."""
         return self._gateway_message_injector is not None
 
-    def set_gateway_message_injector(self, owner: object, injector: Callable[..., bool]) -> None:
+    def set_gateway_message_injector(self, owner: object, injector: Callable[..., bool | GatewayInjectionHandle]) -> None:
         """Publish a live gateway injector and its lifecycle owner."""
         self._gateway_message_injector = (owner, injector)
 
@@ -1206,9 +1214,15 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         if self._gateway_message_injector is not None and self._gateway_message_injector[0] is owner:
             self._gateway_message_injector = None
 
-    def inject_gateway_message(self, **kwargs: Any) -> bool:
+    def inject_gateway_message(self, **kwargs: Any) -> bool | GatewayInjectionHandle:
         """Submit a plugin-triggered turn to the live gateway."""
         registered = self._gateway_message_injector
+        if kwargs.get("await_dispatch"):
+            from hermes_cli.plugin_injection import immediate_result
+            if registered is None:
+                return immediate_result(False, "gateway_unavailable", session_key=kwargs.get("session_key"),
+                                        correlation_id=kwargs.get("correlation_id"))
+            return registered[1](**kwargs)
         return registered is not None and bool(registered[1](**kwargs))
 
     @property
@@ -1590,7 +1604,7 @@ def _known_plugin_managers() -> list[PluginManager]:
     return managers
 
 
-def publish_gateway_message_host(owner: object, injector: Callable[..., bool]) -> None:
+def publish_gateway_message_host(owner: object, injector: Callable[..., bool | GatewayInjectionHandle]) -> None:
     """Remember the process gateway host and stamp managers that already exist."""
     global _published_gateway_message_injector
     # Keep publication + stamping atomic with owner-safe clear. Managers created concurrently are

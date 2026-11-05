@@ -6,6 +6,7 @@ import json
 import socket
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -26,6 +27,14 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def _socket_tmpdir(short_sock_dir, monkeypatch):
+    import tempfile
+
+    monkeypatch.setenv("TMPDIR", str(short_sock_dir))
+    monkeypatch.setattr(tempfile, "tempdir", str(short_sock_dir))
+
+
 @pytest.fixture()
 def home(tmp_path: Path) -> Path:
     d = tmp_path / "home" / ".hermes"
@@ -42,27 +51,13 @@ def _serve(home: Path, handlers=None):
 # Path resolution
 # ---------------------------------------------------------------------------
 
-def test_short_home_binds_in_home(tmp_path: Path):
-    # A home short enough for sun_path binds in-home with no pointer.
-    # tmp_path can exceed the limit on CI runners, so build one in the
-    # system temp root directly.
-    import tempfile
-
-    try:
-        short_root = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
-    except OSError:
-        pytest.skip("/tmp not writable on this host")
-    try:
-        short_home = short_root / ".hermes"
-        short_home.mkdir()
-        assert len(str(short_home / "gateway.sock").encode()) <= 100
-        bind, pointer = resolve_server_socket_path(short_home)
-        assert bind == short_home / "gateway.sock"
-        assert pointer is None
-    finally:
-        import shutil
-
-        shutil.rmtree(short_root, ignore_errors=True)
+def test_short_home_binds_in_home(short_sock_dir):
+    short_home = short_sock_dir / ".hermes"
+    short_home.mkdir()
+    assert len(str(short_home / "gateway.sock").encode()) <= 100
+    bind, pointer = resolve_server_socket_path(short_home)
+    assert bind == short_home / "gateway.sock"
+    assert pointer is None
 
 
 def test_long_home_uses_pointer_fallback(tmp_path: Path):
@@ -214,7 +209,8 @@ def test_stop_removes_socket_and_pointer(home: Path):
             home, verb_handlers={"identify": lambda: {"pid": 1}}
         )
         assert await server.start()
-        bind, _ = resolve_server_socket_path(home)
+        # The private fallback may differ from the predictable candidate.
+        bind = cast(Path, server._bind_path)
         assert bind.exists()
         await server.stop()
         return bind

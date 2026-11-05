@@ -12,16 +12,15 @@ path — including the in-flight cron drain floor from #86684.
 import asyncio
 import json
 import os
-import shutil
 import socket
 import sys
-import tempfile
 import threading
 import time
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+from tests.socket_paths import short_socket_dir
 
 import hermes_cli.gateway as gateway_cli
 from gateway.shutdown_watchdog import (
@@ -46,20 +45,9 @@ _NEEDS_UNIX_SOCKETS = pytest.mark.skipif(
 
 @pytest.fixture()
 def tmp_path():
-    """Short-path override for this module (macOS AF_UNIX ~104-byte limit).
-
-    The loop-tick witness tests bind real UNIX sockets under HERMES_HOME.
-    pytest's default tmp_path nests deep enough on macOS that
-    ``state/gateway.loop-tick.<pid>.sock`` exceeds the sockaddr_un limit and
-    ``bind()`` raises ``OSError: AF_UNIX path too long``. A mkdtemp directly
-    under the system temp root keeps the socket path well under the limit
-    on every platform.
-    """
-    path = Path(tempfile.mkdtemp(prefix="hwg-"))
-    try:
+    """Keep real loop-tick witnesses inside the approved socket-sized root."""
+    with short_socket_dir("state/gateway.loop-tick.2147483647.sock") as path:
         yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
 
 def _write_heartbeat(home, pid, age_s=0.0):
     """Write a heartbeat file for ``pid`` whose mtime is ``age_s`` old."""

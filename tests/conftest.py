@@ -31,6 +31,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture
+def short_sock_dir():
+    """Shared socket-safe root, including the legacy discovery directory suffix."""
+    from tests.socket_paths import short_socket_dir
+
+    with short_socket_dir("hermes-gw-" + "x" * 16 + "/control.sock") as path:
+        yield path
+
+
 def reset_pm_path_cache() -> None:
     """Drop the per-process terminal PATH composition cache between tests.
 
