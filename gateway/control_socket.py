@@ -44,6 +44,12 @@ _DEFAULT_CLIENT_TIMEOUT = 2.0
 _SOCKET_UNSUPPORTED_ERRNOS = frozenset({errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
+def _foreign_socket_node(bind_path: Path) -> bool:
+    """Inspect a fallback node off-loop without changing the ownership checks."""
+    return os.path.lexists(bind_path) and (
+        bind_path.is_symlink() or bind_path.lstat().st_uid != os.getuid())  # windows-footgun: ok — POSIX listener
+
+
 def _home_hash(home: Path) -> str:
     return hashlib.sha256(os.path.normcase(str(Path(home).expanduser().resolve(strict=False))).encode("utf-8")).hexdigest()[:16]
 
@@ -268,8 +274,7 @@ class GatewayControlServer:
                 # Some sandboxed temp roots deny metadata reads even though a child can be created.
                 # Treat that as unsafe and use the unpredictable private root below it.
                 private = False
-            foreign = os.path.lexists(bind_path) and (
-                bind_path.is_symlink() or bind_path.lstat().st_uid != os.getuid())  # windows-footgun: ok — POSIX listener
+            foreign = await asyncio.to_thread(_foreign_socket_node, bind_path)
             if not private or foreign:
                 # A shared temp root (or another user's node at the predictable name) must not stop the
                 # gateway: bootstrap treats a missing listener as fatal, so use an unpredictable private root.
