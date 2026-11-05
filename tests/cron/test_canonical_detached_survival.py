@@ -19,6 +19,8 @@ import time
 
 import pytest
 
+from tests.waiting import process_alive
+
 from tests.gateway.fixtures.local_recovery_probe import child_env, daemon
 
 
@@ -169,8 +171,7 @@ scheduler.run_one_job(job, adapters=None, loop=None)
             if lose_worker:
                 os.killpg(worker_pid, signal.SIGKILL)
                 # The unknown path must not replay an agent or its pending tool.
-                wait_for(lambda: not psutil.pid_exists(worker_pid)
-                    or psutil.Process(worker_pid).status() == psutil.STATUS_ZOMBIE)
+                wait_for(lambda: not process_alive(worker_pid))
         with daemon(root, home, env, barrier=False) as (_, _desc):
             if lose_worker:
                 rows = wait_for(lambda: admissions() if admissions()[0]['status'] == 'terminal' else None)

@@ -22,7 +22,7 @@ from hermes_state import SessionDB
 from hermes_state_runtime import admit_session_input, claim_session_input
 from tests.fakes.runtime_owner import begin_runtime_epoch
 from tests.gateway.fixtures.local_recovery_probe import child_env, daemon, rpc, websocket
-from tests.waiting import async_wait_until
+from tests.waiting import async_wait_until, process_alive, kill_if_alive, process_children
 
 LAUNCHER = ('import subprocess, sys\n'
             'child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=sys.stdin)\n'
@@ -69,8 +69,7 @@ def test_owner_binds_reservation_to_verified_descendant_of_the_handle_only(tmp_p
     finally:
         # The real interpreter first, while it is still the launcher's child: killing the launcher
         # first reparents it outside the test subtree, where the conftest kill guard refuses it.
-        if psutil.pid_exists(real):
-            psutil.Process(real).kill()
+        kill_if_alive(real)
         for proc in (launcher, stranger):
             proc.stdin.close()
             if proc.poll() is None:
@@ -142,8 +141,7 @@ def test_managed_worker_completes_through_interpreter_trampoline(tmp_path):
             # The launcher chain is fully reaped: neither the launcher nor the real worker survives
             # the owner's close (which runs after the admission commits terminal; bounded wait).
             def leftovers():
-                return [(p.pid, p.cmdline()) for p in psutil.Process(owner.pid).children(recursive=True)
-                        if p.is_running() and p.status() != psutil.STATUS_ZOMBIE]
+                return [p.pid for p in process_children(owner.pid) if process_alive(p)]
             await async_wait_until(lambda: not leftovers(), timeout=15, interval=.1, what='the launcher chain to be reaped')
             assert leftovers() == []
             print(json.dumps({'owner_pid': owner.pid, 'launcher_pid': workers[0]['launcher'], 'worker_pid': workers[0]['child']}))
