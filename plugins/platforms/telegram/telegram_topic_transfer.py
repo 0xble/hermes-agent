@@ -18,7 +18,7 @@ from gateway.session_identity import replace_source
 logger = logging.getLogger(__name__)
 
 # ``(thread_id, created)``: ``created`` = a fresh topic; otherwise the lobby-recovery fallback topic.
-TopicTransferFn = Callable[[Any], Awaitable[Optional[tuple[str, bool]]]]
+TopicTransferFn = Callable[[Any, str], Awaitable[Optional[tuple[str, bool]]]]
 
 
 async def apply_root_dm_topic_transfer(adapter: Any, event: MessageEvent) -> None:
@@ -40,7 +40,7 @@ async def apply_root_dm_topic_transfer(adapter: Any, event: MessageEvent) -> Non
     if adapter._is_sender_authorized(source.user_id, source.chat_type, source.chat_id) is False:
         return
     try:
-        decided = await transfer(source)
+        decided = await transfer(source, event.text)
     except Exception:
         logger.debug("telegram topic transfer hook failed", exc_info=True)
         return
