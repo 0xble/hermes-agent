@@ -549,7 +549,9 @@ def _rich_is_prose_line(line: str) -> bool:
         stripped,
     ):
         return False
-    if re.match(r"^</?(?:details|summary)(?:\s|>|$)", stripped, re.IGNORECASE):
+    # A raw HTML quote ends only at a blank line; a visual spacer would keep
+    # subsequent Markdown inside that HTML block, even after </blockquote>.
+    if re.search(r"^</?(?:details|summary|blockquote)(?:\s|>|$)|</blockquote\s*>$", stripped, re.IGNORECASE):
         return False
     return not bool(re.fullmatch(r"(?:[-*_]\s*){3,}", stripped))
 
