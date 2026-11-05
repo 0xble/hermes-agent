@@ -276,7 +276,7 @@ class TestShellLayerDecisionWins:
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [_shell_hook_callback(fail_closed=False)]
         assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}, tool_call_id="t1") == []
-        assert mgr._hook_timeout_suppressed_until == {}
+        assert mgr._hook_live_workers == {}
 
     def test_shell_timeout_block_carries_the_hook_message(self, monkeypatch):
         """A fail-closed shell timeout names the shell hook's decision."""
