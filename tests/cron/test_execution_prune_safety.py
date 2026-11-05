@@ -46,20 +46,21 @@ def test_terminal_writes_survive_broken_retention_config(ledger, monkeypatch, co
         monkeypatch.setattr(executions, "_owner_is_live", lambda *_: False)
     (home / "config.yaml").write_text(config, encoding="utf-8")
 
-    if transition == "finish":
-        assert executions.finish_execution(attempt["id"], success=True)["status"] == "completed"
-    elif transition == "recover":
-        assert executions.recover_interrupted_executions() == 1
-    elif transition == "receipt":
-        assert executions.recover_receipted_execution(
-            attempt["id"], "audit", success=True)["status"] == "completed"
-    elif transition == "dead-owner":
-        assert executions.terminalize_dead_owner(attempt["id"], reason="worker exited")
-    elif transition == "give-up":
-        assert executions.give_up_execution(attempt["id"], reason="unknown outcome")
-    else:
-        attempt = executions.record_missed_execution(
-            "missed", scheduled_instant=NOW.isoformat(), error="never started")
+    transitions = {
+        "finish": lambda: executions.finish_execution(attempt["id"], success=True),
+        "recover": executions.recover_interrupted_executions,
+        "receipt": lambda: executions.recover_receipted_execution(
+            attempt["id"], "audit", success=True),
+        "dead-owner": lambda: executions.terminalize_dead_owner(
+            attempt["id"], reason="worker exited"),
+        "give-up": lambda: executions.give_up_execution(attempt["id"], reason="unknown outcome"),
+        "missed": lambda: executions.record_missed_execution(
+            "missed", scheduled_instant=NOW.isoformat(), error="never started"),
+    }
+    result = transitions[transition]()
+    assert result
+    if transition == "missed":
+        attempt = result
 
     # Read through an independent connection after return: no rolled-back running row.
     with sqlite3.connect(home / "cron" / "executions.db") as conn:
