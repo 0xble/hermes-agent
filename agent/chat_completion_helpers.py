@@ -2069,7 +2069,9 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
     fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
-    if should_skip_candidate(fb_ident, current_ident):
+    # Distinct labels can be a useful bounded retry of one route after a transient 5xx.
+    # Keep earlier unavailability/connection-domain skips authoritative.
+    if should_skip_candidate(fb_ident, current_ident) and fb_provider == current_ident.provider:
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider)
@@ -2231,6 +2233,7 @@ def try_activate_fallback(
     another process already armed; it must not re-arm the record or emit a duplicate notice.
     """
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    from agent.fallback_notice import buffer_fallback_route_notice, resolved_route
     shared_adoption = isinstance(_shared_cooldown_record, dict)
     new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
     if new_fallback_episode and not shared_adoption:
@@ -2264,6 +2267,7 @@ def try_activate_fallback(
 
         try:
             from agent.route_binding import bind_route_entry
+            old_route = resolved_route(agent)
             bound = bind_route_entry(agent, fb, fb_provider, fb_model)
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
@@ -2271,18 +2275,8 @@ def try_activate_fallback(
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
-            use_generic_notice, notice = _rate_limit_fallback_notice(
-                agent, reason, shared_adoption, old_model, fb_model, fb_provider)
-            if use_generic_notice:
-                notice = (
-                    f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
-                    f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
-                )
-                if cooldown_seconds is not None:
-                    remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
-                    notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
-            if notice:
-                _buffer_fallback_notice(agent, notice)
+            buffer_fallback_route_notice(
+                agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds)
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True

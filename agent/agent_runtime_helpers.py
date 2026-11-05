@@ -1534,7 +1534,7 @@ def restore_primary_runtime(agent) -> bool:
         # A shared outage's recovery notice belongs to the request that proves the primary works
         # (complete_primary_recovery), never to this restore. Restore proceeds only once the
         # shared window has passed or the record is gone, so it never rewrites the record.
-        if provider_fallback_active and not held_shared_record:
+        if provider_fallback_active and not held_shared_record and not getattr(agent, "_provider_fallback_silent_retry", False):
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
                 agent._emit_diagnostic_status(ContextNotice(f"✅ Primary model restored: {agent.model} via {agent.provider}; "
