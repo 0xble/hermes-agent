@@ -400,7 +400,7 @@ jobs:
           NOUS_API_KEY: ''
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          git fetch --force --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v20*:refs/tags/v20*'
+          git fetch --force --prune --no-tags https://github.com/NousResearch/hermes-agent.git '+refs/tags/v20*:refs/tags/v20*'
           release=$(git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1)
           echo "Upstream upgrade baseline: $release $(git rev-parse "$release^{commit}")"
           python -c "from tests.e2e.core.upgrade._helpers import BWRAP_OK; assert BWRAP_OK, 'bwrap unusable'; from tests.e2e.core.upgrade.network._netedge import netns_usable; assert netns_usable(), 'bwrap --unshare-net unusable'"
