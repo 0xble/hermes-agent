@@ -964,12 +964,7 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
         updates["pinned"] = bool(a["pinned"])
     if a["base_url"] is not None:
         updates["base_url"] = _normalize_optional_job_value(a["base_url"], strip_trailing_slash=True)
-    if a.get("payload_sha256") is not None:
-        updates["payload_sha256"] = a["payload_sha256"]
-    if a.get("payload_path") is not None:
-        updates["payload_path"] = a["payload_path"]
-    if a.get("send_freshness_json") is not None:
-        updates["send_freshness"] = _parse_send_freshness(a["send_freshness_json"])
+    _update_scheduled_send_fields(a, updates)
     # Preserve strict zero and explicit '' clears; None means unchanged. These values
     # share the same forwarding contract, with field-specific validation in update_job.
     for key in ("hard_wall_timeout_seconds", "max_catch_up_lateness_seconds",
@@ -985,6 +980,15 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
     return _validate_cron_base_url(_pick(updates, job, "provider"), _pick(updates, job, "base_url"))
+
+
+def _update_scheduled_send_fields(a: dict[str, Any], updates: dict[str, Any]) -> None:
+    if a.get("payload_sha256") is not None:
+        updates["payload_sha256"] = a["payload_sha256"]
+    if a.get("payload_path") is not None:
+        updates["payload_path"] = a["payload_path"]
+    if a.get("send_freshness_json") is not None:
+        updates["send_freshness"] = _parse_send_freshness(a["send_freshness_json"])
 
 
 def _update_script_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:

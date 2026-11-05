@@ -8,8 +8,11 @@ import pytest
 
 from cron import executions, incidents, jobs, jobs_oneshot, scheduler, scheduler_authority as authority
 from hermes_cli.cron import cron_resume
-from tests.cron.oneshot_helpers import NOW, store
+from tests.cron import oneshot_helpers
+from tests.cron.oneshot_helpers import NOW
 from tests.cron.test_cron_recover_pause import _foreign_journal, _peer
+
+store = oneshot_helpers.store
 
 
 def _started(*, lateness=60):
@@ -26,25 +29,18 @@ def _started(*, lateness=60):
     return job, row['id'], journal
 
 
-@pytest.mark.parametrize('entry', ['expiry', 'limit', 'claim'])
-@pytest.mark.parametrize('status', ['running', 'unknown'])
-@pytest.mark.parametrize('evidence', ['valid', 'corrupt', 'unreadable', 'capture-settled', 'identity-conflict'])
-def test_current_recovery_obligation_blocks_each_destructive_gate(
-        store, monkeypatch, entry, status, evidence):
-    job, fire, journal = _started(lateness=660 if entry == 'expiry' else 60)
-    if status == 'unknown':
-        assert executions.terminalize_dead_owner(fire, reason='former owner exited')
-    if evidence == 'corrupt':
-        journal.write_text('{not-json')
-    elif evidence == 'capture-settled':
+def _apply_recovery_evidence(evidence, journal, monkeypatch):
+    def capture_settled():
         record = json.loads(journal.read_text())
         record.update(worker_result={'result': [True, 'doc', 'answer', None]}, canonical_settled=True)
         journal.write_text(json.dumps(record))
-    elif evidence == 'identity-conflict':
+
+    def identity_conflict():
         record = json.loads(journal.read_text())
         record['params']['request_id'] = 'other-attempt'
         journal.write_text(json.dumps(record))
-    elif evidence == 'unreadable':
+
+    def unreadable():
         original = Path.read_text
 
         def read(path, *args, **kwargs):
@@ -53,6 +49,26 @@ def test_current_recovery_obligation_blocks_each_destructive_gate(
             return original(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, 'read_text', read)
+
+    handlers = {
+        'valid': lambda: None,
+        'corrupt': lambda: journal.write_text('{not-json'),
+        'capture-settled': capture_settled,
+        'identity-conflict': identity_conflict,
+        'unreadable': unreadable,
+    }
+    handlers[evidence]()
+
+
+@pytest.mark.parametrize('entry', ['expiry', 'limit', 'claim'])
+@pytest.mark.parametrize('status', ['running', 'unknown'])
+@pytest.mark.parametrize('evidence', ['valid', 'corrupt', 'unreadable', 'capture-settled', 'identity-conflict'])
+def test_current_recovery_obligation_blocks_each_destructive_gate(
+        store, monkeypatch, entry, status, evidence):
+    job, fire, journal = _started(lateness=660 if entry == 'expiry' else 60)
+    if status == 'unknown':
+        assert executions.terminalize_dead_owner(fire, reason='former owner exited')
+    _apply_recovery_evidence(evidence, journal, monkeypatch)
     before = jobs.get_job(job['id'])
     for _ in range(2):
         assert (jobs.claim_dispatch(job['id']) if entry == 'claim' else jobs.get_due_jobs()) in (False, [])
