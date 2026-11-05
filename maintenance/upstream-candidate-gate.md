@@ -1,6 +1,7 @@
 # Qualifying upstream-based heads
 
-Fork patch identity: `fork-ci-reliability` (portable contributor gate extension).
+Fork patch identities: `fork-ci-reliability` (portable contributor gate extension),
+  `upstream-candidate-gate` (exact-head upstream qualification and baseline equivalence).
 
 `gate.yml` tests the exact PR head, not GitHub's synthetic merge tree. Its
 `qualification` job succeeds only if the planner, prompt-surface check, and

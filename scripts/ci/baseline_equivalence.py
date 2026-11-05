@@ -44,7 +44,7 @@ def collect(suite: str, index: int, output: Path) -> int:
     python = os.environ["HERMES_PYTHON"]
     # The runner intentionally strips PYTHONPATH. A disposable test-venv .pth
     # makes the frozen observer importable without touching candidate sources.
-    site = subprocess.check_output([python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip()
+    site = subprocess.check_output([python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True, encoding="utf-8").strip()
     (Path(site) / "frozen_gate_evidence.pth").write_text(str(Path(__file__).parent.resolve()) + "\n", encoding="utf-8")
     env = {**os.environ, "HERMES_TEST_FILE_RETRIES": "0"}
     env.pop("HERMES_TEST_SLICE", None)
@@ -52,7 +52,7 @@ def collect(suite: str, index: int, output: Path) -> int:
     if suite == "messaging":
         files = list(MESSAGING)
     else:
-        planned = subprocess.check_output(["scripts/run_tests.sh", *roots, "--generate-slices", "10"], env=env, text=True)
+        planned = subprocess.check_output(["scripts/run_tests.sh", *roots, "--generate-slices", "10"], env=env, text=True, encoding="utf-8")
         matrices = [json.loads(line) for line in planned.splitlines() if line.startswith('{"slice":')]
         require(len(matrices) == 1, "Missing or ambiguous canonical slice plan")
         files = matrices[0]["slice"][index - 1]["files"].split(":")
@@ -152,7 +152,7 @@ def api(repository: str, suffix: str, *, pages=False):
     command = ["gh", "api", f"repos/{repository}/{suffix}"]
     if pages:
         command += ["--paginate", "--slurp"]
-    return json.loads(subprocess.check_output(command, text=True))
+    return json.loads(subprocess.check_output(command, text=True, encoding="utf-8"))
 
 
 def verify_jobs(jobs: list[dict]):
