@@ -17,7 +17,6 @@ async def test_pause_reports_client_ownership_without_claiming_a_drain(
 ):
     from gateway import run, run_bootstrap
     from gateway.control_socket import pause_gateway_for_update
-    from gateway.run_shutdown import GatewayShutdownMixin
     from hermes_constants import get_hermes_home
 
     home = get_hermes_home()
@@ -31,8 +30,6 @@ async def test_pause_reports_client_ownership_without_claiming_a_drain(
         session_ticket_store=None,
         request_restart=restart,
     )
-    if client_owned:
-        runner.request_restart = lambda **kw: GatewayShutdownMixin.request_restart(runner, **kw)
     monkeypatch.setattr("hermes_cli.gateway._get_restart_drain_timeout", lambda: 12.5)
     start = (run_bootstrap if entrypoint == "bootstrap" else run)._start_gateway_start_control_socket
     server = await start(runner)
@@ -42,6 +39,7 @@ async def test_pause_reports_client_ownership_without_claiming_a_drain(
     finally:
         await server.stop()
     if client_owned:
+        restart.assert_not_called()
         assert answer == {"pausing": False, "client_owned": True}
         assert not getattr(runner, "_draining", False)
     else:
