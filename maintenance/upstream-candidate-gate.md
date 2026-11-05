@@ -107,7 +107,10 @@ Run from the reviewed policy checkout, with full candidate/upstream/fork history
 present. Use full 40-character SHAs. Authenticate through the approved `gh-env.sh`
 and require `GH_USER=0xble`. Set `POLICY`, `C`, and a unique `probe` prefix first.
 The shell function below supplies the required per-command Git environment; it
-changes no global Git configuration or exported shell state.
+changes no global Git configuration or exported shell state. First write the
+probe description to the literal scratch body-file path shown below, beginning
+with exact `## Summary` then `## Motivation` headings and recording `C`, `B`,
+`U`, `POLICY` and the never-merge intent; retain it as the probe receipt.
 
 ```bash
 g() { GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 git "$@"; }
@@ -119,7 +122,7 @@ S=$(python3 scripts/ci/candidate_mode.py . "$B" "$U" --prepare-staging "$POLICY"
 g push origin "$S:refs/heads/$probe-baseline-base" "$B:refs/heads/$probe-baseline-head"
 gh pr create -R 0xble/hermes-agent --draft --base "$probe-baseline-base" \
   --head "$probe-baseline-head" --title 'Exact upstream baseline qualification' \
-  --body "Evidence only; never merge. Head=$B upstream=$U policy=$POLICY staging=$S"
+  --body-file /Users/brianle/.hermes/cache/scratch/baseline-pr.md
 ```
 
 Read back the PR head/base SHAs, mergeability and the `Repository gate` run.
