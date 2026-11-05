@@ -227,7 +227,12 @@ def test_admission_fence_outlives_expiry_claim_and_early_release(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_goal_admission_releases_privacy_fence(harness, monkeypatch):
+@pytest.mark.parametrize("boundary", ["marker", "admission", "stamp"])
+async def test_cancelled_goal_admission_keeps_fence_until_physical_settlement(harness, monkeypatch, boundary):
+    import threading
+    from types import SimpleNamespace
+
+    from gateway.session_runtime_workers import tracked_write
     from tests.gateway import test_goal_parked_idle_wake as parked
     from hermes_cli import goals
 
@@ -238,18 +243,97 @@ async def test_cancelled_goal_admission_releases_privacy_fence(harness, monkeypa
     manager.set("Finish the report")
     manager.wait_for_seconds(1)
     monkeypatch.setattr(goals.GoalManager, "lifted_barrier_prompt", lambda self: "Continue the report")
-    clearing = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    started, finished = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    written_private = []
 
-    async def held_clear(*_args):
-        clearing.set()
-        await asyncio.Event().wait()
+    def blocked_write(operation=lambda: True):
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(10), "test did not release the physical writer"
+            written_private.append(entry.incognito)
+            return operation()
+        finally:
+            loop.call_soon_threadsafe(finished.set)
 
-    monkeypatch.setattr(runner, "_clear_stale_resume_pending", held_clear)
+    async def executor(fn, *args):
+        return await asyncio.to_thread(fn, *args)
+
+    monkeypatch.setattr(runner, "_run_in_executor_with_context", executor)
+    if boundary == "marker":
+        async def clear(*_args):
+            return await executor(blocked_write)
+        monkeypatch.setattr(runner, "_clear_stale_resume_pending", clear)
+    elif boundary == "admission":
+        async def accept(incoming):
+            await tracked_write(SimpleNamespace(), blocked_write,
+                                then=lambda _result: setattr(incoming, "_gateway_accepted", True))
+        monkeypatch.setattr(adapter, "handle_message", accept)
+    else:
+        stamp = goals.GoalManager.mark_automatic_continuation_dispatched
+        def held_stamp(self, **kwargs):
+            return blocked_write(lambda: stamp(self, **kwargs))
+        monkeypatch.setattr(goals.GoalManager, "mark_automatic_continuation_dispatched", held_stamp)
+
     wake = asyncio.create_task(runner._goal_wakeup_fire_one(entry.session_id))
-    await asyncio.wait_for(clearing.wait(), 2)
-    assert runner._background_admission_pending(entry.session_key)
-    wake.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await wake
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        wake.cancel()
+        # Deliver cancellation before the switch, without relying on a wall-clock delay.
+        delivered = asyncio.Event()
+        loop.call_soon(delivered.set)
+        await asyncio.wait_for(delivered.wait(), 2)
+        reply = await runner._handle_incognito_command(event("/incognito on"))
+        assert "not changed" in reply and not entry.incognito
+        assert runner._background_admission_pending(entry.session_key)
+    finally:
+        release.set()
+        outcome = await asyncio.wait_for(asyncio.gather(wake, return_exceptions=True), 2)
+        await asyncio.wait_for(finished.wait(), 2)
+    assert isinstance(outcome[0], asyncio.CancelledError)
+    assert written_private == [False]
     assert not runner._background_admission_pending(entry.session_key)
+    assert "ON" in await runner._handle_incognito_command(event("/incognito on"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["adapter", "authority", "queued"])
+async def test_incognito_waits_for_admitted_wake_execution_owner(harness, monkeypatch, owner):
+    from types import SimpleNamespace
+    from gateway.session_events import SessionEvents
+    from tests.gateway import test_goal_parked_idle_wake as parked
+
+    runner, _store, entry, _config, event, _db = harness
+    adapter = parked._Adapter()
+    monkeypatch.setattr(runner, "_intake_adapter_for", lambda _source: adapter)
+    release = asyncio.Event()
+    task = asyncio.create_task(release.wait())
+    if owner == "adapter":
+        adapter._active_sessions[entry.session_key] = asyncio.Event()
+        monkeypatch.setattr(adapter, "_session_tasks", {entry.session_key: task}, raising=False)
+    else:
+        runner.session_authority = SimpleNamespace(profile_id="test", sessions={entry.session_id: SimpleNamespace(
+            route=entry.session_key, task=task if owner == "authority" else None, superseded=False,
+            event_stream=SessionEvents())},
+            _pending_rows=lambda _ref: [] if release.is_set() or owner != "queued" else [{"status": "queued"}])
+    try:
+        reply = await runner._handle_incognito_command(event("/incognito on"))
+        assert "not changed" in reply and not entry.incognito
+    finally:
+        release.set()
+        await task
+    adapter._active_sessions.clear()
+    assert "ON" in await runner._handle_incognito_command(event("/incognito on"))
+
+
+@pytest.mark.asyncio
+async def test_incognito_allows_its_own_idle_adapter_guard(harness, monkeypatch):
+    from tests.gateway import test_goal_parked_idle_wake as parked
+
+    runner, _store, entry, _config, event, _db = harness
+    adapter = parked._Adapter()
+    monkeypatch.setattr(runner, "_intake_adapter_for", lambda _source: adapter)
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+    monkeypatch.setattr(adapter, "_session_tasks", {entry.session_key: asyncio.current_task()}, raising=False)
     assert "ON" in await runner._handle_incognito_command(event("/incognito on"))

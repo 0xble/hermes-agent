@@ -1384,7 +1384,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         reservation = self._reserve_background_turn(key, event)
         if reservation is None:
             return  # background turn limit reached: keep the barrier for a later scan
-        with self._get_replay_scheduler().gate.admitting(reservation):
+        async def settle():
             if not await self._clear_stale_resume_pending(key, resume_marker, sid, "goal wakeup"):
                 self._release_background_turn(reservation)
                 return  # marker changed or the session disappeared; retry on the next scan
@@ -1413,6 +1413,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             )
             # Resuming is silent: the continuation turn itself is the visible signal.
             await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
+
+        try:
+            await self._get_replay_scheduler().gate.settle_admission(reservation, settle())
+        finally:
+            if getattr(event, "_gateway_accepted", False) is not True:
+                self._release_background_turn(reservation)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups and resume lifted /goal waits for idle gateway sessions: a coarse

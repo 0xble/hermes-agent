@@ -44,9 +44,11 @@ not only the command reply.
   wakeup and no continuation. The judge would send the private reply to the
   auxiliary goal_judge provider, and goal writes are withheld anyway. The goal
   resumes untouched after `/incognito off`. Background wake admission holds its
-  existing reservation through bookkeeping, and `/incognito` refuses a switch
-  until that admission finishes. Do not hold the model-route lock across dispatch,
-  because an inline slash command acquires it itself.
+  existing reservation through bookkeeping and physical writes that outlive caller
+  cancellation. `/incognito` refuses while admission is pending, another task owns
+  the adapter guard, or authority work is queued/running before its agent slot exists.
+  The command's own otherwise-idle adapter guard is not foreign work. Do not hold
+  the model-route lock across dispatch, because an inline slash command acquires it itself.
 - The content-free sidecar preserves privacy routing across restart. Model
   overrides pass through the existing sanitizer. Do not persist a private model
   selection or credentials as recovery metadata.

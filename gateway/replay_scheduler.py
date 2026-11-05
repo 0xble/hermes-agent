@@ -130,6 +130,32 @@ class BackgroundTurnGate:
             if reservation.released:
                 self._reserved.pop(token, None)
 
+    async def settle_admission(self, token: object, operation: Awaitable[Any]) -> Any:
+        """Keep admission ownership until its writes and callbacks physically settle.
+
+        Cancelling a producer does not stop an executor write or shielded authority commit.
+        Shield the whole admitted operation, including its bookkeeping, then propagate caller
+        cancellation. Repeated cancellation cannot tear down its privacy fence early.
+        """
+        with self.admitting(token):
+            pending = asyncio.ensure_future(operation)
+            cancelled = None
+            while True:
+                try:
+                    result = await asyncio.shield(pending)
+                except asyncio.CancelledError as exc:
+                    if pending.cancelled():
+                        raise
+                    cancelled = exc
+                except Exception:
+                    if cancelled is not None:
+                        raise cancelled
+                    raise
+                else:
+                    if cancelled is not None:
+                        raise cancelled
+                    return result
+
     def release(self, token: object) -> None:
         """Return a reservation whose admission was refused before any turn claimed it."""
         reservation = self._reserved.get(token)
