@@ -412,7 +412,7 @@ def test_signal_guard_rechecks_group_members(request, monkeypatch, state, leader
     leader.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
     leader.children.return_value = [member]
     owner = Mock()
-    owner.children.return_value = []
+    owner.children.return_value = [leader, member]
     processes = {os.getpid(): owner, leader_pid: leader, member.pid: member}
 
     def lookup(pid):
@@ -445,6 +445,54 @@ def test_signal_guard_rechecks_group_members(request, monkeypatch, state, leader
             with pytest.raises(RuntimeError, match="live-system guard"):
                 os.killpg(leader_pid, signal.SIGKILL)
             killpg.assert_not_called()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("state", ["owned", "recycled", "foreign"])
+def test_signal_guard_keeps_siblings_when_bottom_up_term_reaps_the_leader(request, monkeypatch, state):
+    """A signal to 1 helper can make its parent exit before its sibling is signalled."""
+    import psutil
+
+    leader_pid = 987654321
+    processes = {}
+    owner = Mock()
+    owner.children.side_effect = lambda recursive=True: list(processes.values())
+
+    def lookup(pid):
+        if pid == os.getpid():
+            return owner
+        if pid not in processes:
+            raise psutil.NoSuchProcess(pid)
+        return processes[pid]
+
+    monkeypatch.setattr(psutil, "Process", lookup)
+    with _record_signal_delivery(request) as (kill, _):
+        leader, sibling, member = (Mock(pid=leader_pid + i) for i in range(3))
+        for process in (leader, sibling, member):
+            process.create_time.return_value = float(process.pid)
+            process.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+            process.children.return_value = []
+            processes[process.pid] = process
+        if state == "foreign":
+            member.parents.return_value = []
+
+        def reap_leader(pid, sig):
+            if pid == sibling.pid:
+                del processes[leader.pid]
+                member.parents.return_value = []
+
+        kill.side_effect = reap_leader
+        os.kill(sibling.pid, signal.SIGTERM)
+        if state == "recycled":
+            member.create_time.return_value += 100.0
+        kill.reset_mock()
+        if state == "owned":
+            os.kill(member.pid, signal.SIGKILL)
+            kill.assert_called_once_with(member.pid, signal.SIGKILL)
+        else:
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.kill(member.pid, signal.SIGKILL)
+            kill.assert_not_called()
 
 
 @pytest.mark.platforms("posix")

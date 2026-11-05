@@ -60,6 +60,24 @@ local helper/reaper stubs, without importing Unix-only dependencies. All eight
 controlled cases remain unmarked for Linux, macOS and Windows. Native Linux
 regressions retain foreign-sibling refusal and detached cleanup.
 No test is skipped and no worker count or timeout is relaxed.
+Before destructive signal delivery, the live-system guard records independently
+verified identities from the test's full subtree. Bottom-up TERM can kill a
+foreground child, reap its shell, and orphan a TERM-ignoring sibling before the
+sibling is signalled. Remembering only the first recipient's descendants loses
+that valid owner. Retained ownership still requires a fresh matching creation
+time and each surviving group member's independent proof. Foreign, mixed,
+recycled and unverifiable identities remain refused. Deterministic regressions
+force sibling reparenting between delivery calls, and the real POSIX grace-kill
+regression must pass without guard bypasses or longer timeouts.
+
+Local native Electron case-spelling security tests require a case-sensitive
+temporary filesystem. On a default case-insensitive macOS volume, provide a
+job-owned case-sensitive APFS scratch image through `TMPDIR` to the canonical
+`./bin/ci gate <sha>` entrypoint. Prove distinct case-only directory identities
+before running. Keep the checkout's pinned toolchain and every assertion intact,
+then detach and remove only the invocation's disposable image after all owned
+processes have exited.
+
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning
 clears only after a gateway serves the new commit.
