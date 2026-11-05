@@ -1338,11 +1338,11 @@ def _last_assistant_index(messages: list[dict[str, Any]]) -> int:
 
 def _pending_tool_round(messages: list[dict[str, Any]]) -> range:
     """Indices of the tool results the transcript ends with — a round the model has not answered yet; empty when
-    the transcript ends in any other row. /steer rows after the round do not answer it: a steer is delivered
-    after the newest tool result before the next API call, and two can land in one iteration (one when the tool
-    batch ends, one before the request), so every contiguous trailing steer row is skipped."""
+    the transcript ends in any other row. Trailing /steer and host-notice rows do not answer it, so skip
+    these continuation rows when protecting results the model has not read yet."""
+    from agent.plugin_live_notes import is_runtime_notice
     end = len(messages)
-    while end and messages[end - 1].get("display_kind") == STEER_DISPLAY_KIND:
+    while end and (messages[end - 1].get("display_kind") == STEER_DISPLAY_KIND or is_runtime_notice(messages[end - 1])):
         end -= 1
     start = end
     while start > 0 and messages[start - 1].get("role") == "tool":

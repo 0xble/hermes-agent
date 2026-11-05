@@ -33,6 +33,11 @@ def _unit(path, home) -> None:
 def recorded(monkeypatch):
     """Record every service-manager and process-kill call instead of running it."""
     calls: list = []
+    from hermes_cli import forward_only_guard
+
+    # This suite has no withdrawn handover jobs. Their inventory and refusal
+    # paths are covered by test_forward_only_guard without touching launchd.
+    monkeypatch.setattr(forward_only_guard, "_loaded_forward_labels", lambda **kw: [])
     monkeypatch.setattr(gw, "_run_systemctl", lambda argv, **kw: calls.append(("systemctl", list(argv))))
     monkeypatch.setattr(gw.subprocess, "run", lambda argv, *a, **kw: calls.append(("run", list(argv))))
     monkeypatch.setattr(gw, "terminate_pid", lambda pid, **kw: calls.append(("kill", pid)))

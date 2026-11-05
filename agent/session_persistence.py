@@ -231,7 +231,10 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
         api_content = content
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
-        "role": role, "content": _durable_content(content),
+        # Tool receipts already have a native structured-content codec in SessionDB.
+        # Projecting them to text here would lose parts before replay, even though
+        # the live request kept them. Other roles retain their existing projection.
+        "role": role, "content": content if role == "tool" else _durable_content(content),
         "tool_name": msg.get("tool_name") or (msg.get("name") if role == "tool" else None),
         "tool_calls": msg["tool_calls"] if isinstance(msg.get("tool_calls"), list) else None,
         "tool_call_id": msg.get("tool_call_id"), "effect_disposition": msg.get("effect_disposition"),

@@ -203,19 +203,12 @@ def _templates():
 
 
 def _template_id(template: str) -> str:
-    import hermes_cli.checkins as checkins
-    import hermes_cli.goals as goals
-    import hermes_cli.heartbeat as heartbeat
-    import hermes_cli.loops as loops
+    from agent.synthetic_prompt import _INJECTED_TURN_PATTERNS
 
-    from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
-
-    for module in (checkins, goals, heartbeat, loops):
-        for name, value in vars(module).items():
-            if name.endswith("_TEMPLATE") and value == template:
-                return name
-    row = next(row for row in GOAL_PROMPT_REGISTRY if row["template"] == template)
-    return f"registry-{row['formatter']}-{row['source_commits'][0][:8]}"
+    return next(
+        f"{kind}-{index}" for index, (kind, value, _matcher) in enumerate(_INJECTED_TURN_PATTERNS)
+        if value == template
+    )
 
 
 def test_review_repro_contract_continuation_nested_in_a_plain_goal_stays_generated():

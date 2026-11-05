@@ -145,6 +145,17 @@ def scaffolding_replay_fields(msg: Mapping[str, Any]) -> dict:
     return fields
 
 
+def unstamped_replay_fields(msg: Mapping[str, Any]) -> dict:
+    """Producer provenance for user rows sent unstamped, retained through replay and re-persist."""
+    fields = scaffolding_replay_fields(msg)
+    from agent.plugin_live_notes import RUNTIME_NOTICE, is_runtime_notice
+    if is_runtime_notice(msg):
+        fields["display_metadata"] = {**fields.get("display_metadata", {}), RUNTIME_NOTICE: True}
+        if msg.get("display_kind"):
+            fields["display_kind"] = msg["display_kind"]
+    return fields
+
+
 def is_compaction_scaffolding(msg: Mapping[str, Any]) -> bool:
     """Compaction sent its summary and restatement rows unstamped; a replay stamp would break the cached prefix."""
     return bool(scaffolding_replay_fields(msg))

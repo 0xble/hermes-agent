@@ -17,7 +17,6 @@ import os
 import socket
 import stat
 import subprocess
-import sys
 import time
 
 import pytest
@@ -27,6 +26,7 @@ import tools.browser_use_cli as bu_cli
 from tools import browser_tool_install as bt_install
 from tools import browser_tool_cloud as bt_cloud
 from tools import browser_tool_session as bt_session
+from tests.waiting import wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -1239,7 +1239,7 @@ class TestTimeoutProcessGroupKill:
     blocked forever, and the wedged call's activity heartbeat pins the session at
     "now" in the sidebar indefinitely."""
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    @pytest.mark.platforms("posix")
     def test_timeout_kills_grandchild_and_returns_promptly(self, tmp_path, monkeypatch):
         """A grandchild that outlives the direct child and holds the inherited stdout
         pipe must not keep browser_exec blocked past the timeout (it wedged permanently
@@ -1247,13 +1247,29 @@ class TestTimeoutProcessGroupKill:
         monkeypatch.setattr("hermes_cli.config.read_raw_config", dict)
         pid_file = tmp_path / "grandchild.pid"
         cli = _fake_cli(tmp_path, (
-            "cat > /dev/null\n"
             "sleep 60 &\n"
             "echo $! > \"" + str(pid_file) + "\"\n"
             "sleep 60\n"
         ))
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
+        real_popen = bu_cli.subprocess.Popen
+
+        def ready_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            try:
+                # Exercise a pipe-holding descendant, not a race against shell startup.
+                wait_until(
+                    lambda: pid_file.exists() and pid_file.read_text(encoding="utf-8-sig").strip(),
+                    timeout=5, what="pipe-holding grandchild started",
+                )
+            except BaseException:
+                bu_cli._kill_cli_process_group(proc)
+                proc.communicate(timeout=5)
+                raise
+            return proc
+
+        monkeypatch.setattr(bu_cli.subprocess, "Popen", ready_popen)
 
         start = time.time()
         result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))
