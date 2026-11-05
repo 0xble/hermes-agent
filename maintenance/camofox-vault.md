@@ -112,8 +112,9 @@ the browser vault fill tool, or the 1Password backends.
   assertion, and report `remembered`. Marketing, terms, consent, privacy, cookie and
   public-computer boxes are never ticked. `vault.remember_logins` (default on) maps browser
   account aliases to booleans with a `default` key, so an identity can keep logins
-  unremembered. Fork patch identity: `vault-remember-logins` (local, no upstream
-  submission). Regression: `tests/tools/test_browser_vault_remember.py` (real Chromium).
+  unremembered.
+- Fork patch identity: `vault-remember-logins` (local, no upstream submission).
+- Contract test: `tests/tools/test_browser_vault_remember.py` (real Chromium).
 
 ## Provenance and patches
 
