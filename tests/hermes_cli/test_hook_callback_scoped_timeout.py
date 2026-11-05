@@ -134,6 +134,7 @@ class HookRig:
     def drain(self):
         assert wait_until(lambda: not self.manager._hook_running_callbacks, timeout=5)
         assert not self.manager._hook_abandoned
+        assert not self.manager._hook_live_workers
 
     def close(self):
         self.start_gate.set()
