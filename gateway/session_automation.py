@@ -85,6 +85,23 @@ async def admit_process_notice(runner, authority, adapter, event, evt):
     """Admit a process notice. A completion and the withdrawal of its process's waiting ticks hold
     the heartbeat lock together; a tick already holds it (``deliver_heartbeat``)."""
     identity = producer_identity(runner, evt)
+    # A trusted process notice recovers a stored origin, not a new sender assertion.
+    # Validate its original route and session pin before borrowing committed provenance.
+    # Direct automation callers still undergo the strict source comparison below.
+    if event.source.platform not in (Platform.LOCAL, Platform.API_SERVER):
+        import asyncio
+        from gateway.session_envelope import restore_native
+        from gateway.session_identity import replace_source
+
+        entry = await asyncio.to_thread(_owner, runner, event, authority)
+        envelope = await asyncio.to_thread(committed_route_envelope, authority, entry)
+        if envelope is not None and not route_rebound(entry, envelope):
+            restored = restore_native({'text': event.text, 'native_text_v1': {
+                key: value for key, value in envelope.items() if key != 'media'}}, runner)
+            if (runner.session_store._generate_session_key(restored.source) != entry.session_key
+                    or runner._adapter_for_source(restored.source) is not adapter):
+                raise RuntimeStoreError('admission_conflict')
+            event.source = replace_source(restored.source, message_id=None)
     if evt.get('type') == 'heartbeat':
         # The tick's raw output rides its stored admission: a later tick folds from the ledger.
         event.metadata['heartbeat_tick'] = {'output': str(evt.get('output') or ''),
@@ -389,6 +406,13 @@ def admission_display(payload):
     return card
 
 
+_UNCOMPARED_FIELDS = frozenset({'message_id', 'chat_topic'})
+
+
+def _route_identity(source):
+    return {key: value for key, value in source.to_dict().items() if key not in _UNCOMPARED_FIELDS}
+
+
 def route_rebound(entry, envelope):
     """Whether the route's last committed envelope was admitted under a route key this session no
     longer serves: the session was rebound (``switch_session``, e.g. moved to another platform's
@@ -444,8 +468,8 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
             key: value for key, value in envelope.items() if key != 'media'}}, runner)
     # Synthetic wakes clear ``message_id`` (#52694, #123097) while the committed human source keeps
     # it, so compare the routing/provenance identity, never the platform reply anchor.
-    if (runner.session_store._generate_session_key(restored.source) != entry.session_key
-            or restored.source.user_id != event.source.user_id
+    if (_route_identity(restored.source) != _route_identity(event.source)
+            or runner.session_store._generate_session_key(restored.source) != entry.session_key
             or runner._adapter_for_source(restored.source) is not adapter):
         raise RuntimeStoreError('admission_conflict')
     provenance = deepcopy(envelope['provenance'])
@@ -590,7 +614,7 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
         # Provenance/adapter identity and all live publication remain on the owner loop.
         payload, entry = snapshot_automation(authority, adapter, event, identity, (entry, captured, owner))
         sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
-        ref = prepared['ref'] = SessionRef(authority.profile_id, sid)
+        prepared['ref'] = SessionRef(authority.profile_id, sid)
         source, envelope = event.source, payload.get('native_text_v1')
         if envelope is not None and 'relay' in envelope['provenance']:
             from gateway.session_envelope import restore_native_source

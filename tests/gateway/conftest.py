@@ -32,12 +32,40 @@ incident.
 """
 
 import ast
+import datetime as dt
 import os
 import sys
+from functools import wraps
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def fixed_daily_quota_wall(monkeypatch):
+    """Keep default quota ledgers in one UTC day; explicit rollover clocks win.
+
+    Pressure/count tests must not lose their setup when the real wall crosses
+    midnight, including adapters and limiters that construct their own quota.
+    Leave monotonic pacing, flood deadlines, and global wall time untouched.
+    """
+    from plugins.platforms.telegram.daily_quota import DailyQuota
+
+    fixed = dt.datetime(2026, 11, 3, 23, 59, 59, tzinfo=dt.timezone.utc).timestamp()
+
+    def wall():
+        return fixed
+
+    original_init = DailyQuota.__init__
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        kwargs.setdefault("wall", wall)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(DailyQuota, "__init__", init)
+    return wall
 
 
 @pytest.fixture

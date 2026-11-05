@@ -314,9 +314,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('outbox_in_use')
         try:
             if self.path.exists():
-                if self.path.stat().st_size > max_bytes:
-                    raise WorkerPersistenceError('outbox_full')
-                self.journal = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                from agent.runtime_session_journal import read_journal
+                self.journal = read_journal(self.path, max_bytes)
                 reconciled = self.journal['scope'] != self.scope
                 if reconciled:
                     self._reconcile_adopted(adopted)
@@ -367,21 +366,14 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.journal = candidate
 
     def _save(self, journal):
-        if self._outbox_owner.closed:
-            raise WorkerPersistenceError('outbox_closed')
-        encoded = json.dumps(journal, ensure_ascii=True, allow_nan=False, separators=(',', ':')).encode()
-        if len(encoded) > self.max_bytes:
-            self.failure = 'outbox_full'
-            raise WorkerPersistenceError(self.failure)
-        from utils import atomic_write_bytes
-        # Owner-only journal (the dir is 0700 too); the rename and its directory entry are durable.
-        atomic_write_bytes(self.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
+        from agent.runtime_session_journal import save_journal
+        save_journal(self, journal)
 
     def _session(self, session_id):
         if session_id != self.scope['session_id']:
             raise WorkerPersistenceError('permission_denied')
 
-    def _apply(self, operation, payload):
+    def _apply(self, operation, payload, *, best_effort=False):
         with self.lock:
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
@@ -391,8 +383,16 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             candidate = json.loads(json.dumps(self.journal))
             candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
             candidate['next_sequence'] += 1
+            from agent.runtime_session_journal import OutboxCapacityError, check_worker_frame
             try:
+                check_worker_frame(self.scope, candidate['pending'][-1])
                 self._save(candidate)
+            except OutboxCapacityError:
+                # Only explicitly optional archives may skip an unsent rejection. Mandatory
+                # append callers can swallow errors: retain the failure for flush/finish.
+                if not best_effort:
+                    self.failure = 'outbox_full'
+                raise
             except Exception as exc:
                 self.failure = str(exc)
                 raise

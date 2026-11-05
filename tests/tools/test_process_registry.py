@@ -85,7 +85,6 @@ def test_bounded_kill_after_deadline_still_leaves_cut_receipt(registry, tmp_path
 
     def slow_signal(*_args, **_kwargs):
         time.sleep(0.03)
-        return None
 
     monkeypatch.setattr(registry, "_signal_kill", slow_signal)
     monkeypatch.setattr(registry, "_stop_scope", lambda *_args, **_kwargs: True)
@@ -806,7 +805,7 @@ def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
         f"p.with_suffix(\\'.tmp\\').write_text(str(os.getpid())); p.with_suffix(\\'.tmp\\').replace(p); time.sleep(60)']); "
         f"signal.signal(signal.SIGTERM, signal.SIG_DFL); time.sleep(60)\""
     )
-    session = registry.spawn_local(command, task_id="descendant-test")
+    registry.spawn_local(command, task_id="descendant-test")
     try:
         # Atomic publication makes existence a complete PID readiness signal.
         assert _wait_until(lambda: os.path.exists(pidfile))
@@ -2244,17 +2243,23 @@ class TestSpawnRewriteCompoundBackground:
 # =========================================================================
 
 class TestCheckpoint:
-    def test_recover_dead_pid(self, registry, tmp_path):
+    @pytest.mark.parametrize("notify", [False, True])
+    def test_recover_dead_pid(self, registry, tmp_path, notify):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_dead",
             "command": "sleep 999",
             "pid": 999999999,  # almost certainly not running
-            "task_id": "t1",
+            "task_id": "t1", "notify_on_complete": notify,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
-            assert recovered == 0
+            assert recovered == 1
+            assert registry.poll("proc_dead")["exit_code"] is None
+            if notify:
+                assert registry.completion_queue.get_nowait()["session_id"] == "proc_dead"
+            else:
+                assert registry.completion_queue.empty()
 
     def test_recover_dead_wrapper_retries_unreaped_systemd_scope(
         self, registry, tmp_path, monkeypatch
@@ -2299,7 +2304,7 @@ class TestCheckpoint:
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), patch(
             "tools.process_registry._stop_systemd_unit", return_value=True
         ) as stop_unit:
-            assert registry.recover_from_checkpoint() == 0
+            assert registry.recover_from_checkpoint() == 1
 
         stop_unit.assert_called_once_with(entry["systemd_unit"])
         assert json.loads(checkpoint.read_text(encoding="utf-8-sig")) == []
@@ -3269,6 +3274,7 @@ class TestSystemdCgroupIsolation:
         def fake_popen(argv, **kwargs):
             captured["argv"] = list(argv)
             captured["start_new_session"] = kwargs.get("start_new_session")
+            captured["stdout"] = kwargs.get("stdout")
             proc = MagicMock()
             proc.pid = 4321
             proc.stdout = iter([])
@@ -3278,12 +3284,11 @@ class TestSystemdCgroupIsolation:
 
         return fake_popen, captured
 
-    @pytest.mark.platforms("linux")
     def test_wraps_in_systemd_scope_when_supervisor_and_available(
         self, registry, monkeypatch, _gateway_identity
     ):
-        """Under a supervisor with systemd-run available, the spawn argv is
-        wrapped in ``systemd-run --user --scope --unit=hermes-worker-<id>``."""
+        """The fully mocked Linux dispatch is testable on every POSIX host."""
+        monkeypatch.setattr("tools.process_registry._IS_LINUX", True)
         fake_popen, captured = self._fake_popen_capture()
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
@@ -3336,6 +3341,8 @@ class TestSystemdCgroupIsolation:
         sep_idx = argv.index("--")
         assert "/bin/bash" in argv[sep_idx:]
         assert "set +m; echo hello" in argv[sep_idx:]
+        assert not session.exit_path and not session.log_path
+        assert captured["stdout"] == subprocess.PIPE
         # systemd-run --scope gives the worker a new cgroup but NOT a new
         # session (#70716 regression: start_new_session was False, so the
         # worker kept the parent's session + controlling terminal → SIGTTIN/
@@ -3371,6 +3378,7 @@ class TestSystemdCgroupIsolation:
         argv = captured["argv"]
         # No systemd-run wrapping — direct shell invocation.
         assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert captured["stdout"] == subprocess.PIPE
         assert captured["start_new_session"] is True
 
     def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
@@ -3397,6 +3405,7 @@ class TestSystemdCgroupIsolation:
 
         argv = captured["argv"]
         assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert captured["stdout"] == subprocess.PIPE
         assert captured["start_new_session"] is True
 
     @pytest.mark.parametrize("use_pty", [False, True])
@@ -3438,9 +3447,8 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
-                "/bin/bash", "-lic", "set +m; echo hello",
-            ]
+            assert captured["argv"] == ["/bin/bash", "-lic", "set +m; echo hello"]
+            assert captured["stdout"] == subprocess.PIPE
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""
@@ -3489,9 +3497,8 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
-                "/bin/bash", "-lic", "set +m; echo hello",
-            ]
+            assert captured["argv"] == ["/bin/bash", "-lic", "set +m; echo hello"]
+            assert captured["stdout"] == subprocess.PIPE
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""
@@ -3563,11 +3570,11 @@ class TestSystemdCgroupIsolation:
         assert argv[-3:] == ["/bin/bash", "-lic", "set +m; codex"]
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
-    @pytest.mark.platforms("linux")
     def test_pty_spawn_failure_reaps_scope_before_distinct_pipe_fallback(
         self, registry, monkeypatch, _gateway_identity
     ):
-        """A failed PTY scope must not collide with the pipe fallback scope."""
+        """A failed PTY scope must not collide with the file-backed fallback scope."""
+        monkeypatch.setattr("tools.process_registry._IS_LINUX", True)
         from ptyprocess import PtyProcess
 
         events = []

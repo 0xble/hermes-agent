@@ -133,6 +133,7 @@ gateway:
     started: "🔄 Tâche d'arrière-plan démarrée : « {preview} »\nID de tâche : {task_id}\nVous pouvez continuer à discuter — les résultats apparaîtront ici une fois terminés."
     task_finished: "✅ Tâche d'arrière-plan terminée"
     task_failed: "❌ Échec de la tâche d'arrière-plan"
+    task_unknown: "⚠️ Tâche en arrière-plan terminée, statut de sortie inconnu"
     exit_code: "code de sortie {code}"
     last_output: |-
       . Dernière sortie :
@@ -2598,6 +2599,7 @@ cli:
     exit_code: "sortie {code}"
     verdict_killed: "tué"
     verdict_lost: "perdu"
+    verdict_unknown: "terminé, statut de sortie inconnu"
     verdict_ago: "{verdict} · il y a {seconds} s"
     process_gone: "Ce processus n'est plus suivi."
     no_output: "Pas encore de sortie."

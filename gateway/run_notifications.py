@@ -1699,6 +1699,27 @@ class GatewayNotificationsMixin(
             return None
         return self._adapter_for_source(restored.source)
 
+    def _bind_registered_local_source(self, adapter, source):
+        """The live object local admission will accept, or None.
+
+        ``authorize_source`` requires the registered instance, not an equal
+        copy. Rebind only when the reconstructed identity matches that live
+        source, so a foreign chat cannot borrow it.
+        """
+        from gateway.session_local import LocalSessionAdapter
+        if not isinstance(adapter, LocalSessionAdapter) or source is None:
+            return None
+        saved = adapter.sources.get(getattr(source, "chat_id", None))
+        if not saved:
+            return None
+        original, identity = saved
+        if adapter._identity(source) != identity:
+            return None
+        if not any(getattr(live, "source", None) is original
+                   for live in adapter.authority.sessions.values()):
+            return None
+        return original
+
     def _platform_adapter_for_unproven_relay(self, platform_name: str, source, evt: dict):
         """Platform adapter for a relay-flagged pre-ledger route, else None.
 
@@ -1822,7 +1843,15 @@ class GatewayNotificationsMixin(
             trigger_message_id = str(evt.get("message_id") or "").strip() or None
             if trigger_message_id:
                 metadata["original_trigger_message_id"] = trigger_message_id
-            if getattr(source, "message_id", None):
+            # Local admission accepts only the registered live SessionSource.
+            # A rebuilt origin, or clearing its stale reply anchor, is a
+            # different object: snapshot_local_automation then raises
+            # permission_denied and the completion is logged as an internal
+            # refusal, so the chat never starts the notification turn.
+            bound = self._bind_registered_local_source(adapter, source)
+            if bound is not None:
+                source = bound
+            elif getattr(source, "message_id", None):
                 from gateway.session_identity import replace_source
                 source = replace_source(source, message_id=None)
             synth_event = MessageEvent(
@@ -3115,10 +3144,13 @@ class GatewayNotificationsMixin(
         _started = getattr(session, "started_at", None)
         _dur = max(0.0, time.time() - _started) if isinstance(_started, (int, float)) else None
         command = _redact_gateway_user_facing_secrets(getattr(session, "command", "") or "")
+        provenance = {"completion_reason": getattr(session, "completion_reason", ""),
+                      "termination_source": getattr(session, "termination_source", "")}
         if notify_mode == "concise":
             return _format_concise_process_notification(session_id, command, session.exit_code, new_output,
-                                                        duration_seconds=_dur)
-        header = _format_concise_process_notification(session_id, command, session.exit_code, "", duration_seconds=_dur)
+                                                        duration_seconds=_dur, **provenance)
+        header = _format_concise_process_notification(session_id, command, session.exit_code, "",
+                                                      duration_seconds=_dur, **provenance)
         return t("gateway.background.final_output", header=header, output=new_output.strip()) if new_output.strip() else header
 
     def _format_process_running_message(self, session) -> str:
@@ -3170,6 +3202,7 @@ class GatewayNotificationsMixin(
         if exit != 0) / off."""
         from tools.process_registry import process_registry
         from tools.process_registry_notifications import acknowledge_survivor_notifications, format_process_notification, should_surface_notification
+        from tools.process_registry_survival import is_restart_safe
         session_id = watcher["session_id"]
         interval = watcher["check_interval"]
         platform_name = watcher.get("platform", "")
@@ -3210,18 +3243,25 @@ class GatewayNotificationsMixin(
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
                 if session.exited:
-                    if getattr(session, "survive_restart", False) and process_registry._claim_survivor_delivery(session):
-                        process_registry._mark_survivor_delivered(session)
+                    if is_restart_safe(session):
+                        if process_registry._claim_survivor_delivery(session):
+                            process_registry._mark_survivor_delivered(session)
+                    else:
+                        acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
                     break
                 continue
             current_output_len = len(session.output_buffer)
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
             if session.exited:
+                from tools.process_registry_notifications import process_exit_unknown
+                non_success = session.exit_code != 0 or process_exit_unknown(
+                    session.exit_code, getattr(session, "completion_reason", ""),
+                    getattr(session, "termination_source", ""))
                 # Durable delivery suppresses replay, not a consumer's render/wait/log snapshot.
                 # Claim before admission; while a live peer gateway holds the claim, wait so
                 # this watcher can reclaim the completion if that peer dies before delivering.
-                if getattr(session, "survive_restart", False) and not process_registry._claim_survivor_delivery(session):
+                if is_restart_safe(session) and not process_registry._claim_survivor_delivery(session):
                     if process_registry._survivor_delivery_pending(session):
                         continue
                     break
@@ -3243,7 +3283,7 @@ class GatewayNotificationsMixin(
                     # queued follow-up, or a held fan-in batch), and the chat would stay mute that long
                     # (#112033): send the concise receipt now, once, without waiting for the wake.
                     if turn_busy and not busy_receipt_sent and (notify_mode in {"concise", "all", "result"} or (
-                        notify_mode == "error" and session.exit_code not in {0, None}
+                        notify_mode == "error" and non_success
                     )):
                         busy_receipt_sent = True
                         message_text = self._format_process_final_message(session_id, session, "concise")
@@ -3257,7 +3297,7 @@ class GatewayNotificationsMixin(
                     completion_attempts += 1
                     if completion_attempts < _MAX_COMPLETION_INJECTION_ATTEMPTS:
                         # The process remains terminal; only this claim owner may return it to pending.
-                        if getattr(session, "survive_restart", False):
+                        if is_restart_safe(session):
                             process_registry.release_survivor_completion(session_id)
                         retry_interval = jittered_backoff(
                             completion_attempts, base_delay=max(interval, 1) * 2,
@@ -3290,11 +3330,12 @@ class GatewayNotificationsMixin(
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,
                     )
-                    if getattr(session, "survive_restart", False):
+                    if is_restart_safe(session):
                         process_registry._mark_survivor_delivered(session)
                     break
+                settled = True
                 if notify_mode in {"concise", "all", "result"} or (
-                    notify_mode == "error" and session.exit_code not in {0, None}
+                    notify_mode == "error" and non_success
                 ):
                     message_text = self._format_process_final_message(session_id, session, notify_mode)
                     from gateway.warning_notifications import present_notification
@@ -3308,8 +3349,9 @@ class GatewayNotificationsMixin(
                     async with self._completion_event_scope(watcher):
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                         await present_notification(send_final, platform=platform_name,
-                                                   diagnostic=session.exit_code not in {0, None})
-                    if sent is False and getattr(session, "survive_restart", False):
+                                                   diagnostic=non_success)
+                    settled = sent is not False
+                    if sent is False and is_restart_safe(session):
                         process_registry.release_survivor_completion(session_id)
                         # Keep one offer alive until shutdown cancels the watcher, even if
                         # transport recovery takes hours. A capped scalar bounds retry state.
@@ -3318,8 +3360,8 @@ class GatewayNotificationsMixin(
                         continue
                 # Presented, or deliberately suppressed by the notification mode: either way the
                 # claimed survivor completion is settled and must not replay on a successor.
-                if getattr(session, "survive_restart", False):
-                    process_registry.acknowledge_survivor_completion(session_id)
+                if settled:
+                    acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers

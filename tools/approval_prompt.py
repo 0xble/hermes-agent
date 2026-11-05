@@ -290,10 +290,12 @@ class ApprovalUnavailable(RuntimeError):
 
 def _remembered_consent(session_key: str, choice, remember_key: str | None, unresolved: str) -> str:
     """:func:`_consent`, recording a ``session``/``always`` answer under *remember_key*. Without a key
-    those scopes were never offered, so a stale or typed broader answer covers this call only."""
+    those scopes were never offered, so a stale or typed broader answer is declined."""
     if remember_key is not None:
         from tools import approval as _a
-        _a._persist_choice(session_key, choice, [remember_key])
+        if choice in ("once", "session", "always"):
+            _a._persist_choice(session_key, choice, [remember_key])
+            return "accept"
     return _consent(choice, unresolved)
 
 

@@ -47,7 +47,13 @@ class _Chat:
 
     def _answer(self, data: dict) -> None:
         self.cards.append(dict(data))
-        approval.resolve_gateway_approval(self.session_key, self.choice, request_id=data["request_id"])
+        resolved = approval.resolve_gateway_approval(self.session_key, self.choice, request_id=data["request_id"])
+        if self.choice in ("session", "always") and not data["allow_session"]:
+            # A stale broader answer must leave a one-shot request pending.
+            assert resolved == 0
+            assert approval.resolve_gateway_approval(
+                self.session_key, "once", request_id=data["request_id"]
+            ) == 1
 
 
 @pytest.mark.parametrize("choice", ["session", "always"])
@@ -72,7 +78,7 @@ def test_session_and_always_answers_stop_the_next_prompt_for_that_tool_only(choi
 
 def test_consent_without_an_identity_offers_and_records_only_once(monkeypatch):
     """Elicitation-style consent: the card offers Once / Deny, the CLI panel is asked for once/deny,
-    and a stale broader answer approves this call without remembering anything."""
+    and a stale broader answer cannot settle or broaden the one-shot request."""
     with _Chat("tg:chat-c", "session") as chat:
         assert approval_prompt.request_elicitation_consent("Use the camera?", "server asks") == "accept"
     assert chat.cards[0]["allow_session"] is False and chat.cards[0]["allow_permanent"] is False
@@ -82,6 +88,8 @@ def test_consent_without_an_identity_offers_and_records_only_once(monkeypatch):
     monkeypatch.setattr("tools.terminal_tool._get_approval_callback",
                         lambda: lambda *a, **kw: asked.append(kw) or "always")
     monkeypatch.setattr(approval_prompt._ctx, "_no_user_can_answer", lambda: False)
-    assert approval_prompt.request_elicitation_consent("Fill card?", "pay") == "accept"
+    assert approval_prompt.request_elicitation_consent("Fill card?", "pay") == "decline"
     assert asked[0]["allow_session"] is False and asked[0]["allow_permanent"] is False
     assert approval._session_approved == {} and approval._permanent_approved == set()
+    monkeypatch.setattr("tools.terminal_tool._get_approval_callback", lambda: lambda *a, **kw: "once")
+    assert approval_prompt.request_elicitation_consent("Fill card?", "pay") == "accept"

@@ -514,6 +514,12 @@ def _short_command(command) -> str:
     return cmd[:77] + "..." if len(cmd) > 80 else cmd
 
 
+def process_exit_unknown(exit_code, completion_reason: str | None = "", termination_source: str | None = "") -> bool:
+    """Missing collection evidence is an unknown outcome, never a successful exit."""
+    return (exit_code is None or completion_reason == "lost"
+            or termination_source in {"checkpoint.exit_uncollected", "survivor_lost"})
+
+
 def process_completion_display_text(events: list) -> str:
     """Compact UI title for one or more process completions; the model text keeps the full output."""
     if len(events) != 1:
@@ -526,8 +532,11 @@ def process_completion_display_text(events: list) -> str:
         outcome = "Lost" if reason == "lost" else "Failed to Start"
     else:
         outcome = "Finished" if exit_code == 0 else "Failed"
+    unknown = process_exit_unknown(evt.get("exit_code"), reason, evt.get("termination_source", ""))
+    if unknown and reason not in {"killed", "failed_start"}:
+        outcome = "Finished, exit status unknown"
     cmd = _short_command(evt.get("command"))
-    detail = f" (exit {exit_code})" if reason not in ("killed", *_REASON_STATUS) and exit_code != 0 else ""
+    detail = f" (exit {exit_code})" if not unknown and reason not in ("killed", *_REASON_STATUS) and exit_code != 0 else ""
     return f"Background Process {outcome}{detail}: {cmd}" if cmd else f"Background Process {outcome}{detail}"
 
 
@@ -623,6 +632,10 @@ def _completion_status(evt: dict) -> str:
         if _routine_process_stop(evt):
             return "stopped before it finished"
         return f"terminated by {evt.get('termination_source') or 'Hermes'}"
+    if reason != "failed_start" and process_exit_unknown(
+        evt.get("exit_code"), reason, evt.get("termination_source", ""),
+    ):
+        return "finished, exit status unknown"
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
 
 
@@ -659,6 +672,9 @@ def _format_process_notification_payload(evt: dict) -> str | None:
             f"{attribution}Command: {_cmd}\nMatched output:\n{evt.get('output', '')}"
             + (f"\n({_sup} earlier matches were suppressed by rate limit)" if _sup else "") + "]")
     _exit = evt.get("exit_code", "?")
+    _status = _completion_status(evt)
+    if process_exit_unknown(evt.get("exit_code"), evt.get("completion_reason"), evt.get("termination_source")):
+        _exit = "unknown"
     _out = evt.get("output", "")
     _routine_stop = _routine_process_stop(evt)
     _signal = "" if _routine_stop else (", SIGTERM" if _exit in {-15, 143, "-15", "143"} else "")
@@ -676,7 +692,7 @@ def _format_process_notification_payload(evt: dict) -> str | None:
         _out = (f"...(first {evt['output_cut']} characters cut — process(action=\"log\", "
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
     return (
-        f"{PROCESS_NOTICE_OPEN}Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
+        f"{PROCESS_NOTICE_OPEN}Background process {_sid} {_status} (exit code {_exit}{_signal}).\n"
         f"{_retry}{attribution}Command: {_cmd}\nOutput:\n{_out}]")
 
 

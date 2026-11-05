@@ -204,8 +204,11 @@ def _adapter(tmp_path, ceiling=10):
 
 
 def _spend(adapter, n):
+    quota = adapter._daily_quota()
+    before = quota.messages(CHAT)
     for _ in range(n):
-        adapter._daily_quota().record(CHAT, "sendMessage")
+        quota.record(CHAT, "sendMessage")
+    assert quota.messages(CHAT) == before + n, "daily message pressure must survive test setup"
 
 
 def test_ceiling_comes_from_platform_extra(tmp_path):
@@ -469,8 +472,10 @@ async def test_post_delivery_cleanup_keeps_the_registering_turns_trigger(tmp_pat
 
 
 def _spend_calls(quota, n, endpoint="editMessageText"):
+    before = sum(quota.calls(CHAT).values())
     for _ in range(n):
         quota.record(CHAT, endpoint)
+    assert sum(quota.calls(CHAT).values()) == before + n, "daily call pressure must survive test setup"
 
 
 @pytest.mark.parametrize("calls, background, typed", [(0, False, False), (49, False, False), (50, True, False),

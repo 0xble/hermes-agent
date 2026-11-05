@@ -7,10 +7,25 @@ servers without `&`) keep the refusal: the caller may expect later commands to r
 import json
 import shutil
 import subprocess
+import threading
 import time
 from unittest.mock import patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _terminal_home(tmp_path, monkeypatch):
+    """Readers copy this binding, not a later test's process-global environment."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "hh"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    token = set_hermes_home_override(home)
+    try:
+        yield home
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _env_config(cwd):
@@ -26,7 +41,6 @@ def test_trailing_amp_runs_as_tracked_background_through_the_same_guards(tmp_pat
     from tools.process_registry import process_registry
     from tools.terminal_tool import terminal_tool
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
     marker = tmp_path / "ran"
     seen = []
 
@@ -76,7 +90,6 @@ def test_converted_command_never_gets_relaunch_hint_even_with_another_hint(tmp_p
     from tools.terminal_tool import terminal_tool
     from tools.terminal_tool_background import _HOMEBREW_CI_POLLER_HINT, _SILENT_BACKGROUND_HINT
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
     with patch("tools.terminal_tool._get_env_config", return_value=_env_config(tmp_path)), \
          patch("tools.terminal_tool._start_cleanup_thread"), \
          patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
@@ -114,12 +127,44 @@ def test_conversion_never_changes_what_runs_or_how_it_is_approved(command):
         assert out(stripped) == out(command + " wait")
 
 
+def test_delayed_reader_keeps_the_spawning_tests_home(tmp_path, monkeypatch):
+    """An earlier test's reader must not checkpoint into the next test's home."""
+    from tools.process_registry import ProcessRegistry
+
+    home = tmp_path / "hh"
+    next_home = tmp_path / "next-test-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    registry = ProcessRegistry()
+    checkpoint = registry._write_checkpoint
+    reader_ready = threading.Event()
+    release_reader = threading.Event()
+
+    def delayed_checkpoint():
+        if threading.current_thread() is not threading.main_thread():
+            reader_ready.set()
+            assert release_reader.wait(10), "reader was never released"
+        checkpoint()
+
+    monkeypatch.setattr(registry, "_write_checkpoint", delayed_checkpoint)
+    session = registry.spawn_local("echo callback-canary", cwd=str(tmp_path))
+    reader = session._reader_thread
+    assert reader is not None
+    try:
+        assert reader_ready.wait(10), "reader never reached completion checkpoint"
+        monkeypatch.setenv("HERMES_HOME", str(next_home))
+    finally:
+        release_reader.set()
+        reader.join(10)
+    assert not reader.is_alive()
+    assert (home / "processes.json").is_file()
+    assert not (next_home / "processes.json").exists()
+
+
 def test_trailing_amp_is_refused_in_incognito_before_any_spawn(tmp_path, monkeypatch):
     """The rewrite makes this a background spawn; its registry entry and log would persist."""
     from agent.incognito import incognito_scope
     from tools.terminal_tool import terminal_tool
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
     with patch("tools.terminal_tool._get_env_config", return_value=_env_config(tmp_path)), \
          patch("tools.terminal_tool._start_cleanup_thread"), \
          patch("tools.terminal_tool._acquire_env", side_effect=AssertionError("must not run")), \

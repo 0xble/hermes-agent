@@ -3157,10 +3157,14 @@ def _shorten_command_for_display(command: str, limit: int = 80) -> str:
 
 
 def _format_concise_process_notification(
-    session_id: str, command: str, exit_code, output: str, duration_seconds=None) -> str:
-    """One-line completion message for ``concise`` display mode; failure appends a short output tail."""
-    ok = exit_code in {0, None}
-    parts = [t("gateway.background.task_finished") if ok else t("gateway.background.task_failed")]
+    session_id: str, command: str, exit_code, output: str, duration_seconds=None,
+    *, completion_reason="", termination_source="") -> str:
+    """One-line completion; failed and uncollected exits append a short output tail."""
+    from tools.process_registry_notifications import process_exit_unknown
+    unknown = process_exit_unknown(exit_code, completion_reason, termination_source)
+    ok = exit_code == 0 and not unknown
+    parts = [t("gateway.background.task_unknown") if unknown else (
+        t("gateway.background.task_finished") if ok else t("gateway.background.task_failed"))]
     short_cmd = _shorten_command_for_display(command)
     if short_cmd:
         parts.append(f"— `{short_cmd}`")
@@ -3173,7 +3177,7 @@ def _format_concise_process_notification(
             details.append(f"{secs // 60}m {secs % 60}s")
         else:
             details.append(f"{secs}s")
-    if not ok:
+    if not ok and not unknown:
         details.append(t("gateway.background.exit_code", code=exit_code))
     if details:
         parts.append(f"({', '.join(details)})")

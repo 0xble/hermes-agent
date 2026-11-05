@@ -4,6 +4,7 @@ from contextlib import ExitStack, nullcontext
 from threading import Barrier
 import importlib.util
 import os
+import ntpath
 import re
 import shutil
 from pathlib import Path
@@ -261,6 +262,70 @@ class PortableGateTests(unittest.TestCase):
             })
             self.assertTrue(Path(result['LOCALAPPDATA']).is_dir())
             self.assertTrue(Path(result['APPDATA']).is_dir())
+
+    def test_windows_system_locations_survive_isolation_in_either_casing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            for casing in ('SystemDrive', 'SYSTEMDRIVE'):
+                with self.subTest(casing=casing):
+                    locations = {
+                        casing: 'D:',
+                        'SystemRoot' if casing[0].isupper() and casing[1].islower() else 'SYSTEMROOT': r'D:\Windows',
+                        'ProgramData' if casing == 'SystemDrive' else 'PROGRAMDATA': r'D:\ProgramData',
+                        'ALLUSERSPROFILE': r'D:\ProgramData',
+                        'PATH': os.defpath,
+                    }
+                    with patch.dict(os.environ, locations, clear=True), patch.object(ci, 'STATE', state):
+                        env = ci.environment(state / casing)
+                    for key, value in locations.items():
+                        if key == 'PATH':
+                            continue
+                        self.assertEqual(env.get(key.upper()), value, key)
+                    with patch.dict(os.environ, {'SYSTEMDRIVE': env['SYSTEMDRIVE']}, clear=False):
+                        expanded = ntpath.expandvars('%SYSTEMDRIVE%\\ProgramData')
+                    self.assertEqual(expanded, r'D:\ProgramData')
+                    self.assertNotIn('%SystemDrive%', expanded)
+                    self.assertNotIn('OPENAI_API_KEY', env)
+
+    def test_windows_location_variables_cross_the_test_runner_env_boundary(self):
+        locations = {
+            'SYSTEMDRIVE': r'D:',
+            'SystemDrive': r'D:',
+            'SYSTEMROOT': r'D:\Windows',
+            'SystemRoot': r'D:\Windows',
+            'PROGRAMDATA': r'D:\ProgramData',
+            'ProgramData': r'D:\ProgramData',
+            'ALLUSERSPROFILE': r'D:\ProgramData',
+            'PSModuleAnalysisCachePath': r'D:\cache\ModuleAnalysisCache',
+            'PSMODULEANALYSISCACHEPATH': r'D:\cache\ModuleAnalysisCache',
+        }
+        # Do not replace the real native Windows system paths when this
+        # portable contract itself runs there.
+        if os.name == 'nt':
+            locations = {
+                key: os.environ.get(key) or os.environ.get(key.upper()) or value
+                for key, value in locations.items()
+            }
+        probe = (
+            'import os, sys\n'
+            'expected = {\n'
+            + ''.join(f'    {key!r}: {value!r},\n' for key, value in locations.items())
+            + '}\n'
+            'missing = {key: os.environ.get(key) for key, value in expected.items() if os.environ.get(key) != value}\n'
+            'assert not missing, missing\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_file = root / 'test_windows_location_boundary.py'
+            test_file.write_text('def test_locations_survive():\n' + ''.join(f'    {line}\n' for line in probe.splitlines()), encoding='utf-8')
+            env = dict(os.environ)
+            env.update(locations)
+            env['HERMES_PYTHON'] = sys.executable
+            env['HERMES_HOME'] = str(root / 'hermes-home')
+            subprocess.run(
+                ['bash', 'scripts/run_tests.sh', '-j', '1', '--file-retries', '0', str(test_file)],
+                cwd=ci.ROOT, env=env, check=True, timeout=300,
+            )
 
     def test_windows_appdata_seeds_only_the_isolated_analysis_cache(self):
         with tempfile.TemporaryDirectory() as directory:

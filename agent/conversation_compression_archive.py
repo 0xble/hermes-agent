@@ -8,6 +8,7 @@ compressor actually held, the commit archives those and clones the rest.
 
 from __future__ import annotations
 
+from inspect import getattr_static
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 ABSORBED_ROW_IDS = "_absorbed_row_ids"
@@ -26,6 +27,19 @@ RETIRED_ROW = "_retired_row"
 # Marks the entry for the dict's own row: an assistant fold rewrote its text, so content no longer names it.
 # It stands in the dict's own tail slot and is not one of the counted rows behind it.
 OWN_ROW = "_own_row"
+
+
+def optional_archive_method(session_db):
+    """Only a declared capability may opt a store into non-sticky archive admission.
+
+    getattr alone manufactures capabilities on MagicMock and dynamic RPC proxies.
+    Resolve the bound callable only after static inspection proves it exists.
+    """
+    if getattr_static(session_db, "archive_and_compact_best_effort", None) is not None:
+        optional = getattr(session_db, "archive_and_compact_best_effort")
+        if callable(optional):
+            return optional
+    return session_db.archive_and_compact
 
 
 def retired_row_payload(message: dict[str, Any]) -> dict[str, Any]:

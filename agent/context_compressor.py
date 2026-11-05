@@ -2638,6 +2638,8 @@ class ContextCompressor(
             logger.info("Skipping compression cooldown clear: host already cancelled this compression attempt")
             return
         self._summary_failure_cooldown_until, self._last_summary_error = 0.0, None
+        self._consecutive_archive_capacity_failures = 0
+        self._optional_archive_cooldown_until = 0.0
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
         self._cooldown_persist_failed = False
         ContextCompressor._durable_write(self, "clear_compression_failure_cooldown", "compression failure cooldown clear")
@@ -3344,6 +3346,8 @@ class ContextCompressor(
         at 0) would be silent (#101889).
         """
         self._proactive_prune_rearm_tokens = 0
+        self._consecutive_archive_capacity_failures = 0
+        self._optional_archive_cooldown_until = 0.0
         self._last_reclaim_block_warn = None
 
     def _billed_basis_over_threshold(self, current_tokens: int | None) -> bool:

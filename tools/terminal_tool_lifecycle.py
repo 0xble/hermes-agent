@@ -181,6 +181,24 @@ def _is_workspace_key(key: str) -> bool:
     return ":ws:" in str(key or "")
 
 
+def _local_shell_owner(task_id: Optional[str]) -> Optional[str]:
+    """Local exports belong to one child/run, not its inherited parent session.
+
+    Container aliases deliberately share a filesystem/backend for delegation.
+    A local environment also owns a mutable bash export snapshot, so following
+    those aliases would let a reviewer change the parent's HERMES_HOME. Use the
+    registered child ID (including nested/lifecycle children), never an ID prefix.
+    """
+    from tools import terminal_tool as tt
+
+    if not task_id:
+        return None
+    with tt._container_alias_lock:
+        if task_id in tt._container_aliases or task_id in tt._run_scoped_tasks:
+            return task_id
+    return None
+
+
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id

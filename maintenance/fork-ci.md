@@ -573,11 +573,57 @@ tmux journey, assertion and deadline. Retire this fixture choice only when the
 accepted upstream scripted homes have equivalent startup isolation.
 Contract tests: `tests/ci/test_tmux_home_startup_offers.py`.
 
+The TUI gateway drop scenario holds its first provider request until five
+heartbeat RPCs have actually completed while that request is in flight. A
+legal slow first RPC otherwise consumes most of a short failed turn, so elapsed
+time cannot establish the sampler's count. The provider emits the partial SSE
+immediately and sends empty content chunks during observation, keeping each
+read/stale gap short without changing either timeout. Only then does it close
+without a finish chunk. The first marked request must have served that drop to
+an open peer, with no retry before release. The turn's original deadline includes observation,
+and all heartbeat latency, terminal, retry-bound, history, reaping and subsequent
+prompt assertions remain. Each parallel scenario owns its provider and barrier.
+Retire this synchronization when upstream supplies equivalent observation-driven
+fault injection.
+
+The PM wheelhouse fixture uses the four unmodified universal wheels vendored in
+`tests/pm/fixtures/runtime-wheelhouse`, not live PyPI or a host cache. It checks
+the selected wheels' hashes against the current `pm/uv.lock` before copying them
+into the isolated wheelhouse, and requires the fixture archives to match that
+selection exactly. Missing fixtures name their lock entry. Keep the fixtures
+and lock together when updating PM. The offline sealing, relocation and missing-locked-wheel rejection checks are
+unchanged. Retire the vendored source if upstream provides an equally hermetic
+real-wheel fixture.
+
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
 complete-suite gap or proves an installed runtime.
 Retire fixture adaptations when the accepted release tests already cover the maintained
 behavior. Retire superseded hosted orchestration after its replacement qualifies.
+
+## API admission thread-affinity proof
+
+The API held-writer test measures the actual blocking write's thread, not the
+maximum gap between owner-loop ticks. The old 0.5-second tick budget included
+unrelated callbacks and shared-runner descheduling: injecting one unrelated
+0.6-second callback reproduced the failure with the already off-loop admission
+driver unchanged (`gateway/session_api.py::run_steps_off_loop` and
+`gateway/session_runtime_workers.py::tracked_write`). The production off-loop
+fix originated in upstream commit `47b24028dd8`.
+
+For Chat Completions, Responses and Runs, the test guards the real
+`SessionDB._execute_write` against the owner thread and observes a real SQLite
+busy retry while another connection retains `BEGIN IMMEDIATE`. An event must
+reach the owner loop while the request remains pending; only then does the test
+release the writer and require the original successful HTTP status. The event
+and request watchdogs bound deadlocks, not admission latency. No production
+path, skip, timeout or performance threshold is relaxed.
+
+Contract tests: `tests/gateway/test_api_admission_off_loop.py`.
+
+Retire this `fork-ci-reliability` adaptation when the accepted upstream test
+uses equivalent causal thread-affinity and real-contention evidence rather
+than a subsecond wall-clock scheduling budget.
 
 ## Portable source gate migration
 
@@ -587,6 +633,30 @@ worktree isolation, complete allocation of the 36 workflows, and residual native
 OS/integration/release lanes. The candidate removes hosted orchestration while
 remote enforcement remains until replacement qualification and cutover. A partial
 lane or a Linux pass cannot establish all-platform coverage.
+
+## Trailing-amp reader home isolation
+
+The `fork-ci-reliability` identity covers the real-process tests in
+`tests/tools/test_terminal_trailing_amp_auto_background.py`. Their reader threads
+can finish after a later test changes process-global `HERMES_HOME`.
+`_track_started` already copies the producer's context, but an environment-only
+home has no context-local binding to copy. A delayed `_publish_finished` can then
+write `processes.json` into the incognito refusal test's home despite neither
+acquiring an environment nor spawning a process there. Hosted run 41755656382,
+attempt 1, exposed this race.
+
+A module-local autouse fixture binds the existing temporary home with
+`set_hermes_home_override` as well as `HERMES_HOME`, so real reader callbacks keep
+their producer's home. An event-held real reader completion deterministically
+crosses a subsequent home change and must checkpoint only in its original home.
+The incognito no-acquire, no-spawn and no-checkpoint assertions stay intact. No
+production behavior, timeout, retry or checkpoint persistence is relaxed.
+Upstream guidance was checked at `29a61cb7ab509cda0c376bf3860edb87210b0755`;
+[merged PR #140317](https://github.com/NousResearch/hermes-agent/pull/140317)
+is related origin, not a fix for callback test isolation. Retire this adaptation
+when released upstream binds these real-process tests to fixture-owned homes.
+
+Contract tests: `tests/tools/test_terminal_trailing_amp_auto_background.py`
 
 ## Release-sync scope
 

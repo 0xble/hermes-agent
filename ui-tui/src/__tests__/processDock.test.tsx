@@ -109,3 +109,28 @@ it('paints a Processes block under the agents without letting either block hide 
 
   expect(collapsed.trim().split('\n')).toHaveLength(1)
 })
+
+it.each([
+  { exit_code: null },
+  { exit_code: undefined },
+  { exit_code: 0, completion_reason: 'lost' },
+  { exit_code: 0, termination_source: 'checkpoint.exit_uncollected' },
+  { exit_code: 0, termination_source: 'survivor_lost' }
+])('never paints unknown exit %j as a successful process', provenance => {
+  const rows = buildProcessRows([{ ...exited('unknown', 2), ...provenance }], NOW * 1000)
+
+  expect(rows[0]?.status).not.toBe('done')
+  expect(rows[0]?.detail).toContain('exit status unknown')
+
+  const text = paint(
+    <AgentsPanelView
+      cols={100}
+      {...buildAgentRows([], [], NOW * 1000)}
+      processes={buildProcessBlock(rows, 5)}
+      t={DEFAULT_THEME}
+    />
+  )
+
+  expect(text).toContain('exit status unknown')
+  expect(text).not.toContain('✔')
+})
