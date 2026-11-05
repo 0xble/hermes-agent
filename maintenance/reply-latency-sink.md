@@ -8,7 +8,10 @@ Contract tests: `tests/gateway/test_reply_latency_sink.py`, `tests/gateway/test_
 Extend [reply-latency metrics](reply-latency-metrics.md) without changing its
 receipt clock or genuine-user classification. Confirmed visible text, media and
 reactions settle first reply once; deliberate NO_REPLY/[SILENT] settles `no_reply`
-without inventing a delivery or latency sample.
+without inventing a delivery or latency sample. Tool destination matching normalizes
+an absent thread (`None` or the session-routing empty string) centrally, on both
+sides of the comparison. Named threads and zero-valued IDs remain distinct; chat
+and message IDs are not normalized to empty or treated as wildcards.
 The scripts factory scorecard is the concrete consumer. Ordinary gateway.log
 rotation must not delete sparse measurement evidence. This is local private
 instrumentation, independent of shared-telemetry consent; no content or outbound

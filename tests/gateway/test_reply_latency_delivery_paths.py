@@ -133,7 +133,7 @@ def test_reaction_is_visible_reply_only_after_success(monkeypatch, caplog, threa
         clear_session_vars(tokens)
 
 
-@pytest.mark.parametrize('thread_id', [None, '', 'topic'])
+@pytest.mark.parametrize('thread_id', [None, '', 'topic', 0])
 def test_send_message_only_current_route_and_confirmed_delivery(monkeypatch, caplog, thread_id):
     import tools.send_message_tool as tool
     import model_tools
@@ -141,8 +141,9 @@ def test_send_message_only_current_route_and_confirmed_delivery(monkeypatch, cap
     incoming = event(Adapter(), 'tool', thread_id)
     latency.bind_agent_start(incoming)
     # Target parsers return None for an unthreaded destination, even if intake used ''.
+    destination_thread_id = None if thread_id in (None, '') else thread_id
     monkeypatch.setattr(tool, '_resolve_tool_target', lambda target: (
-        'telegram', target.split(':')[0], 'other-topic' if ':' in target else thread_id or None, None))
+        'telegram', target.split(':')[0], 'other-topic' if ':' in target else destination_thread_id, None))
     monkeypatch.setattr('gateway.config.load_gateway_config', lambda: object())
     monkeypatch.setattr(tool, '_resolve_platform_config', lambda *args: (Platform.TELEGRAM, object(), None, None))
     monkeypatch.setattr(tool, '_authorize_relay_target', lambda *args, **kwargs: None)

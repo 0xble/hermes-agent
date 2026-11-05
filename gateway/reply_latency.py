@@ -248,6 +248,11 @@ def hand_over_receipt(source: Any, target: Any) -> None:
             setattr(target, name, getattr(source, name))
 
 
+def _thread_identity(thread_id: Any) -> str | None:
+    """Session routing uses '' for no thread; retain nonempty IDs, including zero."""
+    return (str(thread_id) or None) if thread_id is not None else None
+
+
 def record_tool_reply(platform: str, chat_id: Any, thread_id: Any = None) -> None:
     """Only a successful delivery to this turn's destination answers its input."""
     receipt = current_receipt()
@@ -255,5 +260,5 @@ def record_tool_reply(platform: str, chat_id: Any, thread_id: Any = None) -> Non
         return
     identity = receipt.identity
     if (identity['platform'] == platform and identity['chat_id'] == str(chat_id)
-            and identity['thread_id'] == (str(thread_id) if thread_id is not None else None)):
+            and _thread_identity(identity['thread_id']) == _thread_identity(thread_id)):
         record_first_reply(receipt, "delivery")
