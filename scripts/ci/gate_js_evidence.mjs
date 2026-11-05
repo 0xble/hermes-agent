@@ -118,7 +118,8 @@ async function frozenTestCall(fn, context) {
 }
 `
   return helpers + source
-    .replaceAll('return fn(context);', 'return options?.context ? frozenTestCall(fn, context) : fn(context);')
+    // Suite hooks also supply options.context, but their file/worker context has no test task.
+    .replaceAll('return fn(context);', 'return options?.context && !options.suiteHook ? frozenTestCall(fn, context) : fn(context);')
     .replace('(_, error) => abortIfTimeout([context], error)',
       '(_, error) => { if (context.task.meta.frozenCallActive) frozenRecordCallError(context, error); abortIfTimeout([context], error); }')
     .replace('failTask(test.result, e, runner.config.diffOptions);\n\t\t\t\t}\n\t\t\t\ttry {\n\t\t\t\t\tawait runner.onTaskFinished',
