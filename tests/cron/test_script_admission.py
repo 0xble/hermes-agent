@@ -266,7 +266,7 @@ def test_queued_script_edited_to_agent_waits_for_agent_admission(home, monkeypat
 
 
 def test_person_send_starts_while_ordinary_script_is_running(home, monkeypatch):
-    """Real script execution overtakes an occupied ordinary-script FIFO, without a send."""
+    """Person-send retains its serial lane even when every ordinary worker is busy."""
     path, now = home
     marker = path / "person-send-started"
     script = path / "scripts" / "person-send.py"
@@ -277,11 +277,16 @@ def test_person_send_starts_while_ordinary_script_is_running(home, monkeypatch):
     first, second = due_job(now, no_agent=True), due_job(now, no_agent=True)
     send = due_job(now, schedule="in 1m", no_agent=True, script=str(script), repeat=1)
     release, first_started, second_started = (threading.Event() for _ in range(3))
+    blockers = [due_job(now, no_agent=True) for _ in range(3)]
+    blocker_started = {item["id"]: threading.Event() for item in blockers}
 
     def run(item, **kwargs):
         if item["id"] == first["id"]:
             first_started.set()
             assert release.wait(10)
+        elif item["id"] in blocker_started:
+            blocker_started[item["id"]].set()
+            assert release.wait(30)
         elif item["id"] == second["id"]:
             second_started.set()
         else:
@@ -296,12 +301,13 @@ def test_person_send_starts_while_ordinary_script_is_running(home, monkeypatch):
     futures = []
     try:
         pool = scheduler._get_parallel_pool(1)
-        futures += admission.submit_due_jobs([first], pool, run)
+        futures += admission.submit_due_jobs([first, *blockers], pool, run)
         assert first_started.wait(5)
+        assert all(event.wait(5) for event in blocker_started.values())
         # Exercise the real tick/fire-claim path for the queued jobs.
         assert scheduler.tick(sync=False) == 2
         assert wait_until(marker.exists, timeout=3), "person-send queued behind an ordinary script"
-        assert not second_started.is_set(), "ordinary scripts must remain serial"
+        assert not second_started.is_set(), "ordinary scripts must retain their four-worker bound"
         row = executions.latest_execution(send["id"])
         assert row is not None and row["started_at"] == now.isoformat()
         assert not release.is_set()
