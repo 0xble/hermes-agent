@@ -100,33 +100,49 @@ async def test_intentional_silence_emits_terminal_not_latency(monkeypatch, tmp_p
     assert terminal == ['no_reply']
 
 
-def test_reaction_is_visible_reply_only_after_success(monkeypatch, caplog):
+@pytest.mark.parametrize('thread_id', [None, '', 'topic'])
+def test_reaction_is_visible_reply_only_after_success(monkeypatch, caplog, thread_id):
     import tools.react_tool as react
     import tools.send_message_senders as senders
     import tools.send_message_tool as send_tool
     import model_tools
+    from gateway.session_context import clear_session_vars, set_session_vars
+
     caplog.set_level('INFO', logger='gateway.reply_latency')
-    incoming = event(Adapter(), 'reaction')
+    incoming = event(Adapter(), 'reaction', thread_id)
     latency.bind_agent_start(incoming)
-    env = {'HERMES_SESSION_CHAT_ID': 'chat', 'HERMES_SESSION_MESSAGE_ID': 'reaction'}
-    monkeypatch.setattr(react, 'get_session_env', lambda key: env.get(key))
-    monkeypatch.setattr(senders, '_live_adapter', lambda platform: (None, SimpleNamespace(add_reaction=object())))
-    async def dispatch(*args):
-        return True
+    reaction = AsyncMock(return_value=False)
+    monkeypatch.setattr(senders, '_live_adapter', lambda platform: (None, SimpleNamespace(add_reaction=reaction)))
+    async def dispatch(runner, call, error):
+        return await call()
     monkeypatch.setattr(send_tool, '_dispatch_on_gateway_loop', dispatch)
     monkeypatch.setattr(model_tools, '_run_async', asyncio.run)
-    result = json.loads(react._react_gateway(Platform.TELEGRAM, '👍'))
-    assert result['success']
-    assert [r['event'] for r in records(caplog)] == ['received', 'agent_start', 'first_reply']
+    # Match GatewayRunner._set_session_env: no thread is bound as '', not None.
+    tokens = set_session_vars(platform='telegram', chat_id='chat', message_id='reaction',
+                              thread_id=thread_id or '', scope_id='', user_id='', parent_chat_id='')
+    try:
+        assert 'error' in json.loads(react._react_gateway(Platform.TELEGRAM, '👍'))
+        assert not incoming._reply_latency_receipt.replied
+        reaction.return_value = True
+        assert json.loads(react._react_gateway(Platform.TELEGRAM, '👍'))['success']
+        reaction.assert_awaited_with('chat', 'reaction', '👍', scope_id='', thread_id=thread_id or '',
+                                     user_id='', parent_chat_id='', team_id='')
+        latency.record_no_reply(incoming._reply_latency_receipt)
+        assert [r['event'] for r in records(caplog)] == ['received', 'agent_start', 'first_reply']
+    finally:
+        clear_session_vars(tokens)
 
 
-def test_send_message_only_current_route_and_confirmed_delivery(monkeypatch, caplog):
+@pytest.mark.parametrize('thread_id', [None, '', 'topic'])
+def test_send_message_only_current_route_and_confirmed_delivery(monkeypatch, caplog, thread_id):
     import tools.send_message_tool as tool
     import model_tools
     caplog.set_level('INFO', logger='gateway.reply_latency')
-    incoming = event(Adapter(), 'tool', 'topic')
+    incoming = event(Adapter(), 'tool', thread_id)
     latency.bind_agent_start(incoming)
-    monkeypatch.setattr(tool, '_resolve_tool_target', lambda target: ('telegram', target, 'topic', None))
+    # Target parsers return None for an unthreaded destination, even if intake used ''.
+    monkeypatch.setattr(tool, '_resolve_tool_target', lambda target: (
+        'telegram', target.split(':')[0], 'other-topic' if ':' in target else thread_id or None, None))
     monkeypatch.setattr('gateway.config.load_gateway_config', lambda: object())
     monkeypatch.setattr(tool, '_resolve_platform_config', lambda *args: (Platform.TELEGRAM, object(), None, None))
     monkeypatch.setattr(tool, '_authorize_relay_target', lambda *args, **kwargs: None)
@@ -142,6 +158,7 @@ def test_send_message_only_current_route_and_confirmed_delivery(monkeypatch, cap
     tool._handle_send({'target': 'chat', 'message': 'skipped'})
     skipped = False
     tool._handle_send({'target': 'other', 'message': 'not an answer here'})
+    tool._handle_send({'target': 'chat:other-topic', 'message': 'not an answer in this thread'})
     assert not [r for r in records(caplog) if r['event'] == 'first_reply']
     tool._handle_send({'target': 'chat', 'message': 'answer'})
     tool._handle_send({'target': 'chat', 'message': 'second answer'})
