@@ -573,7 +573,9 @@ def template_home(tmp_path_factory, provider) -> Path:
     (work / ".env").write_text("OPENAI_API_KEY=sk-fake-e2e-work\n", encoding="utf-8")
     cp = seed.run("-p", "work", "-z", "work profile session before the upgrade")
     assert cp.returncode == 0, H.describe(cp)
-    cp = seed.run("cron", "create", "--name", "nightly", "0 3 * * *", "summarize the day")
+    # This suite checks cron-state preservation, not dispatch. A live 03:00 job can
+    # become due during a slow update and add an unrelated provider call/session.
+    cp = seed.run("cron", "create", "--paused", "--name", "nightly", "0 3 * * *", "summarize the day")
     assert cp.returncode == 0, H.describe(cp)
     # Configs were written by hand AFTER the N-1 CLI touched them; re-pin them to the user's bytes.
     (seed.hermes_home / "config.yaml").write_text(cfg, encoding="utf-8")

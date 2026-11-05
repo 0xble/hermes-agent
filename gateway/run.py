@@ -2368,11 +2368,14 @@ def _resolve_gateway_model_context(
     resolved_model = model or _resolve_gateway_model()
     config_context_length = provider = base_url = api_key = custom_providers = None
     configured_model = configured_provider = configured_base_url = None
+    requested_provider = None
+    # Invalid authored routes must fail before optional metadata/auth best-effort reads.
+    from gateway.run_model_config import _load_gateway_runtime_config
+    data = _load_gateway_runtime_config()
 
     def _read_config() -> None:
         nonlocal config_context_length, provider, base_url, custom_providers
         nonlocal configured_model, configured_provider, configured_base_url
-        data = _load_gateway_config()
         if not data:
             return
         model_cfg = data.get("model", {})
@@ -2391,16 +2394,18 @@ def _resolve_gateway_model_context(
             custom_providers = data.get("custom_providers")
 
     def _read_runtime() -> None:
-        nonlocal provider, base_url, api_key
+        nonlocal provider, base_url, api_key, requested_provider
         if route and route.get("base_url"):
             # A session route with its own endpoint (a /model switch) replaces the default runtime
             # read; a route without one (persisted / SessionDB / plain config) still resolves the
             # default runtime credentials so a custom endpoint and its context_length pin survive.
+            requested_provider = route.get("requested_provider") or route.get("provider")
             provider = route.get("provider") or provider
             base_url = route["base_url"]
             api_key = route.get("api_key")
             return
         runtime = _resolve_runtime_agent_kwargs()
+        requested_provider = runtime.get("requested_provider")
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
@@ -2409,7 +2414,8 @@ def _resolve_gateway_model_context(
         # Drop a configured context_length pin when the effective route no longer matches (or on error).
         from hermes_cli.route_identity import should_clear_context_pin
         return not should_clear_context_pin(
-            configured_model, resolved_model, configured_base_url, base_url, configured_provider, provider)
+            configured_model, resolved_model, configured_base_url, base_url,
+            configured_provider, requested_provider or provider)
 
     def _custom_ctx() -> Optional[int]:
         from hermes_cli.config import get_custom_provider_context_length
@@ -2452,17 +2458,6 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str, target_model: Opti
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "capabilities": dict(runtime.get("capabilities") or {})}
 
-
-def _deep_merge_request_overrides(base: Optional[dict], override: Optional[dict]) -> dict:
-    """Merge request_overrides dicts, deep-merging nested dictionaries."""
-    from hermes_cli.config import _deep_merge
-    base_dict = dict(base or {})
-    override_dict = dict(override or {})
-    if not base_dict:
-        return override_dict
-    if not override_dict:
-        return base_dict
-    return _deep_merge(base_dict, override_dict)
 
 
 def _credential_pool_for_provider(provider: Optional[str]):
@@ -2878,7 +2873,10 @@ def _load_gateway_config(config_path: Path | None = None) -> dict:
     try:
         from hermes_cli.config_effective import load_user_config_effective
         return load_user_config_effective(config_path)
-    except Exception:
+    except Exception as exc:
+        from hermes_cli.model_presets import ModelPresetError
+        if isinstance(exc, ModelPresetError):
+            raise
         logger.debug("Could not load gateway config from %s", config_path, exc_info=True)
         return {}
 
@@ -2886,12 +2884,14 @@ def _load_gateway_config(config_path: Path | None = None) -> dict:
 from gateway.session_worker_construct import checkpoint_agent_kwargs as _checkpoint_agent_kwargs
 
 
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """The profile's model when nothing else names one: config.yaml (single source of truth), else the
     claimed welcome trial's. Temporary AIAgents (e.g. /compress) otherwise use the hardcoded default,
     which fails under openai-codex."""
     from hermes_cli.anon_auth import trial_model
-    model_cfg = (config if config is not None else _load_gateway_config()).get("model", {})
+    from gateway.run_model_config import _load_gateway_runtime_config
+    model_cfg = _load_gateway_runtime_config(config).get("model", {})
     if isinstance(model_cfg, dict):
         model_cfg = model_cfg.get("default") or model_cfg.get("model")
     return (model_cfg if isinstance(model_cfg, str) else "") or trial_model()

@@ -15,6 +15,7 @@ import hashlib
 import inspect
 import json
 import logging
+from agent.auxiliary_fallback_config import _fallback_reasoning_config, _fallback_provider_from_label, _fallback_entry_timeout
 import os
 import re
 import threading
@@ -3899,23 +3900,7 @@ def _coerce_positive_timeout(raw: Any) -> Optional[float]:
     return None
 
 
-def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[float]:
-    """Per-entry ``timeout`` for a configured fallback candidate, or None (keep the task-level
-    timeout). Inheriting the primary's deadline used to kill healthy-but-slower fallbacks.
 
-    A fallback candidate previously inherited the exact timeout the primary provider was called with. When
-    that deadline was tuned for the primary (or the primary simply consumed its whole budget before failing
-    over), the fallback aborted on the same clock even when independently healthy — a 163k-token compression
-    that needs ~90s on the fallback died at the primary's 30s deadline every turn (#62452).
-    """
-    entry = _fallback_chain_entry(task, fb_label)
-    return _coerce_positive_timeout(entry.get("timeout") if entry else None)
-
-
-def _fallback_provider_from_label(label: str) -> str:
-    """Recover the provider identifier from a fallback display label."""
-    match = re.match(r"(?:fallback_chain\[\d+\]|fallback_providers\[\d+\]|main-agent)\(([^)]+)\)$", label or "")
-    return match.group(1).strip() if match else str(label or "").strip()
 
 
 class _FallbackDestination(NamedTuple):
@@ -4027,6 +4012,7 @@ def _plan_fallback_candidate(
         task=task, effective_timeout=effective_timeout, fallback_entry=fallback_entry,
         task_config=task_config, apply_fast_lane=apply_fast_lane, **request,
     )
+    common["reasoning_config"] = _fallback_reasoning_config(task, fb_label, request.get("reasoning_config"), fb_client)
 
     def _rebuild(provider: str, client: Any, model: Optional[str]) -> tuple[_FallbackDestination, dict[str, Any]]:
         retry_destination = _FallbackDestination(
@@ -4484,6 +4470,9 @@ def _try_main_fallback_chain(
                 continue
             logger.info("Auxiliary %s: %s on %s — main fallback chain to %s (%s)",
                         task or "call", reason, failed_provider or "auto", label, resolved_model or fb_model)
+            # Carry the selected main-chain effort with the concrete candidate; do not
+            # re-read a mutable config when building or retrying this request.
+            fb_client._hermes_fallback_reasoning_effort = entry.get("reasoning_effort")
             return fb_client, resolved_model or fb_model, fb_provider
         tried.append(label)
     if tried:
