@@ -58,7 +58,7 @@ _EXTRA_FAILURE_CLASSES = frozenset({
     "codex_auto_native", "codex_auto_off", "codex_no_thread", "codex_compaction_failed",
     "session_ownership_lost", "session_ownership_unreadable", "cooldown_state_unreadable", "empty_transcript",
     "summary_model_benched",
-    "summarize_failed", "exchange_skipped", "defrag_failed", "stale_generation", "watermark_unavailable",
+    "summarize_failed", "exchange_skipped", "defrag_failed", "stale_generation", "watermark_unavailable", "archive_capacity",
 })
 # An aborted attempt the compressor ran but deliberately did not commit; other aborts are failures.
 _ABORTED_CLASSES = frozenset({"would_grow", "no_progress", "commit_fence_cancelled"})
