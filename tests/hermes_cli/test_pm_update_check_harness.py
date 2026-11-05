@@ -49,6 +49,9 @@ def test_pm_configure_keeps_update_check_local_when_github_is_rate_limited(tmp_p
     before = git("rev-parse", "HEAD", cwd=root)
     monkeypatch.setattr(main, "PROJECT_ROOT", root)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", env["GIT_CONFIG_GLOBAL"])
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
     monkeypatch.delenv("HERMES_MANAGED", raising=False)
     monkeypatch.setattr(github_api, "github_token", lambda: None)
 
