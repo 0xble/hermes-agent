@@ -15,6 +15,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.waiting import process_alive, kill_if_alive
+
 from agent.lsp.client import _STREAM_LIMIT, LSPClient
 from agent.lsp.protocol import LSPProtocolError, LSPRequestError
 
@@ -24,15 +26,9 @@ MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 def _kill_live_descendant(child) -> None:
     """A killed child may remain a zombie after its launcher exits, until init reaps it."""
-    import psutil
-
     if child is None:
         return
-    try:
-        if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
-            child.kill()
-    except psutil.NoSuchProcess:
-        pass  # The child was reaped between the liveness check and cleanup.
+    kill_if_alive(child)
 
 
 @pytest.mark.parametrize("state", ["live", "zombie", "gone", "reaped", "exits_on_kill", "guard_rejected"])
@@ -236,7 +232,7 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
             await asyncio.wait_for(start, timeout=0.05)
 
         deadline = asyncio.get_running_loop().time() + 15.0
-        while child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+        while process_alive(child):
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.01)
         assert client.state == "error"

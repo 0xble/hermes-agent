@@ -418,6 +418,7 @@ json.dump({"results": results, "stale_roots": stale_roots}, open(spec["out"], "w
 _SUBREAPER = r'''
 import ctypes, json, os, signal, subprocess, sys, time
 import psutil
+from tests.waiting import process_alive, process_cmdline
 
 out = sys.argv[1]
 ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
@@ -430,11 +431,12 @@ status = proc.wait()
 deadline = time.monotonic() + 20
 orphans = []
 while True:
-    orphans = [p for p in psutil.Process().children(recursive=True) if p.status() != psutil.STATUS_ZOMBIE]
+    orphans = [p for p in psutil.Process().children(recursive=True) if process_alive(p)]
     if not orphans or time.monotonic() > deadline:
         break
     time.sleep(0.1)
-report = {"returncode": status, "orphans": [" ".join(p.cmdline()) for p in orphans]}
+report = {"returncode": status, "orphans": [" ".join(cmd) or f"pid={p.pid}" for p in orphans
+                                         if (cmd := process_cmdline(p)) is not None]}
 for p in orphans:
     try:
         p.kill()

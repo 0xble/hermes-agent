@@ -633,6 +633,27 @@ when released upstream binds these real-process tests to fixture-owned homes.
 
 Contract tests: `tests/tools/test_terminal_trailing_amp_auto_background.py`
 
+## Descendant reap races in test probes
+
+Test liveness and teardown probes share `tests.waiting.process_alive` (PID or
+retained Process), `kill_if_alive`, `terminate_if_alive`, `process_children`,
+`process_name`, and `process_cmdline`.
+A descendant can exit between any two psutil reads; NoSuchProcess and
+ZombieProcess mean gone, not a test failure. Recorded creation times and retained
+Process handles preserve identity checks. AccessDenied and live-system guard
+refusals remain errors, never evidence of exit. The helper design extends the
+four-file upstream proposal [#146926](https://github.com/NousResearch/hermes-agent/pull/146926)
+(`055dd8c4914f943899bf0229735fba991a440765`) across the test suite, including the
+LSP cancellation wait. Runtime liveness checks under `gateway/` and `tools/`
+already catch these exceptions; no product behavior is changed.
+
+The deterministic regression holds pid_exists true and raises both reap errors
+from Process.status. Retire this adaptation once an accepted upstream release
+provides equivalent race-safe helpers and all converted probes. Roll back the
+commits carrying `Fork-Patch: fork-ci-reliability` for this change together.
+
+Contract tests: `tests/test_process_liveness.py`, `tests/gateway/test_managed_worker_launch.py`, `tests/agent/lsp/test_client_e2e.py`
+
 ## Release-sync scope
 
 A release sync merges thousands of upstream commits. Fork policy checks classify

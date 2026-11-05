@@ -11,6 +11,8 @@ from unittest.mock import Mock
 import psutil
 import pytest
 
+from tests.waiting import kill_if_alive
+
 from tools import mcp_tool_lifecycle as lifecycle
 from tools import mcp_tool_transport as transport
 
@@ -352,8 +354,8 @@ else:
         grandchild.wait(timeout=10)
         assert not lifecycle._mcp_process_alive(grandchild)
     finally:
-        if grandchild is not None and grandchild.is_running():
-            grandchild.kill()
+        if grandchild is not None:
+            kill_if_alive(grandchild)
         if parent.poll() is None:
             parent.kill()
         parent.wait(timeout=10)
