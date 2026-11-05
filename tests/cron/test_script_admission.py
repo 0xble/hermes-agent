@@ -38,7 +38,7 @@ def due_job(now, **kwargs):
     if kwargs.get("no_agent") and "script" not in kwargs:
         script = scheduler._get_hermes_home() / "scripts" / "noop.py"
         script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text("pass\n")
+        script.write_text("pass\n", encoding="utf-8")
         kwargs["script"] = str(script)
     job = jobs.create_job(prompt="scheduled work", schedule=kwargs.pop("schedule", "every 10m"),
                           deliver="local", **kwargs)
@@ -88,11 +88,13 @@ def test_due_script_runs_while_general_and_protected_detached_workers_wait(home,
         scripts.mkdir(exist_ok=True)
         marker = path / "script-started"
         script = scripts / "wake.py"
-        script.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('awake')\n")
+        script.write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('awake', encoding='utf-8')\n",
+            encoding="utf-8")
         wake = due_job(now, no_agent=True, script=str(script))
         assert scheduler.tick(sync=False) == 1
         assert script_done.wait(5), "due no_agent fire queued behind detached agent waiters"
-        assert marker.read_text() == "awake"
+        assert marker.read_text(encoding="utf-8-sig") == "awake"
         row = executions.latest_execution(wake["id"])
         assert row is not None
         assert row["status"] == "completed"
@@ -104,6 +106,92 @@ def test_due_script_runs_while_general_and_protected_detached_workers_wait(home,
         monkeypatch.setattr(scheduler, "run_one_job", lambda item, **kwargs: True)
         for process in processes:
             process.communicate(timeout=10)
+
+
+def test_slow_script_does_not_delay_due_watchdog(home, monkeypatch):
+    _, now = home
+    release, started, watchdog_done = (threading.Event() for _ in range(3))
+    slow = due_job(now, no_agent=True)
+
+    def run(item, **kwargs):
+        if item["id"] == slow["id"]:
+            started.set()
+            assert release.wait(30)
+        else:
+            watchdog_done.set()
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+    try:
+        assert scheduler.tick(sync=False) == 1
+        assert started.wait(5)
+        due_job(now, no_agent=True, schedule="every 10m")
+        assert scheduler.tick(sync=False) == 1
+        assert watchdog_done.wait(5), "due watchdog queued behind a blocked no_agent script"
+        assert scheduler.is_job_running(slow["id"])
+    finally:
+        release.set()
+
+
+def test_running_script_is_single_flight_while_other_scripts_start(home, caplog):
+    _, now = home
+    release, started, peer_done = (threading.Event() for _ in range(3))
+    script, peer = due_job(now, no_agent=True), due_job(now, no_agent=True)
+    starts = []
+
+    def run(item):
+        starts.append(item["id"])
+        if item["id"] == script["id"]:
+            started.set()
+            assert release.wait(30)
+        else:
+            peer_done.set()
+        return True
+
+    futures = []
+    try:
+        pool = scheduler._get_parallel_pool(4)
+        futures += admission.submit_due_jobs([script], pool, run)
+        assert started.wait(5)
+        with caplog.at_level("INFO", logger="cron.scheduler"):
+            assert admission.submit_due_jobs([script], pool, run) == []
+        assert "already running — skipping" in caplog.text
+        futures += admission.submit_due_jobs([peer], pool, run)
+        assert peer_done.wait(5)
+        assert starts.count(script["id"]) == 1
+        assert scheduler.is_job_running(script["id"])
+    finally:
+        release.set()
+        for future in futures:
+            assert future.result(timeout=5) is True
+    assert not scheduler.is_job_running(script["id"])
+
+
+def test_script_pool_has_four_workers_and_queues_excess_without_overlap(home):
+    _, now = home
+    scripts = [due_job(now, no_agent=True) for _ in range(5)]
+    release = threading.Event()
+    started = {item["id"]: threading.Event() for item in scripts}
+
+    def run(item):
+        started[item["id"]].set()
+        assert release.wait(30)
+        return True
+
+    futures = []
+    try:
+        pool = scheduler._get_parallel_pool(4)
+        futures += admission.submit_due_jobs(scripts, pool, run)
+        assert len(futures) == 5
+        assert all(started[item["id"]].wait(5) for item in scripts[:4])
+        assert not started[scripts[4]["id"]].is_set()
+        # Queued jobs also retain single-flight ownership before a worker starts.
+        assert admission.submit_due_jobs(scripts, pool, run) == []
+    finally:
+        release.set()
+        for future in futures:
+            assert future.result(timeout=5) is True
+    assert all(event.is_set() for event in started.values())
 
 
 def test_queued_script_edited_to_agent_waits_for_agent_admission(home, monkeypatch):
@@ -121,6 +209,9 @@ def test_queued_script_edited_to_agent_waits_for_agent_admission(home, monkeypat
     monkeypatch.setattr(scheduler, "_resolve_max_parallel_workers", lambda: 1)
     agent = due_job(now)
     first = due_job(now, no_agent=True)
+    # Fill every script worker so mode changes happen while the fire is queued.
+    blockers = [due_job(now, no_agent=True) for _ in range(3)]
+    blocker_started = {job["id"]: threading.Event() for job in blockers}
     changed, tail = {}, {}
 
     def run(item, **kwargs):
@@ -131,6 +222,9 @@ def test_queued_script_edited_to_agent_waits_for_agent_admission(home, monkeypat
         elif item["id"] == first["id"]:
             script_started.set()
             assert release_script.wait(10)
+        elif item["id"] in blocker_started:
+            blocker_started[item["id"]].set()
+            assert release_script.wait(30)
         elif item["id"] == changed["id"]:
             changed_started.set()
             assert release_changed.wait(10)
@@ -140,8 +234,9 @@ def test_queued_script_edited_to_agent_waits_for_agent_admission(home, monkeypat
 
     monkeypatch.setattr(scheduler, "run_one_job", run)
     try:
-        assert scheduler.tick(sync=False) == 2
+        assert scheduler.tick(sync=False) == 5
         assert agent_started.wait(5) and script_started.wait(5)
+        assert all(event.wait(5) for event in blocker_started.values())
         changed, tail = due_job(now, no_agent=True), due_job(now, no_agent=True)
         assert scheduler.tick(sync=False) == 2
         execution = executions.latest_execution(changed["id"])
@@ -216,9 +311,9 @@ def test_person_send_starts_while_ordinary_script_is_running(home, monkeypatch):
             future.result(timeout=5)
 
 
-def test_script_fifo_is_serial_scoped_and_does_not_take_protected_reservation(home, tmp_path):
+def test_script_pool_is_scoped_and_does_not_take_protected_reservation(home, tmp_path):
     path, now = home
-    release, first_started, protected_started = (threading.Event() for _ in range(3))
+    release, first_started, protected_started, second_done = (threading.Event() for _ in range(4))
     starts = []
     first, second = due_job(now, no_agent=True), due_job(now, no_agent=True)
     protected = due_job(now, schedule="every 2m")
@@ -230,6 +325,8 @@ def test_script_fifo_is_serial_scoped_and_does_not_take_protected_reservation(ho
             assert release.wait(10)
         if item["id"] == protected["id"]:
             protected_started.set()
+        if item["id"] == second["id"]:
+            second_done.set()
         return True
 
     futures = []
@@ -239,7 +336,7 @@ def test_script_fifo_is_serial_scoped_and_does_not_take_protected_reservation(ho
         assert first_started.wait(5)
         futures += admission.submit_due_jobs([second, protected], pool, body)
         assert protected_started.wait(5)
-        assert second["id"] not in [job_id for job_id, _ in starts]
+        assert second_done.wait(5)
         # A blocked script in A cannot consume B's script capacity or release its claim.
         other_home = tmp_path / "other"
         with _profile_cron_scope(other_home):
