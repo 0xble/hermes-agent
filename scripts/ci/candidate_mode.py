@@ -26,6 +26,8 @@ OVERLAY_PATHS = frozenset({
     ".github/workflows/gate.yml",
     ".github/workflows/prompt-surface-diff.yml",
     "scripts/ci/candidate_mode.py",
+    "scripts/ci/baseline_equivalence.py",
+    "scripts/ci/gate_test_evidence.py",
 })
 
 

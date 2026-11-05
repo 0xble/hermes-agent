@@ -216,3 +216,132 @@ def test_prepare_strips_upstream_workflow_support_files(graph, workflow_support)
     assert git("ls-tree", staging, path) == ""
     assert git("show", f"{candidate}:{path}") == "upstream workflow support"
     assert mode.select(root, candidate, upstream, staging) == ("upstream", upstream)
+
+
+# Exercise the admission boundary, not the workflow's YAML spelling.
+import copy
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/ci"))
+import baseline_equivalence as equivalence
+
+
+def paired_evidence():
+    return {name: {"runner": {"scripts/run_tests.sh": "same"},
+                   "failures": {}, "called": {"tests/a.py::test_existing"}}
+            for name in (*equivalence.SLICES, "messaging-1")}
+
+
+def test_baseline_equivalence_admits_subset_and_rejects_new_failure():
+    baseline = paired_evidence()
+    baseline["python-1"]["failures"] = {"tests/a.py::test_existing": "AssertionError",
+                                          "tests/a.py::test_fixed": "ValueError"}
+    candidate = copy.deepcopy(baseline)
+    del candidate["python-1"]["failures"]["tests/a.py::test_fixed"]
+    assert equivalence.compare("upstream", candidate, baseline) == [
+        "tests/a.py::test_existing [AssertionError]",
+    ]
+    for node, category in (("tests/a.py::test_new", "AssertionError"),
+                           ("tests/a.py::test_existing", "RuntimeError")):
+        changed = copy.deepcopy(candidate)
+        changed["python-1"]["failures"][node] = category
+        with pytest.raises(ValueError, match="Candidate-only"):
+            equivalence.compare("upstream", changed, baseline)
+    with pytest.raises(ValueError, match="full green"):
+        equivalence.compare("fork", candidate, baseline)
+
+
+@pytest.mark.parametrize("side", ["candidate", "baseline"])
+def test_equivalence_requires_every_slice_and_baseline_executed_node(side):
+    candidate, baseline = paired_evidence(), paired_evidence()
+    del (candidate if side == "candidate" else baseline)["e2e-10"]
+    with pytest.raises(ValueError, match="Missing selected slice"):
+        equivalence.compare("upstream", candidate, baseline)
+    candidate, baseline = paired_evidence(), paired_evidence()
+    baseline["e2e-1"]["called"].add("tests/e2e/a.py::test_removed")
+    with pytest.raises(ValueError, match="removed or newly skipped"):
+        equivalence.compare("upstream", candidate, baseline)
+
+
+@pytest.mark.parametrize("field,value", [("head_sha", "b" * 40), ("workflow_id", 8),
+                                         ("path", ".github/workflows/other.yml"),
+                                         ("status", "in_progress"), ("conclusion", "cancelled"),
+                                         ("run_attempt", 2)])
+def test_baseline_wrong_identity_or_incomplete_fails(field, value):
+    run = {"head_sha": "a" * 40, "workflow_id": 7, "path": ".github/workflows/gate.yml",
+           "event": "pull_request", "status": "completed", "conclusion": "failure", "run_attempt": 1}
+    equivalence.validate_run(run, "a" * 40, 7, baseline=True)
+    run[field] = value
+    with pytest.raises(ValueError):
+        equivalence.validate_run(run, "a" * 40, 7, baseline=True)
+
+
+def test_candidate_cannot_supply_baseline_run_id_or_failures(monkeypatch):
+    # No input surface exists; these candidate-controlled environment values
+    # must never affect the frozen selector or baseline discovery.
+    monkeypatch.setenv("BASELINE_RUN_ID", "1")
+    monkeypatch.setenv("BASELINE_FAILURES", '{"tests/a.py::test_new":"AssertionError"}')
+    candidate, baseline = paired_evidence(), paired_evidence()
+    candidate["python-1"]["failures"] = {"tests/a.py::test_new": "AssertionError"}
+    with pytest.raises(ValueError, match="Candidate-only"):
+        equivalence.compare("upstream", candidate, baseline)
+
+
+def test_machine_node_evidence_rejects_infra_and_missing_file():
+    manifest = {"schema": 1, "head": "a" * 40, "files": ["tests/a.py"], "exit": 1, "suite": "python"}
+    session = {"files": ["/checkout/tests/a.py"], "collected": ["tests/a.py::test_x[exact]"],
+               "errors": [], "exit": 1, "reports": [
+                   {"node": "tests/a.py::test_x[exact]", "phase": phase, "outcome": outcome,
+                    "category": "AssertionError" if phase == "call" else ""}
+                   for phase, outcome in (("setup", "passed"), ("call", "failed"), ("teardown", "passed"))]}
+    assert equivalence.slice_nodes(manifest, [session], "a" * 40)[0] == {
+        "tests/a.py::test_x[exact]": "AssertionError",
+    }
+    with pytest.raises(ValueError, match="Missing selected"):
+        equivalence.slice_nodes(manifest, [], "a" * 40)
+    for phase in ("setup", "teardown"):
+        broken = copy.deepcopy(session)
+        next(r for r in broken["reports"] if r["phase"] == phase)["outcome"] = "failed"
+        with pytest.raises(ValueError, match="[Ss]etup|[Tt]eardown"):
+            equivalence.slice_nodes(manifest, [broken], "a" * 40)
+    session["exit"] = 124
+    with pytest.raises(ValueError, match="harness"):
+        equivalence.slice_nodes(manifest, [session], "a" * 40)
+
+
+@pytest.mark.parametrize("incomplete", ["cancelled", "skipped", "timed_out"])
+def test_missing_or_incomplete_hosted_slice_fails(incomplete):
+    names = [f"Upstream {suite} ({i}/10)" for suite in ("Python", "E2E") for i in range(1, 11)]
+    names += ["Freeze candidate gate mode", "Upstream blocking lint, JS and Rust",
+              "Prompt surface diff / Prompt surface summary"]
+    jobs = [{"name": name, "status": "completed", "conclusion": "success", "steps": []} for name in names]
+    for job in jobs[:20]:
+        test_step = ("Full candidate-owned Python suite (all slices required)" if "Python" in job["name"]
+                     else "Full candidate-owned E2E suite (including upgrade)")
+        job["steps"] = [{"name": test_step, "conclusion": "success"},
+                        {"name": "Upload complete test-node evidence", "conclusion": "success"}]
+        if job["name"] == "Upstream E2E (1/10)":
+            job["steps"].append({"name": "Messaging-gated gateway contracts (no skipped coverage)",
+                                 "conclusion": "success"})
+    jobs += [{"name": name, "conclusion": "skipped"} for name in (
+        "Static and Node gate", "Python and e2e (${{ matrix.shard }}/10)",
+    )]
+    equivalence.verify_jobs(jobs)
+    with pytest.raises(ValueError, match="Missing"):
+        equivalence.verify_jobs(jobs[1:])
+    jobs[0]["conclusion"] = incomplete
+    with pytest.raises(ValueError, match="incomplete"):
+        equivalence.verify_jobs(jobs)
+    jobs[0]["conclusion"] = "failure"
+    jobs[0]["steps"].append({"name": "Set up Python", "conclusion": "failure"})
+    with pytest.raises(ValueError, match="Setup/harness/infra"):
+        equivalence.verify_jobs(jobs)
+
+
+
+def test_cli_rejects_candidate_baseline_override(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["baseline_equivalence.py", "qualify", ".", "policy", "upstream",
+                                    "head", "staging", "--baseline-run-id", "123"])
+    with pytest.raises(SystemExit) as error:
+        equivalence.main()
+    assert error.value.code == 2

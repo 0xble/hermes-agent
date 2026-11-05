@@ -4,7 +4,9 @@ Fork patch identity: `fork-ci-reliability` (portable contributor gate extension)
 
 `gate.yml` tests the exact PR head, not GitHub's synthetic merge tree. Its
 `qualification` job succeeds only if the planner, prompt-surface check, and
-**every job in the selected mode** succeed. Only the other mode may be skipped.
+**every selected non-test job** succeed. Fork heads still require every selected
+job green. Upstream-only test failures may satisfy the strict baseline-equivalence
+rule below. Only the other mode may be skipped.
 The `review_candidate` admission contract is unchanged.
 
 ## Mode and trust boundaries
@@ -80,12 +82,14 @@ staging base. No fork-main changes or candidate commits are required.
 
 Use `candidate_mode.py --prepare-staging POLICY_SHA` from the reviewed policy
 checkout. It uses a private temporary index and `commit-tree`, touching no
-checkout, real index, candidate branch or existing ref. It copies exactly three
+checkout, real index, candidate branch or existing ref. It copies exactly five
 files from the frozen policy commit:
 
 - `.github/workflows/gate.yml`
 - `.github/workflows/prompt-surface-diff.yml`
 - `scripts/ci/candidate_mode.py`
+- `scripts/ci/baseline_equivalence.py`
+- `scripts/ci/gate_test_evidence.py`
 
 All other upstream workflow-tree files (including README and nested helpers)
 are **deleted in the staging overlay only**
@@ -98,7 +102,7 @@ not re-add upstream workflows or replace policy workflow bytes on the merge ref.
 Before selecting upstream mode, the planner refuses unless the staging/head
 merge-base equals `B` (candidate) or `B^1` (baseline), the staging base descends
 from that anchor, and every overlay commit is single-parent and changes only
-those three paths or deletes other files under `.github/workflows/`.
+those five paths or deletes other files under `.github/workflows/`.
 It checks **each commit**, not just the net diff: implementation commits,
 reverted off-path changes, overlay merge commits, and added/modified unrelated
 workflows all fail closed. The final staging tree must contain exactly the two
@@ -140,8 +144,10 @@ matches the frozen expected `B`; otherwise regenerate the paired evidence.
 Only after baseline evidence is complete, repeat construction/push/PR creation
 with head `$C` and fresh `-candidate-base`/`-candidate-head` refs. Compare actual
 failures with baseline before attributing a regression. A successful exact-SHA
-`qualification` is still required for admission; matching baseline failures do
-not turn a failed check into a pass. Close both evidence PRs, delete **both**
+`qualification` is still required for admission. Under the rule below, a fresh
+complete baseline can admit an explicitly baseline-equivalent candidate. Keep
+the baseline probe open with both refs until candidate admission finishes: its
+server-side PR association is part of the proof. Close both evidence PRs, delete **both**
 base/head refs for each, then read back closed PR states and absent remote refs.
 Never add harness files to the candidate, rewrite its SHA, or retarget its real PR.
 
@@ -176,6 +182,89 @@ not baseline evidence, and not successful admission. Run the new exact baseline
 first before any baseline-versus-candidate attribution or subsequent candidate
 qualification. All future probes must use clean overlay-only staging.
 
+
+
+## Upstream-only baseline equivalence
+
+The isolated `qualification` job runs `baseline_equivalence.py` from the frozen
+base. It checks out but never executes candidate code. It independently reruns
+the ancestry selector with the planner-frozen upstream tip `U`, exact head `C`
+and staging base, obtaining `B = merge-base U C`. There are no baseline-run ID,
+merge-base or failure-set inputs. Fork-descendant heads never enter this path;
+the existing full-green fork aggregator and deletion refusal are unchanged.
+
+All 10 Python and 10 E2E slices, the messaging contract invocation, planner,
+prompt-surface, lint, JS and Rust remain mandatory. Each test slice first uses
+the candidate's canonical `--generate-slices 10` planner, then runs that exact
+file list through `scripts/run_tests.sh --files-from` with retries disabled.
+A frozen pytest observer records exact `item.nodeid` values (including parameter
+IDs), collection, setup/call/teardown outcomes, exception class and session exit
+status. This is machine-readable pytest evidence, not scraped logs or counts.
+The observer is added to the disposable PM test venv via a `.pth`, not to candidate
+sources. Slice manifests, selected files and per-file sessions are uploaded to
+run-scoped artifacts. Source-integrity assertions still run after test failure.
+
+Qualification reads the GitHub jobs and artifacts APIs using an Actions-read,
+contents-read token, available only in that isolated job. It requires complete
+selected jobs and artifacts; every selected file must have exactly one finished
+pytest session. Missing phases, collection/setup/teardown errors, killed workers,
+runner/session exit mismatch, empty messaging files, messaging skips, setup,
+harness or artifact-upload failures fail. Intentional platform/marker skips stay
+supported, but no node executed by the baseline may disappear or newly skip.
+All non-test jobs must pass outright; no lint/JS/Rust/build exemption exists.
+
+If all candidate tests pass, qualification reports fully green. Otherwise the
+job discovers completed `gate.yml` pull-request runs on **exactly `B`** through
+the API, newest first; a baseline must precede the candidate and be an original
+complete attempt, never a mixed-job rerun. A failing baseline qualifies as
+*evidence*, not as a successful qualification of itself. Old log-only runs are
+not usable, including runs 41968636289 and 41979064843: the new machine evidence
+and frozen policy are required, not reconstructed summaries.
+
+For each baseline, verification binds the server run ID, exact `head_sha`,
+workflow ID/path, event, completed success/failure conclusion and unique live
+PR association. The reusable prompt workflow's **server-recorded merge-ref SHA**
+must match that PR number; its merge parents must be the API's frozen base and
+exact `B`. The baseline overlay ancestry is checked as policy-only, anchored at
+`B^1`; all five policy blobs on that base and actual workflow merge tree must
+match the candidate's frozen policy byte-for-byte. This rejects a different
+workflow with the same check name, candidate-supplied artifact identity, and
+policy drift. No live PR association means fail closed; keep baseline refs until
+admission and only then perform normal probe cleanup. Deleted/expired artifacts
+also fail closed. Comparison checks the selected slice inventory and independently
+verified runner/planner Git blobs, not candidate claims about their hashes.
+Changed runner/planner code requires full green instead of differential relief.
+
+Candidate call-failure nodes must be a subset of baseline call-failure nodes,
+with the **same exception class**. New failures and category changes fail. New
+tests may repartition LPT buckets, so comparison is across each full suite while
+all 10 buckets remain required. An inherited failure list, both run IDs and both
+SHAs appear in the qualification log and job summary under **Baseline-equivalent
+(NOT fully green)**. Selected test jobs and the overall workflow remain red when
+they really failed; only `qualification` becomes successful differential admission.
+`review_candidate` is not changed and still consumes that exact-head check.
+
+### Limits and maintenance risks
+
+- The same node and exception class can fail for different reasons. Exception
+  categories cheaply reject obvious changes, but equivalence is not proof of the
+  same root cause. Review every inherited node and its trace when deciding to
+  land; this gate never represents inherited failures as resolved.
+- A flaky baseline failure can mask a new same-node/same-category regression.
+  Both sides disable retries; a flaky candidate-only node blocks. Use fresh,
+  baseline-first paired runs, not an accumulating failure allowlist. The rule is
+  intentionally not statistical flake suppression or a guarantee of test quality.
+- `B` is recomputed from frozen `U` in each run. When upstream main moves, an old
+  baseline remains usable only if the independently computed exact `B` and frozen
+  policy still match. Different `B`, changed policy/runner, incomplete runs or
+  unavailable artifacts require fresh proof. No moving branch name substitutes
+  for a SHA. Baselines may be reused only while their live association is intact;
+  after probe cleanup another candidate needs a new paired baseline.
+- Candidate tests still execute candidate code on disposable read-only hosted
+  runners, as before. The isolated comparison job never executes it and does not
+  trust candidate-provided baseline IDs/sets. This rule does not claim to detect
+  malicious tests that lie about their own behavior or dependency/network drift.
+  No paid, persistent or self-hosted runners are introduced.
 
 ## Residual maintenance
 

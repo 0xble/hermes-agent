@@ -14,6 +14,7 @@ jobs:
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
       upstream_base: ${{ steps.mode.outputs.upstream_base }}
+      upstream_tip: ${{ steps.mode.outputs.upstream_tip }}
     # Always execute selector policy from the frozen base, never the merge/candidate tree.
     # The explicit rollout pin covers bases predating this new policy file.
     steps:
@@ -37,6 +38,7 @@ jobs:
         run: |
           git -C candidate fetch --no-tags https://github.com/NousResearch/hermes-agent.git main
           upstream=$(git -C candidate rev-parse FETCH_HEAD)
+          echo "upstream_tip=$upstream" >> "$GITHUB_OUTPUT"
           if test -f policy/scripts/ci/candidate_mode.py; then
             python3 policy/scripts/ci/candidate_mode.py candidate "$HEAD_SHA" "$upstream" "$BASE_SHA"
           else
@@ -242,6 +244,7 @@ jobs:
         working-directory: apps/bootstrap-installer/src-tauri
         run: cargo test --lib
       - name: Assert unchanged exact candidate source
+        if: ${{ !cancelled() }}
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
@@ -317,14 +320,23 @@ jobs:
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
-        run: scripts/run_tests.sh
+        run: python3 "$RUNNER_TEMP/gate-harness/scripts/ci/baseline_equivalence.py" collect python ${{ matrix.shard }} "$RUNNER_TEMP/evidence"
       - name: Assert unchanged exact candidate source
+        if: ${{ !cancelled() }}
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           git diff --exit-code
           git diff --cached --exit-code
+      - name: Upload complete test-node evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-evidence-python-${{ matrix.shard }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 7
   upstream-e2e:
     name: Upstream E2E (${{ matrix.shard }}/10)
     needs: plan
@@ -407,22 +419,27 @@ jobs:
           release=$(git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1)
           echo "Upstream upgrade baseline: $release $(git rev-parse "$release^{commit}")"
           python -c "from tests.e2e.core.upgrade._helpers import BWRAP_OK; assert BWRAP_OK, 'bwrap unusable'; from tests.e2e.core.upgrade.network._netedge import netns_usable; assert netns_usable(), 'bwrap --unshare-net unusable'"
-          scripts/run_tests.sh --include-integration tests/e2e
+          python3 "$RUNNER_TEMP/gate-harness/scripts/ci/baseline_equivalence.py" collect e2e ${{ matrix.shard }} "$RUNNER_TEMP/evidence"
       - name: Messaging-gated gateway contracts (no skipped coverage)
         if: matrix.shard == 1 && (success() || failure())
         run: |
-          set -o pipefail
-          log="$RUNNER_TEMP/messaging-gateway.log"
-          scripts/run_tests.sh -rs tests/gateway/test_native_role_reauthorization.py tests/gateway/test_native_telegram_startup_recovery.py tests/gateway/test_native_pause_notice.py tests/gateway/test_native_reply_crash_recovery.py | tee "$log"
-          summary=$(grep '^=== Summary:' "$log")
-          case "$summary" in *skipped*) echo "Messaging contracts skipped: $summary" >&2; exit 1 ;; esac
+          python3 "$RUNNER_TEMP/gate-harness/scripts/ci/baseline_equivalence.py" collect messaging 1 "$RUNNER_TEMP/evidence/messaging"
       - name: Assert unchanged exact candidate source
+        if: ${{ !cancelled() }}
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           git diff --exit-code
           git diff --cached --exit-code
+      - name: Upload complete test-node evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-evidence-e2e-${{ matrix.shard }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 7
   prompt-surface:
     needs: plan
     name: Prompt surface diff
@@ -433,8 +450,34 @@ jobs:
     if: always()
     needs: [plan, linux, python-shard, upstream-static, upstream-python, upstream-e2e, prompt-surface]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.plan.outputs.mode == 'upstream'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.plan.outputs.mode == 'upstream'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify complete upstream execution and exact baseline
+        if: needs.plan.outputs.mode == 'upstream'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          UPSTREAM: ${{ needs.plan.outputs.upstream_tip }}
+        run: python3 policy/scripts/ci/baseline_equivalence.py qualify candidate "$BASE_SHA" "$UPSTREAM" "$HEAD_SHA" "$BASE_SHA"
       - name: Require every gate job
+        if: needs.plan.outputs.mode != 'upstream'
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           DRAFT_PR: ${{ github.event.pull_request.draft }}
