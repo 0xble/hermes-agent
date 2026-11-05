@@ -20,6 +20,15 @@ reusable idle-exit behavior. The classic `HermesCLI` route forwards its existing
 `chat -q`/`-Q` uses the same lease as `-z`; no new configuration or lifecycle
 manager is introduced. Injected connection factories are unchanged.
 
+Update pause must not acquire a finite client's lease: `pause-for-update` refuses
+with `{"pausing": false, "client_owned": true}`, and POSIX bare discovery excludes
+client-owned identity or `--client-owned` argv. Such owners are never drained,
+SIGKILLed, replayed with detached stdin, or added to update resume debt; they end
+with their creating client's lease. Ordinary bare gateway pause/replay is unchanged.
+
+Contract tests: `tests/gateway/test_client_owned_update_pause.py`,
+  `tests/hermes_cli/test_update_client_owned_pause.py`.
+
 The finite-client owner serves local sessions only. It must not dispatch cron,
 restore heartbeat/loop/recovered work, connect messaging adapters, or start
 long-lived daemon housekeeping. A disposable home is not a daemon enrollment.
