@@ -411,6 +411,39 @@ async def test_goal_ack_does_not_invert_routing_save_locks(parked, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['reset', 'suspend', 'remove'])
+async def test_goal_ack_rejects_changed_durable_route(parked, change):
+    import json
+    from gateway.run_goal_wait import goal_wait_guard
+    from hermes_state_runtime import admit_session_input
+
+    runner, _, authority, source, sid, key, manager, rows, _ = parked
+    guard = goal_wait_guard(authority, captured_event(runner, source, sid, manager))
+    before = goals.load_goal(sid).to_json()
+    scope = runner.session_store._routing_scope()
+
+    def rotate(conn):
+        row = conn.execute('SELECT entry_json FROM gateway_routing WHERE scope=? AND session_key=?',
+                           (scope, key)).fetchone()
+        assert row is not None
+        if change == 'remove':
+            conn.execute('DELETE FROM gateway_routing WHERE scope=? AND session_key=?', (scope, key))
+        else:
+            route = json.loads(row[0])
+            route['session_id' if change == 'reset' else 'suspended'] = 'replacement' if change == 'reset' else True
+            conn.execute('UPDATE gateway_routing SET entry_json=? WHERE scope=? AND session_key=?',
+                         (json.dumps(route), scope, key))
+
+    authority.db._execute_write(rotate)
+    with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+        admit_session_input(authority.db, epoch=authority.epoch,
+            principal_id='automation:' + key, session_id=sid, request_id='stale-route-wake',
+            payload={'text': 'stale route wake'}, _authorize_write=guard)
+    assert rows() == []
+    assert goals.load_goal(sid).to_json() == before
+
+
+@pytest.mark.asyncio
 async def test_receipt_lookup_failure_still_backs_off_and_logs_refusal(parked, monkeypatch, caplog):
     runner, _, authority, _, sid, _, _, rows, _ = parked
     before = goals.load_goal(sid).to_json()
