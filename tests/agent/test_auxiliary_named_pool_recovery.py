@@ -116,3 +116,26 @@ def test_named_pool_filters_builtin_rows_and_missing_owner_fails_closed(tmp_path
     after = json.loads((tmp_path / "auth.json").read_text())["credential_pool"]["deepseek"]
     assert next(row for row in after if row["id"] == "foreign") == next(row for row in before if row["id"] == "foreign")
     assert pool_for_aux_provider("custom:deepseek", "custom:deepseek", load_pool).peek().access_token == "owned-b"
+
+
+@pytest.mark.parametrize("error_type", [OSError, ValueError, TypeError, AttributeError])
+def test_named_pool_load_failure_tries_only_owned_legacy_candidate(tmp_path, monkeypatch, error_type):
+    from agent.custom_entry_pool import pool_for_aux_provider
+    from agent.credential_pool import load_pool
+
+    _home(tmp_path, monkeypatch, {"proxy": {"name": "Proxy Display", "base_url": URL}},
+          {"custom:proxy-display": [_row("legacy", "owned-legacy")]})
+    attempted = []
+
+    def load(key):
+        attempted.append(key)
+        if key == "proxy":
+            raise error_type("unreadable or malformed durable pool")
+        return load_pool(key)
+
+    pool = pool_for_aux_provider("custom:proxy", "custom:proxy", load)
+    assert attempted == ["proxy", "custom:proxy-display"]
+    assert pool.peek().access_token == "owned-legacy"
+    attempted.clear()
+    assert pool_for_aux_provider("custom:removed", "custom:removed", load) is None
+    assert attempted == []

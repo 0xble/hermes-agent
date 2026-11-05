@@ -96,7 +96,8 @@ def pool_for_aux_provider(provider: Optional[str], pool_key: str, load: Callable
     for key in custom_provider_pool_key_candidates(entry.get("base_url"), entry.get("provider_key") or name):
         try:
             pool = entry_scoped_pool(load(key), key, entry)
-        except Exception:
+        except (OSError, ValueError, TypeError, AttributeError):
+            # Store I/O and malformed persisted rows must not hide the legacy candidate.
             continue
         if pool is not None and pool.has_credentials():
             return pool
