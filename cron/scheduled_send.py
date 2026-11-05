@@ -135,9 +135,61 @@ def validate_scheduled_send_inputs(
             raise ValueError("timezone required")
     except ValueError as exc:
         raise ValueError("send_freshness.approved_at must be a timezone-aware ISO timestamp.") from exc
-    script = Path(str(send_freshness["script"])).expanduser()
-    if not script.is_file():
-        raise ValueError(f"send_freshness.script does not exist: {send_freshness['script']}")
+    _resolve_freshness_script(send_freshness["script"])
+
+
+def _resolve_freshness_script(script: str) -> Path:
+    """Apply cron's script owner, with one installed communications resource.
+
+    A deployed skill directory may itself be a symlink. That does not make
+    other files in that skill (or a checker symlink escaping it) executable.
+    Project-local skills are deliberately not an installation trust source.
+    """
+    from cron.lifecycle_guard import check_gateway_lifecycle
+    from cron.scheduler_script import _resolve_script_path
+
+    requested = Path(script).expanduser()
+    if ".." in requested.parts:
+        raise ValueError("send_freshness.script must not contain '..' traversal.")
+    resolved, script_error = _resolve_script_path(script)
+    if resolved is None:
+        from agent.skill_utils import get_skill_search_roots
+        from tools.skills_tool import locate_skill
+
+        error, skill_dir, _skill_md = locate_skill(
+            "communications", None, get_skill_search_roots(include_project=False))
+        expected = (skill_dir.resolve() / "scripts/send_freshness.py") if skill_dir else None
+        if (error or expected is None or not requested.is_absolute()
+                or requested.resolve() != expected or expected.resolve() != expected):
+            raise ValueError(
+                "send_freshness.script must be inside HERMES_HOME/scripts or the installed "
+                "communications/scripts/send_freshness.py checker. "
+                f"Checker is unavailable or does not exist: {script_error}"
+            )
+        resolved = expected
+    if not resolved.is_file():
+        raise ValueError(f"send_freshness.script does not exist: {script}")
+    try:
+        check_gateway_lifecycle("", str(resolved))
+    except ValueError as exc:
+        raise ValueError(f"send_freshness.script: {exc}") from exc
+    return resolved
+
+
+def _freshness_subprocess_env() -> dict[str, str]:
+    """Bind the owning fire profile even before run_one_job's worker handoff."""
+    from hermes_constants import get_hermes_home
+    from cron.scheduler import _fire_secret_scope
+    from tools.environments.local import build_subprocess_env
+    from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
+
+    home = get_hermes_home()
+    with _fire_secret_scope():
+        token = install_profile_terminal_scope(home)
+        try:
+            return build_subprocess_env(strip_launch_profile=True)
+        finally:
+            reset_terminal_scope(token)
 
 
 def parse_send_freshness(raw: Any) -> Optional[dict[str, Any]]:
@@ -166,15 +218,20 @@ def run_freshness_script(spec: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "job_id": job.get("id"),
     }
     try:
+        # Re-resolve and scan at execution as well: a persisted checker can have
+        # disappeared, escaped via a replaced symlink, or changed since admission.
+        script_path = _resolve_freshness_script(script)
+        env = _freshness_subprocess_env()
         proc = subprocess.run(
-            [sys.executable, str(Path(script).expanduser())],
+            [sys.executable, str(script_path)],
             input=json.dumps(payload),
+            env=env,
             capture_output=True,
             text=True,
             timeout=45,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return {"stale": True, "checked": False, "reason": f"freshness check failed: {exc}"}
     if proc.returncode not in (0, 2):
         detail = (proc.stderr or proc.stdout or "").strip()[:240]
