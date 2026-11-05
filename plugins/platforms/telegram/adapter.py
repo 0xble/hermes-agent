@@ -483,13 +483,15 @@ def _escape_mdv2(text: str) -> str:
 
 def _strip_mdv2(text: str) -> str:
     """Strip MarkdownV2 escapes and formatting markers for the plain-text fallback."""
+    from gateway.copy_blocks import protect_inline_copy_bodies, restore_inline_copy_bodies
+    text, bodies = protect_inline_copy_bodies(text)
     cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)  # escape backslashes
     cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)  # **bold** BEFORE MarkdownV2 *bold*
     cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
     cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)  # italic; word-bounded so snake_case survives
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
-    return cleaned
+    return restore_inline_copy_bodies(cleaned, bodies)
 
 
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
@@ -652,8 +654,11 @@ def _normalize_dollar_entities(text: str) -> str:
     HTML-escaped its dollars to dodge LaTeX still reaches the user as ``$``."""
     if "&#" not in text:
         return text
-    return _RICH_DOLLAR_ENTITY_RE.sub(
-        lambda match: "$" if match.group(0).startswith("&#") else match.group(0), text)
+    from gateway.copy_blocks import map_outside_copy_blocks
+    return map_outside_copy_blocks(
+        text, lambda outside: _RICH_DOLLAR_ENTITY_RE.sub(
+            lambda match: "$" if match.group(0).startswith("&#") else match.group(0), outside),
+        keep_markers=True)
 
 
 _RICH_CURRENCY_AMOUNT_RE = re.compile(r"(?<![\\`\w])\$\d+(?:,\d{3})*(?:\.\d+)?")
@@ -1831,6 +1836,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         shapes, under the cap, async-capable bot)."""
         return bool(
             content and content.strip()
+            # Copy quotes need literal MarkdownV2 on sends, edits, and drafts alike.
+            and "[[copy]]" not in content and "[[/copy]]" not in content
+            and "\x00HERMES_COPY_" not in content
             and not self._has_telegram_desktop_details_math_crash_shape(content)
             and (
                 getattr(self, "_allow_cjk_rich_messages", False)
@@ -7257,7 +7265,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
 
         # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
         #    before the normal MarkdownV2 conversions run.
-        text = _wrap_markdown_tables(content)
+        from .copy_quotes import protect_copy_quotes
+        text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
         # 1a) CommonMark multi-backtick inline code (``a `b` c``, as format_progress_literal emits). MarkdownV2
         # has only single-backtick code, so re-emit the content as one with ` and \ escaped. Runs before the
         # fenced pass; spans inside a real fence stay that fence's content. Lead-in prose remains outside

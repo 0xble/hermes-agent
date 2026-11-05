@@ -45,6 +45,34 @@ This repair belongs to `telegram-delivery`. Retire it when released upstream pro
 the same FIFO copy handoff and shared failure visibility. Roll back the commit carrying
 that repair without changing persisted replies or delivery rows.
 
+## Literal inline copy context
+
+Patch identity: `telegram-inline-copy-quotes` (fork-authored). Preserve the existing
+separate-copy ledger identity, byte-exact bodies, ordered refusals and TTS exclusion
+while adding inline literal context. Display-only sentinels distinguish an inline
+main-reply ledger row from a raw-wrapped separate-copy row; replay must never promote
+the former into additional copy sends, or give the latter an extra inline message.
+No schema migration is involved. A downgrade should drain pending display-sentinel
+reply rows before reverting, because older renderers do not understand them.
+
+The literal quote renderer deliberately selects MarkdownV2 for replies containing
+copy context, including rich-enabled draft/final/edit paths. Rich-only constructs
+elsewhere in that same reply therefore use the existing legacy degradation. Fences
+inside a body are quoted as escaped literal text, not nested pre entities. Large
+bodies may create extra main-reply overflow messages; all use existing admission,
+pacing, flood and ambiguity handling, without a new producer or retry loop.
+
+Source: `gateway/copy_blocks.py`, stream filtering/fence/overflow owners, extraction,
+reconcile and recovery, and `plugins/platforms/telegram/copy_quotes.py`. Proof:
+`tests/gateway/test_copy_inline_quotes.py` plus copy/stream/ledger regressions.
+Upstream inspected at `a5f20c5c04d52dd92a55c01e58dcc004896b52c2`; open PRs
+[#89997](https://github.com/NousResearch/hermes-agent/pull/89997) and
+[#145608](https://github.com/NousResearch/hermes-agent/pull/145608) concern generic
+expandable-quote syntax, not this fork's paired inline/plain copy contract. No
+released equivalent was found. Retire only when the paired delivery and literal
+body tests pass on an accepted upstream release. Roll back this logical patch
+with its hint and regenerated prompt fixtures, after handling pending rows above.
+
 ## Cancelled Final Settlement
 
 A captured successful final stays delivered when its turn is cancelled. A cancelled

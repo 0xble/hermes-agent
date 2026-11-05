@@ -1598,12 +1598,11 @@ class TestFlushPendingSync:
 
 
 
-class TestCopyBlocksNeverStream:
+class TestCopyBlocksInlineContext:
 
     @pytest.mark.asyncio
-    async def test_overflow_split_and_previews_never_send_copy_syntax(self):
-        """Copy blocks are delivered separately, so no streamed send carries their markers
-        or bodies, including sealed overflow heads and the finalize edit."""
+    async def test_overflow_split_and_previews_keep_copy_context(self):
+        """The Telegram formatter receives literal copy context through overflow/finalize."""
         adapter = TestUtf16OverflowDetection()._make_telegram_like_adapter()
         msg_ids = iter(f"msg_{i}" for i in range(100))
         adapter.send = AsyncMock(
@@ -1626,12 +1625,14 @@ class TestCopyBlocksNeverStream:
         visible = [c.kwargs["content"] for c in adapter.send.call_args_list]
         visible += [c.kwargs["content"] for c in adapter.edit_message.call_args_list]
         assert visible
-        assert not any("[[" in t and "copy" in t for t in visible)
-        assert not any("SECRET" in t for t in visible)
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+        formatted = [TelegramAdapter.format_message(None, t) for t in visible]
+        assert not any("[[" in t and "copy" in t for t in formatted)
+        assert any("> SECRET" in t for t in formatted)
         assert any("after" in t for t in visible)
 
     @pytest.mark.asyncio
-    async def test_copy_block_and_partial_marker_spanning_segment_break_stay_hidden(self):
+    async def test_copy_block_and_partial_marker_spanning_segment_break_keep_context(self):
         """The copy filter lives for the turn: a block, fence, or partial marker line that
         spans a tool-call segment break never leaks into either segment."""
         adapter = TestUtf16OverflowDetection()._make_telegram_like_adapter()
@@ -1659,16 +1660,18 @@ class TestCopyBlocksNeverStream:
         visible = [c.kwargs["content"] for c in adapter.send.call_args_list]
         visible += [c.kwargs["content"] for c in adapter.edit_message.call_args_list]
         joined = "\n".join(visible)
-        assert "PART1" not in joined and "PART2" not in joined and "PART3" not in joined
-        assert "[[co" not in joined.replace("```\n[[copy]]\nliteral in fence", "")
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+        formatted = "\n".join(TelegramAdapter.format_message(None, t) for t in visible)
+        assert "> PART1" in formatted and "> PART2" in formatted and "> PART3" in formatted
+        assert "\\[\\[co" not in formatted.replace("[[copy]]", "")
         assert "middle" in joined and "after" in joined
         assert "literal in fence" in joined
 
 
-class TestStreamedReconcileEditsOmitCopyBlocks:
+class TestStreamedReconcileEditsKeepCopyBlocks:
 
     @pytest.mark.parametrize("transformed", [False, True])
-    def test_reconcile_edit_never_carries_copy_syntax(self, transformed):
+    def test_reconcile_edit_carries_inline_copy_context(self, transformed):
         from gateway.run_turn import GatewayTurnMixin
         adapter = MagicMock()
         adapter.platform = "telegram"
@@ -1686,5 +1689,8 @@ class TestStreamedReconcileEditsOmitCopyBlocks:
         )
         asyncio.run(GatewayTurnMixin()._run_agent_mark_streamed_delivery(response, turn_ctx))
         edited = adapter.edit_message.call_args.kwargs["content"]
-        assert edited == "visible\nmore\n"
+        from gateway.copy_blocks import copy_free_text_for
+        assert edited == copy_free_text_for(adapter, final)
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+        assert TelegramAdapter.format_message(None, edited) == "visible\nmore\n> SECRET\n"
         assert response.get("already_sent") is True
