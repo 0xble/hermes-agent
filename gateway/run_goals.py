@@ -1298,8 +1298,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         The post-turn judge is the only other path that re-evaluates a barrier, and it needs a turn.
         A process killed by a gateway restart, a process started without notify_on_complete, or an
         elapsed timed wait produces no turn, so without this the goal stays parked until an
-        unrelated message arrives. The barrier is cleared only after the adapter admitted the
-        continuation; a busy or unroutable session keeps it for the next scan."""
+        unrelated message arrives. Managed admission acknowledges the exact wait atomically
+        with its durable FIFO row; a refusal keeps it for a later scan."""
         from hermes_cli.goals import GoalManager
 
         store = getattr(self, "session_store", None)
@@ -1348,45 +1348,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
                 or self._queue_depth(key, adapter=adapter) > 0):
             return
-        since = mgr.state.waiting_since
-        logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
-                    sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
-        event = self._synthetic_prompt_event(
-            source, prompt, reply_expected=False, goal_continuation=True,
-            goal_session_id=sid, goal_state=mgr.state,
-        )
-        event.metadata["gateway_session_key"] = key
-        reservation = self._reserve_background_turn(key, event)
-        if reservation is None:
-            return  # background turn limit reached: keep the barrier for a later scan
-        if not await self._clear_stale_resume_pending(key, resume_marker, sid, "goal wakeup"):
-            self._release_background_turn(reservation)
-            return  # marker changed or the session disappeared; retry on the next scan
-        from gateway.wake import WakeNotAccepted, admit_internal_event
-
-        try:
-            # A normal return from handle_message is not admission (routing refusal, session-key
-            # mismatch); only the adapter's receipt proves a continuation was scheduled.
-            await admit_internal_event(adapter, event)
-        except WakeNotAccepted:
-            logger.info("goal wakeup: continuation for session %s not admitted; barrier kept for retry", sid)
-            return
-        # The lifted-barrier path dispatches before the continuation turn's evaluator runs. Stamp
-        # this accepted wake now so a CONTINUE result cannot immediately dispatch a second one.
-        # Admission may rebind the continuation to a compression successor, so stamp the live
-        # destination from the event metadata rather than the pre-admission manager.
-        accepted_sid = str(event.metadata.get("goal_continuation_session_id") or sid)
-        anchor_mgr = mgr if accepted_sid == sid else GoalManager(
-            session_id=accepted_sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
-        )
-        await self._run_in_executor_with_context(
-            lambda: anchor_mgr.mark_automatic_continuation_dispatched(
-                expected_instance=event.metadata.get("goal_continuation_instance"),
-                expected_fingerprint=event.metadata.get("goal_continuation_fingerprint"),
-            )
-        )
-        # Resuming is silent: the continuation turn itself is the visible signal.
-        await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
+        from gateway.run_goal_wait import dispatch_goal_wait
+        await dispatch_goal_wait(self, adapter, source, key, sid, mgr, prompt, resume_marker)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups and resume lifted /goal waits for idle gateway sessions: a coarse
