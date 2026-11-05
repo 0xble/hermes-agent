@@ -444,6 +444,35 @@ async def test_goal_ack_rejects_changed_durable_route(parked, change):
 
 
 @pytest.mark.asyncio
+async def test_local_route_wake_reads_live_sessions_on_owner_loop():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from gateway.config import Platform
+    from gateway.session_route_wake import admit_route_wake_receipt
+    owner = threading.get_ident()
+
+    class LoopOwnedSessions(dict):
+        def get(self, key, default=None):
+            assert threading.get_ident() == owner, 'worker read loop-owned sessions'
+            return super().get(key, default)
+
+    key, sid = 'agent:main:local:fixture', 'local-fixture'
+    source = SimpleNamespace(platform=Platform.LOCAL, chat_id=sid)
+    receipt = SimpleNamespace(status='queued')
+    authority = SimpleNamespace(sessions=LoopOwnedSessions({sid: SimpleNamespace(source=source, route=key)}),
+                                admit_automation=AsyncMock(return_value=receipt))
+    entry = SimpleNamespace(session_id=sid, suspended=False)
+    runner = SimpleNamespace(session_authority=authority,
+        _session_key_for_source=Mock(return_value=key),
+        session_store=SimpleNamespace(lookup_by_session_key=Mock(return_value=entry)))
+    authority.runner = runner
+    assert await admit_route_wake_receipt(runner, object(), source, 'wake', 'local-tick',
+                                          identity='owner-loop') is receipt
+    admitted = authority.admit_automation.call_args.args[1]
+    assert admitted.source is source
+
+
+@pytest.mark.asyncio
 async def test_receipt_lookup_failure_still_backs_off_and_logs_refusal(parked, monkeypatch, caplog):
     runner, _, authority, _, sid, _, _, rows, _ = parked
     before = goals.load_goal(sid).to_json()
