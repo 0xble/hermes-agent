@@ -218,10 +218,12 @@ class ProcessSurvivalMixin:
 
         The gateway may have cancelled its queue consumer before agents drain.
         This is a one-startup result handoff, not a restart-safe delivery lease.
+        Jobs killed by the shutdown sweep must not replay as natural completions.
         """
         stopped = getattr(self, "_survivor_pollers_stopped", None)
         return (stopped is not None and stopped.is_set()
                 and getattr(session, "persist_on_release", False)
+                and getattr(session, "completion_reason", "") != "killed"
                 and not is_restart_safe(session) and has_exit_marker(session)
                 and getattr(session, "notify_on_complete", False)
                 and not getattr(session, "_completion_delivered", False)

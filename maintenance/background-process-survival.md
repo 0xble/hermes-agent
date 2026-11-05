@@ -161,7 +161,9 @@ Fork patch identity: `terminal-background-survival`.
   write into that gateway's pipe: once the old gateway exits, the re-adopted job
   dies of `BrokenPipeError` on its next write. Re-adoption polls the files like a
   survivor. Shutdown kill semantics for `persist_on_release` are unchanged, and
-  the run directory is pruned together with the finished session.
+  the run directory is pruned together with the finished session. Jobs marked
+  `killed` are excluded from the drain-completion handoff: a shutdown sweep must
+  not make its successor replay a killed persistent job as a natural exit.
 - Post-kill verification takes its verdict only from a probe that started after
   the settle window closed. On a loaded macOS host, the psutil ppid scan alone
   can outlast the window, and its "alive" answer predates the reap it waited for.
