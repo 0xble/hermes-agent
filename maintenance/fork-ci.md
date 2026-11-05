@@ -636,7 +636,8 @@ Contract tests: `tests/tools/test_terminal_trailing_amp_auto_background.py`
 ## Descendant reap races in test probes
 
 Test liveness and teardown probes share `tests.waiting.process_alive` (PID or
-retained Process), `kill_if_alive`, `process_children`, and `process_cmdline`.
+retained Process), `kill_if_alive`, `terminate_if_alive`, `process_children`,
+`process_name`, and `process_cmdline`.
 A descendant can exit between any two psutil reads; NoSuchProcess and
 ZombieProcess mean gone, not a test failure. Recorded creation times and retained
 Process handles preserve identity checks. AccessDenied and live-system guard
