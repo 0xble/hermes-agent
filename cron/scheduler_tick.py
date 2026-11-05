@@ -45,8 +45,11 @@ def process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
         if skipped:
             _sched.finish_execution(job["execution_id"], success=False, error=skipped, output=skipped)
             return True
-        from cron.scheduler_diagnostics import script_dispatch
-        if script_dispatch():
+        from cron.scheduler_diagnostics import person_send_dispatch, script_dispatch
+        if person_send_dispatch():
+            claimed = _sched.claim_job_for_fire(
+                job["id"], return_job=True, require_no_agent=True, require_person_send=True)
+        elif script_dispatch():
             claimed = _sched.claim_job_for_fire(job["id"], return_job=True, require_no_agent=True)
         else:
             claimed = _sched.claim_job_for_fire(job["id"], return_job=True)

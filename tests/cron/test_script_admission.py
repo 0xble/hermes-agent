@@ -170,6 +170,52 @@ def test_queued_script_edited_to_agent_waits_for_agent_admission(home, monkeypat
         release_changed.set()
 
 
+def test_person_send_starts_while_ordinary_script_is_running(home, monkeypatch):
+    """Real script execution overtakes an occupied ordinary-script FIFO, without a send."""
+    path, now = home
+    marker = path / "person-send-started"
+    script = path / "scripts" / "person-send.py"
+    script.parent.mkdir(exist_ok=True)
+    script.write_text("# hermes: person-send\nfrom pathlib import Path\n"
+                      f"Path({str(marker)!r}).write_text('started', encoding='utf-8')\n",
+                      encoding="utf-8")
+    first, second = due_job(now, no_agent=True), due_job(now, no_agent=True)
+    send = due_job(now, schedule="in 1m", no_agent=True, script=str(script), repeat=1)
+    release, first_started, second_started = (threading.Event() for _ in range(3))
+
+    def run(item, **kwargs):
+        if item["id"] == first["id"]:
+            first_started.set()
+            assert release.wait(10)
+        elif item["id"] == second["id"]:
+            second_started.set()
+        else:
+            executions.mark_execution_running(item["execution_id"])
+            success, _, _, error = scheduler.run_job(item)
+            executions.finish_execution(item["execution_id"], success=success, error=error)
+            jobs.mark_job_run(item["id"], success, error)
+            assert success, error
+        return True
+
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+    futures = []
+    try:
+        pool = scheduler._get_parallel_pool(1)
+        futures += admission.submit_due_jobs([first], pool, run)
+        assert first_started.wait(5)
+        # Exercise the real tick/fire-claim path for the queued jobs.
+        assert scheduler.tick(sync=False) == 2
+        assert wait_until(marker.exists, timeout=3), "person-send queued behind an ordinary script"
+        assert not second_started.is_set(), "ordinary scripts must remain serial"
+        row = executions.latest_execution(send["id"])
+        assert row is not None and row["started_at"] == now.isoformat()
+        assert not release.is_set()
+    finally:
+        release.set()
+        for future in futures:
+            future.result(timeout=5)
+
+
 def test_script_fifo_is_serial_scoped_and_does_not_take_protected_reservation(home, tmp_path):
     path, now = home
     release, first_started, protected_started = (threading.Event() for _ in range(3))

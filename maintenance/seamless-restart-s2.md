@@ -25,6 +25,21 @@ This is the fork's core update/launchd/cron release boundary, not a plugin: atom
 
 ## Qualification evidence (disposable only)
 
+The transaction fixture explicitly disables `gateway.guardian.admission_canary`
+through its disposable `config.yaml`. Its probe gateway only reports a code root;
+it does not implement native ingress. After `post-install-admission-canary` added
+update-side observation, each real migration retry otherwise spent the production
+180-second window qualifying that probe. The file passed 71 native tests in
+48.2 seconds (nightly 39583566600) and 54.1 seconds (39762130206) before that
+addition, then exceeded 300 seconds (41834945580). Local verbose reproduction
+stacks identify `test_disposable_launchd_first_migration_and_rollback[migration-plist]`
+in `admission_canary.observe`, followed by `[migration-loaded]` at the file cap.
+Keep the real launchd acknowledgement, crash matrix and pointer assertions;
+`tests/hermes_cli/test_admission_canary.py` separately covers enabled, disabled,
+quiet-window and rollback behavior. Production defaults and runner budgets stay
+unchanged. Retire this fixture adaptation if probes implement native ingress and
+can meaningfully qualify the admission window.
+
 The crash-injection matrix in `test_immutable_release_transactions.py` hard-exits a real child after every durable rename, unlink, plist install, reload marker and transaction deletion for promote, rollback, first migration and first-migration rollback. The ordinary entry point uses the **recorded intended target**; it does not re-derive rollback A from a partially changed `previous` pointer. First migration and its reversal include UUID-named disposable launchd labels and check the bytes loaded by launchd, not only the plist file. These tests predate the review-11 supervised-process acknowledgement; a simulated loaded marker or successful `launchctl` call alone does not prove that the running gateway imported the intended release.
 
 `release-txn.json` is the write-ahead authority for pointer, plist, launchd reload and migration-journal changes. Its temp file is fsynced before atomic rename and directory fsync. It records the operation, original and intended pointers/journal, original plist backup and hash, and exact intended plist bytes and SHA-256. For a reload-required transaction, pointer and installed-plist convergence is **not activation acknowledgement**: a returned `launchctl submit`, synchronous bootstrap, positive launchd PID, or `reload_done` flag alone cannot remove the record. `acknowledge_running_release` checks pointer/journal/plist intent; the installed plist hash, label and `HERMES_HOME`; a live PID in that label's launchd-supervised process tree; its gateway argv, physical interpreter, cwd, empty `PYTHONPATH`, and the intended release ready marker/SHA (or recorded source SHA on first-migration rollback). When the gateway itself calls the acknowledgement, it also binds the observed PID to its loaded physical code root. Only then is the completion identity saved in `release-last-txn.json` and the pending record removed. The gateway's macOS supervised-child startup watcher attempts this after its own runtime status reports the same PID in `running` state; it keeps checking on later running transitions for the life of the process, and failure remains pending rather than becoming a success receipt. The candidate interpreter runs strict bundled-skills, catalog and profile-config maintenance **after staging and before promotion** so a failed migration cannot select code requiring new state. The shared post-update maintenance result controls the receipt and exit status.
