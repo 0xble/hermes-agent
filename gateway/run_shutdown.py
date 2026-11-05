@@ -2887,6 +2887,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
     async def _stop_release_runtime_state(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
         from gateway.run import GatewayRunner
+        # The sink shares the restart cleanup leash, rather than adding another two seconds.
+        evidence_deadline = (time.monotonic() + self._restart_shutdown_bound()
+                             if self._restart_requested else None)
         for _task in list(self._background_tasks):
             # _restart_task awaits _stop_task: cancelling it would tunnel into _stop_impl and skip _shutdown_event.set().
             if _task is self._stop_task or _task is self._restart_task:
@@ -2950,7 +2953,13 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         # Agents/adapters are quiescent and the coverage watcher is cancelled.
         # Evidence is best-effort: one global deadline, never an unbounded queue.join.
         from gateway.reply_latency_sink import shutdown_sinks
-        await asyncio.to_thread(shutdown_sinks, 2.0)
+        evidence_budget = (2.0 if evidence_deadline is None else
+                           min(2.0, max(0.0, evidence_deadline - time.monotonic())))
+        # Bound admission as well as draining: the default executor may be saturated.
+        with suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.to_thread(
+                shutdown_sinks, evidence_budget, deadline=time.monotonic() + evidence_budget,
+            ), timeout=evidence_budget)
 
     def _stop_quiesce_and_close_session_dbs(self, timeout: float, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Quiesce the executor, then close SessionDB handles only if no worker is still live."""

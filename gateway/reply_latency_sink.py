@@ -103,7 +103,14 @@ class ReplyLatencySink:
     def _rotate(self, now: float) -> None:
         day = datetime.fromtimestamp(now, timezone.utc).date()
         if day == self.day:
-            return
+            try:
+                self.root.stat()
+            except FileNotFoundError:
+                # Same-day cleanup must not disable this writer until UTC rollover
+                # or attest to the interval whose evidence disappeared.
+                self.coverage_start = None
+            else:
+                return
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name == "posix":
             self.root.chmod(0o700)
@@ -144,6 +151,8 @@ class ReplyLatencySink:
                 if payload is None:
                     self.coverage_start = now
             except Exception:
+                # Retry initialization too: ENOENT may race the same-day directory probe.
+                self.day = None
                 # A subsequent successful checkpoint must not attest the failed interval.
                 self.coverage_start = None
                 self._warn("reply-latency sink unavailable; coverage interrupted")
@@ -166,13 +175,15 @@ def sink_for_home(home: Path, profile: str = "default") -> ReplyLatencySink:
         return _sinks[canonical]
 
 
-def shutdown_sinks(timeout: float = 2.0) -> bool:
+def shutdown_sinks(timeout: float = 2.0, *, deadline: float | None = None) -> bool:
     """Drain all local writers under one deadline, including directly owned test sinks.
 
     A slow daemon remains closed and registered until it finishes: do not let a new
     writer race its undrained queue. A later shutdown call can reap it.
     """
-    deadline = time.monotonic() + max(0.0, timeout)
+    local_deadline = time.monotonic() + max(0.0, timeout)
+    # A worker admitted late must not begin a fresh relative wait budget.
+    deadline = local_deadline if deadline is None else min(local_deadline, deadline)
     with _sinks_lock:
         sinks = tuple(_instances)
         for sink in sinks:

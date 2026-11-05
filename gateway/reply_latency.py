@@ -155,7 +155,6 @@ def snapshot_inputs(event: Any) -> list[dict[str, Any]]:
 
 
 def restore_inputs(event: Any, inputs: list[dict[str, Any]]) -> None:
-    from dataclasses import replace
     import math
     if (not isinstance(inputs, list) or not inputs
             or any(not isinstance(item, dict) or 'message_id' not in item
@@ -163,18 +162,29 @@ def restore_inputs(event: Any, inputs: list[dict[str, Any]]) -> None:
                    or isinstance(item.get('received_at'), bool)
                    or not math.isfinite(item['received_at']) for item in inputs)):
         return
-    event._reply_latency_inputs = inputs
-    event._hermes_absorbed_events = []
-    for index, item in enumerate(inputs):
-        candidate = event if index == 0 else replace(event, message_id=item['message_id'])
-        if item.get('received_at') is not None:
-            candidate._reply_latency_received_at = item['received_at']
-            if index:
-                candidate._attended_activity_received_at = item['received_at']
-        if item.get('receipt_id'):
-            candidate._reply_latency_receipt_id = item['receipt_id']
-        if index:
-            event._hermes_absorbed_events.append(candidate)
+    # Copy descriptors so legacy id-less rows get one stable token across rebinds.
+    rows = [dict(item) for item in inputs]
+    for item in rows:
+        if item['message_id'] is None and not item.get('receipt_id'):
+            item['receipt_id'] = uuid.uuid4().hex
+    event._reply_latency_inputs = rows
+    event._reply_latency_received_at = rows[0]['received_at']
+    if rows[0].get('receipt_id'):
+        event._reply_latency_receipt_id = rows[0]['receipt_id']
+
+
+def _latency_input_events(event: Any):
+    """Rebuild content-free receipt carriers without granting input provenance."""
+    from types import SimpleNamespace
+    for candidate in (event, *getattr(event, '_hermes_absorbed_events', ())):
+        yield candidate
+        for item in (getattr(candidate, '_reply_latency_inputs', None) or [])[1:]:
+            yield SimpleNamespace(
+                source=candidate.source, message_id=item['message_id'], internal=False,
+                metadata={}, _reply_latency_received_at=item['received_at'],
+                _attended_activity_received_at=item['received_at'],
+                _reply_latency_receipt_id=item.get('receipt_id') or uuid.uuid4().hex,
+            )
 
 
 def bind_agent_start(event: Any) -> None:
@@ -185,8 +195,11 @@ def bind_agent_start(event: Any) -> None:
     """
     receipt = record_received(event)
     if receipt is not None:
-        receipt.absorbed = tuple(r for candidate in getattr(event, '_hermes_absorbed_events', ())
-                                 if (r := record_received(candidate)) is not None and r is not receipt)
+        # Private restored carriers never enter _hermes_absorbed_events: that trail
+        # is authoritative human/synthetic provenance, not latency instrumentation.
+        receipts = [r for candidate in _latency_input_events(event)
+                    if (r := record_received(candidate)) is not None and r is not receipt]
+        receipt.absorbed = tuple({id(r): r for r in receipts}.values())
     _current.set(receipt)  # synthetic turns must clear an inherited human clock
     if receipt is not None:
         for item in (receipt, *receipt.absorbed):

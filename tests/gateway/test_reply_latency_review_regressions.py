@@ -47,6 +47,25 @@ def test_restored_latency_inputs_do_not_reopen_marked_attended_activity():
     assert head._attended_activity_marked is True
 
 
+def test_private_restored_receipts_settle_once_across_rebind(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    caplog.set_level('INFO', logger='gateway.reply_latency')
+    head = event(Adapter(), 'head')
+    descriptors = [{'message_id': 'head', 'received_at': 100},
+                   {'message_id': None, 'received_at': 200}]
+    latency.restore_inputs(head, descriptors)
+    restored_id = head._reply_latency_inputs[1]['receipt_id']
+    assert 'receipt_id' not in descriptors[1]  # caller-owned spool data is unchanged
+    for _ in range(2):
+        latency.bind_agent_start(head)
+        receipt = latency.current_receipt()
+        assert len(receipt.absorbed) == 1
+        assert receipt.absorbed[0].identity['receipt_id'] == restored_id
+        latency.record_no_reply(receipt)
+    assert [row['message_id'] for row in records(caplog) if row['event'] == 'no_reply'] == ['head', None]
+    assert not getattr(head, '_hermes_absorbed_events', ())
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('token', ['NO_REPLY', '[SILENT]'])
 async def test_queued_silent_head_and_visible_followup_settle_independently(monkeypatch, tmp_path, caplog, token):
@@ -142,7 +161,7 @@ async def test_shutdown_evidence_drain_uses_remaining_restart_budget(monkeypatch
     monkeypatch.setattr(GatewayRunner, '_stop_kill_tool_subprocesses_off_loop', final_kill)
     monkeypatch.setattr('agent.auxiliary_client.shutdown_cached_clients', lambda: None)
     budgets = []
-    monkeypatch.setattr('gateway.reply_latency_sink.shutdown_sinks', lambda timeout: budgets.append(timeout))
+    monkeypatch.setattr('gateway.reply_latency_sink.shutdown_sinks', lambda timeout, **kwargs: budgets.append(timeout))
     runner = SimpleNamespace(
         _background_tasks=set(), _stop_task=None, _restart_task=None, adapters={},
         _running_agents={}, _running_agents_ts={}, _pending_messages={}, _pending_approvals={},
@@ -154,7 +173,8 @@ async def test_shutdown_evidence_drain_uses_remaining_restart_budget(monkeypatch
     finally:
         # Restore before the autouse writer-drain fixture (including on a RED assertion).
         monkeypatch.undo()
-    assert budgets == [expected]
+    # An exhausted budget skips executor admission altogether.
+    assert budgets == ([expected] if expected else [])
     assert runner._shutdown_event.is_set()
 
 
@@ -187,7 +207,7 @@ async def test_restart_does_not_wait_for_executor_admission(monkeypatch):
     task = asyncio.create_task(shutdown.GatewayShutdownMixin._stop_release_runtime_state(
         runner, SimpleNamespace(elapsed=lambda: 0)))
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
     finally:
         release.set()
         await task

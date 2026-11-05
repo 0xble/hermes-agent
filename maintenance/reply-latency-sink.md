@@ -1,12 +1,15 @@
 # Durable reply-latency evidence
 
 Fork patch identity: `reply-latency-sink`.
-Contract tests: `tests/gateway/test_reply_latency_sink.py`, `tests/gateway/test_reply_latency_logs.py`, `tests/gateway/test_reply_latency_followups.py`, `tests/gateway/test_reply_latency_delivery_paths.py`, `tests/gateway/test_reply_latency_privacy_recovery.py`.
+Contract tests: `tests/gateway/test_reply_latency_sink.py`, `tests/gateway/test_reply_latency_logs.py`, `tests/gateway/test_reply_latency_followups.py`, `tests/gateway/test_reply_latency_delivery_paths.py`, `tests/gateway/test_reply_latency_privacy_recovery.py`, `tests/gateway/test_reply_latency_review_regressions.py`.
 
 ## Intent and ownership
 
 Extend [reply-latency metrics](reply-latency-metrics.md) without changing its
-receipt clock or genuine-user classification. Confirmed visible text, media and
+receipt clock or genuine-user classification. Restored receipt descriptors stay
+on `_reply_latency_inputs`; they never become absorbed events or attended-activity
+provenance. The queued head settles allowed silence before handing off to its
+follow-up, whose receipt settles independently. Confirmed visible text, media and
 reactions settle first reply once; deliberate NO_REPLY/[SILENT] settles `no_reply`
 without inventing a delivery or latency sample. Tool destination matching normalizes
 an absent thread (`None` or the session-routing empty string) centrally, on both
@@ -35,7 +38,10 @@ realpath homes share one writer and process sequence. A bounded 1024-item per-ho
 intake and delivery. Overflow or failed I/O interrupts coverage, rate-limits a
 warning and never waits for disk writes on delivery. Canonicalize each new home
 alias once and cache it for subsequent intake/delivery. Shutdown closes admission,
-drains FIFO and stops writers under a shared 2-second deadline; slow daemons remain
+drains FIFO and stops writers under a shared 2-second deadline, clamped to the
+remaining restart cleanup leash. Executor admission shares that bound and late
+workers retain the absolute deadline. Same-day directory loss reinitializes private
+markers and interrupts the old coverage interval. Slow daemons remain
 closed until reaped. Abrupt exit may lose queued records; FIFO
 checkpoints attest only their captured enqueue time, never future/pending data.
 `instrumentation_start` is written on first initialization and daily rollover,

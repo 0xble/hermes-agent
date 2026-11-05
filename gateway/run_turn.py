@@ -5011,6 +5011,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             from gateway.response_filters import reaction_answered
             if ((reaction_answered(_delivery_result) and silence_kind != "supervisor_checkin")
                     or silence_allowed(silence_kind, turn_ctx.reply_expected)):
+                from gateway.reply_latency import current_receipt, record_no_reply
+                record_no_reply(current_receipt())
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
