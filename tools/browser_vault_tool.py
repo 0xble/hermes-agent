@@ -1032,18 +1032,22 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                                "error": "Could not fill every birth-date part unambiguously; check the form "
                                         "or use browser_handoff for the user to finish it."})
 
-        out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
-               "kind": meta.kind, "origin": page_origin}
-        if meta.kind == "login":
-            out["next"] = ("Submit. If the site then asks for a verification code, "
-                           + ("call browser_vault_enter_code with this handle (a code will be generated automatically)."
-                              if meta.has_otp else
-                              "fetch the newest matching code from the intended 1Password item, mailbox, or phone and "
-                              "type it with the browser input tool; call browser_vault_enter_code only when no such source "
-                              "exists."))
-        if meta.kind != "login":
-            out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
-        return json.dumps(out)
+        return _fill_success_response(filled, backend, meta, page_origin, fills)
+
+
+def _fill_success_response(filled, backend, meta, page_origin: str, fills: list[dict]) -> str:
+    out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
+           "kind": meta.kind, "origin": page_origin}
+    if meta.kind == "login":
+        out["next"] = ("Submit. If the site then asks for a verification code, "
+                       + ("call browser_vault_enter_code with this handle (a code will be generated automatically)."
+                          if meta.has_otp else
+                          "fetch the newest matching code from the intended 1Password item, mailbox, or phone and "
+                          "type it with the browser input tool; call browser_vault_enter_code only when no such source "
+                          "exists."))
+    if meta.kind != "login":
+        out["fields"] = sorted(f["token"] for f in fills)  # which controls were targeted, never the values
+    return json.dumps(out)
 
 
 def _payment_fill_refusal(decision: str, retry_key: tuple[str, str, str]) -> str:

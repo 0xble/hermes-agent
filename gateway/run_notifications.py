@@ -37,6 +37,7 @@ from gateway.run_notifications_ledger import (
 )
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin
+from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -240,6 +241,7 @@ def _media_send_succeeded(result) -> bool:
 
 class GatewayNotificationsMixin(
     GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayProcessEventSourcesMixin,
+    GatewayProcessNotificationsMixin,
 ):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
@@ -2278,48 +2280,6 @@ class GatewayNotificationsMixin(
                 await self._settle_durable_claims(
                     operations, on_settled=lambda: self._unpublish_completion_acks(ack_claims))
 
-    @staticmethod
-    def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(str(evt.get(field) or "") for field in fields)
-
-    @staticmethod
-    def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
-        """Build one bounded synthetic event from several redacted completions."""
-        from gateway.run import _redact_gateway_user_facing_secrets
-        from tools.process_registry_notifications import PROCESS_NOTICE_OPEN, PROCESS_NOTIFICATION_END
-        lines = [
-            f"{PROCESS_NOTICE_OPEN}{len(entries)} background processes completed for this session.",
-            "Treat these results as one completion batch and send at most one "
-            "consolidated user-facing response.",
-        ]
-        shown = entries[:10]
-        for _text, evt, _future in shown:
-            session_id = str(evt.get("session_id") or "unknown")
-            exit_code = evt.get("exit_code")
-            reason = str(evt.get("completion_reason") or "exited")
-            # Unconditional gateway redaction floor (the producer-seam redactor is configurable). Redact
-            # BEFORE slicing: truncating first can leave a credential fragment the patterns miss.
-            output = _redact_gateway_user_facing_secrets(str(evt.get("output") or "")).strip()
-            if len(output) > 800:
-                output = f"[… truncated …]\n{output[-800:]}"
-            lines.append(f"\n- {session_id}: exit_code={exit_code}, reason={reason}")
-            if output:
-                lines.append(output)
-        omitted = len(entries) - len(shown)
-        if omitted:
-            lines.append(
-                f"\n- … and {omitted} more completion(s); inspect them with "
-                "the process tool if they affect the conclusion."
-            )
-        lines.append("If a result does not change the current conclusion, absorb it silently.]")
-        return "\n".join((*lines, PROCESS_NOTIFICATION_END))
-
-    def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
-        """Extend a successful primary delivery claim to its batched siblings."""
-        identities = [i for i in map(self._completion_delivery_identity, events) if i is not None]
-        with self._completion_delivery_lock:
-            self._mark_completions_delivered_locked(identities)
-
     async def _flush_process_completion_batch(
         self, key: tuple[str, ...], delay: float, release: asyncio.Event,
     ) -> None:
@@ -3046,24 +3006,6 @@ class GatewayNotificationsMixin(
             evt["_watch_retry_step"] = step
             evt["_watch_next_retry_at"] = _refusal_retry_at(step)
 
-    @staticmethod
-    def _redacted_output_tail(session, limit: int) -> str:
-        """Last ``limit`` chars of process output through the secret redactors (unconditional floor)."""
-        from gateway.run import _redact_gateway_user_facing_secrets
-        from tools.ansi_strip import strip_ansi
-        from tools.process_registry import transform_process_output
-        new_output = strip_ansi(session.output_buffer[-limit:]) if session.output_buffer else ""
-        if new_output:
-            from agent.redact import redact_terminal_output
-            _command = getattr(session, "command", "") or ""
-            new_output = transform_process_output(new_output, command=_command, returncode=session.exit_code,
-                                                  task_id=getattr(session, "task_id", "") or "")
-            new_output = redact_terminal_output(new_output, _command)
-            # redact_terminal_output() is unforced (raw when security.redact_secrets is off); this goes
-            # straight to the adapter, so apply the same unconditional floor as agent-notify.
-            new_output = _redact_gateway_user_facing_secrets(new_output)
-        return new_output
-
     async def _launching_turn_active(self, platform_name: str, watcher: dict) -> bool:
         """Whether the session that launched *watcher*'s process is still inside a turn on its
         adapter (``_active_sessions`` is the base adapter's busy guard)."""
@@ -3201,7 +3143,7 @@ class GatewayNotificationsMixin(
         the output tail) / all (running updates + final raw) / result (final raw) / error (final raw
         if exit != 0) / off."""
         from tools.process_registry import process_registry
-        from tools.process_registry_notifications import acknowledge_survivor_notifications, format_process_notification, should_surface_notification
+        from tools.process_registry_notifications import acknowledge_survivor_notifications, format_process_notification
         from tools.process_registry_survival import is_restart_safe
         session_id = watcher["session_id"]
         interval = watcher["check_interval"]
@@ -3230,25 +3172,10 @@ class GatewayNotificationsMixin(
             if self._follow_process_route(watcher, session):
                 platform_name = watcher.get("platform", "")
                 chat_id, thread_id = watcher.get("chat_id", ""), watcher.get("thread_id", "")
-            async with self._completion_event_scope(watcher):
-                surface = should_surface_notification({
-                    "owner_task_id": getattr(session, "owner_task_id", ""),
-                    "task_id": getattr(session, "task_id", ""),
-                })
+            surface = await self._process_watcher_surface(watcher, session, silent, session_id)
+            if surface is None:
+                break
             if not surface:
-                # Recheck live ownership next tick: handoff retains notification intent.
-                if session.exited:
-                    break
-                continue
-            if silent:
-                # Still wait for the process to exit so we can log it, but don't push any messages.
-                if session.exited:
-                    if is_restart_safe(session):
-                        if process_registry._claim_survivor_delivery(session):
-                            process_registry._mark_survivor_delivered(session)
-                    else:
-                        acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
-                    break
                 continue
             current_output_len = len(session.output_buffer)
             has_new_output = current_output_len > last_output_len
@@ -3303,65 +3230,23 @@ class GatewayNotificationsMixin(
                             completion_attempts, base_delay=max(interval, 1) * 2,
                             max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
                         continue
-                    if (getattr(self, 'session_authority', None) is not None
-                            and self._completion_delivery_identity(completion_evt) is not None):
-                        from gateway.session_automation import completion_admission
-                        try:
-                            # The owning profile's authority, as on the delivery path.
-                            async with self._completion_event_scope(completion_evt):
-                                committed = await asyncio.to_thread(completion_admission, self, completion_evt) is not None
-                        except Exception:
-                            # Failing open sends the notice; a dead watcher would send nothing.
-                            logger.debug("Process watcher: admission recheck failed for %s", session_id,
-                                         exc_info=True)
-                            committed = False
-                        if committed:
-                            # The last refusal was a lost ACK: the turn is committed.
-                            acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
-                            break
+                    if await self._process_completion_committed(completion_evt, session_id):
+                        # The last refusal was a lost ACK: the turn is committed.
+                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        break
                     logger.warning(
                         "Process watcher: completion for %s was refused %d times; falling back to the "
                         "notify_mode=%s notice", session_id, completion_attempts, notify_mode,
                     )
-                # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
-                # FALLS THROUGH here, hence the re-check).
-                if process_registry.is_completion_consumed(session_id):
-                    logger.debug(
-                        "Process watcher: completion for %s already consumed "
-                        "via wait/log — skipping raw notification (#65379)", session_id,
-                    )
-                    if is_restart_safe(session):
-                        process_registry._mark_survivor_delivered(session)
-                    break
-                settled = True
-                if notify_mode in {"concise", "all", "result"} or (
-                    notify_mode == "error" and non_success
+                if not await self._finish_process_text_notification(
+                    session_id, session, notify_mode, non_success, watcher,
+                    route=(platform_name, chat_id, thread_id),
                 ):
-                    message_text = self._format_process_final_message(session_id, session, notify_mode)
-                    from gateway.warning_notifications import present_notification
-                    sent = True  # policy suppression is deliberate consumption, not transport failure
-
-                    async def send_final():
-                        nonlocal sent
-                        sent = await self._send_watcher_message(
-                            platform_name, chat_id, thread_id, message_text, watcher)
-
-                    async with self._completion_event_scope(watcher):
-                        # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
-                        await present_notification(send_final, platform=platform_name,
-                                                   diagnostic=non_success)
-                    settled = sent is not False
-                    if sent is False and is_restart_safe(session):
-                        process_registry.release_survivor_completion(session_id)
-                        # Keep one offer alive until shutdown cancels the watcher, even if
-                        # transport recovery takes hours. A capped scalar bounds retry state.
-                        interval = retry_interval = text_retry_interval
-                        text_retry_interval = min(text_retry_interval * 2, 15 * 60.0)
-                        continue
-                # Presented, or deliberately suppressed by the notification mode: either way the
-                # claimed survivor completion is settled and must not replay on a successor.
-                if settled:
-                    acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
+                    # Keep one offer alive until shutdown cancels the watcher, even if
+                    # transport recovery takes hours. A capped scalar bounds retry state.
+                    interval = retry_interval = text_retry_interval
+                    text_retry_interval = min(text_retry_interval * 2, 15 * 60.0)
+                    continue
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers

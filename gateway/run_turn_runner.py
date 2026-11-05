@@ -31,6 +31,7 @@ from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typin
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.run_task_card_progress import TaskCardProgressMixin
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
+from gateway.run_turn_runner_receipts import _persisted_turn
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
 from hermes_cli.plugins_dispatch import stream_held
@@ -114,24 +115,6 @@ _FAILURE_DESCRIPTOR_KEYS = ("free_tier", "failure_retryable", "failure_resets_at
 def _finite_viewer_turn() -> bool:
     from gateway.session_finite import finite_turn_required
     return finite_turn_required() is True
-
-
-def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
-    """``message.complete.persisted_turn`` for this turn, the receipt the TUI gateway's own turns
-    publish: clients bind the streamed reply to its stored row instead of comparing words. The
-    agent copies ``conversation_history`` into its message list, so an untouched pre-turn prefix
-    is the same dicts (transcript rows here carry no ``_row_id`` to compare)."""
-    from agent.persisted_turn_receipt import persisted_turn_receipt
-    if not isinstance(result, dict):
-        return None
-    status = ("interrupted" if result.get("interrupted")
-              else "error" if result.get("failed") or result.get("error") else "complete")
-    return persisted_turn_receipt(
-        result.get("messages"), getattr(agent, "_persist_user_message_idx", None), agent_history,
-        result.get("final_response"), status,
-        compression_unchanged=type(compressions) is int and compressions == getattr(
-            getattr(agent, "context_compressor", None), "compression_count", None),
-        prefix_row_matches=lambda before, after: before is after)
 
 
 class _NoStreamConsumer(RuntimeError):
