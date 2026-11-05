@@ -94,6 +94,21 @@ def _native_metadata(event):
     return project(metadata)
 
 
+def _absorbed_synthetic(event):
+    """Project every absorbed capability; None retains an unknown legacy merge history."""
+    from gateway.session_synthetic import project_synthetic
+    trail = getattr(event, '_native_absorbed_synthetic', [])
+    if not isinstance(trail, list):
+        return None
+    trail = deepcopy(trail)
+    for candidate in getattr(event, '_hermes_absorbed_events', ()):
+        prior = getattr(candidate, '_native_absorbed_synthetic', [])
+        if not isinstance(prior, list):
+            return None
+        trail.extend([project_synthetic(candidate), *deepcopy(prior)])
+    return trail
+
+
 def _adapter_event(event, **changes):
     """An adapter's event at the envelope boundary: an absent media list (``None``) is no media.
     Any other non-list still reaches ``_validate_native`` and refuses."""
@@ -102,10 +117,18 @@ def _adapter_event(event, **changes):
     # Each absorbed input owns its stamp task. Do not replace the head's live clock: a task
     # already persisting that clock could then mark a newer, unpersisted receipt as complete.
     # Only the durable projection represents the newest receipt still needing a retry.
-    unmarked = [candidate for candidate in (event, *getattr(event, '_hermes_absorbed_events', ()))
-                if getattr(candidate, '_attended_activity_received_at', None) is not None
-                and not getattr(candidate, '_attended_activity_marked', False)]
-    receipt = max(unmarked, key=lambda candidate: candidate._attended_activity_received_at) if unmarked else event
+    # A marked human follower must survive too: a synthetic head has no receipt of its own.
+    # Otherwise retain the head's marked clock; each absorbed receipt already persisted itself.
+    stamped = [candidate for candidate in (event, *getattr(event, '_hermes_absorbed_events', ()))
+               if getattr(candidate, '_attended_activity_received_at', None) is not None]
+    unmarked = [candidate for candidate in stamped
+                if not getattr(candidate, '_attended_activity_marked', False)]
+    receipt = event
+    if unmarked:
+        receipt = max(unmarked, key=lambda candidate: candidate._attended_activity_received_at)
+    elif stamped and getattr(event, '_attended_activity_received_at', None) is None:
+        # Carry the marked clock for provenance only, never to refresh attended activity.
+        receipt = max(stamped, key=lambda candidate: candidate._attended_activity_received_at)
     if receipt is not event and projected is event:
         projected = copy(event)
     for name in ('_attended_activity_received_at', '_attended_activity_marked'):
@@ -116,6 +139,11 @@ def _adapter_event(event, **changes):
     from gateway.session_synthetic import is_synthetic, mark_synthetic
     if is_synthetic(event):
         mark_synthetic(projected)
+    if (is_synthetic(event) or getattr(event, '_hermes_absorbed_events', ())
+            or hasattr(event, '_native_absorbed_synthetic')):
+        if projected is event:
+            projected = copy(event)
+        projected._native_absorbed_synthetic = _absorbed_synthetic(event)
     return _drop_remote_media(projected)
 
 
@@ -327,6 +355,8 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
         envelope['synthetic'] = synthetic
     elif metadata := _native_metadata(event):
         envelope['event']['metadata'] = metadata
+    if hasattr(event, '_native_absorbed_synthetic'):
+        envelope['absorbed_synthetic'] = deepcopy(event._native_absorbed_synthetic)
     # COMMAND that passed admission is path text (``/Users/x is broken``): replay it as text.
     if event.message_type not in (MessageType.TEXT, MessageType.COMMAND):
         envelope['message_type'] = event.message_type.value
@@ -348,9 +378,14 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
             legacy = deepcopy(payload)
             legacy['native_text_v1'].pop('provenance')
             legacy['native_text_v1'].pop('attended_activity', None)
+            legacy['native_text_v1'].pop('absorbed_synthetic', None)
             for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
-                if row['request_id'] == event.message_id and row['payload'] == legacy:
-                    return legacy
+                prior = deepcopy(row['payload'])
+                if isinstance(prior.get('native_text_v1'), dict):
+                    prior['native_text_v1'].pop('attended_activity', None)
+                    prior['native_text_v1'].pop('absorbed_synthetic', None)
+                if row['request_id'] == event.message_id and prior == legacy:
+                    return row['payload']  # Preserve the original durable recovery evidence.
     return payload
 
 
@@ -401,6 +436,9 @@ def restore_native(payload, runner=None):
     if 'synthetic' in envelope:
         from gateway.session_synthetic import restore_synthetic
         restore_synthetic(event, envelope['synthetic'])
+    if 'synthetic' in envelope or 'absorbed_synthetic' in envelope:
+        # Absence on a legacy synthetic row is unknown, not proof that no human merged.
+        event._native_absorbed_synthetic = deepcopy(envelope.get('absorbed_synthetic'))
     return event
 
 

@@ -485,7 +485,8 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     envelope = {'source': source, 'route': entry.session_key,
         'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
         'event': {'message_id': identity}, 'provenance': provenance,
-        'automation': {'identity': identity, 'owner': owner}}
+        'automation': {'identity': identity, 'owner': owner},
+        'absorbed_synthetic': []}  # Producer wakes never absorb native ingress merges.
     envelope['automation'].update(notification)
     if synthetic is not None:
         envelope['synthetic'] = synthetic

@@ -2992,6 +2992,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False, require_no_agent: bool = False,
+    require_person_send: bool = False,
 ) -> bool | dict[str, Any]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -3017,6 +3018,10 @@ def claim_job_for_fire(
         if require_no_agent and not job.get("no_agent"):
             from cron.scheduler_admission import AgentAdmissionRequired
             raise AgentAdmissionRequired(job_id)
+        if require_person_send:
+            from cron.scheduler_admission import ScriptAdmissionRequired, is_person_send
+            if not is_person_send(job):
+                raise ScriptAdmissionRequired(job_id)
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim

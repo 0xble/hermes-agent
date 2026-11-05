@@ -31,10 +31,63 @@ They never queue behind detached agent waiters, even while the protected
 reservation is busy. Agent jobs, including monitor or pre-run scripts that may
 wake an agent, cannot enter this lane. This adds 1 script worker, not agent
 capacity: the general cap and the single protected reservation are unchanged.
-Script jobs can still wait behind another script, bounded by the existing
-script timeout. Preserve the common execution journal, copied profile context,
-per-job guard, cancellation and process-exit fences. Departure and shutdown
-reclaim both auxiliary lanes.
+Script jobs can still wait behind another ordinary script, bounded by the existing
+script timeout. Frozen person-send wrappers can opt into a separate serial per-profile
+`person-send` lane with the exact first line `# hermes: person-send`, but only for
+`no_agent` jobs with a one-shot schedule and `deliver=local`. This is an author
+scheduling declaration, not send authorization or a sandbox. Do not infer eligibility
+from job names, IDs, script names, or message content. Read at most the marker-sized
+first line, within the owning profile's scripts root; malformed/missing/escaped
+paths retain ordinary script admission. New prepared wrappers opt in; existing
+scripts and cron records are never rewritten by the scheduler.
+
+The additional lane keeps one worker, FIFO order and the existing script timeout;
+it does not promise hard real-time delivery or shorten provider/readback deadlines.
+A prior person-send may still occupy this lane. Validate the persisted job and current
+marker under the fire-claim lock before leasing. If edited out of class, hand it to
+the ordinary script FIFO (or general pool for agent mode), preserving the original
+execution and in-flight owner without starting a lease while queued. This does not
+increase ordinary-script or agent concurrency. The older `TERMINAL_CWD` serialization
+hazard in upstream #73804 must not return: current script spawning uses subprocess
+`cwd` and profile-scoped child environments; agent cwd uses ContextVars.
+
+Preserve the common execution journal, copied profile context, per-job guard,
+cancellation and process-exit fences. Departure and shutdown reclaim all auxiliary
+lanes. No new dependency, config, job-store schema, provider or transport is added.
+
+### Person-send evidence and upstream design
+
+Independent hypothesis (2026-11-04, before discussion search): the serial no-agent
+FIFO introduced in fork [#925](https://github.com/0xble/hermes-agent/pull/925) prevents
+agent starvation but explicitly permits script-vs-script head-of-line delay. A
+separate narrow serial class is preferable to raising worker counts or introducing
+another scheduler. A real tick/fire-claim regression on base
+`2fece2a7529e495c2026be0f4b92ed0231678c4a` failed waiting 3 seconds for the fake
+person-send marker while an ordinary script held its event. The corrected path
+starts the real marker-only subprocess before releasing that event.
+
+Related upstream [#138072](https://github.com/NousResearch/hermes-agent/pull/138072)
+is open and unreviewed: it separates agent/no-agent pools, not two script classes,
+so it cannot replace this fix. Closed upstream
+[#73804](https://github.com/NousResearch/hermes-agent/issues/73804) documents the older
+process-global cwd/environment hazard; its automated triage is not maintainer
+approval. Current upstream/fork source is already ContextVar/subprocess-cwd based.
+No equivalent released/merged person-send admission implementation was found in
+open/closed issue, PR or relevant commit searches. This is a fork-policy extension,
+not a claim that unmodified upstream contains fork #925's exact regression.
+
+Qualification: `tests/cron/test_person_send_admission.py` and
+`tests/cron/test_script_admission.py` cover class refusal, actual script overlap,
+ordinary FIFO, edited-job reroutes, execution/dedup retention, serial per-profile
+capacity, departure/shutdown, and real concurrent subprocess cwd/profile-home
+isolation. No transport is called. Native delivery budgets are unchanged; marked
+jobs deliver locally. External provider scheduling declarations do not grant a rate
+budget: the prepared-send owner must retain its provider/conversation throttling and
+readback checks. Rollback removes only this lane/classification and its reroute
+extension, returning marked scripts to the existing serial script lane. Retire this
+private extension when upstream preserves the same narrow-class start, claim,
+profile and shutdown contract. Source publication only: do not merge, promote or
+restart as part of this change.
 
 A finished waiter future or terminal execution row does not release the
 reservation while its detached process remains live. Only the existing

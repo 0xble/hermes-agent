@@ -24,7 +24,12 @@ def dispatch_context(lane: str, code_sha: str | None):
 
 def script_dispatch() -> bool:
     """Whether the current worker has only script (not agent) admission."""
-    return _dispatch_identity.get()[0] == "script"
+    return _dispatch_identity.get()[0] in {"script", "person-send"}
+
+
+def person_send_dispatch() -> bool:
+    """Whether the current worker has only declared person-send admission."""
+    return _dispatch_identity.get()[0] == "person-send"
 
 
 def note_dispatch_stage(job: dict, stage: str) -> None:
