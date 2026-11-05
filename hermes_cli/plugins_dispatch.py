@@ -65,9 +65,11 @@ _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: set[str] = {"pre_tool_call"}
 # Documented parent-thread serialization contract — never run on a timeout worker (hooks.md).
 _HOOK_CALLER_THREAD_HOOKS: set[str] = {"subagent_stop"}
 # Separate hung and live limits: the abandoned threshold must not throttle healthy parallel
-# tool calls. The live budget also counts reservations before a worker starts (#98382).
-K_ABANDONED = 2
-LIVE_BUDGET = 32
+# tool calls. The live budget is per hook/callback, process-wide across sessions in the owning
+# manager/registration generation, including reservations before worker start (#98382). Many
+# busy sessions can exhaust it without a hung worker; policy hooks fail closed as callback_busy.
+_HOOK_ABANDONED_LIMIT = 2
+_HOOK_LIVE_BUDGET = 32
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
     "pre_tool_call plugin callback timed out or is still running. "
     "Do not retry the same tool call in this turn."
@@ -344,7 +346,6 @@ class _QueuedPluginEvent:
 # ``plugins.hook_callback_timeout``. Shell hooks enforce their own subprocess timeout.
 _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
 _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
-_HOOK_SKIPPED = object()  # legacy internal skip sentinel, still normalized to a policy veto
 
 
 @dataclass(frozen=True)
@@ -490,10 +491,10 @@ class PluginDispatchMixin:
                     cb_fail_closed = fail_closed and spec.fail_closed
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, cb_timeout)
-                    if ret is _HOOK_SKIPPED or isinstance(ret, _HookSkipped):
+                    if isinstance(ret, _HookSkipped):
                         if cb_fail_closed:  # policy hook: fail closed with a block directive
                             message = (_PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
-                                       if ret is _HOOK_SKIPPED or ret.reason in {
+                                       if ret.reason in {
                                            "callback_timeout", "callback_already_running"} else
                                        f"{hook_name} plugin callback refused: {ret.reason}. "
                                        "This tool call was not authorized.")
@@ -550,7 +551,7 @@ class PluginDispatchMixin:
         token = object()
         with self._hook_timeout_lock:
             abandoned = self._hook_abandoned.get(callback_key)
-            if abandoned and len(abandoned) >= K_ABANDONED:
+            if abandoned and len(abandoned) >= _HOOK_ABANDONED_LIMIT:
                 logger.warning(
                     "Hook '%s' callback %s skipped: callback_hung (%d abandoned workers)",
                     hook_name, callback_name, len(abandoned))
@@ -558,7 +559,7 @@ class PluginDispatchMixin:
             if gate_key in self._hook_running_callbacks:
                 return _HookSkipped("callback_already_running")
             live = self._hook_live_workers.get(callback_key, 0)
-            if live >= LIVE_BUDGET:
+            if live >= _HOOK_LIVE_BUDGET:
                 logger.warning(
                     "Hook '%s' callback %s skipped: callback_busy (%d live/reserved workers)",
                     hook_name, callback_name, live)
@@ -607,7 +608,7 @@ class PluginDispatchMixin:
             thread.start()
         except Exception as exc:
             _release_token()  # the runner's finally never runs when worker setup fails
-            logger.warning(
+            logger.exception(
                 "Hook '%s' callback %s worker failed to start: %s — skipping",
                 hook_name, callback_name, exc)
             return _HookSkipped("callback_worker_start_failed")

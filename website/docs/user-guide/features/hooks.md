@@ -591,7 +591,24 @@ Shell hooks also accept the Claude Code-compatible format:
 
 Both formats are normalized internally to `{"action": "modify", "args": {...}}`.
 
-If a `pre_tool_call` callback exceeds `plugins.hook_callback_timeout` (or is still running from a previous timed-out fire), Hermes **fails closed**: the tool is blocked with a timeout message rather than proceeding without a policy decision. The same applies to a callback that raises: the block message names the callback and the error. A hung callback is skipped for a 60s suppression window; after that a new tool call runs it again (up to three abandoned workers per callback, so a permanently hung plugin blocks tool calls with a warning naming it instead of silently wedging the agent until restart).
+For synchronous bounded dispatch, a `pre_tool_call` timeout **fails closed** for that invocation only. There is no callback-wide timer cooldown: a fresh call evaluates its own arguments as soon as capacity permits. A duplicate invocation still running is also blocked. Both outcomes return the exact message:
+
+> pre_tool_call plugin callback timed out or is still running. Do not retry the same tool call in this turn.
+
+Admission has two separate limits per hook/callback:
+
+- **Hung workers:** two abandoned invocations still running (`_HOOK_ABANDONED_LIMIT = 2`) refuse new work as `callback_hung`. Completion below that threshold permits the next call immediately, without a timer.
+- **Live capacity:** all live and reserved invocations count toward `_HOOK_LIVE_BUDGET = 32`, atomically before worker creation. This budget is per callback, process-wide across sessions in the owning manager/registration generation, not per session. Many busy sessions can exhaust it without any hung worker; policy dispatch then fails closed as `callback_busy` rather than authorizing unchecked calls.
+
+The exact block messages for these refusals and worker setup failure are:
+
+| Reason | Block message |
+| --- | --- |
+| `callback_hung` | `pre_tool_call plugin callback refused: callback_hung. This tool call was not authorized.` |
+| `callback_busy` | `pre_tool_call plugin callback refused: callback_busy. This tool call was not authorized.` |
+| `callback_worker_start_failed` | `pre_tool_call plugin callback refused: callback_worker_start_failed. This tool call was not authorized.` |
+
+A callback that raises also fails closed; its block message names the callback and error. Another callback's approval cannot override a block. Observer hooks remain fail-open, and shell hooks retain their applicability and `fail_closed` settings. Workers are abandoned, not killed. Unload-all resets the manager's accounting without stopping old workers, so repeated reloads are not a process-lifetime thread bound and must not be used to escape hung refusal. These synchronous limits do not change async `ainvoke_hook` dispatch.
 
 **Use cases:** Logging, audit trails, tool call counters, blocking dangerous operations, rate limiting, per-user policy enforcement, argument sanitization, path rewriting, injecting default parameters.
 
