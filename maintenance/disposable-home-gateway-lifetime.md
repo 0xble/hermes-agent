@@ -181,6 +181,43 @@ Upstream guidance was rechecked at
 CONTRIBUTING). Open/closed PR searches for gateway one-shot lifetime and issue
 searches for gateway idle-exit found no equivalent ownership fence.
 
+## Identify interrupted during finite-owner release
+
+Two overlapping finite clients can identify the first owner just as its lifetime
+pipe closes. An EOF before the control response newline is a transport loss, not
+an invalid response from a stable peer. `ensure_gateway_runtime` now retries
+`incomplete_control_response` only after its existing retirement state has been
+established by a validated finite-owner or idle-exit draining descriptor. EOF
+and reset share that classification. A first-contact EOF, malformed response,
+or unauthorized peer remains terminal; an incomplete identify never grants
+attach, replacement, or spawn authority. The original startup deadline and
+owner fencing are unchanged. An observed absence clears the retirement state.
+
+The deterministic same-home regression pauses the real control server after a
+partial identify response, then releases the first client. A marker written
+only from `DiscoveryError` proves the injected transport result is EOF, not
+ConnectionResetError. The second client must then acquire its own new owner.
+Before the fix, this fails with the hosted signature:
+`GatewayUnavailableError: Gateway inaccessible: incomplete_control_response`.
+The companion deadline matrix covers known finite/idle retirement versus an
+unknown peer, EOF versus reset, and malformed protocol fail-closed behavior.
+
+Fork PR #1113 changes socket-path fixtures only and does not repair this path;
+all open fork PR file lists were checked before implementation. Upstream root
+and subsystem AGENTS and CONTRIBUTING were rechecked at
+`e26e0e4b67b` and related open/closed PR and issue searches found no equivalent.
+Independent proposal and chosen approach: reuse the existing ensure retirement
+window and deadline, not a broad retry or a second lifecycle policy. Stack:
+existing Python discovery state and pytest; no dependency or live rollout.
+
+Contract tests: `tests/hermes_cli/test_client_owned_discovery_errors.py`
+
+Local verification: the injected EOF regression is RED on main
+`493665b0fe4f` with the exact hosted exception, then GREEN after the fix.
+The final discovery/finite-chat/lifecycle selection passes **145 tests in
+16 files, 0 failed, 36 platform skips**, retries disabled. Code-health delta,
+Windows-footgun and source-only Fork-Patch checks pass; no runtime promotion.
+
 ## Verification and retirement
 
 Contract tests: `tests/hermes_cli/test_gateway_client_lifetime.py`

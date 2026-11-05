@@ -18,9 +18,13 @@ def unmanaged_spawn_options(deadline, idle_exit, client_lease) -> dict:
     return options
 
 
-def retirement_wait(observed, finite_owner):
+def retirement_wait(observed, finite_owner, *, retiring=False):
     """One wait policy for expiring finite owners and normally retiring daemons."""
     from hermes_cli.gateway_runtime import GatewayDiscovery, _RETIRING
+    # EOF/reset during a previously validated retirement is transport loss, not
+    # permission to attach or spawn. Unknown/malformed peers still fail closed.
+    if retiring and observed.reason_code == "incomplete_control_response":
+        return True, finite_owner
     if observed.reason_code == "client_owned":
         return True, GatewayDiscovery("conflict", reason_code="client_owned",
             detail="timed out waiting for another finite client to exit; wait for that client "
