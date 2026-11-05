@@ -51,6 +51,42 @@ async def test_loop_blocking_is_rejected_and_cancelled_observer_does_not_cancel_
 
 
 @pytest.mark.asyncio
+async def test_cancelling_consumer_propagates_while_dispatch_continues():
+    loop = asyncio.get_running_loop()
+    release, observing = asyncio.Event(), asyncio.Event()
+    delivery = InjectionDelivery("key", "relay-cancel")
+
+    async def dispatch():
+        delivery.started = True
+        await release.wait()
+        delivery.finish(True, "adopted", admission_id="admission-after-cancel")
+        return True
+
+    task = loop.create_task(delivery.observe(dispatch()))
+    handle = GatewayInjectionHandle.track(task, delivery, loop)
+
+    async def consumer():
+        observing.set()
+        return await handle
+
+    consumer_task = loop.create_task(consumer())
+    await observing.wait()
+    consumer_task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await consumer_task
+        assert consumer_task.cancelled()
+        assert not task.done() and not handle.settled
+        observed = await handle.wait(timeout=0)
+        assert observed.indeterminate and not observed.refused and not observed.safe_to_retry
+    finally:
+        release.set()
+        await task
+    result = await handle
+    assert result.accepted and result.admission_id == "admission-after-cancel"
+
+
+@pytest.mark.asyncio
 async def test_commit_receipt_wins_when_cancellation_callback_runs_after_commit():
     delivery = InjectionDelivery("key", "relay-1")
     delivery.started = True
