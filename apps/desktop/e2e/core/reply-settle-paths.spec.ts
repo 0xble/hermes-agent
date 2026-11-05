@@ -263,7 +263,8 @@ test('an answer repeated as the final reply renders once, with or without a row 
 })
 
 test('a steer at every point of a tool turn, then reload and switch back', async () => {
-  await withApp('steer-matrix', '', async ({ page, provider, sandbox, ws }) => {
+  // This tests delivery/settlement, not the production five-minute fan-in policy.
+  await withApp('steer-matrix', 'gateway:\n  completion_notification_batch_window_seconds: 0\n', async ({ page, provider, sandbox, ws }) => {
     const session: OracleTarget = { sessionId: '', expectUserMarkers: [] }
 
     const steer = async (label: string, turn: number, by: number, onAir: () => Promise<void>) => {

@@ -44,6 +44,9 @@ export const GATEWAY_NOT_CONNECTED_MESSAGE = 'Hermes gateway is not connected'
 const CANONICAL_PROMPT_EVENTS: Record<string, 'approval' | 'clarify'> = { 'approval.request': 'approval', 'clarify.request': 'clarify' }
 
 const ATTACH_REQUIRED = new Set([
+  // A replay reads past frames; resume also subscribes the replacement socket
+  // before that read, so future deltas/completion cannot fall into a gap.
+  'session.events.since',
   'prompt.submit',
   'approval.respond',
   'clarify.respond',
