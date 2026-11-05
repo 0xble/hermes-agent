@@ -85,8 +85,11 @@ breaks scheduler admission before a turn can start.
 
 For checkouts nested beneath a real Hermes home, use the portable CI environment
 (`bin/ci check --lane python`) rather than the machine's inherited home. Targeted
-runs can use the same `scripts.ci.portable.environment` with `scripts/run_tests.sh`
-and the candidate's already-provisioned `HERMES_PYTHON`. This keeps credentials,
+runs can use the same `resolve_local_toolchain(environment(home))` from
+`scripts/ci/portable.py` with `scripts/run_tests.sh` and the candidate's
+already-provisioned `HERMES_PYTHON`. `environment()` alone leaves `uv` and Node to
+PATH shims, which can select an unpinned version or start a mise install inside a
+test's startup window. This keeps credentials,
 runtime plugins and profile state out of qualification. Do not disable the
 real-home I/O guard: a source payload-manifest probe outside the checkout can
 otherwise be mistaken for profile I/O in a hidden-home worktree.
