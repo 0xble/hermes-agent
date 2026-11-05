@@ -3171,8 +3171,8 @@ class GatewayNotificationsMixin(
         notify_mode = self._load_background_notifications_mode()  # the owning profile's (scope bound above)
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
-        # Explicit completion intent must not override the owning profile's notifications-off policy.
-        silent = notify_mode == "off"
+        # Off hides public receipts, not an explicitly requested messaging wake.
+        silent = notify_mode == "off" and (not agent_notify or platform_name == Platform.LOCAL.value)
         last_output_len = 0
         busy_receipt_sent = False
         text_retry_interval = min(max(interval, 1.0), 30.0)

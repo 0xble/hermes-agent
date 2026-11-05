@@ -178,6 +178,28 @@ async def test_off_refused_explicit_completion_stops_after_eight_without_receipt
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "'off'"])
+@pytest.mark.parametrize("notify", [False, True])
+async def test_off_keeps_local_client_watcher_silent(monkeypatch, tmp_path, mode, notify):
+    import tools.process_registry as pr_module
+
+    registry = _FakeRegistry([
+        SimpleNamespace(output_buffer="running\n", exited=False),
+        SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0, command="build", started_at=None),
+    ])
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    runner = _build_runner(monkeypatch, tmp_path, mode)
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+    runner._send_watcher_message = AsyncMock(return_value=True)
+    runner._launching_turn_active = AsyncMock(return_value=True)
+
+    await runner._run_process_watcher({**_watcher_dict(), "platform": "local", "notify_on_complete": notify})
+
+    runner._enqueue_process_completion_notification.assert_not_awaited()
+    runner._send_watcher_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_consumed_completion_skips_raw_notification(monkeypatch, tmp_path):
     """#65379: after process(wait) already returned the completion inline,
     the gateway watcher must NOT also push the raw

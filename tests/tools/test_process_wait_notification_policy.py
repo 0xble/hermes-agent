@@ -8,7 +8,7 @@ from tools.process_registry_wait import wait_plan
 
 
 @pytest.mark.parametrize("mode", ["off", "'off'", "concise"])
-@pytest.mark.parametrize("surface", ["telegram", "cli", "tui", "desktop", "finite"])
+@pytest.mark.parametrize("surface", ["telegram", "cli", "tui", "desktop", "local-cli", "local-tui", "local-desktop", "finite"])
 @pytest.mark.parametrize("notify", [False, True])
 def test_wait_guidance_matches_consumer_policy(monkeypatch, tmp_path, mode, surface, notify):
     (tmp_path / "config.yaml").write_text(f"display:\n  background_process_notifications: {mode}\n")
@@ -18,7 +18,10 @@ def test_wait_guidance_matches_consumer_policy(monkeypatch, tmp_path, mode, surf
     monkeypatch.delenv("HERMES_DELEGATED_CHILD", raising=False)
     monkeypatch.delenv("HERMES_TASK_ID", raising=False)
     with preserved_session_context(), finite_turn_scope(surface == "finite"):
-        set_session_vars(platform="telegram" if surface in {"telegram", "finite"} else "", source=surface)
+        set_session_vars(
+            platform="telegram" if surface in {"telegram", "finite"} else ("local" if surface.startswith("local-") else ""),
+            source=surface.removeprefix("local-"),
+        )
         timeout, note = wait_plan(notify, 120)
         if mode != "concise":
             from tools.process_registry_wait_policy import _can_deliver_completion
