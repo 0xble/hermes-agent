@@ -435,7 +435,8 @@ while True:
     if not orphans or time.monotonic() > deadline:
         break
     time.sleep(0.1)
-report = {"returncode": status, "orphans": [cmd for p in orphans if (cmd := " ".join(process_cmdline(p)))]}
+report = {"returncode": status, "orphans": [" ".join(cmd) or f"pid={p.pid}" for p in orphans
+                                         if (cmd := process_cmdline(p)) is not None]}
 for p in orphans:
     try:
         p.kill()

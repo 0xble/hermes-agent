@@ -215,7 +215,7 @@ def _policies(home, *session_ids):
 
 def _peers_running(pid):
     return [child for child in process_children(pid)
-            if any('peer.py' in part for part in process_cmdline(child))]
+            if any('peer.py' in part for part in (process_cmdline(child) or []))]
 
 
 @pytest.mark.platforms("linux")
