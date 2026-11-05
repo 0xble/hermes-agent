@@ -62,7 +62,10 @@ def collect(suite: str, index: int, output: Path) -> int:
     command = ["scripts/run_tests.sh", *roots, f"--files-from={selection}", "--file-retries=0"]
     if suite == "messaging":
         command.append("--fail-on-skip")
-    command += ["--", "-p", "gate_test_evidence", f"--gate-evidence-dir={output / 'nodes'}"]
+    # A separate '-p module' looks like Hermes' profile flag to tests that
+    # import hermes_cli.main. Pytest accepts the attached form; Hermes does not
+    # mistake it for a CLI profile, so observation cannot break the suite.
+    command += ["--", "-pgate_test_evidence", f"--gate-evidence-dir={output / 'nodes'}"]
     rc = subprocess.call(command, env=env)
     manifest = {"schema": 1, "head": git(root, "rev-parse", "HEAD"), "suite": suite,
                 "index": index, "files": files, "exit": rc,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -345,3 +346,26 @@ def test_cli_rejects_candidate_baseline_override(monkeypatch):
     with pytest.raises(SystemExit) as error:
         equivalence.main()
     assert error.value.code == 2
+
+
+
+def test_observer_argument_does_not_select_a_hermes_profile(tmp_path, monkeypatch):
+    """Importing CLI modules must not consume pytest's observer as '-p PROFILE'."""
+    site = tmp_path / "site"
+    site.mkdir()
+    selected = tmp_path / "tests" / "a.py"
+    selected.parent.mkdir()
+    selected.touch()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_PYTHON", sys.executable)
+    monkeypatch.setattr(equivalence, "git", lambda *args: "a" * 40)
+    monkeypatch.setattr(equivalence.subprocess, "check_output", lambda command, **kw: (
+        str(site) if command[0] == sys.executable else
+        json.dumps({"slice": [{"files": "tests/a.py"} for _ in range(10)]})
+    ))
+    commands = []
+    monkeypatch.setattr(equivalence.subprocess, "call", lambda command, **kw: commands.append(command) or 0)
+    assert equivalence.collect("python", 1, tmp_path / "output") == 0
+    assert "-pgate_test_evidence" in commands[0]
+    assert "-p" not in commands[0]
+    assert commands[0][0] == "scripts/run_tests.sh"
