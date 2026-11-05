@@ -8,6 +8,8 @@ from hermes_state_runtime import admit_session_input, claim_session_input, list_
 from tests.fakes.runtime_owner import begin_runtime_epoch
 from tui_gateway import server
 
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
+
 
 class _InlineThread:
     def __init__(self, target, **_kwargs):

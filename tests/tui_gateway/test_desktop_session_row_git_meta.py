@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 from hermes_state import SessionDB
 from tui_gateway import server
+
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
 
 
 class _ImmediateThread:
