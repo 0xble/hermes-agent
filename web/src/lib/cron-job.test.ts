@@ -212,6 +212,12 @@ describe("cronNextRunOverdueMs", () => {
     expect(cronNextRunOverdueMs(job, now)).toBe(now - Date.parse(job.next_run_at));
   });
 
+  it("surfaces a held missed slot even disabled and inside doctor grace, without blaming the ticker", () => {
+    const job = { next_run_at: "2026-09-17T20:25:00+04:00", enabled: false, state: "missed" };
+    expect(cronNextRunOverdueMs(job, now)).toBe(now - Date.parse(job.next_run_at));
+    expect(cronSchedulerStaleAgeS([{ ...job, enabled: true, scheduler_heartbeat_age_s: 900 }])).toBeNull();
+  });
+
   it("keeps upcoming, within-grace, paused and unparseable slots as plain next runs", () => {
     expect(cronNextRunOverdueMs({ next_run_at: "2026-09-17T21:00:00+04:00", enabled: true }, now)).toBeNull();
     expect(cronNextRunOverdueMs({ next_run_at: "2026-09-17T20:30:00+04:00", enabled: true }, now)).toBeNull();

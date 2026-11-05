@@ -1665,6 +1665,27 @@ class GatewayNotificationsMixin(
             return _transport.adapter
         return next((a for p, a in adapters.items() if p.value == platform_name), None)
 
+    def _bind_registered_local_source(self, adapter, source):
+        """The live object local admission will accept, or None.
+
+        ``authorize_source`` requires the registered instance, not an equal
+        copy. Rebind only when the reconstructed identity matches that live
+        source, so a foreign chat cannot borrow it.
+        """
+        from gateway.session_local import LocalSessionAdapter
+        if not isinstance(adapter, LocalSessionAdapter) or source is None:
+            return None
+        saved = adapter.sources.get(getattr(source, "chat_id", None))
+        if not saved:
+            return None
+        original, identity = saved
+        if adapter._identity(source) != identity:
+            return None
+        if not any(getattr(live, "source", None) is original
+                   for live in adapter.authority.sessions.values()):
+            return None
+        return original
+
     def _platform_adapter_for_unproven_relay(self, platform_name: str, source, evt: dict):
         """Platform adapter for a relay-flagged pre-ledger route, else None.
 
@@ -1786,7 +1807,15 @@ class GatewayNotificationsMixin(
             trigger_message_id = str(evt.get("message_id") or "").strip() or None
             if trigger_message_id:
                 metadata["original_trigger_message_id"] = trigger_message_id
-            if getattr(source, "message_id", None):
+            # Local admission accepts only the registered live SessionSource.
+            # A rebuilt origin, or clearing its stale reply anchor, is a
+            # different object: snapshot_local_automation then raises
+            # permission_denied and the completion is logged as an internal
+            # refusal, so the chat never starts the notification turn.
+            bound = self._bind_registered_local_source(adapter, source)
+            if bound is not None:
+                source = bound
+            elif getattr(source, "message_id", None):
                 from gateway.session_identity import replace_source
                 source = replace_source(source, message_id=None)
             synth_event = MessageEvent(
