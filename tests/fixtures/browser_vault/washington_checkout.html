@@ -4,4 +4,9 @@
 <select name=ExpirationMonth data-test=month><option value="">Month</option><option value=5>June</option><option value=6>July</option></select>
 <select name=ExpirationYear data-test=year><option value="">Year</option><option value=28>2028</option><option value=29>2029</option></select>
 <input name=BillingAddress data-test=street><input name=ZipCode data-test=postal>
-</form>
+</form><script>
+// Model the common framework reaction: changing brand clears card text fields.
+document.querySelector('[data-test=brand]').onchange = () => {
+ for (const input of document.querySelectorAll('input')) input.value = '';
+};
+</script>

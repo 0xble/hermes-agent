@@ -332,6 +332,9 @@ def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict
             fills.append({"index": control.index, "token": token, "value": value})
     if any(f["token"] == "cc-exp" for f in fills):
         fills = [f for f in fills if f["token"] not in ("cc-exp-month", "cc-exp-year")]
+    # A brand change can reset number/expiry widgets. Select it before writing
+    # those fields, never clear an already-filled card by setting brand last.
+    fills.sort(key=lambda f: f["token"] != "cc-type")
     return fills
 
 
