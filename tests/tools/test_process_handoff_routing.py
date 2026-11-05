@@ -240,7 +240,7 @@ async def test_gateway_watcher_follows_handoff_without_child_pin_or_duplicate(
         await async_wait_until(lambda: bool(watchers), timeout=10)
         await asyncio.wait_for(asyncio.gather(*watchers), timeout=10)
         assert len(watchers) == 1
-        admitted = not new_session and mode != "off"
+        admitted = not new_session
         assert adapter.handle_message.await_count == int(admitted)
         if admitted:
             event = adapter.handle_message.await_args.args[0]
