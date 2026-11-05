@@ -61,47 +61,66 @@ def test_first_class_credential_switch_and_verified_recovery_both_notify(agent):
     assert len([message for message in emitted if "Primary model restored" in message]) == 1
 
 
-@pytest.mark.parametrize("reset", ["restore", "shared-restore", "shared-recovery", "model-switch", "exhaustion", "voice"])
-def test_silent_provenance_cannot_leak_into_a_later_recovery(agent, reset):
-    from agent.agent_runtime_helpers import _finish_switch
-    from agent.chat_completion_helpers import _fallback_chain_exhausted
+def _restore(agent):
+    agent._fallback_activated = agent._provider_fallback_active = True
+    with patch("agent.agent_runtime_helpers._rebuild_primary_client"):
+        assert agent._restore_primary_runtime()
+
+
+def _shared_restore(agent):
     from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+
+    record = arm_cooldown(route_from_agent(agent), reason="overloaded")
+    agent._shared_primary_cooldown_record = record
+    agent._fallback_activated = agent._provider_fallback_active = True
+    emitted = []
+    agent._emit_diagnostic_status = emitted.append
+    with (
+        patch("agent.shared_primary_cooldown.time.time", return_value=record["reset_at"] + 1),
+        patch("agent.agent_runtime_helpers._rebuild_primary_client"),
+    ):
+        assert agent._restore_primary_runtime()
+        assert complete_primary_recovery(agent)
+    assert not emitted  # consume this episode's silence without leaking it to the next
+
+
+def _shared_recovery(agent):
+    from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+
+    agent._shared_primary_cooldown_record = arm_cooldown(route_from_agent(agent), reason="overloaded")
+    assert complete_primary_recovery(agent)
+
+
+def _model_switch(agent):
+    from agent.agent_runtime_helpers import _finish_switch
+
+    _finish_switch(agent, agent.provider, agent.provider, agent.provider)
+
+
+def _exhaustion(agent):
+    from agent.chat_completion_helpers import _fallback_chain_exhausted
+
+    assert not _fallback_chain_exhausted(agent, FailoverReason.server_error)
+
+
+def _voice(agent):
     from agent.voice_turn_route import _capture, _reinstall
 
+    agent._provider_fallback_silent_retry = False
+    state = _capture(agent)
+    state.update({name: getattr(agent, name, None) for name in (
+        "reasoning_config", "reasoning_override", "_pre_fallback_reasoning_override")})
+    agent._provider_fallback_silent_retry = True  # a silent retry on the temporary voice route
+    with patch("agent.agent_runtime_helpers._rebuild_primary_client"):
+        _reinstall(agent, state)
+
+
+@pytest.mark.parametrize("reset", [_restore, _shared_restore, _shared_recovery, _model_switch, _exhaustion, _voice])
+def test_silent_provenance_cannot_leak_into_a_later_recovery(agent, reset):
+    from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+
     agent._provider_fallback_silent_retry = True
-    if reset == "restore":
-        agent._fallback_activated = True
-        agent._provider_fallback_active = True
-        with patch("agent.agent_runtime_helpers._rebuild_primary_client"):
-            assert agent._restore_primary_runtime()
-    elif reset == "shared-restore":
-        record = arm_cooldown(route_from_agent(agent), reason="overloaded")
-        agent._shared_primary_cooldown_record = record
-        agent._fallback_activated = agent._provider_fallback_active = True
-        emitted = []
-        agent._emit_diagnostic_status = emitted.append
-        with (
-            patch("agent.shared_primary_cooldown.time.time", return_value=record["reset_at"] + 1),
-            patch("agent.agent_runtime_helpers._rebuild_primary_client"),
-        ):
-            assert agent._restore_primary_runtime()
-            assert complete_primary_recovery(agent)
-        assert not emitted  # consume this episode's silence without leaking it to the next
-    elif reset == "shared-recovery":
-        agent._shared_primary_cooldown_record = arm_cooldown(route_from_agent(agent), reason="overloaded")
-        assert complete_primary_recovery(agent)
-    elif reset == "model-switch":
-        _finish_switch(agent, agent.provider, agent.provider, agent.provider)
-    elif reset == "exhaustion":
-        assert not _fallback_chain_exhausted(agent, FailoverReason.server_error)
-    else:
-        agent._provider_fallback_silent_retry = False
-        state = _capture(agent)
-        state.update({name: getattr(agent, name, None) for name in (
-            "reasoning_config", "reasoning_override", "_pre_fallback_reasoning_override")})
-        agent._provider_fallback_silent_retry = True  # a silent retry on the temporary voice route
-        with patch("agent.agent_runtime_helpers._rebuild_primary_client"):
-            _reinstall(agent, state)
+    reset(agent)
     assert agent._provider_fallback_silent_retry is False
     emitted = []
     agent._emit_diagnostic_status = emitted.append

@@ -2021,6 +2021,7 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_a
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
         agent._fallback_episode_cooled = True
+    agent._provider_fallback_silent_retry = False
     return False
 
 
@@ -2063,13 +2064,12 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
-    # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
-    # See #22548, #62984, #70893.
+    # Skip same-label entries on the failed backend; different labels retain their bounded retry.
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
     fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
-    # Distinct labels can be a useful bounded retry of one route after a transient 5xx.
+    # This preserves alias retry eligibility for all existing failover reasons, not only 5xx.
     # Keep earlier unavailability/connection-domain skips authoritative.
     if should_skip_candidate(fb_ident, current_ident) and fb_provider == current_ident.provider:
         logger.warning(
