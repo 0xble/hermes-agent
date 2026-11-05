@@ -9,7 +9,7 @@ backend identity as its failed primary is a silent retry. Custom aliases can
 share identity: named-custom primary resolution uses `custom`, while fallback
 binding can retain `custom:<name>`. Distinct first-class registry providers do
 not: `xai-oauth` → `xai` changes subscription/API-key credential surfaces even
-on the same host/model/wire and must notify (see `backend_identity._both_first_class`).
+on the same host/model/wire and must notify (see `backend_identity.distinct_credential_surface`).
 The bounded alias attempt must remain available after transient server errors
 because it can rescue the turn. Retry eligibility is intentionally unchanged
 for other existing failover reasons: credentials can differ even on one route;
@@ -20,10 +20,12 @@ one-shot fallback notice. Activation remains logged with resolved identities;
 terminal-error reporting and final give-up messages must not be suppressed. A silent
 alias retry must not generate a false primary-restored notice on the next turn;
 restoration after a real route change still announces recovery. Clear the silent
-flag on restore, `/model` completion, chain exhaustion and successful shared
-recovery, and snapshot it with temporary voice routes. A pending shared recovery
-keeps its own local-only silent receipt until primary success, without carrying
-the episode flag into a later outage.
+flag on restore, `/model` completion and successful shared recovery, and snapshot
+it with temporary voice routes. Chain exhaustion clears stale silence only when
+no fallback episode is active; an active alias retains silence until restoration
+or recovery ends the episode. A pending shared recovery keeps its own local-only
+silent receipt until primary success, without carrying the episode flag into a
+later outage.
 
 ## Integration and upstream adoption
 

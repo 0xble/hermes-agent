@@ -97,10 +97,51 @@ def _model_switch(agent):
     _finish_switch(agent, agent.provider, agent.provider, agent.provider)
 
 
-def _exhaustion(agent):
+def _inactive_exhaustion(agent):
     from agent.chat_completion_helpers import _fallback_chain_exhausted
 
+    assert not getattr(agent, "_provider_fallback_active", False)
     assert not _fallback_chain_exhausted(agent, FailoverReason.server_error)
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["local", "shared-record"])
+def test_active_alias_exhaustion_preserves_silence_through_next_turn_restore(agent, shared):
+    from agent.chat_completion_helpers import _fallback_chain_exhausted
+    from agent.shared_primary_cooldown import arm_cooldown, get_cooldown, route_from_agent
+
+    agent._primary_runtime["provider"] = "custom:primary"
+    agent.provider = "custom:alias"
+    agent._fallback_activated = agent._provider_fallback_active = True
+    agent._provider_fallback_silent_retry = True
+    agent._provider_fallback_route = (agent.model, agent.provider)
+    route = route_from_agent(agent)
+    record = arm_cooldown(route, reason="overloaded") if shared else None
+    agent._shared_primary_cooldown_record = record
+    emitted = []
+    agent._emit_diagnostic_status = emitted.append
+
+    assert not _fallback_chain_exhausted(agent, FailoverReason.server_error)
+    assert agent._provider_fallback_active
+    assert agent.provider == "custom:alias"
+    assert agent._provider_fallback_silent_retry is True
+
+    with (
+        patch("agent.agent_runtime_helpers.time.monotonic", return_value=agent._rate_limited_until + 1),
+        patch("agent.shared_primary_cooldown.time.time", return_value=(record or {}).get("reset_at", 0) + 1),
+        patch("agent.agent_runtime_helpers._rebuild_primary_client"),
+    ):
+        assert agent._restore_primary_runtime()
+        assert agent.provider == "custom:primary"
+        assert not agent._provider_fallback_active
+        assert agent._provider_fallback_silent_retry is False
+        assert not emitted
+        if shared:
+            assert isinstance(agent._shared_primary_cooldown_record, dict)
+            assert agent._shared_primary_cooldown_record["_silent_retry"] is True
+            assert complete_primary_recovery(agent)
+            assert get_cooldown(route) is None
+            assert agent._shared_primary_cooldown_record is None
+    assert not any("Primary model restored" in message for message in emitted)
 
 
 def _voice(agent):
@@ -115,7 +156,7 @@ def _voice(agent):
         _reinstall(agent, state)
 
 
-@pytest.mark.parametrize("reset", [_restore, _shared_restore, _shared_recovery, _model_switch, _exhaustion, _voice])
+@pytest.mark.parametrize("reset", [_restore, _shared_restore, _shared_recovery, _model_switch, _inactive_exhaustion, _voice])
 def test_silent_provenance_cannot_leak_into_a_later_recovery(agent, reset):
     from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
 

@@ -29,7 +29,7 @@ def resolved_route(agent) -> tuple[str, str, str]:
 
 def buffer_fallback_route_notice(agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds):
     """Silence identical alias retries, never distinct first-class credential surfaces."""
-    from agent.backend_identity import BackendIdentity, _both_first_class
+    from agent.backend_identity import BackendIdentity, distinct_credential_surface
     from agent.chat_completion_helpers import (
         _buffer_fallback_notice, _fallback_reason_text, _rate_limit_fallback_notice,
     )
@@ -37,8 +37,8 @@ def buffer_fallback_route_notice(agent, reason, shared_adoption, old_model, old_
 
     new_route = resolved_route(agent)
     same_route = (all(old_route) and old_route == new_route
-                  and not _both_first_class(BackendIdentity.build(provider=old_provider),
-                                            BackendIdentity.build(provider=agent.provider)))
+                  and not distinct_credential_surface(BackendIdentity.build(provider=old_provider),
+                                                      BackendIdentity.build(provider=agent.provider)))
     agent._provider_fallback_silent_retry = same_route and (
         not getattr(agent, "_provider_fallback_active", False)
         or getattr(agent, "_provider_fallback_silent_retry", False))

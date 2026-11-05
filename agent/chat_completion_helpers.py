@@ -2013,15 +2013,15 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
 
 
 def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_armed: bool = False) -> bool:
-    """Chain exhausted (always False). A non-empty chain walked without an armed primary cooldown
-    arms a short one so next turn's restore_primary_runtime stays gated instead of replaying the
-    whole context across every provider again. A rate limit or overload from an active fallback
-    arms nothing shared, so it still gets this short window."""
+    """Always False; briefly cool an exhausted chain if the primary has no cooldown.
+    Gate next-turn restore even when a rate limit or overload came from an active fallback."""
     if agent._fallback_chain and not cooldown_armed:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
         agent._fallback_episode_cooled = True
-    agent._provider_fallback_silent_retry = False
+    # Exhaustion is not restoration: an active alias still owns its silent provenance.
+    if not getattr(agent, "_provider_fallback_active", False):
+        agent._provider_fallback_silent_retry = False
     return False
 
 
