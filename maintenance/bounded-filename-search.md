@@ -1,64 +1,77 @@
 # Bounded filename search
 
-## Required behavior
-
-`search_files(target="files")` runs `rg --files` with a small explicit walker-thread
-bound in both the native and shell execution lanes. The bound is derived from the
-host CPU count as `max(1, min(4, cpu_count // 4))`, so a large host cannot turn one
-filename search into a whole-machine parallel walk. An unknown CPU count uses one
-thread. Content searches keep their existing ripgrep command and parallelism.
-
-## Provenance and patch
-
 Fork patch identity: `bounded-filename-search`.
+Contract tests: `tests/tools/test_search_filename_globs.py`, `tests/tools/test_search_cwd_preservation.py`, `tests/tools/test_search_files_engine_selection.py`, `tests/tools/test_search_budget_truncation.py`, `tests/tools/test_macos_protected_search.py`, `tests/tools/test_search_supplement_safety.py`, `tests/tools/test_search_timeout_diagnostics.py`, `tests/tools/environments/test_execute_timeouts.py`.
 
-Maintenance evidence from the Mac Studio on 2026-10-11 showed filename searches over
-`$HERMES_HOME` and `cache/scratch` spawning `rg --files` at roughly 900–1000% CPU.
-The filename lane already bounded result admission and timeout, but its ripgrep
-walker remained unbounded. This patch changes only the filename command builder and
-its regression coverage.
+## Current contract
 
-Upstream guidance was checked at `835c3dd038d903182a66ecc45e34bf5e0de65f00`
-and rechecked at `41cd7b649d0980c57620035af736f91be10dae79` during recovery;
-no relevant contract change was found.
-Related issue [NousResearch #127861](https://github.com/NousResearch/hermes-agent/issues/127861)
-and open PR [#129710](https://github.com/NousResearch/hermes-agent/pull/129710)
-propose indexed lookup and completion changes; they are broader alternatives, not
-an adopted thread-budget fix. Delivery is an own-fork patch and a draft PR on
-`0xble/hermes-agent`; no upstream contribution is authorized for this task.
+Filename matching has three invariants: changing the terminal/backend cwd,
+spelling the same root relatively or absolutely, or adding an unrelated root
+cannot change matches inside an existing root. An extra root contributes only
+its own matches. Results are absolute paths, deduplicated in caller root order
+for discovery; modified order remains globally newest-first.
 
-Broad-root pruning of `cache/scratch` is intentionally not included. An explicit
-scratch root must remain searchable, and the implicit-parent distinction needs a
-separate path-policy regression surface before it is safe to add. Separate callers
-in `hermes_cli/commands_completion.py::_get_project_files` and
-`agent/context_references.py::_iter_visible_entries` also issue `rg --files`; they
-are follow-ups outside the requested agent-tool command path. The read-file
-not-found suggestions use a same-directory `ls -1 ... | head -50`, not a recursive
-ripgrep walk.
+| Pattern | Match within each selected root |
+| --- | --- |
+| Unanchored basename without `/` or braces | Basename at any depth, preserving the historical implicit leading `*` |
+| Unanchored slash/brace glob, including explicit `**/` | Root-relative path suffix at any depth (`**/<pattern>`); also accept the variant with a repeated literal root path or root basename stripped |
+| Leading `./` or `/` | Root-relative path without an implicit recursive prefix |
+| Absolute path inside a selected root | Root-relative path in that root only, preserving absolute root identity |
+
+Each root runs its own bounded `rg --files` job in an isolated subprocess cwd
+(or shell subshell). A literal root prefix in that root's parent frame also
+supports file operands without attempting to cd into a file. No shared ancestor
+or caller-cwd matching coordinates are used. POSIX roots require an absolute
+backend cwd; expand `~` using the backend HOME, never the controller's. Unsupported
+coordinates fail explicitly rather than returning silent empty matches.
+
+Filename walkers use `max(1, min(4, cpu_count // 4))` threads (one if CPU count
+is unknown). Root admission, bounded result capture, pagination and the shared
+60-second search deadline remain in force. The directory supplement, BSD find
+retry, gitignore checks and all mtime stat passes share that deadline; exhaustion
+retains discovered paths with the existing `search_timeout` truncation notice.
+`BaseEnvironment.execute` floors timeout seconds to an integer with a minimum
+of one before SDK dispatch and waiting (Modal/Daytona reject fractional seconds).
+`None` still selects the environment default. Search keeps its precise remaining
+budget and skips new work below one second rather than rounding past the deadline.
+Docker delegates to this boundary; Managed Modal overrides it but already sends
+integer milliseconds and can represent fractional seconds without the SDK defect.
+Discovery stops at the page budget;
+modified order merges each root's bounded newest candidates globally. Native
+and shell transports keep bounded stderr separate from paths and report engine
+status plus at most 4096 diagnostic bytes on failure. Neither transport changes
+the caller's session cwd, including after empty matches or failures.
+
+Ripgrep ignore rules, hidden-directory defaults and macOS protected-root pruning
+remain enabled. Basename globs (including `**/basename`) retain the `find`
+directory supplement in every root so empty directories remain discoverable.
+Both find forms prune the same protected roots before descending, including in
+single-root searches; explicit protected roots remain searchable. Unchanged
+hidden-directory pruning and gitignore checks still apply. Path/brace globs
+exceed its basename syntax. The no-rg `find -name` fallback
+retains its historical basename-only syntax. Content matching is unchanged;
+BSD find-wrapped grep errors now surface diagnostics at exit 1 instead of being
+misreported as empty matches (a diagnostic-free grep exit 1 still means no matches).
+This intentionally includes an unreadable subdirectory with no usable match
+payload: it errors like ripgrep, rather than leaking `find: ... Permission denied`
+as a filename. Partial readable matches remain usable in all output modes.
+
+## Timeout provenance
+
+The shared execution boundary and every in-tree backend were checked before this
+normalization. Existing wait-backstop protection (`53e3c14f1d9`) bounds invalid
+timeouts but does not convert SDK timeout values. Upstream PR
+[#14699](https://github.com/NousResearch/hermes-agent/pull/14699) is open/unmerged
+and normalizes Modal-only preparation; it does not cover this checkout's shared
+dispatch. Remote process termination also computes fractional `env.execute`
+budgets in `tools/process_registry.py`; the same boundary makes those SDK calls
+integer-compatible without adding backend-specific conversions to each caller.
 
 ## Verification
 
-The RED test on the base asserts that a 28-CPU host's filename command contains
-`--threads 4` and fails because the command has no thread bound. The GREEN focused
-suite is:
+Run in an invocation-owned sandbox home with a prepared test interpreter;
+`scripts/run_tests.sh` acquires machine-wide heavy-slot admission:
 
-`scripts/run_tests.sh tests/tools/test_search_files_engine_selection.py tests/tools/test_search_native_rg.py tests/tools/test_search_files_cpu_windows.py tests/tools/test_search_zero_match_and_multipath.py --file-retries 0`
-
-Also run the relevant broader tools tests through the canonical runner.
-Recovery verification through machine-wide `heavy-slot` admission observed:
-
-- RED: `1 failed, 53 deselected in 0.84s`; the generated filename command
-  lacked `--threads 4`.
-- GREEN: `15 files, 354 tests passed, 0 failed, 12 skipped` across all nine
-  search-engine test modules plus file operations, edge cases, file tools,
-  single-roundtrip behavior, cwd resolution, and macOS protected search.
-- The native-ripgrep module passed all six tests, including real native and
-  shell execution with the thread bound. Windows-only tests were skipped on
-  macOS; native Windows qualification remains separate.
-
-## Retirement and rollback
-
-Retire when a selected upstream release bounds `rg --files` walker threads while
-preserving the native/shell behavior and the content-search contract. Roll back the
-filename command option, its regression test, this maintenance unit, and its root
-index row together. The scratch-pruning follow-up can be evaluated independently.
+```sh
+scripts/run_tests.sh tests/tools/test_search*.py tests/tools/test_file_operations*.py tests/tools/test_macos_protected_search.py --file-retries 0
+```

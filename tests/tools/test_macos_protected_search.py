@@ -76,10 +76,10 @@ def test_grep_pruned_search_still_finds_nested_protected_names(tmp_path, monkeyp
     home = tmp_path / "Users" / "alice"
     project = home / "work" / "repo" / "Downloads"
     project.mkdir(parents=True)
-    (project / "notes.txt").write_text("needle here\n")
+    (project / "notes.txt").write_text("needle here\n", encoding="utf-8")
     protected = home / "Downloads"
     protected.mkdir()
-    (protected / "secret.txt").write_text("needle protected\n")
+    (protected / "secret.txt").write_text("needle protected\n", encoding="utf-8")
     monkeypatch.setattr(file_operations, "_HOME", str(home))
     ops = ShellFileOperations(LocalEnvironment(cwd=str(home)))
     monkeypatch.setattr(ops, "_has_command", lambda command: command == "grep")
@@ -125,11 +125,13 @@ def test_rg_multi_root_scopes_protected_globs_and_restores_absolute_paths(monkey
             return {"output": "/usr/bin/rg\n", "returncode": 0}
         if "--version" in command:
             return {"output": "ripgrep 14.1.1\n", "returncode": 0}
+        if command.startswith("command -v find"):
+            return {"output": "", "returncode": 1}
+        if command.startswith("while IFS= read"):
+            return {"output": "10\n20\n", "returncode": 0}
         if "--files" in command:
-            return {
-                "output": "repo/Downloads/visible.txt\nUsers/alice/safe.txt\n",
-                "returncode": 0,
-            }
+            return {"output": "alice/safe.txt\n" if " -- 'alice')" in command
+                    else "repo/Downloads/visible.txt\n", "returncode": 0}
         raise AssertionError(command)
 
     env.execute = execute
@@ -138,13 +140,15 @@ def test_rg_multi_root_scopes_protected_globs_and_restores_absolute_paths(monkey
     )
 
     commands = _rg_files_commands(env.commands)
-    assert len(commands) == 1
-    command = commands[0]
-    assert command.startswith("set -o pipefail; cd '/' && ")
-    assert "--sortr=modified" in command
-    assert "'!Users/alice/Downloads/**'" in command
-    assert "'!repo/Downloads/**'" not in command
-    assert "'Users/alice' 'repo'" in command
+    assert len(commands) == 2
+    assert all(command.startswith("set -o pipefail; ") for command in commands)
+    assert "(cd -- '/Users' && " in commands[0]
+    assert "(cd -- '/' && " in commands[1]
+    assert all("--sortr=modified" in command for command in commands)
+    assert "'!/alice/Downloads/**'" in commands[0]
+    assert "'!/repo/Downloads/**'" not in commands[1]
+    assert " -- 'alice')" in commands[0]
+    assert " -- 'repo')" in commands[1]
     assert result.files == [
         "/repo/Downloads/visible.txt",
         "/Users/alice/safe.txt",
@@ -153,7 +157,8 @@ def test_rg_multi_root_scopes_protected_globs_and_restores_absolute_paths(monkey
 
 @pytest.mark.platforms("macos")
 def test_rg_scoped_multi_root_terminates_options_before_dash_prefixed_root(monkeypatch):
-    env = RecordingEnvironment("/Users/alice")
+    # With base multi-root protected scoping, '/' keeps --version a bare operand.
+    env = RecordingEnvironment("/")
     ops = ShellFileOperations(env)
     monkeypatch.setattr(file_operations, "_HOME", "/Users/alice")
 
@@ -164,6 +169,8 @@ def test_rg_scoped_multi_root_terminates_options_before_dash_prefixed_root(monke
             return {"output": output, "returncode": 0}
         if command.startswith("command -v rg"):
             return {"output": "/usr/bin/rg\n", "returncode": 0}
+        if command.startswith("command -v find"):
+            return {"output": "", "returncode": 1}
         if "--files" in command:
             return {"output": "", "returncode": 0}
         raise AssertionError(command)
@@ -171,9 +178,11 @@ def test_rg_scoped_multi_root_terminates_options_before_dash_prefixed_root(monke
     env.execute = execute
     result = ops.search("*.txt", path="., --version", target="files")
 
-    command = _rg_files_commands(env.commands)[0]
-    assert "cd '/Users/alice' &&" in command
-    assert " -- '.' '--version' 2>/dev/null" in command
+    commands = _rg_files_commands(env.commands)
+    assert len(commands) == 2
+    assert all("(cd -- '/' &&" in command for command in commands)
+    assert " -- '.') | head -n " in commands[0]
+    assert " -- '--version') | head -n " in commands[1]
     assert result.error is None
 
 
@@ -184,8 +193,8 @@ def test_real_ripgrep_does_not_descend_into_protected_folder(tmp_path, monkeypat
     protected = home / "Downloads"
     safe.mkdir(parents=True)
     protected.mkdir()
-    (safe / "visible.txt").write_text("needle")
-    (protected / "protected.txt").write_text("needle")
+    (safe / "visible.txt").write_text("needle", encoding="utf-8")
+    (protected / "protected.txt").write_text("needle", encoding="utf-8")
     monkeypatch.setattr(file_operations, "_HOME", str(home))
     ops = ShellFileOperations(LocalEnvironment(cwd=str(home)))
 
