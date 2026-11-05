@@ -171,6 +171,110 @@ def test_ledger_rechecks_invalid_header_after_permission_repair(tmp_path, monkey
     finally:
         path.chmod(0o600)
 
+@pytest.mark.parametrize("module", ["tools.async_delegation", "gateway.delivery_ledger"])
+@pytest.mark.parametrize("stage", ["connect", "initialize"])
+def test_failed_first_ledger_open_can_be_retried(tmp_path, monkeypatch, module, stage):
+    import importlib
+    import hermes_state as hs
+
+    ledger = importlib.import_module(module)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ledger, "_db_path", lambda: path)
+    owner = hs if stage == "connect" else ledger
+    name = "_connect_tracked_db" if stage == "connect" else "_initialize_schema"
+    original = getattr(owner, name)
+
+    sidecars = [tmp_path / f"state.db{suffix}" for suffix in ("-wal", "-shm")]
+
+    empty_on_failure = False
+
+    def fail_once(*args, **kwargs):
+        nonlocal empty_on_failure
+        monkeypatch.setattr(owner, name, original)
+        empty_on_failure = path.stat().st_size == 0
+        if empty_on_failure:
+            for sidecar in sidecars:
+                sidecar.touch()
+        raise sqlite3.OperationalError("forced first-open failure")
+
+    monkeypatch.setattr(owner, name, fail_once)
+    with pytest.raises(sqlite3.OperationalError, match="forced first-open failure"):
+        ledger._connect()
+    leftover_sidecars = [sidecar for sidecar in sidecars if sidecar.exists()]
+    conn = ledger._connect()
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        conn.close()
+    if empty_on_failure:
+        assert not leftover_sidecars, "failed first open left newly created sidecars"
+    assert not list(tmp_path.glob("state.db.*.bak"))
+
+
+@pytest.mark.parametrize("origin", ["existing", "replacement", "initialized"])
+def test_failed_ledger_open_preserves_unowned_or_nonempty_files(tmp_path, monkeypatch, origin):
+    import hermes_state as hs
+    from tools import async_delegation as ledger
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ledger, "_db_path", lambda: path)
+    if origin == "existing":
+        conn = ledger._connect()
+        conn.close()
+    original = hs._connect_tracked_db
+    # Existing sidecars are evidence, even when the primary was absent.
+    wal = tmp_path / "state.db-wal"
+    if origin != "initialized":
+        wal.write_bytes(b"pre-existing sidecar")
+    expected_inode = None
+
+    def fail_open(*args, **kwargs):
+        nonlocal expected_inode
+        if origin == "replacement":
+            path.rename(tmp_path / "original-empty-inode")
+            path.touch()
+        elif origin == "initialized":
+            conn = original(*args, **kwargs)
+            try:
+                conn.execute("CREATE TABLE retained (value TEXT)")
+                conn.commit()
+            finally:
+                conn.close()
+            wal.write_bytes(b"pre-existing sidecar")
+        expected_inode = path.stat().st_ino
+        raise sqlite3.OperationalError("forced open failure")
+
+    monkeypatch.setattr(hs, "_connect_tracked_db", fail_open)
+    with pytest.raises(sqlite3.OperationalError, match="forced open failure"):
+        ledger._connect()
+    assert path.stat().st_ino == expected_inode
+    assert wal.read_bytes() == b"pre-existing sidecar"
+    if origin == "initialized":
+        assert path.stat().st_size > 0
+
+
+def test_failed_first_ledger_open_retains_nonempty_sidecars(tmp_path, monkeypatch):
+    import hermes_state as hs
+    from tools import async_delegation as ledger
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ledger, "_db_path", lambda: path)
+    sidecar = tmp_path / "state.db-wal"
+
+    def fail_open(*args, **kwargs):
+        sidecar.write_bytes(b"retain these bytes")
+        raise sqlite3.OperationalError("forced open failure")
+
+    monkeypatch.setattr(hs, "_connect_tracked_db", fail_open)
+    with pytest.raises(sqlite3.OperationalError, match="forced open failure"):
+        ledger._connect()
+    assert not path.exists()
+    assert sidecar.read_bytes() == b"retain these bytes"
+
+
 def _process_ledger_first_open(home, connected, release):
     import os
     from pathlib import Path
