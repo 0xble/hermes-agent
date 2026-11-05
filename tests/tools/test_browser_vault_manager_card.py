@@ -111,7 +111,7 @@ def test_manager_card_binds_to_current_page_and_confirmation_names_it():
         assert prompts == ["Fill payment card 'Amex' on https://shop.test"]
         # The checkout tab is focused before the origin is read (the supervisor's default tab may be blank).
         assert _run_fill.focus_calls[0] == ("", "payment")
-        assert len(secret_exprs) == 1 and _CARD["card_number"] in secret_exprs[0] and "07/29" in secret_exprs[0]
+        assert len(secret_exprs) == 2 and _CARD["card_number"] in secret_exprs[0] and "07/29" in secret_exprs[0]
         assert '"https://shop.test"' in secret_exprs[0]  # the fill script re-checks the bound origin itself
         assert _CARD["card_number"] not in raw and _CARD["cvc"] not in raw
     finally:
@@ -338,7 +338,7 @@ def test_slow_card_confirmation_without_refresh_support_preserves_base_fill(monk
         raw, _prompts, secret_exprs = _run_fill("https://shop.test/checkout")
         out = json.loads(raw)
         assert out["success"] is True
-        assert len(secret_exprs) == 1
+        assert len(secret_exprs) == 2
     finally:
         redact.clear_vault_redaction_values()
 
@@ -424,3 +424,28 @@ def test_pan_postal_fill_reports_missing_expiry_and_cvc():
         assert result["field_results"]["cc-number"] == "filled"
     finally:
         redact.clear_vault_redaction_values()
+
+
+@pytest.mark.parametrize('failure', [{'success': False, 'error': 'untrusted-page-exception'},
+    {'success': True, 'result': 'not-json'},
+    {'success': True, 'result': [{'index': 'invalid'}]}, RuntimeError('untrusted-page-exception')])
+def test_payment_inspection_failures_are_safe_missing_field_receipts(failure, monkeypatch):
+    from tools import browser_vault_tool as vault
+    backend = _Manager()
+    def evaluate(task, expression):
+        if 'location.href' in expression:
+            return {'success': True, 'result': 'https://merchant.test/checkout'}
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+    with patch('agent.vault_backends.backend_for_handle', return_value=backend), \
+         patch.object(vault, '_eval_js', side_effect=evaluate), \
+         patch.object(vault, '_confirm_payment_fill') as consent, \
+         patch.object(backend, 'resolve_secret') as resolve:
+        result = json.loads(vault.browser_vault_fill('mg:card'))
+    assert not result['success'] and result['partial']
+    assert result['missing_fields'] == ['cc-csc','cc-exp-month','cc-exp-year','cc-number']
+    assert set(result['field_results'].values()) == {'missing'}
+    assert 'untrusted-page-exception' not in json.dumps(result)
+    consent.assert_not_called()
+    resolve.assert_not_called()

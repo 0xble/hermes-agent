@@ -591,7 +591,7 @@ class TestBrowserVaultTools:
             assert out["fields"] == (["cc-number"] if partial else ["cc-csc", "cc-exp", "cc-number"])
             assert out["missing_fields"] == (["cc-csc", "cc-exp-month", "cc-exp-year"] if partial else [])
             assert _CARD["card_number"] not in raw and _CARD["cvc"] not in raw
-            assert len(secret_exprs) == 1 and _CARD["card_number"] in secret_exprs[0] and "07/29" in secret_exprs[0]
+            assert len(secret_exprs) == 2 and _CARD["card_number"] in secret_exprs[0] and "07/29" in secret_exprs[0]
             assert '"index": 3' not in secret_exprs[0]  # the email box is never a card target
             assert _CARD["card_number"] not in redact.redact_sensitive_text(f"dom says {_CARD['card_number']}")
         finally:

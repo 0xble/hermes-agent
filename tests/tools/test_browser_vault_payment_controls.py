@@ -76,3 +76,15 @@ def test_frame_navigation_retains_truthful_prior_field_receipts(monkeypatch):
     assert result["partial"] and not result["success"]
     assert result["filled_fields"] == 1 and result["fields"] == ["cc-number"]
     assert "cc-csc" in result["missing_fields"]
+
+
+def test_receipt_uses_final_pass_not_historical_write_results():
+    ctx = context({'autocomplete': 'cc-number'}, {'autocomplete': 'cc-exp'}, {'label': 'CVC'})
+    selected, ambiguous = plan([ctx], CARD)
+    initial = {'fieldResults': [{'token': f['token'], 'status': 'filled'} for f in selected[0]['fills']]}
+    final = {'fieldResults': [{'token': f['token'], 'status': 'missing' if f['token'] == 'cc-number' else 'filled'} for f in selected[0]['fills']]}
+    writer = Mock(side_effect=[{'success': True, 'result': initial}, {'success': True, 'result': final}])
+    result = fill('task', ORIGIN, selected, ambiguous, writer)
+    assert not result['success'] and result['field_results']['cc-number'] == 'missing'
+    assert writer.call_count == 2
+    assert 'const verifyOnly = true' in writer.call_args_list[-1].args[1]

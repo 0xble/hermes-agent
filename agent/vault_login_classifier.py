@@ -30,7 +30,7 @@ LOGIN_AUTOFILL_TOKENS = ("username", "email", "tel", "current-password")
 # Payment / address autocomplete tokens (WHATWG) the checkout fill targets. ``cc-exp`` (combined
 # MM/YY) is derived at fill time from exp_month + exp_year. Field-name/label heuristics below back
 # up sites that omit autocomplete attributes.
-PAYMENT_AUTOFILL_TOKENS = ("cc-number", "cc-name", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc")
+PAYMENT_AUTOFILL_TOKENS = ("cc-number", "cc-name", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc", "cc-type")
 ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "address-level1",
                            "postal-code", "country-name", "country")
 PROTECTED_FIELD_TOKENS = ("bday", "bday-day", "bday-month", "bday-year")
@@ -38,9 +38,10 @@ _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan)\b"), "cc-number"),
     (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname)\b"), "cc-name"),
     (re.compile(r"\b(?:cvc|cvv|csc|security\s*code|card\s*code)\b"), "cc-csc"),
+    (re.compile(r"\b(?:card|credit\s*card)\s*(?:type|brand)\b"), "cc-type"),
     (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth)\b"), "cc-exp-month"),
     (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear)\b"), "cc-exp-year"),
-    (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy|valid\s*thru)\b"), "cc-exp"),
+    (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy(?:yy)?|valid\s*thru)\b"), "cc-exp"),
     (re.compile(r"\b(?:address\s*(?:line\s*)?2|apt|suite|unit)\b"), "address-line2"),
     (re.compile(r"\b(?:address(?:\s*line\s*1)?|street)\b"), "address-line1"),
     (re.compile(r"\b(?:city|town|locality)\b"), "address-level2"),
@@ -261,6 +262,8 @@ def select_password_fill(
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
     """Classify payment/address targets; masked passwords qualify only as CVC."""
     tokens = [t for t in control.autocomplete.lower().split() if t]
+    if set(tokens) & {"one-time-code", "current-password", "new-password", "username"}:
+        return None
     for token in PAYMENT_AUTOFILL_TOKENS + ADDRESS_AUTOFILL_TOKENS:
         if token in tokens:
             if control.type == "password" and token != "cc-csc":
@@ -272,7 +275,10 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
             and control.group_candidate_count == 1
             and re.search(r"\b(?:cvc|cvv|csc|security\s*code|card\s*code)\b", _normalize_text(control.group_label))):
         return ClassifiedLoginControl(control, 65, "cc-csc")
-    searchable = _normalize_text(" ".join(part for part in (control.name, control.label) if part))
+    metadata = " ".join(part for part in (control.name, control.label) if part)
+    metadata = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", metadata)
+    metadata = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", metadata)
+    searchable = _normalize_text(metadata)
     if (control.type in {"combobox", "listbox", "select"}
             and re.search(r"\bexp(?:iry|iration)?\b", _normalize_text(control.group_label))
             and searchable in {"month", "year"}):
@@ -285,7 +291,26 @@ def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLogin
             if control.type == "password" and token != "cc-csc":
                 continue
             return ClassifiedLoginControl(control, 70, token)
+    if control.type in {"combobox", "listbox", "select"}:
+        token = {"mm": "cc-exp-month", "yyyy": "cc-exp-year", "yy": "cc-exp-year"}.get(searchable)
+        if token:
+            return ClassifiedLoginControl(control, 60, token)
     return None
+
+
+def _payment_brand(number: str) -> str:
+    number = re.sub(r"[\s-]", "", number)
+    if not re.fullmatch(r"[0-9]{13,19}", number):
+        return ""
+    if number.startswith("4"):
+        return "visa"
+    if number.startswith(("34", "37")):
+        return "amex"
+    if 51 <= int(number[:2]) <= 55 or 2221 <= int(number[:4]) <= 2720:
+        return "mastercard"
+    if number.startswith(("6011", "65")) or 644 <= int(number[:3]) <= 649:
+        return "discover"
+    return ""
 
 
 def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict[str, str],
@@ -298,15 +323,26 @@ def select_checkout_fills(classified: list[ClassifiedLoginControl], secret: dict
     score then DOM order.
     """
     values: dict[str, str] = {tok: secret[f] for f, tok in field_tokens.items() if secret.get(f)}
+    if brand := _payment_brand(secret.get("card_number", "")):
+        values["cc-type"] = brand
     if "cc-exp-month" in values and "cc-exp-year" in values:
         values["cc-exp"] = f"{values['cc-exp-month'].zfill(2)}/{values['cc-exp-year'][-2:]}"
     fills: list[dict[str, Any]] = []
     for token, value in values.items():
         candidates = sorted((c for c in classified if c.token == token), key=lambda c: (-c.score, c.control.index))
         if candidates:
-            fills.append({"index": candidates[0].control.index, "token": token, "value": value})
+            control = candidates[0].control
+            if token == "cc-exp" and "cc-exp-month" in values and re.search(r"yyyy", control.label, re.IGNORECASE):
+                separator = " / " if " / " in control.label else "/"
+                value = values['cc-exp-month'].zfill(2) + separator + values['cc-exp-year']
+            elif token == "cc-exp-year" and control.max_length == 2:
+                value = value[-2:]
+            fills.append({"index": control.index, "token": token, "value": value})
     if any(f["token"] == "cc-exp" for f in fills):
         fills = [f for f in fills if f["token"] not in ("cc-exp-month", "cc-exp-year")]
+    # A brand change can reset number/expiry widgets. Select it before writing
+    # those fields, never clear an already-filled card by setting brand last.
+    fills.sort(key=lambda f: f["token"] != "cc-type")
     return fills
 
 
@@ -491,6 +527,11 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const style = getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || element.getClientRects().length === 0) return [];
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
+    if (!labels.length && element.parentElement &&
+        element.parentElement.querySelectorAll('input, select, [role=combobox], [role=listbox]').length === 1) {
+      labels.push(...Array.from(element.parentElement.children)
+        .filter(n => n.tagName === "LABEL").map(n => n.textContent || ""));
+    }
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
       .map((id) => { const n = element.getRootNode().getElementById(id); return n ? (n.textContent || "") : ""; })
@@ -531,7 +572,8 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()"""
 
 
-def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "", *,
+                  verify_only: bool = False, retain_stamps: bool = False) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -553,8 +595,10 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
             .replace("__QUERY_ALL__", _QUERY_ALL_JS)
             .replace("__EXCLUDED_PASSWORD__", json.dumps(_RE_EXCLUDED_PASSWORD.pattern))
             .replace("__OTP_PATTERN__", json.dumps(_RE_OTP.pattern))
-            .replace("__FILLS__", payload)
-            .replace("__PAYMENT_FILL_HELPERS__", FILL_HELPERS))
+            .replace("__PAYMENT_FILL_HELPERS__", FILL_HELPERS)
+            .replace("__VERIFY_ONLY__", json.dumps(verify_only))
+            .replace("__RETAIN_STAMPS__", json.dumps(retain_stamps))
+            .replace("__FILLS__", payload))
 
 
 _FILL_JS_TEMPLATE = """(async () => {
@@ -563,6 +607,8 @@ _FILL_JS_TEMPLATE = """(async () => {
     return JSON.stringify({ refused: "origin_changed", found: window.location.origin });
   }
   const fills = __FILLS__;
+  const verifyOnly = __VERIFY_ONLY__;
+  const retainStamps = __RETAIN_STAMPS__;
   const nonce = __NONCE__;
   __QUERY_ALL__
   const stamped = queryAll("[data-hermes-vault-slot]");
@@ -571,11 +617,32 @@ _FILL_JS_TEMPLATE = """(async () => {
   const fieldResults = [];
   const norm = (t) => String(t || "").trim().toLowerCase();
   __PAYMENT_FILL_HELPERS__
+  const readback = (el, f) => {
+    if (!el || !live(el)) return false;
+    if (['combobox', 'listbox'].includes(el.getAttribute('role'))) {
+      // aria-selected on a stale option alone cannot certify a trigger reset.
+      if (el.getAttribute('role') === 'listbox') {
+        const options = Array.from(el.querySelectorAll('[role=option][aria-selected=true]'));
+        return options.length === 1 && optionMatch(options[0].textContent, f.value, f.token);
+      }
+      return [el.value, el.getAttribute('aria-valuetext'), el.textContent].some(t => optionMatch(t, f.value, f.token));
+    }
+    if (el.tagName === 'SELECT') {
+      const options = Array.from(el.options).filter(o => !o.disabled);
+      const option = (f.token.startsWith('cc-exp') || f.token === 'cc-type' || f.token === 'bday-month')
+        ? chooseOption(options, {...f, token: f.token === 'bday-month' ? 'cc-exp-month' : f.token}, false)
+        : options.find(o => [o.value, o.textContent].some(t => norm(t) === norm(f.value) || norm(t) === norm(f.value).replace(/^0/, '')));
+      return !!option && el.value === option.value;
+    }
+    const canonical = value => String(value || '').replace(/[^a-z0-9]/gi, '');
+    return ['cc-number', 'cc-exp'].includes(f.token)
+      ? canonical(el.value) === canonical(f.value) : String(el.value) === String(f.value);
+  };
   for (const f of fills) {
     const result = {token: f.token, status: "missing"};
     fieldResults.push(result);
     const el = stamped.find((n) => n.getAttribute("data-hermes-vault-slot") === nonce + ':' + f.index);
-    if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    if (verifyOnly || !el || (f.token === "current-password" && el.type !== "password")) continue;
     try {
       if (!live(el)) continue;
       if (['combobox', 'listbox'].includes(el.getAttribute('role'))) {
@@ -583,7 +650,7 @@ _FILL_JS_TEMPLATE = """(async () => {
         continue;
       }
       if (el.tagName === "SELECT") {
-        if (f.token.startsWith('cc-exp')) {
+        if (f.token.startsWith('cc-exp') || f.token === 'cc-type') {
           const option = chooseOption(Array.from(el.options).filter(o => !o.disabled), f, false);
           if (!option || !live(el)) continue;
           el.value = option.value;
@@ -645,6 +712,16 @@ _FILL_JS_TEMPLATE = """(async () => {
       }
     } catch (e) { /* skip */ }
   }
-  stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  // Let queued framework input/change reactions settle, then certify the final
+  // state of EVERY target, not the historical success of each assignment.
+  await new Promise(resolve => setTimeout(resolve, 50));
+  filled = 0;
+  fills.forEach((f, index) => {
+    const el = stamped.find(n => n.getAttribute('data-hermes-vault-slot') === nonce + ':' + f.index);
+    const confirmed = (verifyOnly || fieldResults[index].status === 'filled') && readback(el, f);
+    fieldResults[index].status = confirmed ? 'filled' : 'missing';
+    if (confirmed) filled++;
+  });
+  if (!retainStamps) stamped.forEach(n => n.removeAttribute('data-hermes-vault-slot'));
   return JSON.stringify({ filled, selectedOptions, fieldResults });
 })()"""

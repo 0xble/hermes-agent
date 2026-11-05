@@ -223,7 +223,7 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
             if not tab["tab_id"]:
                 return {"success": False, "error_type": "eval_failed", "error": "No browser session. Call browser_navigate first."}
             # Catch page exceptions in-page too: the REST server logs JS error messages.
-            wrapped = "(async () => { try { return await (" + expression + "); } catch (_) { return {vault_eval_failed:true}; } })()"
+            wrapped = "(async () => { try { return await Promise.resolve(" + expression + ").catch(() => ({vault_eval_failed:true})); } catch (_) { return {vault_eval_failed:true}; } })()"
             response = _post(f"/tabs/{tab['tab_id']}/evaluate", body={
                 "expression": wrapped, "userId": tab["user_id"], "secret": True}, allow_redirects=False)
             if (isinstance(response, dict) and "result" in response and not response.get("error")
@@ -842,23 +842,34 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         """(nonce, classified controls) for a fresh stamped inspection, or a JSON refusal."""
         nonlocal payment_contexts, payment_inspection_error
         nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-        inspect = _eval_js(browser_key, build_inspection_js(nonce))
-        if not inspect.get("success"):
-            return json.dumps(
-                {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
-            )
+        def inspection_failure():
+            assert meta is not None
+            if meta.kind == "payment":
+                from tools.browser_vault_payment import receipt
+                return json.dumps(receipt(set(), set(), error="Payment input inspection unavailable; rediscover the checkout."))
+            return json.dumps({"success": False, "error": "Page input inspection unavailable."})
+
+        try:
+            inspect = _eval_js(browser_key, build_inspection_js(nonce))
+        except Exception:
+            return inspection_failure()
+        if not isinstance(inspect, dict) or not inspect.get("success"):
+            return inspection_failure()
         raw_controls = _parse_json_result(inspect.get("result"))
         if isinstance(raw_controls, str):
             raw_controls = _parse_json_result(raw_controls)
         if not isinstance(raw_controls, list):
-            return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
+            return inspection_failure()
 
         classify = classify_login_control if meta.kind == "login" else classify_checkout_control
         classified: list[ClassifiedLoginControl] = []
         for raw in raw_controls:
             if not isinstance(raw, dict):
                 continue
-            control = LoginControl.from_dict(raw)
+            try:
+                control = LoginControl.from_dict(raw)
+            except (ValueError, TypeError, OverflowError):
+                return inspection_failure()
             result = (classify_protected_field_control(control, str(meta.field_token or ""))
                       if meta.kind == "protected_field" else classify(control))
             if result is not None:

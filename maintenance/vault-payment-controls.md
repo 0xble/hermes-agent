@@ -8,9 +8,15 @@ Payment fills discover native inputs/selects and accessible ARIA combobox/listbo
 expiry controls, including open shadow roots. An unassociated `###` CVC requires
 a unique candidate in a bounded local group visibly labeled CVC/CVV/card security
 code; page-wide text is not evidence. Equally strong competing targets refuse
-all writes. Field-level post-event readback, not a nonzero write count, determines
+all writes. A final value-blind pass after all document writes and queued framework events,
+not historical per-field assignments or a nonzero write count, determines
 `filled`, `missing`, and `ambiguous`; required PAN, expiry month/year, and CVC
-must all be confirmed before success. Receipts contain tokens/status only.
+must all be confirmed before success. Receipts contain tokens/status only. Explicit authentication autocomplete
+excludes checkout controls. Anonymous hashes retain the bounded local-context
+requirement; CamelCase identifiers do not loosen that gate. Native submit/reset/
+default-submit buttons (including ancestors) are never clicked for ARIA targets.
+Card brand is derived and selected before PAN/expiry to avoid framework resets.
+Secret evaluation contains rejected promises inside the page before transport.
 
 The existing Camofox evaluate route discovers direct processor frames using an
 exact-origin allowlist. Opaque IDs bind the current merchant and processor
@@ -51,15 +57,24 @@ Contract tests: `tests/tools/test_browser_vault_manager_card.py`
   `tests/tools/test_browser_vault_payment_controls.py`
   `tests/tools/test_browser_vault_checkout_live.py`
 
-Use `scripts/run_tests.sh`. The opt-in native fixture needs
-`VAULT_BROWSER_FIXTURE_MODULES` set to a directory containing installed
-`playwright-core`/`camoufox-js`, and `VAULT_BROWSER_FIXTURE_SOURCE` set to the
-companion service checkout. It launches a fresh headless context and two local
-HTTP servers, with synthetic cards only; no user account or charge is involved.
-Checks cover native month names/short years, ARIA binding/readback, adjacent and
-masked CVC, duplicate ambiguity, open shadow root, cross-origin processor frame,
-partial status and frame navigation. Browser-missing skips are not proof of live
-fixture execution. Preserve red-on-base and green-on-candidate evidence in the PR.
+Use `scripts/run_tests.sh`. The required `test_browser_vault_checkout_live.py`
+matrix runs in ordinary hosted qualification without opt-in variables, using
+Playwright's isolated Chromium, synthetic cards and two loopback HTTP origins.
+`scripts/ci/portable.py` provisions Chromium for every shard owning that file;
+`test_vault_browser_provision.py` pins the independent-shard requirement. Coverage
+includes native/ARIA/shadow/partial/ambiguous/frame DOMs, native button zero-submit
+and zero-reset invariants, cross-field and cross-document framework resets,
+Washington brand reset, expiry formats, auth exclusions and asynchronous secret
+error containment. The frame DOM adapter is test-only; it is not evidence of the
+Camofox capability implementation.
+
+The separate `test_browser_vault_camofox_live.py` retains the companion-backed
+contract matrix. It needs `VAULT_BROWSER_FIXTURE_MODULES` pointing to installed
+`playwright-core`/`camoufox-js`, and `VAULT_BROWSER_FIXTURE_SOURCE` pointing to the
+companion source. Hosted Hermes runners do not install that separate repository
+or its Node dependency tree, so companion integration remains opt-in. Its skips
+are not live execution proof; run it against the qualified companion before
+runtime promotion. Neither matrix uses a user account or makes a charge.
 
 ## Retirement and rollback
 

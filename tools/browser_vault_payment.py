@@ -91,6 +91,7 @@ def plan(contexts: list[dict], secret: dict) -> tuple[list[dict], set[str]]:
     if any(f["token"] == "cc-exp" for context in selected for f in context["fills"]):
         for context in selected:
             context["fills"] = [f for f in context["fills"] if f["token"] not in {"cc-exp-month", "cc-exp-year"}]
+    selected.sort(key=lambda context: not any(f["token"] == "cc-type" for f in context["fills"]))
     return selected, ambiguous
 
 
@@ -121,26 +122,34 @@ def fill(task_id: str, origin: str, selected: list[dict], ambiguous: set[str], e
     filled_tokens = set()
     count = 0
     error = None
-    for context in selected:
-        fills = context["fills"]
-        if not fills:
-            continue
-        expression = build_fill_js(fills, expected_origin=context["origin"], nonce=context["nonce"])
+    def evaluate(context, *, verify_only=False):
+        expression = build_fill_js(context["fills"], expected_origin=context["origin"], nonce=context["nonce"],
+                                   verify_only=verify_only, retain_stamps=not verify_only)
         try:
             response = (evaluate_payment_frame(task_id, context["frame_id"], expression, origin, context["origin"], secret=True)
                         if context.get("frame_id") else eval_secret(task_id, expression))
         except Exception:
             response = {"success": False}
-        if not response.get("success"):
-            error = "Payment write refused or unavailable; fields confirmed earlier remain filled."
+        result = _parse(response.get("result")) if response.get("success") else None
+        return result if isinstance(result, dict) and not result.get("refused") else None
+
+    attempted = []
+    for context in selected:
+        if not context["fills"]:
+            continue
+        attempted.append(context)
+        if evaluate(context) is None:
+            error = "Payment write refused or unavailable; rediscover the checkout."
             break
-        result = _parse(response.get("result"))
-        if not isinstance(result, dict) or result.get("refused"):
-            error = "Payment document changed before writing; rediscover the checkout."
-            break
-        # Counts alone are insufficient: only per-field post-event readback can
-        # certify a field. Never infer every target succeeded from filled > 0.
-        expected = Counter(f["token"] for f in fills)
+    # A later document/event may reset a field filled earlier. Recheck all
+    # attempted targets only after the entire write phase, without writing or
+    # clicking again. The final pass removes the private inspection stamps.
+    for context in attempted:
+        result = evaluate(context, verify_only=True)
+        if result is None:
+            error = error or "Payment verification unavailable; rediscover the checkout."
+            continue
+        expected = Counter(f["token"] for f in context["fills"])
         for field in result.get("fieldResults", []):
             if isinstance(field, dict) and field.get("status") == "filled" and expected[field.get("token")] > 0:
                 filled_tokens.add(field["token"])

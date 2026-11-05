@@ -27,12 +27,22 @@ FILL_HELPERS = r"""
     !el.matches(':disabled') && el.getAttribute('aria-disabled') !== 'true' && !el.readOnly &&
     getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden' &&
     el.getClientRects().length > 0;
+  const safeClick = el => {
+    const button = el.closest('button, input');
+    return live(el) && (!button ||
+      (button.tagName === 'BUTTON' ? button.type === 'button' : !['submit', 'reset', 'image'].includes(button.type))) &&
+      !el.closest('a[href]');
+  };
   const monthNames = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
   const optionMatch = (text, value, token) => {
     const t = norm(text), v = norm(value);
     if (token === 'cc-exp-month') {
       const named = monthNames.findIndex(m => new RegExp('(^|[^a-z])' + m).test(t));
       return named >= 0 ? named + 1 === Number(v) : /^\d{1,2}$/.test(t) && Number(t) === Number(v);
+    }
+    if (token === 'cc-type') {
+      const brand = s => ({visa:'visa', mastercard:'mastercard', amex:'amex', americanexpress:'amex', discover:'discover'})[norm(s).replace(/[^a-z]/g, '')];
+      return brand(t) === v;
     }
     if (token === 'cc-exp-year') return /^\d{2}(\d{2})?$/.test(t) && (t === v || t === v.slice(-2));
     return t === v;
@@ -48,7 +58,7 @@ FILL_HELPERS = r"""
     return hits.length === 1 ? hits[0] : null;
   };
   const fillAria = async (el, f) => {
-    if (!f.token.startsWith('cc-exp') || !live(el)) return false;
+    if ((!f.token.startsWith('cc-exp') && f.token !== 'cc-type') || !safeClick(el)) return false;
     const root = el.getRootNode();
     if (el.getAttribute('role') === 'combobox') el.click();
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -57,9 +67,9 @@ FILL_HELPERS = r"""
     const popups = el.getAttribute('role') === 'listbox' ? [el] : ids.map(id => root.getElementById(id)).filter(Boolean);
     if (popups.length !== 1 || popups[0].getAttribute('role') !== 'listbox') return false;
     const options = Array.from(popups[0].querySelectorAll('[role=option]')).filter(o =>
-      o.getAttribute('aria-disabled') !== 'true' && o.getClientRects().length && getComputedStyle(o).display !== 'none');
+      safeClick(o));
     const option = chooseOption(options, f, true);
-    if (!option || !live(el)) return false;
+    if (!option || !safeClick(el) || !safeClick(option)) return false;
     option.click();
     await new Promise(resolve => setTimeout(resolve, 0));
     if (!live(el)) return false;
