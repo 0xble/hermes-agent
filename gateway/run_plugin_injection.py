@@ -68,8 +68,9 @@ class GatewayPluginInjectionMixin:
             coro = plugin_keyless_inject.admit(self, *resolved, content=content, plugin_id=plugin_id)
         elif origin is not None:
             source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id)
-            if source is None or not self._plugin_origin_admissible(source, plugin_home=plugin_home,
-                                                                    plugin_id=plugin_id):
+            if source is None:
+                return refused("not_routed")
+            if not self._plugin_origin_admissible(source, plugin_home=plugin_home, plugin_id=plugin_id):
                 return refused("not_authorized")
             target = f"origin={source.platform.value}/{source.chat_id}"
             coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id)

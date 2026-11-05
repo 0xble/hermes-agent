@@ -4,7 +4,7 @@ import asyncio
 import pytest
 
 from hermes_state_runtime import ADMISSION_QUEUE_MAX, list_session_admissions
-from tests.gateway.test_synthetic_native_admission import native_chat as native_chat  # noqa: F401
+from tests.gateway.test_synthetic_native_admission import native_chat
 
 
 def inject(runner, key, text, correlation_id="relay-note"):
@@ -21,7 +21,7 @@ def setup(runner):
 
 @pytest.mark.asyncio
 async def test_queue_refusal_is_retryable_but_admitted_delayed_work_is_not(native_chat, monkeypatch):
-    runner, adapter, authority, source, sent, turns = native_chat
+    runner, _adapter, authority, source, _sent, turns = native_chat
     setup(runner)
     key = runner._session_key_for_source(source)
     entry = runner.session_store.lookup_by_session_key(key)
@@ -48,7 +48,7 @@ async def test_queue_refusal_is_retryable_but_admitted_delayed_work_is_not(nativ
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["timeout_after_commit", "cancel_after_commit", "draining"])
 async def test_dispatch_observation_never_turns_possible_commit_into_refusal(native_chat, monkeypatch, mode):
-    runner, adapter, authority, source, sent, turns = native_chat
+    runner, _adapter, authority, source, _sent, _turns = native_chat
     setup(runner)
     key = runner._session_key_for_source(source)
     monkeypatch.setattr(authority, "_schedule", lambda ref: None)
@@ -83,3 +83,39 @@ async def test_dispatch_observation_never_turns_possible_commit_into_refusal(nat
     entry = runner.session_store.lookup_by_session_key(key)
     assert len(list_session_admissions(authority.db, session_id=entry.session_id)) == 1
     release.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route, reason", [
+    ("keyless_draining", "gateway_draining"),
+    ("keyless_draining_after_lookup", "gateway_draining"),
+    ("malformed_origin", "not_routed"),
+])
+async def test_pre_admission_refusal_reason_matches_route(native_chat, monkeypatch, route, reason):
+    runner, _adapter, authority, source, _sent, _turns = native_chat
+    setup(runner)
+    entry = runner.session_store.lookup_by_session_key(runner._session_key_for_source(source))
+    if route.startswith("keyless_draining"):
+        live = authority.sessions[entry.session_id]
+        monkeypatch.setattr("gateway.plugin_keyless_inject.resolve", lambda *args, **kw: (authority, live))
+        if route == "keyless_draining":
+            runner._draining = True
+        else:
+            lookup = runner.async_session_store.lookup_by_session_key
+
+            async def drain_after_lookup(key):
+                found = await lookup(key)
+                runner._draining = True
+                return found
+
+            monkeypatch.setattr(runner.async_session_store, "lookup_by_session_key", drain_after_lookup)
+        target = {"keyless": True}
+    else:
+        target = {"origin": {"platform": "not-a-real-platform"}}
+    before = list_session_admissions(authority.db, session_id=entry.session_id)
+    handle = runner._schedule_plugin_message_injection(
+        **target, content="must-not-land", plugin_id="relay", await_dispatch=True)
+    result = await handle
+    assert result.reason == reason
+    assert result.refused and result.safe_to_retry and not result.indeterminate
+    assert list_session_admissions(authority.db, session_id=entry.session_id) == before

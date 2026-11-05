@@ -10,16 +10,20 @@ from types import SimpleNamespace
 
 import pytest
 
-relay_tests = pytest.importorskip("test_session_relay", reason="external session-relay checkout not supplied")
+relay_tests = pytest.importorskip(
+    "test_session_relay",
+    reason="optional session-relay harness absent from PYTHONPATH; requires 0xble/agents#2014 "
+           "(fix/relay-admission-refusal, 319717a7)",
+)
 plugin, db, h = relay_tests.plugin, relay_tests.db, relay_tests.h
 
 from hermes_state_runtime import ADMISSION_QUEUE_MAX, list_session_admissions
-from tests.gateway.test_synthetic_native_admission import native_chat as native_chat  # noqa: E402, F401
+from tests.gateway.test_synthetic_native_admission import native_chat
 
 
 @pytest.mark.asyncio
 async def test_real_relay_receipt_queue_full_same_key_then_exactly_one_admission(native_chat, h, monkeypatch):
-    runner, adapter, authority, source, sent, turns = native_chat
+    runner, _adapter, authority, source, _sent, turns = native_chat
     runner._running = True
     runner._gateway_loop = asyncio.get_running_loop()
     monkeypatch.setattr(authority, "_schedule", lambda ref: None)
@@ -51,6 +55,12 @@ async def test_real_relay_receipt_queue_full_same_key_then_exactly_one_admission
     first = json.loads(await asyncio.to_thread(tool, args, session_id="s-sender"))
     rid = first["id"]
     receipt = h.mailbox.receipt(rid)  # persisted exact receipt, not sender's summary
+    missing = {"retryable", "correlation_id"} - receipt.keys()
+    if missing:
+        pytest.skip(
+            "external session-relay lacks admission receipt fields "
+            f"{sorted(missing)}; requires 0xble/agents#2014 (fix/relay-admission-refusal, 319717a7)"
+        )
     assert (receipt["status"], receipt["reason"], receipt["retryable"]) == ("refused", "queue_full", True)
     assert receipt["correlation_id"] == rid and h.mailbox.seen(rid) is None
     rows = list_session_admissions(authority.db, session_id=sid)

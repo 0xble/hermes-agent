@@ -1,6 +1,7 @@
 """The public opt-in must survive manager/context forwarding without bool coercion."""
 import asyncio
 import concurrent.futures
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -43,7 +44,9 @@ async def test_loop_blocking_is_rejected_and_cancelled_observer_does_not_cancel_
     waiter = asyncio.create_task(handle.wait())
     await asyncio.sleep(0)
     waiter.cancel()
-    result = await waiter
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    result = await handle.wait(timeout=0)
     assert result.indeterminate and not result.safe_to_retry and not task.cancelled()
     release.set()
     result = await handle
@@ -84,6 +87,44 @@ async def test_cancelling_consumer_propagates_while_dispatch_continues():
         await task
     result = await handle
     assert result.accepted and result.admission_id == "admission-after-cancel"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper_starts", [False, True])
+async def test_worker_cancellation_closes_unobserved_coroutine_on_owner_loop(wrapper_starts):
+    loop = asyncio.get_running_loop()
+    owner_thread = threading.get_ident()
+    closed_on = []
+    delivery = InjectionDelivery("key", "relay-worker")
+    dispatch = concurrent.futures.Future()
+    coro = MagicMock()
+    coro.close.side_effect = lambda: closed_on.append(threading.get_ident())
+    handle = GatewayInjectionHandle.track(dispatch, delivery, loop, coro)
+
+    def cancel_from_worker():
+        if wrapper_starts:
+            loop.call_soon_threadsafe(setattr, delivery, "observing", True)
+        return handle.cancel()
+
+    assert await asyncio.to_thread(cancel_from_worker)
+    result = await handle
+    assert result.indeterminate and not result.safe_to_retry
+    # Receipt settlement does not wait for the separately queued cleanup.
+    cleanup_turn = asyncio.Event()
+    loop.call_soon(cleanup_turn.set)
+    await cleanup_turn.wait()
+    assert closed_on == ([] if wrapper_starts else [owner_thread])
+
+
+def test_closed_loop_cancellation_still_settles_handle():
+    loop = asyncio.new_event_loop()
+    loop.close()
+    dispatch, coro = concurrent.futures.Future(), MagicMock()
+    handle = GatewayInjectionHandle.track(dispatch, InjectionDelivery("key"), loop, coro)
+    assert handle.cancel()
+    result = handle.result(0)
+    assert result.indeterminate and not result.safe_to_retry
+    coro.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio

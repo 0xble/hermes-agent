@@ -82,6 +82,7 @@ class GatewayInjectionHandle:
 
     ``result`` must never block the gateway loop. Timeout does NOT cancel the
     dispatch or mutate the eventual result; later observations can see its commit.
+    Cancelling an awaiting consumer propagates to it, not to the dispatch.
     """
     def __init__(self, future: concurrent.futures.Future, delivery: InjectionDelivery, *, loop=None,
                  dispatch=None):
@@ -99,6 +100,10 @@ class GatewayInjectionHandle:
         future = concurrent.futures.Future()
         handle = cls(future, delivery, loop=loop, dispatch=dispatch)
 
+        def close_unobserved():
+            if not delivery.observing and dispatch_coro is not None:
+                dispatch_coro.close()  # wrapper was cancelled before awaiting it
+
         def complete(done):
             # A commit proof outranks cancellation in the callback/dispatch race.
             try:
@@ -114,8 +119,16 @@ class GatewayInjectionHandle:
                     False, "dispatch_error", indeterminate=delivery.started)
             if delivery.receipt is not None:
                 result = delivery.receipt
-            if not delivery.observing and dispatch_coro is not None:
-                dispatch_coro.close()  # cancelled before the wrapper ever awaited it
+            if dispatch_coro is not None:
+                # A concurrent future may finish on the cancelling worker thread.
+                # Serialize observation and cleanup with the wrapper on its loop.
+                try:
+                    loop.call_soon_threadsafe(close_unobserved)
+                except RuntimeError:
+                    if not loop.is_closed():
+                        raise
+                    # A closed loop cannot start or resume the wrapper.
+                    close_unobserved()
             future.set_result(result)
 
         dispatch.add_done_callback(complete)
@@ -147,11 +160,11 @@ class GatewayInjectionHandle:
     async def wait(self, timeout=None) -> GatewayInjectionResult:
         try:
             return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(self._future)), timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return self._delivery.result(False, "timeout", indeterminate=True)
         except asyncio.CancelledError:
-            # Cancelling an observer never cancels the possibly committed dispatch.
-            return self._delivery.result(False, "cancelled", indeterminate=True)
+            # The shield keeps dispatch live; preserve the observer's cancellation.
+            raise
 
     def __await__(self):
         return self.wait().__await__()
