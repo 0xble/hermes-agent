@@ -364,6 +364,14 @@ def _browser_account_refusal(backend, task_id: str) -> Optional[str]:
                                  f"account={required!r} in a new task first.")})
 
 
+def _remember_login(task_id: str) -> bool:
+    """Whether this task's browser account ticks "Remember me"-style boxes (vault.remember_logins)."""
+    from agent.vault_origin_aliases import remember_logins_enabled
+    from tools.browser_camofox import get_session_account, is_camofox_mode
+
+    return remember_logins_enabled(get_session_account(task_id) if is_camofox_mode() else None)
+
+
 def _list_two_factor_metadata(backend, meta, origin: Optional[str], unambiguous: bool) -> dict:
     """Availability is a display hint, never fill or OTP authorization."""
     from agent.vault_backends.onepassword import OnePasswordLoginBackend
@@ -667,7 +675,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
         return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(browser_key, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    result = _eval_js_secret(browser_key, build_fill_js(fills, expected_origin=origin, nonce=nonce,
+                                                            remember=_remember_login(effective_task_id)))
     del code
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
@@ -677,8 +686,9 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
         return json.dumps({"success": False, "error_type": "origin_changed", "error": "The page navigated before the code could be entered. Nothing was written."})
     filled = int(parsed.get("filled", 0)) if isinstance(parsed, dict) else 0
-    return json.dumps({"success": bool(filled), "filled_fields": filled, "origin": origin, "source": source,
-                       "next": "Submit the form (many sites auto-submit when the last digit lands)."})
+    remembered = bool(parsed.get("remembered")) if isinstance(parsed, dict) else False
+    return json.dumps({"success": bool(filled), "filled_fields": filled, "remembered": remembered, "origin": origin,
+                       "source": source, "next": "Submit the form (many sites auto-submit when the last digit lands)."})
 
 
 def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
@@ -974,7 +984,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         return refusal
     try:
         fill_result = _eval_js_secret(
-            browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce,
+                                       remember=meta.kind == "login" and _remember_login(effective_task_id))
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
@@ -1034,6 +1045,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
     if meta.kind == "login":
+        out["remembered"] = bool(parsed.get("remembered")) if isinstance(parsed, dict) else False
         out["next"] = ("Submit. If the site then asks for a verification code, "
                        + ("call browser_vault_enter_code with this handle (a code will be generated automatically)."
                           if meta.has_otp else

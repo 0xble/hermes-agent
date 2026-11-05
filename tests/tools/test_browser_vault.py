@@ -418,6 +418,7 @@ class TestBrowserVaultTools:
             "backend": "local",
             "kind": "login",
             "origin": "https://example.com",
+            "remembered": False,
         }
         assert "s3cret-pw" not in raw
         # The secret expression only ever goes through the secret eval path,

@@ -144,6 +144,32 @@ def alias_fill_confirmation_enabled() -> bool:
     return True
 
 
+def remember_logins_enabled(browser_account: str | None) -> bool:
+    """Whether login fills in this browser account tick a "Remember me"-style box.
+
+    ``vault.remember_logins`` maps browser account aliases to booleans, with ``default`` covering
+    accounts not listed; a bare boolean applies to every account. Unreadable or invalid config
+    falls back to remembering, the shipped default.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    try:
+        config = load_config_readonly() or {}
+    except Exception as exc:
+        logger.warning("Using the default vault.remember_logins because config could not be read: %s", exc)
+        return True
+    vault_config = config.get("vault") if isinstance(config, dict) else None
+    value = vault_config.get("remember_logins", True) if isinstance(vault_config, dict) else True
+    if isinstance(value, dict):
+        value = value.get(browser_account, value.get("default", True)) if browser_account else value.get("default", True)
+    if isinstance(value, bool):
+        return value
+    if ("remember_logins", repr(value)) not in _invalid_alias_warnings:
+        _invalid_alias_warnings.add(("remember_logins", repr(value)))
+        logger.warning("Ignoring invalid vault.remember_logins value %r; remembering logins", value)
+    return True
+
+
 def _alias_keys(meta: VaultItemMeta) -> tuple[str, ...]:
     """Return exact handle keys plus raw IDs supported by 1Password handles."""
     keys = [meta.id]

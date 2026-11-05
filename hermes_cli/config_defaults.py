@@ -2579,6 +2579,10 @@ DEFAULT_CONFIG = {
         "origin_aliases": {},
         # Alias-only login fills ask for confirmation unless this is false.
         "confirm_alias_fills": True,
+        # Login and one-time-code fills tick a safe "Remember me"/"Trust this device" box in the same
+        # form. Keyed by browser account alias, with "default" for every account not listed, e.g.
+        # {"default": True, "work": False} keeps the "work" identity's logins unremembered.
+        "remember_logins": {"default": True},
         "onepassword": {
             # Detected managers are login sources unless the user opts out (vault.<name>.enabled: false).
             "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.

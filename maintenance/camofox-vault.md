@@ -106,6 +106,14 @@ the browser vault fill tool, or the 1Password backends.
   interactive session); a missing token raises instead of listing empty. Invalid, duplicate,
   or token-sharing entries are skipped. `browser_account` pins fills and one-time codes to a
   task bound to that named Camofox account, checked before any secret is resolved.
+- Login and one-time-code fills tick one visible, enabled "Remember me"-style checkbox
+  (remember me, keep/stay signed in, trust this device/browser, don't ask again) in the
+  filled field's own form or tight container, with a real click, inside the exact-origin
+  assertion, and report `remembered`. Marketing, terms, consent, privacy, cookie and
+  public-computer boxes are never ticked. `vault.remember_logins` (default on) maps browser
+  account aliases to booleans with a `default` key, so an identity can keep logins
+  unremembered. Fork patch identity: `vault-remember-logins` (local, no upstream
+  submission). Regression: `tests/tools/test_browser_vault_remember.py` (real Chromium).
 
 ## Provenance and patches
 
@@ -226,7 +234,8 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_vault_onepassword_listing_quota.py` (counts `op` calls per list and fill),
 `tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
 first-429 stop and cross-process cooldown),
-`tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and
+`tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`,
+`tests/tools/test_browser_vault_remember.py`, and
 `tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome), and for card consent
 `tests/gateway/test_mcp_consent_scope.py` and `tests/tools/test_mcp_trust_gating.py`. Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.
