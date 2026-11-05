@@ -14,7 +14,7 @@ Fork patch identity: `synthetic-unattended-recovery`.
 ## Upstream relationship
 
 - Upstream precedent: [NousResearch/hermes-agent#141357](https://github.com/NousResearch/hermes-agent/pull/141357)
-  merged as `24dde43728559b7f850a21eaac1a24885e9f7b458`.
+  merged as `eea83bb603c397396acaf6cc453cf3012a8524aa`.
   Keep its fenced terminal/interrupted resolution, one transactional interruption
   notice, no replay, and continued FIFO draining.
 - The native synthetic-descriptor gap is still present on upstream `main`
@@ -30,7 +30,13 @@ projected by `gateway/session_synthetic.py`, and only when its metadata identifi
 `goal_continuation`, `loop_wakeup`, `hermes_loop_wakeup`, or `notification_origin`
 in `{process_registry_synthetic, delegation_result, relay_delivery, cron_delivery}`.
 Presence of `native_text_v1.attended_activity` vetoes this additional predicate.
-Existing cron, automation, webhook, and Kanban checks remain unchanged.
+The native codec also persists `absorbed_synthetic`: an empty list proves no
+absorbed inputs; each merged input contributes its private descriptor (or null
+without the capability). Recovery requires the head and every entry to identify
+a trusted producer. This veto precedes even older unattended shortcuts when a
+synthetic/absorbed descriptor is present; unmixed legacy automation remains unchanged.
+Restoring and re-merging an envelope retains its trail. A legacy synthetic row
+without the field has unknown merge history and conservatively pauses.
 
 Producer fields were checked in `gateway/run_goals.py` (the real goal event
 factory), `hermes_cli/session_controls.py` and `gateway/run_loop_wake.py`
@@ -48,6 +54,13 @@ newest stamped merged receipt; otherwise retain the existing head clock and
 priority for the newest unmarked receipt. This is necessary
 for the conservative veto to work in both merge orders, not broader recovery.
 
+Independent-review follow-up: receipt presence is insufficient proof of human
+absence. Compression-deferred `merge_text=True` can absorb human input that
+never gets a receipt (automation-looking prefixes, edits, reactions, recovered
+follow-ups, or an unstamped event). Persist positive absorbed provenance at the
+codec boundary instead of consulting the attended-model heuristic. The marked
+clock remains provenance only and never refreshes activity.
+
 ## Tests and rollout
 
 - RED commit: production unchanged; 10 expected failures and 41 passes across
@@ -57,6 +70,15 @@ for the conservative veto to work in both merge orders, not broader recovery.
 - Regression contract: schema-malformed/unknown descriptors, quoted continuation
   text, forged metadata/token fields, relay-looking text, normal human Telegram,
   attended veto, and both mixed merge orders (marked and unmarked).
+- Follow-up RED `4030092d9b07adcce771a2120ad4c9006dcbc562`: 21 expected
+  failures, 52 passes across the synthetic and existing automation files.
+  Twelve failures reproduce six unstamped human merge kinds through both boot
+  and drain recovery; nine cover nested/roundtrip, unknown producer, legacy,
+  malformed-trail and automation-shortcut cases. The original 43 cases pass.
+- Follow-up GREEN: 429 passed / 0 failed in 12 files through the official
+  `scripts/run_tests.sh` wrapper under the urgent heavy slot, including all 65
+  synthetic-unknown cases (the original 43 plus 22 provenance regressions), the
+  native codec, attended clocks, queue, automation, Kanban and cron recovery.
 - Boot and in-owner drain recovery use disposable stores and a real native goal
   producer event; verify interrupted/no replay, exactly one notice, and one human
   follower execution. Human and mixed unknowns retain the pause.

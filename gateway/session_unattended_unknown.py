@@ -22,17 +22,13 @@ from hermes_state_keys import CRON_PRINCIPAL_ID
 logger = logging.getLogger(__name__)
 
 
-def _trusted_native_synthetic(native) -> bool:
-    synthetic = native.get('synthetic')
+def _trusted_synthetic_descriptor(synthetic) -> bool:
     if not isinstance(synthetic, dict):
         return False
     if type(synthetic.get('internal')) is not bool:
         return False
     metadata = synthetic.get('metadata')
     if not isinstance(metadata, dict):
-        return False
-    # A merged human receipt always wins, even if a trusted synthetic head survives.
-    if 'attended_activity' in native:
         return False
     origin = metadata.get('notification_origin')
     return (
@@ -46,19 +42,33 @@ def _trusted_native_synthetic(native) -> bool:
     )
 
 
+def _synthetic_merge_veto(native) -> bool:
+    if 'synthetic' not in native and 'absorbed_synthetic' not in native:
+        return False
+    # Receipts are incomplete: prefixes, edits, reactions and recovery may omit them.
+    # Require positive proof for the head AND every absorbed input, before any shortcut.
+    trail = native.get('absorbed_synthetic')
+    return ('attended_activity' in native
+            or not _trusted_synthetic_descriptor(native.get('synthetic'))
+            or not isinstance(trail, list)
+            or not all(_trusted_synthetic_descriptor(item) for item in trail))
+
+
 def is_unattended(row) -> bool:
     """True for an admission no person submitted (so nobody can be asked to resend it)."""
     principal = row.get('principal_id') or ''
-    if principal == CRON_PRINCIPAL_ID or principal.startswith('automation:'):
-        return True
     payload = row.get('payload') or {}
     native = payload.get('native_text_v1') or {}
+    if _synthetic_merge_veto(native):
+        return False
+    if principal == CRON_PRINCIPAL_ID or principal.startswith('automation:'):
+        return True
     # A webhook delivery: the provider already got its 202 and nobody can be asked to resend it.
     # A Kanban card attempt (#134889 KB-8): the dispatcher's marker, committed only by
     # ``SessionAuthority.submit(_kanban_card=...)``; a card row main minted without it still pauses.
     return ('local_automation_v1' in payload or 'kanban_card_v1' in payload
             or 'automation' in native or 'webhook_delivery' in native
-            or _trusted_native_synthetic(native))
+            or _trusted_synthetic_descriptor(native.get('synthetic')))
 
 
 def _unattended_unknown(rows):
