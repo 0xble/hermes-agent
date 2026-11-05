@@ -680,7 +680,6 @@ def test_interactive_configuration_keeps_terminal_input(transition):
 @pytest.mark.live_system_guard_bypass
 def test_interrupt_reaps_completion_descendants_before_return(transition, monkeypatch):
     import io
-    import psutil
     import time
     from hermes_cli import update_completion
 
