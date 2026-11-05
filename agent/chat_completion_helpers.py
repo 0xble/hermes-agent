@@ -724,7 +724,7 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> float | None:
     return next((f for f in map(get_reasoning_stale_timeout_floor, candidates) if f is not None), None)
 
 
-def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=None):
+def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=None, allow_retry: bool = True):
     """Pop the Hermes routing keys and call ``converse`` / ``converse_stream`` (boto3 directly) with the
     adapter's shared recovery: a cachePoint rejection (Nova: toolConfig.tools, #97281) or a replayed sealed
     reasoning rejection resends once without the offending blocks inside the same attempt; a streaming IAM
@@ -741,6 +741,8 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     try:
         raw_response = method(**api_kwargs)
     except Exception as exc:
+        if not allow_retry:
+            raise
         retry_kwargs = (recover_from_cache_point_rejection(exc, api_kwargs)
                         or recover_from_redacted_reasoning_rejection(exc, api_kwargs))
         if retry_kwargs is not None:
@@ -770,7 +772,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client("anthropic_messages_request", kind="anthropic_messages")
         return agent._anthropic_messages_create(api_kwargs, client=request_client)
     if agent.api_mode == "bedrock_converse":
-        return _bedrock_converse_call(api_kwargs, stream=False)
+        return _bedrock_converse_call(api_kwargs, stream=False,
+            allow_retry=getattr(agent, "_turn_independent_attempt_active", False) is not True)
     if agent.provider == "moa":
         # MoA is a virtual provider backed by the in-process MoAClient facade — never
         # rebuild a request-local client from the virtual metadata. After a client
@@ -2017,6 +2020,7 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_a
     arms a short one so next turn's restore_primary_runtime stays gated instead of replaying the
     whole context across every provider again. A rate limit or overload from an active fallback
     arms nothing shared, so it still gets this short window."""
+    agent._turn_fallback_chain_exhausted = True
     if agent._fallback_chain and not cooldown_armed:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
@@ -2049,6 +2053,11 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     if not fb_provider or not fb_model:
         return True
+    from agent.route_binding import resolve_route_identity
+    from agent.fallback_endpoint_domain import failed_connection_domain
+    fb_ident = resolve_route_identity(fb)
+    if failed_connection_domain(agent, fb_ident):
+        return True
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
         logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
@@ -2068,7 +2077,6 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
-    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
     if should_skip_candidate(fb_ident, current_ident):
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
@@ -2230,6 +2238,8 @@ def try_activate_fallback(
     ``_shared_cooldown_record`` is used only by a newly-created agent adopting an outage that
     another process already armed; it must not re-arm the record or emit a duplicate notice.
     """
+    if getattr(agent, "_turn_independent_attempt_active", False) is True:
+        return False
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     shared_adoption = isinstance(_shared_cooldown_record, dict)
     new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
@@ -2755,7 +2765,8 @@ class _BedrockStream:
         return _on
 
     def _open_stream(self, next_api_kwargs: dict[str, Any]):
-        return _bedrock_converse_call(dict(next_api_kwargs), stream=True, on_stream_denied=self._fall_back_to_converse)
+        return _bedrock_converse_call(dict(next_api_kwargs), stream=True, on_stream_denied=self._fall_back_to_converse,
+            allow_retry=getattr(self.agent, "_turn_independent_attempt_active", False) is not True)
 
     def _fall_back_to_converse(self, client, final_kwargs: dict, exc: Exception):
         # InvokeModel-only IAM policies cannot stream; fall back inside the same Relay
@@ -3759,6 +3770,9 @@ class _StreamingCall(StreamingWaitMonitor):
         """Classify a failed attempt: True = retry; False = stop with
         ``result["error"]`` set (unless our own interrupt force-closed the
         socket). Runs inside the ``except`` so ``logger.exception`` works."""
+        if getattr(self.agent, "_turn_independent_attempt_active", False) is True:
+            self.result["error"] = e
+            return False
         import httpx as _httpx
         # Our own interrupt force-close: no retry/fallback/"reconnecting" (the
         # poll loop raises InterruptedError).

@@ -28,6 +28,71 @@ def _close_failed_route_client(agent: Any, client: Any) -> None:
         client.close()
 
 
+def _route_metadata_config() -> dict[str, Any]:
+    """Project before expansion, so an endpoint lookup cannot resolve API keys.
+
+    Raw config is used only as input to this metadata view, not as routing policy:
+    apply the same root normalization, env expansion and managed overlay order.
+    """
+    from hermes_cli import config as cfg
+
+    def project(source):
+        if not isinstance(source, dict):
+            return {}
+        fields = {'name', 'provider_key', 'base_url', 'enabled', 'api_mode', 'transport'}
+        def entry(value):
+            return {k: v for k, v in value.items() if k in fields} if isinstance(value, dict) else value
+        result = {}
+        providers = source.get('providers')
+        if 'providers' in source:
+            result['providers'] = {k: entry(v) for k, v in providers.items()} if isinstance(providers, dict) else providers
+        custom = source.get('custom_providers')
+        if 'custom_providers' in source:
+            result['custom_providers'] = [entry(v) for v in custom] if isinstance(custom, list) else custom
+        normalized = cfg._normalize_root_model_keys(source)
+        model = normalized.get('model')
+        if 'model' in normalized:
+            result['model'] = {'base_url': model.get('base_url', '') if isinstance(model, dict) else ''}
+        return result
+
+    user = cfg._expand_env_vars(project(cfg.read_raw_config_readonly()))
+    managed = cfg.managed_scope.load_managed_config()
+    return cfg._deep_merge(user, cfg._expand_env_vars(project(managed))) if managed else user
+
+
+def resolve_route_identity(entry: dict[str, Any]):
+    """Resolve only non-secret endpoint metadata; never activate a client.
+
+    Explicit route overrides win over named-provider definitions, which win
+    over static provider defaults. Unresolvable/dynamic routes remain unknown
+    rather than guessing a shared domain and skipping a potentially good route.
+    """
+    from agent.backend_identity import BackendIdentity
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+
+    provider = str(entry.get('provider') or '').strip()
+    model = str(entry.get('model') or '').strip()
+    base_url = str(entry.get('base_url') or '').strip()
+    if not base_url:
+        config = _route_metadata_config()
+        named = _get_named_custom_provider(provider, config=config, resolve_credentials=False)
+        if named:
+            base_url = str(named.get('base_url') or '').strip()
+        elif provider in {'custom', 'local/custom'}:
+            from agent.secret_scope import get_secret
+            model_config = config.get('model') or {}
+            base_url = str(model_config.get('base_url') or get_secret('OPENAI_BASE_URL', '') or '')
+        else:
+            from hermes_cli.providers import get_provider
+            definition = get_provider(provider, allow_network=False)
+            if definition:
+                from agent.secret_scope import get_secret
+                base_url = str(get_secret(definition.base_url_env_var, '') or '').strip() \
+                    if definition.base_url_env_var else ''
+                base_url = base_url or definition.base_url
+    return BackendIdentity.build(provider=provider, model=model, base_url=base_url)
+
+
 def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
     """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
     old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``

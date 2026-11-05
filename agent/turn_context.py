@@ -1127,6 +1127,14 @@ def build_turn_context(
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
     from tools.skill_provenance import set_review_attended
     set_review_attended(getattr(agent, "_review_attended", False))
+    # Endpoint failures are turn-local, including the primary-restore selector.
+    agent._turn_failed_endpoints = []
+    agent._turn_attempted_routes = []
+    agent._turn_attempted_route_labels = []
+    agent._turn_independent_attempt_used = False
+    agent._turn_independent_attempt_active = False
+    agent._turn_independent_attempt_requested = False
+    agent._turn_fallback_chain_exhausted = False
     agent._restore_primary_runtime()
     _publish_runtime_main(agent)
     _refresh_mcp_tools_between_turns(agent)
