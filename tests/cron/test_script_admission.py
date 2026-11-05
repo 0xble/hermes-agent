@@ -316,13 +316,18 @@ def test_script_pool_is_scoped_and_does_not_take_protected_reservation(home, tmp
     release, first_started, protected_started, second_done = (threading.Event() for _ in range(4))
     starts = []
     first, second = due_job(now, no_agent=True), due_job(now, no_agent=True)
+    blockers = [due_job(now, no_agent=True) for _ in range(3)]
+    blocker_started = {job["id"]: threading.Event() for job in blockers}
     protected = due_job(now, schedule="every 2m")
 
     def body(item):
         starts.append((item["id"], hermes_home_key(scheduler._get_hermes_home())))
         if item["id"] == first["id"]:
             first_started.set()
-            assert release.wait(10)
+            assert release.wait(30)
+        if item["id"] in blocker_started:
+            blocker_started[item["id"]].set()
+            assert release.wait(30)
         if item["id"] == protected["id"]:
             protected_started.set()
         if item["id"] == second["id"]:
@@ -337,7 +342,9 @@ def test_script_pool_is_scoped_and_does_not_take_protected_reservation(home, tmp
         futures += admission.submit_due_jobs([second, protected], pool, body)
         assert protected_started.wait(5)
         assert second_done.wait(5)
-        # A blocked script in A cannot consume B's script capacity or release its claim.
+        futures += admission.submit_due_jobs(blockers, pool, body)
+        assert all(event.wait(5) for event in blocker_started.values())
+        # Saturate A: B must not borrow spare capacity from a shared script pool.
         other_home = tmp_path / "other"
         with _profile_cron_scope(other_home):
             other = due_job(now, no_agent=True)
