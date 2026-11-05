@@ -191,6 +191,7 @@ def ingress_fingerprint(payload, raw=None):
     envelope = {**payload['native_text_v1']}
     envelope.pop('ingress_sha256', None)
     envelope.pop('attended_activity', None)
+    envelope.pop('absorbed_synthetic', None)
     if 'media' in envelope:
         envelope['media'] = [[media['sha256'], media['size']] for media in envelope['media']]
     received = {**payload, 'native_text_v1': envelope}
