@@ -5,12 +5,21 @@ Load this unit before changing `_route_identity` or `_UNCOMPARED_FIELDS` in
 
 ## Required Behavior
 
-Before `snapshot_automation` lends a route's last committed envelope to a producer wake
-(async-delegation completion, process notice, heartbeat), it compares the wake's route
-source with the envelope's source. It does not compare `chat_topic` or `message_id`.
-Every other field still has to match, including `user_name`, which
-`test_native_completion_wake_refuses_other_source_drift` pins. The admitted payload
+Before `snapshot_automation` lends a route's last committed envelope to a direct producer
+wake, it compares the asserted source with the envelope's source. It does not compare
+`chat_topic` or `message_id`. Every other field still has to match, including `user_name`,
+which `test_native_completion_wake_refuses_other_source_drift` pins. The admitted payload
 carries the committed envelope's own source and provenance.
+
+A trusted process notice first validates its recovered stored origin's route and session
+pin, then restores the live committed source before ordinary admission. The stored origin's
+labels or first speaker may be stale on a shared route; they must not strand process
+completions. This exception is private to `admit_process_notice`, not an `internal` metadata
+flag available to arbitrary callers. Per-user route drift, wrong connector/adapter, reset
+sessions and direct foreign-sender automation remain refused. Preparation refusals
+are counted by the admission canary under the same producer identity as ordinary
+admission, including their reason/field; retries count once per retention window.
+The ordered admission preparation still rechecks route, session and provenance.
 
 ## Source
 
@@ -26,5 +35,8 @@ bff96cdf's admission canary.
 ## Verification And Rollback
 
 Guard: `scripts/run_tests.sh tests/gateway/test_automation_route_display_labels.py
-tests/gateway/test_automation_notification_category.py`. To roll back, revert this
+tests/gateway/test_automation_notification_category.py
+tests/gateway/test_process_notice_committed_source.py`. To roll back, revert this
 identity's comparison change and tests. No state migration is needed.
+
+Contract tests: tests/gateway/test_process_notice_committed_source.py
