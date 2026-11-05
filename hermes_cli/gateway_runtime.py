@@ -500,7 +500,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
             observed = _observe_replacing_stale(home, deadline, replaced, **own_child)
             if observed.reason_code == "control_timeout":
                 continue
-            wait_for_exit, finite_owner = retirement_wait(observed, finite_owner)
+            wait_for_exit, finite_owner = retirement_wait(observed, finite_owner, retiring=retiring)
             if wait_for_exit:
                 retiring, requested, child = True, False, None
                 waiting.clear()
