@@ -1478,9 +1478,9 @@ class TestForceReloadSymmetry:
         mgr._hooks["post_tool_call"] = [blocker]
         try:
             with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
-                for i in range(dispatch.K_ABANDONED + 3):
+                for i in range(dispatch._HOOK_ABANDONED_LIMIT + 3):
                     assert mgr.invoke_hook("post_tool_call", tool_name="read_file", tool_call_id=f"call-{i}") == []
-            assert len(starts) == dispatch.K_ABANDONED
+            assert len(starts) == dispatch._HOOK_ABANDONED_LIMIT
             assert "blocker" in caplog.text and "callback_hung" in caplog.text
         finally:
             hold.set()
