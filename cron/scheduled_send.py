@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import re
 import subprocess
 import sys
@@ -81,6 +82,30 @@ def validate_scheduled_send_inputs(
         raise ValueError(
             "send_freshness missing required field(s): " + ", ".join(missing)
         )
+    _validate_freshness_reader(send_freshness)
+    for key in ("transport_sha256", "payload_sha256", "text_sha256"):
+        if key in send_freshness and not _SHA256_HEX.fullmatch(str(send_freshness[key])):
+            raise ValueError(f"send_freshness.{key} must be 64 hex characters.")
+    if send_freshness.get("payload_path"):
+        validate_scheduled_send_inputs(payload_path=send_freshness["payload_path"],
+                                       payload_sha256=send_freshness.get("payload_sha256"))
+    if send_freshness.get("text_file"):
+        validate_scheduled_send_inputs(payload_path=send_freshness["text_file"],
+                                       payload_sha256=send_freshness.get("text_sha256"))
+    if "text_file" in send_freshness and "payload_path" in send_freshness and (
+            send_freshness["text_file"] != send_freshness["payload_path"]
+            or send_freshness.get("text_sha256") != send_freshness.get("payload_sha256")):
+        raise ValueError("send_freshness has conflicting approved payload bindings.")
+    try:
+        approved = datetime.fromisoformat(str(send_freshness["approved_at"]))
+        if approved.tzinfo is None:
+            raise ValueError("timezone required")
+    except ValueError as exc:
+        raise ValueError("send_freshness.approved_at must be a timezone-aware ISO timestamp.") from exc
+    _resolve_freshness_script(send_freshness["script"])
+
+
+def _validate_freshness_reader(send_freshness: dict[str, Any]) -> None:
     channel = send_freshness["channel"]
     if channel not in {"slack", "telegram", "imessage", "email", "quo"}:
         raise ValueError("send_freshness.channel has no supported shared reader.")
@@ -116,26 +141,6 @@ def validate_scheduled_send_inputs(
                 or not isinstance(check.get("argv"), list) or not check["argv"]
                 or any(not isinstance(a, str) or not a for a in check["argv"])):
             raise ValueError("send_freshness.activity_check must be an explicit read-only argv.")
-    for key in ("transport_sha256", "payload_sha256", "text_sha256"):
-        if key in send_freshness and not _SHA256_HEX.fullmatch(str(send_freshness[key])):
-            raise ValueError(f"send_freshness.{key} must be 64 hex characters.")
-    if send_freshness.get("payload_path"):
-        validate_scheduled_send_inputs(payload_path=send_freshness["payload_path"],
-                                       payload_sha256=send_freshness.get("payload_sha256"))
-    if send_freshness.get("text_file"):
-        validate_scheduled_send_inputs(payload_path=send_freshness["text_file"],
-                                       payload_sha256=send_freshness.get("text_sha256"))
-    if "text_file" in send_freshness and "payload_path" in send_freshness and (
-            send_freshness["text_file"] != send_freshness["payload_path"]
-            or send_freshness.get("text_sha256") != send_freshness.get("payload_sha256")):
-        raise ValueError("send_freshness has conflicting approved payload bindings.")
-    try:
-        approved = datetime.fromisoformat(str(send_freshness["approved_at"]))
-        if approved.tzinfo is None:
-            raise ValueError("timezone required")
-    except ValueError as exc:
-        raise ValueError("send_freshness.approved_at must be a timezone-aware ISO timestamp.") from exc
-    _resolve_freshness_script(send_freshness["script"])
 
 
 def _resolve_freshness_script(script: str) -> Path:
@@ -264,8 +269,9 @@ def assess_freshness(
     try:
         verdict = (runner or run_freshness_script)(spec, job)
     except Exception as exc:
-        # This boundary precedes dispatch: an unavailable reader is a hold, not
-        # an unknown/possibly-sent run or an exception escaping the ledger path.
+        # Custom readers can raise arbitrary exceptions. Preserve the fail-closed
+        # dispatch boundary and its ledger settlement, with traceback evidence.
+        logging.getLogger(__name__).warning("Scheduled-send freshness reader failed", exc_info=True)
         return {"stale": True, "checked": False,
                 "reason": f"freshness check failed: {type(exc).__name__}: {exc}"}
     if not isinstance(verdict, dict):

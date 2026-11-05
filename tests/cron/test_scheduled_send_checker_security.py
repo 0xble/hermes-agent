@@ -81,6 +81,43 @@ def checker_home(tmp_path, monkeypatch):
     return home
 
 
+def _declaration_path(shape, home, tmp_path, installed, shared, local, external):
+    def deployed_link():
+        (home / "skills").mkdir()
+        (home / "skills/communications").symlink_to(installed, target_is_directory=True)
+        return home / "skills/communications/scripts/send_freshness.py"
+
+    def script_link():
+        path = home / "scripts/escape.py"
+        path.symlink_to(external)
+        return path
+
+    def checker_link():
+        shared.unlink()
+        shared.symlink_to(external)
+        return shared
+
+    def alias_link():
+        path = tmp_path / "unregistered-checker.py"
+        path.symlink_to(shared)
+        return path
+
+    paths = {
+        "relative": lambda: "check.py",
+        "profile-absolute": lambda: local,
+        "installed": lambda: shared,
+        "deployed-link": deployed_link,
+        "external": lambda: external,
+        "traversal": lambda: home / "scripts/../../arbitrary.py",
+        "script-link": script_link,
+        "checker-link": checker_link,
+        "other-skill": lambda: _checker(installed.parent / "other/scripts/send_freshness.py"),
+        "other-resource": lambda: _checker(installed / "scripts/other.py"),
+        "alias-link": alias_link,
+    }
+    return paths[shape]()
+
+
 @pytest.mark.parametrize("shape", ["relative", "profile-absolute", "installed", "deployed-link",
                                    "external", "traversal", "script-link", "checker-link",
                                    "other-skill", "other-resource", "project-shadow", "alias-link"])
@@ -94,35 +131,7 @@ def test_checker_declaration_trust_boundary(checker_home, tmp_path, monkeypatch,
         f"skills:\n  external_dirs: [{json.dumps(str(installed.parent))}]\n", encoding="utf-8")
     local = _checker(home / "scripts/check.py")
     external = _checker(tmp_path / "arbitrary.py")
-    if shape == "relative":
-        path = "check.py"
-    elif shape == "profile-absolute":
-        path = local
-    elif shape == "installed":
-        path = shared
-    elif shape == "deployed-link":
-        (home / "skills").mkdir()
-        (home / "skills/communications").symlink_to(installed, target_is_directory=True)
-        path = home / "skills/communications/scripts/send_freshness.py"
-    elif shape == "external":
-        path = external
-    elif shape == "traversal":
-        path = home / "scripts/../../arbitrary.py"
-    elif shape == "script-link":
-        path = home / "scripts/escape.py"
-        path.symlink_to(external)
-    elif shape == "checker-link":
-        shared.unlink()
-        shared.symlink_to(external)
-        path = shared
-    elif shape == "other-skill":
-        path = _checker(installed.parent / "other/scripts/send_freshness.py")
-    elif shape == "other-resource":
-        path = _checker(installed / "scripts/other.py")
-    elif shape == "alias-link":
-        path = tmp_path / "unregistered-checker.py"
-        path.symlink_to(shared)
-    else:
+    if shape == "project-shadow":
         project = tmp_path / "project"
         (project / ".git").mkdir(parents=True)
         shadow = project / ".agents/skills/communications"
@@ -138,6 +147,7 @@ def test_checker_declaration_trust_boundary(checker_home, tmp_path, monkeypatch,
         with pytest.raises(ValueError, match="send_freshness.script"):
             jobs.update_job(job["id"], {"send_freshness": _spec(shadow / "scripts/send_freshness.py")})
         return
+    path = _declaration_path(shape, home, tmp_path, installed, shared, local, external)
     kwargs = dict(prompt="fixture", schedule="in 1h", deliver="local", send_freshness=_spec(path))
     if shape in {"relative", "profile-absolute", "installed", "deployed-link"}:
         job = jobs.create_job(**kwargs)
