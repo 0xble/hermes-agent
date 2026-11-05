@@ -206,6 +206,11 @@ def _fixture(tmp_path: Path, scenario: str, *, real: bool = False):
     a, b = (home / "releases" / name for name in ("A", "B"))
     _release(a, real=real)
     _release(b, real=real)
+    # Probe gateways only identify their code root; they have no native ingress.
+    # Admission qualification has its own tests, separate from crash recovery.
+    (home / "config.yaml").write_text(
+        "gateway:\n  guardian:\n    admission_canary:\n      enabled: false\n"
+    )
     source_sha = _source(source, real=real)
     if real:
         venv.EnvBuilder(with_pip=False).create(source / ".venv")
