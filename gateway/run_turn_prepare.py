@@ -218,7 +218,7 @@ class GatewayTurnPrepareMixin:
         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model.
         ``tier`` defaults to the runner's per-turn ``_service_tier``; an off-turn builder (a cold
         ``/review``) passes the session's own instead of writing that shared slot."""
-        from gateway.run import _deep_merge_request_overrides
+        from gateway.run_model_config import _deep_merge_request_overrides
         from agent.fast_mode import STATIC_TIERS
         from hermes_cli.models import resolve_fast_mode_overrides
         # Tests bind this method onto bare namespaces, so no class-level tables here.

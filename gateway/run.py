@@ -2370,6 +2370,7 @@ def _resolve_gateway_model_context(
     configured_model = configured_provider = configured_base_url = None
     requested_provider = None
     # Invalid authored routes must fail before optional metadata/auth best-effort reads.
+    from gateway.run_model_config import _load_gateway_runtime_config
     data = _load_gateway_runtime_config()
 
     def _read_config() -> None:
@@ -2457,17 +2458,6 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str, target_model: Opti
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "capabilities": dict(runtime.get("capabilities") or {})}
 
-
-def _deep_merge_request_overrides(base: Optional[dict], override: Optional[dict]) -> dict:
-    """Merge request_overrides dicts, deep-merging nested dictionaries."""
-    from hermes_cli.config import _deep_merge
-    base_dict = dict(base or {})
-    override_dict = dict(override or {})
-    if not base_dict:
-        return override_dict
-    if not override_dict:
-        return base_dict
-    return _deep_merge(base_dict, override_dict)
 
 
 def _credential_pool_for_provider(provider: Optional[str]):
@@ -2894,20 +2884,13 @@ def _load_gateway_config(config_path: Path | None = None) -> dict:
 from gateway.session_worker_construct import checkpoint_agent_kwargs as _checkpoint_agent_kwargs
 
 
-def _load_gateway_runtime_config(config: dict | None = None) -> dict:
-    """Expand an explicitly supplied route; disk reads use the effective user-config seam."""
-    if config is None:
-        return _load_gateway_config()
-    from hermes_cli.config import _expand_env_vars
-    from hermes_cli.model_presets import expand_model_presets
-    return expand_model_presets(_expand_env_vars(config))
-
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """The profile's model when nothing else names one: config.yaml (single source of truth), else the
     claimed welcome trial's. Temporary AIAgents (e.g. /compress) otherwise use the hardcoded default,
     which fails under openai-codex."""
     from hermes_cli.anon_auth import trial_model
+    from gateway.run_model_config import _load_gateway_runtime_config
     model_cfg = _load_gateway_runtime_config(config).get("model", {})
     if isinstance(model_cfg, dict):
         model_cfg = model_cfg.get("default") or model_cfg.get("model")

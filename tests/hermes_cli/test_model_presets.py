@@ -192,7 +192,7 @@ def test_explicit_empty_fallbacks_and_save_preserve_unrelated_delegation_moa_and
 
 def test_delegation_and_fallback_consumers_receive_preset_reasoning_and_chain(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from agent.chat_completion_helpers import _reresolve_fallback_reasoning_config
+    from agent.fallback_reasoning import _reresolve_fallback_reasoning_config
     from tools.delegate_tool_config import _resolve_child_runtime
     cfg = expand_model_presets({**routes(), "delegation": {"model_preset": "primary"}})
     parent = SimpleNamespace(model="parent", provider="parent-provider", base_url="", api_mode="chat_completions", acp_command=None, acp_args=[], reasoning_config={"enabled": False}, _fallback_chain=[], request_overrides=None, capabilities=None)
