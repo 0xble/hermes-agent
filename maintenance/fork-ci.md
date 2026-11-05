@@ -15,6 +15,26 @@ carry different evidence and must not be confused:
   `scripts/run_tests.sh` harness plus all nine nonrelease Node checks, E2E, docs, Rust and
   container lint. Claims of complete coverage need this profile, not the gate.
 
+The hosted static job runs `python -m scripts.code_health --base
+"$(git merge-base origin/main HEAD)" --head HEAD` as a blocking step in a small
+`uv run --no-project` environment with checkout-pinned Python and Ruff (no full
+application install). The repository-owned `static` lane runs the same ratchet
+with its checkout Python.
+This compares committed PR changes with their merge-base, preserving existing
+findings while rejecting new blocking patterns (including BLE001) and per-unit
+cap growth. Global Ruff selection is unchanged. `qualification` already requires
+the static job; no new required check or branch-protection setting is needed.
+The git-guard wrapper delegates to `./bin/ci`; its lane list is not authoritative.
+
+Upstream's `ca682666b8c` later wired code health into `lint.yml`. The fork had
+already removed that workflow in `d77a654d860`; subsequent upstream integrations
+retained its deletion and never added the ratchet to the portable static lane.
+This is a missed upstream enforcement port, not evidence that a working fork
+ratchet was deliberately disabled. Adding it at this source-owned boundary
+preserves the separate ratchet instead of imposing legacy findings through Ruff.
+Retire this wiring only when its replacement proves the same base-to-head
+blocking behavior. This source-only patch changes no installed runtime.
+
 Profile-owned plugins are tested from their canonical source repository, not from this
 Hermes application checkout. A selected lane (`check --lane`) is partial evidence. No
 profile uses changed-file classification, and the complete profile never substitutes a
