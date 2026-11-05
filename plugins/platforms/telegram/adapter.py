@@ -4875,7 +4875,12 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
             content = _normalize_dollar_entities((metadata or {}).get("rich_fallback_content", content))
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)
+            from .copy_quotes import truncate_copy_source
+            copy_chunks = truncate_copy_source(
+                content, self.MAX_MESSAGE_LENGTH, utf16_len, self.CHUNK_INDICATOR_OVERHEAD, close_chunks=True)
+            chunks = ([self.format_message(chunk) for chunk in copy_chunks] if copy_chunks is not None else
+                      self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH,
+                                            len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD))
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
                 chunks = [
@@ -7244,6 +7249,16 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         parser nor ``format_message`` reads ``mcp__a__b``, ``**/*.md``, ``README.md`` or ``\\s+``
         as markup or a link."""
         return _progress_code_span(text)
+
+    @staticmethod
+    def truncate_message(content: str, max_length: int = 4096,
+                         len_fn: Optional[Callable[[str], int]] = None, *,
+                         indicator_overhead: int = 0) -> list[str]:
+        from .copy_quotes import truncate_copy_source
+        chunks = truncate_copy_source(content, max_length, len_fn or len, indicator_overhead)
+        if chunks is not None:
+            return chunks
+        return BasePlatformAdapter.truncate_message(content, max_length, len_fn, indicator_overhead=indicator_overhead)
 
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Telegram MarkdownV2: code is stashed behind placeholders first (never

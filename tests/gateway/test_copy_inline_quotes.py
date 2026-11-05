@@ -138,3 +138,53 @@ async def test_interrupted_stream_does_not_send_copy_body_a_second_time():
         event, event.source, None, "s", None, {"already_sent": True, "interrupted": True},
         [], "[[copy]]\npartial", None, False)
     adapter.send.assert_not_called()
+
+
+@pytest.mark.parametrize("body", ["*" * 9000, "\n".join(["```", "*code*", "```"] * 150)], ids=["huge-line", "fenced-lines"])
+def test_oversized_copy_quotes_balance_and_escape_each_api_chunk(body):
+    from gateway.copy_blocks import copy_free_text_for
+    from gateway.platforms.base import utf16_len
+    from plugins.platforms.telegram.copy_quotes import truncate_copy_source
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = "telegram"
+    for reply in ["[[copy]]\n" + body + "\n[[/copy]]",
+                  copy_free_text_for(adapter, "[[copy]]\n" + body + "\n[[/copy]]")]:
+        chunks = truncate_copy_source(reply, 4096, utf16_len, 3, close_chunks=True)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            wire = adapter.format_message(chunk)
+            assert utf16_len(wire) <= 4096
+            assert "\x00" not in wire
+            assert wire.startswith(("> ", "**> "))
+            if wire.startswith("**>"):
+                assert "||\n" in wire
+            assert "```" not in wire
+
+
+@pytest.mark.asyncio
+async def test_telegram_final_send_uses_balanced_copy_chunks_at_api_boundary():
+    from gateway.platforms.base import utf16_len
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = "telegram"
+    adapter._text_send_refusal = lambda: None
+    adapter._send_flood_cooldown_remaining = lambda _chat: None
+    adapter._chat_outbound_slot_remaining = lambda _chat: 0
+    adapter._hold_chat_outbound_slot = lambda _chat: None
+    adapter._telegram_error_types = lambda: ()
+    adapter._retrigger_typing = AsyncMock()
+    observed = []
+
+    async def capture(_chat, chunks, _delivered, *_args):
+        observed.extend(chunks)
+        return SimpleNamespace(success=True)
+
+    adapter._send_chunks = capture
+    reply = "[[copy]]\n" + "\n".join(["*literal* `code`"] * 600) + "\n[[/copy]]"
+    result = await adapter._send_text_locked("c", reply, None, None)
+    assert result.success and len(observed) > 1
+    for wire in observed:
+        assert utf16_len(wire) <= 4096
+        assert wire.startswith("**> ") and "||\n" in wire
+        assert "\x00" not in wire and "[[copy]]" not in wire
