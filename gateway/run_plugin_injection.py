@@ -268,7 +268,6 @@ class GatewayPluginInjectionMixin:
             delivery.started = True
             delivery.session_key = session_key
             delivery.session_id = session_id
-            event.metadata["hermes_plugin_correlation_id"] = delivery.correlation_id
         try:
             receipt = await authority.admit_automation(adapter, event, identity)
             if delivery is not None:

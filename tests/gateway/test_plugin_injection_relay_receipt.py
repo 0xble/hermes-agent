@@ -4,6 +4,9 @@ Expose agents/sources/plugins/session-relay on PYTHONPATH to execute; a normal
 Hermes checkout need not have the external plugin's source/test harness installed.
 """
 import asyncio
+import json
+import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,27 +31,41 @@ async def test_real_relay_receipt_queue_full_same_key_then_exactly_one_admission
         assert result.accepted
 
     def inject(content, _key):
+        rid = re.match(r"\[inter-session note id=(\S+) ", content).group(1)
         return runner._schedule_plugin_message_injection(
             session_key=route, content=content, plugin_id="session-relay", await_dispatch=True,
-            correlation_id="n1").result(timeout=10)
+            correlation_id=rid).result(timeout=10)
 
+    # Drive the real keyed tool, mailbox and single drainer synchronously at its
+    # wait boundary; only target discovery uses the plugin's disposable harness DB.
+    def drain_and_read(mailbox, request, **kwargs):
+        mailbox.enqueue(request)
+        h.drainer.tick()
+        h.drainer.tick()
+        return mailbox.receipt(request["id"])
+
+    monkeypatch.setattr(h.plugin, "send_and_wait", drain_and_read)
+    tool = h.plugin.make_tool(SimpleNamespace(profile_name="default"), h.mailbox, None)
+    args = {"target": "hermes:default/s-target", "text": "report", "fyi": True, "key": "factory-report"}
     h.deliverer.inject = inject
-    h.ingest_on_inject = False
-    await asyncio.to_thread(h.send, id="n1", fyi=True)
-    receipt = h.mailbox.receipt("n1")  # persisted exact receipt, not sender's returned summary
+    first = json.loads(await asyncio.to_thread(tool, args, session_id="s-sender"))
+    rid = first["id"]
+    receipt = h.mailbox.receipt(rid)  # persisted exact receipt, not sender's summary
     assert (receipt["status"], receipt["reason"], receipt["retryable"]) == ("refused", "queue_full", True)
-    assert receipt["correlation_id"] == "n1" and h.mailbox.seen("n1") is None
+    assert receipt["correlation_id"] == rid and h.mailbox.seen(rid) is None
     rows = list_session_admissions(authority.db, session_id=sid)
     assert len(rows) == ADMISSION_QUEUE_MAX
-    assert not any("inter-session note id=n1" in str(row["payload"]) for row in rows)
+    header = f"inter-session note id={rid}"
+    assert not any(header in str(row["payload"]) for row in rows)
     authority.db._execute_write(lambda conn: conn.execute(
         "UPDATE session_admissions SET status='terminal' WHERE admission_id=?", (rows[0]["admission_id"],)))
-    await asyncio.to_thread(h.send, id="n1", fyi=True)
-    await asyncio.to_thread(h.send, id="n1", fyi=True)
-    receipt = h.mailbox.receipt("n1")
+    second = json.loads(await asyncio.to_thread(tool, args, session_id="s-sender"))
+    third = json.loads(await asyncio.to_thread(tool, args, session_id="s-sender"))
+    assert first["id"] == second["id"] == third["id"]
+    receipt = h.mailbox.receipt(rid)
     assert receipt["status"] == "pending" and receipt["admitted"] is True
     assert receipt["admission_id"]
     rows = list_session_admissions(authority.db, session_id=sid)
-    admitted = [row for row in rows if "inter-session note id=n1" in str(row["payload"])]
+    admitted = [row for row in rows if header in str(row["payload"])]
     assert len(admitted) == 1 and admitted[0]["admission_id"] == receipt["admission_id"]
     assert len(turns) == 1
