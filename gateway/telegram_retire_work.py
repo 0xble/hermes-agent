@@ -86,8 +86,8 @@ async def inventory(runner, source, state) -> list[dict]:
                               "record": record})
     origin_address = address(source, sid)
     for job in await asyncio.to_thread(list_jobs, include_disabled=True):
-        if is_terminal_job(job):
-            continue
+        if is_terminal_job(job) and job.get("state") != "missed":
+            continue  # Missed holds still need an owner decision/transfer.
         origin = job.get("origin") or {}
         direct = f"telegram:{source.chat_id}:{source.thread_id}"
         points_here = (str(origin.get("platform")) == "telegram"

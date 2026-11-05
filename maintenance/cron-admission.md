@@ -106,6 +106,82 @@ owner-alert helper with the separate one-shot-retirement patch: it was not on
 `origin/main` at this patch's base, and both use the same delivery outbox and
 failure-routing contract rather than introducing a transport.
 
+## Missed One-Shots
+
+Retain the 120-second grace for ordinary catch-up. Persist each profile's actual
+scan-start instant in `ticker_due_scan` after evaluating that scan, separately
+from the provider's tick-completion heartbeat. The marker contains epoch, PID,
+and process nonce; only this process's previous scan at/before the job's grace
+deadline proves continuity. Heartbeats refreshed after another profile stalls
+must never replace that evidence. Missing/malformed markers, a different PID or
+nonce (including a recycled PID), or a scan after the deadline establish no
+continuity. This distinguishes scheduler delay from downtime in the diagnostic,
+but neither authorizes an overdue person-facing send.
+
+**Interaction with #1068 (`cron-missed-oneshot-hold`): held wins.** Prompts and
+scripts can send to people even with `deliver=local`, so never infer replay
+permission from the output lane. Keep every overdue never-started one-shot
+payload disabled with `state=missed`, its original schedule and payload intact,
+and a durable per-occurrence owner decision notice. Preserve non-local
+`failure_deliver`; local/unset failure lanes fall back to origin/home. No scheduler-continuity or
+store-outage catch-up path may bypass that hold. An owner must approve a new
+time/run-now or remove the job. Consumed/ambiguous dispatches retain the separate
+interrupted/partial-effects retirement contract. This supersedes this PR's prior
+automatic same-process catch-up policy under the explicit safety steering.
+
+Before holding an unclaimed miss, atomically insert a terminal failed execution
+with the scheduled instant and original scan time in its missed reason; never
+commit an intermediate claim. Serialize occurrence lookup/insertion in the same
+ledger transaction and reuse that occurrence on incident/jobs-save retries.
+Protect each just-inserted terminal miss from its transaction's own age/cap
+prune with the ledger's existing current-row keep IDs. A same-job attempt
+with a newer timestamp, or an equal timestamp and higher ID, may remain the
+latest row; both latest and current rows can exceed the best-effort cap.
+`tests/cron/test_missed_execution_retention.py` proves durable readback and retry
+reuse in both orderings, the two nonfailing controls, and bounded cleanup with
+eligible history plus in-flight, delivery and journal protections. The production
+100,000-row backstop and 8-day default are unchanged; live incidence is unproven.
+Persist the incident too. If either store fails, keep the job for retry.
+Commit the stable `oneshot-missed:<job>:<instant>` owner-notice receipt before
+persisting the hold, then let normal outbox draining send outside the jobs lock.
+Never bypass it with a direct crash-failure send. Spent dispatches retain the
+interrupted/partial-effects diagnostic and must not be replayed. Keep claimed
+and on-time behavior unchanged. The implementation belongs in
+`cron/jobs_oneshot.py`, not the jobs facade.
+
+An explicit re-arm resets the occurrence's dispatch budget and claims but keeps
+historical `last_run_at`. Never use that history as evidence that the new arm
+started: share the per-occurrence predicate across grace retirement and dispatch
+retirement/diagnostics, including recovered missing slots. Slot recovery only
+restores the scheduled instant; it delegates eligibility to those same gates.
+A consumed current-arm budget
+or a started ledger row for its exact scheduled instant proves partial-effects
+risk; queued or never-started missed rows and previous occurrences do not.
+
+`tests/cron/test_oneshot_occurrence.py` covers CLI `--at`/`--run-now` re-arms,
+held payloads/origin notices, and interrupted/completed occurrence handling.
+`tests/cron/test_oneshot_missed.py` covers actual single/multiplex provider
+stalls, startup/downtime evidence, on-time grace, and accounting/incident/save
+failure retries through real temp-home stores. `test_oneshot_person_hold.py`
+proves the hold applies to local agent prompts and declared/non-local sends.
+No execution-status migration or live-store change is needed.
+
+Claim presence is not liveness: only `_claim_is_live` may protect a run/fire
+claim as in flight, including the started predicate and both retirement gates.
+Dead same-host owners and expired leases must settle consumed dispatches with
+an interrupted/partial-effects retirement receipt, inside and beyond grace.
+The beyond-grace stale-claim wedge also existed on the base and is fixed by the
+same liveness rule. Consumed budgets and started ledger rows remain independent
+current-arm evidence; never replay those dispatches.
+
+`missed` is terminal for automatic scheduling, not a completed run. Default CLI
+list, doctor and dashboard overdue helpers surface the held payload as needing
+owner action even disabled. A stale ticker is not blamed for an intentional hold.
+Completion retention only prunes `completed`, never `missed`: keep held payloads
+until the owner explicitly rearms or removes them. `test_oneshot_claim_recovery.py`,
+`tests/hermes_cli/test_cron_missed_state.py` and the web cron-job suite cover these
+contracts. Shared isolated one-shot fixtures live in `tests/cron/oneshot_helpers.py`.
+
 ## Dispatch Diagnostics
 
 Local `cron.scheduler_diagnostics` INFO events name the execution, job, profile
