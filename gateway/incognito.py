@@ -72,7 +72,7 @@ def discard_private_topic(session_key: str) -> None:
 
 
 INCOGNITO_ROUTE_UNAVAILABLE = (
-    "⚠️ The incognito model isn't responding right now, so this private message wasn't answered. "
+    "⚠ The incognito model isn't responding right now, so this private message wasn't answered. "
     "Nothing was sent to another model. Send it again in a minute, or use /incognito off."
 )
 

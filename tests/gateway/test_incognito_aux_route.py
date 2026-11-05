@@ -401,6 +401,7 @@ async def test_private_main_turn_never_falls_back_to_another_provider(private_ro
             turn, turn.source, key, runner._session_state(key).persistent.run_generation)
     assert boundary.calls and all(url == PRIVATE_URL for url, _messages in boundary.calls), boundary.calls
     assert reply.startswith(INCOGNITO_ROUTE_UNAVAILABLE) and "fallback" not in reply, reply
+    assert not INCOGNITO_ROUTE_UNAVAILABLE.startswith("⚠️")
 
 
 class _RecoveryClients:
@@ -632,3 +633,20 @@ async def test_unusable_named_private_route_never_dispatches_a_builtin(
     finally:
         register_session(sid, False)
     assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_incognito_on_refuses_a_bare_custom_model_alias(private_route, tmp_path):
+    """A model_aliases direct alias resolves to provider ``custom``; /incognito on names the fix."""
+    import hermes_yaml
+    from agent.incognito import incognito_scope, private_route as bound_route
+    runner, _store, entry, config, event, _db = private_route
+    configure(config, tmp_path)
+    config["model_aliases"] = {"private-model": {"model": "private-model", "provider": "custom",
+                                                 "base_url": PRIVATE_URL, "api_key": "private-key"}}
+    (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
+    answer = await e2e.incognito(runner, event, "/incognito on")
+    assert "ON" in answer and "incognito.model must use a named provider (e.g. custom:venice)" in answer
+    assert entry.incognito and entry.model_override is None
+    with incognito_scope(True, entry.session_id):
+        assert bound_route() is None

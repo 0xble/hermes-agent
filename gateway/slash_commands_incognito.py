@@ -106,6 +106,10 @@ class GatewayIncognitoCommandsMixin:
             result, error = await self._perform_model_switch(ctx, request, "", event.source)
             if error is not None:
                 return self._incognito_reply(entry, error)
+            if str(result.target_provider or "").strip().lower() == "custom":
+                # A bare endpoint names no provider entry to take its key from: refuse the route.
+                from agent.auxiliary_call_policy import BARE_CUSTOM_ROUTE_REFUSAL
+                return self._incognito_reply(entry, f"{BARE_CUSTOM_ROUTE_REFUSAL}.")
             override = {
                 "model": result.new_model, "provider": result.target_provider,
                 "api_key": result.api_key, "base_url": result.base_url, "api_mode": result.api_mode,
