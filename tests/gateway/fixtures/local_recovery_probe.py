@@ -1,6 +1,7 @@
 """Real daemon restart driver; model and preclaim crash barriers are owned fixtures."""
 import asyncio
-from contextlib import contextmanager
+import atexit
+from contextlib import contextmanager, ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -15,6 +16,7 @@ import time
 from websockets.asyncio.client import connect
 from tests.gateway.test_normal_runtime_boot import control
 from tests.waiting import async_wait_until
+from tests.socket_paths import short_socket_dir
 
 
 class Model(BaseHTTPRequestHandler):
@@ -48,15 +50,24 @@ class Model(BaseHTTPRequestHandler):
 
 # Windows children need the system environment (Winsock, temp, PATHEXT); POSIX uses the first three.
 # Preserve test context so epoch fixtures acquire real reservations in isolated children.
-CHILD_ENV_KEYS = ('HERMES_TEST_ISOLATION', 'PATH', 'LANG', 'TZ', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'PATHEXT',
+CHILD_ENV_KEYS = ('HERMES_TEST_ISOLATION', 'PATH', 'LANG', 'TZ', 'TMPDIR', 'HERMES_TEST_SCRATCH_ROOT', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'PATHEXT',
                   'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE')
+
+
+# Direct bootstrap probes also use child_env(), without entering daemon().
+# Keep their private socket directories alive until this per-file test process
+# exits, after its children have been joined. Never borrow a live runtime root.
+_child_socket_dirs = ExitStack()
+atexit.register(_child_socket_dirs.close)
 
 
 def child_env():
     # Keep the parent's hermetic dependency policy in real gateway children. Otherwise a
     # selected CI venv can install optional audio extras during a voice-routing RPC, while
     # a foreign developer/test interpreter refuses that sync and hides the escaped install.
+    runtime = _child_socket_dirs.enter_context(short_socket_dir('hermes-gw-' + 'x' * 16 + '.sock'))
     return {**{k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ},
+            'TMPDIR': str(runtime), 'XDG_RUNTIME_DIR': str(runtime),
             'HERMES_DISABLE_LAZY_INSTALLS': '1'}
 
 
