@@ -3,6 +3,7 @@ import json
 import os
 import plistlib
 import subprocess
+from unittest.mock import Mock
 
 import pytest
 
@@ -33,6 +34,9 @@ def _service(tmp_path, monkeypatch, *, path):
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(guardian.subprocess, "run", run)
+    # launchctl below reports synthetic PIDs. Neither process discovery nor the
+    # real reaper's wait/kill operations may touch a host process with that PID.
+    monkeypatch.setattr("psutil.Process", Mock(side_effect=lambda pid: Mock(pid=pid)))
     from hermes_cli import gateway_launchd
     monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: None)
     return home, plist, label, a, b, calls
@@ -40,6 +44,24 @@ def _service(tmp_path, monkeypatch, *, path):
 
 def _receipts(home):
     return [json.loads(p.read_text()) for p in sorted((home / "logs/guardian").glob("*.json"))]
+
+
+@pytest.mark.platforms("macos")
+def test_service_fixture_never_resolves_a_synthetic_pid_on_the_host(tmp_path, monkeypatch):
+    import psutil
+
+    host_process = Mock(side_effect=AssertionError("synthetic PID reached host process signalling"))
+    monkeypatch.setattr(psutil, "Process", host_process)
+    home, *_ = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    monkeypatch.setattr("gateway.status.live_gateway_pid_for_home", lambda home_: None)
+
+    target, owners = guardian._rollback_owners(home, 123)
+    owners[0].wait.side_effect = [psutil.TimeoutExpired(0), 0]
+    guardian._reap_rollback_owners(owners, guardian.time.monotonic() + 1, home=home)
+
+    assert target == 123
+    owners[0].kill.assert_called_once_with()
+    host_process.assert_not_called()
 
 
 @pytest.mark.platforms("macos")
