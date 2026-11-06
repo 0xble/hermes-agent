@@ -5296,20 +5296,18 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             return
         if interrupt_event.is_set():
             self._invalidate_deferred_commands(session_key)
+        # Cancellation hands retained FIFO work to the command tail or shutdown spool.
+        # An obsolete owner must not admit an uncancelled successor from its finally.
+        if current_task is not None and current_task.cancelling():
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
         deferred = None if interrupt_event.is_set() else self._pop_deferred_command(session_key)
         if deferred is not None:
             if not self._spawn_drain_task(deferred, session_key):
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
             return
-        # A cancelled compression waiter must not resurrect itself from its visible
-        # pending slot. Shutdown spools it, while /stop and /new discard it.
         pending = self._pending_messages.get(session_key)
-        if (current_task is not None and current_task.cancelling()
-                and pending is getattr(current_task, "_hermes_event", None)
-                and getattr(pending, "_gateway_compression_deferred", False)):
-            self._cleanup_finished_session_task(session_key, interrupt_event)
-            return
         # A drain-deferred turn belongs to the shutdown spool, not this adapter's
         # post-turn handoff. Keep the FIFO head in its slot until shutdown flush.
         runner = getattr(self, "gateway_runner", None)
