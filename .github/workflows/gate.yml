@@ -52,7 +52,8 @@ jobs:
         shell: bash
         run: |
           base=$(git merge-base origin/main HEAD)
-          python3 scripts/ci/prefetch_tree.py "$base"
+          git show "origin/main:scripts/ci/prefetch_tree.py" > "$RUNNER_TEMP/prefetch_tree.py"
+          python3 "$RUNNER_TEMP/prefetch_tree.py" "$base"
           uv run --no-project --python 3.14.7 --with "$(python3 -m scripts.code_health --print-pins)" \
             python -m scripts.code_health --base "$base" --head HEAD
       - name: Exact-SHA static and Node gate
