@@ -98,7 +98,7 @@ before running. Keep the checkout's pinned toolchain and every assertion intact,
 then detach and remove only the invocation's disposable image after all owned
 processes have exited.
 
-Replay-gap fixtures wait for the viewer's first paused write before publishing the remaining deltas. The fanout drain removes a whole pending batch before its first socket write blocks, so a producer-only delta count can miss the intended overflow under a legal thread schedule. Keep the 256-frame cap, existing wait bounds, actual-overflow precondition and exactly-once assertions unchanged. Exercise every shared-fixture consumer in ACP, GatewayAgent and GatewayChatView.
+Replay-gap fixtures wait for the viewer's first paused write before publishing the remaining deltas. The fanout drain removes a whole pending batch before its first socket write blocks, so a producer-only delta count can miss the intended overflow under a legal thread schedule. Keep the 256-frame cap, existing wait bounds, actual-overflow precondition and exactly-once assertions unchanged. Exercise every shared-fixture consumer in ACP, GatewayAgent and GatewayChatView. The hosted-room policy-hook test supplies a stable injected clock because its 0.4-second lease is not the behavior under test. A controlled clock jump can otherwise fence the callback and leave the task indeterminate, causing the same wait timeout. Preserve the real lease and task-fencing tests, lease duration, policy-publication assertion and stop bound.
 
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning

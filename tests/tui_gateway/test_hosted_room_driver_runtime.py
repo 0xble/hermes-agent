@@ -492,6 +492,8 @@ def test_worker_settles_without_any_client_transport(db: Path):
 
 
 def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
+    # This tests policy hooks, not wall-clock lease expiry while the worker is descheduled.
+    now = time.time()
     identity = _identity()
     _admit(db, identity)
     prepared = []
@@ -505,6 +507,7 @@ def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
             task["identity"].task_id,
             task["status"],
         )),
+        clock=lambda: now,
     )
 
     runtime.start()
