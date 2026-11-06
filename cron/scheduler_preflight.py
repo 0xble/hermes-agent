@@ -81,6 +81,12 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
     return not isinstance(cron_cfg, dict) or cron_cfg.get("preflight", True) is not False
 
 
+def cron_default_provider(cfg: dict) -> str:
+    """``cron.model_provider``: the provider every cron job without its own pin resolves through."""
+    cron = cfg.get("cron") if isinstance(cfg, dict) else None
+    return str(cron.get("model_provider") or "").strip() if isinstance(cron, dict) else ""
+
+
 def _preflight_check_provider_key(job: dict, cfg: dict, jc=None) -> Optional[str]:
     """Read-only credential verdict for the same resolved route and fallback chain as execution.
 
@@ -224,6 +230,16 @@ class SharedRouteAdapters:
             ):
                 return adapter
         return default
+
+
+def has_credential_platform(adapters, owned=None) -> bool:
+    """True when the profile has a bot of its own. Any local session (Desktop chat, CLI run, Kanban
+    worker) adds a ``LOCAL`` adapter, which holds no platform credential: a profile with only that is
+    still a credentialless satellite that may ride routed primary adapters. ``owned`` is the
+    profile's ``_profile_bot_platforms`` entry: a bot that dropped leaves the live map while it
+    disconnects and reconnects, and borrowing the primary meanwhile would send through the wrong bot."""
+    return bool(owned) or any(
+        getattr(platform, "value", platform) != "local" for platform in adapters or ())
 
 
 def _preflight_check_delivery(job: dict) -> Optional[str]:

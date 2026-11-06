@@ -318,6 +318,102 @@ def test_registered_handler_combines_invocation_and_account_opt_out(page, tmp_pa
     assert "fixture-password" not in json.dumps(outcome) and "246810" not in json.dumps(outcome)
 
 
+@pytest.mark.parametrize("action", ["fill", "enter_code"])
+@pytest.mark.parametrize("requested, configured", [(False, True), (True, False), (True, True),
+                                                  (None, True), (None, False)])
+def test_remember_fill_and_automatic_code_stay_inside_backend_context(page, action, requested, configured):
+    """The remember click and credential input share the newer backend's guarded write context."""
+    from contextlib import contextmanager
+
+    from agent.vault_backends.base import LoginBackend
+    from agent.vault_store import VaultItemMeta
+    from tools import browser_vault_tool
+    from tools.registry import registry
+
+    class Backend(LoginBackend):
+        name, prefix, display_name = "fixture", "fixture:", "Fixture"
+        active = False
+
+        def __init__(self):
+            self.calls = []
+
+        @contextmanager
+        def fill_context(self):
+            self.calls.append("enter")
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
+                self.calls.append("exit")
+
+        def list_items(self):
+            return [self.get_meta("fixture:login")]
+
+        def get_meta(self, handle):
+            self.calls.append("meta")
+            return VaultItemMeta(id=handle, kind="login", label="Fixture", origin="https://login.example",
+                                 created_at="2026-01-01T00:00:00Z", has_otp=True)
+
+        def resolve_password(self, handle):
+            assert self.active
+            self.calls.append("resolve_password")
+            return "fixture-password"
+
+        def resolve_otp(self, handle):
+            assert self.active
+            self.calls.append("resolve_otp")
+            return "246810"
+
+    backend = Backend()
+    if action == "fill":
+        _open(page, inside=_box("trust", "Remember me"))
+        target = 'input[type="password"]'
+    else:
+        page.html = ('<!doctype html><body><form><input id="otp" autocomplete="one-time-code">' +
+                     _box("trust", "Trust this device") + '</form></body>')
+        page.goto("https://login.example/mfa")
+        target = "#otp"
+    page.eval_on_selector(target, '(el) => {window.seen = []; '
+                          'el.addEventListener("input", () => window.seen.push(trust.checked));}')
+
+    def evaluate(_task, expression):
+        return {"success": True, "result": page.evaluate(expression)}
+
+    def secret_evaluate(task, expression):
+        assert backend.active
+        backend.calls.append("write")
+        return evaluate(task, expression)
+
+    with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
+         patch.object(browser_vault_tool, "_browser_key", return_value="fixture"), \
+         patch.object(browser_vault_tool, "_focus_bound_origin", return_value=None), \
+         patch.object(browser_vault_tool, "_current_page_origin", return_value="https://login.example"), \
+         patch.object(browser_vault_tool, "_eval_js", side_effect=evaluate), \
+         patch.object(browser_vault_tool, "_eval_js_secret", side_effect=secret_evaluate), \
+         patch("tools.browser_camofox.is_camofox_mode", return_value=True), \
+         patch("tools.browser_camofox.get_session_account", return_value="work"), \
+         patch("hermes_cli.config.load_config_readonly",
+               return_value={"vault": {"remember_logins": {"default": True, "work": configured}}}), \
+         patch("agent.vault_backends.unlock.get_code_prompt_callback",
+               side_effect=AssertionError("An automatic code must not ask the user")):
+        args = {"action": action, "handle": "fixture:login"}
+        if requested is not None:
+            args["remember"] = requested
+        raw = registry.dispatch("browser_vault", args, task_id="fixture")
+        outcome = json.loads(raw) if isinstance(raw, str) else raw
+
+    expected = requested is not False and configured
+    assert outcome["success"] is True, outcome
+    assert outcome["remembered"] is expected
+    assert _checked(page, "trust") is expected
+    assert page.evaluate("window.seen") == [expected]
+    resolver = "resolve_password" if action == "fill" else "resolve_otp"
+    assert backend.calls == ["meta", "enter", "meta", resolver, "write", "exit"]
+    assert backend.active is False
+    assert "fixture-password" not in json.dumps(outcome) and "246810" not in json.dumps(outcome)
+
+
 def test_registered_schema_exposes_per_call_remember_opt_out():
     from tools import browser_vault_tool
     from tools.registry import registry

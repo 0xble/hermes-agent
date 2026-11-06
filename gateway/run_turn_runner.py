@@ -31,8 +31,10 @@ from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typin
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.run_task_card_progress import TaskCardProgressMixin
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
+from gateway.run_turn_runner_receipts import _persisted_turn
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
+from hermes_cli.plugins_dispatch import stream_held
 from utils import is_truthy_value
 from gateway.run_turn_progress import GatewayTurnProgressMixin, _viewer_status_kind, local_viewer_turn
 from gateway.session_execution import GatewaySessionAgentMixin
@@ -56,6 +58,11 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     from hermes_state_runtime import RuntimeStoreError
     auth_permanent = FailoverReason.auth_permanent.value
+    if isinstance(exc, RuntimeStoreError) and exc.reason == 'launch_credentials_unavailable':
+        # The session's launch key is gone (a restart revoked a CLI --api-key, a route key changed):
+        # the shared refusal copy names /new, never a resend.
+        from agent.turn_failure_copy import launch_credentials_copy
+        return launch_credentials_copy(exc), 'launch_credentials_unavailable', False
     if isinstance(exc, RuntimeStoreError):
         return (f"⚠️ This session's launch credentials are no longer available ({exc.reason}), so this "
                 "message wasn't processed. Start a new session from the CLI to bind them again.", auth_permanent, False)
@@ -108,24 +115,6 @@ _FAILURE_DESCRIPTOR_KEYS = ("free_tier", "failure_retryable", "failure_resets_at
 def _finite_viewer_turn() -> bool:
     from gateway.session_finite import finite_turn_required
     return finite_turn_required() is True
-
-
-def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
-    """``message.complete.persisted_turn`` for this turn, the receipt the TUI gateway's own turns
-    publish: clients bind the streamed reply to its stored row instead of comparing words. The
-    agent copies ``conversation_history`` into its message list, so an untouched pre-turn prefix
-    is the same dicts (transcript rows here carry no ``_row_id`` to compare)."""
-    from agent.persisted_turn_receipt import persisted_turn_receipt
-    if not isinstance(result, dict):
-        return None
-    status = ("interrupted" if result.get("interrupted")
-              else "error" if result.get("failed") or result.get("error") else "complete")
-    return persisted_turn_receipt(
-        result.get("messages"), getattr(agent, "_persist_user_message_idx", None), agent_history,
-        result.get("final_response"), status,
-        compression_unchanged=type(compressions) is int and compressions == getattr(
-            getattr(agent, "context_compressor", None), "compression_count", None),
-        prefix_row_matches=lambda before, after: before is after)
 
 
 class _NoStreamConsumer(RuntimeError):
@@ -593,8 +582,12 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
-        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
-        want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
+        # A loaded ``hold_stream`` transform rewrites this session's reply before the user may see it:
+        # no drafts, edits, native stream or commentary bubbles; the rewrite goes out as one plain
+        # final while the typing indicator runs (the agent also withholds every delta).
+        held = stream_held()
+        want_stream_deltas = not held and not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+        want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat and not held
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -1901,7 +1894,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
 
     def run_sync(self):
         from contextlib import ExitStack
-        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, workspace_unavailable_result
+        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, refused_turn_result
         from gateway.session_api_turn import api_policy_scope
         from gateway.session_authorities import active_authority
         from hermes_state_runtime import RuntimeStoreError
@@ -1910,9 +1903,9 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             try:
                 scope.enter_context(policy_scope(policy, authority=active_authority(self._runner)))
             except RuntimeStoreError as exc:
-                if exc.reason != 'workspace_unavailable':
+                result = refused_turn_result(policy, exc)
+                if result is None:
                     raise
-                result = workspace_unavailable_result(policy)
             else:
                 scope.enter_context(api_policy_scope())
                 bind_turn_workspace(policy, self._ctx.session_id)
@@ -2057,7 +2050,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             from gateway.session_cli_turn import run_classic_cli_turn
             from gateway.session_secret_prompt import secret_prompt_scope
             from gateway.session_sudo_prompt import sudo_prompt_scope
-            with sudo_prompt_scope(self, agent), secret_prompt_scope(self, agent):
+            from gateway.session_vault_prompt import vault_prompt_scope
+            with sudo_prompt_scope(self, agent), secret_prompt_scope(self, agent), vault_prompt_scope(self, agent):
                 result = run_classic_cli_turn(self, lambda: self._run_conversation_with_approval(
                     agent, agent_history, observed_group_context, persist_msg, persist_ts))
         finally:

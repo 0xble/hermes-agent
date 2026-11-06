@@ -1,6 +1,7 @@
 """Browser vault defaults; pure data, separate from the CLI config loader."""
 
 DEFAULT_VAULT_CONFIG = {
+    "key_storage": "file",  # OS keychain is an explicit opt-in for new vaults.
     # Map an existing login handle or 1Password item ID to extra exact HTTPS origins.
     # Aliases extend fill authorization without editing the password-manager item; malformed,
     # HTTP, and wildcard origins are ignored. Example: {"item-id": ["https://signin.example.com"]}.

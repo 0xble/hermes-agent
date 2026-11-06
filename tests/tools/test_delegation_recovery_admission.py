@@ -332,7 +332,7 @@ def test_sealed_execution_refuses_previously_claimed_recovery(monkeypatch, shape
 def test_recovery_cannot_bypass_atomic_admission_on_sync_routes(monkeypatch, route, shape):
     did, batch, _ = _legacy_batch(monkeypatch, shape=shape)
     if route == "no_async":
-        monkeypatch.setattr(dispatch, "_resolve_async_wake_sid", lambda *_: None)
+        monkeypatch.setattr(dispatch, "_resolve_async_wake_sid", lambda *_, oneshot_session=None: None)
         result = json.loads(dispatch._dispatch_background(batch))
     else:
         result = json.loads(dispatch._run_batch(batch, background=False))
@@ -389,7 +389,7 @@ def _dispatch_recovery_tasks(tasks, did, monkeypatch, *, tui=False):
         origin_owner_transport=None, origin_owner_session_record=None,
         origin_session_history_delivery=False, overall_start=time.monotonic(),
     )
-    monkeypatch.setattr(dispatch, "_resolve_async_wake_sid", lambda *args: "")
+    monkeypatch.setattr(dispatch, "_resolve_async_wake_sid", lambda *args, oneshot_session=None: "")
     monkeypatch.setattr(dispatch, "_resolve_async_session_key", lambda *args: (
         "" if tui else "agent:main:telegram:dm:1", "tui-owner" if tui else ""))
     monkeypatch.setattr(dispatch, "_cleanup_unit", MagicMock())

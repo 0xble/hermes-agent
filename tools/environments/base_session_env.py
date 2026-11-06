@@ -42,10 +42,44 @@ def _cwd_marker(session_id: str) -> str:
     return f"__HERMES_CWD_{session_id}__"
 
 
+def _pipe_marker(session_id: str) -> str:
+    return f"__HERMES_PIPE_{session_id}__"
+
+
+def _pipe_marker_printf(marker: str) -> str:
+    """Emit the pipeline's per-segment exit statuses (``PIPESTATUS``) on their own line.
+
+    ``cmd | tail`` exits with tail's status, so the shell's code cannot prove ``cmd``
+    passed. The array holds each segment's own status and is captured before anything
+    else runs.
+    """
+    return f"printf '\\n{marker}%s{marker}\\n' \"${{__hermes_ps[*]-}}\""
+
+
+def _eval_capturing_pipestatus(escaped: str) -> str:
+    """``eval`` the command and keep its last pipeline's ``PIPESTATUS`` as side data.
+
+    The array must be read inside the same ``eval`` (afterwards it holds only ``eval``'s
+    status), while ``$?`` stays the exit code: the two differ for ``!``, ``if``/``while``,
+    ``pipefail`` and parse errors. The blank line stops the capture joining a command
+    continued by a trailing backslash. The restore sits on the left of ``&&`` so its
+    non-zero status fires neither a user's ``ERR`` trap a second time nor ``set -e``.
+    """
+    return f"eval '{escaped}\n\n__hermes_rc=$? __hermes_ps=(\"${{PIPESTATUS[@]}}\"); (exit $__hermes_rc) && :'"
+
+
+def _can_capture_pipestatus(command: str) -> bool:
+    """An unterminated heredoc would read the capture line as its body (into the user's
+    file), and a trailing ``\\`` would join onto it: such commands run unchanged."""
+    return "<<" not in command and not command.endswith("\\")
+
+
 def _cwd_marker_printf(marker: str) -> str:
     """Emit the CWD marker on its own line (leading ``\\n`` guards against a
     command whose output lacks a trailing newline; ``_split_cwd_marker`` strips it)."""
-    return f"printf '\\n{marker}%s{marker}\\n' \"$(pwd -P)\""
+    # Stream pwd without re-entering command substitution after a failed eval.
+    # Merged-stderr transports must not adopt a pwd diagnostic as their next cwd.
+    return f"printf '\\n{marker}'; ( pwd -P ) 2>/dev/null || true; printf '{marker}\\n'"
 
 
 def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
@@ -69,7 +103,6 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
     return (
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "${!HERMES_BROWSER_CONTROL_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
         # by every wrapper with ${VAR:-default} semantics; persisting them would
         # let the FIRST command's value override a later outer-harness value.
@@ -84,7 +117,7 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # Remote code-execution channel vars (RPC token, kernel/rpc dirs): a
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.
-        "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
+        "${!HERMES_RPC_*} HERMES_KERNEL_DIR ${!HERMES_BROWSER_CONTROL_*} "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")
@@ -148,7 +181,9 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
     passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
-    relay_parent_address: str = "", persist_env: bool = True) -> str:
+    relay_parent_address: str = "",
+    pipe_marker: str = "",
+    persist_env: bool = True) -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``persist_env=False`` skips the re-dump, so every command starts from the login-time
     snapshot and exports from one command never reach the next (the CWD marker still runs).
@@ -165,6 +200,7 @@ def _wrap_command_script(
     ones whose process env is not inherited; the re-dump unsets it, so it never persists.
     """
     escaped = command.replace("'", "'\\''")
+    capture = bool(pipe_marker) and _can_capture_pipestatus(command)
     save, restore = _passthrough_save_restore(passthrough_names)
     parts = list(save)
     if snapshot_ready:
@@ -177,7 +213,11 @@ def _wrap_command_script(
         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
         # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
         f"builtin cd -- {quoted_cwd} || exit 126",
-        f"eval '{escaped}'",
+        # Bash before bash52-018 can corrupt parser recovery after malformed
+        # eval. Parse its entire epilogue before eval runs, but after sourcing
+        # the snapshot so restored aliases and shell options still apply.
+        "{",
+        _eval_capturing_pipestatus(escaped) if capture else f"eval '{escaped}'",
         "__hermes_ec=$?",
         "umask 077"]
     if snapshot_ready and persist_env:
@@ -186,7 +226,9 @@ def _wrap_command_script(
             f"{{ {_shell_state_dump(_SNAP_TMP, passthrough_names)} "
             f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
-    parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]
+    if capture:
+        parts.append(_pipe_marker_printf(pipe_marker))
+    parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec", "}"]
     return "\n".join(parts)
 
 
@@ -195,10 +237,12 @@ def relay_parent_export_line(address: str) -> str:
     return f"export RELAY_PARENT_ADDRESS={shlex.quote(address)}"
 
 
-def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None:
-    """Locate the last ``marker<path>marker`` pair in *output*. Returns
-    ``(cwd_path_or_None, output_without_marker_line)``, or ``None`` when no complete pair
-    exists. The stripped span runs from the ``\\n`` the wrapper injected before the marker
+def _split_cwd_marker(output: str, marker: str, *, validate_cwd: bool = True) -> tuple[str | None, str] | None:
+    """Locate the last ``marker<body>marker`` pair in *output*. Returns
+    ``(body_or_None, output_without_marker_line)``, or ``None`` when no complete pair
+    exists. CWD bodies must be absolute, single-line paths; ``validate_cwd=False``
+    keeps the generic body for other wrapper markers such as PIPESTATUS.
+    The stripped span runs from the ``\\n`` the wrapper injected before the marker
     through the end of the marker line."""
     last = output.rfind(marker)
     if last == -1:
@@ -207,7 +251,9 @@ def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None
     first = output.rfind(marker, search_start, last)
     if first == -1 or first == last:
         return None
-    cwd_path = output[first + len(marker) : last].strip() or None
+    cwd_path = output[first + len(marker) : last].removesuffix("\n")
+    if validate_cwd and (not cwd_path.startswith("/") or "\n" in cwd_path or "\r" in cwd_path):
+        cwd_path = None
     line_start = output.rfind("\n", 0, first)
     if line_start == -1:
         line_start = first

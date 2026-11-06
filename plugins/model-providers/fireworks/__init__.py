@@ -3,8 +3,9 @@
 
 from typing import Any
 
+from hermes_cli.version_info import hermes_user_agent
 from providers import register_provider
-from providers.base import ProviderProfile, _versioned_user_agent
+from providers.base import LazyHeaders, ProviderProfile
 
 
 class FireworksProfile(ProviderProfile):
@@ -32,11 +33,11 @@ fireworks = FireworksProfile(
     base_url="https://api.fireworks.ai/inference/v1", auth_type="api_key",
     # Attribution headers (canonical Hermes set); via default_headers so they
     # survive switch_model and credential rotation.
-    default_headers={
+    default_headers=LazyHeaders({
         "HTTP-Referer": "https://hermes-agent.nousresearch.com",
         "X-Title": "Hermes Agent",
-    },
-    default_headers_factory=lambda: {"User-Agent": _versioned_user_agent("HermesAgent")},
+        "User-Agent": lambda: hermes_user_agent("HermesAgent"),
+    }),
     default_aux_model="accounts/fireworks/models/glm-5p2",
     # Picker safety net when the live catalog fetch fails.
     fallback_models=(
