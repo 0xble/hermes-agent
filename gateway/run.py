@@ -46,7 +46,8 @@ from agent.message_metadata import (
 )
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance, AwakeIdleMeter
-from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get, config_exists
+from gateway.run_common import _csv_or_list_to_set
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
@@ -601,7 +602,7 @@ def _format_exec_approval_fallback(
     steps a surface without buttons needs."""
     from gateway.platforms.base_exec_approval import (
         approval_timeout_seconds, ea_header_text, ea_reason_label_text, format_approval_deadline_line)
-    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    cmd_preview = BasePlatformAdapter._truncate_preview(command, BasePlatformAdapter._EA_CMD_BUDGET)  # as on a card
     heading = (t("gateway.exec_approval.smart_deny_heading") if smart_denied
                else f"⚠️ **{ea_header_text()}**")
 
@@ -1245,15 +1246,6 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
-def _csv_or_list_to_set(raw: Any) -> set[str]:
-    """Normalize a config list or comma-separated scalar into a string set."""
-    if raw is None:
-        return set()
-    if isinstance(raw, list):
-        return {str(part).strip() for part in raw if str(part).strip()}
-    return {part.strip() for part in str(raw).split(",") if part.strip()}
-
-
 def _slack_ignored_channels_from_gateway_config(config: Any, adapter: Any = None) -> set[str]:
     """Return Slack channels that the generic gateway must never dispatch.
 
@@ -1631,11 +1623,11 @@ def _restart_notification_pending() -> bool:
 
 
 def _planned_restart_notification_path() -> Path:
-    return _hermes_home / ".restart_pending.json"
+    from gateway.restart_notice import planned_restart_marker_path
+    return planned_restart_marker_path(_hermes_home)
 
 
 def _planned_restart_notification_pending() -> bool:
-    """Return True when a non-chat planned restart should notify home channels."""
     return _planned_restart_notification_path().exists()
 
 
@@ -1677,7 +1669,7 @@ def _bridge_max_turns_from_config(home: Path) -> None:
     if profile_scoped():
         return
     config_path = home / 'config.yaml'
-    if not config_path.exists():
+    if not config_exists(config_path):
         return
     try:
         cfg = _load_bridge_config(config_path)
@@ -1699,7 +1691,7 @@ def _current_max_iterations() -> int:
     if override:
         config_path = Path(override) / 'config.yaml'
         try:
-            cfg = _load_bridge_config(config_path) if config_path.exists() else {}
+            cfg = _load_bridge_config(config_path) if config_exists(config_path) else {}
         except Exception:
             cfg = {}
         agent_cfg = cfg.get("agent")
@@ -2235,7 +2227,7 @@ def _load_bridge_config(config_path: Path) -> dict:
 
 _config_path = _hermes_home / 'config.yaml'
 _cfg: dict = {}
-if _config_path.exists():
+if config_exists(_config_path):
     try:
         _cfg = _load_bridge_config(_config_path)
         _bridge_config_to_env(_cfg)
@@ -2908,17 +2900,15 @@ def _is_control_interrupt_message(message: Optional[str]) -> bool:
 
 def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     """Return the visible text portion of a response before direct send().
-    Only explicit ``MEDIA:`` attachments are stripped; bare paths/URLs stay visible. No broad regex after
-    ``extract_media()``: it deliberately preserves protected code spans and unvalidated tags.
-
-    Queued follow-up resends only replay explicit ``MEDIA:`` attachments in this path. Keep bare local paths
-    and ordinary image URLs visible because the post-stream uploader intentionally ignores them (#20834).
+    Explicit ``MEDIA:`` attachments and the image tags ``extract_images`` attaches are stripped, because
+    the post-stream uploader delivers both; bare local paths stay visible (it ignores them, #20834). No
+    broad regex after ``extract_media()``: it deliberately preserves protected code spans and unvalidated tags.
     """
     # Copy bodies are literal text: separately sent ones are dropped, inline ones are opaque
     # to directive extraction and restored byte-exact.
     from gateway.copy_blocks import restore_inline_copy_bodies, split_copy_blocks_protected
     response, _, inline_bodies = split_copy_blocks_protected(adapter, response)
-    _, cleaned = adapter.extract_media(response)
+    _, cleaned = BasePlatformAdapter.extract_images(adapter.extract_media(response)[1])
     cleaned = cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
     return restore_inline_copy_bodies(cleaned, inline_bodies).strip()
 
@@ -4902,7 +4892,7 @@ def _housekeeping_install_orphans() -> None:
 
 def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
     """Drain each profile's worker queue through its matching live adapters. A credential-less satellite
-    profile (empty adapter map) drains through the primary's adapters routed by its own profile routes."""
+    profile (no bot of its own) drains through the primary's adapters routed by its own profile routes."""
     from cron import scheduler as cron_scheduler
     from cron import scheduler_preflight as sched_preflight
 
@@ -4911,14 +4901,14 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
             cron_scheduler.drain_delivery_queue(adapters, loop)
         return
     for profile_name, profile_home in _handoff_watch_scopes(runner):
-        if profile_name is None:
-            profile_adapters = adapters
-        else:
-            profile_adapters = getattr(runner, "_profile_adapters", {}).get(profile_name)
+        profile_adapters = (adapters if profile_name is None
+                            else getattr(runner, "_profile_adapters", {}).get(profile_name))
         if profile_adapters is None:
             continue
         with _profile_runtime_scope(profile_home or get_hermes_home()):
-            if profile_name is not None and not profile_adapters and adapters:
+            owned = (getattr(runner, "_profile_bot_platforms", None) or {}).get(profile_name)
+            if (profile_name is not None and adapters
+                    and not sched_preflight.has_credential_platform(profile_adapters, owned)):
                 routes = sched_preflight._primary_profile_routes_for_current_home()
                 if routes:
                     profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
@@ -5367,87 +5357,6 @@ def _start_gateway_make_restart_signal_handler(runner):
         runner.request_restart(detached=False, via_service=True)
     return restart_signal_handler
 
-
-def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
-    """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
-    planned_stop_seen = [False]
-
-    def shutdown_signal_handler(received_signal=None):
-        # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
-        def _takeover() -> bool:
-            from gateway.status import consume_takeover_marker_for_self
-            return consume_takeover_marker_for_self()
-
-        # Planned stop: CLI marks first, else its SIGTERM looks like an external kill. SIGINT = Ctrl+C.
-        def _planned_stop() -> bool:
-            from gateway.status import consume_planned_stop_marker_for_self
-            return consume_planned_stop_marker_for_self()
-
-        # Planned reload: a launchd bootout issued only to re-read the plist (update, guardian rollback).
-        def _planned_restart() -> bool:
-            from gateway.restart_loop_guard import consume_planned_restart_signal
-            return consume_planned_restart_signal()
-
-        # Fast (<10ms) sync snapshot: stdlib + /proc, no subprocesses (`ps aux` here once blocked ~3s).
-        def _snapshot():
-            from gateway.shutdown_forensics import snapshot_shutdown_context
-            return snapshot_shutdown_context(received_signal)
-
-        planned_takeover = bool(_best_effort(_takeover, "Takeover marker check failed: %s"))
-        planned_stop = getattr(runner, "_client_owned", False) or received_signal == signal.SIGINT or (
-            not planned_takeover and bool(_best_effort(_planned_stop, "Planned stop marker check failed: %s")))
-        # `hermes gateway stop` writes the marker, THEN signals: the planned-stop watcher can consume
-        # the marker in between, and the CLI's own SIGTERM must not then read as an external kill.
-        if planned_stop:
-            planned_stop_seen[0] = True
-        elif planned_stop_seen[0] and not planned_takeover:
-            planned_stop = True
-        planned_restart = not (planned_takeover or planned_stop) and bool(
-            _best_effort(_planned_restart, "Planned restart marker check failed: %s"))
-        _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
-        sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
-
-        if planned_takeover:
-            logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
-        elif planned_stop:
-            logger.info("Received %s as a planned gateway stop — exiting cleanly", sig_name or "SIGTERM/SIGINT")
-        elif planned_restart:
-            logger.info("Received %s with planned-restart marker — taking the bounded restart path",
-                        sig_name or "SIGTERM")
-        else:
-            # Mirrored onto the runner so _stop_impl suppresses the gateway_state=stopped persist for
-            # unexpected signals; operator stops take the `planned_stop` branch and leave it False (DO persist).
-            _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = True
-            logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
-
-        if _shutdown_ctx is not None and not getattr(runner, "_client_owned", False):
-            def _log_context() -> None:
-                # The most useful line for "gateway keeps dying" tickets.
-                from gateway.shutdown_forensics import format_context_for_log
-                logger.warning("Shutdown context: %s", format_context_for_log(_shutdown_ctx))
-
-            def _diagnostic() -> None:
-                # Heavyweight (comm-only ps, pstree, dmesg), detached so it finishes even if our cgroup is torn
-                # down; bounded by an internal timeout, never blocks.
-                from gateway.shutdown_forensics import spawn_async_diagnostic
-                spawn_async_diagnostic(
-                    _hermes_home / "logs" / "gateway-shutdown-diag.log", _shutdown_ctx["signal"], timeout_seconds=5.0)
-
-            _best_effort(_log_context, "format_context_for_log failed: %s")
-            _best_effort(_diagnostic, "spawn_async_diagnostic failed: %s")
-        if not planned_takeover:
-            # Supervisor/operator SIGNAL stop (bootout, kickstart -k, systemd, s6, bare kill) — the
-            # only kind launchd times with ExitTimeOut. In-band SIGUSR1 restarts never pass through
-            # here, and a sibling-driven --replace takeover is not launchd-timed either, so both
-            # keep the configured drain. _stop_impl uses this to cap the drain to the live budget.
-            runner._stop_requested_by_signal = True
-        if planned_restart:
-            # The SIGUSR1 restart's stop() without its after-turn wait, which launchd's ExitTimeOut
-            # would not allow: bounded post-interrupt sweep, exit 75.
-            asyncio.create_task(runner.stop(restart=True, service_restart=True))
-        else:
-            asyncio.create_task(runner.stop())
-    return shutdown_signal_handler
 
 
 def _start_gateway_claim_pid_file(force: bool = False) -> bool:
@@ -5964,6 +5873,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 async def _start_gateway_impl(config: Optional[GatewayConfig] = None, replace: bool = False,
                               verbosity: Optional[int] = 0, force: bool = False) -> bool:
     """Legacy in-module lifecycle retained for compatibility with older direct callers."""
+    from gateway.run_bootstrap import _start_gateway_make_shutdown_signal_handler
+
     os.environ["HERMES_EXEC_ASK"] = "1"
 
     configured_cwd = os.environ.get("TERMINAL_CWD", "")
@@ -6247,22 +6158,17 @@ def main():
 
 
 def _exit_after_graceful_shutdown(exit_code: int) -> None:
-    """Flush stdio, release the PID file + runtime lock, then hard-exit.
+    """Flush stdio, release the PID file + lock, stamp the clean exit, flush opt-in metrics, hard-exit.
     ``os._exit`` (not ``sys.exit``): SystemExit runs ``Py_FinalizeEx``, which joins every non-daemon
-    thread — exactly the hang a wedged worker causes. It bypasses ``atexit``, so PID/lock release and the
-    bounded log drain (file handlers sit behind a ``QueueListener`` thread) are done here explicitly.
-
-    Graceful teardown is already complete by the time this runs, so there is nothing left that needs a clean
-    interpreter shutdown. See #53107.
-    ``os._exit`` bypasses ``atexit`` handlers, so we cannot rely on the ``atexit``-registered
-    ``remove_pid_file`` / ``release_gateway_runtime_lock`` (registered in ``start_gateway``) to run. The
-    full-shutdown path releases both explicitly in ``_stop_impl``, but the EARLY exit paths —
-    clean-fatal-config (#51228) and startup-aborted-before-running — raise ``SystemExit`` right after
-    ``runner.start()`` without going through ``_stop_impl``, so on those paths ``atexit`` was the only thing
-    releasing them. Now that those paths are routed through this backstop (#53107), release both here
-    explicitly. Both calls are idempotent — ``remove_pid_file`` only unlinks a PID file that belongs to this
-    process, and ``release_gateway_runtime_lock`` no-ops when the lock is already released — so this is a
-    no-op on the normal shutdown path and the actual cleanup on the early-exit paths.
+    thread — exactly the hang a wedged worker causes. It bypasses ``atexit``, so the metrics flush,
+    PID/lock release and the bounded log drain (file handlers sit behind a ``QueueListener`` thread)
+    are done here explicitly; graceful teardown is already complete by the time this runs. See #53107.
+    The atexit-registered ``remove_pid_file`` / ``release_gateway_runtime_lock`` (``start_gateway``) never
+    run either. ``_stop_impl`` releases both on the full shutdown, but the EARLY exits — clean-fatal-config
+    (#51228) and startup-aborted-before-running — raise ``SystemExit`` right after ``runner.start()``
+    without ``_stop_impl``, so atexit was all that released them there; this backstop does now (#53107).
+    Both are idempotent (``remove_pid_file`` only unlinks this process's PID file; the lock release no-ops
+    once released): a no-op on the normal shutdown, the actual cleanup on the early exits.
     """
     for stream in (sys.stdout, sys.stderr):
         with suppress(Exception):
@@ -6284,13 +6190,17 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason="graceful_shutdown")
 
+    def _flush_metrics() -> None:  # after the clean stamp: a supervisor kill mid-flush is no unclean death
+        from hermes_cli.observability.shared_metrics_process import flush_before_hard_exit
+        flush_before_hard_exit()  # the runtimes' atexit flush: open sessions + queued opt-in rows (bounded)
+
     def _drain_logs() -> None:
         # os._exit bypasses the listener's atexit drain. Bounded, no restart — NOT flush_log_queue():
         # a listener wedged on the rotation lock would re-freeze shutdown in an unbounded stop() join.
         from hermes_logging import drain_log_queue
         drain_log_queue(timeout=1.0)
 
-    for _step in (_release_locks, _mark_exited, _drain_logs):
+    for _step in (_release_locks, _mark_exited, _flush_metrics, _drain_logs):
         _best_effort(_step)
     os._exit(exit_code)
 

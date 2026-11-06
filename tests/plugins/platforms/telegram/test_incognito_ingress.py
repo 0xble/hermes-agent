@@ -583,4 +583,3 @@ async def test_picker_without_a_real_message_id_is_unattributed_and_cannot_selec
     query.answer.assert_awaited_once()
     assert getattr(adapter, f"_{kind}_picker_state")["100"] is state
     assert not is_incognito()
-

@@ -439,6 +439,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.journal = candidate
             self.failure = None
 
+    def append_message(self, session_id, role, content=None, *, archived=False,
+                       compression_lock_holder=None, turn_lease_holder=None,
+                       turn_lease_ttl_seconds=300.0, **metadata):
+        self._session(session_id)
+        payload = dict(metadata, role=role, content=content, archived=archived,
+            compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+        return self._apply('transcript.append_one', payload)['row_id']
+
     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
         self._session(session_id)
@@ -568,8 +577,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self._apply('session.sidecars', {'patch': patch})
 
     def update_session_tool_names(self, session_id, pin):
-        # The tools[] freeze pin ({"version", "tools"}; None clears): without it every fresh worker
-        # re-probes check_fns and a config flip between turns silently forks the cached prefix.
+        # The tools[] freeze pin ({"version", "tools"[, "delegation_backend"]}; None clears): without it every
+        # fresh worker re-probes check_fns and a config flip between turns silently forks the cached prefix.
         self._session(session_id)
         self._apply('session.tools', {'tool_names': pin})
 

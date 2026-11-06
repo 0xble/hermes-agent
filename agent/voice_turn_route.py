@@ -31,7 +31,7 @@ _REJECTION_FIELDS = ("_reasoning_disable_rejected", "_reasoning_floor_required",
 _REASONING_FIELDS = ("reasoning_config", "reasoning_override", "_pre_fallback_reasoning_override")
 _EXTRA_FIELDS = (
     "_fallback_activated", "_fallback_index", "_provider_fallback_active", "_provider_fallback_route",
-    "_active_fallback_entry", "_fallback_stay_started_at", "_fallback_episode_cooled",
+    "_active_fallback_entry", "_fallback_stay_started_at", "_fallback_episode_cooled", "_provider_fallback_silent_retry",
     "_rate_limit_backoff_count", "_credential_pool", "_credential_pool_entry_id", "_config_context_length",
     "_bedrock_region", "_bedrock_guardrail_config", "_codex_reasoning_replay_enabled",
     "_codex_reasoning_replay_rejected", "_transport_cache",
@@ -197,7 +197,8 @@ class _SessionRuntimeView:
 
     def __init__(self, agent: Any, state: dict[str, Any]) -> None:
         snapshot = state.get("snapshot") or {}
-        own = {name: snapshot[name] for name in ("model", "provider", "base_url", "api_mode") if name in snapshot}
+        own = {name: snapshot[name] for name in
+               ("model", "provider", "requested_provider", "base_url", "api_mode") if name in snapshot}
         if "anthropic_base_url" in snapshot:
             own["_anthropic_base_url"] = snapshot["anthropic_base_url"]
         own["reasoning_config"] = state.get("reasoning_config")

@@ -411,6 +411,8 @@ class CLIInitMixin:
     def _init_runtime_state(self, resume):
         """Session store + all per-run mutable state (queues, overlays, pet/voice/status-bar fields)."""
         from cli import _hermes_home
+        from hermes_cli.left_core_migration import serve_notices_on_stderr
+        serve_notices_on_stderr()
         # A signature change across turns (/model, credential rotation) rebuilds the agent.
         self._active_agent_route_signature = None
         self.agent: Optional[Any] = None  # initialized on first use
@@ -463,11 +465,62 @@ class CLIInitMixin:
         if held and not self._claim_active_session("cli", stderr=True):
             raise RuntimeError("session_already_owned")
 
+    def _ensure_gateway_session(self):
+        """Create (or resume) this CLI's gateway session and adopt the id it returns, before the banner
+        and the first turn. Idempotent; a store without the gateway facade (tests) is left alone."""
+        from hermes_cli.gateway_session_store import GatewaySessionStore
+        store = getattr(self, "_session_db", None)
+        if getattr(self, "_gateway_session_open", False) or not isinstance(store, GatewaySessionStore):
+            return
+        launch = _gateway_launch(self)
+        held = getattr(self, "_resumed", False) and getattr(self, "_active_session_lease", None) is not None
+        _record_shell_hook_consent()
+        with lease_handed_over(self, held):
+            sid = store.open_session(self, launch)
+            self._gateway_session_open = True
+            from hermes_cli import gateway_plugin_commands, tools_config
+            tools_config._gateway_plugin_toolsets = lambda: gateway_plugin_commands.toolsets(self)
+            _adopt_gateway_toolsets(self, store)
+            from hermes_cli.gateway_tools import bind_session
+            bind_session(self, store.connection)  # the session's processes, before _init_agent's chat proxy
+            if sid and sid != self.session_id:
+                self.session_id = sid
+                getattr(self, "_write_terminal_breadcrumb", lambda: None)()
+
     def _new_session_id(self, now, *, branch_of=None, title=None):
         """The id main mints for /new (``new_session_id``) and /branch (``mint_session_id``). On a gateway
         store it is a session the gateway created: /new is a fresh ``session.create`` on the profile's
         default model (an explicit -m was for the previous session only) with the run's other launch
         flags, /branch the child of ``session.mutate branch``. Before this CLI opened its gateway session (or off the gateway) it is
+        main's local mint, which ``_ensure_gateway_session`` replaces on first use, as at startup."""
+        from hermes_cli.gateway_session_store import GatewaySessionStore
+        store = getattr(self, "_session_db", None)
+        if not isinstance(store, GatewaySessionStore) or not getattr(self, "_gateway_session_open", False):
+            from hermes_state_ids import new_session_id
+            return new_session_id(now)
+        if branch_of:
+            child = store.branch(branch_of, title)
+            # Main's with_session_yolo: a live /yolo carries onto the branch. The gateway's child starts
+            # without the parent's toggle, so set it there too (/branch moves the CLI's own flag over).
+            # Approvals run on the gateway, so this write is not toggle_session_yolo's best-effort persist:
+            # a failure raises before the child shows YOLO locally.
+            from tools.approval import enable_session_yolo, is_session_yolo_enabled
+            if is_session_yolo_enabled(branch_of):
+                store.set_session_yolo(child, True)
+                enable_session_yolo(child)
+            return child
+        # The run's other launch flags hold for every session it opens, as main's one AIAgent did across /new.
+        launch = {key: value for key, value in _gateway_launch(self).items() if key not in _ROUTE_FLAGS}
+        sid = store.create(launch, record_cwd=False)
+        self.session_id = sid
+        return sid
+
+    def _new_session_id(self, now, *, branch_of=None, title=None):
+        """The id main mints for /new (``new_session_id``) and /branch (``mint_session_id``). On a gateway
+        store it is a session the gateway created: /new is a fresh ``session.create`` on the profile's
+        default model (an explicit -m was for the previous session only) with the run's other launch
+        flags, /branch the child of
+        ``session.mutate branch``. Before this CLI opened its gateway session (or off the gateway) it is
         main's local mint, which ``_ensure_gateway_session`` replaces on first use, as at startup."""
         from hermes_cli.gateway_session_store import GatewaySessionStore
         store = getattr(self, "_session_db", None)
@@ -525,57 +578,6 @@ class CLIInitMixin:
             from gateway.warning_notifications import render_notification
             render_notification(_present_store_warning, platform="cli")
         # No state.db / checkpoint maintenance here: the gateway (the single writer) runs both.
-
-    def _ensure_gateway_session(self):
-        """Create (or resume) this CLI's gateway session and adopt the id it returns, before the banner
-        and the first turn. Idempotent; a store without the gateway facade (tests) is left alone."""
-        from hermes_cli.gateway_session_store import GatewaySessionStore
-        store = getattr(self, "_session_db", None)
-        if getattr(self, "_gateway_session_open", False) or not isinstance(store, GatewaySessionStore):
-            return
-        launch = _gateway_launch(self)
-        held = getattr(self, "_resumed", False) and getattr(self, "_active_session_lease", None) is not None
-        _record_shell_hook_consent()
-        with lease_handed_over(self, held):
-            sid = store.open_session(self, launch)
-            self._gateway_session_open = True
-            from hermes_cli import gateway_plugin_commands, tools_config
-            tools_config._gateway_plugin_toolsets = lambda: gateway_plugin_commands.toolsets(self)
-            _adopt_gateway_toolsets(self, store)
-            from hermes_cli.gateway_tools import bind_session
-            bind_session(self, store.connection)  # the session's processes, before _init_agent's chat proxy
-            if sid and sid != self.session_id:
-                self.session_id = sid
-                getattr(self, "_write_terminal_breadcrumb", lambda: None)()
-
-    def _new_session_id(self, now, *, branch_of=None, title=None):
-        """The id main mints for /new (``new_session_id``) and /branch (``mint_session_id``). On a gateway
-        store it is a session the gateway created: /new is a fresh ``session.create`` on the profile's
-        default model (an explicit -m was for the previous session only) with the run's other launch
-        flags, /branch the child of
-        ``session.mutate branch``. Before this CLI opened its gateway session (or off the gateway) it is
-        main's local mint, which ``_ensure_gateway_session`` replaces on first use, as at startup."""
-        from hermes_cli.gateway_session_store import GatewaySessionStore
-        store = getattr(self, "_session_db", None)
-        if not isinstance(store, GatewaySessionStore) or not getattr(self, "_gateway_session_open", False):
-            from hermes_state_ids import new_session_id
-            return new_session_id(now)
-        if branch_of:
-            child = store.branch(branch_of, title)
-            # Main's with_session_yolo: a live /yolo carries onto the branch. The gateway's child starts
-            # without the parent's toggle, so set it there too (/branch moves the CLI's own flag over).
-            # Approvals run on the gateway, so this write is not toggle_session_yolo's best-effort persist:
-            # a failure raises before the child shows YOLO locally.
-            from tools.approval import enable_session_yolo, is_session_yolo_enabled
-            if is_session_yolo_enabled(branch_of):
-                store.set_session_yolo(child, True)
-                enable_session_yolo(child)
-            return child
-        # The run's other launch flags hold for every session it opens, as main's one AIAgent did across /new.
-        launch = {key: value for key, value in _gateway_launch(self).items() if key not in _ROUTE_FLAGS}
-        sid = store.create(launch, record_cwd=False)
-        self.session_id = sid
-        return sid
 
     def _init_ui_state(self):
         """Per-run mutable UI state; must exist before any chat() call since -q never goes through run()."""

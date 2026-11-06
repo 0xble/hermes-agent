@@ -1032,6 +1032,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
         from gateway.run import _AGENT_PENDING_SENTINEL
         if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
                 and not handover_accepts_received(self, source)):
             if await self._route_plaintext_approval_while_busy(event, _quick_key):
                 return None
@@ -1451,6 +1452,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
                 and not handover_accepts_received(self, source)):
             self._preserve_drain_event(self._session_key_for_source(source), event)
             return True, None, command
@@ -1942,6 +1944,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # here would send it a second time.
             return None
         if (self._draining and not self._hm_is_registered_command(event)
+                and getattr(event, "_admitted_before_drain", False) is not True
                 and not handover_accepts_received(self, source)):
             from gateway.session_retry_admission import refuse_deferred_retry
             refuse_deferred_retry(event)
@@ -2170,7 +2173,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.debug("Failed to restore one-turn model override", exc_info=True)
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
-        """Attribute the sender in shared multi-user sessions and prepend history-backfill channel context."""
+        """Attribute the sender in shared multi-user sessions."""
         _is_shared_multi_user = is_shared_multi_user_session(
             source, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
@@ -2185,9 +2188,6 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if source.platform == Platform.SLACK and source.user_id:
                 _safe_user_name = f"{_safe_user_name} | Slack user <@{source.user_id}>"
             message_text = f"[{_safe_user_name}] {message_text}"
-        # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
-        if getattr(event, "channel_context", None):
-            message_text = event.channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY + message_text
         return message_text
 
     @staticmethod
@@ -2452,6 +2452,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
+        # Keep current media after the recall boundary, not among discarded backfill.
+        # The sender prefix stays on the caption, after the media notes.
+        if channel_context := getattr(event, "channel_context", None):
+            message_text = channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY + message_text
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
         from gateway.session_context_refs import turn_references

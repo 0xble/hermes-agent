@@ -101,16 +101,7 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return max_dimension if 512 <= max_dimension <= 8000 else None
 
 
-def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
-    """Refresh Nous runtime credentials after a fresh paid-entitlement check."""
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        if get_nous_portal_account_info(force_fresh=True).paid_service_access is not True:
-            return False
-        return agent._try_refresh_nous_client_credentials(force=True)
-    except Exception:
-        return False
+from agent.turn_recovery_entitlement import _try_refresh_nous_paid_entitlement_credentials as _try_refresh_nous_paid_entitlement_credentials
 
 
 def _repair_transport_credentials(agent: Any) -> bool:
@@ -401,10 +392,10 @@ def _print_anthropic_401_diagnostics(agent: Any, key: Any) -> None:
 def _refresh_credentials_after_401(
     agent: Any, api_error: Exception, _retry: TurnRetryState, status_code: Optional[int]
 ) -> bool:
-    """Per-provider one-shot credential refresh on 401 (codex/xai, vertex, nous, copilot,
-    anthropic), printing user-facing diagnostics when the nous/anthropic refresh fails.
-    Returns True when a refresh succeeded and the call should be retried."""
-    from agent.conversation_loop import _is_copilot_provider
+    """Per-provider one-shot credential refresh on 401 (codex/xai, vertex, nous, a profile's
+    ``refresh_runtime_credentials``, anthropic), printing user-facing diagnostics when the
+    nous/anthropic refresh fails. Returns True when a refresh succeeded and the call should be retried."""
+    from agent.conversation_loop import _credential_refresh_profile
 
     if status_code != 401:
         return False
@@ -433,10 +424,12 @@ def _refresh_credentials_after_401(
             agent._buffer_vprint("🔐 Nous agent key refreshed after 401. Retrying request...")
             return True
         _print_nous_401_diagnostics(agent, api_error)
-    if _is_copilot_provider(agent) and not _retry.copilot_auth_retry_attempted:
-        _retry.copilot_auth_retry_attempted = True
-        if agent._try_refresh_copilot_client_credentials():
-            agent._buffer_vprint("🔐 Copilot credentials refreshed after 401. Retrying request...")
+    if not _retry.provider_auth_refresh_attempted and (profile := _credential_refresh_profile(agent)) is not None:
+        _retry.provider_auth_refresh_attempted = True
+        if agent._try_refresh_provider_runtime_credentials(reason="unauthorized"):
+            from agent.provider_route_hooks import ask_on_error_path
+            agent._buffer_vprint("🔐 " + (ask_on_error_path(profile, "credential_refresh_notice", "", reason="unauthorized") or (
+                f"{profile.display_name or profile.name} credentials refreshed after 401. Retrying request...")))
             return True
     if (
         agent.api_mode == "anthropic_messages"
@@ -1052,6 +1045,9 @@ def nonretryable_client_error_result(
         )
     _welcome_hint = _welcome_tier_guidance(classified, model=model, in_chat=False)
     _prefix_suggestion = _missing_vendor_prefix_suggestion(api_error, provider, model)
+    from hermes_cli.left_core_migration import host_install_hint
+    if _moved_hint := host_install_hint(base_url):  # a host whose plugin left core: install it first
+        _vlines(agent, f"   💡 {_moved_hint}")
     if _welcome_hint:
         # A free-tier gate or a wrong-host refusal: the way forward is a sign-in or another
         # provider, never the key/credits advice below.

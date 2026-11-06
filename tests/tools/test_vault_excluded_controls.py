@@ -2,6 +2,7 @@
 import json
 from unittest.mock import Mock
 import pytest
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_store import VaultItemMeta
 from tools import browser_vault_tool as vault
 
@@ -10,9 +11,10 @@ from tools import browser_vault_tool as vault
     ('otp','',''), ('otp','','current-password'),
 ])
 def test_excluded_fields_never_resolve_password(monkeypatch,name,label,autocomplete):
-    backend=Mock()
-    backend.needs_unlock=False
-    backend.get_meta.return_value=VaultItemMeta(id='op:test',kind='login',label='Synthetic',origin='https://example.com',created_at='')
+    backend = LocalLoginBackend()
+    backend.get_meta = Mock(return_value=VaultItemMeta(
+        id='op:test', kind='login', label='Synthetic', origin='https://example.com', created_at=''))
+    backend.resolve_password = Mock()
     monkeypatch.setattr('agent.vault_backends.backend_for_handle',lambda _:backend)
     monkeypatch.setattr(vault,'_focus_bound_origin',lambda *_:None)
     monkeypatch.setattr(vault,'_current_page_origin',lambda _:'https://example.com')
@@ -26,11 +28,11 @@ def test_excluded_fields_never_resolve_password(monkeypatch,name,label,autocompl
 
 @pytest.mark.parametrize('mixed', [False, True])
 def test_text_password_candidate_never_outranks_real_password(monkeypatch, mixed):
-    backend = Mock(needs_unlock=False)
+    backend = LocalLoginBackend()
     backend.name = 'onepassword'
-    backend.get_meta.return_value = VaultItemMeta(id='op:test', kind='login', label='Synthetic',
-                                                 origin='https://example.com', created_at='')
-    backend.resolve_password.return_value = 'synthetic-only'
+    backend.get_meta = Mock(return_value=VaultItemMeta(
+        id='op:test', kind='login', label='Synthetic', origin='https://example.com', created_at=''))
+    backend.resolve_password = Mock(return_value='synthetic-only')
     monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda _: backend)
     monkeypatch.setattr(vault, '_focus_bound_origin', lambda *_: None)
     monkeypatch.setattr(vault, '_current_page_origin', lambda _: 'https://example.com')
