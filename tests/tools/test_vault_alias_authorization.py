@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_store import VaultItemMeta
 from tools import browser_vault_tool as vault
 
@@ -15,11 +16,11 @@ def alias_fill(monkeypatch):
     meta = VaultItemMeta(id="op:synthetic-alias", kind="login", label="Synthetic login",
                          origin="https://example.test", allowed_origins=("https://example.test",),
                          created_at="", has_otp=True)
-    backend = Mock(browser_account="", needs_unlock=False)
+    backend = LocalLoginBackend()
     backend.name = "onepassword"
-    backend.get_meta.return_value = meta
-    backend.resolve_password.return_value = "synthetic-password"
-    backend.resolve_otp.return_value = "246810"
+    backend.get_meta = Mock(return_value=meta)
+    backend.resolve_password = Mock(return_value="synthetic-password")
+    backend.resolve_otp = Mock(return_value="246810")
     config = {"vault": {"origin_aliases": {meta.id: [origin]}}}
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
     monkeypatch.setattr("agent.vault_backends.backend_for_handle", lambda _: backend)
@@ -41,7 +42,7 @@ def alias_fill(monkeypatch):
 @pytest.mark.parametrize("confirm", [True, False])
 @pytest.mark.parametrize("decision", ["decline", "timeout"])
 def test_alias_refusal_survives_confirmation_preference_change(alias_fill, monkeypatch, action, confirm, decision):
-    backend, config, write, origin = alias_fill
+    backend, config, write, _origin = alias_fill
     monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *_: decision)
     args = {"action": action, "handle": backend.get_meta.return_value.id}
     declined = json.loads(vault._handle_vault(args, task_id="alias-refusal"))

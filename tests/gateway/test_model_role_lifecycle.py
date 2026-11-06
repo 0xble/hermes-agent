@@ -434,6 +434,8 @@ async def test_real_session_boundary_role_io_is_off_loop_and_unchanged_is_not_wr
     if held:
         await runner._set_session_model_role(lane.key, "fast")
     runner._session_db = SimpleNamespace(get_session_title=AsyncMock(return_value="target"))
+    monkeypatch.setattr("gateway.session_route_recovery.conversation_head",
+                        AsyncMock(return_value=(None, None, "target")))
     monkeypatch.setattr(runner, "_resolve_resume_target", AsyncMock(return_value=("target", "target")))
     monkeypatch.setattr(runner, "_resume_access_denied_reply", AsyncMock(return_value=None))
     monkeypatch.setattr(runner, "_cleanup_old_agent_for_reset", AsyncMock())

@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import gateway.run as run_mod
+import gateway.run_bootstrap as bootstrap
 import gateway.shutdown_forensics as forensics
 from gateway import status
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
@@ -63,7 +64,7 @@ async def _deliver_sigterm(monkeypatch):
     monkeypatch.setattr(run_mod.asyncio, "create_task", _record)
     signal_initiated = [False]
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
-        run_mod._start_gateway_make_shutdown_signal_handler(runner, signal_initiated)(signal.SIGTERM)
+        bootstrap._start_gateway_make_shutdown_signal_handler(runner, signal_initiated)(signal.SIGTERM)
         await asyncio.wait_for(created[0], timeout=10)
     return runner, sweeps, signal_initiated[0]
 

@@ -15,8 +15,6 @@ from gateway.turn_context import TurnContext
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from tools import approval, approval_context, approval_prompt
 from tools.approval_gateway_wait import _ApprovalEntry, _await_gateway_decision
-from tools.mcp_tool_handlers import _trust_gate_check
-from tools import mcp_tool as _core
 
 
 @pytest.mark.parametrize("one_shot", [True, False], ids=["mcp", "terminal"])
@@ -28,8 +26,6 @@ def test_gateway_scope_reaches_telegram_and_controls_resolution(monkeypatch, one
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "12345")
     monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 2)
-    monkeypatch.setattr(_core, "_server_trust_levels", {"test": _core._TRUST_UNTRUSTED})
-    monkeypatch.setattr(_core, "_tool_read_only_hints", {})
     monkeypatch.setattr(approval, "_gateway_queues", {})
     monkeypatch.setattr(approval, "_gateway_notify_cbs", {})
     monkeypatch.setattr(approval, "_session_approved", {})
@@ -98,10 +94,11 @@ def test_gateway_scope_reaches_telegram_and_controls_resolution(monkeypatch, one
     approval.register_gateway_notify(session, notify)
     try:
         if one_shot:
-            # The trust gate itself re-enters the prompt on every invocation.
+            # Unremembered elicitation (including vault payments) re-enters the
+            # prompt for every call. MCP trust grants have their own scoped policy.
             for _ in range(2):
-                result = _trust_gate_check("test", "write")
-                assert (result is None) == (choice == "once")
+                result = approval_prompt.request_elicitation_consent("Confirm this call", "One-shot consent")
+                assert (result == "accept") == (choice == "once")
             assert len(prompts) == 2
             assert not approval._session_approved
             assert not approval._permanent_approved

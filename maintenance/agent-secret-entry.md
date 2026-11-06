@@ -27,9 +27,11 @@ Unchanged boundaries:
   given by the user in chat is never a source. Only a value deliberately fetched
   from an authorized store for that service counts. Never ask for or accept a
   secret in chat, or repeat one in a reply.
-- Cards: prefer `browser_vault_fill` first. Direct entry may follow only a real
-  fill or field failure: `no_payment_fields`, a partial fill, missed fields, or a
-  processor frame. Read each native field at entry with
+- Cards: prefer `browser_vault_fill` first. Direct entry may follow in two
+  cases: (1) a real fill or field failure: `no_payment_fields`, a partial fill,
+  missed fields, or a processor frame; or (2) `approval_unavailable` (no prompt
+  surface), only when the user explicitly approved this exact charge in this
+  session's conversation. Read each native field at entry with
   `onepass --account <alias> read 'op://<vault>/<item>/ccnum'` (or `cvv`, `expiry`)
   and type it with `browser_type` or `fill_input` on the verified merchant origin.
   An approved exact charge means the user explicitly approved the merchant,
