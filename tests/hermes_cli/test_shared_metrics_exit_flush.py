@@ -214,6 +214,10 @@ def test_exit_flush_applies_each_profiles_own_consent(tmp_path, monkeypatch):
                 _wait_for(home, "hermes.task_run.finished")
             finally:
                 reset_hermes_home_override(token)
+        # Drain writes admitted while consent was still enabled before taking the revoked baseline.
+        host = relay_runtime.get_runtime(create=False, profile_key=str(revoked))
+        assert host is not None
+        host.relay.subscribers.flush()
         _write_policy(revoked, enabled=False, send=False)
         rows_before_exit = _metric_names(revoked)
 
