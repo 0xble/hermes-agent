@@ -20,7 +20,14 @@ def _make_session(sid="proc_test123", task_id="t1", persist=False, survive=False
 
 
 @pytest.fixture()
-def registry():
+def registry(monkeypatch, tmp_path):
+    # Lifecycle units need neither the operator's PATH store nor CLI dependency activation.
+    from pm import environments
+    from tools.environments import local
+
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setattr(local, "_resolve_hermes_bin_dir", lambda: None)
+    monkeypatch.setattr(environments, "activate_dependencies", lambda root: None)
     return ProcessRegistry()
 
 

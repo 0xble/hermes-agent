@@ -31,12 +31,13 @@ def registry():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_spawn_host_state(monkeypatch):
+def _isolate_spawn_host_state(monkeypatch, tmp_path):
     """Keep scope probes and console-script discovery off the operator's install."""
     import tools.process_registry as _pr
     from tools.environments import local as local_env
 
-    # Same spawn-unit seam as test_persist_on_release: PATH discovery is tested separately.
+    # Isolate PM's PATH store as in test_store_path_dirs_cache, plus console-script discovery.
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
     monkeypatch.setattr(local_env, "_resolve_hermes_bin_dir", lambda: None)
     original = _pr._SYSTEMD_SCOPE_AVAILABLE
     _pr._SYSTEMD_SCOPE_AVAILABLE = False

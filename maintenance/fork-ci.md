@@ -139,15 +139,21 @@ readiness predicate false until release. Exit-zero and parent-only TERM
 assertions remain unchanged, as do production parent-first signalling, grace
 windows, worker counts and timeouts.
 
-The process-registry unit fixture also isolates console-script discovery using
-`_resolve_hermes_bin_dir = lambda: None`, the existing spawn-unit seam in
-`test_persist_on_release`. These tests exercise process spawning and teardown,
+The process-registry unit fixture isolates PM's PATH store with a temporary
+`HERMES_RUNTIME_DIR` (as in `test_store_path_dirs_cache`) and console-script
+discovery with `_resolve_hermes_bin_dir = lambda: None` (as in
+`test_persist_on_release`). These tests exercise process spawning and teardown,
 not the operator's managed Hermes installation. The payload-aware resolver
 introduced in `3383a1d8b3` probes a sibling `manifest.json`; in a checkout under
 real `HERMES_HOME`, that sibling is correctly outside HomeIOGuard's source-tree
-exemption. Leave payload discovery, the home guard and every process assertion
-unchanged. Run the full registry file alongside the real-home tripwire tests;
-retire this fixture adaptation when upstream isolates the same host lookup.
+exemption. The persistence lifecycle fixture owns the same temporary PM store
+and stubs unrelated dependency activation when importing `run_agent` for cleanup
+hooks; it still executes the real lifecycle method, survivor wrapper and registry.
+An exact-main fixture reproduced all eighteen original guard failures before
+this isolation; isolating console-script discovery alone did not fix PM's
+independent store lookup. Leave payload discovery, the home guard and every
+process assertion unchanged. Run both process files alongside the real-home
+tripwire tests; retire this adaptation when upstream isolates those host lookups.
 
 Prompt-surface review keeps full commit ancestry for the merge-base comparison,
 but its checkout uses Git's `blob:none` partial-clone filter. Fetching every
