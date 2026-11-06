@@ -8,6 +8,14 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def source_checkout_env(tmp_path, monkeypatch):
+    # Bootstrap must use source-checkout dependencies, not probe a sealed payload
+    # or install metadata beside a checkout that may live inside the real home.
+    monkeypatch.setattr("pm.paths.repo_root", lambda: tmp_path / "source")
+    monkeypatch.setattr("pm.environments._payload_manifest", lambda _: None)
+
+
 @pytest.mark.platforms("posix")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entrypoint", ["bootstrap", "legacy"])
