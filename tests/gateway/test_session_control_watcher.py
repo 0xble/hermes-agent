@@ -78,6 +78,9 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
         async def _run_in_executor_with_context(self, func, *args):
             return func(*args)
 
+        def _admit_bot_chain(self, event):
+            return True
+
         async def _warm_goals_session_db(self, _label):
             return None
 

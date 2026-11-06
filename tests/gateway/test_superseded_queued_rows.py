@@ -67,7 +67,7 @@ async def test_new_before_startup_recovery_cancels_the_routes_queued_rows(monkey
 @pytest.mark.asyncio
 async def test_a_superseded_sessions_queued_rows_can_be_cancelled_then_deleted(monkeypatch):
     from tests.fakes.runtime_owner import initialize_session_authority
-    from gateway.session_contract import Principal, SessionRef
+    from gateway.session_contract import SessionActor, SessionRef
 
     runner, adapter = _setup(monkeypatch)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
@@ -81,7 +81,7 @@ async def test_a_superseded_sessions_queued_rows_can_be_cancelled_then_deleted(m
     runner.session_store.reset_session(key)
     assert runner.session_store.peek_session_id(key) != owner
 
-    actor = Principal('messaging-control', authority.profile_id,
+    actor = SessionActor('messaging-control', authority.profile_id,
                       frozenset({'session:submit', 'session:control'}), 'operator')
     ref = SessionRef(authority.profile_id, owner)
     for admission_id in queued:

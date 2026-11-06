@@ -23,7 +23,7 @@ def isolated_ledger(monkeypatch):
         monkeypatch.setattr(lifecycle, name, value)
         if hasattr(transport, name):
             monkeypatch.setattr(transport, name, value)
-    monkeypatch.setattr("tools.mcp_tool._update_death_supervisor", lambda *args: None)
+    monkeypatch.setattr("hermes_cli.process_identity._update_supervised_pgids", lambda *args: None)
 
 
 @pytest.mark.parametrize("ledger", ["empty", "dead", "reused", "unverifiable", "exits_during_scan"])
@@ -77,7 +77,7 @@ def test_reaper_skips_wait_and_signals_without_a_live_owned_incarnation(monkeypa
         original.create_time.return_value = 100.0
         monkeypatch.setattr(psutil, "Process", lambda _: original)
         monkeypatch.setattr(lifecycle.os, "getpgid", lambda _: os.getpgrp(), raising=False)
-        monkeypatch.setattr("hermes_cli.process_identity.register_child", lambda *args: None)
+        monkeypatch.setattr(transport, "register_child", lambda *args: None)
         server = SimpleNamespace(name="test")
         transport.MCPServerTransportMixin._track_spawned_children(server, {pid})
         # A handle whose (pid, create-time) no longer matches must be discarded.
@@ -121,7 +121,7 @@ def test_recycled_pgid_with_unrelated_session_is_not_signalled(monkeypatch):
     monkeypatch.setattr(lifecycle.os, "killpg", Mock(), raising=False)
     calls = []
     monkeypatch.setattr(
-        "tools.mcp_tool._update_death_supervisor",
+        "hermes_cli.process_identity._update_supervised_pgids",
         lambda verb, pgids: calls.append((verb, set(pgids))),
     )
 
@@ -195,7 +195,7 @@ def test_exited_replacement_leader_cannot_authorize_unwitnessed_survivor(monkeyp
     monkeypatch.setattr(psutil, "wait_procs", wait)
     calls = []
     monkeypatch.setattr(
-        "tools.mcp_tool._update_death_supervisor",
+        "hermes_cli.process_identity._update_supervised_pgids",
         lambda verb, pgids: calls.append((verb, set(pgids))),
     )
     server = SimpleNamespace(name="test")
@@ -232,7 +232,7 @@ def test_active_group_without_spawn_witness_is_not_signalled(monkeypatch):
     monkeypatch.setattr(psutil, "wait_procs", wait)
     calls = []
     monkeypatch.setattr(
-        "tools.mcp_tool._update_death_supervisor",
+        "hermes_cli.process_identity._update_supervised_pgids",
         lambda verb, pgids: calls.append((verb, set(pgids))),
     )
 
@@ -258,7 +258,7 @@ def test_unverifiable_live_group_is_not_unregistered(monkeypatch):
     monkeypatch.setattr(psutil, "process_iter", lambda: [proc])
     calls = []
     monkeypatch.setattr(
-        "tools.mcp_tool._update_death_supervisor",
+        "hermes_cli.process_identity._update_supervised_pgids",
         lambda verb, pgids: calls.append((verb, set(pgids))),
     )
 

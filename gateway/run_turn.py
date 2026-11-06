@@ -2899,17 +2899,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event and session_key and hasattr(adapter, "_pending_messages"):
-                # The drain already dequeued this event and promoted the next one into the slot, so
-                # it is the OLDEST waiting message: put it back at the head, never behind newer ones.
-                existing = adapter._pending_messages.get(session_key)
-                if existing is not None and existing is not pending_event:
-                    self._session_state(session_key).conversation.queued_events.insert(0, existing)
-                adapter._pending_messages[session_key] = pending_event
-                pending_event._gateway_accepted = True
+            if adapter and session_key and hasattr(adapter, "_pending_messages"):
+                self._requeue_at_depth_cap(session_key, source, pending_event, pending)
+                if pending_event is not None:
+                    pending_event._gateway_accepted = True
             elif adapter and hasattr(adapter, 'queue_message'):
-                # Legacy adapters expose only a text queue API. Pass the event contract when the
-                # adapter supports keyword metadata, then fall back without changing old adapters.
+                # Legacy adapters keep the fork's event metadata contract.
                 try:
                     adapter.queue_message(
                         session_key, pending, reply_expected=turn_ctx.reply_expected,

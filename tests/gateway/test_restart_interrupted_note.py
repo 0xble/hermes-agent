@@ -1556,6 +1556,8 @@ async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monke
     store.mark_resume_pending(entry.session_key, turn_id="turn-marker", human=True)
     marker = store.get_resume_pending_marker(entry.session_key)
     runner = object.__new__(GatewayTurnMixin)
+    runner._note_bot_reply = lambda source: None
+    runner._run_in_executor_with_context = asyncio.to_thread
     runner.async_session_store = AsyncSessionStore(store)
     runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
     runner._hmwa_prepare_turn = AsyncMock(
@@ -1600,6 +1602,8 @@ async def test_post_delivery_clear_accepts_same_turn_drain_remark_but_not_succes
     store.mark_resume_pending(entry.session_key, turn_id="turn-interrupted", human=True)
     marker_a = store.get_resume_pending_marker(entry.session_key)
     runner = object.__new__(GatewayTurnMixin)
+    runner._note_bot_reply = lambda source: None
+    runner._run_in_executor_with_context = asyncio.to_thread
     runner.async_session_store = AsyncSessionStore(store)
     runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
     runner._hmwa_prepare_turn = AsyncMock(

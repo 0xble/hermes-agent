@@ -21,7 +21,7 @@ async def _run(tmp_path, monkeypatch, reply, native=False):
     from gateway.config import Platform
     from gateway.session import SessionSource
     from gateway.session_authority import LiveSession
-    from gateway.session_contract import Principal, SessionRef
+    from gateway.session_contract import SessionActor, SessionRef
     from gateway.session_results import execution_result
     from tests.gateway.test_prompt_attachments import _authority as _store_authority
 
@@ -39,7 +39,7 @@ async def _run(tmp_path, monkeypatch, reply, native=False):
     async def deliver(adapter, event, session_key, response):
         log.append(('sent', response))
     monkeypatch.setattr(session_ingress, 'deliver_response', deliver)
-    actor = Principal('human', 'p', frozenset({'session:submit'}), 't')
+    actor = SessionActor('human', 'p', frozenset({'session:submit'}), 't')
     if native:
         from gateway.platforms.event import MessageEvent
 

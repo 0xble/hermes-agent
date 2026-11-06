@@ -151,13 +151,13 @@ async def test_real_process_metadata_still_rejects_unknown_key(tmp_path, monkeyp
 async def test_valid_retry_stamp_crosses_snapshot_and_restore(tmp_path, monkeypatch, local):
     from gateway.session_automation import restore_local_automation
     from tests.gateway.test_automation_notification_category import _authority
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_local import create_local_session
     from gateway.session_local_title import title_new_session
     stamp = {'delegation_id': 'deleg-retry', 'claim': 'retry:fixture'}
     if local:
         runner, authority = await _authority(tmp_path, monkeypatch)
-        actor = Principal('owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'fixture')
+        actor = SessionActor('owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'fixture')
         ref = create_local_session(authority, actor, dict(request_id='local', source='gui', model='fixture', toolsets=[]))
         live = authority.sessions[ref.session_id]
         title_new_session(authority, ref, 'local')
