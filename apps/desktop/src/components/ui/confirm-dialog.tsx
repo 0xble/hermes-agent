@@ -61,6 +61,7 @@ export function ConfirmDialog({
   const { t } = useI18n()
   const confirmRef = useRef<HTMLButtonElement>(null)
   const closeTimerRef = useRef<null | number>(null)
+  const mountedRef = useRef(false)
   const [status, setStatus] = useState<'done' | 'idle' | 'saving'>('idle')
   const [error, setError] = useState<null | string>(null)
   const busy = status === 'saving' || status === 'done'
@@ -86,7 +87,11 @@ export function ConfirmDialog({
   // It happens on unmount only, and it clears the handle this component owns.
   // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
+    mountedRef.current = true
+
     return () => {
+      mountedRef.current = false
+
       if (closeTimerRef.current !== null) {
         window.clearTimeout(closeTimerRef.current)
         closeTimerRef.current = null
@@ -104,8 +109,15 @@ export function ConfirmDialog({
     if (dismissOnConfirm) {
       try {
         await onConfirm()
+
+        if (!mountedRef.current) {
+          return
+        }
         onClose()
       } catch (err) {
+        if (!mountedRef.current) {
+          return
+        }
         setError(err instanceof Error ? err.message : t.errors.genericFailure)
       }
 
@@ -116,12 +128,22 @@ export function ConfirmDialog({
 
     try {
       await onConfirm()
+
+      if (!mountedRef.current) {
+        return
+      }
       setStatus('done')
       closeTimerRef.current = window.setTimeout(() => {
         closeTimerRef.current = null
-        onClose()
+
+        if (mountedRef.current) {
+          onClose()
+        }
       }, 600)
     } catch (err) {
+      if (!mountedRef.current) {
+        return
+      }
       setStatus('idle')
       setError(err instanceof Error ? err.message : t.errors.genericFailure)
     }
