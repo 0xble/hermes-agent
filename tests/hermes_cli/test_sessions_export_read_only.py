@@ -161,7 +161,7 @@ def test_verified_delete_keeps_writer_and_requires_confirmation(tmp_path, fmt):
     args = ["--session-id", "export-target", "--format", fmt, "--delete-after-verified", str(output)]
 
     refused = _run_cli(tmp_path, home, *args)
-    assert refused.returncode == 0, refused.stdout + refused.stderr
+    assert refused.returncode == 1, refused.stdout + refused.stderr
     _assert_reader(refused)
     assert "requires --yes" in refused.stdout
     assert not output.exists()

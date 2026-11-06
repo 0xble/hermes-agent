@@ -6,7 +6,13 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v0.22.5`, `bf0203a794a07aac3ff764972ab9087baa4e4f4e`.
+`v0.22.5 + matured-main checkpoint`, `69f73ec5f11f5a945cc864f29c4e2ad2307eaec3`.
+The checkpoint contains stable release `v0.22.5`
+(`bf0203a794a07aac3ff764972ab9087baa4e4f4e`) and follows Brian's matured-main
+selection policy. Fork policy checks classify only changes beyond this immutable
+upstream baseline. Exact-head tests, independent review and protected landing
+remain required before adoption. This contract authorizes source maintenance,
+not runtime installation or promotion.
 The prior baselines `v0.22.2` (`d923a5eb487a17c0a68801bba9ef0f56c81040a8`) and
 `v0.22.0` (`e06df9c2eae6901f4c88f464e0ae6e753c0428b8`) remain ancestors. The earlier `v0.21.6` baseline
 (`818c13be1dc4fd28987e1e881a9408224afd4535`) also remains an ancestor.
@@ -72,6 +78,8 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Delivered steer observer | Give native mid-turn insertions a stable plugin delivery identity | Steer insertion, turn identity or plugin lifecycle changes | [Steer delivery observer](maintenance/steer-delivery-observer.md) |
 | Turn-origin provenance | Give plugins and session context a default-deny per-turn provenance value | Gateway turn identity, plugin hook context, or session environment changes | [Turn-origin provenance](maintenance/turn-origin-provenance.md) |
 | Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, proof-surface, or startup capability-read changes | [Fork CI](maintenance/fork-ci.md), [startup capability reads](maintenance/startup-capability-reads.md) |
+| Rejected preflight input | Archive rejected asks without growing oversized model history | Turn-start compression rejection or archived message append changes | [Rejected preflight input archive](maintenance/preflight-input-archive.md) |
+| Queued metrics consent | Honor owning-profile revocation during asynchronous persistence | Relay subscriber delivery, consent or exit-flush changes | [Queued metrics consent](maintenance/queued-metrics-consent.md) |
 | CI toolchain pinning | Resolve local gate uv and Node binaries from the exact repository pins without changing hosted runner semantics | `scripts/ci/toolchain.json`, `scripts/ci/portable.py`, or local gate tool resolution changes | [CI toolchain pinning](maintenance/ci-toolchain-pin.md) |
 | Launchd account home | Keep service labels and plist placement on the same real account identity even when process HOME changes | Service naming, sandbox gateway startup or launchd profile ownership | [Launchd account home](maintenance/launchd-account-home.md) |
 | Historical upgrade compatibility | Provision pinned Python on pre-PEP-706 interpreters and heal backup-first stale root imports | PM tar extraction, historical updater takeover, or backup import graph changes; read install and scratch GC for PM runtime identity | [Historical upgrade compatibility](maintenance/nightly-upgrade-e2e.md) |

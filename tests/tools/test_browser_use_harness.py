@@ -34,7 +34,7 @@ def test_browser_exec_child_environment(tmp_path, monkeypatch):
                      "print(json.dumps({'argv': sys.argv, 'stdin': sys.stdin.read(), 'env': dict(os.environ)}))\n",
                      encoding="utf-8")
     monkeypatch.setattr(bu, "_find_cli", lambda: [sys.executable, str(probe)])
-    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"browser": {"backend": "browser-use"}})
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"browser": {"backend": "browser-use"}})
     monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
     monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
     monkeypatch.setattr("tools.browser_tool_cloud._get_cloud_provider", lambda: None)
@@ -62,6 +62,6 @@ def test_browser_exec_child_environment(tmp_path, monkeypatch):
     assert child["env"]["BU_NAME"] == "research"
     assert child["env"]["BU_CDP_WS"] == "ws://127.0.0.1:47000/private"
     assert child["env"]["ANONYMIZED_TELEMETRY"] == "false"
-    assert child["env"]["BROWSERBASE_API_KEY"] == "browser-key"
+    assert "BROWSERBASE_API_KEY" not in child["env"]
     assert child["env"]["KEEP_BROWSER_PROBE"] == "kept"
     assert attached == [("owner", "ws://127.0.0.1:47000/private")]

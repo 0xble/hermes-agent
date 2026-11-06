@@ -684,7 +684,10 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     if agent._compression_warning:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
-    if getattr(agent, "_pending_startup_notices", None):  # gateway: init ran before its callbacks
+    from agent.status_output import deliver_kept_startup_notices
+    deliver_kept_startup_notices(agent)
+    if getattr(agent, "_pending_startup_notices", None) or getattr(agent, "_pending_startup_prints", None):
+        # gateway: init ran before this turn's callbacks / viewer print sink
         agent._replay_startup_warnings()
 
     agent.iteration_budget = IterationBudget(agent.max_iterations)
@@ -1175,8 +1178,8 @@ def build_turn_context(
     agent._persist_user_message_idx = current_turn_user_idx
 
     agent._user_turn_count += 1
-    # Copilot x-initiator: the first API call of this user turn is user-initiated;
-    # tool-loop follow-ups revert to "agent".
+    # Turn-initiator state for per-request provider headers: the first API call of this
+    # user turn is user-initiated; tool-loop follow-ups are agent-initiated.
     agent._is_user_initiated_turn = True
 
     # Preserve the original user message (no nudge injection).
@@ -1194,6 +1197,9 @@ def build_turn_context(
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
     active_system_prompt = agent._cached_system_prompt
+    # `/delegation <backend> --now`: after the pin restore, so a fresh agent rebuilds too.
+    from agent.delegation_backends import apply_requested_tool_rebuild
+    apply_requested_tool_rebuild(agent)
 
     # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat" session (same
     # gate as the protocol section); gate is session-stable, so cache-safe.
@@ -1217,12 +1223,28 @@ def build_turn_context(
     ):
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
 
-    compaction = run_turn_start_compaction(
-        agent, messages=messages, system_message=system_message,
-        active_system_prompt=active_system_prompt, conversation_history=conversation_history,
-        current_turn_user_idx=current_turn_user_idx, user_message=user_message,
-        effective_task_id=effective_task_id,
-    )
+    try:
+        compaction = run_turn_start_compaction(
+            agent, messages=messages, system_message=system_message,
+            active_system_prompt=active_system_prompt, conversation_history=conversation_history,
+            current_turn_user_idx=current_turn_user_idx, user_message=user_message,
+            effective_task_id=effective_task_id,
+        )
+    except PreflightCompressionTimedOut:
+        # The rejected ask must remain recoverable, but must not grow the over-window model
+        # history on every retry (#7100). Archive only this turn's original input, atomically
+        # under the normal compression/turn lease guards. The failure envelope stays unchanged.
+        if agent._session_db is not None and agent.session_id:
+            agent._session_db.append_message(
+                session_id=agent.session_id, role="user", content=original_user_message,
+                timestamp=persist_user_timestamp, platform_message_id=persist_user_platform_id,
+                display_kind=persist_user_display_kind, display_metadata=persist_user_display_metadata,
+                message_uid=user_msg.get("message_uid"), archived=True,
+                compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+                turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+            )
+        raise
     messages = compaction.messages
     active_system_prompt = compaction.active_system_prompt
     conversation_history = compaction.conversation_history

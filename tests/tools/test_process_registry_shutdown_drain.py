@@ -198,3 +198,29 @@ def test_acknowledged_persistent_completion_is_not_handed_off(tmp_path, monkeypa
         gate.touch()
         session.process.wait(timeout=5)
         session._reader_thread.join(5)
+
+
+@pytest.mark.platforms("posix")
+def test_shutdown_killed_persistent_job_is_not_replayed_as_natural_completion(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    registry = ProcessRegistry()
+    session, gate = _spawn_gated(registry, tmp_path, persist_on_release=True)
+    assert session.process is not None and session._reader_thread is not None
+    try:
+        registry.stop_survivor_pollers()
+        assert registry.kill_all(source="gateway_shutdown", deadline=time.monotonic() + 5) == 1
+        session.process.wait(timeout=5)
+        session._reader_thread.join(5)
+        assert not session._reader_thread.is_alive()
+        assert session.completion_reason == "killed"
+        assert session.termination_source == "gateway_shutdown"
+
+        successor = ProcessRegistry()
+        assert successor.recover_from_checkpoint() == 0
+        assert successor.drain_notifications(session_key="session") == []
+        assert successor.completion_queue.empty()
+    finally:
+        gate.touch()
+        registry.kill_all(source="test_cleanup", deadline=time.monotonic() + 5)
+        session.process.wait(timeout=5)
+        session._reader_thread.join(5)

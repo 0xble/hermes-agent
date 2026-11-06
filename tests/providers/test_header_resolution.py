@@ -343,7 +343,8 @@ def test_versioned_headers_reach_client_and_catalog_boundaries(monkeypatch, prov
 
         module_name, _, check = _REQUEST_CONSUMERS[provider]
         module = importlib.import_module(module_name)
-        monkeypatch.setattr(module, "get_version_info", lambda: SimpleNamespace(base_version="2099.1.1"))
+        version_owner = module if provider == "yuanbao" else importlib.import_module("hermes_cli.version_info")
+        monkeypatch.setattr(version_owner, "get_version_info", lambda: SimpleNamespace(base_version="2099.1.1"))
         check(monkeypatch, module, f"{prefix}/2099.1.1" if prefix else "2099.1.1")
         return
     import httpx
