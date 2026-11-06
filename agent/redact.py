@@ -850,7 +850,7 @@ def _redact_python_repr_fields(text: str) -> str:
 
 
 def _redact_python_diagnostic_repr_fields(text: str) -> str:
-    """Mask repr fields only on pytest/error lines in source-preserving output."""
+    """Mask repr fields and opaque Bearers only on pytest/error diagnostic lines."""
     lines = text.splitlines(keepends=True)
     for index, line in enumerate(lines):
         ending = ""
@@ -866,7 +866,9 @@ def _redact_python_diagnostic_repr_fields(text: str) -> str:
         if match is not None:
             lines[index] = (
                 match.group("prefix")
-                + _redact_python_repr_fields(match.group("body"))
+                + _BEARER_RESIDUE_RE.sub(
+                    "Bearer [redacted]", _redact_python_repr_fields(match.group("body"))
+                )
                 + ending
             )
     return "".join(lines)
@@ -1364,9 +1366,10 @@ def redact_terminal_output(output: str, command: str | None = None, *, force: bo
     code_file = not (is_env_dump_command(command) or _command_reads_secret_file(command))
     redacted = redact_sensitive_text(output, force=force, code_file=code_file)
     # Source-preserving output still gets the Python-repr pass on high-confidence
-    # diagnostic lines (pytest ``E   `` introspection, final exception lines): that is
-    # where {'BRAVE_API_KEY': '…'} leaks, not in source dumps.
-    if code_file and (force or _redact_enabled()) and ":" in redacted and "'" in redacted:
+    # diagnostic lines (pytest ``E   `` introspection, final exception lines):
+    # keyed mapping fields and unkeyed ``b'Bearer …\\n'`` values, not source dumps.
+    if (code_file and (force or _redact_enabled())
+            and ((":" in redacted and "'" in redacted) or "bearer" in redacted.lower())):
         redacted = _redact_python_diagnostic_repr_fields(redacted)
     return redacted
 
