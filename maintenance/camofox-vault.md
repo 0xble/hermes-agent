@@ -116,7 +116,12 @@ without changing the native browser or its consent surface.
 - Payment PAN and CVC remain profile-global exact-value redactions. Name, expiry month/year
   (including padded/unpadded month and four-/two-digit year), and billing ZIP use whole-token
   redaction only on the filled browser session and origin. Neither terminal/log output nor
-  other tabs/origins inherit these low-entropy matches; card fills do not trigger the
+  other tabs/known unrelated origins inherit these low-entropy matches. If either
+  registration or read-time origin is unavailable, protect the owning tab until
+  cleanup, including snapshot redaction before truncation and cache writes.
+  Omitted tab scope is not the browser task named `default`: generic output
+  redactors must not acquire that task's short card values.
+  Birthday components retain their existing tab-wide semantics. Card fills do not trigger the
   protected-birthday pixel quarantine. Browser close (including a failed card-only
   close that releases session resources), force-reap, and timed-out generation discard
   clear the scoped card metadata so a reused task key cannot inherit it. Protected
@@ -251,6 +256,31 @@ without changing the native browser or its consent surface.
   PAN formatting, issue dates and masked CVV). Roll back the bundle's small commits bearing
   the existing identities; do not retire the surrounding fork features.
 
+## Direct typed-card privacy
+
+Fork patch identity: `browser-typed-card-privacy` (fork-only). Direct
+`browser_type` registers PANs before either transport injects them. CVC and
+expiry require the existing checkout field classifier and stay scoped to the
+filled session/origin; standalone matching values on other pages remain usable.
+This does not authorize a payment, change secret-source policy, or remove the
+accepted model-context/session-record exposure of direct entry.
+
+The existing browser egress boundary scrubs registered strings and numeric
+leaves even without scoped components, preserving element refs and unrelated
+ordinals. Agent-browser fills send literal input through batch stdin, never
+argv or a staging file. CLI output is bounded in memory; inherited daemon
+handles are drained without waiting for daemon exit or retaining late output.
+Raw stdout/stderr and malformed/timeout diagnostics are not logged.
+
+Verify with `scripts/run_tests.sh tests/tools/test_browser_typed_card_privacy.py
+ tests/tools/test_browser_typed_card_expiry.py tests/tools/test_browser_open_timeout.py
+ tests/agent/test_browser_output_egress.py` and the browser transport, cleanup,
+redaction and PM fixture regressions. Windows pipe behavior needs the native
+Windows-marked test; macOS does not qualify that branch. No live account or
+card is required. Retire when released upstream preserves this transport and
+egress contract; roll back this patch as a unit, not the existing vault policy
+or protected-field guards.
+
 ## Verification
 
 Keyed MCP trust consent accepts explicit Once, Session or Always and persists
@@ -275,6 +305,12 @@ first-429 stop and cross-process cooldown),
 `tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome), and for card consent
 `tests/gateway/test_mcp_consent_scope.py` and `tests/tools/test_mcp_trust_gating.py`. Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.
+
+Direct typing classifies textbox, spinbutton, combobox and select roles through
+the shared checkout classifier. A standalone `CID` label is card-code evidence;
+an ambiguous `cid` DOM id/name alone is not, and `autocomplete=cc-csc` remains
+authoritative. Keep `test_checkout_cvc_targeting.py`, `test_browser_typed_card_origin.py`,
+and the typed-card privacy/expiry suites in the focused regression matrix.
 
 ## Retirement and rollback
 

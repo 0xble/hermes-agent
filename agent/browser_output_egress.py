@@ -1,7 +1,7 @@
-"""Final model-visible browser result boundary for tab-scoped vault components.
+"""Final model-visible browser result boundary for registered vault secrets.
 
-Birthday components remain session-wide; low-entropy card components additionally
-require the filled origin. Global password/PAN/CVC redaction runs independently.
+Global registered values apply on every browser result. Birthday components remain
+session-wide; card components require the filled origin when the read origin is known.
 """
 
 import json
@@ -20,12 +20,14 @@ def scrub_browser_result(name: str, result: Any, task_id: str | None) -> Any:
         tab = _last_session_key(task)
     except Exception:
         tab = task
-    if not has_vault_scoped_components(tab):
-        return result
-    # A card component is eligible only on the currently focused filled origin.
-    # Birthday components intentionally remain tab-wide, including when this probe fails.
-    from tools.browser_vault_tool import _current_page_origin
-    origin = _current_page_origin(tab) or ""
+    # Global registered values (including directly typed PANs) must pass this
+    # boundary even when no low-entropy component was filled on the tab.
+    origin = ""
+    if has_vault_scoped_components(tab):
+        # A known unrelated origin excludes card parts. An unavailable probe
+        # conservatively retains same-tab protection.
+        from tools.browser_vault_tool import _current_page_origin
+        origin = _current_page_origin(tab) or ""
 
     parsed = result
     serialized = isinstance(result, str)
@@ -55,4 +57,6 @@ def scrub_browser_result(name: str, result: Any, task_id: str | None) -> Any:
         return value
 
     cleaned = scrub(parsed)
+    if serialized and cleaned == parsed:
+        return result
     return json.dumps(cleaned, ensure_ascii=False) if serialized and parsed is not result else cleaned
