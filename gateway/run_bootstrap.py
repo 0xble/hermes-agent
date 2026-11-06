@@ -329,27 +329,8 @@ async def _start_gateway_start_control_socket(runner):
         # manager) relaunches after the code swap.
         _main_loop = asyncio.get_running_loop()
 
-        def _pause_for_update_handler() -> dict:
-            try:
-                from hermes_cli.gateway import _get_restart_drain_timeout
-                _drain = float(_get_restart_drain_timeout())
-            except Exception:
-                _drain = 30.0
-            accepted_box: list[bool] = []
-            _done = threading.Event()
-
-            def _request() -> None:
-                try:
-                    accepted_box.append(runner.request_restart(detached=False, via_service=True))
-                finally:
-                    _done.set()
-
-            _main_loop.call_soon_threadsafe(_request)
-            _done.wait(timeout=5.0)
-            accepted = bool(accepted_box and accepted_box[0])
-            return {
-                "pausing": accepted, "already_stopping": not accepted,
-                "pid": os.getpid(), "drain_timeout": _drain}
+        from gateway.run_control_pause import make_update_pause_handler
+        _pause_for_update_handler = make_update_pause_handler(runner, _main_loop)
 
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now
