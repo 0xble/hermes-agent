@@ -1482,30 +1482,6 @@ def list_quick_snapshots(limit: int = 20, hermes_home: Optional[Path] = None) ->
 _CRON_JOBS_REL = "cron/jobs.json"
 
 
-def _count_cron_jobs(path: Path) -> Optional[int]:
-    """Number of cron jobs in ``path`` (canonical ``{"jobs": [...]}`` or legacy bare list).
-
-    ``None`` if missing or unparseable — "unknown", not zero: acting on an unreadable file could
-    mask a real corruption the user needs to see.
-    """
-    if not path.is_file():
-        return None
-    try:
-        # utf-8-sig as cron/jobs.load_jobs: a Windows-editor BOM would otherwise read as
-        # "unreadable" and silently disable the post-update auto-restore safety net.
-        with open(path, "r", encoding="utf-8-sig") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if isinstance(data, dict):
-        data = data.get("jobs", [])
-    if not isinstance(data, list):
-        return None
-    # Count only entries the restore treats as jobs (objects with a truthy id): a malformed live
-    # entry (e.g. ``42`` or ``{}``) must not mask a missing real job by matching the snapshot.
-    return sum(1 for job in data if isinstance(job, dict) and job.get("id"))
-
-
 def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Safety net for silent cron-job loss across ``hermes update``.
 

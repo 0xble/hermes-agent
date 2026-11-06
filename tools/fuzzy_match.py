@@ -403,12 +403,15 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
     # gutter paste, a single numbered line included, is stripped BEFORE any similarity
     # strategy sees it: a `41|` prefix barely moves per-line similarity, so context_aware
     # would accept the raw paste and write the prefixes into the file.
-    result = _run_strategy_chain(content, old_string, new_string, replace_all, _PRECISE_STRATEGIES)
+    result = _run_strategy_chain(content, old_string, new_string, replace_all, _PRECISE_STRATEGIES,
+                                 diagnostics=diagnostics)
     stripped = None if result else _gutter_stripped_old(content, old_string)
     if result is None and stripped is not None:
-        result = _gutter_recovery(content, *stripped, new_string, replace_all, correction_notes)
+        result = _gutter_recovery(content, *stripped, new_string, replace_all, correction_notes,
+                                  diagnostics=diagnostics)
     elif result is None:
-        result = _run_strategy_chain(content, old_string, new_string, replace_all, _SIMILARITY_TIER)
+        result = _run_strategy_chain(content, old_string, new_string, replace_all, _SIMILARITY_TIER,
+                                     diagnostics=diagnostics)
     if result is None:
         _note_edit_match(None, "no_match")
         return content, 0, None, "Could not find a match for old_string in the file" + (
@@ -419,7 +422,8 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
 
 
 def _run_strategy_chain(content: str, old_string: str, new_string: str, replace_all: bool,
-                        strategies: list[tuple[str, Callable[[str, str], list[Span]]]]) -> Optional[tuple]:
+                        strategies: list[tuple[str, Callable[[str, str], list[Span]]]], *,
+                        diagnostics: Optional[dict] = None) -> Optional[tuple]:
     """Apply the first strategy in ``strategies`` that matches; None when none does."""
     for strategy_name, strategy_fn in strategies:
         matches = strategy_fn(content, old_string)
@@ -524,7 +528,8 @@ def _gutter_stripped_old(content: str, old_string: str) -> Optional[tuple[str, l
 
 
 def _gutter_recovery(content: str, stripped_old: str, strategies: list, new_string: str,
-                     replace_all: bool, correction_notes: Optional[list[str]]) -> Optional[tuple]:
+                     replace_all: bool, correction_notes: Optional[list[str]], *,
+                     diagnostics: Optional[dict] = None) -> Optional[tuple]:
     """Match a gutter-stripped old_string; None when no precise strategy matches.
 
     Only the exact/normalizing strategies may match the stripped text: a similarity
@@ -540,7 +545,8 @@ def _gutter_recovery(content: str, stripped_old: str, strategies: list, new_stri
         stripped_new = new_string
     if stripped_old == stripped_new:
         return content, 0, None, IDENTICAL_STRINGS_ERROR
-    result = _run_strategy_chain(content, stripped_old, stripped_new, replace_all, strategies)
+    result = _run_strategy_chain(content, stripped_old, stripped_new, replace_all, strategies,
+                                 diagnostics=diagnostics)
     if result and result[3] is None and correction_notes is not None:
         correction_notes.append(GUTTER_STRIPPED_NOTE)
     return result

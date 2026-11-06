@@ -1981,7 +1981,7 @@ class TestSafeCopyDb:
             )
 
         real_connect = backup_mod.sqlite3.connect
-        writer = real_connect(src, timeout=1.0)
+        writer = real_connect(src, timeout=1.0, check_same_thread=False)
         remaining_values = []
         writes = 0
 
@@ -1997,13 +1997,14 @@ class TestSafeCopyDb:
                     nonlocal writes
                     progress(status, remaining, total)
                     remaining_values.append(remaining)
-                    if remaining:
-                        writer.execute(
-                            "UPDATE payload SET value = ? WHERE id = 1",
-                            (f"write-{writes}".encode() * 400,),
-                        )
-                        writer.commit()
-                        writes += 1
+                    # A one-step WAL copy reports only SQLITE_DONE. Commit while
+                    # backup() still owns its pinned snapshot on the copy thread.
+                    writer.execute(
+                        "UPDATE payload SET value = ? WHERE id = 1",
+                        (f"write-{writes}".encode() * 400,),
+                    )
+                    writer.commit()
+                    writes += 1
                     if len(remaining_values) >= 32 and remaining:
                         raise TimeoutError("backup kept restarting under WAL writes")
 

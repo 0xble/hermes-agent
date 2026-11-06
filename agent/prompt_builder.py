@@ -30,8 +30,7 @@ from agent.skill_utils import (
     skill_matches_platform, skill_matches_platform_list,
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
-from utils import atomic_json_write, file_signature, filesystem_poll_seconds
-from utils import atomic_json_write, file_cache_version
+from utils import atomic_json_write, file_cache_version, file_signature, filesystem_poll_seconds
 
 logger = logging.getLogger(__name__)
 

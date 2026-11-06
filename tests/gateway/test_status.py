@@ -778,7 +778,7 @@ class TestPidExistsZombieProbe:
         assert status._pid_exists(999999) is False
         assert calls == []
 
-    @pytest.mark.platforms("linux")
+    @pytest.mark.platforms("posix")
     def test_posix_still_probes_zombie_status(self, monkeypatch):
         # Control: on POSIX a zombie still answers pid_exists(), so the probe must survive.
         calls = self._spy_status(monkeypatch)

@@ -702,8 +702,8 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
     except (OSError, json.JSONDecodeError):
         return None
     if isinstance(data, dict):
-        jobs = data.get("jobs", [])
-        return len(jobs) if isinstance(jobs, list) else None
-    if isinstance(data, list):
-        return len(data)
-    return None
+        data = data.get("jobs", [])
+    if not isinstance(data, list):
+        return None
+    # Match the restore's job admission so malformed entries cannot hide lost jobs.
+    return sum(1 for job in data if isinstance(job, dict) and job.get("id"))

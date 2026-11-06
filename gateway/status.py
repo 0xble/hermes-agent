@@ -952,7 +952,7 @@ def _pid_exists(pid: int) -> bool:
             # dead and cannot be a gateway. Treating it as alive makes ``--replace`` wait forever, then exit 1:
             # a silent crash loop under systemd ``Restart=always`` (#42126). Report zombies as dead. Any
             # status-read failure falls through to the authoritative ``pid_exists()`` below.
-            if probe_zombie and psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
                 return False
         except getattr(psutil, "NoSuchProcess", ()):
             return False

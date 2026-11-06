@@ -81,3 +81,13 @@ def test_single_gutter_line_is_recovered_whole_or_refused(content, old, new, exp
         assert (count, result) == (0, content) and err
     else:
         assert (err, count, result) == (None, 1, expected)
+
+
+def test_ambiguous_gutter_anchor_keeps_match_diagnostics():
+    content = "anchor\npadding\nanchor\n"
+    diagnostics = {}
+    result, count, _strategy, error = fuzzy_find_and_replace(
+        content, "41|anchor", "changed", diagnostics=diagnostics)
+    assert result == content and count == 0
+    assert error is not None and "Found 2 matches" in error
+    assert diagnostics == {"match_count": 2, "match_lines": [1, 3]}

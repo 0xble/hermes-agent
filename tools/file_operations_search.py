@@ -8,7 +8,6 @@ import contextlib
 import os
 import posixpath
 import re
-import contextlib
 import shlex
 import subprocess
 import sys
