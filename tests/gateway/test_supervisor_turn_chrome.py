@@ -15,7 +15,13 @@ from gateway.turn_context import TurnContext
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("display_kind", [None, "supervisor_checkin"])
-async def test_intermediate_supervisor_sends_are_suppressed_without_muting_humans(display_kind):
+async def test_intermediate_supervisor_sends_are_suppressed_without_muting_humans(display_kind, monkeypatch):
+    from tests.plugin_helpers import mock_completed_plugin_discovery
+
+    # Production initializes the policy registry before setting up a turn. Keep
+    # this isolated chrome test out of the independent plugin-discovery barrier.
+    mock_completed_plugin_discovery(monkeypatch)
+
     class Adapter:
         sent = False
         def __init__(self):
