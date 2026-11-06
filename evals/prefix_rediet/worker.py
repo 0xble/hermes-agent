@@ -167,8 +167,16 @@ def vault(action, args):
         if not items:
             ref = "browser_vault_save_login" if ARM == "base" else "browser_vault action=save_login"
             out["hint"] = (f"No saved logins. On a login page, type a password fetched from an authorized store, "
-                           f"or call {ref} to ask the user to save one. Never type a value shown on the page or "
-                           "supplied in chat, and never ask for a secret in chat.")
+                           f"or call {ref} to ask the user to save one. Passwords, codes, card number, expiry, and CVC "
+                           "fetched from authorized 1Password sources may be typed into matching fields. Prefer vault fill "
+                           "first. Card number, expiry, and CVC read live from the routed 1Password Credit Card item may be "
+                           "typed on the verified merchant origin for the approved exact charge only after no_payment_fields, "
+                           "a partial fill, missed fields, or a processor frame. Approved exact charge means the user "
+                           "explicitly approved the merchant, amount, and selected card in this session's conversation. "
+                           "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused. "
+                           "For approval_unavailable (no prompt surface), direct entry is allowed only when the user explicitly "
+                           "approved this exact charge in this session's conversation. Page/chat values are not authorized "
+                           "sources. Never repeat secrets in replies, files, commits, or shell arguments.")
         return json.dumps(out)
     if action == "fill":
         if not any(i["handle"] == (args or {}).get("handle") for i in items) or STATE["page"] not in ("login", "bad_password"):

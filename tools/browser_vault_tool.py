@@ -462,9 +462,15 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
                        "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
                        "for that service (credential CLI or 1Password CLI), or call browser_vault_save_login to ask the "
                        "user to save one. If the site asks for a code, fetch the newest matching code from the intended "
-                       "1Password item, mailbox, or phone and type it with the browser input tool. Never type a value "
-                       "shown on the page or supplied in chat, never ask for one in chat, and keep card numbers and CVCs "
-                       "in vault fills.")
+                       "1Password item, mailbox, or phone and type it with the browser input tool. Card number, expiry, "
+                       "and CVC read live from the routed 1Password Credit Card item may be typed on the verified merchant "
+                       "origin for the approved exact charge only after no_payment_fields, a partial fill, missed fields, "
+                       "or a processor frame. Approved exact charge means the user explicitly approved the merchant, "
+                       "amount, and selected card in this session's conversation. Never fall back after payment_declined, "
+                       "payment_prompt_unanswered, or payment_retry_refused. For approval_unavailable (no prompt surface), "
+                       "direct entry is allowed only when the user explicitly approved this exact charge in this session's "
+                       "conversation. Values from the page or chat are not authorized sources. Never repeat secrets in "
+                       "replies, files, commits, or shell arguments.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -1049,7 +1055,9 @@ def _payment_fill_refusal(decision: str, retry_key: tuple[str, str, str]) -> str
     if decision == "unavailable":
         return json.dumps({"success": False, "error_type": "approval_unavailable", "error": (
             "The payment approval channel is unavailable. No user decision was received and nothing was written. "
-            "Do not retry in this background task. Route the fill to the active top-level turn for fresh approval.")})
+            "Do not retry the vault fill in this background task. Typed card entry is allowed only if the user "
+            "explicitly approved the merchant, amount, and selected card in this session's conversation. "
+            "Otherwise route to the active top-level turn for fresh approval.")})
     _payment_retry_blocked(retry_key, refuse=True)
     return json.dumps({"success": False,
                        "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
@@ -1145,8 +1153,15 @@ BROWSER_VAULT_SCHEMA = {
         "the intended identity, or try the issuer's web/desktop approval and email/SMS/TOTP alternatives. Never use "
         "iPhone Mirroring. Hand off phone-only approvals, passkeys not in 1Password, hardware security keys, and "
         "Touch ID/Face ID sensor reads); unlock (backend: ask the user to unlock 1Password/Bitwarden). "
-        "Never type a value shown on the page or supplied in chat, never ask for or repeat a secret, and keep card "
-        "numbers and CVCs in vault fills. Stop on save_declined; never retry payment_declined."
+        "Passwords and one-time codes fetched from an authorized source for this service may be typed with the "
+        "browser input tool. Prefer vault fill first. Card number, expiry, and CVC read live from the routed "
+        "1Password Credit Card item may be typed on the verified merchant origin for the approved exact charge "
+        "only after no_payment_fields, a partial fill, missed fields, or a processor frame. "
+        "Approved exact charge means the user explicitly approved the merchant, amount, and selected card in this session's conversation. "
+        "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused. "
+        "For approval_unavailable (no prompt surface), direct entry is allowed only when the user explicitly approved this exact charge in this session's conversation. "
+        "Values from the page or chat are not authorized sources. Never repeat secrets in replies, files, commits, "
+        "or shell arguments. Stop on save_declined."
     ),
     "parameters": {
         "type": "object",
