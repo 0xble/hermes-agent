@@ -90,7 +90,7 @@ class _StderrTee:
             self._write_lines([rest])
 
     def _write_lines(self, lines: list[str]) -> None:
-        if not lines:
+        if not lines or self._log is None:
             return
         try:
             self._log.write("".join(stamp_line(line) for line in lines))

@@ -9,6 +9,7 @@ import time
 from typing import Iterable, Optional
 from tools.mcp_tool_errors import _is_method_not_found_error, _unwrap_exception_group
 from tools.mcp_tool_common import _core
+from tools.mcp_tool_callback_context import callback_owner, run_owned_callback
 from tools import mcp_tool_registration as _registration
 
 logger = logging.getLogger("tools.mcp_tool")
@@ -93,7 +94,9 @@ class MCPServerHealthMixin:
                 logger.log(level, "MCP server log [%s]: %s", origin, data)
             except Exception:
                 logger.debug("Failed to handle MCP log notification from '%s'", self.name, exc_info=True)
-        return _on_log
+        async def _owned(params):
+            return await run_owned_callback(lambda: callback_owner(self), _on_log, params, private_allowed=False)
+        return _owned
 
     def _make_message_handler(self):
         """``message_handler``: only ``ToolListChangedNotification`` triggers a refresh; prompt/resource changes log."""
@@ -119,7 +122,9 @@ class MCPServerHealthMixin:
                     logger.debug("MCP server '%s': resources/list_changed (ignored)", self.name)
             except Exception:
                 logger.exception("Error in MCP message handler for '%s'", self.name)
-        return _handler
+        async def _owned(message):
+            return await run_owned_callback(lambda: callback_owner(self), _handler, message, private_allowed=False)
+        return _owned
 
     def _deregister_owned(self, tool_names: Iterable[str]) -> None:
         """Deregister *tool_names* this server's toolset still owns (never a colliding name owned by another server)."""

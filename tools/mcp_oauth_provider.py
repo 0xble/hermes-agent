@@ -89,6 +89,7 @@ class HermesProviderMixin:
 
     def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
         super().__init__(*args, **kwargs)
+        self._hermes_configured_server_url = self.context.server_url
         self._hermes_oauth_flow = oauth_flow
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
@@ -283,6 +284,235 @@ class HermesProviderMixin:
             finally:
                 await self._hermes_release_refresh_fence()
 
+    def _hermes_set_resource_policy(self, resource: str | None) -> None:
+        """Install a saved or independently reconstructed policy, never a request fallback."""
+        from tools.mcp_oauth import OAuthNonInteractiveError
+        from mcp.shared.auth import ProtectedResourceMetadata
+        from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
+        if resource is not None:
+            configured = self._hermes_configured_server_url
+            if not check_resource_allowed(requested_resource=resource_url_from_server_url(configured),
+                                          configured_resource=resource):
+                raise OAuthNonInteractiveError('Saved MCP authorization resource does not match configured server.')
+            metadata = self.context.oauth_metadata
+            self.context.protected_resource_metadata = ProtectedResourceMetadata(
+                resource=resource, authorization_servers=[str(metadata.issuer)])
+        else:
+            self.context.protected_resource_metadata = None
+        self._hermes_resource_policy = (True, resource)
+
+    def _hermes_remember_resource_authority(self) -> None:
+        """Keep normal selected authority on its existing owner, bound to the grant.
+
+        External token/registration replacements must not inherit an old challenge
+        just because new credentials were loaded into the same mutable Context.
+        """
+        from tools.mcp_oauth import HermesTokenStorage
+        storage = self.context.storage
+        if (not isinstance(storage, HermesTokenStorage) or getattr(storage, 'volatile', False)
+                or getattr(storage, 'auth_only', False)):
+            return
+        known, resource = getattr(self, '_hermes_resource_policy', (False, None))
+        if known and self.context.current_tokens and self.context.client_info and self.context.oauth_metadata:
+            self._hermes_resource_authority = (
+                str(storage._tokens_path().resolve()), self._hermes_configured_server_url,
+                self.context.current_tokens.refresh_token, self.context.client_info.model_dump(mode='json'),
+                _metadata_issuer(self.context), str(self.context.oauth_metadata.token_endpoint), resource,
+                self.context.current_tokens.refresh_token,
+            )
+
+    def _hermes_matching_resource_authority(self, server_url):
+        """Validate the normal owner and its own fenced replacement lineage.
+
+        The SDK Context may still hold the grant preceding several auth-only
+        receipts. Keep that exact owner anchor, not arbitrary saved generations;
+        the latest receipt's grant must separately match disk at export.
+        """
+        storage = self.context.storage
+        proof = getattr(self, '_hermes_resource_authority', None)
+        if getattr(storage, 'volatile', False) or getattr(storage, 'auth_only', False) or proof is None:
+            return None
+        path, configured, grant, client, issuer, endpoint, resource, owner_grant = proof
+        tokens, info, meta = self.context.current_tokens, self.context.client_info, self.context.oauth_metadata
+        if (str(storage._tokens_path().resolve()) != path
+                or (server_url, self._hermes_configured_server_url, self.context.server_url) != (configured, configured, configured)
+                or tokens is None or not grant
+                or tokens.refresh_token not in (grant, owner_grant)
+                or info is None or info.model_dump(mode='json') != client
+                or meta is None or (_metadata_issuer(self.context), str(meta.token_endpoint)) != (issuer, endpoint)):
+            return None
+        known, current = getattr(self, '_hermes_resource_policy', (False, None))
+        if known and current != resource:
+            return None
+        prm = self.context.protected_resource_metadata
+        if prm is not None:
+            if (str(prm.resource) != resource or not any(str(s).rstrip('/') == issuer for s in prm.authorization_servers)):
+                return None
+        return proof
+
+    def _hermes_export_resource_policy(self, saved_storage, server_url) -> tuple[bool, str | None]:
+        """Read-only minimum authority; caller holds the saved grant's rotation fence."""
+        proof = self._hermes_matching_resource_authority(server_url)
+        if proof is None:
+            return False, None
+        path, _configured, grant, client, issuer, endpoint, resource, _owner_grant = proof
+        if str(saved_storage._tokens_path().resolve()) != path:
+            return False, None
+        disk = saved_storage.load_oauth_metadata()
+        raw_tokens = saved_storage._read_state(saved_storage._tokens_path()) or {}
+        disk_client = saved_storage._load_model(saved_storage._client_info_path(), 'OAuthClientInformationFull', 'client info')
+        if (disk is None or str(disk.issuer).rstrip('/') != issuer or str(disk.token_endpoint) != endpoint
+                or (saved_storage.loaded_issuer or '').rstrip('/') != issuer
+                or raw_tokens.get('refresh_token') != grant or disk_client is None
+                or disk_client.model_dump(mode='json') != client):
+            return False, None
+        return True, resource
+
+    def _hermes_adopt_independent_resource_policy(self, saved_storage, server_url, renewal) -> None:
+        """Publish only a successful auth-only grant receipt to the existing owner.
+
+        No private Context is passed or copied. The receipt comes from fresh
+        public discovery/saved policy and the saved token endpoint under flock;
+        it is usable only for that exact replacement registration and generation.
+        """
+        previous_grant, next_grant, resource = renewal
+        storage = self.context.storage
+        meta, client, tokens = self.context.oauth_metadata, self.context.client_info, self.context.current_tokens
+        owner_grant = getattr(tokens, 'refresh_token', None)
+        if owner_grant not in (previous_grant, next_grant):
+            proof = self._hermes_matching_resource_authority(server_url)
+            if proof is None or proof[2] != previous_grant or proof[6] != resource:
+                return
+            # Only our exact accepted predecessor permits an untouched SDK
+            # generation to anchor another independently fenced replacement.
+        disk = saved_storage.load_oauth_metadata()
+        disk_client = saved_storage._load_model(saved_storage._client_info_path(), 'OAuthClientInformationFull', 'client info')
+        disk_tokens = saved_storage._read_state(saved_storage._tokens_path()) or {}
+        if (getattr(storage, 'volatile', False) or getattr(storage, 'auth_only', False)
+                or str(storage._tokens_path().resolve()) != str(saved_storage._tokens_path().resolve())
+                or (self._hermes_configured_server_url, self.context.server_url) != (server_url, server_url)
+                or not owner_grant
+                or disk_tokens.get('refresh_token') != next_grant or not next_grant
+                or meta is None or disk is None or client is None or disk_client is None
+                or client.model_dump(mode='json') != disk_client.model_dump(mode='json')
+                or (_metadata_issuer(self.context), str(meta.token_endpoint),
+                    (saved_storage.loaded_issuer or '').rstrip('/')) !=
+                   (str(disk.issuer).rstrip('/'), str(disk.token_endpoint), _metadata_issuer(self.context))):
+            return
+        self._hermes_resource_authority = (
+            str(storage._tokens_path().resolve()), server_url, next_grant, client.model_dump(mode='json'),
+            _metadata_issuer(self.context), str(meta.token_endpoint), resource, owner_grant,
+        )
+
+    async def _hermes_build_refresh_request(self):
+        """Preserve normal SDK selection; reconstruct only private unknown authority.
+
+        Ordinary modern canonical refresh must not acquire a discovery dependency.
+        Auth-only renewal uses saved or generation-bound normal authority first;
+        only its unknown case performs content-free independent discovery.
+        """
+        from tools.mcp_oauth import HermesTokenStorage, OAuthNonInteractiveError
+        from mcp.client.auth.utils import (build_protected_resource_metadata_discovery_urls,
+            create_oauth_metadata_request, handle_protected_resource_response)
+        storage = self.context.storage
+        known, resource = getattr(self, '_hermes_resource_policy', (False, None))
+        if isinstance(storage, HermesTokenStorage) and not known:
+            known, resource = storage.load_oauth_resource_policy()
+        if not known:
+            from agent.incognito import is_incognito
+            # Ordinary SDK refresh uses its current normal-owned PRM/protocol,
+            # including canonical modern selection when no PRM is available.
+            if (not is_incognito() and not getattr(storage, 'volatile', False)
+                    and not getattr(storage, 'auth_only', False)):
+                known = True
+                resource = (self.context.get_resource_url()
+                            if self.context.should_include_resource_param(self.context.protocol_version) else None)
+        if not known:
+            lookup = getattr(self, '_hermes_normal_resource_policy', None)
+            if lookup is not None:
+                known, resource = lookup(storage, self._hermes_configured_server_url)
+        if not known:
+            from tools.mcp_tool import sdk_httpx, LATEST_HANDSHAKE_VERSION
+            from tools.mcp_tool_transport import _mcp_http_transport_kwargs
+            http = sdk_httpx()
+            policy = getattr(self, '_hermes_auth_policy', None) or {}
+            configured = self._hermes_configured_server_url
+            metadata = self.context.oauth_metadata
+            if metadata is None:
+                raise OAuthNonInteractiveError('Saved MCP authorization audience is unavailable.')
+            prm = None
+            # No private inputs and no attached auth/headers/cookies/redirects.
+            for url in build_protected_resource_metadata_discovery_urls(None, configured):
+                transport = _mcp_http_transport_kwargs(http, str(url),
+                    policy.get('ssl_verify', True), policy.get('client_cert'))
+                async with http.AsyncClient(timeout=10, follow_redirects=False, **transport) as client:
+                    response = await client.send(stamp_default_user_agent(create_oauth_metadata_request(url)),
+                                                 follow_redirects=False)
+                if response.status_code in (404, 410):continue
+                if response.status_code != 200:
+                    raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is unavailable.')
+                prm = await handle_protected_resource_response(response)
+                if prm is None:
+                    raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is invalid.')
+                issuer = str(metadata.issuer).rstrip('/')
+                if issuer not in {str(value).rstrip('/') for value in prm.authorization_servers}:
+                    raise OAuthNonInteractiveError('Saved MCP authorization audience has a different issuer.')
+                resource = str(prm.resource)
+                break
+            if prm is None:
+                # A cold legacy grant may have been authorized through a
+                # challenge-specific PRM URL absent from every well-known URL.
+                # Obtain a NEW content-free challenge at the configured origin;
+                # never reuse the private handshake/request/headers or its scope.
+                from mcp.client.auth.utils import extract_resource_metadata_from_www_auth
+                transport = _mcp_http_transport_kwargs(http, configured,
+                    policy.get('ssl_verify', True), policy.get('client_cert'))
+                async with http.AsyncClient(timeout=10, follow_redirects=False, **transport) as client:
+                    challenge = await client.send(stamp_default_user_agent(http.Request('GET', configured)),
+                                                  follow_redirects=False, stream=True)
+                    try:
+                        url = extract_resource_metadata_from_www_auth(challenge)
+                    finally:
+                        # A public MCP GET can be an endless SSE response. Only
+                        # headers authorize discovery; never read its body.
+                        await challenge.aclose()
+                if url:
+                    transport = _mcp_http_transport_kwargs(http, url,
+                        policy.get('ssl_verify', True), policy.get('client_cert'))
+                    async with http.AsyncClient(timeout=10, follow_redirects=False, **transport) as client:
+                        response = await client.send(stamp_default_user_agent(create_oauth_metadata_request(url)),
+                                                     follow_redirects=False)
+                    if response.status_code not in (404, 410):
+                        if response.status_code != 200:
+                            raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is unavailable.')
+                        prm = await handle_protected_resource_response(response)
+                        if prm is None:
+                            raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is invalid.')
+                        issuer = str(metadata.issuer).rstrip('/')
+                        if issuer not in {str(value).rstrip('/') for value in prm.authorization_servers}:
+                            raise OAuthNonInteractiveError('Saved MCP authorization audience has a different issuer.')
+                        resource = str(prm.resource)
+                elif challenge.status_code not in (200, 401, 403, 404, 405, 410):
+                    raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is unavailable.')
+            if prm is None:
+                # Definitive absence is a legacy policy, unlike a failed or
+                # malformed discovery response. Modern configured policy uses
+                # the canonical resource; old configured policy sends none.
+                from mcp.client.auth.oauth2 import is_version_at_least
+                from mcp.shared.auth_utils import resource_url_from_server_url
+                version = policy.get('protocol_version', LATEST_HANDSHAKE_VERSION)
+                resource = (resource_url_from_server_url(configured)
+                            if version and is_version_at_least(version, '2025-06-18') else None)
+        self._hermes_set_resource_policy(resource)
+        # A known resource-free grant must not acquire a resource just because
+        # a later MCP request negotiates a newer protocol version.
+        version = self.context.protocol_version
+        try:
+            if resource is None:self.context.protocol_version = None
+            return self._prepare_token_request(await super()._refresh_token())
+        finally:
+            self.context.protocol_version = version
+
     async def _refresh_token(self):
         """Take the refresh fence, then build the request from the token we own.
 
@@ -298,6 +528,17 @@ class HermesProviderMixin:
         aborted) by one task, and async_auth_flow cannot interleave two
         refreshes inside one process.
         """
+        storage = self.context.storage
+        if getattr(storage, "volatile", False) and not storage.owns_tokens:
+            from tools.mcp_oauth_private import renew_saved_authorization
+            await renew_saved_authorization(storage, self._hermes_configured_server_url,
+                                            self._hermes_token_user_agent,
+                                            getattr(self, '_hermes_auth_policy', None),
+                                            getattr(self, '_hermes_normal_resource_policy', None))
+            self.context.current_tokens = await storage.get_tokens()
+            self.context.update_token_expiry(self.context.current_tokens)
+            enforce_refresh_token_issuer(self.context)
+            raise _RefreshCompletedByPeer  # re-evaluate validity; never POST saved grants via private Context
         self._coerce_client_secret_post()
         await self._hermes_acquire_refresh_fence()
         try:
@@ -319,7 +560,7 @@ class HermesProviderMixin:
                     # refresh token would only burn a generation on a single-use
                     # provider. Skip the POST and let the flow restart.
                     raise _RefreshCompletedByPeer
-            return self._prepare_token_request(await super()._refresh_token())
+            return await self._hermes_build_refresh_request()
         except BaseException:
             # Never hold the fence when no POST will follow.
             await self._hermes_release_refresh_fence()
@@ -351,6 +592,13 @@ class HermesProviderMixin:
 
         await self._hermes_release_refresh_fence()
         storage = self.context.storage
+        if getattr(storage, "volatile", False):
+            if not storage.owns_tokens:
+                from tools.mcp_oauth import OAuthNonInteractiveError
+                raise OAuthNonInteractiveError(
+                    "Refresh this saved MCP authorization outside incognito before retrying. "
+                    "A rotating saved refresh grant cannot be consumed without persisting its replacement.")
+            return  # Connection-owned private grant: no disk/cross-process fence.
         tokens_path = getattr(storage, "_tokens_path", None)
         if tokens_path is None:  # pragma: no cover - non-Hermes storage
             return
@@ -409,6 +657,13 @@ class HermesProviderMixin:
             if meta is not None:
                 self.context.oauth_metadata = meta
         enforce_refresh_token_issuer(self.context)
+        if isinstance(storage, HermesTokenStorage):
+            known, resource = storage.load_oauth_resource_policy()
+            self._hermes_resource_policy = (known, resource)
+            if not known and getattr(self, '_hermes_resource_authority', None) is not None:
+                known, resource = self._hermes_export_resource_policy(storage, self._hermes_configured_server_url)
+            if known and self.context.oauth_metadata is not None:
+                self._hermes_set_resource_policy(resource)
 
     async def _store_tokens(self, token_response) -> None:
         self.context.current_tokens = token_response
@@ -434,6 +689,12 @@ class HermesProviderMixin:
         except (HTTPError, OAuthTokenError):
             raise OAuthTokenError("Invalid token response") from None
         await self._store_tokens(token_response)
+        # This policy was actually used for the successful authorization exchange,
+        # unlike a valid-token MCP request which need not discover any PRM.
+        resource = (self.context.get_resource_url()
+                    if self.context.should_include_resource_param(self.context.protocol_version) else None)
+        self._hermes_resource_policy = (True, resource)
+        self._hermes_remember_resource_authority()
 
     async def _handle_refresh_response(self, response) -> bool:
         """Accept any 2xx refresh response; never log the body.
@@ -481,6 +742,7 @@ class HermesProviderMixin:
             if token_response.scope is None:
                 token_response.scope = prior.scope
         await self._store_tokens(token_response)
+        self._hermes_remember_resource_authority()
         return True
 
     async def _hermes_reload_tokens_after_refresh_failure(self) -> bool:
@@ -610,7 +872,8 @@ def prepare_oauth_config(server_name: str, server_url: str, oauth_config: dict |
     from tools import mcp_oauth as mo
     cfg = dict(oauth_config or {})
     mo.apply_oauth_provider_defaults(cfg, server_name=server_name, server_url=server_url)
-    return cfg, mo.HermesTokenStorage(server_name)
+    from tools.mcp_oauth_private import token_storage
+    return cfg, token_storage(server_name)
 
 
 def build_provider_kwargs(cfg: dict, storage: HermesTokenStorage, *, ssh_proxy_hint: bool) -> dict[str, Any]:

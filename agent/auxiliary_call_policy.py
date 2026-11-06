@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from typing import Any, Callable
 from weakref import finalize
@@ -67,15 +67,42 @@ def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[di
         # pair the endpoint with some other entry's credential. Only named providers are routed.
         raise RuntimeError(BARE_CUSTOM_ROUTE_REFUSAL)
     routed = {**kwargs, "provider": route["provider"], "model": route["model"],
-              "base_url": None, "api_key": None, "main_runtime": None}
+              "base_url": route.get("base_url") or None, "api_key": None, "main_runtime": None}
     if sync:
-        routed.update(api_mode=None, fallback_chain=[])
+        routed.update(api_mode=route.get("api_mode") or None, fallback_chain=[])
     token = _private_routed.set(True)
     try:
         with scoped_fallback_policy(CallFallbackPolicy(task, [])):
             yield routed
     finally:
         _private_routed.reset(token)
+
+
+def named_private_credentials(provider: str) -> bool:
+    """Keep private named pool credentials inside the origin-checking named resolver.
+
+    A pool peek is NOT an explicit caller key: promoting it to one bypasses the
+    foreign-origin guard. The named branch selects its own pool on the same origin.
+    """
+    if not private_route_active():
+        return False
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+    return _get_named_custom_provider(provider, resolve_credentials=False) is not None
+
+
+def named_route_credentials(req: Any, entry: dict, base_url: str) -> tuple[Any, Any]:
+    """Named entries keep key rotation; a private alias on another origin cannot borrow their secrets."""
+    from agent import auxiliary_client as aux
+    from utils import base_url_origin
+    explicit = aux._normalize_api_key(req.explicit_api_key)
+    foreign = private_route_active() and base_url_origin(base_url) != base_url_origin(entry.get("base_url", ""))
+    if foreign:
+        # The main runtime already resolved a direct alias's host-specific credentials.
+        # Without one, keep the selected host but send no named-provider secret to it.
+        runtime = req.main_runtime or {}
+        key = runtime.get("api_key") if base_url_origin(runtime.get("base_url", "")) == base_url_origin(base_url) else None
+        return explicit or key or aux._read_main_api_key_if_same_origin(base_url) or "no-key-required", None
+    return explicit or aux._named_custom_api_key(entry, req.provider, base_url), entry.get("extra_headers")
 
 
 def has_call_fallback_chain(task: str | None) -> bool:
@@ -166,33 +193,23 @@ class _OwnedStream(Iterator):
 
 def scoped_fallback_stream(stream: Any, policy: CallFallbackPolicy, progress_hook: Any, main_runtime: Any):
     """Bind only while advancing/closing, never while control belongs to its consumer."""
-    from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT, aux_progress_hook, scoped_runtime_main
-    relay_context = _RELAY_AUX_CALL_CONTEXT.get()
-    private_routed = _private_routed.get()
+    from agent.auxiliary_client import aux_progress_hook, scoped_runtime_main
+    captured = copy_context()
 
-    @contextmanager
-    def scope():
-        token = _RELAY_AUX_CALL_CONTEXT.set(relay_context)
-        private_token = _private_routed.set(private_routed)
-        try:
-            with scoped_fallback_policy(policy), aux_progress_hook(progress_hook), scoped_runtime_main(main_runtime):
-                yield
-        finally:
-            _private_routed.reset(private_token)
-            _RELAY_AUX_CALL_CONTEXT.reset(token)
+    def invoke(callback, *args):
+        with scoped_fallback_policy(policy), aux_progress_hook(progress_hook), scoped_runtime_main(main_runtime):
+            return callback(*args)
 
     def advance():
         while True:
-            with scope():
-                try:
-                    chunk = next(stream)
-                except StopIteration:
-                    return
+            try:
+                chunk = captured.run(invoke, next, stream)
+            except StopIteration:
+                return
             yield chunk
 
     def close():
-        with scope():
-            _close_stream(stream)
+        captured.run(invoke, _close_stream, stream)
 
     return _OwnedStream(advance(), close)
 

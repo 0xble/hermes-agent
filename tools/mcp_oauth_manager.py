@@ -153,8 +153,14 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
         if meta is None or storage is None:
             return
         existing = storage.load_oauth_metadata()
-        if existing is None or str(existing.token_endpoint) != str(meta.token_endpoint):
-            storage.save_oauth_metadata(meta)
+        known, resource = getattr(self, '_hermes_resource_policy', (False, None))
+        # A valid-token request proves no discovery/resource choice. In particular
+        # it cannot replace a saved parent with the SDK's canonical child fallback.
+        old_known, old_resource = storage.load_oauth_resource_policy()
+        if (existing is None or str(existing.token_endpoint) != str(meta.token_endpoint)
+                or str(existing.issuer) != str(meta.issuer)
+                or (known and (not old_known or old_resource != resource))):
+            storage.save_oauth_metadata(meta, resource=resource, resource_known=known)
 
     async def _is_invalid_client_at_token_endpoint(self, response: Any) -> bool:
         """True when *response* is the token endpoint (same scheme/host/path, query ignored)
@@ -240,7 +246,8 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
 
     async def async_auth_flow(self, request):  # type: ignore[override]
         try:  # pre-flow hook: reload from disk if it changed (non-fatal on error)
-            await get_manager().invalidate_if_disk_changed(self._hermes_server_name, hermes_home=self._hermes_home)
+            if not getattr(self.context.storage, "volatile", False):
+                await get_manager().invalidate_if_disk_changed(self._hermes_server_name, hermes_home=self._hermes_home)
         except Exception as exc:  # pragma: no cover — defensive
             self._log_nonfatal("pre-flow disk-watch", exc)
         # Bridge the bidirectional generator by hand: a naive ``async for item in inner: yield
@@ -320,6 +327,26 @@ class MCPOAuthManager:
     def get_or_build_provider(self, server_name: str, server_url: str, oauth_config: Optional[dict]) -> Optional[Any]:
         """Cached OAuth provider for ``server_name``, built on first use (rebuilt when ``server_url`` changes);
         None if the MCP SDK's OAuth support is unavailable."""
+        from agent.incognito import is_incognito
+        if is_incognito():
+            # Connection-owned SDK Context + volatile storage; never mutate/cache a normal provider.
+            entry = _ProviderEntry(server_url=server_url, oauth_config=oauth_config)
+            provider = self._build_provider(server_name, entry)
+            if provider is not None:
+                key = self._key(server_name)
+                def normal_resource_policy(saved_storage, configured_url, renewal=None):
+                    # Lookup at renewal under the grant fence, not at private
+                    # connection creation. Transfer only independently validated
+                    # minimal policy, never the normal mutable SDK Context.
+                    owner = self._entries.get(key)
+                    if owner is None or owner.provider is None or owner.server_url != configured_url:
+                        return False, None
+                    if renewal is not None:
+                        owner.provider._hermes_adopt_independent_resource_policy(saved_storage, configured_url, renewal)
+                        return False, None
+                    return owner.provider._hermes_export_resource_policy(saved_storage, configured_url)
+                provider._hermes_normal_resource_policy = normal_resource_policy
+            return provider
         key = self._key(server_name)
         with self._entries_lock:
             entry = self._entries.get(key)

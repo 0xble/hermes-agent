@@ -278,7 +278,7 @@ def _reserve_callback_port() -> int:
 def _cached_client_info(storage: "HermesTokenStorage | None") -> dict | None:
     """The on-disk client registration for *storage*, or None."""
     try:
-        info = _read_json(storage._client_info_path()) if storage is not None else None
+        info = storage._read_state(storage._client_info_path()) if storage is not None else None
     except (AttributeError, TypeError, ValueError):
         return None
     # A non-object payload is not a registration get_client_info could ever load, so callers
@@ -430,14 +430,19 @@ class HermesTokenStorage:
     _meta_path = partialmethod(_path, ".meta.json")
     _cimd_rejected_path = partialmethod(_path, ".cimd-off")
 
+    def _read_state(self, path: Path):
+        return _read_json(path)
+
+    def _write_state(self, path: Path, data: dict) -> None:
+        _write_json(path, data)
+
     def _state_paths(self) -> tuple[Path, Path, Path]:
         return self._tokens_path(), self._client_info_path(), self._meta_path()
 
-    @staticmethod
-    def _load_model(path: Path, sdk_name: str, label: str, fixup=None):
+    def _load_model(self, path: Path, sdk_name: str, label: str, fixup=None):
         """Read *path* into SDK model *sdk_name*; None if absent, no SDK, or corrupt.
         ``fixup(data)`` may rewrite the raw dict before validation."""
-        data = _read_json(path)
+        data = self._read_state(path)
         if data is not None and not isinstance(data, dict):
             # A non-object payload (list/str/number) has no fields for the fixups' ``.get``/``.pop``
             # and cannot validate: treat it like any other corrupt file instead of crashing auth init.
@@ -496,7 +501,7 @@ class HermesTokenStorage:
         if self._bound_issuer:  # which authorization server granted these tokens (never sent on the wire)
             payload["hermes_issuer"] = self._bound_issuer
             self.loaded_issuer = self._bound_issuer
-        _write_json(self._tokens_path(), payload)
+        self._write_state(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
 
     def bind_issuer(self, issuer: str | None) -> None:
@@ -506,12 +511,12 @@ class HermesTokenStorage:
     def stamp_issuer(self, issuer: str) -> None:
         """Backfill ``hermes_issuer`` onto a pre-binding token file: adopt the currently discovered
         issuer once instead of forcing a re-login, so the *next* read is protected."""
-        data = _read_json(self._tokens_path())
+        data = self._read_state(self._tokens_path())
         if data is None or data.get("hermes_issuer"):
             return
         data["hermes_issuer"] = str(issuer)
         try:
-            _write_json(self._tokens_path(), data)
+            self._write_state(self._tokens_path(), data)
         except OSError as exc:  # non-fatal — worst case we stamp next time
             logger.debug("Could not stamp issuer on tokens for %s: %s", self._server_name, exc)
             return
@@ -521,14 +526,14 @@ class HermesTokenStorage:
         """Drop the refresh token (and its issuer record) from disk, keeping the access token: the
         unexpired access token may still be used, but a refresh token must never go to a different
         issuer than the one that granted it."""
-        data = _read_json(self._tokens_path())
+        data = self._read_state(self._tokens_path())
         if data is None or not data.get("refresh_token"):
             return
         data.pop("refresh_token", None)
         data.pop("hermes_issuer", None)
         self.loaded_issuer = None
         try:
-            _write_json(self._tokens_path(), data)
+            self._write_state(self._tokens_path(), data)
         except OSError as exc:
             logger.warning("Could not strip refresh token for %s: %s", self._server_name, exc)
             return
@@ -551,20 +556,47 @@ class HermesTokenStorage:
             self._client_info_path(), "OAuthClientInformationFull", "client info",
             lambda data: coerced.append(self._coerce_secret_auth_method(data)))
         if info is not None and coerced[0]:
-            _write_json(self._client_info_path(), _model_json(info))  # persist so later flows skip the coercion
+            self._write_state(self._client_info_path(), _model_json(info))  # persist so later flows skip the coercion
         return info
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
         data = _model_json(client_info)
         self._coerce_secret_auth_method(data)
-        _write_json(self._client_info_path(), data)
+        self._write_state(self._client_info_path(), data)
         logger.debug("OAuth client info saved for %s", self._server_name)
 
-    def save_oauth_metadata(self, metadata: "OAuthMetadata") -> None:
-        """Persist server metadata so a restarted process can refresh without re-discovery;
-        otherwise the SDK guesses ``{server_url}/token`` (404) and forces re-auth."""
-        _write_json(self._meta_path(), _model_json(metadata))
+    def save_oauth_metadata(self, metadata: "OAuthMetadata", *, resource: str | None = None,
+                            resource_known: bool = False) -> None:
+        """Persist authorization authority, including a normally selected RFC 8707 audience.
+
+        Only the selected resource is retained, not the PRM/challenge which selected it.
+        Volatile storage keeps private discovery in memory; auth-only maintenance cannot write metadata.
+        """
+        data = _model_json(metadata)
+        # Explicit null is a known resource-free grant, not missing legacy provenance.
+        if resource_known or resource is not None:
+            data["hermes_resource"] = resource
+        self._write_state(self._meta_path(), data)
         logger.debug("OAuth metadata saved for %s", self._server_name)
+
+    def load_oauth_resource(self) -> str | None:
+        data = self._read_state(self._meta_path())
+        resource = data.get("hermes_resource") if isinstance(data, dict) else None
+        return resource if isinstance(resource, str) and resource else None
+
+    def load_oauth_resource_policy(self) -> tuple[bool, str | None]:
+        """Known audience (including explicit no-resource), or an unmigrated grant.
+
+        Do not collapse malformed authority or absent legacy provenance into a
+        resource-free policy. Callers must reconstruct unknown policy independently.
+        """
+        data = self._read_state(self._meta_path())
+        if not isinstance(data, dict) or "hermes_resource" not in data:
+            return False, None
+        resource = data["hermes_resource"]
+        if resource is not None and (not isinstance(resource, str) or not resource):
+            raise ValueError("Invalid saved MCP authorization resource policy")
+        return True, resource
 
     def load_oauth_metadata(self) -> "OAuthMetadata | None":
         return self._load_model(self._meta_path(), "OAuthMetadata", "OAuth metadata")
@@ -1167,9 +1199,12 @@ def _invalidate_tokens_on_client_change(
     Matching identity is a no-op so live sessions and valid tokens are preserved. Port of
     cline/cline#12983's "invalidate tokens when OAuth client changes" invariant.
     """
-    existing = _read_json(storage._client_info_path())
+    existing = storage._read_state(storage._client_info_path())
     old_client_id = existing.get("client_id") if isinstance(existing, dict) else None
     if not old_client_id or (old_client_id == new_client_id and (existing.get("client_secret") or None) == (new_client_secret or None)):
+        return
+    if getattr(storage, "volatile", False):
+        storage.discard_tokens_and_metadata()
         return
     removed = False
     for path in (storage._tokens_path(), storage._meta_path()):
@@ -1201,8 +1236,9 @@ def _maybe_preregister_client(storage: HermesTokenStorage, cfg: dict, client_met
         "response_types": client_metadata.response_types,
         "token_endpoint_auth_method": client_metadata.token_endpoint_auth_method,
         **{key: cfg[key] for key in ("client_secret", "client_name", "scope") if cfg.get(key)}}
-    _write_json(storage._client_info_path(), _model_json(info_cls.model_validate(info_dict)))
-    logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
+    storage._write_state(storage._client_info_path(), _model_json(info_cls.model_validate(info_dict)))
+    if not getattr(storage, "volatile", False):
+        logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
 
 
 def humanize_oauth_registration_error(

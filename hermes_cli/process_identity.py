@@ -372,13 +372,15 @@ def _append_entry(entry: LedgerEntry) -> bool:
             return False
 
 
-def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = None) -> bool:
+def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = None, include_argv: bool = True) -> bool:
     """Record a CHILD process this process just spawned. Best-effort.
 
     Mirror of :func:`register_self` for children that cannot register themselves (stdio MCP
     helpers: arbitrary ``npx``/binary servers never import Hermes code). Records the child's
     ``(pid, create_time)`` with THIS process as spawner, so a helper whose spawner is provably gone
     is a reapable orphan and one whose spawner is alive is never reaped.
+    ``include_argv=False`` retains those incarnation/reaping witnesses without
+    persisting command arguments from a private MCP lifetime.
     """
     try:
         pid = int(pid)
@@ -391,7 +393,8 @@ def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = Non
     try:
         import psutil
 
-        entry.argv = " ".join(psutil.Process(pid).cmdline()[:10])
+        if include_argv:
+            entry.argv = " ".join(psutil.Process(pid).cmdline()[:10])
     except Exception:
         pass
     return _append_entry(entry)

@@ -95,7 +95,7 @@ class SamplingHandler:
     _LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING}
 
     def __init__(self, server_name: str, config: dict,
-                 call_context: Callable[[], Optional[Context]] = lambda: None):
+                 call_context: Optional[Callable[[], Optional[Context]]] = None):
         self.server_name = server_name
         self._call_context = call_context
         self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
@@ -216,13 +216,16 @@ class SamplingHandler:
         call = functools.partial(call_llm, task="mcp", model=resolved_model or None, messages=messages,
                                  max_tokens=max_tokens, temperature=getattr(params, "temperature", None),
                                  tools=tools, timeout=self.timeout)
-        # The recv-loop task does not inherit the calling turn's contextvars. Replay the tool call's
-        # snapshot so a private turn's sampling stays on its incognito route.
-        captured = self._call_context()
-        return call if captured is None else (lambda: captured.copy().run(call))
+        return call
 
     async def __call__(self, context, params):
         """SDK ``SamplingFnT``: CreateMessageResult, CreateMessageResultWithTools, or ErrorData."""
+        from tools.mcp_tool_callback_context import run_owned_callback
+        return await run_owned_callback(self._call_context, self._sample, context, params,
+            on_unowned=lambda: _core.ErrorData(code=-32600, message="MCP sampling has no unambiguous RPC owner"))
+
+    async def _sample(self, context, params):
+        """Admission, dispatch and response parsing share the request owner's context."""
         resolved_model, err = self._admit(params)
         if err is not None:
             return err
@@ -270,7 +273,7 @@ class ElicitationHandler:
     _ANSWER_RESULTS = {"accept": ("accept", "accepted"), "cancel": ("cancel", "errors")}
 
     def __init__(self, server_name: str, config: dict,
-                 call_context: Callable[[], Optional[Context]] = lambda: None):
+                 call_context: Optional[Callable[[], Optional[Context]]] = None):
         self.server_name = server_name
         # 5 min mirrors the gateway approval default so async surfaces (Telegram, Slack) can respond.
         self.timeout = _safe_numeric(config.get("timeout", 300), 300, float)
@@ -297,11 +300,19 @@ class ElicitationHandler:
 
         consent = functools.partial(request_elicitation_consent, message, description,
                                     timeout_seconds=int(self.timeout), surface=f"mcp-elicitation/{self.server_name}")
-        captured = self._call_context()
+        captured = self._call_context() if self._call_context is not None else None
         return consent if captured is None else (lambda: captured.copy().run(consent))
 
     async def __call__(self, context, params):
         """SDK elicitation callback (``ElicitationFnT``). Returns ElicitResult or ErrorData."""
+        from tools.mcp_tool_callback_context import run_owned_callback
+        return await run_owned_callback(self._call_context, self._elicit, context, params,
+                                       on_unowned=lambda: self._result("decline", "declined"))
+
+    async def _elicit(self, context, params):
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return self._result("decline", "declined")
         self.metrics["requests"] += 1
         if getattr(params, "mode", "form") == "url":  # OAuth/payment: needs a browser + elicitation/complete; unsupported
             logger.info("MCP server '%s' requested URL-mode elicitation; declining "

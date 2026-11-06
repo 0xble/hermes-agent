@@ -138,6 +138,8 @@ def _ask_for_call(server_name: str, tool_name: str, charge, booked: Optional[lis
 def _check_circuit_breaker(server_name: str) -> Optional[str]:
     """Open-breaker error, or None when calls may proceed. After the cooldown the breaker is
     half-open: the next call probes; success resets, failure re-bumps and re-arms the cooldown."""
+    from agent.incognito import is_incognito
+    if is_incognito():return None  # private one-shots do not consult the public breaker
     from tools.mcp_tool_scope import _resolve_server_key
     key = _resolve_server_key(server_name)
     failures = _core._server_error_counts.get(key, 0)
@@ -161,6 +163,12 @@ def _acquire_call_server(server_name: str, tool_timeout: float):
     reconnect may be completing, so wait briefly before a breaker strike; still down -> ask the
     server task to rebuild (probing a dead transport would re-arm the breaker forever)."""
     from tools import mcp_tool_discovery as _discovery  # lazy: discovery -> registration -> handlers cycle
+    from agent.incognito import is_incognito
+    if is_incognito():
+        # Resolve configuration only. Public readiness, breaker and reconnect state
+        # are not evidence about the separately owned connection we will start.
+        server = _discovery._get_connected_server_for_call(server_name)
+        return (server, None) if server is not None else (None, tool_error(f"MCP server '{server_name}' is not configured"))
     not_connected = tool_error(f"MCP server '{server_name}' is not connected")
     from tools.mcp_liveness import unavailable_details
     details = unavailable_details(server_name)
@@ -265,6 +273,17 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
                    needs_reauth=True, server=server_name)
 
 
+def _uncertain_call_error(server_name: str, exc: BaseException, *, call_may_have_side_effects=False,
+                          session_state="not recovered yet"):
+    """Classification only: no server lookup, recovery, accounting or replay."""
+    if isinstance(exc, _StdioChildExited) and exc.in_flight:
+        return tool_error(_STDIO_OUTCOME_UNCERTAIN_MSG.format(s=server_name), outcome_uncertain=True)
+    if call_may_have_side_effects and _is_session_expired_error(exc):
+        return tool_error(_SESSION_OUTCOME_UNCERTAIN_MSG.format(s=server_name, state=session_state),
+                          outcome_uncertain=True, server=server_name)
+    return None
+
+
 def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str,
                                       *, call_may_have_side_effects: bool = False):
     """Transport reconnect + one retry on session expiry; None to fall through. Skips
@@ -297,9 +316,8 @@ def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retr
         logger.warning("MCP server '%s': %s failed with a session-expired/transport error after the request may "
                        "have been dispatched; NOT auto-retrying a write-capable tool (reconnect %s).",
                        server_name, op_description, "succeeded" if reconnected else "failed")
-        return tool_error(_SESSION_OUTCOME_UNCERTAIN_MSG.format(
-            s=server_name, state="been re-established" if reconnected else "not recovered yet"),
-            outcome_uncertain=True, server=server_name)
+        return _uncertain_call_error(server_name, exc, call_may_have_side_effects=True,
+                                     session_state="been re-established" if reconnected else "not recovered yet")
     if srv is None:
         return None
     logger.info("MCP server '%s': %s failed with session-expired error (%s); signalling transport reconnect "
@@ -347,11 +365,8 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
         else:  # No MCP loop to wait on (non-async adapters, tests): still request the respawn.
             _loop._signal_reconnect(srv)
     if exc.in_flight:
-        return _strike(
-            server_name,
-            _STDIO_OUTCOME_UNCERTAIN_MSG.format(s=server_name),
-            outcome_uncertain=True,
-        )
+        _core._bump_server_error(server_name)
+        return _uncertain_call_error(server_name, exc)
     if not reconnected:
         return _strike(server_name, _STDIO_NO_RESPAWN_MSG.format(s=server_name, t=_core._STDIO_RESPAWN_WAIT_SEC))
     try:
@@ -375,24 +390,47 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
 
 
 def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float, recoverers,
-              on_final_failure: Callable[[BaseException], None], record_outcome: bool = False) -> str:
+              on_final_failure: Callable[[BaseException], None], record_outcome: bool = False,
+              *, call_may_have_side_effects: bool = False) -> str:
     """Mark the call started on *server* (doubles may lack ``mark_tool_call``), run coroutine function *call*
     on the MCP loop and, on failure, walk ``recoverers`` (``(server_name, exc, retry_call, op) -> Optional[str]``,
     None = not its kind; order matters). Unrecovered exceptions go through ``on_final_failure`` and become the
     generic call-failed error. ``record_outcome`` applies breaker bookkeeping to the FIRST attempt only."""
-    if callable(getattr(server, "mark_tool_call", None)):
-        server.mark_tool_call()
+    from agent.incognito import is_incognito
+    from tools.mcp_tool import MCPServerTask
+    captured = contextvars.copy_context()
+    private_transport = captured.run(is_incognito) and isinstance(server, MCPServerTask)
+    call_started = False
+
+    async def private_or_normal_call():
+        nonlocal call_started
+        from tools.mcp_tool_callback_context import private_rpc_transport
+        async with private_rpc_transport(server) as target:
+            call_started = True
+            if callable(getattr(target, "mark_tool_call", None)):
+                target.mark_tool_call()
+            return await call()
+
+    async def owned_call():
+        return await captured.copy().run(asyncio.create_task, private_or_normal_call())
 
     def call_once():
-        return _loop._run_on_mcp_loop(call, timeout=tool_timeout)
+        return _loop._run_on_mcp_loop(owned_call, timeout=tool_timeout)
 
     try:
         result = call_once()
-        return _record_call_outcome(server_name, result) if record_outcome else result
+        return _record_call_outcome(server_name, result) if record_outcome and not private_transport else result
     except InterruptedError:
         return tool_error("MCP call interrupted: user sent a new message")
     except Exception as exc:
-        for recover in recoverers:
+        # The failed private one-shot has already been torn down. The recovery
+        # ladder resolves the registered PUBLIC server/provider by name; running
+        # it here would rotate/reconnect an unrelated normal lifetime. A caller
+        # may retry on a fresh private connection, never replay an uncertain write.
+        if private_transport and call_started:
+            uncertain = _uncertain_call_error(server_name, exc, call_may_have_side_effects=call_may_have_side_effects)
+            if uncertain is not None:return uncertain
+        for recover in (() if private_transport else recoverers):
             recovered = recover(server_name, exc, call_once, op)
             if recovered is not None:
                 return recovered
@@ -416,6 +454,8 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
     tracked = task is not None and inflight is not None
     if tracked:
         inflight.add(task)
+    from tools.mcp_tool_callback_context import begin_rpc_owner, end_rpc_owner
+    owner = begin_rpc_owner(server)
     try:
         yield
     except asyncio.CancelledError:
@@ -425,6 +465,7 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             raise RuntimeError(f"MCP {op} on '{server_name}' was aborted by a reconnect teardown; {advice}") from None
         raise
     finally:
+        end_rpc_owner(server, owner)
         if tracked:
             inflight.discard(task)
 
@@ -659,30 +700,37 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
                 report(progress, total, message)
 
         async def _call():
-            async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
-                server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
-                try:
-                    result = await _call_tool_racing_stdio_death(
-                        server, server_name, tool_name, args, meta=meta,
-                        progress_callback=_on_progress if report is not None else None)
-                finally:
-                    server._pending_call_context = None
-            if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
-                server._mark_session_proven()
+            from tools.mcp_tool_callback_context import rpc_target
+            target = rpc_target(server)
+            async with target._rpc_lock, _track_inflight_rpc(target, server_name, op, retry_safe=read_only):
+                result = await _call_tool_racing_stdio_death(
+                    target, server_name, tool_name, args, meta=meta,
+                    progress_callback=_on_progress if report is not None else None)
+            if getattr(target, "_mark_session_proven", None) is not None:  # prove only the actual transport
+                target._mark_session_proven()
             image_paths.clear()
             return _render_call_tool_result(result, server_name, image_paths)
 
         def _on_failure(exc):
-            _core._bump_server_error(server_name)
+            from agent.incognito import is_incognito
+            if not is_incognito():_core._bump_server_error(server_name)
             logger.error("MCP tool %s/%s call failed: %s", server_name, tool_name, exc)
         session_expired = partial(_handle_session_expired_and_retry, call_may_have_side_effects=not read_only)
         text = _dispatch(
             server_name, server, op, _call, tool_timeout,
             (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, session_expired),
-            _on_failure, record_outcome=True)
+            _on_failure, record_outcome=True, call_may_have_side_effects=not read_only)
         # Off the MCP loop on purpose: image prep is CPU work (bounded vision pool) that must not stall other servers' I/O.
         return _mcp_result_with_native_images(text, image_paths) if native_images and not _result_is_error(text) else text
     return _handler
+
+
+def _acquire_utility_server(server_name: str):
+    """Resolve shared read utilities without imposing public readiness on private one-shots."""
+    from tools import mcp_tool_discovery as _discovery
+    from agent.incognito import is_incognito
+    server = _discovery._get_connected_server_for_call(server_name)
+    return server if server is not None and (server.session is not None or is_incognito()) else None
 
 
 def _make_utility_handler(op: str, log_label: str, rpc, render, required: Optional[str] = None):
@@ -691,16 +739,17 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
     payload, ``required`` validated before any transport work."""
     def _factory(server_name: str, tool_timeout: float):
         def _handler(args: dict, **kwargs) -> str:
-            from tools import mcp_tool_discovery as _discovery  # lazy: import cycle
-            server = _discovery._get_connected_server_for_call(server_name)
-            if not server or not server.session:
+            server = _acquire_utility_server(server_name)
+            if server is None:
                 return tool_error(f"MCP server '{server_name}' is not connected")
             if required and not args.get(required):
                 return tool_error(f"Missing required parameter '{required}'")
 
             async def _call():
-                async with server._rpc_lock:
-                    result = await rpc(server.session, args, server_name)
+                from tools.mcp_tool_callback_context import rpc_target
+                target = rpc_target(server)
+                async with target._rpc_lock, _track_inflight_rpc(target, server_name, op):
+                    result = await rpc(target.session, args, server_name)
                 return json.dumps(render(result, server_name), ensure_ascii=False)
             return _dispatch(
                 server_name, server, op, _call, tool_timeout,

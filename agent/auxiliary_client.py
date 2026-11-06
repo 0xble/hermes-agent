@@ -123,7 +123,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.auxiliary_call_policy import (
     CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request, resolve_unavailable_client,
-    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response, private_route_scope, private_route_active,
+    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response, private_route_scope, private_route_active, named_route_credentials, named_private_credentials,
 )
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
@@ -3816,7 +3816,7 @@ def _pool_cache_hint(provider: str, *, main_runtime: Optional[dict[str, Any]] = 
         normalized = _normalize_aux_provider(runtime.get("provider") or _read_main_provider())
     if normalized in {"", "auto", "custom"}:
         return ""
-    pool = _load_pool_with_credentials(normalized, " (cache hint)")
+    pool = pool_for_aux_provider(provider, normalized, lambda k: _load_pool_with_credentials(k, " (cache hint)"))
     if pool is None:
         return ""
     entry = _peek_pool_entry(normalized, pool)
@@ -5448,7 +5448,7 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
     # whatever the caller left blank, never replaces what the caller set (compression prompts carry
     # conversation history, so a silently swapped destination is a data-routing bug, not a nuisance).
     custom_base = (req.explicit_base_url or custom_entry.get("base_url") or "").strip()
-    custom_key = _normalize_api_key(req.explicit_api_key) or _named_custom_api_key(custom_entry, provider, custom_base)
+    custom_key, entry_headers = named_route_credentials(req, custom_entry, custom_base)
     if custom_key == "no-key-required":
         logger.warning("resolve_provider_client: named custom provider %r has no resolvable "
                        "api_key — request will be sent with placeholder no-key-required "
@@ -5463,7 +5463,7 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
         logger.warning("resolve_provider_client: named custom provider %r has no base_url", provider)
         return None, None
     from hermes_cli.config import normalize_extra_headers
-    entry_headers = normalize_extra_headers(custom_entry.get("extra_headers"))
+    entry_headers = normalize_extra_headers(entry_headers)
     final_model = _normalize_resolved_model(
         req.model
         or custom_entry.get("model")
@@ -6088,7 +6088,7 @@ def _client_cache_key(
     # Profile home leads the key: callers that omit api_key (pool / Nous auth.json paths) would
     # otherwise share one client across multiplex profiles holding different credentials.
     return (hermes_home_key(), provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key,
-            _borrowed_main_credential_key(provider, base_url, api_key, runtime))
+            _borrowed_main_credential_key(provider, base_url, api_key, runtime), named_private_credentials(provider))
 
 
 def _borrowed_main_credential_key(provider: str, base_url: Optional[str], api_key: Any, runtime: dict[str, Any]) -> tuple:
@@ -6338,7 +6338,7 @@ def _get_cached_client(
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
     # and retry an exhausted key. A pinned ``custom:<name>`` peeks only its entry's rows.
     effective_api_key = api_key
-    if not effective_api_key:
+    if not effective_api_key and not named_private_credentials(provider):
         _pool = pool_for_aux_provider(provider, _normalize_aux_provider(provider), lambda k: _load_pool_with_credentials(k, " (peek)"))
         if _pool is not None and (_pe := _peek_pool_entry(provider, _pool)) is not None:
             effective_api_key = _pool_runtime_api_key(_pe) or api_key
@@ -6392,7 +6392,7 @@ def _preserve_provider_with_base_url(prov: Optional[str]) -> bool:
     """True when a first-class provider keeps its identity alongside an explicit base_url."""
     normalized = str(prov or "").strip().lower()
     if normalized in {"", "auto", "custom"} or normalized.startswith("custom:"):
-        return False
+        return normalized.startswith("custom:")  # named routes must never become anonymous
     if normalized in _LOCAL_SERVER_ALIASES:
         return True  # the custom branch applies the /v1 tail only when it still sees the alias
     # #76602 — two independent lookups, each guarded by its own try/except so a partial
