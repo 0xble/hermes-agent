@@ -48,6 +48,13 @@ round trip, no persistent approval, unchanged arguments, unrelated tools,
 agent socket bypass refusal, native updater spawning, human CLI update,
 scheduled updater CLI mode, and immediate human slash restart. Existing socket
 lineage tests explicitly inject an in-window clock without removing assertions.
+The real two-store profile-isolation regression test also pins the Pacific clock:
+inside the window it must route the duplicate session ID to the served satellite
+store and write the owner marker in the root; outside the window it must refuse
+the socket handoff without a marker, lock, spawn, or watcher. Unknown and
+traversal profile names remain refused in both windows. These are independent
+profile-routing and lifecycle-admission contracts, not an always-accepted socket
+contract dependent on the CI wall clock.
 
 Before deployment, run the exact-head local gate. Keep the PR draft until that
 qualification and delivery-owner review pass; a partial or failed gate is not

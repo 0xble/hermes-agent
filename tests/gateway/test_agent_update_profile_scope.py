@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -14,8 +16,15 @@ from gateway.update_launcher import make_agent_update_handler
 from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
 
 
+@pytest.mark.parametrize("local_time", ("04:00:00", "14:00:00"), ids=("in-window", "outside-window"))
 @pytest.mark.parametrize("profile", ("other", "missing", "../other"))
-def test_agent_update_uses_only_the_served_profiles_session_store(tmp_path, monkeypatch, profile):
+def test_agent_update_uses_only_the_served_profiles_session_store(
+    tmp_path, monkeypatch, profile, local_time,
+):
+    # Profile routing is orthogonal to lifecycle admission: exercise both policies
+    # with the real Pacific-window evaluator, never the wall clock of the runner.
+    timestamp = datetime.fromisoformat(f"2026-11-05T{local_time}-08:00").timestamp()
+    monkeypatch.setattr("tools.lifecycle_approval.time", SimpleNamespace(time=lambda: timestamp))
     root = tmp_path / "root"
     root.mkdir()
     (root / "config.yaml").write_text("{}\n", encoding="utf-8")
@@ -58,7 +67,7 @@ def test_agent_update_uses_only_the_served_profiles_session_store(tmp_path, monk
         )
         result = handler({"session_id": "requesting-session", "reason": "Apply routing fix", "profile": profile})
         assert get_hermes_home() == root  # The socket worker must not retain the requesting scope.
-        if profile == "other":
+        if profile == "other" and local_time == "04:00:00":
             assert result["accepted"] is True
             pending = json.loads((root / ".update_pending.json").read_text(encoding="utf-8"))
             assert pending["chat_id"] == "other-chat"
@@ -68,9 +77,17 @@ def test_agent_update_uses_only_the_served_profiles_session_store(tmp_path, monk
             spawn.assert_called_once()
             loop.call_soon_threadsafe.assert_called_once_with(runner._schedule_update_notification_watch)
         else:
-            assert result == {"accepted": False, "error": "profile is not served by this gateway"}
+            if profile == "other":
+                assert result["accepted"] is False
+                assert result["status"] == "approval_required"
+                assert "request_update" in result["error"]
+            else:
+                assert result == {"accepted": False, "error": "profile is not served by this gateway"}
             spawn.assert_not_called()
             loop.call_soon_threadsafe.assert_not_called()
             assert not (root / ".update_pending.json").exists()
+            assert not (satellite / ".update_pending.json").exists()
+            assert not (root / ".update_pending.lock").exists()
+            assert not (satellite / ".update_pending.lock").exists()
     finally:
         runner.close_all_session_db_handles()
