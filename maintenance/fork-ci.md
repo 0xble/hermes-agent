@@ -744,6 +744,22 @@ when released upstream binds these real-process tests to fixture-owned homes.
 
 Contract tests: `tests/tools/test_terminal_trailing_amp_auto_background.py`
 
+## Attached native-kill readiness probe
+
+The `fork-ci-reliability` identity covers the attached-job readiness probe in
+`tests/tools/test_process_registry_attached_boundary.py`. Login-shell startup
+can leave a child in a psutil snapshot that is reaped before its name is read.
+Only `NoSuchProcess` and `ZombieProcess` mean that candidate is gone; continue
+looking for a real `sleep` before timing the native kill. Access and other probe
+errors still fail. The killed-status, sub-0.5-second kill, and no-exit-receipt
+assertions are unchanged. Deterministic vanished-child probes require both a
+negative result without a sleeper and a positive result after a vanished child.
+This is independent of the broader teardown-helper change in fork PR #1120.
+Retire when released upstream carries equivalent race-safe readiness probing;
+roll back the commit carrying `Fork-Patch: fork-ci-reliability` for this probe.
+
+Contract tests: `tests/tools/test_process_registry_attached_boundary.py`
+
 ## Release-sync scope
 
 A release sync merges thousands of upstream commits. Fork policy checks classify
