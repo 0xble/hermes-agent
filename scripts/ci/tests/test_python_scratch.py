@@ -104,7 +104,7 @@ class PythonScratchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'scripts').mkdir()
-            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh'):
+            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh', '_setup_guard.sh', 'setup_guard.py'):
                 shutil.copy2(ROOT / 'scripts' / name, root / 'scripts' / name)
             (root / 'scripts/ci').mkdir()
             shutil.copy2(ROOT / 'scripts/ci/list_os_marked_tests.py', root / 'scripts/ci/list_os_marked_tests.py')
@@ -131,7 +131,7 @@ if __name__ == '__main__':
 ''', encoding='utf-8')
             subprocess.run(['git', 'init', '-q', str(root)], check=True)
             env = dict(os.environ, HOME=str(root / 'home'), HERMES_TEST_SCRATCH_ROOT=str(scratch), OPENAI_API_KEY='must-not-forward', HERMES_PYTHON=str(root / '.venv/bin/python'))
-            result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=root, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
+            result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=root, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('1 tests passed', result.stdout)
             self.assertTrue(scratch.is_dir())
@@ -143,7 +143,7 @@ if __name__ == '__main__':
         with tempfile.TemporaryDirectory() as directory:
             primary = Path(directory) / 'primary'
             (primary / 'scripts').mkdir(parents=True)
-            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh'):
+            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh', '_setup_guard.sh', 'setup_guard.py'):
                 shutil.copy2(ROOT / 'scripts' / name, primary / 'scripts' / name)
             (primary / 'scripts/ci').mkdir()
             shutil.copy2(ROOT / 'scripts/ci/list_os_marked_tests.py', primary / 'scripts/ci/list_os_marked_tests.py')
@@ -164,7 +164,7 @@ if __name__ == '__main__':
             env['HOME'] = str(Path(directory) / 'home')
             env['HERMES_PYTHON'] = str(primary / '.venv/bin/python')
             result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=worktree, env=env,
-                                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60, check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('1 tests passed', result.stdout)
 

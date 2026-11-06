@@ -249,11 +249,29 @@ clears `PYTHONPATH`, so PM shell activation alone does not supply pytest. For a
 fresh output outside the checkout, set `HERMES_PYTHON` to its interpreter.
 
 If the checkout environment is missing or stale, `scripts/run_tests.sh` refuses
-to run that setup when the inherited `HERMES_HOME` is a live runtime home (a
-`current` release pointer, `gateway_state.json`, a running gateway pid, or the
-OS account default home). Rebuild the checkout venv with the command above, or
-set `HERMES_HOME` to a scratch directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1`
-overrides the refusal only when setup against that home is deliberate.
+to run that setup when the inherited `HERMES_HOME` is a live runtime home, or
+resolves to one. The same check runs inside `hermes_sync` in
+`scripts/_activation.sh`, so sourcing activation and calling `hermes_ensure_env`
+or `hermes_sync` directly cannot bypass it. Both entry points use the single
+read-only guard in `scripts/_setup_guard.sh`. It asks `scripts/setup_guard.py`
+for the real runtime home and PM destinations, in setup's repo cwd, with its
+sanitized Python environment and the exact interpreter passed to setup. There
+is no shell path-resolution fallback: no interpreter or an import error refuses.
+Live means a `current` release pointer, `gateway_state.json`,
+a gateway pid `kill -0` can see (including EPERM), or any path under the OS
+account default. A profile under that default, or under another live root
+(`<root>/profiles/<name>`), is live even when the profile directory itself has
+no markers. That profiles parent is lexical, including when the profile
+directory is a symlink. As with `Path(home)`, empty and `.` components are
+removed before reading that parent; `..` remains lexical. Canonicalization matches Python
+`Path.resolve(strict=False)`, including a missing suffix under a symlinked
+ancestor. If that canonical root differs from the lexical root, either live
+root refuses. Every lexical and resolved path is checked, even if equal. A
+resolution error is live. The account-default lookup uses the real runtime
+function, never a PATH Python or macOS stub. Rebuild the
+checkout venv with the command above, or set `HERMES_HOME` to a scratch
+directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1` overrides the refusal only when
+setup against that home is deliberate.
 
 ```bash
 scripts/run_tests.sh                                    # full suite
