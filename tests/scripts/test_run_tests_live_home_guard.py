@@ -148,6 +148,48 @@ def test_stale_fallback_refuses_live_home_and_writes_nothing(tmp_path, kind):
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("activated", ["", "stale-checkout"])
+def test_refusal_advice_selects_rebuilt_interpreter_without_setup(tmp_path, activated):
+    root, commands = _checkout(tmp_path)
+    home = tmp_path / "live-home"
+    _mark(home, "gateway-state")
+    before = _snapshot(home)
+    interpreter = root / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text(
+        "#!/bin/bash\n"
+        "case \"$1\" in\n"
+        "  -c) [ \"$2\" = 'import pytest' ] ;;\n"
+        "  -m) exit 0 ;;\n"
+        "  *) printf 'TEST_RUNNER_ACCEPTED\\n' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
+    result = _run(root, commands, home, extra_env={"__HERMES_ACTIVATED": activated})
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    advice = [line.strip() for line in output.splitlines() if "HERMES_PYTHON=" in line]
+    assert len(advice) == 1, output
+    # Execute the emitted command verbatim in the caller's same stale shell.
+    (root / "advice.sh").write_text(advice[0] + "\n", encoding="utf-8")
+    env = {
+        "PATH": str(commands), "HOME": str(tmp_path / "account-home"),
+        "HERMES_HOME": str(home), "HERMES_RUNTIME_DIR": str(tmp_path / "runtime"),
+        "__HERMES_ACTIVATED": activated,
+    }
+    followed = subprocess.run(
+        ["bash", str(root / "advice.sh")], cwd=root, env=env,
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    followed_output = followed.stdout + followed.stderr
+    assert followed.returncode == 0, followed_output
+    assert "TEST_RUNNER_ACCEPTED" in followed_output
+    assert "SETUP_RAN" not in followed_output
+    assert _snapshot(home) == before
+
+
+@pytest.mark.platforms("posix")
 @pytest.mark.parametrize("kind", ["scratch", "dead-pid", "not-a-pointer"])
 def test_stale_fallback_still_sets_up_a_non_live_home(tmp_path, kind):
     root, commands = _checkout(tmp_path)

@@ -208,9 +208,8 @@ inferring support from the executable's reported version.
 `computer_use` is desktop-only: it does not expose a typed route for browser
 page content (no `cua_browser_*` actions). For reading or acting on a page's
 DOM — navigation, clicking a link by text, typed input into a form field —
-use the separate `browser_navigate`/`browser_click`/`browser_type`/`browser_snapshot`
-tools (or `browser_exec` when the Browser Use CLI backend is active); their
-own schemas document the current contract. Reserve `computer_use` for browser
+use the separate `browser_exec` tool (Python CDP helpers driving a headless
+Chromium); its own schema documents the current contract. Reserve `computer_use` for browser
 *chrome* (the address bar, permission prompts, extension popups, native
 dialogs) and anything else on screen that isn't page content.
 
@@ -309,12 +308,12 @@ in your conversation context.
   and CVC read live from the routed 1Password Credit Card item may be typed with
   `browser_type` or `fill_input`. An approved exact charge means the user explicitly
   approved the merchant, amount, and selected card in this session's conversation.
-  Prefer `browser_vault(action=fill)` first; direct entry may follow only a real fill
-  or field failure: `no_payment_fields`, a partial fill, missed fields, or a processor
-  frame. Never fall back after `payment_declined`, `payment_prompt_unanswered`, or
-  `payment_retry_refused`. For `approval_unavailable` (no prompt surface), direct
-  entry is allowed only when the user explicitly approved this exact charge in this
-  session's conversation. Never repeat secrets in replies, files, commits, or shell
+  Prefer `browser_vault(action=fill)` first; direct entry may follow in two cases:
+  (1) a real fill or field failure: `no_payment_fields`, a partial fill, missed
+  fields, or a processor frame; or (2) `approval_unavailable` (no prompt surface),
+  only when the user explicitly approved this exact charge in this session's
+  conversation. Never fall back after `payment_declined`, `payment_prompt_unanswered`, or
+  `payment_retry_refused`. Never repeat secrets in replies, files, commits, or shell
   arguments.
   Do not grant new OS permissions or accept unrelated consent without explicit
   task authority.
@@ -348,7 +347,7 @@ in your conversation context.
 
 ## When NOT to use `computer_use`
 
-- **Web automation you can do via separate headless `browser_*` tools** — those use a
+- **Web automation you can do via the separate headless `browser_exec` tool** — it drives a
   real headless Chromium and are more reliable than driving the user's
   GUI browser. Reach for `computer_use` specifically when the task
   needs the user's actual native apps (Finder/Explorer/Files, Mail/

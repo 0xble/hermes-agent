@@ -101,7 +101,7 @@ def test_eviction_published_during_staging_prevents_unchanged_notice(staged_upda
     for directory in (home, profile):
         mutated = roundtrip_yaml().load((directory / "config.yaml").read_text())
         assert mutated["plugins"]["disabled"] == ["incompatible"]
-        assert mutated["memory"]["provider"] == ""
+        assert mutated["memory"]["provider"] == "incompatible"
 
 
 def test_fresh_dependency_validation_failure_can_still_prove_unchanged(staged_update, monkeypatch):

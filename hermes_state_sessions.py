@@ -30,10 +30,7 @@ from hermes_state_deletion import finish_pending_deletes, stage_delete, visible_
 logger = logging.getLogger("hermes_state")
 
 
-def workspace_key(row: dict[str, Any]) -> Optional[str]:
-    """Workspace grouping key: git repo root, else cwd, else None (branch excluded: a checkout must not
-    fragment history)."""
-    return (row.get("git_repo_root") or "").strip() or (row.get("cwd") or "").strip() or None
+from hermes_state_sessions_workspace import workspace_key as workspace_key
 
 
 def _delegate_from_json(col: str = "model_config") -> str:
@@ -44,9 +41,9 @@ def _delegate_from_json(col: str = "model_config") -> str:
 # ("merged config is empty → store NULL").
 _MODEL_CONFIG_ROW_MISSING = object()
 
-# ``lineage(id)``: the compression lineage of the session bound twice as ``(?, ?)`` —
-# ancestors through compression-ended parents plus compression continuations after it.
-_LINEAGE_CTE_SQL = """
+# ``lineage(id)``: the compression lineage of the session bound twice as ``(?, ?)`` — ancestors and
+# continuations over compression edges only (a branch forked from a compressed chat is another chat).
+_LINEAGE_CTE_SQL = f"""
             WITH RECURSIVE
               ancestors(id) AS (
                 SELECT ?
@@ -56,6 +53,7 @@ _LINEAGE_CTE_SQL = """
                 JOIN sessions child ON child.id = a.id
                 JOIN sessions parent ON parent.id = child.parent_session_id
                 WHERE parent.end_reason = 'compression'
+{_non_continuation_child_sql('child.', 'parent.id')}
               ),
               descendants(id) AS (
                 SELECT ?
@@ -65,6 +63,7 @@ _LINEAGE_CTE_SQL = """
                 JOIN sessions parent ON parent.id = d.id
                 JOIN sessions child ON child.parent_session_id = parent.id
                 WHERE parent.end_reason = 'compression'
+{_non_continuation_child_sql('child.', 'parent.id')}
               ),
               lineage(id) AS (
                 SELECT id FROM ancestors
