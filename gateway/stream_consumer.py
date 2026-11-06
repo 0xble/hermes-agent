@@ -686,9 +686,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
         finally:
-            if not self._final_content_delivered:
-                await self._abandon_native_stream(reconcile=self._run_still_current())
-            self._wake_flush_waiters()
+            await self._finish_transports()
 
     # ── run() collaborators ─────────────────────────────────────────────
 

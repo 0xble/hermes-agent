@@ -212,6 +212,12 @@ class StreamTransportMixin:
         self._use_draft_streaming = False
         return False
 
+    async def _finish_transports(self) -> None:
+        """Close unfinished output before releasing any pending flush barriers."""
+        if not self._final_content_delivered:
+            await self._abandon_native_stream(reconcile=self._run_still_current())
+        self._wake_flush_waiters()
+
     async def _abandon_native_stream(self, *, reconcile: bool = True) -> None:
         """Seal an orphaned draft stream on turn death (stale exit / cancel): else the live
         indicator stays forever and armed interception state leaks into the next turn.

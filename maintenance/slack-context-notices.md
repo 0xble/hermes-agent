@@ -91,6 +91,9 @@ uninterrupted turn, including when ownership changes after the seal. Consumer
 failure never claims partial text as the final. Relay abandon requires the same
 exact `_draft_id` ownership proof as native Slack, even for its single-open-stream
 routing fallback (`tests/gateway/relay/test_abandoned_draft_reconciliation.py`).
+Relay draft sealing and abandon ownership live together in
+`gateway/relay/adapter_draft_lifecycle.py`; consumer exit cleanup lives beside
+abandon handling in `gateway/stream_consumer_transport.py`.
 Relay egress drops the native-only `_draft_id` after local ownership handling
 (`tests/gateway/relay/test_draft_identity_metadata.py`).
 
