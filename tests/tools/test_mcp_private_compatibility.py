@@ -16,7 +16,9 @@ from tools import mcp_tool as core
 from tools.mcp_tool import MCPServerTask
 from tools.mcp_tool_callback_context import private_rpc_transport
 from tools.mcp_tool_scope import _server_key
-from tests.tools.mcp_private_native_http import native_http, PRIVATE, NORMAL, URL, ISSUER
+from tests.tools.mcp_private_native_http import native_http as _registered_native_http, PRIVATE, NORMAL, URL, ISSUER
+
+native_http = _registered_native_http
 from tests.tools.test_mcp_private_oauth_transport import config, read
 
 

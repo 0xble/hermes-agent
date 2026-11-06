@@ -4,6 +4,7 @@ whole reply with ``replay_gap: true``. Adoption wakes a waiting one-shot; a cont
 the snapshot still lists; an ack received mid-resume settles against that snapshot; ``unknown`` settles."""
 import asyncio
 import json
+import threading
 
 import pytest
 
@@ -41,6 +42,61 @@ async def test_stream_json_result_is_authoritative_and_no_text_follows_the_gap(t
 async def test_quiet_oneshot_prints_the_answer_once(tmp_path, capsys, mode):
     assert await real_oneshot(tmp_path, mode, quiet=True) == 0
     assert capsys.readouterr().out.count(FINAL) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["ended", "live"])
+async def test_paused_owner_holds_the_first_write_before_filling_the_mailbox(tmp_path, capsys, monkeypatch, mode):
+    """Observe real claim/publication boundaries, without delaying or replacing the fanout drain."""
+    from hermes_cli.gateway_chat_view import GatewayChatView
+
+    entered = threading.Event()
+
+    class ObservedOwner(Owner):
+        def write(self, frame):
+            if not self.running.is_set():
+                entered.set()
+            return super().write(frame)
+
+    owner = ObservedOwner(tmp_path / "state.db", pause=mode)
+    claimed, deltas, snapshots = [], [], []
+    stamp, publish, resume = owner.authority._stamp_claim, owner.authority.publish_execution, owner.conn.resume
+
+    def stamp_claim(*args):
+        claimed.append(not owner.running.is_set())
+        return stamp(*args)
+
+    def publish_execution(session, generation, kind, payload):
+        if kind == "message.delta":
+            deltas.append(entered.is_set())
+        return publish(session, generation, kind, payload)
+
+    async def resumed(*args):
+        snapshot = await resume(*args)
+        snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(owner.authority, "_stamp_claim", stamp_claim)
+    monkeypatch.setattr(owner.authority, "publish_execution", publish_execution)
+    monkeypatch.setattr(owner.conn, "resume", resumed)
+    task = None
+    try:
+        view = GatewayChatView(owner, await owner.conn.resume(owner.ref, {}), quiet=True)
+        task = asyncio.create_task(view.run("write a long answer", oneshot=True))
+        await until(lambda: claimed, what="real owner claim publication")
+        assert claimed == [True], "viewer was not paused before the claim could publish message.start"
+        assert await asyncio.wait_for(task, 30) == 0
+        assert deltas and all(deltas), "producer filled the mailbox before the paused writer entered"
+        assert owner.gaps == ["s"], "probe did not retire exactly one real subscription"
+        assert len(snapshots) == 2
+        assert snapshots[0]["subscription_id"] != snapshots[1]["subscription_id"]
+        assert bool(snapshots[1]["pending"]) is (mode == "live")
+        assert capsys.readouterr().out.count(FINAL) == 1
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(owner.finish)
 
 
 class Peer:

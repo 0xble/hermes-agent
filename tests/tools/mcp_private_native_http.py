@@ -104,34 +104,50 @@ def native_http(monkeypatch, tmp_path):
             if not hasattr(current, 'sse'):current.sse = {}
             current.sse[session] = stream
             return http.Response(200, headers={'content-type': 'text/event-stream'}, stream=stream)
+        return await mcp_response(request, body, private, marker, path)
+
+    async def initialize_result(request, message, private, marker, path):
+        result = {'protocolVersion': message['params']['protocolVersion'], 'capabilities': {'resources': {}},
+                  'serverInfo': {'name': 'synthetic-offline-http', 'version': '1'}}
+        return result
+
+    async def read_result(request, message, private, marker, path):
+        current.entered.set()
+        if current.case == 'hold':await current.hold.wait()
+        if current.case == 'failure':raise http.ReadError(marker)
+        if current.case == 'expired' and private:
+            response = {'jsonrpc': '2.0', 'id': message['id'], 'error': {'code': -32001, 'message': 'session expired ' + marker}}
+            if path == '/messages':
+                current.sse[str(request.url.params['sessionId'])].queue.put_nowait(event(response))
+                return http.Response(202)
+            return http.Response(200, json=response)
+        result = {'contents': [{'uri': message['params']['uri'], 'text': marker}]}
+        return result
+
+    async def call_result(request, message, private, marker, path):
+        effects.append({'private': private, 'args': message['params']['arguments']})
+        if private and current.case == 'write-loss':raise http.ReadError(marker)
+        if private and current.case == 'write-expired':
+            return http.Response(200, json={'jsonrpc': '2.0', 'id': message['id'],
+                'error': {'code': -32001, 'message': 'session expired ' + marker}})
+        result = {'content': [{'type': 'text', 'text': marker}], 'isError': current.case == 'tool-error'}
+        return result
+
+    async def mcp_response(request, body, private, marker, path):
         message = json.loads(body)
         if 'id' not in message:return http.Response(202)
         method = message['method']
-        if method == 'initialize':
-            result = {'protocolVersion': message['params']['protocolVersion'], 'capabilities': {'resources': {}},
-                      'serverInfo': {'name': 'synthetic-offline-http', 'version': '1'}}
-        elif method == 'resources/read':
-            current.entered.set()
-            if current.case == 'hold':await current.hold.wait()
-            if current.case == 'failure':raise http.ReadError(marker)
-            if current.case == 'expired' and private:
-                response = {'jsonrpc': '2.0', 'id': message['id'], 'error': {'code': -32001, 'message': 'session expired ' + marker}}
-                if path == '/messages':
-                    current.sse[str(request.url.params['sessionId'])].queue.put_nowait(event(response))
-                    return http.Response(202)
-                return http.Response(200, json=response)
-            result = {'contents': [{'uri': message['params']['uri'], 'text': marker}]}
-        elif method == 'tools/call':
-            effects.append({'private': private, 'args': message['params']['arguments']})
-            if private and current.case == 'write-loss':raise http.ReadError(marker)
-            if private and current.case == 'write-expired':
-                return http.Response(200, json={'jsonrpc': '2.0', 'id': message['id'],
-                    'error': {'code': -32001, 'message': 'session expired ' + marker}})
-            result = {'content': [{'type': 'text', 'text': marker}], 'isError': current.case == 'tool-error'}
-        elif method == 'tools/list':result = {'tools': [{'name': 'write', 'inputSchema': {'type': 'object'}}]}
-        elif method == 'resources/list':result = {'resources': []}
-        elif method == 'prompts/list':result = {'prompts': []}
-        else:result = {}
+        handlers = {'initialize': initialize_result, 'resources/read': read_result, 'tools/call': call_result}
+        handler = handlers.get(method)
+        if handler is not None:
+            result = await handler(request, message, private, marker, path)
+            if isinstance(result, http.Response):
+                return result
+        else:
+            result = {
+                'tools/list': {'tools': [{'name': 'write', 'inputSchema': {'type': 'object'}}]},
+                'resources/list': {'resources': []}, 'prompts/list': {'prompts': []},
+            }.get(method, {})
         response = {'jsonrpc': '2.0', 'id': message['id'], 'result': result}
         if request.url.path == '/messages':
             if current.case == 'malformed' and method == 'resources/read':

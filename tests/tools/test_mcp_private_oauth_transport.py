@@ -8,7 +8,9 @@ import pytest
 from agent.incognito import incognito_scope, is_incognito
 from tools.mcp_tool import MCPServerTask
 from tools.mcp_tool_callback_context import private_rpc_transport
-from tests.tools.mcp_private_native_http import native_http, PRIVATE, NORMAL, URL
+from tests.tools.mcp_private_native_http import native_http as _registered_native_http, PRIVATE, NORMAL, URL
+
+native_http = _registered_native_http
 
 
 def config(kind):

@@ -48,6 +48,33 @@ def offline_mcp(monkeypatch):
                 await incoming.send(SessionMessage(message=message))
             peer.emit = emit
 
+            async def read_resource(message):
+                marker = NORMAL if message.params['uri'].startswith('fixture://normal/') else PRIVATE
+                case = message.params['uri'].rsplit('/', 1)[-1]
+                if case == 'hold':await peer.release.wait()
+                if case in {'malformed-notify', 'malformed-request', 'malformed-wire', 'stream-error'}:
+                    if case == 'malformed-notify':
+                        await emit('notifications/message', {'level': 'warning', 'data': 'fixture', 'logger': {'private': marker}})
+                    elif case == 'malformed-request':
+                        await emit('sampling/createMessage', {'messages': [{'role': 'user', 'content': {'type': 'text', 'text': marker}}], 'maxTokens': {'private': marker}}, 'malformed-private-input')
+                    elif case == 'malformed-wire':
+                        from mcp.client.stdio import _parse_line
+                        await incoming.send(_parse_line(json.dumps({'jsonrpc': '2.0', 'method': {'invalid': marker}})))
+                    else:await incoming.send(RuntimeError(marker))
+                    # SDK notification processing must complete before this response is observed.
+                    # Yield behind spawned SDK callback tasks, while the actual RPC is still active.
+                    for _ in range(8):
+                        step = asyncio.Event()
+                        asyncio.get_running_loop().call_soon(step.set)
+                        await step.wait()
+                result = {'contents': [{'uri': message.params['uri'], 'text': 'synthetic read result'}]}
+                return result
+
+            async def initialize(message):
+                return {'protocolVersion': message.params['protocolVersion'],
+                        'capabilities': {'resources': {}, 'tools': {'listChanged': True}},
+                        'serverInfo': {'name': 'synthetic-offline-server', 'version': '1'}}
+
             async def pump():
                 async with outgoing:
                     async for item in outgoing:
@@ -57,34 +84,14 @@ def offline_mcp(monkeypatch):
                             continue
                         peer.requests.append(message)
                         for observe in observers:await observe(peer, message)
-                        if message.method == 'initialize':
-                            result = {'protocolVersion': message.params['protocolVersion'],
-                                      'capabilities': {'resources': {}, 'tools': {'listChanged': True}},
-                                      'serverInfo': {'name': 'synthetic-offline-server', 'version': '1'}}
-                        elif message.method == 'tools/list':result = {'tools': []}
-                        elif message.method == 'events/list':result = {'events': [{'name': 'synthetic-public-event'}]}
-                        elif message.method == 'events/subscribe':result = {'id': 'synthetic-public-grant'}
-                        elif message.method == 'resources/read':
-                            marker = NORMAL if message.params['uri'].startswith('fixture://normal/') else PRIVATE
-                            case = message.params['uri'].rsplit('/', 1)[-1]
-                            if case == 'hold':await peer.release.wait()
-                            if case in {'malformed-notify', 'malformed-request', 'malformed-wire', 'stream-error'}:
-                                if case == 'malformed-notify':
-                                    await emit('notifications/message', {'level': 'warning', 'data': 'fixture', 'logger': {'private': marker}})
-                                elif case == 'malformed-request':
-                                    await emit('sampling/createMessage', {'messages': [{'role': 'user', 'content': {'type': 'text', 'text': marker}}], 'maxTokens': {'private': marker}}, 'malformed-private-input')
-                                elif case == 'malformed-wire':
-                                    from mcp.client.stdio import _parse_line
-                                    await incoming.send(_parse_line(json.dumps({'jsonrpc': '2.0', 'method': {'invalid': marker}})))
-                                else:await incoming.send(RuntimeError(marker))
-                                # SDK notification processing must complete before this response is observed.
-                                # Yield behind spawned SDK callback tasks, while the actual RPC is still active.
-                                for _ in range(8):
-                                    step = asyncio.Event()
-                                    asyncio.get_running_loop().call_soon(step.set)
-                                    await step.wait()
-                            result = {'contents': [{'uri': message.params['uri'], 'text': 'synthetic read result'}]}
-                        else:result = {}
+                        handlers = {'initialize': initialize, 'resources/read': read_resource}
+                        handler = handlers.get(message.method)
+                        if handler is not None:
+                            result = await handler(message)
+                        else:
+                            result = {'tools/list': {'tools': []},
+                                      'events/list': {'events': [{'name': 'synthetic-public-event'}]},
+                                      'events/subscribe': {'id': 'synthetic-public-grant'}}.get(message.method, {})
                         await incoming.send(SessionMessage(message=JSONRPCResponse(jsonrpc='2.0', id=message.id, result=result)))
             task = asyncio.create_task(pump())
             try:

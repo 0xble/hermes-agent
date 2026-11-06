@@ -46,8 +46,10 @@ def test_turn_ended_in_the_hole_reports_the_answer_and_the_next_turn_streams(tmp
         assert second is not None, "turn 2 hangs: the gap detached the viewer and nothing re-attached"
         assert not second["failed"] and "".join(t for t in streamed if t) == FINAL
     finally:
-        owners[0].finish()
-        connection.close()
+        try:
+            owners[0].finish()
+        finally:
+            connection.close()
 
 
 @pytest.fixture
@@ -178,3 +180,42 @@ def test_gap_recovery_restores_or_clears_the_connection_card(agents, monkeypatch
     monkeypatch.setattr(client, "rpc", rpc)
     assert run_turn(agent, "connect linear", 5) is not None
     assert (opened, updates) == (([pending], []) if pending else ([], [{"settled": True}]))
+
+
+@pytest.mark.parametrize("finish_fails", [False, True], ids=["ordinary-cleanup", "finish-error"])
+def test_real_replay_consumer_closes_connection_when_owner_finish_fails(tmp_path, monkeypatch, finish_fails):
+    """Drive the actual overflow consumer; observe teardown before emergency cleanup."""
+    from hermes_cli.gateway_connection import GatewayConnection
+    connections = []
+    original_start, original_finish = GatewayConnection.start, Owner.finish
+    failure = RuntimeError("injected owner finish failure")
+
+    def start(connection, *args, **kwargs):
+        if connection not in connections:
+            connections.append(connection)
+        return original_start(connection, *args, **kwargs)
+
+    def finish(owner):
+        original_finish(owner)
+        if finish_fails:
+            raise failure
+
+    monkeypatch.setattr(GatewayConnection, "start", start)
+    monkeypatch.setattr(Owner, "finish", finish)
+    try:
+        consumer = test_turn_ended_in_the_hole_reports_the_answer_and_the_next_turn_streams
+        if finish_fails:
+            with pytest.raises(RuntimeError) as raised:
+                consumer(tmp_path)
+            assert raised.value is failure
+        else:
+            consumer(tmp_path)
+        assert len(connections) == 1
+        connection = connections[0]
+        assert connection.closed, "owner finish failure bypassed real connection.close()"
+        assert not connection._thread.is_alive(), "consumer left its loop thread running"
+        assert connection.loop.is_closed(), "consumer left its event loop open"
+    finally:
+        # RED must not leak the very resource this regression detects.
+        for connection in connections:
+            connection.close()
