@@ -98,6 +98,8 @@ before running. Keep the checkout's pinned toolchain and every assertion intact,
 then detach and remove only the invocation's disposable image after all owned
 processes have exited.
 
+Replay-gap fixtures wait for the viewer's first paused write before publishing the remaining deltas. The fanout drain removes a whole pending batch before its first socket write blocks, so a producer-only delta count can miss the intended overflow under a legal thread schedule. Keep the 256-frame cap, existing wait bounds, actual-overflow precondition and exactly-once assertions unchanged. Exercise every shared-fixture consumer in ACP, GatewayAgent and GatewayChatView.
+
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning
 clears only after a gateway serves the new commit.
