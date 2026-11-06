@@ -242,6 +242,35 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    @pytest.mark.parametrize("readback_action", ["create", "list"])
+    def test_manifest_binding_readback(self, tmp_path, readback_action):
+        import hashlib
+        from cron.jobs import get_job
+
+        manifest = tmp_path / "manifest.json"
+        manifest.write_bytes(b'{"messages": []}\n')
+        binding = {
+            "payload_path": str(manifest),
+            "payload_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        }
+        created = json.loads(cronjob(
+            action="create", prompt="Inspect the frozen manifest", schedule="in 10m",
+            payload_path=binding["payload_path"], payload_sha256=binding["payload_sha256"],
+        ))
+        assert created["success"] is True
+        persisted = get_job(created["job_id"])
+        assert persisted is not None
+        assert {key: persisted[key] for key in binding} == binding
+        if readback_action == "create":
+            formatted = created["job"]
+        else:
+            listing = json.loads(cronjob(action="list"))
+            assert listing["success"] is True
+            assert listing["count"] == 1
+            formatted = listing["jobs"][0]
+        assert formatted["job_id"] == created["job_id"]
+        assert {key: formatted.get(key) for key in binding} == binding
+
     def test_create_with_natural_weekday_schedule(self):
         # The documented "every monday 9am" form must create a real cron job
         # through the tool path, not error out (issue: parser rejected it).
