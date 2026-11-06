@@ -63,6 +63,7 @@ import hermes_yaml as yaml
 
 from tests.e2e.core._pending_fixes import known_failure
 from tests.e2e.core.upgrade import _helpers as H
+from tests.e2e.core.upgrade._install_cache import InstallCache
 from tests.fakes.fake_llm_provider import FakeLLMServer
 
 pytestmark = [
@@ -309,7 +310,7 @@ _RETRY_PREFIX = ["/bin/sh", "-c", 'true; exec "$0" "$@"']
 
 def _make_origin(root: Path) -> Path:
     origin = root / "origin.git"
-    _git("clone", "-q", "--bare", "--shared", "--no-tags", str(H.WORKTREE), str(origin), cwd=root)
+    _git("clone", "-q", "--bare", "--shared", "--no-tags", "--single-branch", str(H.WORKTREE), str(origin), cwd=root)
     _git("update-ref", "refs/heads/main", _refs().base, cwd=origin)
     _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=origin)
     _git("tag", "-f", "e2e-upgrade-base", _refs().base, cwd=origin)
@@ -360,8 +361,12 @@ def _write_wrappers(leg_root: Path, install: Path, hermes_home: Path) -> Path:
     return wrap
 
 
-def make_leg(root: Path, template_home: Path | None) -> Leg:
+def make_leg(root: Path, template_home: Path | None, cache: InstallCache | None = None) -> Leg:
     root.mkdir(parents=True, exist_ok=True)
+    # Other upgrade suites use the original two-argument helper. Keep their downloads
+    # private to this leg; only callers explicitly supplying a fixture cache share content.
+    if cache is None:
+        cache = InstallCache(root / "downloads")
     origin = _make_origin(root)
     install = root / "install"
     _git("clone", "-q", "--shared", "-b", "main", str(origin), str(install), cwd=root)
@@ -379,7 +384,7 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
     # the updater must cross that interpreter boundary during the retry.
     no_cfg = root / "uv-config"
     no_cfg.mkdir()
-    uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
+    uv_env = cache.environment(H.isolated_env(root))
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
     cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--managed-python",
                          "--python", base_python], cwd=str(install),
@@ -391,7 +396,7 @@ def make_leg(root: Path, template_home: Path | None) -> Leg:
         shutil.rmtree(hermes_home)
         shutil.copytree(template_home, hermes_home, symlinks=True)
     wrap = _write_wrappers(root, install, hermes_home)
-    env = H.isolated_env(root, extra_path=[wrap])
+    env = cache.environment(H.isolated_env(root, extra_path=[wrap]))
     return Leg(root=root, origin=origin, install=install, env=env, hermes_home=hermes_home, wrap_dir=wrap)
 
 
@@ -556,9 +561,14 @@ def provider():
 
 
 @pytest.fixture(scope="module")
-def template_home(tmp_path_factory, provider) -> Path:
+def install_cache(tmp_path_factory):
+    return InstallCache(tmp_path_factory.mktemp("upgrade-downloads"), os.environ)
+
+
+@pytest.fixture(scope="module")
+def template_home(tmp_path_factory, provider, install_cache) -> Path:
     """HERMES_HOME populated by the N-1 CLI itself (sessions, profile, cron, config)."""
-    seed = make_leg(tmp_path_factory.mktemp("seed"), None)
+    seed = make_leg(tmp_path_factory.mktemp("seed"), None, install_cache)
     # A user's config may predate the release binary. v45 is the last schema before
     # the MCP editor's disabled → enabled migration, so even a v46+ base must exercise it.
     version = min(_base_config_version(seed), 45)
@@ -591,8 +601,8 @@ def template_home(tmp_path_factory, provider) -> Path:
 
 
 @pytest.fixture
-def leg(tmp_path, template_home) -> Leg:
-    lg = make_leg(tmp_path / "leg", template_home)
+def leg(tmp_path, template_home, install_cache) -> Leg:
+    lg = make_leg(tmp_path / "leg", template_home, install_cache)
     lg.snapshot = snapshot_state(lg)
     assert lg.snapshot["default"]["db"]["integrity"] == [("ok",)]
     assert len(lg.snapshot["default"]["db"]["sessions"]) >= 2 and len(lg.snapshot["work"]["db"]["sessions"]) >= 1
@@ -632,8 +642,8 @@ def _age_git_locks(install: Path, seconds: float = 3600) -> None:
 
 
 @pytest.fixture(scope="module")
-def clean_leg(tmp_path_factory, template_home):
-    lg = make_leg(tmp_path_factory.mktemp("clean") / "leg", template_home)
+def clean_leg(tmp_path_factory, template_home, install_cache):
+    lg = make_leg(tmp_path_factory.mktemp("clean") / "leg", template_home, install_cache)
     lg.snapshot = snapshot_state(lg)
     _publish_head(lg)
     return lg, _update(lg)

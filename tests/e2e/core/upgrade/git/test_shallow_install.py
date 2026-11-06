@@ -1,7 +1,8 @@
 """Shallow and stale installs through the real ``hermes update``.
 
-N-1's ``scripts/install.sh`` clones ``--depth 1 --single-branch``: that is the checkout every
-N-1 user has. Three installs run concurrently over smart HTTP:
+The fork's previous promoted installer provisions the real N-1 runtime. A real depth-1 clone
+then supplies retained legacy Git metadata (modern bootstrap would heal it during install).
+Three installs run concurrently over smart HTTP (release selection is owned by ``G.n1_tag``):
 
 * ``depth1``: N-1's own depth-1 install, updated to HEAD and then to one more release. The first
   update must not download the whole project history to move one release (#123254: on a real
@@ -20,10 +21,13 @@ N-1 user has. Three installs run concurrently over smart HTTP:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from tests.e2e.core._pending_fixes import known_failure
 from tests.e2e.core.upgrade import _install_helpers as I
+from tests.e2e.core.upgrade._install_cache import InstallCache
 from tests.e2e.core.upgrade.git import _git_world as G
 
 pytestmark = G.PYTESTMARK
@@ -31,8 +35,9 @@ pytestmark = G.PYTESTMARK
 ORPHAN = "orphan divergence"
 
 
-def _depth1(root) -> dict:
-    cm, w = G.start_world(root / "depth1", base=G.n1_base(), installer_ref=G.n1_tag())
+def _depth1(root, cache: InstallCache) -> dict:
+    cm, w = G.start_world(root / "depth1", base=G.n1_base(), installer_ref=G.n1_tag(), cache=cache)
+    w.seed_clone_shape(["--depth=1", "--single-branch"])
     run = {"cm": cm, "w": w, "shape0": w.install_shape}
     w.set_main(I.head_sha())
     run["mark1"] = w.srv.mark()
@@ -45,22 +50,23 @@ def _depth1(root) -> dict:
     return run
 
 
-def _checked(root) -> dict:
-    cm, w = G.start_world(root / "checked", base=G.n1_base(), installer_ref=G.n1_tag())
+def _checked(root, cache: InstallCache) -> dict:
+    cm, w = G.start_world(root / "checked", base=G.n1_base(), installer_ref=G.n1_tag(), cache=cache)
+    w.seed_clone_shape(["--depth=1", "--single-branch"])
     run = {"cm": cm, "w": w, "shape0": w.install_shape, "checks": []}
     between = I.git("rev-list", "--first-parent", f"{G.n1_base()}..{I.head_sha()}", cwd=I.H.WORKTREE).split()
     for k in (len(between) * 3 // 4, len(between) // 2, len(between) // 4):
         w.set_main(between[k])
         run["checks"].append(w.sb.cli("update", "--check", timeout=600))
     shallow = w.checkout / ".git" / "shallow"
-    run["grafts"] = len(shallow.read_text(encoding="utf-8").split()) if shallow.is_file() else 0
+    run["grafts"] = len(shallow.read_text(encoding="utf-8-sig").split()) if shallow.is_file() else 0
     w.set_main(I.head_sha())
     run["cp1"], run["head1"] = w.update(), w.head()
     return run
 
 
-def _prefetched(root) -> dict:
-    cm, w = G.start_world(root / "prefetched", base=I.head_sha())
+def _prefetched(root, cache: InstallCache) -> dict:
+    cm, w = G.start_world(root / "prefetched", base=I.head_sha(), cache=cache)
     run = {"cm": cm, "w": w}
     (w.checkout / "e2e-local-before-prefetch.txt").write_text("my local commit\n", encoding="utf-8")
     w.git("add", "-A")
@@ -76,8 +82,9 @@ def _prefetched(root) -> dict:
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("git-shallow")
-    results = G.in_parallel({"depth1": lambda: _depth1(root), "checked": lambda: _checked(root),
-                             "prefetched": lambda: _prefetched(root)})
+    cache = InstallCache(root / "downloads", os.environ)
+    results = G.in_parallel({"depth1": lambda: _depth1(root, cache), "checked": lambda: _checked(root, cache),
+                             "prefetched": lambda: _prefetched(root, cache)})
     yield results
     for res in results.values():
         if isinstance(res, dict):
@@ -135,6 +142,16 @@ def test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(runs)
         assert ORPHAN not in G.output(cp1) and not w.refs("refs/hermes-update-backups/orphan-*"), (
             f"after {len(run['checks'])} passive checks ({run['grafts']} grafts in .git/shallow) the update "
             f"claims orphan divergence on a history it shares with upstream:\n{w.diag(cp1)}")
+
+
+def test_current_updater_heals_shallow_history_before_its_bounded_fetch(runs):
+    """Independent of which fork promotion supplies N-1: this cell starts at HEAD."""
+    run = _run(runs, "prefetched")
+    transcript = G.output(run["cp1"])
+    healed = transcript.find("Fetched the commit history this shallow checkout was missing")
+    bounded = transcript.find("Fetching updates...")
+    assert 0 <= healed < bounded, (
+        f"current updater did not heal the shallow graft before its ordinary fetch:\n{transcript}")
 
 
 def test_depth1_prefetch_never_turns_shared_history_into_orphan_divergence(runs):

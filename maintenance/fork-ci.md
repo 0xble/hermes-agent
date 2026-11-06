@@ -1,5 +1,82 @@
 # Fork CI reliability
 
+## Historical git-install download isolation
+
+The shallow/partial clone suites retain smart HTTP, complete subject ancestry, historical
+N-1 installer bytes, all clone-shape/transfer assertions and the 900-second nightly file bound.
+Their three simultaneous real installs share only explicit runner content caches (uv, managed
+Python and npm) and a fixture-owned PM runtime download store. Each checkout, PM install identity,
+venv, active selection record and Hermes user home remains distinct. PM's machine uv cache is
+linked to the explicit content cache because PM intentionally does not use `UV_CACHE_DIR`.
+The shell runner must forward only `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, and `npm_config_cache`
+across its `env -i` boundary: otherwise the portable lane's already-primed downloads silently
+vanish before the file worker starts. The runner regression also proves installed/runtime/user
+state and credentials remain scrubbed; do not widen this to a generic environment passthrough.
+Only absolute explicit cache paths are eligible. Resolve symlinks and refuse descendants of
+`.hermes`, `.cache/uv`, `.npm` and `.local/share/uv` under the OS password-database home, even
+when `HOME` names a sandbox. Failure to resolve that account also drops these inputs.
+N-1 receives a private copy of the runner's actual uv, avoiding repeated Astral bootstrap.
+The Git worlds pass the existing `--skip-browser` option to both real installer versions.
+Their contract is clone shape, transfer, hydration and update behavior, not optional browser
+provisioning. Process snapshots from the 900-second Linux reproduction found their installers
+inside `npx playwright install --with-deps chromium` (a separate 600-second optional step).
+Skipping that unrelated step does not replace the installer or bypass Git/dependency assertions.
+Cold real installer download coverage remains in
+`test_install_fresh.py::test_fresh_install_serves_head_and_runs_a_turn`: its `installed` fixture
+starts with an empty machine home, does not use `InstallCache` or copy uv/runtime artifacts,
+and runs the real installer against its pinned download sources. This PR does not preseed that
+separate cold path; all three git worlds retain the download-sharing optimization.
+
+`make_leg(root, template_home)` remains supported for other upgrade suites. Omitting the optional
+cache creates download storage under that leg's own root; only explicit fixture-cache callers share
+content. Keep caller audits and a two-argument regression when extending shared test helpers.
+
+`test_upgrade_path` uses the same download-only fixture for its repeated N-1/update legs. Its
+bare origin advertises only the subject branch, like `_install_helpers.make_origin`, rather than
+all branches of a developer's partial clone (whose unrelated missing blobs could trigger network
+fetches during a local fixture clone). No source clone is redirected to external GitHub. The
+small local-repository regression proves the unrelated branch stays unadvertised; cache
+regressions prove user state and installed environments are not shared.
+
+## Fork upgrade release contract
+
+Git-world N-1 means the newest `origin` `deploy/nightly-*` promotion that is a strict
+ancestor of the candidate, not the nearest upstream CalVer tag. Discover refs using a bounded
+`ls-remote` and fetch a missing promotion object without changing `nightly.yml`. When those refs
+are unavailable, use the immutable `deploy/nightly-20261103` floor
+`002f8807dbdef3b9aa450980baa501c6e9920f58`; fail loudly if neither resolves. Ignore promotions
+before that floor. Both it and subsequent promotions contain upstream #126150's shallow healing
+fix (#123254), while upstream `v2026.9.24` performs an unfiltered `git fetch origin main` before
+swapping updater code. A depth-1 *install* does not make that later fetch depth-limited: the real
+smart-HTTP backend correctly sends hundreds of MB of historical blobs. This is a historical
+product defect, not a cache, browser, dumb-HTTP or fixed-pack fixture defect.
+
+Provision the genuine promoted runtime first, then seed its retained depth-1 Git metadata with a
+fresh real depth-1 smart-HTTP clone of the same commit. Modern bootstrap heals shallow clones at
+install time, so seeding before bootstrap cannot model retained legacy user state. Replace only
+the sandbox checkout's `.git`; never its source or installed dependencies. Record the real clone's
+shape and transfer baseline. Use this shared `World.seed_clone_shape` for partial cells too,
+asserting exact tree:0/blob:none/full input shapes so bootstrap cannot silently erase updater
+coverage. Keep the original shape, transfer, ancestry and two-update
+assertions. Current shallow-healer real-Git regressions remain independent of release selection;
+never truncate history, patch the historical updater or raise either timeout to make this pass.
+
+Local prerequisite: run historical upstream-tag suites from a tag-pinned object store rather than
+sharing mutable refs with other worktrees. A global `fetch.pruneTags=true` (with prune enabled)
+lets another fetch against the fork delete a just-hydrated upstream tag the fork does not publish,
+silently selecting August again. Verify the selected tag/SHA at execution time. This is separate
+from immutable object hydration needed for a partial developer checkout; hosted full-history,
+fresh-tag checkout is the arbiter for unchanged `test_upgrade_path.py`.
+
+Contract tests: `tests/e2e/core/upgrade/git/test_release_selection.py` `tests/hermes_cli/test_update_shallow_heal.py`
+
+Historical baseline: nightly 41454766643 completed shallow/partial/upgrade_path in 659.5/677.8/816.0
+seconds; 41834945580 timed out all three at 900 seconds. That establishes expensive successful
+runs, not a proven deadlock. Local process snapshots show installer dependency/runtime downloads
+and N-1's npm workspace install after the loopback Git clone has completed. Network is still
+required on a cold dependency cache; do not describe this fixture as offline or claim complete
+nightly coverage from a focused run.
+
 ## Required behavior
 
 The current CI interface is owned by [repository-ci-contract.md](repository-ci-contract.md);
