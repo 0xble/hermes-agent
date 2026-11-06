@@ -369,6 +369,8 @@ class LoopState:
     revisions: List[Dict[str, Any]] = field(default_factory=list)
     mutation_id: str = ""  # durable-write token, including same-value lifecycle changes
     tick_id: str = ""  # survives revisions, changes on every new claim
+    created_by: str = ""  # agent tool or user command, empty on legacy rows
+    stop_condition_owner: str = ""
 
     @property
     def version(self) -> int:
@@ -384,6 +386,8 @@ class LoopState:
         revisions = data.get("revisions", [])
         kwargs: dict[str, Any] = {
             "prompt": data.get("prompt", ""),
+            "created_by": str(data.get("created_by") or ""),
+            "stop_condition_owner": str(data.get("stop_condition_owner") or ""),
             "status": data.get("status", "active"),
             "mode": data.get("mode", "interval"),
             "paused_reason": data.get("paused_reason"),
@@ -522,9 +526,10 @@ def _next_control_generation(session_id: str, stored: Optional[LoopState], state
 
 
 def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None,
-              tick_lifecycle: bool = False, apply=None):
+              tick_lifecycle: bool = False, apply=None, precondition=None):
     """Write a loop or apply a command to the current row under the same control fence.
 
+    An optional precondition checks transcript/quote authority under this same write lock.
     Command callbacks validate and edit only their owned fields on the live row. They may
     be replayed on lock contention and must not mutate a manager's cached state. Return the
     persisted row and command result only after a successful write; cursor owners see errors.
@@ -546,6 +551,8 @@ def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None
         stored = _parse_state(row[0]) if row and row[0] else None
         original = stored.to_json() if stored is not None else None
         live = _parse_state(original) if original is not None else None
+        if precondition is not None and not precondition(conn):
+            return stored, False
         result = apply(live) if apply is not None else None
         updated = live if apply is not None else state
         if updated is not None and (apply is None or updated.to_json() != original):
@@ -826,6 +833,7 @@ class LoopManager(LoopRevisionsMixin):
         times: int = 0,
         until: str = "",
         route: Optional[dict[str, str]] = None,
+        actor: str = "user",
     ) -> LoopState:
         """Start a new loop (replaces any existing one for the session)."""
         prompt = (prompt or "").strip()
@@ -837,6 +845,8 @@ class LoopManager(LoopRevisionsMixin):
         # clock is coarse or frozen; otherwise a stale scheduler or completion could match it.
         stored = load_loop(self.session_id) if self._cursor is None else load_loop(
             self.session_id, cursor=self._cursor)
+        if actor == "agent" and stored is not None and stored.status in {"active", "paused"}:
+            raise ValueError("Use revise or replace to preserve the existing loop authority")
         prior = max(
             float(getattr(self._state, "created_at", 0.0) or 0.0),
             float(getattr(stored, "created_at", 0.0) or 0.0),
@@ -846,6 +856,8 @@ class LoopManager(LoopRevisionsMixin):
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
         state = LoopState(
             prompt=prompt,
+            created_by="agent" if actor == "agent" else "user",
+            stop_condition_owner="agent" if actor == "agent" else "user",
             mode="self_paced" if self_paced else "interval",
             interval_seconds=interval,
             current_delay=float(self_paced_floor_seconds()) if self_paced else interval,

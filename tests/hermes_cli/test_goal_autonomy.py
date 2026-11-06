@@ -226,8 +226,8 @@ def test_user_pause_authority_stays_explicit(home, monkeypatch, entry):
         if entry == "stale_quote":
             check = session_controls.check_user_quote
 
-            def supersede(sid, text, *, cursor=None):
-                checked = check(sid, text, cursor=cursor)
+            def supersede(sid, text, *, cursor=None, **scope):
+                checked = check(sid, text, cursor=cursor, **scope)
                 if cursor is None:
                     db.append_message("autonomy", "user", "Continue the goal.")
                 return checked
