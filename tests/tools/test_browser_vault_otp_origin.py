@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_store import VaultItemMeta
 from tools import browser_vault_tool as vault
 from tools.registry import registry
@@ -16,11 +17,11 @@ def otp(monkeypatch, tmp_path):
     meta = VaultItemMeta(id="op:otp-origin", kind="login", label="Synthetic login",
                          origin="https://login.test", allowed_origins=("https://login.test",),
                          created_at="", has_otp=True)
-    backend = Mock(name="backend", browser_account="", needs_unlock=False)
+    backend = LocalLoginBackend()
     backend.name = "onepassword"
     backend.display_name = "1Password"
-    backend.get_meta.return_value = meta
-    backend.resolve_otp.return_value = "246810"
+    backend.get_meta = Mock(return_value=meta)
+    backend.resolve_otp = Mock(return_value="246810")
     monkeypatch.setattr("agent.vault_backends.backend_for_handle", lambda _: backend)
     monkeypatch.setattr(vault, "_browser_key", lambda t: t)
     monkeypatch.setattr(vault, "_focus_bound_origin", lambda *_: None)

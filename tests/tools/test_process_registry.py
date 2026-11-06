@@ -31,14 +31,13 @@ def registry():
 
 
 @pytest.fixture(autouse=True)
-def _reset_systemd_scope_cache():
-    """Reset the cached ``systemd-run --user --scope`` availability flag
-    before each test so a probe run on a real systemd host (where
-    ``INVOCATION_ID`` is set) doesn't leak into tests that mock
-    ``subprocess.Popen``. Tests that exercise the probe directly reset the
-    cache themselves."""
+def _isolate_spawn_host_state(monkeypatch):
+    """Keep scope probes and console-script discovery off the operator's install."""
     import tools.process_registry as _pr
+    from tools.environments import local as local_env
 
+    # Same spawn-unit seam as test_persist_on_release: PATH discovery is tested separately.
+    monkeypatch.setattr(local_env, "_resolve_hermes_bin_dir", lambda: None)
     original = _pr._SYSTEMD_SCOPE_AVAILABLE
     _pr._SYSTEMD_SCOPE_AVAILABLE = False
     yield

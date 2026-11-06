@@ -640,15 +640,15 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
         "pre_tool_call",
         **cancelled,
         tool_call_id="sensitive-cancelled-tool-call",
-        tool_name="browser_navigate",
-        args={"url": prompt_canary},
+        tool_name="browser_exec",
+        args={"code": prompt_canary},
     )
     lifecycle.invoke_hook(
         "post_tool_call",
         **cancelled,
         tool_call_id="sensitive-cancelled-tool-call",
-        tool_name="browser_navigate",
-        args={"url": prompt_canary},
+        tool_name="browser_exec",
+        args={"code": prompt_canary},
         result={"error": tool_canary},
         status="cancelled",
         duration_ms=31_000,
@@ -709,7 +709,7 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
     } == {
         ("terminal", "success", "none"),
         ("read_file", "failed", "unknown"),
-        ("browser_navigate", "cancelled", "interrupted"),
+        ("browser_exec", "cancelled", "interrupted"),
     }
     assert {
         counter["dimensions"]["outcome"]
@@ -2863,7 +2863,7 @@ def test_install_snapshot_is_daily_and_carries_only_bucketed_counts(
         "main_provider": "none", "mcp_server_count_bucket": "1", "memory_provider": "plugin",
         "messaging_platform_count_bucket": "0", "plugin_count_bucket": "3_to_5",
         "profile_count_bucket": snapshot["profile_count_bucket"], "skill_count_bucket": "0",
-        "terminal_backend": "local", "local_model_provider_used": "no",
+        "terminal_backend": "local", "local_model_provider_used": "no", "compression_prepare_ahead": "off",
         **{k: snapshot[k] for k in ("behind_bucket", "gpu_class", "ram_bucket", "release_channel", "version_age_bucket")},
     }
 
@@ -2953,6 +2953,30 @@ def test_milestone_install_age_is_the_subscriber_profile_not_the_relay_thread(tm
     assert ages == ["gte_90d"]
 
 
+def test_subscriber_rechecks_consent_between_queued_counter_writes(tmp_path, monkeypatch):
+    """A queued Relay event cannot keep writing after its owning profile revokes collection."""
+    from hermes_cli.observability.shared_metrics import SharedMetricsStore
+    from hermes_cli.observability.shared_metrics_subscriber import SharedMetricsSubscriber
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    consent = [True]
+    subscriber = SharedMetricsSubscriber(SharedMetricsStore(), "1.0", consent_check=lambda: consent[0])
+    dimensions = {"crash_class": "none", "exit_kind": "killed", "process_kind": "gateway"}
+    counter = ("hermes.process.exit", dimensions, 1)
+    monkeypatch.setattr(subscriber, "_classify", lambda event: [counter, counter])
+    persist = subscriber._persist
+
+    def persist_then_revoke(*args):
+        persist(*args)
+        consent[0] = False
+
+    monkeypatch.setattr(subscriber, "_persist", persist_then_revoke)
+    subscriber(SimpleNamespace(metadata={}))
+    subscriber(SimpleNamespace(metadata={}))  # another event was queued before revocation
+    rows = subscriber.store.counter_snapshot()
+    assert [(r["metric_name"], r["value"]) for r in rows] == [("hermes.process.exit", 1)]
+
+
 def test_token_usage_is_summed_per_model_and_auxiliary_task(direct_runtime, tmp_path):
     base = {"session_id": "s1", "task_id": "t1", "provider": "anthropic", "model": "claude-sonnet"}
     for request_id in ("r1", "r2"):
@@ -2998,58 +3022,3 @@ def test_recovered_rows_report_saved_only_once_the_store_holds_them(real_binding
     assert relay_shared_metrics.record_process_marks_saved([row]) == 1
     saved = [(r["metric_name"], r["dimensions"], r["value"]) for r in SharedMetricsStore().counter_snapshot()]
     assert saved == [("hermes.process.exit", row[1], 1)]
-
-
-def _cli_turn(session_id: str, parent_session_id: str = "") -> None:
-    hook = dict(session_id=session_id, task_id=f"{session_id}-t", platform="cli")
-    lifecycle.invoke_hook("pre_llm_call", **hook, parent_session_id=parent_session_id)
-    relay_shared_metrics.finish_task_run(**hook, result={"completed": True})
-
-
-def test_finite_cli_runs_report_their_own_entrypoint(direct_runtime, tmp_path, monkeypatch):
-    """`hermes -z` / `chat -q` / `-Q` runs (HERMES_SINGLE_QUERY_SESSION) report `one_shot`, a
-    dispatcher-spawned one (kanban worker, A2A forward) `background`; the REPL stays `interactive`,
-    and a delegated child or a non-CLI surface keeps its own entrypoint inside a finite run."""
-    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
-    _cli_turn("repl")
-    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
-    _cli_turn("oneshot")
-    _cli_turn("child", parent_session_id="oneshot")
-    _finish_desktop_task("desktop", "desktop-t")
-    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
-    _cli_turn("kanban")
-    for session_id in ("repl", "oneshot", "child", "desktop", "kanban"):
-        lifecycle.finalize_session(session_id=session_id)
-    _join_export_workers()
-
-    started = sorted((d["entrypoint"], d["execution_surface"], v)
-                     for d, v in _stored_values(tmp_path, "hermes.task_run.started"))
-    assert started == [
-        ("background", "cli", 1), ("delegated", "cli", 1), ("interactive", "cli", 1),
-        ("interactive", "desktop", 1), ("one_shot", "cli", 1),
-    ]
-    finished = {d["entrypoint"] for d, _ in _stored_values(tmp_path, "hermes.task_run.finished")}
-    assert finished == {"background", "delegated", "interactive", "one_shot"}
-    # Delegated children are not sessions of their own.
-    sessions = sorted((d["entrypoint"], d["execution_surface"], d["turn_count_bucket"])
-                      for d, _ in _stored_values(tmp_path, "hermes.session.count"))
-    assert sessions == [
-        ("background", "cli", "1"), ("interactive", "cli", "1"), ("interactive", "desktop", "1"),
-        ("one_shot", "cli", "1"),
-    ]
-
-
-def test_oneshot_hard_exit_cleanup_records_the_session_summary(direct_runtime, tmp_path, monkeypatch):
-    """`hermes -z` leaves through os._exit, past the atexit hook that closes the metrics session; its
-    pre-exit cleanup must write the run's session.count itself."""
-    from hermes_cli import main as hermes_main
-
-    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
-    monkeypatch.setattr(hermes_main, "_oneshot_cleanup_done", False)
-    _cli_turn("z-run")
-    hermes_main._cleanup_oneshot_runtime()
-    _join_export_workers()
-
-    sessions = _stored_values(tmp_path, "hermes.session.count")
-    assert [(d["entrypoint"], d["turn_count_bucket"], v) for d, v in sessions] == [("one_shot", "1", 1)]

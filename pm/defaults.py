@@ -21,6 +21,13 @@ from pathlib import Path
 
 DECLINED_FILENAME = "declined-packages.json"
 
+# The native agent-browser owner remains shipped, so its opt-out is not retired.
+RETIRED_DEFAULTS: dict[str, str] = {}
+
+
+def canonical_default_name(name: str) -> str:
+    return RETIRED_DEFAULTS.get(name, name)
+
 
 def declined_path(project_root: Path | None = None) -> Path:
     from pm.environments import install_state_dir
@@ -42,7 +49,7 @@ def declined(project_root: Path | None = None) -> frozenset[str]:
         raise InstallError("defaults", f"cannot read {declined_path(project_root)}: {exc}",
                            "fix or delete the file, then retry") from exc
     names = data.get("declined") if isinstance(data, dict) else None
-    return frozenset(name for name in names or () if isinstance(name, str))
+    return frozenset(canonical_default_name(name) for name in names or () if isinstance(name, str))
 
 
 def record_declined(*, add: Iterable[str] = (), remove: Iterable[str] = (),
@@ -51,7 +58,7 @@ def record_declined(*, add: Iterable[str] = (), remove: Iterable[str] = (),
     from pm.filesystem import durable_write_bytes
 
     current = declined(project_root)
-    updated = (current | set(add)) - set(remove)
+    updated = (current | {canonical_default_name(name) for name in add}) - set(remove)
     if updated != current:
         body = json.dumps({"schema": 1, "declined": sorted(updated)}, indent=2) + "\n"
         durable_write_bytes(declined_path(project_root), body.encode("utf-8"))

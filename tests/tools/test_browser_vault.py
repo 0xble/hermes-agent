@@ -25,6 +25,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_login_classifier import (
     ClassifiedLoginControl,
     LoginControl,
@@ -298,7 +299,7 @@ class TestBrowserVaultTools:
 
         meta = self._manager_meta()
 
-        class _ManagerBackend:
+        class _ManagerBackend(LocalLoginBackend):
             name, display_name, needs_unlock = "onepassword", "1Password", False
 
             def is_unlocked(self):
@@ -343,7 +344,7 @@ class TestBrowserVaultTools:
 
         meta = self._manager_meta()
 
-        class _ManagerBackend:
+        class _ManagerBackend(LocalLoginBackend):
             name, display_name, needs_unlock = "onepassword", "1Password", False
 
             def is_unlocked(self):

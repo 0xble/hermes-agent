@@ -10,6 +10,7 @@ namespaced by ``prefix`` so ``backend_for_handle`` needs no lookup table.
 from __future__ import annotations
 
 import subprocess
+from contextlib import AbstractContextManager, nullcontext
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -49,6 +50,11 @@ class LoginBackend(ABC):
 
     def is_unlocked(self) -> bool:
         return True
+
+    def fill_context(self) -> AbstractContextManager:
+        """Optional profile-exclusive context, entered after the origin pre-check: covers the in-context
+        metadata re-check, secret resolution and the CDP write."""
+        return nullcontext()
 
     @abstractmethod
     def list_items(self) -> list[VaultItemMeta]:
@@ -163,7 +169,8 @@ def enabled_backends() -> list[LoginBackend]:
             # Password managers with several accounts (1Password) add one backend per extra account.
             if extra := getattr(cls, "additional_accounts", None):
                 out.extend(extra(section))
-    return out
+    from agent.vault_backend_registry import enabled_plugin_backends
+    return out + enabled_plugin_backends(cfg)
 
 
 def backend_for_handle(handle: str) -> Optional[LoginBackend]:

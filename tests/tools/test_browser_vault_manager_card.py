@@ -53,7 +53,7 @@ class _Manager(LoginBackend):
         return dict(_CARD)
 
 
-def _run_fill(page_url, decision="accept", focused=None, controls=_CONTROLS, after_consent=None):
+def _run_fill(page_url, decision="accept", focused=None, controls=_CONTROLS, after_consent=None, backend=None):
     from tools import browser_vault_tool
     prompts, secret_exprs, focus_calls, order, nonces = [], [], [], [], []
     page = {"url": page_url, "controls": controls}
@@ -87,7 +87,7 @@ def _run_fill(page_url, decision="accept", focused=None, controls=_CONTROLS, aft
             page["controls"] = after_consent  # the page changed while the prompt waited
         return decision
 
-    backend = _Manager()
+    backend = backend or _Manager()
     with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
          patch.object(browser_vault_tool, "_focus_bound_origin", side_effect=fake_focus), \
          patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
@@ -459,3 +459,67 @@ def test_payment_inspection_failures_are_safe_missing_field_receipts(failure, mo
     assert 'untrusted-page-exception' not in json.dumps(result)
     consent.assert_not_called()
     resolve.assert_not_called()
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_payment_writes_stay_in_backend_snapshot_and_revalidate_origin(changed):
+    """Main's backend lock must cover the new planner and both write/readback passes."""
+    from contextlib import contextmanager
+    from dataclasses import replace
+    from agent import redact
+    from tools import browser_vault_payment as payment
+
+    class SnapshotManager(_Manager):
+        active = False
+        contexts = 0
+        resolutions = 0
+
+        @contextmanager
+        def fill_context(self):
+            self.active = True
+            self.contexts += 1
+            try:
+                yield
+            finally:
+                self.active = False
+
+        def get_meta(self, handle):
+            meta = super().get_meta(handle)
+            assert meta is not None
+            if self.active:
+                origin = "https://other.test" if changed else "https://shop.test"
+                return replace(meta, origin=origin, allowed_origins=(origin,))
+            return meta
+
+        def resolve_secret(self, handle):
+            assert self.active
+            self.resolutions += 1
+            return super().resolve_secret(handle)
+
+    backend = SnapshotManager()
+    real_fill = payment.fill
+    calls = []
+
+    def fill_in_snapshot(task, origin, selected, ambiguous, writer, error=None):
+        assert backend.active
+        calls.append(True)
+
+        def checked_write(*write_args, **write_kwargs):
+            assert backend.active
+            return writer(*write_args, **write_kwargs)
+
+        return real_fill(task, origin, selected, ambiguous, checked_write, error)
+
+    try:
+        with patch.object(payment, "fill", side_effect=fill_in_snapshot):
+            raw, _, writes = _run_fill("https://shop.test/pay", backend=backend)
+        result = json.loads(raw)
+        assert backend.contexts == 1 and not backend.active
+        if changed:
+            assert result["error_type"] == "origin_mismatch"
+            assert not writes and not calls and backend.resolutions == 0
+        else:
+            assert result["success"] and not result["partial"]
+            assert calls == [True] and len(writes) == 2 and backend.resolutions == 1
+    finally:
+        redact.clear_vault_redaction_values()

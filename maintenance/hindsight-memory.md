@@ -131,10 +131,23 @@ strategy and cron-exclusion behavior.
   registry also owns Discord's unverified notice and reply-only context, Slack's trusted and
   unverified thread headers, and the relay recent-history header. Channel history ends at its
   last `[New message]` boundary, accepting the same quoted-boundary limitation as generated
-  templates. Model input and retention keep the complete file and channel content.
+  templates. A backfill-quoted boundary followed by a complete counted document frame can
+  also be byte-identical to a genuine current-message document, including a count reaching EOF.
+  Text alone cannot prevent that frame from swallowing a later question while preserving counted
+  document opacity. Deferred follow-up: carry a producer-trusted current-message split on the
+  event into recall; do not resolve this ambiguity with a text heuristic. The original backfill
+  test covers invalid counts, not this ambiguous complete-frame case. Model input and retention
+  keep the complete file and channel content.
+  Inbound voice/image enrichment runs before channel context is added, leaving transcripts and
+  descriptions after `[New message]`; sender attribution stays in its original position inside
+  enrichment. The enrichers transcribe attachment paths or analyze images with a fixed prompt,
+  rather than reading channel backfill. For image-only shared turns, bracket-only remaining text
+  (such as `[Brian]`) no longer blocks the description fallback: recall puts the description first
+  and preserves the suffix, since text cannot prove it is attribution rather than a typed caption.
   Shared media-batch caption merging preserves the exact document bytes, including trailing
   whitespace covered by the count, while still comparing stripped captions for deduplication.
   Proof: `tests/agent/test_document_channel_recall_query.py`,
+  `tests/gateway/test_media_channel_recall_query.py`, `tests/agent/test_attachment_recall_query.py`,
   `tests/gateway/test_document_media_batch_framing.py` (Feishu, Telegram, Slack, Discord,
   and WhatsApp real batching paths), and the platform document suites.
   Retire when upstream carries the human caption separately through all attachment producers.

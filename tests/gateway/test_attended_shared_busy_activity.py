@@ -140,7 +140,14 @@ async def test_internal_busy_input_keeps_existing_admission_without_user_auth(
                          allow_gateway_control=allow_gateway_control)
     from gateway.wake import admit_internal_event
 
-    await admit_internal_event(env.adapter, event)
+    if draining:
+        # Already-admitted adapter arrivals spool during drain. New producer wakes do not.
+        from gateway.wake import WakeNotAccepted
+        with pytest.raises(WakeNotAccepted, match="draining"):
+            await admit_internal_event(env.adapter, event)
+        await env.adapter.handle_message(event)
+    else:
+        await admit_internal_event(env.adapter, event)
     assert event._gateway_accepted
     assert env.adapter._pending_messages[env.owner.key] is event
     assert not env.runner._overflow_queue(env.owner.key)

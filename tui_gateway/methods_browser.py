@@ -19,8 +19,8 @@ def _resolve_browser_cdp_url() -> str:
     if env_url := live_cdp_override() or env_cdp_url():
         return env_url
     with contextlib.suppress(Exception):
-        from hermes_cli.config import read_raw_config
-        cfg = read_raw_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
         if isinstance(browser_cfg, dict):
             return str(browser_cfg.get("cdp_url", "") or "").strip()

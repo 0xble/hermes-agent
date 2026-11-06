@@ -40,6 +40,31 @@ Hermes application checkout. A selected lane (`check --lane`) is partial evidenc
 profile uses changed-file classification, and the complete profile never substitutes a
 smoke manifest for complete discovery.
 
+Upstream-sync fixtures retain the fork's admission, detached-pruner, native
+browser, resident-completion and degraded-platform contracts. Use a real base
+interpreter and valid `pyvenv.cfg` when a release fixture executes Python,
+instead of linking a fake environment back through another virtualenv. A
+parked bot keeps the gateway serving local clients, while ownership conflicts
+still terminate startup. Assertions must verify those outcomes, not merely
+relax an exit-code expectation. Regenerate prompt-surface fixtures through
+`scripts/ci/prompt_surface.py render` after changing tool catalog descriptions.
+
+`run_tests_parallel.py` retains the child return code (and terminating signal),
+runner status and presence/absence of a terminal pytest summary on every failed
+attempt. A timed-out or crashed child with no parsed outcomes is reported as
+"NO TEST OUTCOMES RECOVERED", never asserted to have run no tests. Keep the
+failure-count headline and every cause bucket visible.
+
+Update-finish fixtures copy the native `plugins` tree as well as core packages:
+bootstrap performs real registry discovery, so an incomplete fixture creates a
+false gateway-restart followup after a genuine build failure. Startup fixtures
+pin the import-time process home to their simulated launch home. Do not stub
+control-socket admission or weaken the real-home I/O guard to make them pass.
+
+TypeScript qualification keeps the composer's actual `void | boolean` promise
+return and one finite `PromptSubmitResponse.status` union, including `rejected`.
+Do not replace these with broad strings or suppress type errors.
+
 Shared update E2E signal injection must never enumerate or signal another file's
 processes when CI lacks usable bubblewrap. The existing fixture HOME boundary
 scopes the command agent's process table and each signal request. Fallback close
@@ -55,6 +80,24 @@ local helper/reaper stubs, without importing Unix-only dependencies. All eight
 controlled cases remain unmarked for Linux, macOS and Windows. Native Linux
 regressions retain foreign-sibling refusal and detached cleanup.
 No test is skipped and no worker count or timeout is relaxed.
+Before destructive signal delivery, the live-system guard records independently
+verified identities from the test's full subtree. Bottom-up TERM can kill a
+foreground child, reap its shell, and orphan a TERM-ignoring sibling before the
+sibling is signalled. Remembering only the first recipient's descendants loses
+that valid owner. Retained ownership still requires a fresh matching creation
+time and each surviving group member's independent proof. Foreign, mixed,
+recycled and unverifiable identities remain refused. Deterministic regressions
+force sibling reparenting between delivery calls, and the real POSIX grace-kill
+regression must pass without guard bypasses or longer timeouts.
+
+Local native Electron case-spelling security tests require a case-sensitive
+temporary filesystem. On a default case-insensitive macOS volume, provide a
+job-owned case-sensitive APFS scratch image through `TMPDIR` to the canonical
+`./bin/ci gate <sha>` entrypoint. Prove distinct case-only directory identities
+before running. Keep the checkout's pinned toolchain and every assertion intact,
+then detach and remove only the invocation's disposable image after all owned
+processes have exited.
+
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning
 clears only after a gateway serves the new commit.
@@ -95,6 +138,16 @@ existed and the supervisor exited -15. Holding that same point now keeps the
 readiness predicate false until release. Exit-zero and parent-only TERM
 assertions remain unchanged, as do production parent-first signalling, grace
 windows, worker counts and timeouts.
+
+The process-registry unit fixture also isolates console-script discovery using
+`_resolve_hermes_bin_dir = lambda: None`, the existing spawn-unit seam in
+`test_persist_on_release`. These tests exercise process spawning and teardown,
+not the operator's managed Hermes installation. The payload-aware resolver
+introduced in `3383a1d8b3` probes a sibling `manifest.json`; in a checkout under
+real `HERMES_HOME`, that sibling is correctly outside HomeIOGuard's source-tree
+exemption. Leave payload discovery, the home guard and every process assertion
+unchanged. Run the full registry file alongside the real-home tripwire tests;
+retire this fixture adaptation when upstream isolates the same host lookup.
 
 Prompt-surface review keeps full commit ancestry for the merge-base comparison,
 but its checkout uses Git's `blob:none` partial-clone filter. Fetching every
@@ -387,6 +440,18 @@ checkout, and fails on the previous probe order. Upstream main (after
 (`scripts/_activation.sh`, `activate`), which builds a test environment for
 each worktree. Retire this probe when the fork adopts a released upstream
 runner with that activation.
+
+## Explicit-interpreter dependency paths
+
+The `fork-ci-reliability` identity covers `scripts/run_tests.sh` preserving the
+Nix devShell interpreter's inherited `PYTHONPATH` across its `env -i` boundary.
+Only the explicit, unactivated `HERMES_PYTHON` lane inherits this path; a normal
+checkout activation still starts with an empty extra path. If the live-gateway
+pytest guard is installed, append its directory instead of replacing the
+interpreter's dependency path. `tests/scripts/test_run_tests_shell.py` runs the
+real shell harness with an import available only through that inherited path,
+both with and without the guard. Retire this adaptation when the supported Nix
+interpreter no longer depends on `PYTHONPATH` for its locked environment.
 
 ## Hosted load-progress fixture isolation
 

@@ -431,11 +431,12 @@ def announced_fallback(route: tuple[str, str, str], outage_id: str) -> tuple[str
 
 
 def complete_primary_recovery(agent) -> bool:
-    """Clear a shared outage after a successful primary response and emit one recovery notice.
+    """Clear a shared outage after primary success; announce real backend recovery once.
 
     Request wrappers call this after every successful response, so it must prove the response
     came from the cooled primary: the agent's LIVE route (not its ``_primary_runtime`` snapshot)
     must equal the record's route and no fallback may be active. A fallback reply never clears.
+    Silent alias retries consume their recovery without a notice and retire that provenance.
     """
     record = getattr(agent, "_shared_primary_cooldown_record", None)
     if not isinstance(record, dict):
@@ -451,8 +452,10 @@ def complete_primary_recovery(agent) -> bool:
     agent._shared_primary_cooldown_record = None
     agent._rate_limited_until = 0
     agent._fallback_episode_cooled = False
+    silent_retry = bool(record.get("_silent_retry", getattr(agent, "_provider_fallback_silent_retry", False)))
+    agent._provider_fallback_silent_retry = False
     with contextlib.suppress(Exception):
-        if not getattr(agent, "_provider_fallback_silent_retry", False):
+        if not silent_retry:
             agent._emit_diagnostic_status(
                 ContextNotice(f"✅ Primary model restored: {record.get('model') or route[2]} via "
                 f"{record.get('provider') or route[0]}; fallback is no longer active."))

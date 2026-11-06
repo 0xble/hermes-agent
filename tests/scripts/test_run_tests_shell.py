@@ -74,3 +74,34 @@ def test_shell_runner_preserves_powershell_analysis_cache_path(tmp_path):
         cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("live_guard", [False, True])
+def test_explicit_interpreter_keeps_pythonpath_across_clean_environment(tmp_path, live_guard):
+    """Nix's HERMES_PYTHON finds its editable environment through PYTHONPATH."""
+    modules = tmp_path / "nix site-packages"
+    modules.mkdir()
+    (modules / "runner_nix_dependency.py").write_text("VALUE = 'inherited'\n", encoding="utf-8")
+    account = tmp_path / "account"
+    account.mkdir()
+    if live_guard:
+        (account / ".hermes").mkdir()
+        (account / ".hermes" / "pytest_live_guard.py").write_text("", encoding="utf-8")
+    case = tmp_path / "test_nix_dependency.py"
+    case.write_text(
+        "from runner_nix_dependency import VALUE\n"
+        "def test_dependency():\n"
+        "    assert VALUE == 'inherited'\n",
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "HERMES_PYTHON": sys.executable, "PYTHONPATH": str(modules),
+           "HERMES_TEST_FILE_RETRIES": "0", "HOME": str(account)}
+    env.pop("__HERMES_ACTIVATED", None)
+    result = subprocess.run(
+        ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
+    )
+    assert "using HERMES_PYTHON" in result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
