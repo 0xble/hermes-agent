@@ -82,9 +82,28 @@ The separate `test_browser_vault_camofox_live.py` retains the companion-backed
 contract matrix. It needs `VAULT_BROWSER_FIXTURE_MODULES` pointing to installed
 `playwright-core`/`camoufox-js`, and `VAULT_BROWSER_FIXTURE_SOURCE` pointing to the
 companion source. Hosted Hermes runners do not install that separate repository
-or its Node dependency tree, so companion integration remains opt-in. Its skips
-are not live execution proof; run it against the qualified companion before
-runtime promotion. Neither matrix uses a user account or makes a charge.
+or its Node dependency tree, so companion integration remains opt-in. The canonical
+runner forwards only these two fixture paths through its test-environment
+allowlist; unrelated environment and credentials remain stripped. Its shell
+regression exercises both opt-in and default-unset paths through a real pytest
+child. Run the provisioned matrix with:
+
+```bash
+VAULT_BROWSER_FIXTURE_MODULES=/installed/companion/node_modules \
+VAULT_BROWSER_FIXTURE_SOURCE=/installed/companion \
+scripts/run_tests.sh tests/tools/test_browser_vault_camofox_live.py
+```
+
+Use a disposable `HOME`, `HERMES_HOME` and `HERMES_RUNTIME_DIR`, and seed that
+home's platform Camoufox cache from an installed engine before running. Ensure
+`node` on `PATH` is an installed executable, not a manager shim requiring the
+real home's trust/configuration. If `heavy-slot` uses `env python3`, put the
+checkout interpreter's bin directory before manager shims too, so admission
+does not recompose `PATH` through a shim. The fixture does not use the shared
+service or its profiles. Missing opt-in paths still skip all seven cases.
+Skips are not live execution proof; require seven executed cases against the
+qualified companion before runtime promotion.
+Neither matrix uses a user account or makes a charge.
 
 ## Retirement and rollback
 
