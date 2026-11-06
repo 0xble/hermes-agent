@@ -605,6 +605,64 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     assert "last_read_at" not in _session_columns(path)
 
 
+@pytest.mark.platforms("linux", "macos")
+def test_browse_budget_covers_durability_setup_before_begin(tmp_path, monkeypatch):
+    """macOS durability PRAGMAs can load the schema before BEGIN. Their SQL must
+    already be budgeted, and their best-effort error handling must not let an
+    interrupted setup proceed into DDL. Advance a clock per real SQLite callback
+    instead of depending on the host SQLite's schema-initialization cost."""
+    import hermes_cli.sqlite_safe_read as safe_read
+    import hermes_state_reconcile as reconcile
+    import hermes_state_wal as wal
+
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE sentinel(value)")
+    before = path.read_bytes()
+    clock = [0.0]
+    budget = reconcile._Budget(0.25)
+    budget._clock = lambda: clock[0]
+    budget.deadline = 0.25
+    statements = []
+    completed = []
+    original_connect = safe_read.connect_tracked
+
+    class ClockedConnection:
+        def __init__(self, conn):
+            self._conn = conn
+            conn.set_trace_callback(statements.append)
+            self.set_progress_handler(None, 0)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def set_progress_handler(self, handler, n):
+            def progress():
+                clock[0] += 0.01
+                return handler() if handler is not None else 0
+            self._conn.set_progress_handler(progress, 20)
+
+    def connect(*args, **kwargs):
+        return ClockedConnection(original_connect(*args, **kwargs))
+
+    def schema_loading_barrier(conn):
+        conn.execute(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5000) "
+            "SELECT sum(x) FROM c"
+        ).fetchone()
+        completed.append(True)
+
+    monkeypatch.setattr(safe_read, "connect_tracked", connect)
+    monkeypatch.setattr(wal, "_apply_macos_checkpoint_barrier", schema_loading_barrier)
+    with pytest.raises(reconcile.BrowseBudgetExceeded):
+        reconcile._apply_additive_schema(path, budget)
+    assert not completed, "durability setup ran without a budget progress handler"
+    assert not any(sql.startswith("BEGIN") for sql in statements), statements
+    assert path.read_bytes() == before
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == [("sentinel",)]
+
+
 def test_equal_cardinality_corrupt_index_plus_drift_is_not_written(tmp_path):
     """R2-3: quick_check does not compare index keys with the table, so two equal-size indexes
     with swapped root pages pass it. Browse must still refuse as corrupt and write nothing."""

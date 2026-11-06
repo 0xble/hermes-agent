@@ -232,8 +232,12 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     budget.check()
     with closing(connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
                                  isolation_level=None)) as conn:
-        _reapply_durability_barriers(conn)
+        # macOS durability PRAGMAs may parse the schema: budget them too, not
+        # just BEGIN/DDL. Their best-effort wrappers swallow interruption, so
+        # check again before beginning a write transaction.
         budget.arm(conn)
+        _reapply_durability_barriers(conn)
+        budget.check()
         conn.execute('BEGIN IMMEDIATE')
         try:
             cursor = conn.cursor()

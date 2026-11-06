@@ -18,8 +18,14 @@ A guardian rollback never leaves the gateway down for a release it cannot start.
     `reload_ack`, or it passed the running-release health proof. An expired,
     never-acknowledged switch is not restored.
   - The target is proven down: parked, unloaded, or no supervised PID. A target that is
-    still running gets its own `STARTUP_SECONDS` window first. If it is still running and
-    unhealthy after that, it is left alone. A probe that cannot answer is not proof.
+    still running gets its own `STARTUP_SECONDS` window first. The test of that
+    window must not stub the pre-bootout supervised PID to a live foreign process:
+    `reload_target` pins the old incarnation before bootout and reaps it afterward,
+    before bootstrap. On macOS CI PID 123 is a real process whose blocked reap
+    prevents startup. The replacement startup-window path itself does not kill a
+    target that is still starting. If it
+    is still running and unhealthy after that window, it is left alone. A probe
+    that cannot answer is not proof.
 - The restore re-activates the serving release with the exact plist bytes it last started
   with, as operation `restore`.
   - The admission canary does not watch it, because it is not a promote.
