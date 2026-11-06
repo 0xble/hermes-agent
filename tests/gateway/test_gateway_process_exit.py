@@ -29,6 +29,7 @@ def test_main_terminates_via_os_exit_not_systemexit(monkeypatch):
     stdout = SimpleNamespace(flush=Mock())
     stderr = SimpleNamespace(flush=Mock())
 
+    monkeypatch.setattr("hermes_cli.boot_bootstrap.maybe_run_boot_bootstrap", lambda _root: None)
     monkeypatch.setattr(gateway_run, "start_gateway", fake_start_gateway)
     monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
     monkeypatch.setattr(gateway_run.sys, "argv", ["gateway.run"])
@@ -53,6 +54,7 @@ def test_main_routes_systemexit_through_os_exit(monkeypatch):
     stdout = SimpleNamespace(flush=Mock())
     stderr = SimpleNamespace(flush=Mock())
 
+    monkeypatch.setattr("hermes_cli.boot_bootstrap.maybe_run_boot_bootstrap", lambda _root: None)
     monkeypatch.setattr(gateway_run, "start_gateway", fake_start_gateway)
     monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
     monkeypatch.setattr(gateway_run.sys, "argv", ["gateway.run"])

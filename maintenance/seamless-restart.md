@@ -7,6 +7,27 @@ bounded priority scheduler. Its ordering, long-turn opening window, profile scop
 and shutdown-source durability contract live in
 [Shared Replay Admission](restart-continuation.md#shared-replay-admission).
 
+## Process shutdown exit boundary
+
+Signal stops use the same short cleanup/finalization deadlines as explicit
+restarts, independently of how the stop is classified. Preserve the configured
+drain (including zero), pending-input spool, transcript flush, session-DB
+quiesce, receipts and lifecycle writes before exit. The shutdown watchdog stays
+armed as a backstop; it is not the normal exit timer.
+
+Both process entrypoints call the existing flushed hard-exit path **inside**
+their main coroutine, after `start_gateway` completes all teardown/finally blocks.
+Calling it after `asyncio.run` is too late: `Runner.close` first cancels tasks
+and joins the default executor, whose abandoned network/cleanup jobs may never
+return. Embedded coroutine callers retain their existing lifecycle.
+
+The stop task carries `tools.environments.local.process_exit_cleanup` into its
+workers. Local cleanup unlinks its known snapshot/cwd files without scanning
+the shared temp directory for orphan atomic snapshots; ordinary session teardown
+still removes those immediately, and temp-cache housekeeping reclaims leftovers.
+Verify `tests/gateway/test_process_exit_after_stop.py`, gateway process-exit,
+bounded-adapter and shutdown-kill tests, plus `tests/tools/test_local_temp_dir.py`.
+
 ## Shutdown Notice Routing
 
 Use upstream's `_delivery_target_key` for active chats, served home channels,

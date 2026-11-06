@@ -35,6 +35,7 @@ from gateway.run_common import _UNSET
 from agent.async_utils import cancel_task_with_grace
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
+from gateway.run_shutdown_deadlines import GatewayShutdownDeadlinesMixin, bounded_stop_requested
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -187,7 +188,7 @@ def _persist_shutdown_pending_messages(runner):
     return GatewayShutdownMixin._persist_shutdown_pending_messages(runner)
 
 
-class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
+class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, GatewayShutdownDeadlinesMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -2568,9 +2569,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         # and a zero wait would drop the marked IDs (the sweep's second mark then loses the
         # expected_fire_owner race and returns []), silently losing the #82232 notice.
         _restart_deadline = None
-        if self._restart_requested:
+        if bounded_stop_requested(self):
             _restart_deadline = time.monotonic() + self._restart_shutdown_bound()
-            _mark_deadline = _restart_deadline
+            _mark_deadline = _restart_deadline if self._restart_requested else min(
+                _restart_deadline, time.monotonic() + _NONRESTART_CRON_MARK_BOUND_S,
+            )
         else:
             # Unused post-interrupt grace (converted off loop.time into a duration), floored at the
             # short non-zero bound and capped by the restart-path bound: never longer than either the
@@ -2602,8 +2605,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 max(0.0, _restart_deadline - time.monotonic()),
             )
         if _sweep_timeout is None:
-            # Preserve the unbounded graceful-path call shape for lightweight runners and
-            # test doubles. Restart cleanup always takes the bounded branch above.
+            # Preserve ordinary in-process graceful teardown. A signal stop must be
+            # bounded even without restart intent; the watchdog is only a last resort.
             _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
         else:
             _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
@@ -2713,17 +2716,6 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
             logger.info("Shutdown phase: durably spooled %d queued inbound message(s) before cleanup", persisted)
         return persisted
 
-    def _restart_shutdown_bound(self) -> float:
-        """Keep restart-only post-interrupt cleanup within a short successor handoff bound."""
-        launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
-        if isinstance(launchd_budget, (int, float)) and launchd_budget > 0:
-            return max(1.0, min(3.0, float(launchd_budget) - 1.0))
-        return 3.0
-
-    def _restart_agent_finalize_bound(self, bound: float) -> float:
-        """Reserve the final restart slice for adapter/token teardown."""
-        return max(0.1, bound - min(1.0, max(0.5, bound / 3.0)))
-
     async def _stop_finalize_agents_and_adapters(
         self, ctx: GatewayShutdownMixin._StopContext,
         *, stop_event: Optional[threading.Event] = None,
@@ -2765,7 +2757,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
             except (TypeError, ValueError):
                 parameters = {}
             finalize_kwargs = {}
-            if "interrupted" in parameters and self._restart_requested and ctx.timed_out:
+            if "interrupted" in parameters and ctx.timed_out and (
+                bounded_stop_requested(self)
+            ):
                 finalize_kwargs["interrupted"] = True
             if "stop_event" in parameters:
                 finalize_kwargs["stop_event"] = stop_event
@@ -2933,7 +2927,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
         await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
             "final-cleanup", restart=self._restart_requested,
-            timeout=min(2.0, self._restart_shutdown_bound()) if self._restart_requested else None,
+            timeout=min(2.0, self._restart_shutdown_bound())
+            if bounded_stop_requested(self) else None,
         )
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
@@ -3156,7 +3151,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 self._flush_shutdown_agent_transcripts(ctx.active_agents)
             _finalize_stop_event = threading.Event()
             self._shutdown_finalize_stop_event = _finalize_stop_event
-            _finalize_bound = self._restart_shutdown_bound() if ctx.timed_out and self._restart_requested else None
+            _bounded_stop = bounded_stop_requested(self)
+            _finalize_bound = self._restart_shutdown_bound() if ctx.timed_out and _bounded_stop else None
             _finalize_started = time.monotonic()
             _finalize_deadline = None if _finalize_bound is None else _finalize_started + _finalize_bound
             _agent_finalize_bound = None if _finalize_bound is None else self._restart_agent_finalize_bound(_finalize_bound)
@@ -3216,7 +3212,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         if self._stop_task is not None:
             await self._stop_task
             return
-        self._stop_task = asyncio.create_task(GatewayRunner._stop_impl(self))
+        from tools.environments.local import process_exit_cleanup
+        with process_exit_cleanup():
+            self._stop_task = asyncio.create_task(GatewayRunner._stop_impl(self))
         await self._stop_task
 
     async def wait_for_shutdown(self) -> None:
