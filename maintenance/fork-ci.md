@@ -158,6 +158,22 @@ Git regression leaves an unrelated historical artifact missing while rendering
 the base-to-head prompt diff. The job timeout, staleness test, committed
 snapshots, qualification requirement, and core-approval path are unchanged.
 
+The PM upgrade harness must re-pin its local-origin `main` channel after writing
+fake-provider configuration. Replacing `config.yaml` otherwise erases the
+installer's channel record and makes an official-origin sandbox fall back to
+`stable`, spending live anonymous GitHub API quota. Keep the managed-environment
+`update --check` behind a dead HTTP(S) proxy and assert `Update channel: main`;
+its Git origin is a local path and must remain usable without release HTTP.
+`tests/hermes_cli/test_pm_update_check_harness.py` reproduces a rate-limited
+403 through the real checker before configuring, then verifies that the real
+harness restores `main`, makes no release HTTP request, and leaves HEAD and
+configuration unchanged during `--check`. This ports upstream
+[PR #147904](https://github.com/NousResearch/hermes-agent/pull/147904), with an
+additional deterministic regression. Retire this fork note when the upstream
+fix and equivalent no-network coverage are present through normal integration.
+Do not substitute a GitHub token, retries, skips, or a successful unknown state
+for the fixture's local-origin contract.
+
 The nightly fetches upstream CalVer release tags before its historical upgrade E2E:
 `actions/checkout` sees only fork tags (latest `v2026.8.3`), otherwise the test's
 `git describe HEAD~1` stages an obsolete updater instead of the previous release.

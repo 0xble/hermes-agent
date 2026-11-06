@@ -5358,87 +5358,6 @@ def _start_gateway_make_restart_signal_handler(runner):
     return restart_signal_handler
 
 
-def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
-    """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
-    planned_stop_seen = [False]
-
-    def shutdown_signal_handler(received_signal=None):
-        # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
-        def _takeover() -> bool:
-            from gateway.status import consume_takeover_marker_for_self
-            return consume_takeover_marker_for_self()
-
-        # Planned stop: CLI marks first, else its SIGTERM looks like an external kill. SIGINT = Ctrl+C.
-        def _planned_stop() -> bool:
-            from gateway.status import consume_planned_stop_marker_for_self
-            return consume_planned_stop_marker_for_self()
-
-        # Planned reload: a launchd bootout issued only to re-read the plist (update, guardian rollback).
-        def _planned_restart() -> bool:
-            from gateway.restart_loop_guard import consume_planned_restart_signal
-            return consume_planned_restart_signal()
-
-        # Fast (<10ms) sync snapshot: stdlib + /proc, no subprocesses (`ps aux` here once blocked ~3s).
-        def _snapshot():
-            from gateway.shutdown_forensics import snapshot_shutdown_context
-            return snapshot_shutdown_context(received_signal)
-
-        planned_takeover = bool(_best_effort(_takeover, "Takeover marker check failed: %s"))
-        planned_stop = getattr(runner, "_client_owned", False) or received_signal == signal.SIGINT or (
-            not planned_takeover and bool(_best_effort(_planned_stop, "Planned stop marker check failed: %s")))
-        # `hermes gateway stop` writes the marker, THEN signals: the planned-stop watcher can consume
-        # the marker in between, and the CLI's own SIGTERM must not then read as an external kill.
-        if planned_stop:
-            planned_stop_seen[0] = True
-        elif planned_stop_seen[0] and not planned_takeover:
-            planned_stop = True
-        planned_restart = not (planned_takeover or planned_stop) and bool(
-            _best_effort(_planned_restart, "Planned restart marker check failed: %s"))
-        _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
-        sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
-
-        if planned_takeover:
-            logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
-        elif planned_stop:
-            logger.info("Received %s as a planned gateway stop — exiting cleanly", sig_name or "SIGTERM/SIGINT")
-        elif planned_restart:
-            logger.info("Received %s with planned-restart marker — taking the bounded restart path",
-                        sig_name or "SIGTERM")
-        else:
-            # Mirrored onto the runner so _stop_impl suppresses the gateway_state=stopped persist for
-            # unexpected signals; operator stops take the `planned_stop` branch and leave it False (DO persist).
-            _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = True
-            logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
-
-        if _shutdown_ctx is not None and not getattr(runner, "_client_owned", False):
-            def _log_context() -> None:
-                # The most useful line for "gateway keeps dying" tickets.
-                from gateway.shutdown_forensics import format_context_for_log
-                logger.warning("Shutdown context: %s", format_context_for_log(_shutdown_ctx))
-
-            def _diagnostic() -> None:
-                # Heavyweight (comm-only ps, pstree, dmesg), detached so it finishes even if our cgroup is torn
-                # down; bounded by an internal timeout, never blocks.
-                from gateway.shutdown_forensics import spawn_async_diagnostic
-                spawn_async_diagnostic(
-                    _hermes_home / "logs" / "gateway-shutdown-diag.log", _shutdown_ctx["signal"], timeout_seconds=5.0)
-
-            _best_effort(_log_context, "format_context_for_log failed: %s")
-            _best_effort(_diagnostic, "spawn_async_diagnostic failed: %s")
-        if not planned_takeover:
-            # Supervisor/operator SIGNAL stop (bootout, kickstart -k, systemd, s6, bare kill) — the
-            # only kind launchd times with ExitTimeOut. In-band SIGUSR1 restarts never pass through
-            # here, and a sibling-driven --replace takeover is not launchd-timed either, so both
-            # keep the configured drain. _stop_impl uses this to cap the drain to the live budget.
-            runner._stop_requested_by_signal = True
-        if planned_restart:
-            # The SIGUSR1 restart's stop() without its after-turn wait, which launchd's ExitTimeOut
-            # would not allow: bounded post-interrupt sweep, exit 75.
-            asyncio.create_task(runner.stop(restart=True, service_restart=True))
-        else:
-            asyncio.create_task(runner.stop())
-    return shutdown_signal_handler
-
 
 def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
@@ -5954,6 +5873,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 async def _start_gateway_impl(config: Optional[GatewayConfig] = None, replace: bool = False,
                               verbosity: Optional[int] = 0, force: bool = False) -> bool:
     """Legacy in-module lifecycle retained for compatibility with older direct callers."""
+    from gateway.run_bootstrap import _start_gateway_make_shutdown_signal_handler
+
     os.environ["HERMES_EXEC_ASK"] = "1"
 
     configured_cwd = os.environ.get("TERMINAL_CWD", "")
