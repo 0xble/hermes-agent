@@ -308,12 +308,12 @@ in your conversation context.
   and CVC read live from the routed 1Password Credit Card item may be typed with
   `browser_type` or `fill_input`. An approved exact charge means the user explicitly
   approved the merchant, amount, and selected card in this session's conversation.
-  Prefer `browser_vault(action=fill)` first; direct entry may follow only a real fill
-  or field failure: `no_payment_fields`, a partial fill, missed fields, or a processor
-  frame. Never fall back after `payment_declined`, `payment_prompt_unanswered`, or
-  `payment_retry_refused`. For `approval_unavailable` (no prompt surface), direct
-  entry is allowed only when the user explicitly approved this exact charge in this
-  session's conversation. Never repeat secrets in replies, files, commits, or shell
+  Prefer `browser_vault(action=fill)` first; direct entry may follow in two cases:
+  (1) a real fill or field failure: `no_payment_fields`, a partial fill, missed
+  fields, or a processor frame; or (2) `approval_unavailable` (no prompt surface),
+  only when the user explicitly approved this exact charge in this session's
+  conversation. Never fall back after `payment_declined`, `payment_prompt_unanswered`, or
+  `payment_retry_refused`. Never repeat secrets in replies, files, commits, or shell
   arguments.
   Do not grant new OS permissions or accept unrelated consent without explicit
   task authority.
