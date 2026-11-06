@@ -49,6 +49,13 @@ still terminate startup. Assertions must verify those outcomes, not merely
 relax an exit-code expectation. Regenerate prompt-surface fixtures through
 `scripts/ci/prompt_surface.py render` after changing tool catalog descriptions.
 
+Runner fixtures copy `run_tests_launch.py` and `run_tests_fork_child.py` with the
+parallel runner. Upstream split process launch into those siblings, so partial
+copies fail before exercising scratch isolation. Keep gateway preparation
+inherited through `GatewayTurnMixin`, not before it as a second direct base:
+the reversed ancestor order prevents `GatewayRunner` from importing. Preserve
+the real gateway route and scratch-runner regressions when reconciling this split.
+
 `run_tests_parallel.py` retains the child return code (and terminating signal),
 runner status and presence/absence of a terminal pytest summary on every failed
 attempt. A timed-out or crashed child with no parsed outcomes is reported as

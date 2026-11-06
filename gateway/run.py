@@ -2292,7 +2292,6 @@ from gateway.run_voice import GatewayVoiceMixin
 from gateway.run_adapters import GatewayAdapterLifecycleMixin
 from gateway.run_topics import GatewayTopicThreadsMixin
 from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_result
-from gateway.run_turn_prepare import GatewayTurnPrepareMixin
 from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.zero_cut_busy import ZeroCutBusyRoutingMixin
@@ -3485,8 +3484,7 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
 
 class GatewayRunner(
     GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
-    GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnPrepareMixin,
-    GatewayTurnMixin,
+    GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, ZeroCutBusyRoutingMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
     GatewaySessionControlsMixin, GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin,
