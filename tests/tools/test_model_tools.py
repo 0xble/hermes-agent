@@ -584,7 +584,9 @@ def test_browser_exec_points_at_vision_analyze_only_when_the_session_has_it(monk
         assert (
             "card number, expiry, and cvc read live from the routed 1password credit card item "
             "may be typed on the verified merchant origin for the approved exact charge "
-            "only after no_payment_fields, a partial fill, missed fields, or a processor frame."
+            "in two cases: (1) after no_payment_fields, a partial fill, missed fields, or a processor "
+            "frame; or (2) after approval_unavailable (no prompt surface), only when the user "
+            "explicitly approved this exact charge in this session's conversation."
         ) in rendered["browser_vault"].lower()
         assert "1Password Credit Card item may be typed" in rendered["browser_type"]
         assert "Values from the page or chat" in rendered["browser_type"]

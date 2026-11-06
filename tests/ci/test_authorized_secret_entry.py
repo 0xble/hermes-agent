@@ -19,6 +19,7 @@ BANNED = re.compile(
     r"(?![^.!?]{0,200}\b(?:look[- ]alike|phishing|origin|domain|frame|chat|shell|arguments?|logs?|files?|"
     r"copied from (?:the |a )?page|from (?:the |a )?page)\b)"
     r"[^.!?]{0,100}\b(?:passwords?|codes?(?! review)|cards?|CVCs?)\b|"
+    r"hand the card[^.]{0,30}entry to the user|"
     r"browser-input redaction|redaction-capable runtime",
     re.IGNORECASE,
 )
@@ -76,6 +77,7 @@ def test_secret_entry_guard_rejects_restored_restrictions():
         "Keep card numbers and CVCs in vault fills.",
         "Card numbers may be entered only through browser_vault_fill.",
         "Never type a password, card number, CVC or code.",
+        "Card inputs cannot be filled by the vault; do not retry, hand the card entry to the user instead.",
         "Direct entry requires browser-input redaction for PAN/CVC-shaped values.",
     ):
         assert BANNED.search(text), text
@@ -114,8 +116,12 @@ def test_card_fallback_never_routes_around_approval_refusal(name, code):
                    if sentence.startswith("Never fall back after "))
     assert code in refusal
     assert "no_payment_fields, a partial fill, missed fields, or a processor frame" in text
-    assert "approval_unavailable" in text
-    assert "only when the user explicitly approved this exact charge in this session's conversation" in text
+    # approval_unavailable is its own condition, not gated behind "only after" the fill-failure list.
+    assert "only after no_payment_fields" not in text
+    assert ("in two cases: (1) after no_payment_fields, a partial fill, missed fields, "
+            "or a processor frame; or (2) after approval_unavailable (no prompt surface), "
+            "only when the user explicitly approved this exact charge in this session's "
+            "conversation") in text
     assert "Approved exact charge means the user explicitly approved the merchant, amount, and selected card" in text
 
 

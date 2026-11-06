@@ -94,13 +94,13 @@ Prefer vault fill first. If it fails or misses fields, passwords and one-time co
 fetched from an authorized source for the service may be typed with `browser_type`
 or `fill_input`. A card number, expiry, and CVC read live from the routed 1Password
 Credit Card item may be typed for the approved exact charge on the verified merchant
-origin only after a real fill or field failure: `no_payment_fields`, a partial
-fill, missed fields, or a processor frame. An approved exact charge means the user
+origin in two cases: (1) after a real fill or field failure: `no_payment_fields`, a partial
+fill, missed fields, or a processor frame; or (2) after `approval_unavailable` (no
+prompt surface), only when the user explicitly approved this exact charge in this
+session's conversation. An approved exact charge means the user
 explicitly approved the merchant, amount, and selected card in this session's
 conversation. Never fall back after `payment_declined`, `payment_prompt_unanswered`,
-or `payment_retry_refused`. For `approval_unavailable` (no prompt surface), direct
-entry is allowed only when the user explicitly approved this exact charge in this
-session's conversation. Read each native field only at entry with
+or `payment_retry_refused`. Read each native field only at entry with
 `onepass --account <alias> read 'op://<vault>/<item>/ccnum'` (or `cvv`, `expiry`).
 Values from a page or chat are not authorized sources. Never repeat secrets in
 replies, files, commits, or shell arguments; never retry `payment_declined`.
