@@ -1,4 +1,4 @@
-"""Exa's request-local quality policy. A standard hint never overrides protected research."""
+"""Exa's query-only backstop to the caller's whole-task stakes judgment."""
 
 import re
 import unicodedata
@@ -22,10 +22,10 @@ _PROTECTED = re.compile(
     r"[a-z]*(?:cillin|cycline|mycin|pril|sartan|statin|olol|azole|oxetine)|"
     r"compliance|comply|regulatory|regulation|regulations|regulator|regulators|"
     r"statute|statutes|legislation|legislative|permit|permits|license|licensing|"
-    r"official|government|federal|municipal|agency|primary|original|source|sources|"
+    r"official|authoritative|canonical|docs|documentation|government|federal|municipal|agency|primary|original|source|sources|"
     r"news|current|events|election|elections|war|conflict|headline|headlines|"
     r"today|tonight|yesterday|latest|breaking|recent|recently|live|now|urgent|"
-    r"price|prices|pricing|deadline|deadlines|updated|updates|outage|status|"
+    r"price|prices|pricing|deadline|deadlines|updated|updates|outages?|incidents?|escalat(?:e|ion|ing)|status|"
     r"policy|policies|requirement|requirements|risk|risks|safe|safety|"
     r"sec|fda|cdc|nih|osha|hipaa|gdpr|finra|apr|apy|ada|erisa"
     r")\b|\.gov\b|\b(?:last|past|next)\s+(?:\d+(?:[-–]\d+)?\s*)?(?:hours?|hrs?|h|days?|weeks?)\b|"
@@ -36,13 +36,21 @@ _PROTECTED = re.compile(
     r"tratamiento|gripe|pajak|penghasilan)\b|"
     r"\bstate\s+(?:laws?|tax(?:es)?|regulations?|legislation|benefits|elections?)\b|"
     r"\b(?:interest|exchange|mortgage|tax|currency)\s+rates?\b|"
-    r"\bcurrency\s+convert(?:er|ing|s|ion|ions)?\b",
+    r"\bcurrency\s+convert(?:er|ing|s|ion|ions)?\b|"
+    # Documentation syntax signals intent, not verified ownership or authority.
+    # docs/documentation above also cover hosts and paths, including site.example/docs.
+    r"\bdoc\.[a-z0-9-]+\.[a-z0-9.-]+\b|/doc(?:[/\s?#]|$)|"
+    r"\b(?:api[ -]reference|reference\s+manual|time[ -]critical)\b|"
+    r"\b(?:contact\s+(?:details|information|info|verification)|"
+    r"(?:e[ -]?mail|phone|telephone)\s+(?:address|number)|"
+    r"(?:customer|technical)\s+(?:support|service)|"
+    r"support\s+(?:contact|e[ -]?mail|address|phone|number|ticket))\b",
     re.IGNORECASE,
 )
 
 
 def select_search_policy(query: str, stakes: str | None = None) -> tuple[str, str]:
-    """Trust the agent's low-stakes judgment unless the protected guard fires."""
+    """Use Lite only on explicit standard hints with no detected protected query signal."""
     if stakes == "high":
         return "auto", "hint_high"
     if stakes != "standard":

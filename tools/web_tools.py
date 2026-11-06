@@ -18,6 +18,7 @@ _firecrawl_client = _firecrawl_client_config = _parallel_client = _async_paralle
 
 from plugins.web.firecrawl.provider import _is_tool_gateway_ready, check_firecrawl_api_key
 from tools.debug_helpers import DebugSession
+from tools.web_search_guidance import WEB_SEARCH_STAKES_GUIDANCE
 from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER, read_selection, selection_exists
 from tools.url_safety import async_is_safe_url
 from tools.web_tools_rescue import _managed_search_fallback, _rescue_eligible, _rescue_search
@@ -651,7 +652,7 @@ WEB_SEARCH_SCHEMA = {
             "stakes": {
                 "type": "string",
                 "enum": ["standard", "high"],
-                "description": "Optional. standard: low-stakes lookups where some error is cheap (docs, APIs, product specs, how-tos, recipes, navigation, background); may use a cheaper search tier. Omit or pass high for legal, financial, tax, medical, compliance, official sources, news, prices, safety, time-sensitive or costly-if-wrong work. When unsure, omit."
+                "description": WEB_SEARCH_STAKES_GUIDANCE
             },
             "limit": {
                 "type": "integer",

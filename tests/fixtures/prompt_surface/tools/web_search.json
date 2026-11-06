@@ -15,7 +15,7 @@
         "type": "string"
       },
       "stakes": {
-        "description": "Optional. standard: low-stakes lookups where some error is cheap (docs, APIs, product specs, how-tos, recipes, navigation, background); may use a cheaper search tier. Omit or pass high for legal, financial, tax, medical, compliance, official sources, news, prices, safety, time-sensitive or costly-if-wrong work. When unsure, omit.",
+        "description": "Optional. Classify the WHOLE TASK CONTEXT, not only the search words. Omit stakes or pass high for legal, financial, tax, medical/health, compliance, official-source work (including authoritative vendor docs/API facts and contact verification), current events/news, prices, safety, time-critical work (including support escalation/production outages), non-English or uncertain cases, and anything costly to get wrong. Use standard only for nonprotected commodity tutorials, how-tos, recipes, navigation or background where error is genuinely cheap. standard may use a cheaper search tier, subject to a query-only protected guard that cannot see surrounding task context. When unsure, omit.",
         "enum": [
           "standard",
           "high"

@@ -80,12 +80,10 @@ def _search(query, **kwargs):
     ("最新ニュース", "standard", "auto", "protected_guard"),
     ("history of the roman empire", "standard", "lite", "hint_standard"),
     ("best hiking trails near seattle", "standard", "lite", "hint_standard"),
-    # Known guard gaps (e.g. "ozempic reviews") rely on the agent's judgment by design.
-    ("ozempic reviews", "standard", "lite", "hint_standard"),
     ("ceramic glazing techniques", "high", "auto", "hint_high"),
     ("ceramic glazing techniques", "unknown", "auto", "default"),
     ("FastAPI docs", None, "auto", "default"),
-    ("FastAPI docs", "standard", "lite", "hint_standard"),
+    ("FastAPI docs", "standard", "auto", "protected_guard"),
     ("FastAPI docs", "high", "auto", "hint_high"),
     ("how to install ripgrep on mac", None, "auto", "default"),
     ("how to install ripgrep on mac", "standard", "lite", "hint_standard"),
@@ -108,20 +106,48 @@ def _search(query, **kwargs):
     ("TSLA quarterly results tutorial", "standard", "auto", "protected_guard"),
     ("USD EUR conversion tutorial", "standard", "auto", "protected_guard"),
     ("site:github.com tokio select example site:unknown.test", "standard", "lite", "hint_standard"),
-    ("como hacer pan", "standard", "lite", "hint_standard"),
-    ("resep nasi goreng", "standard", "lite", "hint_standard"),
+    ("como hacer pan", "high", "auto", "hint_high"),
+    ("resep nasi goreng", "high", "auto", "hint_high"),
     ("obscure opaque phrase", "standard", "lite", "hint_standard"),
     ("site:unknown.test python tutorial", "standard", "lite", "hint_standard"),
     ("site:github.com.evil.test tokio select example", "standard", "lite", "hint_standard"),
     ("site:github.com:443 tokio select example", "standard", "lite", "hint_standard"),
     ("site:github.com tokio select", "standard", "lite", "hint_standard"),
     ("site:github.com/example/project tokio select example", "standard", "lite", "hint_standard"),
-    ("site:docs.python.org asyncio api", "standard", "lite", "hint_standard"),
+    ("site:docs.python.org asyncio api", "standard", "auto", "protected_guard"),
     ("site:amazon.com espresso grinder reviews", "standard", "lite", "hint_standard"),
     ("site:github.com asthma tutorial", "standard", "auto", "protected_guard"),
-    ("React state docs", "standard", "lite", "hint_standard"),
+    ("React state docs", "standard", "auto", "protected_guard"),
     ("API rate limiting tutorial", "standard", "lite", "hint_standard"),
     ("JavaScript array convert examples", "standard", "lite", "hint_standard"),
+    ("docsify tutorial", "standard", "lite", "hint_standard"),
+    ("Python pattern matching support tutorial", "standard", "lite", "hint_standard"),
+    ("how to write a support chatbot", "standard", "lite", "hint_standard"),
+    ("site:unknown.test/docsify tutorial", "standard", "lite", "hint_standard"),
+    ("document scanner how-to", "standard", "lite", "hint_standard"),
+    *[(query, "standard", "auto", "protected_guard") for query in (
+        "site.trigger.dev/docs update environment variable isSecret secret read redacted API",
+        "trigger.dev support email address help@trigger.dev",
+        "site:docs.example.test widget API",
+        "https://example.test/docs/v2 widget API",
+        "site:example.test/en/documentation widget API",
+        "site.example.test/docs widget API",
+        "site:doc.example.test widget API",
+        "site:example.test/doc widget API",
+        "example.test API reference",
+        "widget reference manual",
+        "authoritative vendor API behavior",
+        "canonical widget guide",
+        "widget documentation",
+        "example.test support contact",
+        "example.test contact details",
+        "example.test contact verification",
+        "example.test customer service",
+        "example.test telephone number",
+        "example.test support escalation",
+        "production incident escalation",
+        "time-critical deployment help",
+    )],
     *[(query, "standard", "auto", "protected_guard") for query in (
         "tax software reviews", "lawyer reviews", "mortgage calculator api",
         "state law tutorial", "state tax docs", "interest rate examples",
@@ -138,6 +164,37 @@ def test_search_quality_reaches_sdk_and_metadata(backend_harness, query, stakes,
     assert sdk.search.call_args.kwargs["type"] == expected
     assert result["data"]["search_type_reason"] == expected_reason
     assert provider.SEARCH_TYPE == "auto"  # never mutate the shared plugin instance
+
+
+@pytest.mark.parametrize("transport", ["uds", "file"])
+@pytest.mark.parametrize("query,stakes,expected,reason", [
+    ("python list comprehensions tutorial", "standard", "lite", "hint_standard"),
+    ("python list comprehensions tutorial", "high", "auto", "hint_high"),
+    ("python list comprehensions tutorial", None, "auto", "default"),
+    ("site.trigger.dev/docs update environment variable isSecret secret read redacted API",
+     "standard", "auto", "protected_guard"),
+    ("trigger.dev support email address help@trigger.dev", "standard", "auto", "protected_guard"),
+])
+def test_generated_search_guidance_and_routing(backend_harness, transport, query, stakes, expected, reason):
+    from tools.code_execution_tool import generate_hermes_tools_module
+    from tools.web_search_guidance import WEB_SEARCH_STAKES_GUIDANCE
+
+    provider, sdk = backend_harness
+    namespace = {}
+    exec(generate_hermes_tools_module(["web_search"], transport=transport), namespace)
+    entry = wt.registry.get_entry("web_search")
+    assert entry.schema["parameters"]["properties"]["stakes"]["description"] == WEB_SEARCH_STAKES_GUIDANCE
+    assert WEB_SEARCH_STAKES_GUIDANCE in namespace["web_search"].__doc__
+    # The transport seam dispatches into the real handler and Exa policy, not an echo.
+    namespace["_call"] = lambda name, args: json.loads(wt.registry.get_entry(name).handler(args))
+    result = namespace["web_search"](query, limit=3, **({"stakes": stakes} if stakes is not None else {}))
+    assert result["success"]
+    assert result["data"]["search_type"] == expected
+    assert result["data"]["search_type_reason"] == reason
+    assert sdk.search.call_args.args == (query,)
+    assert sdk.search.call_args.kwargs["type"] == expected
+    assert sdk.search.call_args.kwargs["num_results"] == cache.bucket_limit(3)
+    assert provider.SEARCH_TYPE == "auto"
 
 
 def test_lite_and_auto_have_separate_shared_cache_entries(backend_harness):
@@ -179,7 +236,7 @@ def test_concurrent_search_hints_are_request_local(backend_harness):
 
     sdk.search.side_effect = response
     with ThreadPoolExecutor(max_workers=2) as pool:
-        requests = [pool.submit(_search, "FastAPI docs", stakes=hint)
+        requests = [pool.submit(_search, "python list comprehensions tutorial", stakes=hint)
                     for hint in ("standard", "high")]
         results = [request.result(timeout=10)["data"] for request in requests]
     assert [(r["search_type"], r["search_type_reason"], r["web"][0]["title"]) for r in results] == [

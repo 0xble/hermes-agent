@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
 from tools.registry import registry, tool_error
+from tools.web_search_guidance import WEB_SEARCH_STAKES_GUIDANCE
 
 from hermes_time import get_timezone_name
 from tools.code_execution_env import _resolve_child_cwd, _resolve_child_python
@@ -124,7 +125,8 @@ def check_sandbox_requirements() -> bool:
 # Per-tool stub templates: (signature, docstring, args_dict_expr — the JSON payload sent over RPC).
 _TOOL_STUBS = {
     "web_search": ("query: str, limit: int = 5, stakes: str = None",
-        '"""Search the web. Optional stakes="standard" marks low-stakes searches for Lite, subject to the protected-topic guard. Otherwise Auto. Returns dict with data.web list of {url, title, description}."""',
+        repr("Search the web. " + WEB_SEARCH_STAKES_GUIDANCE
+             + " Returns dict with data.web list of {url, title, description}."),
         '{"query": query, "limit": limit, "stakes": stakes}'),
     "web_extract": ("urls: list, char_limit: int = None",
         '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',

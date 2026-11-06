@@ -126,19 +126,38 @@ def register(ctx) -> None:
 ## Request-Local Search Quality
 
 `web_search` accepts an optional `stakes` hint (`standard` or `high`). Exa defaults
-to Auto. The agent marks a search `standard` when a somewhat wrong or incomplete
-answer costs little, such as software docs and APIs, product specs and reviews,
-how-tos, recipes, entertainment, navigation, general background, or early broad
-discovery. These searches use Lite unless the protected-topic keyword guard fires.
-There is no commodity-term or `site:` domain allowlist.
+to Auto. The caller must classify the **whole task context**, not just the search
+words. Use `standard` only for nonprotected commodity tutorials, how-tos, recipes,
+navigation or background where error is genuinely cheap. These searches use Lite
+unless the query guard detects a protected signal. For example, `API rate limiting
+tutorial` can qualify, while `FastAPI docs` and `React state docs` retain Auto.
+There is no commodity-term or vendor/domain allowlist.
 
 Use `high` or omit the hint for legal, financial, tax, medical or health,
-compliance, official or government sources, news or current events, prices or
-rates, safety, time-sensitive work, or anything costly to get wrong. When unsure,
-omit it. Missing or unknown hints retain Auto. Protected and non-ASCII queries
-override `standard`. The guard is a backstop, not a complete topic classifier:
-known gaps rely on the agent's judgment, and occasional sensitive Lite searches
-are an accepted trade-off. The pilot spot-checks protected topics.
+compliance, official-source work (including authoritative vendor documentation,
+API facts and contact verification), current events or news, prices, safety,
+time-critical work (including support escalation and production outages),
+non-English or uncertain cases, and anything costly to get wrong. A generic query
+inside a production outage still requires `high` or omission. Documentation and
+API lookups are not inherently cheap-error work. The schema and generated
+`hermes_tools.web_search` SDK share these caller instructions from
+`tools/web_search_guidance.py`.
+
+Missing or unknown hints retain Auto. Detected protected signals and non-ASCII
+queries override `standard`. The query guard includes documentation host/path
+syntax, documentation and authority intent, and contact/support escalation
+signals. It covers `site:docs.example.test`, `example.test/docs`, and the malformed
+`site.example.test/docs` spelling. These are intent signals, not proof that a host
+is authoritative. A `site:` restriction alone does not force Auto, so
+`site:github.com tokio select example` and `site:unknown.test python tutorial`
+remain eligible for Lite.
+
+The guard receives query text only. It cannot infer surrounding outage context,
+verify authority, recognize every protected topic or named entity, or identify
+every non-English query written in ASCII. Callers must keep protected tasks on
+Auto even when the query has no recognized signal. Incorrect `standard` hints
+can still route undetected protected intent to Lite. This is a remaining failure
+risk, not acceptance of protected searches using Lite or a zero-leak guarantee.
 
 Responses report the request-local `data.search_type_reason`: `default`,
 `hint_standard`, `hint_high`, or `protected_guard`, including cache hits.
