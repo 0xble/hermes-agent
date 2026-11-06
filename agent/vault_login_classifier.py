@@ -37,7 +37,7 @@ PROTECTED_FIELD_TOKENS = ("bday", "bday-day", "bday-month", "bday-year")
 _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan)\b"), "cc-number"),
     (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname)\b"), "cc-name"),
-    (re.compile(r"\b(?:cvc|cvv|csc|security\s*code|card\s*code)\b"), "cc-csc"),
+    (re.compile(r"\b(?:cvc|cvv2?|csc|cid|security\s*code|card\s*(?:(?:verification|security)\s*(?:code|number)|code))\b"), "cc-csc"),
     (re.compile(r"\b(?:exp(?:iry|iration)?\s*month|exp\s*mm|ccmonth)\b"), "cc-exp-month"),
     (re.compile(r"\b(?:exp(?:iry|iration)?\s*year|exp\s*yy(?:yy)?|ccyear)\b"), "cc-exp-year"),
     (re.compile(r"\b(?:exp(?:iry|iration)?(?:\s*date)?|mm\s*yy|valid\s*thru)\b"), "cc-exp"),

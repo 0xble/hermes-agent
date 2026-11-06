@@ -215,6 +215,31 @@ the browser vault fill tool, or the 1Password backends.
   PAN formatting, issue dates and masked CVV). Roll back the bundle's small commits bearing
   the existing identities; do not retire the surrounding fork features.
 
+## Direct typed-card privacy
+
+Fork patch identity: `browser-typed-card-privacy` (fork-only). Direct
+`browser_type` registers PANs before either transport injects them. CVC and
+expiry require the existing checkout field classifier and stay scoped to the
+filled session/origin; standalone matching values on other pages remain usable.
+This does not authorize a payment, change secret-source policy, or remove the
+accepted model-context/session-record exposure of direct entry.
+
+The existing browser egress boundary scrubs registered strings and numeric
+leaves even without scoped components, preserving element refs and unrelated
+ordinals. Agent-browser fills send literal input through batch stdin, never
+argv or a staging file. CLI output is bounded in memory; inherited daemon
+handles are drained without waiting for daemon exit or retaining late output.
+Raw stdout/stderr and malformed/timeout diagnostics are not logged.
+
+Verify with `scripts/run_tests.sh tests/tools/test_browser_typed_card_privacy.py
+ tests/tools/test_browser_typed_card_expiry.py tests/tools/test_browser_open_timeout.py
+ tests/agent/test_browser_output_egress.py` and the browser transport, cleanup,
+redaction and PM fixture regressions. Windows pipe behavior needs the native
+Windows-marked test; macOS does not qualify that branch. No live account or
+card is required. Retire when released upstream preserves this transport and
+egress contract; roll back this patch as a unit, not the existing vault policy
+or protected-field guards.
+
 ## Verification
 
 `scripts/run_tests.sh` on `tests/tools/test_browser_camofox_accounts.py`,

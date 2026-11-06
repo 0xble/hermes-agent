@@ -39,7 +39,7 @@ def test_cmd_shim_routes_eval_and_multiline_text_losslessly(monkeypatch):
     """Through ``_run_browser_command``: a ``.cmd`` argv[0] sends ``eval`` as ``--base64 <script>``
     and any other command whose argv carries a newline or ``%`` as ``batch`` with the command as
     JSON on stdin (cmd.exe never parses the text), with the batch entry unwrapped to the usual
-    ``{success, data, error}`` shape; plain arguments and non-shim spawns keep the raw argv."""
+    ``{success, data, error}`` shape. Fills always use batch; other plain commands keep argv."""
     parts, stdin, _ = _run_through_seam(monkeypatch, _SHIM, "eval", [_SCRIPT], '{"success":true,"data":{"result":1}}')
     assert parts[-3:-1] == ["eval", "--base64"] and stdin is None
     assert base64.b64decode(parts[-1]).decode("utf-8") == _SCRIPT  # byte-identical round trip
@@ -52,10 +52,10 @@ def test_cmd_shim_routes_eval_and_multiline_text_losslessly(monkeypatch):
     assert result == {"success": True, "data": {"filled": "@e3"}, "error": None}
 
     parts, stdin, _ = _run_through_seam(monkeypatch, _SHIM, "fill", ["@e3", "one line"], '{"success":true,"data":{}}')
-    assert parts[-3:] == ["fill", "@e3", "one line"] and stdin is None
+    assert parts[-1] == "batch" and json.loads(stdin) == [["fill", "@e3", "one line"]]
     for argv0 in (r"C:\tools\agent-browser.exe", "/home/u/.local/bin/agent-browser"):
         parts, stdin, _ = _run_through_seam(monkeypatch, argv0, "fill", ["@e3", _TEXT], '{"success":true,"data":{}}')
-        assert parts[-3:] == ["fill", "@e3", _TEXT] and stdin is None
+        assert parts[-1] == "batch" and json.loads(stdin) == [["fill", "@e3", _TEXT]]
 
 
 def test_bundled_js_eval_payload_constants_are_single_line():

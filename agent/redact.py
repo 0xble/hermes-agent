@@ -85,8 +85,11 @@ def register_vault_date_component(token: str, value: str, *,
 
 
 def register_vault_card_component(field: str, value: str, *, tab: str, origin: str) -> None:
-    """Keep low-entropy card metadata on its filled tab and origin, not in the global secret set."""
-    if field not in {"cardholder_name", "exp_month", "exp_year", "billing_postal_code"} or not isinstance(value, str) or not value:
+    """Keep low-entropy card metadata on its filled tab and origin, not in the global secret set.
+
+    An unavailable origin is conservatively tab-scoped until the existing browser cleanup.
+    """
+    if field not in {"cardholder_name", "exp_month", "exp_year", "billing_postal_code", "cvc", "expiry"} or not isinstance(value, str) or not value:
         return
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_CARD_PARTS.setdefault(_date_scope(tab, origin), {})
@@ -144,17 +147,22 @@ def _date_parts(tab: str, origin: str = "") -> tuple:
             if key[:2] == (_vault_scope(), str(tab)):
                 merged.update(bucket)
         for key, bucket in _VAULT_CARD_PARTS.items():
-            if key[:2] == (_vault_scope(), str(tab)) and origin and key[2] == origin.lower():
+            if key[:2] == (_vault_scope(), str(tab)) and (not key[2] or origin and key[2] == origin.lower()):
                 merged.update(bucket)
         return tuple(merged)
 
 
 def redact_registered_vault_number(value: Any, *,
                                    tab: str = "default", origin: str = "") -> Any:
-    """Scrub an exact registered date component on its owning tab and origin."""
+    """Scrub registered global secrets and scoped components returned as numbers."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
-    return "«redacted-vault-secret»" if any(str(value) == part for _, part in _date_parts(tab, origin)) else value
+    text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+    with _VAULT_REDACTION_LOCK:
+        registered = text in _VAULT_REDACTION_VALUES.get(_vault_scope(), ())
+    if registered or any(text == part for _, part in _date_parts(tab, origin)):
+        return "«redacted-vault-secret»"
+    return value
 
 
 def clear_vault_redaction_values() -> None:

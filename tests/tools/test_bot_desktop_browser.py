@@ -14,6 +14,16 @@ import pytest
 from tools.bot_desktop import browser, runtime
 
 
+@pytest.fixture(autouse=True)
+def _isolated_pm_checkout(tmp_path, monkeypatch):
+    # Package resolution may inspect manifest/install metadata beside its source
+    # checkout; never let a checkout under the real Hermes home select host state.
+    from pm import paths
+    root = tmp_path / "pm-checkout"
+    root.mkdir()
+    monkeypatch.setattr(paths, "repo_root", lambda: root)
+
+
 def test_dock_and_agent_share_browser_identity(tmp_path, monkeypatch):
     exe = tmp_path / "chrome"
     exe.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -290,6 +300,7 @@ def test_headed_chromium_spawn_asks_the_screen_to_start_but_the_env_builder_neve
             Path(socket_dir, f"_{slot}_{tag}").write_text("{}" if slot == "stdout" else "", encoding="utf-8")
         return _Done()
     monkeypatch.setattr(session, "_popen_agent_browser", _fake_popen)
+    monkeypatch.setattr(session, "_read_command_output", lambda proc: ("{}", ""))
     monkeypatch.setattr(session, "_prepare_session_socket_dir", lambda name: str(tmp_path))
     session._spawn_and_collect("t", {"session_name": "h_x"}, ["agent-browser"], "open", engine, 5)
     assert len(calls) == starts
