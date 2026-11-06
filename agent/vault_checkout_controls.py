@@ -27,6 +27,8 @@ FILL_HELPERS = r"""
     !el.matches(':disabled') && el.getAttribute('aria-disabled') !== 'true' && !el.readOnly &&
     getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden' &&
     el.getClientRects().length > 0;
+  const usable = (el, f) => !!el && live(el) &&
+    el.getAttribute('data-hermes-vault-slot') === nonce + ':' + f.index;
   const safeClick = el => {
     const button = el.closest('button, input');
     return live(el) && (!button ||
@@ -48,9 +50,11 @@ FILL_HELPERS = r"""
     return t === v;
   };
   const chooseOption = (options, f, aria) => {
-    const textOf = o => o.textContent || o.getAttribute('aria-label') || '';
+    const textOf = o => f.token === 'cc-type' ? o.textContent : (o.textContent || o.getAttribute('aria-label') || '');
     const byText = options.filter(o => optionMatch(textOf(o), f.value, f.token));
-    if (byText.length) return byText.length === 1 ? byText[0] : null;
+    // Brands are human-facing semantics, never opaque provider IDs. This also
+    // governs native readback: a value of visa cannot certify a Mastercard label.
+    if (byText.length || f.token === 'cc-type') return byText.length === 1 ? byText[0] : null;
     // Numeric month values can be zero-based. Visible month text wins; never
     // guess from a numeric opaque value when the labels carry month semantics.
     if (f.token === 'cc-exp-month' && options.some(o => monthNames.some(m => norm(textOf(o)).includes(m)))) return null;
@@ -58,21 +62,35 @@ FILL_HELPERS = r"""
     return hits.length === 1 ? hits[0] : null;
   };
   const fillAria = async (el, f) => {
-    if ((!f.token.startsWith('cc-exp') && f.token !== 'cc-type') || !safeClick(el)) return false;
-    const root = el.getRootNode();
-    if (el.getAttribute('role') === 'combobox') el.click();
-    await new Promise(resolve => setTimeout(resolve, 0));
-    if (!live(el)) return false;
-    const ids = (el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '').split(/\s+/).filter(Boolean);
-    const popups = el.getAttribute('role') === 'listbox' ? [el] : ids.map(id => root.getElementById(id)).filter(Boolean);
-    if (popups.length !== 1 || popups[0].getAttribute('role') !== 'listbox') return false;
-    const options = Array.from(popups[0].querySelectorAll('[role=option]')).filter(o =>
-      safeClick(o));
-    const option = chooseOption(options, f, true);
-    if (!option || !safeClick(el) || !safeClick(option)) return false;
+    if ((!f.token.startsWith('cc-exp') && f.token !== 'cc-type') || !usable(el, f) || !safeClick(el)) return false;
+    const root = el.getRootNode(), role = el.getAttribute('role');
+    const association = () => el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '';
+    const ids = association().split(/\s+/).filter(Boolean);
+    if (role !== 'listbox' && ids.length !== 1) return false;
+    const binding = association();
+    const bound = () => usable(el, f) && el.getRootNode() === root &&
+      el.getAttribute('role') === role && association() === binding;
+    if (role === 'combobox') el.click();
+    let popup, options;
+    // Frameworks may mount or reveal the associated popup asynchronously. Keep
+    // the old bounded readiness window, revalidating authority after EVERY yield.
+    for (let attempt = 0; attempt < 10; attempt++) {
+      if (!bound()) return false;
+      await new Promise(resolve => setTimeout(resolve, 25));
+      if (!bound()) return false;
+      popup = role === 'listbox' ? el : root.getElementById(ids[0]);
+      if (!popup || popup.getAttribute('role') !== 'listbox' || !live(popup)) continue;
+      options = Array.from(popup.querySelectorAll('[role=option]')).filter(safeClick);
+      if (options.length) break;
+    }
+    const option = chooseOption(options || [], f, true);
+    if (!option || !bound() || !safeClick(el) || !safeClick(option) ||
+        !popup.contains(option) || (role !== 'listbox' && root.getElementById(ids[0]) !== popup)) return false;
     option.click();
+    if (!bound()) return false;
     await new Promise(resolve => setTimeout(resolve, 0));
-    if (!live(el)) return false;
+    if (!bound()) return false;
+    if (f.token === 'cc-type' && !optionMatch(option.textContent, f.value, f.token)) return false;
     return option.getAttribute('aria-selected') === 'true' ||
       [el.value, el.getAttribute('aria-valuetext'), el.textContent].some(t => optionMatch(t, f.value, f.token));
   };

@@ -17,6 +17,13 @@ requirement; CamelCase identifiers do not loosen that gate. Native submit/reset/
 default-submit buttons (including ancestors) are never clicked for ARIA targets.
 Card brand is derived and selected before PAN/expiry to avoid framework resets.
 Secret evaluation contains rejected promises inside the page before transport.
+Each mutation/event and readback rechecks the exact inspection nonce/index,
+origin, and control liveness. ARIA popup readiness is bounded to ten 25ms DOM
+checks against the trigger's unique explicit association, with authority checked
+after every yield; nonce revocation prevents the option click, not just its
+receipt. Brand selection and final verification require a unique supported
+visible option label, never a plausible opaque provider value. Duplicate,
+missing, unsupported, and conflicting labels remain missing without selection.
 Wrapping-label evidence excludes descendant widget state (button text and select
 options), so `Expiration month` remains classifiable when its trigger displays `MM`.
 
@@ -26,8 +33,9 @@ documents, not iframe `src`; the mutation boundary checks origin and document
 identity and refuses navigation, detach, tab change, sandboxed/unapproved frames,
 tracing, redirects and insecure remote HTTP. No secret enters argv, plugin events,
 traces, errors, or public receipts. The companion service is required for hosted
-fields: [Camofox PR54](https://github.com/0xble/camofox-browser/pull/54), candidate
-`d43bcaba27da92b265db078f1e3c7bb3c17e61f4`. Source publication does not deploy it.
+fields: [Camofox PR54](https://github.com/0xble/camofox-browser/pull/54), merged
+as `58f1d0a9fcde563eaf7902de4afcc75b67005b07`. Source merge does not deploy it
+or prove capability availability in the running companion.
 
 Vault entry stays the first route. Authorized typed entry is the fallback defined
 by the separate [agent secret-entry policy](agent-secret-entry.md); this patch

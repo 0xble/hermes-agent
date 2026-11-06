@@ -252,3 +252,259 @@ def test_native_expiry_controls_use_local_group_labels(bridge):
     html='<input autocomplete=cc-number><fieldset><legend>Expiration</legend><select name=Month><option>Month</option><option value=07>July</option></select><select name=Year><option>Year</option><option value=2029>2029</option></select></fieldset><input aria-label=CVC>'
     result=fill_html(call,ready['origin'],html)
     assert result['success'], result
+
+
+def direct_fill(call, origin, token, value, **kwargs):
+    """Drive the actual shared fill template, keeping receipts value-blind."""
+    from agent.vault_login_classifier import build_fill_js
+
+    response = call('eval', expression=build_inspection_js('synthetic'))
+    assert response['ok']
+    controls = json.loads(response['result'])
+    target = next(c for c in controls if c['name'].split()[-1] == 'target')
+    response = call('eval', expression=build_fill_js(
+        [{'index': target['index'], 'token': token, 'value': value}],
+        origin, 'synthetic', **kwargs))
+    assert response['ok']
+    receipt = json.loads(response['result'])
+    assert receipt.get('selectedOptions', []) == []
+    return receipt
+
+
+@pytest.mark.parametrize('mutation', ['none', 'click-restamp', 'timer-restamp', 'option-restamp', 'option-timer-restamp',
+                                      'index-drift', 'detach', 'disable', 'association-drift'])
+def test_aria_nonce_is_rechecked_at_each_event_and_yield(bridge, mutation):
+    ready, call = bridge
+    call('load', kind='native')
+    restamp = "target.setAttribute('data-hermes-vault-slot','replacement:0');"
+    actions = {
+        'none': '', 'click-restamp': restamp,
+        'timer-restamp': "setTimeout(()=>{" + restamp + "},0);",
+        'index-drift': "target.setAttribute('data-hermes-vault-slot','synthetic:999');",
+        'detach': 'target.remove();', 'disable': "target.setAttribute('aria-disabled','true');",
+        'association-drift': "target.setAttribute('aria-controls','elsewhere');",
+        'option-restamp': '', 'option-timer-restamp': '',
+    }
+    html = ('<button id=target type=button role=combobox aria-label="Expiry month" '
+            'aria-controls=months>Month</button><div id=months role=listbox>'
+            '<div role=option>July</div></div>')
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    call('eval', expression="""window.optionClicks=0;window.triggerClicks=0;
+        window.target=document.getElementById('target');
+        target.onclick=()=>{window.triggerClicks++;ACTION};
+        document.querySelector('[role=option]').onclick=function(){
+          window.optionClicks++;target.textContent='July';this.setAttribute('aria-selected','true');OPTION
+        };void 0;""".replace('ACTION', actions[mutation]).replace('OPTION', restamp if mutation == 'option-restamp' else
+          'setTimeout(()=>{' + restamp + '},0);' if mutation == 'option-timer-restamp' else ''))
+    receipt = direct_fill(call, ready['origin'], 'cc-exp-month', '07')
+    state = call('eval', expression="[window.optionClicks,target.textContent,document.querySelectorAll('[data-hermes-vault-slot]').length]")['result']
+    assert state == [1 if mutation in {'none', 'option-restamp', 'option-timer-restamp'} else 0,
+                     'July' if mutation in {'none', 'option-restamp', 'option-timer-restamp'} else 'Month', 0]
+    assert receipt['filled'] == (1 if mutation == 'none' else 0)
+    assert receipt['fieldResults'] == [{'token': 'cc-exp-month', 'status': 'filled' if mutation == 'none' else 'missing'}]
+
+
+@pytest.mark.parametrize('mode', ['associated', 'restamp', 'wrong-association', 'unassociated', 'ambiguous', 'no-popup'])
+def test_delayed_popup_requires_live_nonce_and_unique_association(bridge, mode):
+    ready, call = bridge
+    call('load', kind='native')
+    association = {'unassociated': '', 'ambiguous': 'aria-controls="months other"'}.get(mode, 'aria-controls=months')
+    html = '<button id=target type=button role=combobox aria-label="Expiry month" ' + association + '>Month</button>'
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    popup_id = 'other' if mode == 'wrong-association' else 'months'
+    call('eval', expression="""window.optionClicks=0;window.popupReady=false;
+        const target=document.getElementById('target');target.onclick=()=>{
+          RESTAMP
+          setTimeout(()=>{
+            if(NOPOPUP) return;
+            const list=document.createElement('div');list.id=POPUP;list.setAttribute('role','listbox');
+            list.innerHTML='<div role=option>July</div>';
+            list.firstChild.onclick=()=>{window.optionClicks++;target.textContent='July';};
+            document.body.append(list);window.popupReady=true;
+          },60);
+        };void 0;""".replace('RESTAMP', "setTimeout(()=>target.setAttribute('data-hermes-vault-slot','replacement:0'),40);" if mode == 'restamp' else '')
+            .replace('NOPOPUP', 'true' if mode == 'no-popup' else 'false').replace('POPUP', json.dumps(popup_id)))
+    receipt = direct_fill(call, ready['origin'], 'cc-exp-month', '07')
+    assert receipt['filled'] == (1 if mode == 'associated' else 0)
+    state = call('eval', expression="[window.optionClicks,document.getElementById('target').textContent]")['result']
+    assert state == ([1, 'July'] if mode == 'associated' else [0, 'Month'])
+
+
+@pytest.mark.parametrize('kind', ['native', 'aria'])
+@pytest.mark.parametrize('labels', [[], [''], ['Diners Club'], ['Mastercard'], ['Visa', 'Visa']])
+def test_brand_never_falls_back_to_opaque_provider_values(bridge, kind, labels):
+    ready, call = bridge
+    call('load', kind='native')
+    options = ''.join(f'<option aria-label=Visa value=visa>{label}</option>' if kind == 'native' else
+                      f'<div aria-label=Visa role=option data-value=visa>{label}</div>' for label in labels)
+    html = ('<select id=target aria-label="Card brand"><option value="">Choose</option>' + options + '</select>'
+            if kind == 'native' else
+            '<button id=target type=button role=combobox aria-label="Card brand" aria-controls=brands>Choose</button>'
+            '<div id=brands role=listbox>' + options + '</div>')
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    call('eval', expression="""window.optionClicks=0;window.changes=0;
+        const target=document.getElementById('target');target.onchange=()=>window.changes++;
+        for(const option of document.querySelectorAll('[role=option]')) option.onclick=()=>{
+          window.optionClicks++;target.textContent=option.textContent;option.setAttribute('aria-selected','true');
+        };void 0;""")
+    receipt = direct_fill(call, ready['origin'], 'cc-type', 'visa')
+    assert receipt['filled'] == 0 and receipt['fieldResults'] == [{'token': 'cc-type', 'status': 'missing'}]
+    state = call('eval', expression="[window.optionClicks,window.changes,document.getElementById('target').selectedIndex??-1,document.getElementById('target').textContent]")['result']
+    assert state[:3] == [0, 0, 0 if kind == 'native' else -1]
+    if kind == 'aria':
+        assert state[3] == 'Choose'
+
+
+@pytest.mark.parametrize('kind', ['native', 'aria'])
+@pytest.mark.parametrize('label,brand', [('Visa', 'visa'), ('Mastercard', 'mastercard'),
+                                        ('American Express', 'amex'), ('Discover', 'discover')])
+def test_supported_visible_brand_beats_opaque_provider_value(bridge, kind, label, brand):
+    ready, call = bridge
+    call('load', kind='native')
+    html = ('<select id=target aria-label="Card brand"><option value="">Choose</option><option value=opaque>' + label + '</option></select>'
+            if kind == 'native' else
+            '<button id=target type=button role=combobox aria-label="Card brand" aria-controls=brands>Choose</button>'
+            '<div id=brands role=listbox><div role=option data-value=opaque>' + label + '</div></div>')
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    call('eval', expression="""const option=document.querySelector('[role=option]');if(option) option.onclick=()=>{
+      document.getElementById('target').textContent=option.textContent;option.setAttribute('aria-selected','true');};void 0;""")
+    receipt = direct_fill(call, ready['origin'], 'cc-type', brand)
+    assert receipt['filled'] == 1 and receipt['fieldResults'] == [{'token': 'cc-type', 'status': 'filled'}]
+    assert call('eval', expression="document.getElementById('target').selectedOptions?.[0]?.textContent||document.getElementById('target').textContent")['result'] == label
+
+
+@pytest.mark.parametrize('kind', ['native', 'aria'])
+def test_brand_final_readback_rejects_changed_visible_label(bridge, kind):
+    ready, call = bridge
+    call('load', kind='native')
+    html = ('<select id=target aria-label="Card brand"><option value="">Choose</option><option value=visa>Visa</option></select>'
+            if kind == 'native' else
+            '<button id=target type=button role=combobox aria-label="Card brand" aria-controls=brands>Choose</button>'
+            '<div id=brands role=listbox><div role=option data-value=visa>Visa</div></div>')
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    call('eval', expression="""const target=document.getElementById('target');
+      if(target.tagName==='SELECT') target.onchange=()=>target.selectedOptions[0].textContent='Mastercard';
+      else document.querySelector('[role=option]').onclick=function(){
+        this.textContent='Mastercard';this.setAttribute('aria-selected','true');target.value='visa';target.textContent='Mastercard';
+      };void 0;""")
+    receipt = direct_fill(call, ready['origin'], 'cc-type', 'visa')
+    assert receipt['filled'] == 0 and receipt['fieldResults'] == [{'token': 'cc-type', 'status': 'missing'}]
+
+
+
+@pytest.mark.parametrize('association', ['', 'aria-controls="months other"', 'aria-controls=other', 'aria-owns=months'])
+@pytest.mark.parametrize('duplicate', [False, True])
+def test_expiry_options_are_never_guessed_page_wide_or_ambiguously(bridge, association, duplicate):
+    ready, call = bridge
+    call('load', kind='native')
+    options = '<div role=option>July</div>' * (2 if duplicate else 1)
+    html = ('<button id=target type=button role=combobox aria-label="Expiry month" ' + association + '>Month</button>'
+            '<div id=months role=listbox>' + options + '</div><div id=other role=listbox><div role=option>June</div></div>')
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    call('eval', expression="""window.optionClicks=0;
+      for(const option of document.querySelectorAll('[role=option]')) option.onclick=()=>{
+        window.optionClicks++;document.getElementById('target').textContent=option.textContent;
+      };void 0;""")
+    receipt = direct_fill(call, ready['origin'], 'cc-exp-month', '07')
+    valid = association == 'aria-owns=months' and not duplicate
+    assert receipt['filled'] == int(valid)
+    assert call('eval', expression="[window.optionClicks,document.getElementById('target').textContent]")['result'] == [int(valid), 'July' if valid else 'Month']
+
+
+@pytest.mark.parametrize('kind', ['input', 'native', 'aria'])
+@pytest.mark.parametrize('mutation', ['nonce', 'index', 'origin'])
+def test_fill_refuses_invalid_binding_before_any_mutation(bridge, kind, mutation):
+    from agent.vault_login_classifier import build_fill_js
+
+    ready, call = bridge
+    call('load', kind='native')
+    html = {'input': '<input id=target autocomplete=cc-number>',
+            'native': '<select id=target aria-label="Expiry month"><option>Month</option><option>July</option></select>',
+            'aria': '<button id=target type=button role=combobox aria-label="Expiry month" aria-controls=months>Month</button><div id=months role=listbox><div role=option>July</div></div>'}[kind]
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    call('eval', expression="window.mutations=0;for(const event of ['focus','input','change','click']) document.addEventListener(event,()=>window.mutations++,true);void 0;")
+    raw = json.loads(call('eval', expression=build_inspection_js('synthetic'))['result'])
+    token, value = ('cc-number', CARD['card_number']) if kind == 'input' else ('cc-exp-month', '07')
+    response = call('eval', expression=build_fill_js(
+        [{'index': raw[0]['index'] + (999 if mutation == 'index' else 0), 'token': token, 'value': value}],
+        ready['processorOrigin'] if mutation == 'origin' else ready['origin'],
+        'replacement' if mutation == 'nonce' else 'synthetic'))
+    assert response['ok']
+    receipt = json.loads(response['result'])
+    assert CARD['card_number'] not in json.dumps(receipt)
+    assert receipt.get('filled', 0) == 0
+    assert call('eval', expression='window.mutations')['result'] == 0
+
+
+@pytest.mark.parametrize('kind,event', [('input', 'focus'), ('input', 'input'), ('native', 'input')])
+def test_native_events_cannot_reuse_revoked_inspection(bridge, kind, event):
+    ready, call = bridge
+    call('load', kind='native')
+    html = ('<input id=target autocomplete=cc-number>' if kind == 'input' else
+            '<select id=target aria-label="Expiry month"><option>Month</option><option value=07>July</option></select>')
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    call('eval', expression="""window.changes=0;const target=document.getElementById('target');
+      target.onchange=()=>window.changes++;
+      target.addEventListener(EVENT,()=>target.setAttribute('data-hermes-vault-slot','replacement:0'));void 0;""".replace('EVENT', json.dumps(event)))
+    token, value = ('cc-number', CARD['card_number']) if kind == 'input' else ('cc-exp-month', '07')
+    receipt = direct_fill(call, ready['origin'], token, value)
+    assert receipt['filled'] == 0 and value not in json.dumps(receipt)
+    state = call('eval', expression="[window.changes,document.getElementById('target').value==='']")['result']
+    assert state == [0, event == 'focus']
+
+
+@pytest.mark.parametrize('kind', ['native', 'aria'])
+def test_verify_only_preserves_stamps_but_rejects_conflicting_brand(bridge, kind):
+    from agent.vault_login_classifier import build_fill_js
+
+    ready, call = bridge
+    call('load', kind='native')
+    html = ('<select id=target aria-label="Card brand"><option value="">Choose</option><option value=visa>Visa</option></select>'
+            if kind == 'native' else
+            '<button id=target type=button role=combobox aria-label="Card brand" aria-controls=brands>Choose</button>'
+            '<div id=brands role=listbox><div role=option>Visa</div></div>')
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    call('eval', expression="""const option=document.querySelector('[role=option]');if(option) option.onclick=()=>{
+      document.getElementById('target').textContent='Visa';option.setAttribute('aria-selected','true');};void 0;""")
+    receipt = direct_fill(call, ready['origin'], 'cc-type', 'visa', retain_stamps=True)
+    assert receipt['filled'] == 1
+    stamp = call('eval', expression="document.getElementById('target').getAttribute('data-hermes-vault-slot')")['result']
+    assert stamp == 'synthetic:0'
+    call('eval', expression="""const target=document.getElementById('target');
+      if(target.tagName==='SELECT') target.selectedOptions[0].textContent='Mastercard';
+      else {target.textContent='Mastercard';target.value='visa';target.setAttribute('aria-valuetext','Visa');}void 0;""")
+    response = call('eval', expression=build_fill_js([{'index': 0, 'token': 'cc-type', 'value': 'visa'}],
+                    ready['origin'], 'synthetic', verify_only=True))
+    assert response['ok']
+    receipt = json.loads(response['result'])
+    assert receipt['filled'] == 0 and receipt['fieldResults'] == [{'token': 'cc-type', 'status': 'missing'}]
+    assert call('eval', expression="document.querySelectorAll('[data-hermes-vault-slot]').length")['result'] == 0
+
+
+
+@pytest.mark.parametrize('first_label', ['Mastercard', 'Visa'])
+def test_native_brand_selects_visible_option_not_shared_provider_value(bridge, first_label):
+    ready, call = bridge
+    call('load', kind='native')
+    second_label = 'Visa' if first_label == 'Mastercard' else 'Mastercard'
+    html = ('<select id=target aria-label="Card brand"><option>Choose</option>'
+            f'<option value=visa>{first_label}</option><option value=visa>{second_label}</option></select>')
+    call('eval', expression='document.body.innerHTML=' + json.dumps(html))
+    receipt = direct_fill(call, ready['origin'], 'cc-type', 'visa')
+    assert receipt['filled'] == 1
+    assert call('eval', expression="document.getElementById('target').selectedOptions[0].textContent")['result'] == 'Visa'
+
+
+@pytest.mark.parametrize('kind', ['native', 'aria'])
+def test_unsupported_brand_yields_partial_value_free_payment_receipt(bridge, kind):
+    ready, call = bridge
+    call('load', kind='native')
+    brand = ('<select id=target aria-label="Card brand"><option>Choose</option><option value=visa>Mastercard</option></select>'
+             if kind == 'native' else '<button id=target type=button role=combobox aria-label="Card brand" aria-controls=brands>Choose</button><div id=brands role=listbox><div role=option data-value=visa>Mastercard</div></div>')
+    receipt = fill_html(call, ready['origin'], '<input autocomplete=cc-number><input autocomplete=cc-exp><input autocomplete=cc-csc>' + brand)
+    assert not receipt['success'] and receipt['partial']
+    assert receipt['field_results']['cc-type'] == 'missing'
+    assert receipt['missing_fields'] == ['cc-type']
+    assert receipt['field_results']['cc-number'] == 'filled'
+    assert all(value not in json.dumps(receipt) for value in CARD.values())
+    assert call('eval', expression="document.getElementById('target').selectedOptions?.[0]?.textContent||document.getElementById('target').textContent")['result'] == 'Choose'

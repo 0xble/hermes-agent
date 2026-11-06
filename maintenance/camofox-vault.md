@@ -89,8 +89,12 @@ without changing the native browser or its consent surface.
   current page origin at fill time and the existing payment confirmation names that origin;
   local-vault cards keep their saved-origin binding. A card handle never resolves as a login.
 - A payment fill prompts only after the origin check and a stamped inspection find a card-number
-  target. A page without one returns `no_payment_fields` and never asks: card inputs in a payment
-  processor's cross-origin frame are unreachable by design. That inspection only decides whether to
+  target in the page or an approved processor document. A page without one returns
+  `no_payment_fields` and never asks. Cross-origin hosted fields require the narrow
+  exact-origin/document-bound companion capabilities in [vault payment controls](vault-payment-controls.md),
+  not a page-wide fallback. [Camofox PR54](https://github.com/0xble/camofox-browser/pull/54)
+  merged as `58f1d0a9fcde563eaf7902de4afcc75b67005b07`; source merge alone does not
+  establish availability in the running companion. That inspection only decides whether to
   ask. After consent the page is inspected again with a fresh nonce, and only those stamps are
   written. Card consent is one-shot: the prompt offers Allow Once and Deny, and a session or
   permanent answer never approves or consumes it (adopted from upstream PR 118429).

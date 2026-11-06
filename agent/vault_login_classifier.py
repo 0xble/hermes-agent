@@ -626,21 +626,31 @@ _FILL_JS_TEMPLATE = """(async () => {
   const norm = (t) => String(t || "").trim().toLowerCase();
   __PAYMENT_FILL_HELPERS__
   const readback = (el, f) => {
-    if (!el || !live(el)) return false;
+    if (!usable(el, f)) return false;
     if (['combobox', 'listbox'].includes(el.getAttribute('role'))) {
       // aria-selected on a stale option alone cannot certify a trigger reset.
       if (el.getAttribute('role') === 'listbox') {
         const options = Array.from(el.querySelectorAll('[role=option][aria-selected=true]'));
-        return options.length === 1 && optionMatch(options[0].textContent, f.value, f.token);
+        return options.length === 1 && chooseOption(Array.from(el.querySelectorAll('[role=option]'))
+          .filter(o => !o.matches(':disabled,[aria-disabled=true]')), f, true) === options[0];
+      }
+      // Visible brand text wins over stale framework values or ARIA state.
+      if (f.token === 'cc-type') {
+        const ids = (el.getAttribute('aria-controls') || el.getAttribute('aria-owns') || '').split(/\\s+/).filter(Boolean);
+        if (ids.length !== 1) return false;
+        const popup = el.getRootNode().getElementById(ids[0]);
+        const options = popup && popup.getAttribute('role') === 'listbox'
+          ? Array.from(popup.querySelectorAll('[role=option]')).filter(o => !o.matches(':disabled,[aria-disabled=true]')) : [];
+        return !!chooseOption(options, f, true) && optionMatch(norm(el.textContent) || el.getAttribute('aria-valuetext'), f.value, f.token);
       }
       return [el.value, el.getAttribute('aria-valuetext'), el.textContent].some(t => optionMatch(t, f.value, f.token));
     }
     if (el.tagName === 'SELECT') {
-      const options = Array.from(el.options).filter(o => !o.disabled);
+      const options = Array.from(el.options).filter(o => !o.matches(':disabled'));
       const option = (f.token.startsWith('cc-exp') || f.token === 'cc-type' || f.token === 'bday-month')
         ? chooseOption(options, {...f, token: f.token === 'bday-month' ? 'cc-exp-month' : f.token}, false)
         : options.find(o => [o.value, o.textContent].some(t => norm(t) === norm(f.value) || norm(t) === norm(f.value).replace(/^0/, '')));
-      return !!option && el.value === option.value;
+      return !!option && el.selectedOptions.length === 1 && el.selectedOptions[0] === option;
     }
     const canonical = value => String(value || '').replace(/[^a-z0-9]/gi, '');
     return ['cc-number', 'cc-exp'].includes(f.token)
@@ -652,19 +662,21 @@ _FILL_JS_TEMPLATE = """(async () => {
     const el = stamped.find((n) => n.getAttribute("data-hermes-vault-slot") === nonce + ':' + f.index);
     if (verifyOnly || !el || (f.token === "current-password" && el.type !== "password")) continue;
     try {
-      if (!live(el)) continue;
+      if (!usable(el, f)) continue;
       if (['combobox', 'listbox'].includes(el.getAttribute('role'))) {
         if (await fillAria(el, f)) { filled++; result.status = 'filled'; }
         continue;
       }
       if (el.tagName === "SELECT") {
         if (f.token.startsWith('cc-exp') || f.token === 'cc-type') {
-          const option = chooseOption(Array.from(el.options).filter(o => !o.disabled), f, false);
-          if (!option || !live(el)) continue;
-          el.value = option.value;
+          const option = chooseOption(Array.from(el.options).filter(o => !o.matches(':disabled')), f, false);
+          if (!option || !usable(el, f)) continue;
+          el.selectedIndex = option.index;
+          if (!usable(el, f)) continue;
           el.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+          if (!usable(el, f)) continue;
           el.dispatchEvent(new Event('change', {bubbles: true}));
-          if (live(el) && el.value === option.value) { filled++; result.status = 'filled'; }
+          if (readback(el, f)) { filled++; result.status = 'filled'; }
           continue;
         }
         const want = norm(f.value);
@@ -687,15 +699,17 @@ _FILL_JS_TEMPLATE = """(async () => {
         } else {
           opt = options.find((o) => [o.value, o.textContent].some(same));
         }
-        if (opt) {
+        if (opt && usable(el, f)) {
           el.value = opt.value;
           el.dispatchEvent(new Event("change", { bubbles: true }));
+          if (!usable(el, f)) continue;
           selectedOptions.push({ token: f.token, value: opt.value, label: opt.textContent });
           filled += 1; result.status = "filled";
         }
         continue;
       }
       el.focus();
+      if (!usable(el, f)) continue;
       if (f.token === "current-password") {
         const tokens = String(el.getAttribute("autocomplete") || "").toLowerCase().split(/\\s+/);
         const labels = Array.from(el.labels || []).map((l) => l.textContent).join(" ");
@@ -712,10 +726,13 @@ _FILL_JS_TEMPLATE = """(async () => {
       }
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
+      if (!usable(el, f)) continue;
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
+      if (!usable(el, f)) continue;
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
+      if (!usable(el, f)) continue;
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      if (live(el) && String(el.value).replace(/[^a-z0-9]/gi, "") === String(f.value).replace(/[^a-z0-9]/gi, "")) {
+      if (usable(el, f) && String(el.value).replace(/[^a-z0-9]/gi, "") === String(f.value).replace(/[^a-z0-9]/gi, "")) {
         filled += 1; result.status = "filled";
       }
     } catch (e) { /* skip */ }
