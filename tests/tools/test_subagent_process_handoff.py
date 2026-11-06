@@ -7,6 +7,7 @@ named on the child's result as orphaned before teardown kills it.
 """
 
 import json
+import shlex
 import time
 import weakref
 
@@ -49,7 +50,14 @@ def clean_queue():
         process_registry.completion_queue.get_nowait()
 
 
-def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(clean_queue):
+def _spawn_blocked(release, task_id, command=":"):
+    """Keep a real process alive until the test has established its handoff/notify preconditions."""
+    return process_registry.spawn_local(
+        f"while [ ! -e {shlex.quote(release.as_posix())} ]; do sleep 0.02; done; {command}",
+        task_id=task_id, owner_task_id=task_id)
+
+
+def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(clean_queue, tmp_path):
     """A real child-owned process handed off carries the parent's owner id (so the parent's drain accepts it, with the
     handoff purpose), while a sibling the child did not hand off is still owned by the child and is listed as orphaned
     on the child's result."""
@@ -58,9 +66,10 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
     child = _Child(parent)
     _register(sid, child)
     try:
-        handed = process_registry.spawn_local("sleep 0.4; echo ci-green", task_id=sid, owner_task_id=sid)
+        release_handed = tmp_path / "handed"
+        handed = _spawn_blocked(release_handed, sid, "echo ci-green")
         handed.notify_on_complete = True
-        leftover = process_registry.spawn_local("sleep 30", task_id=sid, owner_task_id=sid)
+        leftover = _spawn_blocked(tmp_path / "leftover", sid)
 
         out = json.loads(_handle_process(
             {"action": "handoff", "session_id": handed.id, "data": "CI watcher for PR 1"}, task_id=sid))
@@ -71,10 +80,9 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
         # Only the un-handed sibling is left in the child's name — this is what the result entry reports as orphaned.
         assert [s.id for s in process_registry.running_owned_by(sid)] == [leftover.id]
 
-        # Let it exit on its own — a registry wait() would mark the completion consumed (that is the parent-observed path).
-        deadline = time.time() + 10
-        while process_registry.completion_queue.empty() and time.time() < deadline:
-            time.sleep(0.05)
+        # Release only after handoff; waiting on publication does not consume the parent's completion.
+        release_handed.touch()
+        assert handed._completion_event.wait(10)
         assert handed.exited
         # The parent drains with the default suppression of sa- owners: the handed-off completion passes it.
         events = process_registry.drain_notifications(owns_event=lambda e: True)
@@ -88,7 +96,7 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
         _unregister_subagent(sid)
 
 
-def test_handoff_refuses_exited_foreign_or_non_child_callers(clean_queue):
+def test_handoff_refuses_exited_foreign_or_non_child_callers(clean_queue, tmp_path):
     """A PID in prose is not a transfer: handoff is an error for a process that already exited, one the caller does
     not own, or a caller that is not a registered subagent — never a silent no-op."""
     sid, other = "sa-0-handoff02", "sa-1-handoff03"
@@ -102,8 +110,10 @@ def test_handoff_refuses_exited_foreign_or_non_child_callers(clean_queue):
 
         # A notify process that exited while the child was alive and was never read is reported to the parent;
         # the one the child waited on (read) is not.
-        unread = process_registry.spawn_local("echo UNREAD_RESULT", task_id=sid, owner_task_id=sid)
+        release_unread = tmp_path / "unread"
+        unread = _spawn_blocked(release_unread, sid, "echo UNREAD_RESULT")
         unread.notify_on_complete = True
+        release_unread.touch()
         # `exited` flips before the finalization owner publishes into `_finished`; wait for publication.
         assert unread._completion_event.wait(10)
         ids = [s.id for s in process_registry.unread_completions_owned_by(sid)]
@@ -112,7 +122,7 @@ def test_handoff_refuses_exited_foreign_or_non_child_callers(clean_queue):
             {"unread_completions": [{"session_id": unread.id, "command": "echo", "exit_code": 0,
                                      "output_tail": unread.output_buffer}]})[0]
 
-        foreign = process_registry.spawn_local("sleep 30", task_id=other, owner_task_id=other)
+        foreign = _spawn_blocked(tmp_path / "foreign", other)
         assert "error" in json.loads(_handle_process(
             {"action": "handoff", "session_id": foreign.id, "data": "x"}, task_id=sid))
         assert foreign.owner_task_id == other
