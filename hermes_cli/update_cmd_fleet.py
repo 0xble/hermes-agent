@@ -1646,7 +1646,7 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     """
     import signal as _signal
     from hermes_cli.gateway import (
-        find_gateway_pids, find_profile_gateway_processes, _capture_gateway_argv,
+        find_gateway_pids, find_profile_gateway_processes,
         _prepare_profile_gateway_update_restart, _get_service_pids,
         _wait_for_gateway_exit,
     )
@@ -1654,50 +1654,20 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     # live gateway's own external-supervisor declaration is the authoritative fallback;
     # otherwise the new child is indistinguishable from a manual process and the sweep
     # SIGTERMs it before launchd's throttle window can settle.
-    from hermes_cli.gateway_supervised_restart import gateway_declares_external_supervisor
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
     from hermes_cli.update_cmd_posix_pause import already_restarted
     # Plus gateways this update paused and already resumed on the new code.
     service_pids = _get_service_pids(all_profiles=True) | already_restarted()["pids"]
-    candidate_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+    candidate_pids = [pid for pid in find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+                      if not leave_client_owned_gateway(pid)]
     mapped_processes = {
         proc.pid: proc
         for proc in find_profile_gateway_processes(exclude_pids=service_pids)
         if proc.pid in candidate_pids
     }
-    # Only a supervisor child that appeared after the restart snapshot is outside
-    # this sweep. A pre-existing externally supervised gateway still has to leave
-    # its old process so the supervisor can relaunch it on the new modules (#88654).
-    pre_restart_pids = getattr(out, "pre_restart_gateway_pids", None)
-    pre_restart_pids = set(pre_restart_pids) if pre_restart_pids is not None else None
-    externally_supervised_pids = set()
-    for pid in candidate_pids:
-        proc = mapped_processes.get(pid)
-        if proc is not None:
-            # A mapped process gets the control-socket/state-file check as well as
-            # the live argv fallback, scoped to that profile's home.
-            try:
-                declares_external_supervisor = gateway_declares_external_supervisor(pid, proc.path)
-            except Exception as exc:
-                # An unreadable identity is ambiguous; never turn it into a
-                # destructive manual-stop decision. Report the skipped process so
-                # the update summary/receipt is not silently incomplete.
-                print(
-                    f"  ⚠ Could not determine external-supervisor ownership for "
-                    f"gateway PID {pid} ({proc.profile}): {exc}; "
-                    "protecting it if it appeared after the restart snapshot"
-                )
-                declares_external_supervisor = True
-            if declares_external_supervisor and (pre_restart_pids is None or pid not in pre_restart_pids):
-                externally_supervised_pids.add(pid)
-            continue
-        # Unmapped gateways have no profile home to query. The explicit argv
-        # marker is still enough to identify a supervisor-owned launch.
-        try:
-            argv = _capture_gateway_argv(pid)
-        except Exception:
-            argv = None
-        if argv and "--external-supervisor" in argv and (pre_restart_pids is None or pid not in pre_restart_pids):
-            externally_supervised_pids.add(pid)
+    from hermes_cli.update_cmd_manual_restart import new_supervisor_gateway_pids
+    externally_supervised_pids = new_supervisor_gateway_pids(
+        candidate_pids, mapped_processes, getattr(out, "pre_restart_gateway_pids", None))
     manual_pids = [pid for pid in candidate_pids if pid not in externally_supervised_pids]
     profile_processes = {
         pid: proc for pid, proc in mapped_processes.items() if pid in manual_pids
@@ -1713,6 +1683,8 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     # which is the contract already used for gateways with no profile mapping.
     unrestartable_pids = set()
     for pid, proc in profile_processes.items():
+        if leave_client_owned_gateway(pid, home=proc.path):
+            continue
         restart_mode = _prepare_profile_gateway_update_restart(proc.profile, pid)
         if restart_mode is None:
             # A bare ``continue`` here left it serving stale modules with no signal.
@@ -1741,6 +1713,8 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
             out.relaunched_profiles.append(proc.profile)
 
     for pid in manual_pids:
+        if leave_client_owned_gateway(pid):
+            continue
         if pid in profile_processes and pid not in unrestartable_pids:
             continue
         with suppress(ProcessLookupError, PermissionError):
@@ -1778,7 +1752,8 @@ def _force_kill_stuck_gateways(killed_pids) -> None:
         _time.sleep(3.0)
         _surviving = find_gateway_pids(exclude_pids=_get_service_pids(all_profiles=True), all_profiles=True)
         # Only PIDs we already tried to kill; newer ones are left alone.
-        _stuck = [pid for pid in _surviving if pid in killed_pids]
+        from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
+        _stuck = [pid for pid in _surviving if pid in killed_pids and not leave_client_owned_gateway(pid)]
         if _stuck:
             print()
             print(f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing")

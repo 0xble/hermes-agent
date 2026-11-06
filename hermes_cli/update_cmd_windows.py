@@ -358,6 +358,7 @@ def _leftover_pausable_gateway_pids(matches: list[tuple[int, str, str]]) -> list
     Uses the Desktop preflight's ``_is_pausable_gateway`` so exemption and tolerance cannot drift; live argv is
     re-read via psutil when possible since the scan may hold only a cmdline prefix."""
     from hermes_cli._scan_venv_blockers import _is_pausable_gateway
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
     psutil = _psutil()
     pids: list[int] = []
     for pid, _name, cmdline in matches:
@@ -365,7 +366,7 @@ def _leftover_pausable_gateway_pids(matches: list[tuple[int, str, str]]) -> list
         if psutil is not None:
             with suppress(Exception):
                 argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
-        if not _is_pausable_gateway(argv):
+        if not _is_pausable_gateway(argv) or leave_client_owned_gateway(int(pid)):
             return None
         pids.append(int(pid))
     return pids
@@ -894,12 +895,13 @@ def _request_socket_pauses(running_pids, profile_processes, service_gateway_pids
     gateway) -> the marker poll / force-kill ladder in the caller. ``on_request(pid)`` runs once the
     request is issued (marker on disk, else a positive socket ACK) and before the socket call: from
     then on a crash leaves that gateway owed while it drains, never before."""
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
     profiles: dict[str, int] = {}
     mapped_pids = []
     socket_acks: list[dict] = []
     for pid in running_pids:
         proc = None if pid in service_gateway_pids else profile_processes.get(pid)
-        if proc is None:
+        if proc is None or leave_client_owned_gateway(int(pid), home=proc.path):
             continue
         profiles[str(proc.profile)] = int(pid)
         mapped_pids.append(int(pid))
@@ -957,6 +959,18 @@ def _pause_windows_gateways_for_update() -> dict | None:
     profile_processes, service_gateways, service_gateway_pids, running_pids = _discover_windows_gateways()
     if not running_pids:
         return _cold_start_pause_token(adopted, claims)
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
+    # Keep discovery's liveness result: only leases running is NOT a cold-start
+    # authorization. Filter before marker writes, durable pause debt or argv replay.
+    running_pids = [pid for pid in running_pids if not leave_client_owned_gateway(
+        pid, home=getattr(profile_processes.get(pid), "path", None))]
+    if not running_pids:
+        if adopted is None:
+            return None
+        return pause_record.record_pause(
+            {"resume_needed": True, "profiles": {}, "unmapped_pids": [], "unmapped": []}, adopted, claims)
+    service_gateways = [s for s in service_gateways if int(s.gateway_pid) in running_pids]
+    service_gateway_pids.intersection_update(running_pids)
     unmapped_pids = [pid for pid in running_pids if pid not in profile_processes and pid not in service_gateway_pids]
     from gateway.status import get_process_start_time
     from hermes_cli.update_fleet_scope import gateway_pid_home
