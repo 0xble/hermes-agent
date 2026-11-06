@@ -139,21 +139,24 @@ def has_any_vault_date_components() -> bool:
         return any(key[0] == _vault_scope() for key in _VAULT_DATE_PARTS)
 
 
-def _date_parts(tab: str, origin: str = "") -> tuple:
-    """Birthday parts persist across focused origins; card parts require the filled origin."""
+def _date_parts(tab: str | None, origin: str = "") -> tuple:
+    """Keep birthday semantics; card parts need an owned tab, not necessarily a known origin."""
     with _VAULT_REDACTION_LOCK:
         merged = {}
+        scope = (_vault_scope(), "default" if tab is None else str(tab))
         for key, bucket in _VAULT_DATE_PARTS.items():
-            if key[:2] == (_vault_scope(), str(tab)):
+            if key[:2] == scope:
                 merged.update(bucket)
+        # Omitted browser context must not turn the task named "default" into
+        # a source of short card masks for generic terminal/log output.
         for key, bucket in _VAULT_CARD_PARTS.items():
-            if key[:2] == (_vault_scope(), str(tab)) and (not key[2] or origin and key[2] == origin.lower()):
+            if tab is not None and key[:2] == scope and (not key[2] or not origin or key[2] == origin.lower()):
                 merged.update(bucket)
         return tuple(merged)
 
 
 def redact_registered_vault_number(value: Any, *,
-                                   tab: str = "default", origin: str = "") -> Any:
+                                   tab: str | None = None, origin: str = "") -> Any:
     """Scrub registered global secrets and scoped components returned as numbers."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
@@ -176,7 +179,7 @@ def clear_vault_redaction_values() -> None:
 
 
 def redact_registered_vault_values(text: str, *,
-                                   tab: str = "default", origin: str = "") -> str:
+                                   tab: str | None = None, origin: str = "") -> str:
     """Redact exact vault values and date components on the owning tab and origin."""
     if not isinstance(text, str) or not text:
         return text
@@ -198,7 +201,7 @@ def redact_registered_vault_values(text: str, *,
     return text
 
 
-def redact_registered_vault_snapshot(text: str, *, tab: str = "default", origin: str = "") -> str:
+def redact_registered_vault_snapshot(text: str, *, tab: str | None = None, origin: str = "") -> str:
     """Apply the same tab/origin component rule used by every browser output."""
     return redact_registered_vault_values(text, tab=tab, origin=origin)
 
@@ -1059,7 +1062,7 @@ def redact_sensitive_json(value, **kwargs):
         # Serialized dumps scrubbed registered numeric values too; keep that boundary structurally.
         text = str(value)
         scrubbed = redact_registered_vault_values(
-            text, tab=kwargs.get("vault_tab", "default"), origin=kwargs.get("vault_origin", ""))
+            text, tab=kwargs.get("vault_tab"), origin=kwargs.get("vault_origin", ""))
         return value if scrubbed == text else scrubbed
     return value
 
@@ -1067,7 +1070,7 @@ def redact_sensitive_json(value, **kwargs):
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
                           redact_url_credentials: bool = False,
-                          vault_tab: str = "default", vault_origin: str = "") -> str:
+                          vault_tab: str | None = None, vault_origin: str = "") -> str:
     """Apply all redaction patterns to a block of text.
 
     Safe on any string. Enabled by default (``security.redact_secrets: false``

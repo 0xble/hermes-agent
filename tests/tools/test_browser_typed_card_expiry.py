@@ -5,18 +5,20 @@ import pytest
 
 from agent.browser_output_egress import scrub_browser_result
 from agent.redact import clear_vault_redaction_values
+from model_tools import handle_function_call
 from tools import browser_tool as bt, browser_tool_session as session
 
 
 @pytest.mark.parametrize("backend", ["camofox", "agent-browser"])
+@pytest.mark.parametrize("role", ["textbox", "spinbutton", "combobox", "select"])
 @pytest.mark.parametrize("label,value", [("Expiration month", "09"), ("Expiry year", "2031"),
                                          ("Expiration date", "09/31"), ("Valid thru", "09/2031")])
-def test_expiry_typed_public_entrypoint_is_scoped_and_cleans_up(monkeypatch, backend, label, value):
+def test_expiry_typed_public_entrypoint_is_scoped_and_cleans_up(monkeypatch, backend, role, label, value):
     from tools import browser_camofox as cf
     clear_vault_redaction_values()
     task = "expiry-task"
     origin = {"value": "https://shop.example"}
-    tree = f'- textbox "{label}" [e109]\n- textbox "Search" [e2]'
+    tree = f'- {role} "{label}" [e109]\n- textbox "Search" [e2]'
     bt._last_active_session_key[task] = task
     monkeypatch.setattr(bt, "_is_camofox_mode", lambda: backend == "camofox")
     monkeypatch.setattr(bt, "_blocked_private_page_action", lambda *a: None)
@@ -28,7 +30,9 @@ def test_expiry_typed_public_entrypoint_is_scoped_and_cleans_up(monkeypatch, bac
     monkeypatch.setattr(cf, "_snapshot_data", lambda *a: {"snapshot": tree})
     monkeypatch.setattr(cf, "_post", lambda *a, **kw: {"ok": True})
     try:
-        result = json.loads(bt.browser_type("e109", value, task_id=task))
+        result = json.loads(handle_function_call(
+            "browser_type", {"ref": "e109", "text": value}, task_id=task,
+            skip_pre_tool_call_hook=True, skip_tool_request_middleware=True))
         assert result["typed"] == "«redacted-vault-secret»"
         raw = json.dumps({"snapshot": f'- textbox "Echo" [e109]: {value}\n- item "ordinal 1090"',
                           "result": {"value": value, "number": int(value) if value.isdigit() else 0}})
@@ -51,15 +55,19 @@ def test_expiry_typed_public_entrypoint_is_scoped_and_cleans_up(monkeypatch, bac
         bt._last_active_session_key.pop(task, None)
 
 
+@pytest.mark.parametrize("role", ["textbox", "spinbutton", "combobox", "select"])
 @pytest.mark.parametrize("label,value", [("Search", "731"), ("One-time code", "731"),
                                          ("Issue date MM/YY", "09/31"), ("Valid from", "09/31")])
-def test_unrelated_control_metadata_never_registers_card_parts(label, value, monkeypatch):
+def test_unrelated_control_metadata_never_registers_card_parts(role, label, value, monkeypatch):
     from tools.browser_tool_typing import register_typed_card_value
     from agent.redact import has_vault_scoped_components
     clear_vault_redaction_values()
     monkeypatch.setattr("tools.browser_vault_tool._current_page_origin", lambda _: "https://shop.example")
     try:
-        register_typed_card_value("e2", value, "unrelated", lambda: f'- textbox "{label}" [e2]')
+        register_typed_card_value("e2", value, "unrelated", lambda: f'- {role} "{label}" [e2]')
+        for noninput in ("button", "option", "paragraph", "generic"):
+            register_typed_card_value("e2", "731", "unrelated",
+                                      lambda: f'- {noninput} "textbox CVC" [e2]')
         assert not has_vault_scoped_components("unrelated")
     finally:
         clear_vault_redaction_values()

@@ -29,7 +29,7 @@ def _typed_card_token(ref: str, tree: str) -> str:
 
     target = re.compile(r"\[(?:ref=)?@?" + re.escape(ref.lstrip("@")) + r"\]")
     for line in tree.splitlines():
-        if not target.search(line) or not re.search(r"\b(?:textbox|spinbutton)\b", line):
+        if not target.search(line) or not re.search(r"^\s*-?\s*(?:textbox|spinbutton|combobox|select)\b", line):
             continue
         label = re.search(r'"([^"\n]*)"', line)
         if label:

@@ -112,7 +112,12 @@ without changing the native browser or its consent surface.
 - Payment PAN and CVC remain profile-global exact-value redactions. Name, expiry month/year
   (including padded/unpadded month and four-/two-digit year), and billing ZIP use whole-token
   redaction only on the filled browser session and origin. Neither terminal/log output nor
-  other tabs/origins inherit these low-entropy matches; card fills do not trigger the
+  other tabs/known unrelated origins inherit these low-entropy matches. If either
+  registration or read-time origin is unavailable, protect the owning tab until
+  cleanup, including snapshot redaction before truncation and cache writes.
+  Omitted tab scope is not the browser task named `default`: generic output
+  redactors must not acquire that task's short card values.
+  Birthday components retain their existing tab-wide semantics. Card fills do not trigger the
   protected-birthday pixel quarantine. Browser close (including a failed card-only
   close that releases session resources), force-reap, and timed-out generation discard
   clear the scoped card metadata so a reused task key cannot inherit it. Protected
@@ -296,6 +301,12 @@ first-429 stop and cross-process cooldown),
 `tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome), and for card consent
 `tests/gateway/test_mcp_consent_scope.py` and `tests/tools/test_mcp_trust_gating.py`. Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.
+
+Direct typing classifies textbox, spinbutton, combobox and select roles through
+the shared checkout classifier. A standalone `CID` label is card-code evidence;
+an ambiguous `cid` DOM id/name alone is not, and `autocomplete=cc-csc` remains
+authoritative. Keep `test_checkout_cvc_targeting.py`, `test_browser_typed_card_origin.py`,
+and the typed-card privacy/expiry suites in the focused regression matrix.
 
 ## Retirement and rollback
 
