@@ -24,6 +24,8 @@ import time
 
 _OUT = threading.Lock()
 _CHILDREN: dict[int, subprocess.Popen] = {}
+# Retain identities after reaping so a reused PID cannot fall back to enumeration.
+_CHILD_STARTS: dict[int, int | None] = {}
 
 
 def _reply(rid, **payload) -> None:
@@ -127,8 +129,22 @@ def _spawn(req: dict) -> dict:
                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     finally:
         log.close()
+    fields = _stat(proc.pid)
+    _CHILD_STARTS[proc.pid] = int(fields[19]) if fields is not None else None
     _CHILDREN[proc.pid] = proc
     return {"pid": proc.pid}
+
+
+def _alive(pid: int) -> bool:
+    # An owned child can be mid-exec with an empty /proc environ. Its handle
+    # knows whether it exited, independently of the HOME enumeration boundary.
+    if pid in _CHILD_STARTS:
+        proc = _CHILDREN.get(pid)
+        if proc is None or proc.poll() is not None:
+            return False
+        fields = _stat(pid)
+        return fields is not None and int(fields[19]) == _CHILD_STARTS[pid]
+    return any(row["pid"] == pid and row["state"] not in ("Z", "X") for row in _procs())
 
 
 def _kill(req: dict) -> dict:
@@ -153,6 +169,8 @@ def _handle(req: dict) -> None:
             _reply(rid, **_spawn(req))
         elif op == "procs":
             _reply(rid, procs=_procs())
+        elif op == "alive":
+            _reply(rid, alive=_alive(int(req["pid"])))
         elif op == "kill":
             _reply(rid, **_kill(req))
         elif op == "ping":
