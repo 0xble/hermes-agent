@@ -711,6 +711,8 @@ def static(env: dict[str, str]) -> None:
         # pyproject.toml carries the maintained rules, while evals/ is research code outside
         # the shipped package and has its own probes.
         [py, '-m', 'ruff', '--config', 'pyproject.toml', 'check', '.', '--exclude', 'evals'],
+        [py, '-m', 'scripts.code_health', '--base', git('merge-base', 'origin/main', 'HEAD').strip(),
+         '--head', 'HEAD'],
         [py, 'scripts/check-windows-footguns.py', '--all'],
         [py, 'scripts/check_no_tmp_literals.py'],
         [py, 'scripts/ci/check_os_marker_fakes.py'],

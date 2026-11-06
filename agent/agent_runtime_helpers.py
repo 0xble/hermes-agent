@@ -1529,16 +1529,9 @@ def restore_primary_runtime(agent) -> bool:
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
         )
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
-        agent._provider_fallback_active = False
-        agent._provider_fallback_route = None
-        # A shared outage's recovery notice belongs to the request that proves the primary works
-        # (complete_primary_recovery), never to this restore. Restore proceeds only once the
-        # shared window has passed or the record is gone, so it never rewrites the record.
-        if provider_fallback_active and not held_shared_record and not getattr(agent, "_provider_fallback_silent_retry", False):
-            # Notification surfaces are best-effort and must never undo a successful restore.
-            with contextlib.suppress(Exception):
-                agent._emit_diagnostic_status(ContextNotice(f"✅ Primary model restored: {agent.model} via {agent.provider}; "
-                    f"fallback {previous_model} via {previous_provider} is no longer active."))
+        from agent.fallback_notice import finish_fallback_restore
+        finish_fallback_restore(agent, provider_fallback_active, held_shared_record,
+                                previous_model, previous_provider)
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
@@ -2448,6 +2441,7 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     agent._active_fallback_entry = None
     agent._fallback_stay_started_at = None
     agent._provider_fallback_active = False
+    agent._provider_fallback_silent_retry = False
     agent._provider_fallback_route = None
     agent._fallback_episode_cooled = False
     agent._fallback_index = 0

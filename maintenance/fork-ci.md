@@ -15,6 +15,26 @@ carry different evidence and must not be confused:
   `scripts/run_tests.sh` harness plus all nine nonrelease Node checks, E2E, docs, Rust and
   container lint. Claims of complete coverage need this profile, not the gate.
 
+The hosted static job runs `python -m scripts.code_health --base
+"$(git merge-base origin/main HEAD)" --head HEAD` as a blocking step in a small
+`uv run --no-project` environment with checkout-pinned Python and Ruff (no full
+application install). The repository-owned `static` lane runs the same ratchet
+with its checkout Python.
+This compares committed PR changes with their merge-base, preserving existing
+findings while rejecting new blocking patterns (including BLE001) and per-unit
+cap growth. Global Ruff selection is unchanged. `qualification` already requires
+the static job; no new required check or branch-protection setting is needed.
+The git-guard wrapper delegates to `./bin/ci`; its lane list is not authoritative.
+
+Upstream's `ca682666b8c` later wired code health into `lint.yml`. The fork had
+already removed that workflow in `d77a654d860`; subsequent upstream integrations
+retained its deletion and never added the ratchet to the portable static lane.
+This is a missed upstream enforcement port, not evidence that a working fork
+ratchet was deliberately disabled. Adding it at this source-owned boundary
+preserves the separate ratchet instead of imposing legacy findings through Ruff.
+Retire this wiring only when its replacement proves the same base-to-head
+blocking behavior. This source-only patch changes no installed runtime.
+
 Profile-owned plugins are tested from their canonical source repository, not from this
 Hermes application checkout. A selected lane (`check --lane`) is partial evidence. No
 profile uses changed-file classification, and the complete profile never substitutes a
@@ -126,7 +146,8 @@ checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
 
-Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
+Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`, `fork-ci`.
+The `fork-ci` identity owns the subagent process handoff test synchronization below.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
 
@@ -252,6 +273,23 @@ cannot broadcast the half-written start as a separate transition. The runtime al
 zombie launchers as dead in `tools/bot_desktop/runtime.py::_pid_alive`, so this is test-only
 synchronization, not a production liveness correction. Retire when the watcher exposes an owned
 synchronous poll/flush boundary or upstream makes this test isolation unnecessary.
+
+## Subagent process handoff preconditions
+
+The `fork-ci` identity covers `tests/tools/test_subagent_process_handoff.py`. Its
+handed-off child ran `sleep 0.4` and its sibling and foreign processes ran fixed
+sleeps, while the test enabled notification and spawned the sibling before calling
+handoff. Under hosted load the handed child exited first, and the unchanged handler
+correctly refused it as already exited, so the test read `status` from an error-only
+result (hosted job 127391871875). Controlled scheduling of the unchanged test
+reproduced that `KeyError`. Each real process now waits on a test-owned release
+file until its ownership and notification preconditions exist. The handed process
+is released only after handoff, and the test waits on completion publication
+without consuming the parent's notification. Real subprocesses, parent delivery,
+orphan accounting and exited, foreign and non-child refusals remain asserted.
+Product code is unchanged. Retire when upstream synchronizes these preconditions.
+
+Contract tests: `tests/tools/test_subagent_process_handoff.py`.
 
 ## Update pause consumer publish race
 

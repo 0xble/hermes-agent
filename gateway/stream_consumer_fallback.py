@@ -85,8 +85,9 @@ class StreamFallbackMixin:
                            ) -> list[str]:
         """Split text for fallback sends: newline-preferred, fence-balanced across chunks."""
         from gateway.platforms.helpers import split_text_fence_aware
-        return split_text_fence_aware(text, limit, len_fn, prefer_paragraphs=False,
-                                      balance_fences=True)
+        from gateway.copy_blocks import balance_copy_quote_chunks
+        return balance_copy_quote_chunks(split_text_fence_aware(
+            text, limit, len_fn, prefer_paragraphs=False, balance_fences=True))
 
     def _truncate_for_stream(self, text: str, limit: int, len_fn: Callable[[str], int],
                              ) -> list[str]:
@@ -101,7 +102,8 @@ class StreamFallbackMixin:
             chunks = truncate(text, limit)
         if not isinstance(chunks, (list, tuple)) or not all(isinstance(c, str) for c in chunks):
             return self._split_text_chunks(text, limit, len_fn)
-        return list(chunks)
+        from gateway.copy_blocks import balance_copy_quote_chunks
+        return balance_copy_quote_chunks(list(chunks))
 
     async def _send_fallback_final(self, text: str) -> None:
         """Send the final continuation after streaming edits stop working (one flood retry
@@ -359,8 +361,8 @@ class StreamFallbackMixin:
         """Send a completed interim assistant commentary message."""
         # Commentary is a whole message, so whole-text extraction is exact here; copy
         # blocks belong only to the final answer's separate deliveries.
-        from gateway.copy_blocks import render_copy_blocks_inline
-        text = self._clean_for_display(render_copy_blocks_inline(text))
+        from gateway.copy_blocks import copy_free_text_for
+        text = self._clean_for_display(copy_free_text_for(self.adapter, text))
         if not text.strip():
             return False
         try:

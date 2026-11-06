@@ -27,7 +27,7 @@ from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
 from gateway.copy_blocks import (
-    protect_inline_copy_bodies, restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
+    restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
 from gateway.platforms.reaction_lifecycle import reaction_operation
 
@@ -5248,14 +5248,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         pipeline. History dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is
         recovered."""
         pre_extract = response
-        # Platforms without a plain copy send keep blocks inline; their bodies ride through
-        # directive extraction as opaque tokens, so literal text never becomes an attachment.
+        # All inline bodies stay opaque through directive extraction. Telegram keeps
+        # display markers for literal quotes; interrupted blocks never become copy sends.
+        response, copy_blocks, inline_bodies = split_copy_blocks_protected(self, response)
         if getattr(event, "_copy_blocks_inline_only", False):
-            # Interrupted turn: a block may be partial, so it stays inline, still literal.
-            response, inline_bodies = protect_inline_copy_bodies(response)
             copy_blocks = []
-        else:
-            response, copy_blocks, inline_bodies = split_copy_blocks_protected(self, response)
         # Captured after copy extraction: [[as_document]] inside a copy block is literal copied text.
         force_document = "[[as_document]]" in response
         # Gateway-authored text (slash-command output, ephemeral notices) only mentions paths.

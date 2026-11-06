@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import immutable_releases as releases
+from tests.hermes_cli.immutable_test_helpers import _fake_release_generation
 
 
 def _await_ready(process: subprocess.Popen, expected: str) -> None:
@@ -1038,8 +1039,35 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     assert called == [new]
 
 
+@pytest.fixture
+def release_child_stderr(monkeypatch):
+    """Keep captured child diagnostics on the original, still-fatal exception."""
+    run = subprocess.run
+
+    def run_with_stderr(*args, **kwargs):
+        try:
+            return run(*args, **kwargs)
+        except subprocess.CalledProcessError as exc:
+            exc.add_note(f"child stderr:\n{exc.stderr}")
+            raise
+
+    monkeypatch.setattr(releases.subprocess, "run", run_with_stderr)
+
+
+def test_release_child_failure_includes_stderr(release_child_stderr):
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        subprocess.run(
+            [sys.executable, "-c", "import sys; sys.stderr.write('child diagnostic'); sys.exit(7)"],
+            check=True, capture_output=True, text=True,
+        )
+    assert caught.value.returncode == 7
+    assert caught.value.stderr == "child diagnostic"
+    assert caught.value.__notes__ == ["child stderr:\nchild diagnostic"]
+
+
 @pytest.mark.parametrize("carrier", ["previous", "source"])
-def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path, monkeypatch, carrier):
+def test_prepare_venv_carries_extras_from_previous_release_environment(
+        tmp_path, monkeypatch, carrier, release_child_stderr):
     """An extra installed into the active release survives the next release build.
 
     The migration-bound source interpreter never sees `hermes pm install --extra` or a lazy
@@ -1047,8 +1075,6 @@ def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path,
     interpreter alone dropped Slack on every update. At first migration nothing is active yet,
     so the source checkout's own committed environment carries instead.
     """
-    from pm.environments import install_state_dir, runtime_facts_path
-
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     pyproject = ("[project]\nname='hermes-agent'\nversion='0.1.0'\n[project.optional-dependencies]\n"
                  "slack=['slack-bolt==1.30.0']\ntelegram=['python-telegram-bot==22.8']\n")
@@ -1058,13 +1084,7 @@ def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path,
         release.mkdir(parents=True)
         (release / "pyproject.toml").write_text(pyproject, encoding="utf-8")
     carried = previous if carrier == "previous" else source
-    environment = install_state_dir(carried) / "environments" / "generation" / "venv"
-    (environment / "bin").mkdir(parents=True)
-    (environment / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (environment / "bin" / "python").symlink_to(sys.executable)
-    facts = runtime_facts_path(carried)
-    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
-        "environment": str(environment), "extras": ["slack", "telegram"]}}}), encoding="utf-8")
+    environment = _fake_release_generation(carried, ["slack", "telegram"])
 
     def distributions(python):
         installed = {"python-telegram-bot": "22.8"}
@@ -1084,17 +1104,10 @@ def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path,
 
 def test_smoke_runs_the_interpreter_the_candidate_boots(tmp_path, monkeypatch):
     """After a carry commits a PM generation, staging smokes that generation, not `.venv`."""
-    from pm.environments import install_state_dir, runtime_facts_path
-
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     release = tmp_path / "releases" / "B"
     _fake_release(release, "B")
-    generation = install_state_dir(release) / "environments" / "generation" / "venv"
-    (generation / "bin").mkdir(parents=True)
-    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (generation / "bin" / "python").symlink_to(sys.executable)
-    runtime_facts_path(release).write_text(json.dumps({"schema": 1, "packages": {"venv": {
-        "environment": str(generation), "extras": ["slack"]}}}), encoding="utf-8")
+    generation = _fake_release_generation(release, ["slack"])
     ran = []
     monkeypatch.setattr(releases.subprocess, "run",
                         lambda argv, **kwargs: ran.append(argv[0]) or subprocess.CompletedProcess(argv, 0, "", ""))
@@ -1102,7 +1115,8 @@ def test_smoke_runs_the_interpreter_the_candidate_boots(tmp_path, monkeypatch):
     assert ran == [str(generation.resolve() / "bin" / "python")]
 
 
-def test_ready_candidate_from_older_builder_commits_active_extras_before_activation(tmp_path, monkeypatch):
+def test_ready_candidate_from_older_builder_commits_active_extras_before_activation(
+        tmp_path, monkeypatch, release_child_stderr):
     """A release staged by the frozen source checkout gets the active release's extras.
 
     `hermes update` re-enters the source checkout, whose older `prepare_venv` built B without
@@ -1111,8 +1125,6 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
     PM's record supplies `documents`, which inference from installed packages cannot see.
     A recorded extra that is platform-gated off here is never re-synced.
     """
-    from pm.environments import install_state_dir, runtime_facts_path
-
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     home = tmp_path / "profile"
     a, b = home / "releases" / "A", home / "releases" / "B"
@@ -1126,13 +1138,7 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
         (release / ".venv" / "bin" / "python").unlink()
         (release / ".venv" / "bin" / "python").symlink_to(sys.executable)
     releases.promote(home, a)
-    generation = install_state_dir(a) / "environments" / "generation" / "venv"
-    (generation / "bin").mkdir(parents=True)
-    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (generation / "bin" / "python").symlink_to(sys.executable)
-    runtime_facts_path(a).write_text(json.dumps({"schema": 1, "packages": {"venv": {
-        "environment": str(generation), "extras": ["documents", "gated", "slack", "telegram"]}}}),
-        encoding="utf-8")
+    generation = _fake_release_generation(a, ["documents", "gated", "slack", "telegram"])
 
     def distributions(python):
         installed = {"python-telegram-bot": "22.8"}
