@@ -413,8 +413,8 @@ def test_zero_based_and_opaque_selected_option_values_are_masked():
                      {"token": "bday-year", "value": "1990", "label": "1990"},
                  ]})}):
             assert json.loads(browser_vault_tool.browser_vault_fill(meta.id, task_id="zero"))["success"]
-        out = json.loads(scrub_browser_result(
-            "browser_console", json.dumps({"month": "3", "n": 3, "day": "d-12x"}), "zero"))
+            out = json.loads(scrub_browser_result(
+                "browser_console", json.dumps({"month": "3", "n": 3, "day": "d-12x"}), "zero"))
         assert "3" not in json.dumps(out) and "d-12x" not in json.dumps(out)
     finally:
         clear_vault_date_components("zero")
@@ -468,7 +468,7 @@ def test_split_date_selected_option_label_is_redacted_without_masking_unrelated_
         assert _redact_cdp_output({'result': {'value': 4}}, field_context=True)['result']['value'] == MASK
         with patch('tools.browser_camofox._snapshot_data', return_value={
             'snapshot': 'birth month: 4\\nother: 4 bookings', 'refsCount': 2
-        }):
+        }), patch.object(browser_vault_tool, '_current_page_origin', return_value=meta.origin):
             snapshot, count = _fetch_snapshot({'tab_id': 'dummy'})
         assert count == 2 and 'April' not in snapshot and 'birth month: 4' not in snapshot and '4 bookings' not in snapshot
         assert 'option "4"' not in redact_registered_vault_values('option "4" [selected]')

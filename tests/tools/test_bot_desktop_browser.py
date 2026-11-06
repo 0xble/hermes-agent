@@ -49,6 +49,16 @@ def _agent_launch(monkeypatch, display: str = ":37") -> dict:
     return call
 
 
+@pytest.fixture(autouse=True)
+def _isolated_pm_checkout(tmp_path, monkeypatch):
+    # Package resolution may inspect manifest/install metadata beside its source
+    # checkout; never let a checkout under the real Hermes home select host state.
+    from pm import paths
+    root = tmp_path / "pm-checkout"
+    root.mkdir()
+    monkeypatch.setattr(paths, "repo_root", lambda: root)
+
+
 def test_dock_and_agent_share_browser_identity(tmp_path, monkeypatch):
     exe = tmp_path / "chrome"
     exe.write_text("#!/bin/sh\n", encoding="utf-8")
