@@ -3562,6 +3562,7 @@ def _run_one_job_body(
     if not execution_id:
         execution_id = create_execution(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+    original_job = job
     job = dict(job, execution_id=execution_id)
     delivery_attempted = False
     delivery_error = None
@@ -3723,14 +3724,10 @@ def _run_one_job_body(
         return _finish_completed_run(d, fire_owner, execution_id, result_committed=committed)
 
     except BaseException as e:
-        from cron.scheduler_authority import CronExecutionUnknown
-        if isinstance(e, CronExecutionUnknown):
-            from cron.executions import give_up_execution
-            from cron.scheduler_authority import pause_for_unknown
-            pause_for_unknown(job["id"], execution_id, str(e))
-            give_up_execution(execution_id, reason=str(e))
-            logger.error("Cron %s paused with unverified admission: %s", job["id"], e)
-            return False
+        from cron.scheduler_update_deferral import handle_admission_exception
+        admission_result = handle_admission_exception(original_job, execution_id, e)
+        if admission_result is not None:
+            return admission_result
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
         # Without mark_job_run(False) a finite one-shot is wedged: claim_dispatch consumed
         # repeat.completed but last_run_at is never written. Record first, then re-raise
@@ -3976,6 +3973,10 @@ def _wait_for_external_cron_worker(
             worker_hard_wall_deadline=worker_hard_wall_deadline,
         )
     except Exception as wait_error:
+        from cron.scheduler_update_deferral import worker_deferred
+        with contextlib.suppress(Exception):
+            if worker_deferred(process, execution_id, handoff_files):
+                return True  # processed deferral, not a terminal success
         worker_exited = True
         with contextlib.suppress(Exception):
             worker_exited = process.poll() is not None
@@ -4430,6 +4431,8 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             try:
                 completed = run_one_job(job, adapters=None, loop=None, verbose=False,
                                         hard_wall_fence=watchdog_stop)
+                from cron.scheduler_update_deferral import publish_worker_deferral
+                publish_worker_deferral(ack_path, job)
                 with contextlib.suppress(OSError):
                     ack_path.with_suffix(".stderr").unlink(missing_ok=True)
                 return completed

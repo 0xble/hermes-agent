@@ -1,6 +1,6 @@
 # Cron Admission
 
-**Patch identities:** `cron-protected-admission`, `cron-max-catch-up-lateness`.
+**Patch identities:** `cron-protected-admission`, `cron-max-catch-up-lateness`, `cron-update-pause-deferral`.
 
 This unit extends the [fork contract](../MAINTENANCE.md). Load it for cron
 completion rearming, built-in ticker waits, or executor admission changes.
@@ -112,6 +112,26 @@ Do not replace it with a higher general cap, a second protected reservation, job
 identity matching, or an execution-terminal release shortcut. Retire it only
 when the selected upstream baseline preserves the same admission and timing
 contract under general-pool saturation.
+
+## Update-pause deferral
+
+A typed `GatewayUnavailableError(reason_code="update_paused")` at the discovery
+fence, before any connection, admission journal or submit attempt, is a structural
+non-run deferral. It creates no failure incident, owner notice or route packet,
+records neither success nor recovery, and preserves repeat budget and prior
+incidents. Recurring jobs keep their already-advanced natural next slot rather
+than replay the skipped occurrence. One-shots refund only this owner's finite
+dispatch preclaim, release its claims and retain the same due arm through the
+pause (including beyond ordinary missed-one-shot grace); explicit run-window
+expiration still applies. Completed runs and explicit re-arms clear that exemption.
+The owned pre-admission audit row is withdrawn, not marked completed/failed; the
+existing exact-worker acknowledgement carries the deferral across process exit.
+Any prior journal, submit attempt or uncertain admission remains identity-fenced
+`CronExecutionUnknown`, never an automatic replay. Other unavailable errors and
+real failures, plus original recovered `no_agent` alerts, remain unchanged.
+`tests/cron/test_update_pause_deferral.py` verifies the fake-only boundary and
+worker exit receipt. Revert the narrow reason/classification/bookkeeping hooks
+together to roll back; no live-store repair, config or runtime action is included.
 
 ## Maximum catch-up lateness
 

@@ -96,6 +96,10 @@ def retire_expired_oneshot(d) -> bool:
     from cron import jobs
     from cron.oneshot_retirement import queue_retirement_alert
 
+    # The same arm was explicitly deferred before gateway admission, not missed. It remains
+    # pending through a long update; explicit run-window deadlines were checked by the caller.
+    if d.job.get("update_deferred_slot") == d.next_run:
+        return False
     if jobs._elapsed_seconds(d.scan.now, d.next_run_dt) <= jobs.ONESHOT_GRACE_SECONDS:
         return False
     covered = jobs.store_health.outage_covers(

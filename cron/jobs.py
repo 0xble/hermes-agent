@@ -2529,6 +2529,7 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[dict[str, Any]]:
             schedule=parsed_schedule, schedule_display=parsed_schedule.get("display", str(run_at)),
             repeat=repeat, run_claim=None, fire_claim=None)
         _activate_job_record(job)
+        job.pop("update_deferred_slot", None)
         job["next_run_at"] = next_run_at
         save_jobs(jobs)
         return _normalize_job_record(job)
@@ -2645,6 +2646,7 @@ def _record_run_outcome(
     # `cron list` would be permanent after a single skip.
     job.pop("last_skipped_at", None)
     job.pop("last_skip_reason", None)
+    job.pop("update_deferred_slot", None)
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
