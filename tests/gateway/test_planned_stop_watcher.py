@@ -18,6 +18,8 @@ import threading
 import time
 from unittest.mock import MagicMock
 
+from gateway.run_bootstrap import _start_gateway_make_shutdown_signal_handler
+
 
 from gateway.run import _run_planned_stop_watcher
 from gateway import status as status_mod
@@ -221,7 +223,7 @@ def test_cli_sigterm_after_watcher_consumed_the_marker_stays_planned(tmp_path, m
     def _handler():
         runner = SimpleNamespace(_signal_initiated_shutdown=False, stop=lambda: asyncio.sleep(0))
         flag = [False]
-        return run_mod._start_gateway_make_shutdown_signal_handler(runner, flag), flag
+        return _start_gateway_make_shutdown_signal_handler(runner, flag), flag
 
     handler, flag = _handler()
     _write_self_marker(marker)
