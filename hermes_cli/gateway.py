@@ -4802,7 +4802,6 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     verbosity = None if quiet else verbose
 
     import atexit as _atexit
-    import traceback as _traceback
     _exit_diag = _make_exit_diag()
     _exit_diag(
         "gateway.start", replace=replace, argv=sys.argv, stdin_is_tty=stdin_is_tty,
@@ -4813,12 +4812,6 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     _respawn_storm_backoff()
 
-    def _hard_exit_after_gateway_teardown(code: int) -> None:
-        # Mirror gateway.run.main()'s wedge-proof exit: bypass Python finalization so non-daemon
-        # threads (in-flight cron jobs) can't delay a /restart by minutes.
-        from gateway.run import _exit_after_graceful_shutdown
-        _exit_after_graceful_shutdown(code)
-
     async def _run_with_release_ack() -> bool:
         watcher = asyncio.create_task(_acknowledge_release_when_running())
         try:
@@ -4826,29 +4819,13 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         finally:
             watcher.cancel()
 
-    success = False
-    try:
-        success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity,
-                                            idle_exit=idle_exit, **({"client_owned": True} if client_owned else {})))
-        _exit_diag("asyncio.run.returned", success=success)
-    except KeyboardInterrupt:
-        # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
-        _exit_diag("asyncio.run.KeyboardInterrupt", traceback=_traceback.format_exc())
-        print("\nGateway stopped.")
-        _hard_exit_after_gateway_teardown(0)
-        return  # unreachable in production (os._exit); guard for test stubs
-    except SystemExit as e:
-        _exit_diag("asyncio.run.SystemExit", code=e.code, traceback=_traceback.format_exc())
-        _hard_exit_after_gateway_teardown(0 if e.code is None else e.code if isinstance(e.code, int) else 1)
-    except BaseException as e:
-        # Everything else (CancelledError, exotic BaseExceptions): log the cause, then re-raise.
-        _exit_diag("asyncio.run.exception", exc_type=type(e).__name__, exc_repr=repr(e), traceback=_traceback.format_exc())
-        raise
-    if not success:
-        _exit_diag("gateway.exit_nonzero")
-        _hard_exit_after_gateway_teardown(1)
-    _exit_diag("gateway.exit_clean")
-    _hard_exit_after_gateway_teardown(0)
+    from gateway.run_process_exit import run_gateway_process
+    from hermes_cli.gateway_process_exit import make_gateway_process_exit_hook
+    asyncio.run(run_gateway_process(
+        start_gateway, replace=replace, force=force, verbosity=verbosity, idle_exit=idle_exit,
+        before_exit=make_gateway_process_exit_hook(_exit_diag),
+        **({"client_owned": True} if client_owned else {}),
+    ))
 
 
 # =============================================================================

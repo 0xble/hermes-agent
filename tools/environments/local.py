@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping
+from contextvars import ContextVar
 from pathlib import Path
 
 from hermes_constants import get_process_hermes_home
@@ -31,6 +32,22 @@ from tools.environments.local_pythonpath import (
 
 
 _IS_WINDOWS = platform.system() == "Windows"
+_PROCESS_EXIT_CLEANUP = ContextVar("terminal_process_exit_cleanup", default=False)
+
+
+@contextlib.contextmanager
+def process_exit_cleanup():
+    """Skip shared-directory scans only in the process-stop task and its workers.
+
+    Orphan atomic snapshots remain eligible for normal temp-cache housekeeping;
+    ordinary session cleanup still removes them immediately.
+    """
+    token = _PROCESS_EXIT_CLEANUP.set(True)
+    try:
+        yield
+    finally:
+        _PROCESS_EXIT_CLEANUP.reset(token)
+
 
 logger = logging.getLogger(__name__)
 
@@ -1246,7 +1263,7 @@ done
         # See #38249.
         import glob
         try:
-            stale = glob.glob(f"{self._snapshot_path}.tmp.*")
+            stale = [] if _PROCESS_EXIT_CLEANUP.get() else glob.glob(f"{self._snapshot_path}.tmp.*")
         except Exception:
             stale = []
         for f in (self._snapshot_path, self._cwd_file, *stale):
