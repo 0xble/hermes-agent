@@ -2012,14 +2012,15 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
 
 
 def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_armed: bool = False) -> bool:
-    """Chain exhausted (always False). A non-empty chain walked without an armed primary cooldown
-    arms a short one so next turn's restore_primary_runtime stays gated instead of replaying the
-    whole context across every provider again. A rate limit or overload from an active fallback
-    arms nothing shared, so it still gets this short window."""
+    """Always False; briefly cool an exhausted chain if the primary has no cooldown.
+    Gate next-turn restore even when a rate limit or overload came from an active fallback."""
     if agent._fallback_chain and not cooldown_armed:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
         agent._fallback_episode_cooled = True
+    # Exhaustion is not restoration: an active alias still owns its silent provenance.
+    if not getattr(agent, "_provider_fallback_active", False):
+        agent._provider_fallback_silent_retry = False
     return False
 
 
@@ -2062,13 +2063,12 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
-    # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
-    # See #22548, #62984, #70893.
+    # Skip same-label entries on the failed backend; different labels retain their bounded retry.
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
     fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
-    # Distinct labels can be a useful bounded retry of one route after a transient 5xx.
+    # This preserves alias retry eligibility for all existing failover reasons, not only 5xx.
     # Keep earlier unavailability/connection-domain skips authoritative.
     if should_skip_candidate(fb_ident, current_ident) and fb_provider == current_ident.provider:
         logger.warning(

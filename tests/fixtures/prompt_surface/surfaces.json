@@ -5,7 +5,7 @@
       "stable": 1829,
       "volatile": 1528
     },
-    "tool_tokens": 15132,
+    "tool_tokens": 15445,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -54,7 +54,7 @@
       "stable": 1225,
       "volatile": 1529
     },
-    "tool_tokens": 15132,
+    "tool_tokens": 15445,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -103,7 +103,7 @@
       "stable": 1646,
       "volatile": 1527
     },
-    "tool_tokens": 15132,
+    "tool_tokens": 15445,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -152,7 +152,7 @@
       "stable": 2392,
       "volatile": 1525
     },
-    "tool_tokens": 15288,
+    "tool_tokens": 15600,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -201,7 +201,7 @@
       "stable": 1225,
       "volatile": 1528
     },
-    "tool_tokens": 15132,
+    "tool_tokens": 15445,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -250,7 +250,7 @@
       "stable": 1211,
       "volatile": 1529
     },
-    "tool_tokens": 15132,
+    "tool_tokens": 15445,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -299,7 +299,7 @@
       "stable": 1473,
       "volatile": 1530
     },
-    "tool_tokens": 15404,
+    "tool_tokens": 15717,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -348,7 +348,7 @@
       "stable": 1244,
       "volatile": 1530
     },
-    "tool_tokens": 15569,
+    "tool_tokens": 15882,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -395,10 +395,10 @@
   "telegram.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1313,
+      "stable": 1334,
       "volatile": 1530
     },
-    "tool_tokens": 15607,
+    "tool_tokens": 15920,
     "tools": [
       "browser_back",
       "browser_cdp",

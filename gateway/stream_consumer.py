@@ -187,11 +187,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._final_is_silence_marker = False
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
-        # Copy blocks are delivered as separate messages after the turn, so they never
-        # enter the stream buffers; every preview, split, and fallback send inherits that.
+        # Plain-copy adapters also render literal inline quotes; retain their markers
+        # until formatting, while other surfaces keep their existing inline bodies.
         # One filter per turn: a block or fence may span a segment break, and a held
         # partial marker line carries into the next segment instead of being flushed.
-        self._copy_filter = CopyMarkerStreamFilter(drop_bodies=adapter_sends_copy_blocks(adapter))
+        self._copy_filter = CopyMarkerStreamFilter(keep_markers=adapter_sends_copy_blocks(adapter))
         self._before_finalize_notified = False
         self._reset_message_state()
 
@@ -371,7 +371,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         must not confirm delivery).  True: recorded payload (or an earlier segment /
         commentary) matches.  False: payload differs, or payload-less split.  None: nothing
         recorded on a legacy/ambiguous path (caller trusts flags)."""
-        final_text = copy_free_text_for(self.adapter, final_text or "")  # buffers never hold copy blocks
+        final_text = copy_free_text_for(self.adapter, final_text or "")
         target = self._display_payload(self._with_cumulative_prefix(final_text))
         if not target:
             return None
@@ -973,7 +973,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             if self._fallback_final_send or not ok:
                 break  # keep the full text intact for the fallback final send
             await self._journal_split_delivery(self._preview_message_ids | {self._message_id})
-            self._accumulated = self._accumulated[split_at:].lstrip("\n")
+            from gateway.copy_blocks import copy_quote_continuation
+            self._accumulated = copy_quote_continuation(chunk) + self._accumulated[split_at:].lstrip("\n")
             self._message_id = None
             self._last_sent_text = ""
             await self._enter_split_delivery()
@@ -1137,4 +1138,6 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         shows as ``!alt`` plus an unfurl (#141806). The tag is removed without trimming the text
         around it, so interim frames stay prefix-stable.
         """
-        return strip_image_tags_for_display(_BasePlatformAdapter.strip_media_directives_for_display(text))
+        from gateway.copy_blocks import map_outside_copy_blocks
+        return strip_image_tags_for_display(map_outside_copy_blocks(
+            text, _BasePlatformAdapter.strip_media_directives_for_display, keep_markers=True))

@@ -189,7 +189,8 @@ checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
 
-Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
+Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`, `fork-ci`.
+The `fork-ci` identity owns the subagent process handoff test synchronization below.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
 
@@ -315,6 +316,23 @@ cannot broadcast the half-written start as a separate transition. The runtime al
 zombie launchers as dead in `tools/bot_desktop/runtime.py::_pid_alive`, so this is test-only
 synchronization, not a production liveness correction. Retire when the watcher exposes an owned
 synchronous poll/flush boundary or upstream makes this test isolation unnecessary.
+
+## Subagent process handoff preconditions
+
+The `fork-ci` identity covers `tests/tools/test_subagent_process_handoff.py`. Its
+handed-off child ran `sleep 0.4` and its sibling and foreign processes ran fixed
+sleeps, while the test enabled notification and spawned the sibling before calling
+handoff. Under hosted load the handed child exited first, and the unchanged handler
+correctly refused it as already exited, so the test read `status` from an error-only
+result (hosted job 127391871875). Controlled scheduling of the unchanged test
+reproduced that `KeyError`. Each real process now waits on a test-owned release
+file until its ownership and notification preconditions exist. The handed process
+is released only after handoff, and the test waits on completion publication
+without consuming the parent's notification. Real subprocesses, parent delivery,
+orphan accounting and exited, foreign and non-child refusals remain asserted.
+Product code is unchanged. Retire when upstream synchronizes these preconditions.
+
+Contract tests: `tests/tools/test_subagent_process_handoff.py`.
 
 ## Update pause consumer publish race
 

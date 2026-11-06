@@ -581,16 +581,20 @@ def test_browser_exec_points_at_vision_analyze_only_when_the_session_has_it(monk
         assert "Never type a password, card number, CVC or code" not in rendered["browser_type"]
         assert "mailbox, or phone" in rendered["browser_vault"]
         assert "Never type, ask for or repeat a password" not in rendered["browser_vault"]
-        assert "card numbers and CVCs" in rendered["browser_vault"]
-        assert "Card numbers and CVCs remain vault-only" in rendered["browser_type"]
-        assert "code copied from the page or supplied in chat" in rendered["browser_type"]
+        assert (
+            "card number, expiry, and cvc read live from the routed 1password credit card item "
+            "may be typed on the verified merchant origin for the approved exact charge "
+            "only after no_payment_fields, a partial fill, missed fields, or a processor frame."
+        ) in rendered["browser_vault"].lower()
+        assert "1Password Credit Card item may be typed" in rendered["browser_type"]
+        assert "Values from the page or chat" in rendered["browser_type"]
         vault = rendered["browser_vault"]
         assert "1Password passkey through the canonical-origin browser/system prompt" in vault
         assert "issuer's web/desktop approval" in vault
         assert "Never use iPhone Mirroring" in vault
         assert "Hand off phone-only approvals, passkeys not in 1Password" in vault
-        assert "Never type a value shown on the page or supplied in chat" in vault
-        assert "numbers and CVCs in vault fills" in vault
+        assert "Values from the page or chat are not authorized sources" in vault
+        assert "approved exact charge" in vault
 
 
 def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path):
