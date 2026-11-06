@@ -404,6 +404,76 @@ class HermesProviderMixin:
             _metadata_issuer(self.context), str(meta.token_endpoint), resource, owner_grant,
         )
 
+    async def _hermes_read_public_prm(self, url, policy, metadata):
+        """Independent content-free discovery; definitive absence is distinct from any failure."""
+        from tools.mcp_oauth import OAuthNonInteractiveError
+        from tools.mcp_tool import sdk_httpx
+        from tools.mcp_tool_transport import _mcp_http_transport_kwargs
+        from mcp.client.auth.utils import create_oauth_metadata_request, handle_protected_resource_response
+        http = sdk_httpx()
+        transport = _mcp_http_transport_kwargs(http, str(url),
+            policy.get('ssl_verify', True), policy.get('client_cert'))
+        async with http.AsyncClient(timeout=10, follow_redirects=False, **transport) as client:
+            response = await client.send(stamp_default_user_agent(create_oauth_metadata_request(url)),
+                                         follow_redirects=False)
+        if response.status_code in (404, 410):
+            return None
+        if response.status_code != 200:
+            raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is unavailable.')
+        prm = await handle_protected_resource_response(response)
+        if prm is None:
+            raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is invalid.')
+        issuer = str(metadata.issuer).rstrip('/')
+        if issuer not in {str(value).rstrip('/') for value in prm.authorization_servers}:
+            raise OAuthNonInteractiveError('Saved MCP authorization audience has a different issuer.')
+        return prm
+
+    async def _hermes_public_challenge_url(self, configured, policy):
+        """Read new public challenge headers, close the potentially endless SSE body unread."""
+        from tools.mcp_oauth import OAuthNonInteractiveError
+        from tools.mcp_tool import sdk_httpx
+        from tools.mcp_tool_transport import _mcp_http_transport_kwargs
+        from mcp.client.auth.utils import extract_resource_metadata_from_www_auth
+        http = sdk_httpx()
+        transport = _mcp_http_transport_kwargs(http, configured,
+            policy.get('ssl_verify', True), policy.get('client_cert'))
+        async with http.AsyncClient(timeout=10, follow_redirects=False, **transport) as client:
+            challenge = await client.send(stamp_default_user_agent(http.Request('GET', configured)),
+                                          follow_redirects=False, stream=True)
+            try:
+                url = extract_resource_metadata_from_www_auth(challenge)
+            finally:
+                await challenge.aclose()
+        if not url and challenge.status_code not in (200, 401, 403, 404, 405, 410):
+            raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is unavailable.')
+        return url
+
+    async def _hermes_discover_saved_resource(self):
+        """Reconstruct unknown saved authority only from independent, content-free public discovery."""
+        from tools.mcp_oauth import OAuthNonInteractiveError
+        from tools.mcp_tool import LATEST_HANDSHAKE_VERSION
+        from mcp.client.auth.utils import build_protected_resource_metadata_discovery_urls
+        policy = getattr(self, '_hermes_auth_policy', None) or {}
+        configured = self._hermes_configured_server_url
+        metadata = self.context.oauth_metadata
+        if metadata is None:
+            raise OAuthNonInteractiveError('Saved MCP authorization audience is unavailable.')
+        for url in build_protected_resource_metadata_discovery_urls(None, configured):
+            prm = await self._hermes_read_public_prm(url, policy, metadata)
+            if prm is not None:
+                return str(prm.resource)
+        url = await self._hermes_public_challenge_url(configured, policy)
+        if url:
+            prm = await self._hermes_read_public_prm(url, policy, metadata)
+            if prm is not None:
+                return str(prm.resource)
+        # Definitive absence is a legacy policy, never a failed or malformed response.
+        from mcp.client.auth.oauth2 import is_version_at_least
+        from mcp.shared.auth_utils import resource_url_from_server_url
+        version = policy.get('protocol_version', LATEST_HANDSHAKE_VERSION)
+        return (resource_url_from_server_url(configured)
+                if version and is_version_at_least(version, '2025-06-18') else None)
+
     async def _hermes_build_refresh_request(self):
         """Preserve normal SDK selection; reconstruct only private unknown authority.
 
@@ -411,9 +481,7 @@ class HermesProviderMixin:
         Auth-only renewal uses saved or generation-bound normal authority first;
         only its unknown case performs content-free independent discovery.
         """
-        from tools.mcp_oauth import HermesTokenStorage, OAuthNonInteractiveError
-        from mcp.client.auth.utils import (build_protected_resource_metadata_discovery_urls,
-            create_oauth_metadata_request, handle_protected_resource_response)
+        from tools.mcp_oauth import HermesTokenStorage
         storage = self.context.storage
         known, resource = getattr(self, '_hermes_resource_policy', (False, None))
         if isinstance(storage, HermesTokenStorage) and not known:
@@ -432,77 +500,7 @@ class HermesProviderMixin:
             if lookup is not None:
                 known, resource = lookup(storage, self._hermes_configured_server_url)
         if not known:
-            from tools.mcp_tool import sdk_httpx, LATEST_HANDSHAKE_VERSION
-            from tools.mcp_tool_transport import _mcp_http_transport_kwargs
-            http = sdk_httpx()
-            policy = getattr(self, '_hermes_auth_policy', None) or {}
-            configured = self._hermes_configured_server_url
-            metadata = self.context.oauth_metadata
-            if metadata is None:
-                raise OAuthNonInteractiveError('Saved MCP authorization audience is unavailable.')
-            prm = None
-            # No private inputs and no attached auth/headers/cookies/redirects.
-            for url in build_protected_resource_metadata_discovery_urls(None, configured):
-                transport = _mcp_http_transport_kwargs(http, str(url),
-                    policy.get('ssl_verify', True), policy.get('client_cert'))
-                async with http.AsyncClient(timeout=10, follow_redirects=False, **transport) as client:
-                    response = await client.send(stamp_default_user_agent(create_oauth_metadata_request(url)),
-                                                 follow_redirects=False)
-                if response.status_code in (404, 410):continue
-                if response.status_code != 200:
-                    raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is unavailable.')
-                prm = await handle_protected_resource_response(response)
-                if prm is None:
-                    raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is invalid.')
-                issuer = str(metadata.issuer).rstrip('/')
-                if issuer not in {str(value).rstrip('/') for value in prm.authorization_servers}:
-                    raise OAuthNonInteractiveError('Saved MCP authorization audience has a different issuer.')
-                resource = str(prm.resource)
-                break
-            if prm is None:
-                # A cold legacy grant may have been authorized through a
-                # challenge-specific PRM URL absent from every well-known URL.
-                # Obtain a NEW content-free challenge at the configured origin;
-                # never reuse the private handshake/request/headers or its scope.
-                from mcp.client.auth.utils import extract_resource_metadata_from_www_auth
-                transport = _mcp_http_transport_kwargs(http, configured,
-                    policy.get('ssl_verify', True), policy.get('client_cert'))
-                async with http.AsyncClient(timeout=10, follow_redirects=False, **transport) as client:
-                    challenge = await client.send(stamp_default_user_agent(http.Request('GET', configured)),
-                                                  follow_redirects=False, stream=True)
-                    try:
-                        url = extract_resource_metadata_from_www_auth(challenge)
-                    finally:
-                        # A public MCP GET can be an endless SSE response. Only
-                        # headers authorize discovery; never read its body.
-                        await challenge.aclose()
-                if url:
-                    transport = _mcp_http_transport_kwargs(http, url,
-                        policy.get('ssl_verify', True), policy.get('client_cert'))
-                    async with http.AsyncClient(timeout=10, follow_redirects=False, **transport) as client:
-                        response = await client.send(stamp_default_user_agent(create_oauth_metadata_request(url)),
-                                                     follow_redirects=False)
-                    if response.status_code not in (404, 410):
-                        if response.status_code != 200:
-                            raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is unavailable.')
-                        prm = await handle_protected_resource_response(response)
-                        if prm is None:
-                            raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is invalid.')
-                        issuer = str(metadata.issuer).rstrip('/')
-                        if issuer not in {str(value).rstrip('/') for value in prm.authorization_servers}:
-                            raise OAuthNonInteractiveError('Saved MCP authorization audience has a different issuer.')
-                        resource = str(prm.resource)
-                elif challenge.status_code not in (200, 401, 403, 404, 405, 410):
-                    raise OAuthNonInteractiveError('Saved MCP authorization audience discovery is unavailable.')
-            if prm is None:
-                # Definitive absence is a legacy policy, unlike a failed or
-                # malformed discovery response. Modern configured policy uses
-                # the canonical resource; old configured policy sends none.
-                from mcp.client.auth.oauth2 import is_version_at_least
-                from mcp.shared.auth_utils import resource_url_from_server_url
-                version = policy.get('protocol_version', LATEST_HANDSHAKE_VERSION)
-                resource = (resource_url_from_server_url(configured)
-                            if version and is_version_at_least(version, '2025-06-18') else None)
+            resource = await self._hermes_discover_saved_resource()
         self._hermes_set_resource_policy(resource)
         # A known resource-free grant must not acquire a resource just because
         # a later MCP request negotiates a newer protocol version.

@@ -12,8 +12,12 @@ from agent.incognito import incognito_scope
 from tools.mcp_tool import MCPServerTask
 from tools.mcp_tool_callback_context import private_rpc_transport
 from tools.mcp_oauth import _read_json, _write_json
-from tests.tools.mcp_private_native_http import native_http, PRIVATE, NORMAL, URL, ISSUER
-from tests.tools.test_mcp_private_compatibility import compat_http, expire, poison_private_provider
+from tests.tools.mcp_private_native_http import native_http as _registered_native_http, PRIVATE, NORMAL, URL, ISSUER
+
+native_http = _registered_native_http
+from tests.tools.test_mcp_private_compatibility import compat_http as _registered_compat_http, expire, poison_private_provider
+
+compat_http = _registered_compat_http
 from tests.tools.test_mcp_private_oauth_transport import config, read
 
 

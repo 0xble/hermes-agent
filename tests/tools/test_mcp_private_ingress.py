@@ -11,7 +11,9 @@ import pytest
 
 from agent.incognito import incognito_scope, install_logging_filter
 from tools import mcp_tool_handlers as handlers
-from tests.agent.test_auxiliary_private_boundaries import owned  # real offline SDK fixture
+from tests.agent.test_auxiliary_private_boundaries import owned as _registered_owned
+
+owned = _registered_owned  # real offline SDK fixture
 
 PRIVATE = 'SYNTHETIC_PRIVATE_INGRESS_8337'
 NORMAL = 'synthetic-normal-idle-ingress'
@@ -37,7 +39,9 @@ def disk_sink(tmp_path):
         root.setLevel(previous)
 
 
-from tests.tools.mcp_private_wire import offline_mcp
+from tests.tools.mcp_private_wire import offline_mcp as _registered_offline_mcp
+
+offline_mcp = _registered_offline_mcp
 
 def read_handler(server):
     return handlers._make_read_resource_handler(server.name, 10)

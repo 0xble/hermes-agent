@@ -16,7 +16,9 @@ from tools import mcp_tool as core
 from tools.mcp_tool import MCPServerTask
 from tools.mcp_tool_handlers import _make_tool_handler
 from tools.mcp_tool_scope import _server_key
-from tests.tools.mcp_private_native_http import native_http, PRIVATE, NORMAL, snapshot
+from tests.tools.mcp_private_native_http import native_http as _registered_native_http, PRIVATE, NORMAL, snapshot
+
+native_http = _registered_native_http
 
 
 @pytest.fixture

@@ -9,7 +9,11 @@ from tools import mcp_tool as core
 from tools.mcp_tool import MCPServerTask
 from tools.mcp_tool_callback_context import private_rpc_transport
 from tools.mcp_tool_scope import _server_key
-from tests.tools.test_mcp_private_compatibility import compat_http, native_http, expire
+from tests.tools.test_mcp_private_compatibility import compat_http as _registered_compat_http, native_http as _registered_native_http, expire
+
+native_http = _registered_native_http
+
+compat_http = _registered_compat_http
 from tests.tools.test_mcp_private_oauth_transport import config, read
 from tests.tools.mcp_private_native_http import PRIVATE, NORMAL
 

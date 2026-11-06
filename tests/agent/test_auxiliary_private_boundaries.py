@@ -24,7 +24,9 @@ from agent import auxiliary_client as aux
 from agent.incognito import incognito_scope, is_incognito, register_session, set_private_route
 from tools import mcp_tool_handlers as handlers, mcp_tool_events as events
 from tools.mcp_tool import MCPServerTask
-from tests.tools.mcp_private_wire import offline_mcp
+from tests.tools.mcp_private_wire import offline_mcp as _registered_offline_mcp
+
+offline_mcp = _registered_offline_mcp
 from tools.mcp_tool_sampling import SamplingHandler
 
 SECRET = 'SYNTHETIC_PRIVATE_PAYLOAD_6732'

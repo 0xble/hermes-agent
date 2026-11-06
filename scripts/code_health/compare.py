@@ -35,6 +35,8 @@ move: the origin line survives, so nothing departed.
 
 from __future__ import annotations
 
+import ast
+from scripts.code_health import py_structure
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -413,6 +415,84 @@ def _spend_departures(head: dict[str, FileMeasure], splits: dict[str, Split],
             splits[path][hit] = (old, remaining)
 
 
+def _extraction_lines(bf: FileMeasure, origin: Unit, hf: FileMeasure,
+                      helper: Unit) -> dict[int, int]:
+    old_span, new_span = _span(origin), _span(helper)
+    if old_span is None or new_span is None:
+        return {}
+    old = [bf.code_line(n) for n in old_span]
+    new = [hf.code_line(n) for n in new_span]
+    return {old_span[b.a + i]: new_span[b.b + i]
+            for b in SequenceMatcher(None, old, new, autojunk=False).get_matching_blocks()
+            for i in range(b.size)}
+
+
+def _transfer_extracted_hits(path: str, bf: FileMeasure, hf: FileMeasure,
+                             origin: Unit, helper: Unit, block: ast.Try,
+                             splits: dict[str, Split], owned: dict[str, Counter[Hit]]) -> None:
+    mapping = _extraction_lines(bf, origin, hf, helper)
+    # All code lines of this try must survive at their relative offsets, not a relocated handler.
+    lines = [n for n in range(block.lineno, (block.end_lineno or block.lineno) + 1) if bf.code_line(n)]
+    if not lines or any(n not in mapping for n in lines):
+        return
+    if len({mapping[n] - n for n in lines}) != 1:
+        return
+    for hit, occurrences in bf.hit_lines.items():
+        if hit.scope != origin.qualname or hit.rule not in {"BLE001", "S110"}:
+            continue
+        target = Hit(hit.rule, helper.qualname, hit.text)
+        old_credit = Hit(hit.rule, origin.qualname, hit.text)
+        old, fresh = splits[path].get(target, ([], []))
+        for line in occurrences:
+            mapped = mapping.get(line) if line in lines else None
+            if mapped not in old + fresh or owned[path][old_credit] <= 0:
+                continue
+            owned[path][old_credit] -= 1
+            owned[path][target] += 1
+            if mapped in fresh:
+                fresh.remove(mapped)
+                old.append(mapped)
+            old.sort()
+
+
+def _spend_extractions(base: dict[str, FileMeasure], head: dict[str, FileMeasure],
+                       base_of: dict[str, str | None], match: dict[Key, tuple[str, Unit]],
+                       splits: dict[str, Split], owned: dict[str, Counter[Hit]]) -> None:
+    """One unchanged exception block may follow a new helper behind its matched forwarding wrapper.
+
+    No numeric caps move. Copies, ambiguous arrivals, changed try/handler bodies and unrelated
+    delete/re-adds cannot spend this credit. Scope and surviving-line evidence are both required.
+    """
+    for path, hf in head.items():
+        bpath = base_of.get(path, path)
+        bf = base.get(bpath) if bpath else None
+        if bf is None or not hf.hit_lines or not bf.hit_lines:
+            continue
+        old_nodes, new_nodes = py_structure.extraction_functions(bf), py_structure.extraction_functions(hf)
+        blocks = {q: py_structure.exception_blocks(n) for q, n in new_nodes.items()}
+        for wrapper, node in new_nodes.items():
+            matched = match.get((path, wrapper))
+            if matched is None or matched[0] != bf.path or matched[1].qualname != wrapper:
+                continue
+            forwarded = py_structure.forwarded_helpers(node, wrapper, new_nodes, head, path)
+            origin = matched[1]
+            if (not forwarded or wrapper not in old_nodes
+                    or sum(_base_name(q) == _base_name(wrapper) for q in old_nodes) != 1):
+                continue
+            for fingerprint, previous in py_structure.exception_blocks(old_nodes[wrapper]).items():
+                arrivals = [(q, block) for q, found in blocks.items() for block in found.get(fingerprint, [])]
+                if len(previous) != 1 or len(arrivals) != 1:
+                    continue
+                helper, _ = arrivals[0]
+                if helper not in forwarded or helper in old_nodes or (path, helper) in match:
+                    continue
+                if not py_structure.extracted_body_survives(old_nodes[wrapper], new_nodes[helper]):
+                    continue
+                if (_similarity(_code(bf, origin), _code(hf, hf.units[helper])) or 0) < SIMILAR:
+                    continue
+                _transfer_extracted_hits(path, bf, hf, origin, hf.units[helper], previous[0], splits, owned)
+
+
 def compare(base: dict[str, FileMeasure], head: dict[str, FileMeasure],
             changes: list[Change]) -> list[Finding]:
     base_of = {c.new: c.old for c in changes if c.new}
@@ -431,6 +511,7 @@ def compare(base: dict[str, FileMeasure], head: dict[str, FileMeasure],
             survived[bpath] = survived_lines
         unchanged = {qual for hpath, qual in matcher.same_body if hpath == path}
         splits[path] = _split_hits(hf, kept | moved_kept.get(path, set()), unchanged)
+    _spend_extractions(base, head, base_of, match, splits, owned)
     _spend_departures(head, splits, base_of, _Departures(base, survived), owner_of, owned)
     findings: list[Finding] = []
     for path in sorted(head):

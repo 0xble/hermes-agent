@@ -106,6 +106,198 @@ def _executable_lines(text: str, tree: ast.Module) -> list[str]:
     return "".join("".join(row) for row in rows).splitlines()
 
 
+def _body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
+    """Executable statements, excluding a leading docstring."""
+    return [s for s in node.body if not (isinstance(s, ast.Expr)
+            and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str))]
+
+
+def _self_attr(node: ast.AST | None) -> str | None:
+    return node.attr if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                         and node.value.id == "self") else None
+
+
+def _publisher(method: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, str] | None:
+    """Exact object assignment followed by the paired readiness signal, not a name convention."""
+    body = _body(method)
+    args = method.args.args
+    if (len(args) != 2 or len(body) != 2 or method.decorator_list
+            or not isinstance(method, ast.FunctionDef)):
+        return None
+    if (args[0].arg != "self" or method.args.defaults or method.args.posonlyargs
+            or method.args.kwonlyargs or method.args.vararg or method.args.kwarg):
+        return None
+    assign, signal = body
+    if not (isinstance(assign, ast.Assign) and len(assign.targets) == 1
+            and isinstance(assign.value, ast.Name) and assign.value.id == args[1].arg
+            and isinstance(signal, ast.Expr) and isinstance(signal.value, ast.Call)):
+        return None
+    field = _self_attr(assign.targets[0])
+    call = signal.value
+    if not (isinstance(call.func, ast.Attribute) and call.func.attr == "set"
+            and not call.args and not call.keywords):
+        return None
+    event = _self_attr(call.func.value)
+    return (field, event) if field and event and field != event else None
+
+
+def _waits_and_raises(wait: ast.AST, check: ast.AST, field: str, event: str) -> bool:
+    if not (isinstance(wait, ast.Try) and len(wait.body) == 1 and not wait.orelse and not wait.finalbody
+            and all(h.body and isinstance(h.body[-1], ast.Raise) and h.body[-1].exc is None
+                    for h in wait.handlers)):
+        return False
+    statement = wait.body[0]
+    if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Await)
+            and isinstance(statement.value.value, ast.Call)):
+        return False
+    call = statement.value.value
+    if not (isinstance(call.func, ast.Attribute) and call.func.attr == "wait"
+            and _self_attr(call.func.value) == event and not call.args and not call.keywords):
+        return False
+    return (isinstance(check, ast.If) and _self_attr(check.test) == field and not check.orelse
+            and len(check.body) == 1 and isinstance(check.body[0], ast.Raise)
+            and _self_attr(check.body[0].exc) == field and check.body[0].cause is None)
+
+
+def _coroutine(method: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    return py_structure.execution_kind(method) == 'async'
+
+
+def _starts_owner(method: ast.FunctionDef | ast.AsyncFunctionDef, producer: str, field: str, event: str) -> bool:
+    if not _coroutine(method):
+        return False
+    if any(isinstance(n, ast.Name) and n.id == "asyncio" and isinstance(n.ctx, (ast.Store, ast.Del))
+           or isinstance(n, ast.arg) and n.arg == "asyncio"
+           for n in py_structure._own_scope(method)):
+        return False
+    body = _body(method)
+    for index, statement in enumerate(body[:-2]):
+        # Only a straight-line setup can establish the owner's reachable suffix.
+        # Nested defs/lambdas cannot make a return/yield in this scope disappear.
+        if any(not isinstance(s, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign, ast.Expr))
+               or any(isinstance(n, (ast.Return, ast.Raise, ast.Yield, ast.YieldFrom, ast.NamedExpr))
+                      for n in py_structure._own_scope(s)) for s in body[:index]):
+            continue
+        if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                and _self_attr(statement.targets[0]) and isinstance(statement.value, ast.Call)):
+            continue
+        call = statement.value
+        if not (isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "asyncio" and call.func.attr == "create_task" and len(call.args) == 1):
+            continue
+        task = call.args[0]
+        if isinstance(task, ast.Call) and _self_attr(task.func) == producer:
+            if _waits_and_raises(body[index + 1], body[index + 2], field, event):
+                return True
+    return False
+
+
+def _forwarded_pair(handler: ast.ExceptHandler, publishers: dict[str, tuple[str, str]]) -> tuple[str, str] | None:
+    if not handler.name or len(handler.body) != 1 or not isinstance(handler.body[0], ast.Expr):
+        return None
+    call = handler.body[0].value
+    if not (isinstance(call, ast.Call) and len(call.args) == 1 and not call.keywords
+            and isinstance(call.args[0], ast.Name) and call.args[0].id == handler.name):
+        return None
+    return publishers.get(_self_attr(call.func) or "")
+
+
+def _post_handler(producer: ast.AST, handler: ast.ExceptHandler) -> list[ast.stmt] | None:
+    """Reachable continuation, or no proof when an enclosing loop can re-enter code.
+
+    A branch's return ends fallthrough into its enclosing siblings, but cannot skip a
+    finally. Loops also revisit earlier statements and may execute an else suite; a
+    forward suffix alone cannot prove delivery there. Unrelated branches stay excluded.
+    """
+    parents = {}
+    for parent in [producer, *py_structure._own_scope(producer)]:
+        if parent is not producer and isinstance(parent, py_structure._SCOPES):
+            continue
+        for field, value in ast.iter_fields(parent):
+            if isinstance(value, list):
+                for index, child in enumerate(value):
+                    if isinstance(child, ast.AST):
+                        parents[id(child)] = (parent, field, index, value)
+    statements, fallthrough = [], True
+    child = handler
+    while id(child) in parents:
+        parent, field, index, siblings = parents[id(child)]
+        if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)):
+            return None
+        if field in ('body', 'orelse', 'finalbody') and fallthrough:
+            for statement in siblings[index + 1:]:
+                statements.append(statement)
+                if isinstance(statement, (ast.Return, ast.Raise)):
+                    fallthrough = False
+                    break
+        if isinstance(parent, ast.Try) and field != 'finalbody':
+            statements.extend(parent.finalbody)
+            if any(isinstance(s, (ast.Return, ast.Raise)) for s in parent.finalbody):
+                fallthrough = False
+        child = parent
+    return statements
+
+
+def _field_reset(statements: list[ast.stmt], field: str, event: str, methods: dict,
+                 seen: frozenset[str] = frozenset()) -> bool:
+    """Follow post-catch known mutators. Unknown/deferred/recursive effects fail closed."""
+    nodes = [n for statement in statements
+             for n in [statement, *py_structure._own_scope(statement)]]
+    if any(isinstance(n, ast.Attribute) and isinstance(n.ctx, (ast.Store, ast.Del))
+           and _self_attr(n) in (field, event) for n in nodes):
+        return True
+    for n in nodes:
+        if not isinstance(n, ast.Call):
+            continue
+        if isinstance(n.func, ast.Attribute) and _self_attr(n.func.value) == event:
+            if n.func.attr != 'set':
+                return True
+            continue
+        name = _self_attr(n.func)
+        if name is None:
+            continue
+        helper = methods.get(name)
+        if (helper is None or name in seen or not isinstance(helper, ast.FunctionDef)
+                or helper.decorator_list):
+            return True
+        if _field_reset(_body(helper), field, event, methods, seen | {name}):
+            return True
+    return False
+
+
+def _class_deliveries(cls: ast.ClassDef) -> set[int]:
+    methods = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    unique = {m.name: m for m in methods if sum(x.name == m.name for x in methods) == 1}
+    publishers = {name: pair for name, method in unique.items() if (pair := _publisher(method))}
+    delivered = set()
+    for producer in unique.values():
+        if not _coroutine(producer):
+            continue
+        for handler in (n for n in py_structure._own_scope(producer) if isinstance(n, ast.ExceptHandler)):
+            pair = _forwarded_pair(handler, publishers)
+            continuation = _post_handler(producer, handler)
+            if pair and continuation is not None and not _field_reset(continuation, *pair, unique):
+                if any(_starts_owner(reader, producer.name, *pair) for reader in unique.values()):
+                    delivered.add(handler.lineno)
+    return delivered
+
+
+def _delivered_handlers(tree: ast.Module) -> set[int]:
+    """Prove a same-object field/event handoff to its actual awaiting, re-raising owner.
+
+    Unknown/replacement publishers, unpaired signals and disconnected readers remain findings.
+    No runtime names or source paths participate in this structural proof.
+    """
+    imported = any(isinstance(n, ast.Import) and any(a.name == "asyncio" and not a.asname for a in n.names)
+                   for n in tree.body)
+    if not imported or any(isinstance(n, ast.Name) and n.id == "asyncio"
+                           and isinstance(n.ctx, (ast.Store, ast.Del))
+                           for n in py_structure._own_scope(tree)):
+        return set()
+    return {line for cls in ast.walk(tree) if isinstance(cls, ast.ClassDef)
+            for line in _class_deliveries(cls)}
+
+
 class Measurer:
     def __init__(self, repo: Path, ruff: list[str], known_env: set[str]) -> None:
         self.repo = repo
@@ -156,11 +348,14 @@ class Measurer:
             fm.error = f"does not parse: {exc.msg} (line {exc.lineno})"
             return
         scopes = py_structure.measure_structure(fm, tree)
+        delivered = _delivered_handlers(tree)
         if ruff_file is None or ruff_file.errors:
             fm.error = "ruff could not measure it: " + "; ".join((ruff_file.errors if ruff_file else ["no result"])[:3])
         else:
             _own_complexity(fm, ruff_file.cc_by_line)
             for code, row in ruff_file.hits:
+                if code == "BLE001" and row in delivered:
+                    continue
                 if code in RULES_BY_ID and rule_applies(RULES_BY_ID[code], fm.path):
                     fm.add_hit(code, scopes.scope(row), row)
         for rule_id, checker in py_rules.CHECKERS.items():

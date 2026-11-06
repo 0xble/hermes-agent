@@ -11,8 +11,12 @@ import pytest
 from agent.incognito import incognito_scope, is_incognito
 from tools.mcp_oauth import _read_json, _write_json
 from tools.mcp_tool import MCPServerTask
-from tests.tools.mcp_private_native_http import native_http, PRIVATE, NORMAL, URL, ISSUER
-from tests.tools.test_mcp_private_compatibility import compat_http, expire, poison_private_provider
+from tests.tools.mcp_private_native_http import native_http as _registered_native_http, PRIVATE, NORMAL, URL, ISSUER
+
+native_http = _registered_native_http
+from tests.tools.test_mcp_private_compatibility import compat_http as _registered_compat_http, expire, poison_private_provider
+
+compat_http = _registered_compat_http
 from tests.tools.test_mcp_oauth_audience_lifecycle import provider, restart, private_read, lineage
 from tests.tools.test_mcp_private_oauth_transport import config, read
 
@@ -192,38 +196,81 @@ def test_stale_or_mismatched_normal_owner_cannot_supply_private_authority(compat
             # All public discovery is independently unavailable, making accidental
             # adoption of the normal provider's stale parent observable at /token.
             f.auth_state.update(available=False, wellknown=503)
-            if fault == 'home':p.context.storage._hermes_home = f.home / 'other-home'
-            elif fault == 'server':p._hermes_configured_server_url = ISSUER + '/other'
-            elif fault == 'issuer':p.context.oauth_metadata = p.context.oauth_metadata.model_copy(update={'issuer': 'https://foreign.synthetic.invalid/'})
-            elif fault == 'client':p.context.client_info = p.context.client_info.model_copy(update={'client_id': 'other-client'})
-            elif fault == 'registration':p.context.client_info = p.context.client_info.model_copy(update={'client_secret': 'other-registration'})
-            elif fault == 'grant':p.context.current_tokens = p.context.current_tokens.model_copy(update={'refresh_token': 'other-grant'})
-            elif fault == 'resource':p.context.protected_resource_metadata = p.context.protected_resource_metadata.model_copy(update={'resource': ISSUER + '/other'})
-            elif fault == 'policy':p._hermes_resource_policy = (True, ISSUER + '/other')
-            elif fault == 'evicted':assert f.manager.evict(server.name)
-            elif fault in ('reloaded-grant', 'disk-grant'):
+            async def fault_home():
+                p.context.storage._hermes_home = f.home / 'other-home'
+
+            async def fault_server():
+                p._hermes_configured_server_url = ISSUER + '/other'
+
+            async def fault_issuer():
+                p.context.oauth_metadata = p.context.oauth_metadata.model_copy(update={'issuer': 'https://foreign.synthetic.invalid/'})
+
+            async def fault_client():
+                p.context.client_info = p.context.client_info.model_copy(update={'client_id': 'other-client'})
+
+            async def fault_registration():
+                p.context.client_info = p.context.client_info.model_copy(update={'client_secret': 'other-registration'})
+
+            async def fault_grant():
+                p.context.current_tokens = p.context.current_tokens.model_copy(update={'refresh_token': 'other-grant'})
+
+            async def fault_resource():
+                p.context.protected_resource_metadata = p.context.protected_resource_metadata.model_copy(update={'resource': ISSUER + '/other'})
+
+            async def fault_policy():
+                p._hermes_resource_policy = (True, ISSUER + '/other')
+
+            async def fault_evicted():
+                assert f.manager.evict(server.name)
+
+            async def fault_reloaded_grant():
                 path = p.context.storage._tokens_path()
                 raw = _read_json(path)
                 raw['refresh_token'] = 'independently-replaced-grant'
                 _write_json(path, raw)
                 if fault == 'reloaded-grant':await p._initialize()
-            elif fault == 'endpoint':p.context.oauth_metadata = p.context.oauth_metadata.model_copy(update={'token_endpoint': ISSUER + '/other-token'})
-            elif fault == 'disk-resource':
+
+            async def fault_endpoint():
+                p.context.oauth_metadata = p.context.oauth_metadata.model_copy(update={'token_endpoint': ISSUER + '/other-token'})
+
+            async def fault_disk_resource():
                 path = p.context.storage._meta_path()
                 raw = _read_json(path)
                 raw['hermes_resource'] = 'https://foreign.synthetic.invalid/'
                 _write_json(path, raw)
-            elif fault == 'disk-registration':
+
+            async def fault_disk_registration():
                 path = p.context.storage._client_info_path()
                 raw = _read_json(path)
                 raw['client_secret'] = 'independently-replaced-registration'
                 raw['token_endpoint_auth_method'] = 'client_secret_post'
                 _write_json(path, raw)
-            elif fault in ('disk-issuer', 'disk-endpoint'):
+
+            async def fault_disk_issuer():
                 path = p.context.storage._meta_path()
                 raw = _read_json(path)
                 raw['issuer' if fault == 'disk-issuer' else 'token_endpoint'] = 'https://foreign.synthetic.invalid/'
                 _write_json(path, raw)
+
+            faults = {
+                'home': fault_home,
+                'server': fault_server,
+                'issuer': fault_issuer,
+                'client': fault_client,
+                'registration': fault_registration,
+                'grant': fault_grant,
+                'resource': fault_resource,
+                'policy': fault_policy,
+                'evicted': fault_evicted,
+                'reloaded-grant': fault_reloaded_grant,
+                'disk-grant': fault_reloaded_grant,
+                'endpoint': fault_endpoint,
+                'disk-resource': fault_disk_resource,
+                'disk-registration': fault_disk_registration,
+                'disk-issuer': fault_disk_issuer,
+                'disk-endpoint': fault_disk_issuer,
+            }
+            await faults[fault]()
             poison_private_provider(f, monkeypatch)
             before = f.snapshot()
             try:result = await private_read(server)
