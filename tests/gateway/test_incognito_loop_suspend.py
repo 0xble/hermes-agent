@@ -15,9 +15,11 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli import loops
 from tests.gateway import test_incognito_turn_e2e as e2e
-from tests.gateway.test_loop_command import _make_runner, loop_env
+from tests.gateway import test_loop_command as loop_command
+from tests.gateway.test_loop_command import _make_runner
 
 harness = e2e.harness
+loop_env = loop_command.loop_env
 
 SID, KEY = "sid-gateway-loop", "agent:main:discord:channel:chat-loop"
 
@@ -177,19 +179,19 @@ def hold_loop_boundary(topic, monkeypatch, boundary):
         return await execute(fn, *args, **kwargs)
 
     monkeypatch.setattr(runner, "_run_in_executor_with_context", executor)
-    if boundary == "route":
+    def hold_route():
         async def route(*_args):
             await hold()
             return True
         monkeypatch.setattr("gateway.wake.automatic_route_available", route)
-    elif boundary == "marker":
+    def hold_marker():
         original = runner._stale_resume_pending_marker
 
         async def marker(*args):
             await hold()
             return await original(*args)
         monkeypatch.setattr(runner, "_stale_resume_pending_marker", marker)
-    elif boundary in {"dispatch", "settlement"}:
+    def hold_dispatch():
         accept = topic.adapter.handle_message
 
         async def dispatch(incoming):
@@ -205,15 +207,22 @@ def hold_loop_boundary(topic, monkeypatch, boundary):
                 gate._claimed_since = lambda *_: True
                 gate.load()
         topic.adapter.handle_message = dispatch
-    elif boundary == "recovery":
+    def prepare_recovery():
         assert loops.LoopManager(entry.session_id).fire_tick()
-    elif boundary == "migration":
+    def hold_migration():
         migrate = runner._migrate_compressed_loop
 
         async def migration(*args):
             await hold()
             await migrate(*args)
         monkeypatch.setattr(runner, "_migrate_compressed_loop", migration)
+    handlers = {
+        "route": hold_route, "marker": hold_marker, "dispatch": hold_dispatch,
+        "settlement": hold_dispatch, "recovery": prepare_recovery, "migration": hold_migration,
+    }
+    handler = handlers.get(boundary)
+    if handler is not None:
+        handler()
     return reached, release
 
 
@@ -372,23 +381,27 @@ async def test_cancelled_loop_keeps_privacy_fenced_until_physical_write_settles(
 @pytest.mark.parametrize("deferral", ["not_due", "route", "owner", "goal", "gate"])
 async def test_unadmitted_loop_scan_returns_its_background_capacity(loop_topic, monkeypatch, deferral):
     topic = loop_topic
-    if deferral == "not_due":
+    def not_due():
         state = loop_state(topic.entry.session_id)
         state.next_due_at = 2e12
         loops.save_loop(topic.entry.session_id, state)
-    elif deferral == "route":
+    def unavailable_route():
         async def unavailable(*_args):
             return False
         monkeypatch.setattr("gateway.wake.automatic_route_available", unavailable)
-    elif deferral == "owner":
+    def busy_owner():
         topic.runner._running_agents[topic.entry.session_key] = object()
-    elif deferral == "goal":
+    def active_goal():
         state = loop_state(topic.entry.session_id)
         state.next_due_at = 1e12 - 1
         loops.save_loop(topic.entry.session_id, state)
         monkeypatch.setattr(loops, "goal_blocks_loop_tick", lambda sid: True)
-    else:
+    def full_gate():
         monkeypatch.setattr(topic.runner, "_reserve_background_turn", lambda *_args: None)
+
+    handlers = {"not_due": not_due, "route": unavailable_route, "owner": busy_owner,
+                "goal": active_goal, "gate": full_gate}
+    handlers[deferral]()
     before = loop_state(topic.entry.session_id).to_json()
     for _scan in range(3):
         await topic.fire()
