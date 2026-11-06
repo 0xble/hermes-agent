@@ -138,6 +138,18 @@ without changing the native browser or its consent surface.
   interactive session); a missing token raises instead of listing empty. Invalid, duplicate,
   or token-sharing entries are skipped. `browser_account` pins fills and one-time codes to a
   task bound to that named Camofox account, checked before any secret is resolved.
+- Login and one-time-code fills tick one visible, enabled "Remember me"-style checkbox
+  (remember me, keep/stay signed in, trust this device/browser, don't ask again) in the
+  filled field's own form or tight container, with a real click, inside the exact-origin
+  assertion, and report `remembered`. Marketing, terms, consent, privacy, cookie and
+  public-computer boxes are never ticked. `vault.remember_logins` (default on) maps browser
+  account aliases to booleans with a `default` key, so an identity can keep logins
+  unremembered. A per-call `remember: false` further opts out; it never overrides an
+  identity opt-out or unchecks an already-checked box. Password and automatic-code
+  writes, including the checkbox click, stay inside the backend's guarded
+  `fill_context` after the exact-origin pre-check and metadata snapshot re-check.
+- Fork patch identity: `vault-remember-logins` (local, no upstream submission).
+- Contract test: `tests/tools/test_browser_vault_remember.py` (real Chromium).
 
 ## Provenance and patches
 
@@ -267,7 +279,8 @@ Contract tests: `tests/tools/test_mcp_trust_approval_scope.py`,
 `tests/agent/test_vault_onepassword_listing_quota.py` (counts `op` calls per list and fill),
 `tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
 first-429 stop and cross-process cooldown),
-`tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and
+`tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`,
+`tests/tools/test_browser_vault_remember.py`, and
 `tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome), and for card consent
 `tests/gateway/test_mcp_consent_scope.py` and `tests/tools/test_mcp_trust_gating.py`. Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.

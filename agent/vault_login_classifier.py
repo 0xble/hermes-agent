@@ -512,7 +512,24 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()"""
 
 
-def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+# "Remember me"-style boxes a login or code fill ticks, matched on normalized label/aria/name text
+# (camelCase split, punctuation to spaces, so "don't" reads "don t"). The decoy pattern wins over a
+# match: a box that also mentions marketing, terms, consent, privacy or a public/shared computer is
+# never ticked.
+_RE_REMEMBER = re.compile(
+    r"\bremember(?:me)?\b|\b(?:keep|stay|remain)\s(?:me\s)?(?:signed|logged)\s?in\b|"
+    r"\btrust\s(?:this\s)?(?:device|browser|computer)\b|"
+    r"\b(?:don\s?t|do\snot)\sask\s(?:me\s)?(?:for\s(?:a\s)?codes?\s)?again\b|\bpersist(?:ent)?\b"
+)
+_RE_REMEMBER_DECOY = re.compile(
+    r"\b(?:newsletters?|marketing|promo\w*|offers?|deals|subscri\w*|updates|news|terms|conditions|"
+    r"consent\w*|privacy|polic\w*|agree\w*|accept\w*|cookies?|email\sme|send\sme|public|shared|"
+    r"notif\w*|forget|not\smy|(?:don\s?t|do\snot|never)\sremember)\b"
+)
+
+
+def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str = "",
+                  remember: bool = False) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -523,6 +540,11 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
     THIS inspection; a ``current-password`` fill additionally requires ``type=password``; ``<select>``
     controls (country, state, expiry month) match an option by value or visible text. No marker is
     left on filled controls so later model-driven DOM reads cannot address them deterministically.
+
+    ``remember`` (login and one-time-code fills only): after setting a valid input, before its input
+    event, tick one visible, enabled "Remember me"-style checkbox in that field's form (or its tight
+    container without a form), with a real click so site scripts register it. The result's
+    ``remembered`` is true when such a box is checked afterwards.
     """
     payload = json.dumps(
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
@@ -532,6 +554,9 @@ def build_fill_js(fills: list[dict[str, Any]], expected_origin: str, nonce: str 
             .replace("__QUERY_ALL__", _QUERY_ALL_JS)
             .replace("__EXCLUDED_PASSWORD__", json.dumps(_RE_EXCLUDED_PASSWORD.pattern))
             .replace("__OTP_PATTERN__", json.dumps(_RE_OTP.pattern))
+            .replace("__REMEMBER__", "true" if remember else "false")
+            .replace("__REMEMBER_PATTERN__", json.dumps(_RE_REMEMBER.pattern))
+            .replace("__REMEMBER_DECOY__", json.dumps(_RE_REMEMBER_DECOY.pattern))
             .replace("__FILLS__", payload))
 
 
@@ -544,7 +569,7 @@ _FILL_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
   __QUERY_ALL__
   const stamped = queryAll("[data-hermes-vault-slot]");
-  let filled = 0;
+  let filled = 0, remembered = false, rememberAttempted = false;
   const selectedOptions = [];
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
@@ -595,14 +620,80 @@ _FILL_JS_TEMPLATE = """(() => {
             tokens.some((t) => ["username", "email", "tel", "new-password", "one-time-code"].includes(t)) ||
             new RegExp(__EXCLUDED_PASSWORD__).test(purpose) || new RegExp(__OTP_PATTERN__).test(purpose)) continue;
       }
+      if (f.token === "one-time-code") {
+        const style = getComputedStyle(el);
+        if (window.location.origin !== expectedOrigin || !el.isConnected || el.matches(":disabled") ||
+            el.readOnly || !["text", "tel", "number", "password"].includes(el.type) ||
+            style.display === "none" || style.visibility === "hidden" || el.getClientRects().length === 0) continue;
+      }
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
+      // Input/change may auto-submit a code: establish persistence before either event.
+      if (__REMEMBER__ && !rememberAttempted && el.value.length && window.location.origin === expectedOrigin) {
+        rememberAttempted = true;
+        try { remembered = tickRemember(el); } catch (e) { remembered = false; }
+      }
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
       if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
   }
   stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled, selectedOptions });
+  return JSON.stringify({ filled, selectedOptions, remembered });
+
+  function tickRemember(field) {
+    const rememberRe = new RegExp(__REMEMBER_PATTERN__), decoyRe = new RegExp(__REMEMBER_DECOY__);
+    const isBox = (n) => (n.tagName === "INPUT" && n.type === "checkbox") || n.getAttribute("role") === "checkbox";
+    // The field's own form, or without one a tight ancestor: never a page-wide search. A form
+    // wrapping a whole page (ASP.NET WebForms) is no tighter than the page, so it falls back too.
+    let boxes = [];
+    if (field.form && field.form.querySelectorAll("input").length <= 12) {
+      boxes = [...Array.from(field.form.elements), ...field.form.querySelectorAll('[role="checkbox"]')];
+    } else {
+      for (let node = field.parentElement, depth = 0; node && depth < 5; node = node.parentElement, depth++) {
+        if (node === document.body || node === document.documentElement || node.querySelectorAll("input").length > 10) break;
+        if (node.querySelector('input[type="checkbox"], [role="checkbox"]')) {
+          boxes = Array.from(node.querySelectorAll('input[type="checkbox"], [role="checkbox"]'));
+          break;
+        }
+      }
+    }
+    const text = (n) => (n && n.textContent) || "";
+    const purpose = (box) => {
+      const parts = [box.getAttribute("aria-label"), box.getAttribute("title"), box.name, box.id];
+      Array.from(box.labels || []).forEach((l) => parts.push(text(l)));
+      (box.getAttribute("aria-labelledby") || "").split(/\\s+/).filter(Boolean)
+        .forEach((id) => parts.push(text(box.getRootNode().getElementById(id))));
+      if (box.getAttribute("role") === "checkbox") parts.push(text(box));
+      const near = text(box.parentElement).trim();
+      if (near.length <= 120) parts.push(near);  // an unlabeled box beside its caption
+      return parts.filter(Boolean).join(" ").replace(/([a-z])([A-Z])/g, "$1 $2").normalize("NFKD")
+        .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    };
+    const shown = (n) => {
+      if (!n || !n.isConnected) return false;
+      const s = getComputedStyle(n);
+      return s.display !== "none" && s.visibility !== "hidden" && n.getClientRects().length > 0;
+    };
+    // Styled checkboxes often hide the native input behind a visible label.
+    const visible = (box) => shown(box) || Array.from(box.labels || []).some(shown);
+    const enabled = (box) => !box.matches(":disabled") && !box.closest('[aria-disabled="true"]');
+    const sameForm = (box) => (box.form || box.closest("form")) === field.form &&
+      (!field.form || field.form.contains(box));
+    const checked = (box) => box.tagName === "INPUT" ? box.checked : box.getAttribute("aria-checked") === "true";
+    const eligible = boxes.filter((box) => isBox(box) && box !== field && sameForm(box) && visible(box) && enabled(box))
+      .filter((box) => { const p = purpose(box); return rememberRe.test(p) && !decoyRe.test(p); });
+    if (eligible.some(checked)) return true;
+    const box = eligible[0];
+    if (!box) return false;
+    box.click();
+    if (!checked(box) && box.tagName === "INPUT") {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked");
+      setter.set.call(box, true);
+      box.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      box.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    return checked(box);
+  }
 })()"""

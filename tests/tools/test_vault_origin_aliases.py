@@ -508,8 +508,11 @@ def test_saved_origin_fill_skips_prompt_and_alias_recheck(monkeypatch):
     _fill_patches(monkeypatch, backend, page_origin="https://gusto.com")
     prompts, loads = [], []
     monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *args: prompts.append(args) or "accept")
-    with patch("hermes_cli.config.load_config_readonly", side_effect=lambda: loads.append(1) or {"vault": {}}):
+    # Persistence has its own config read; isolate it so this still catches alias revalidation.
+    with patch("hermes_cli.config.load_config_readonly", side_effect=lambda: loads.append(1) or {"vault": {}}), \
+         patch.object(vault, "_remember_login", return_value=True) as remember:
         result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="saved-only"))
+    remember.assert_called_once_with("saved-only")
     assert result["success"] is True
     assert prompts == []
     assert len(loads) == 1
