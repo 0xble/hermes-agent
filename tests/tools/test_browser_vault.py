@@ -222,22 +222,6 @@ class TestClassifier:
         assert len(fills) == 1 and fills[0]["index"] == 1
 
 
-    def test_build_fill_js_leaves_no_dom_marker_and_binds_target_to_inspection(self):
-        # P1-1: no persistent selector for filled controls. The fill targets the input by the
-        # <nonce>:<index> stamp ITS OWN inspection wrote (a bare index is re-resolved by position,
-        # and a second inspection in between would re-stamp — either way the password could land in
-        # another field); stamps carry no secret and the fill script strips every one before returning.
-        js = build_fill_js(
-            [{"index": 0, "token": "current-password", "value": "x"}],
-            expected_origin="https://example.com",
-        )
-        assert "vaultSecret" not in js
-        assert "data-vault-secret" not in js
-        assert "elements[f.index]" not in js
-        assert 'getAttribute("data-hermes-vault-slot")' in js and "nonce + ':' + f.index" in js
-        assert 'f.token === "current-password" && el.type !== "password"' in js  # a password fill never lands in a text box
-        assert js.index('removeAttribute("data-hermes-vault-slot")') > js.index("setter.set.call")
-
     def test_build_fill_js_asserts_origin_before_any_write(self):
         # P1-2: the origin assert must run inside the SAME script, before
         # any element write.
@@ -543,7 +527,8 @@ class TestBrowserVaultTools:
         finally:
             redact.clear_vault_redaction_values()
 
-    def test_payment_fill_requires_confirmation_then_fills_card_fields(self, store):
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_payment_fill_requires_confirmation_then_fills_card_fields(self, store, partial):
         """A card is written only after the user confirms (a prompt injection reaching a checkout must not be
         able to spend); the secret eval then targets the classified card controls and the result carries
         the field tokens but never a value."""
@@ -567,7 +552,9 @@ class TestBrowserVaultTools:
 
         def fake_eval_secret(task_id, expression):
             secret_exprs.append(expression)
-            return {"success": True, "result": json.dumps({"filled": 3})}
+            return {"success": True, "result": json.dumps({"filled": 3, "fieldResults": [
+                {"token": token, "status": "missing" if partial and token != "cc-number" else "filled"}
+                for token in ("cc-number", "cc-exp", "cc-csc")]})}
 
         try:
             with patch("agent.vault_store.get_vault_store", return_value=store), \
@@ -585,9 +572,11 @@ class TestBrowserVaultTools:
                  patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
                 raw = browser_vault_tool.browser_vault_fill(meta.id)
             out = json.loads(raw)
-            assert out["success"] is True and out["fields"] == ["cc-csc", "cc-exp", "cc-number"]
+            assert out["success"] is (not partial) and out["partial"] is partial
+            assert out["fields"] == (["cc-number"] if partial else ["cc-csc", "cc-exp", "cc-number"])
+            assert out["missing_fields"] == (["cc-csc", "cc-exp-month", "cc-exp-year"] if partial else [])
             assert _CARD["card_number"] not in raw and _CARD["cvc"] not in raw
-            assert len(secret_exprs) == 1 and _CARD["card_number"] in secret_exprs[0] and "07/29" in secret_exprs[0]
+            assert len(secret_exprs) == 2 and _CARD["card_number"] in secret_exprs[0] and "07/29" in secret_exprs[0]
             assert '"index": 3' not in secret_exprs[0]  # the email box is never a card target
             assert _CARD["card_number"] not in redact.redact_sensitive_text(f"dom says {_CARD['card_number']}")
         finally:

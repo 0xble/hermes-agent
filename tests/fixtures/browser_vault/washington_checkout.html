@@ -1,0 +1,12 @@
+<!doctype html><form>
+<label>Card type<select name=CardType data-test=brand><option value="">Select</option><option value=v>Visa</option><option value=mc>Master Card</option><option value=a>American Express</option></select></label>
+<input name=CardNumber data-test=number><input name=CVVNumber data-test=cvc maxlength=3>
+<select name=ExpirationMonth data-test=month><option value="">Month</option><option value=5>June</option><option value=6>July</option></select>
+<select name=ExpirationYear data-test=year><option value="">Year</option><option value=28>2028</option><option value=29>2029</option></select>
+<input name=BillingAddress data-test=street><input name=ZipCode data-test=postal>
+</form><script>
+// Model the common framework reaction: changing brand clears card text fields.
+document.querySelector('[data-test=brand]').onchange = () => {
+ for (const input of document.querySelectorAll('input')) input.value = '';
+};
+</script>

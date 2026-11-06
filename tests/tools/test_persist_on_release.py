@@ -20,7 +20,14 @@ def _make_session(sid="proc_test123", task_id="t1", persist=False, survive=False
 
 
 @pytest.fixture()
-def registry():
+def registry(monkeypatch, tmp_path):
+    # Lifecycle units need neither the operator's PATH store nor CLI dependency activation.
+    from pm import environments
+    from tools.environments import local
+
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setattr(local, "_resolve_hermes_bin_dir", lambda: None)
+    monkeypatch.setattr(environments, "activate_dependencies", lambda root: None)
     return ProcessRegistry()
 
 
@@ -183,7 +190,7 @@ def test_checkpoint_carries_persist_on_release():
 
 
 @pytest.mark.platforms("posix")
-def test_persist_on_release_local_spawn_is_file_backed_and_readable_after_readoption(tmp_path, monkeypatch):
+def test_persist_on_release_local_spawn_is_file_backed_and_readable_after_readoption(tmp_path, monkeypatch, registry):
     """A persisted job must not write into a pipe owned by the gateway that spawned it:
     once that gateway exits the next write raises BrokenPipeError and the re-adopted job
     dies. Its stdout/stderr go to a file-backed log that a successor can still read."""

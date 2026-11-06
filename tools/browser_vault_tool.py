@@ -222,9 +222,9 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
             if not tab["tab_id"]:
                 return {"success": False, "error_type": "eval_failed", "error": "No browser session. Call browser_navigate first."}
             # Catch page exceptions in-page too: the REST server logs JS error messages.
-            wrapped = "(() => { try { return (" + expression + "); } catch (_) { return {vault_eval_failed:true}; } })()"
+            wrapped = "(async () => { try { return await Promise.resolve(" + expression + ").catch(() => ({vault_eval_failed:true})); } catch (_) { return {vault_eval_failed:true}; } })()"
             response = _post(f"/tabs/{tab['tab_id']}/evaluate", body={
-                "expression": wrapped, "userId": tab["user_id"]}, allow_redirects=False)
+                "expression": wrapped, "userId": tab["user_id"], "secret": True}, allow_redirects=False)
             if (isinstance(response, dict) and "result" in response and not response.get("error")
                     and response.get("result") != {"vault_eval_failed": True}):
                 return {"success": True, "result": response["result"]}
@@ -835,42 +835,67 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                            "error": "Card confirmation was declined or unanswered on this origin. Do not retry; hand card entry to the user."})
 
     # ── Inspect + classify page controls ────────────────────────────────────
+    payment_contexts = []
+    payment_selected = []
+    payment_ambiguous = set()
+    payment_inspection_error = None
+
     def _inspect_page() -> tuple[str, list[ClassifiedLoginControl]] | str:
         """(nonce, classified controls) for a fresh stamped inspection, or a JSON refusal."""
+        nonlocal payment_contexts, payment_inspection_error
         nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-        inspect = _eval_js(browser_key, build_inspection_js(nonce))
-        if not inspect.get("success"):
-            return json.dumps(
-                {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
-            )
+        def inspection_failure():
+            assert meta is not None
+            if meta.kind == "payment":
+                from tools.browser_vault_payment import receipt
+                return json.dumps(receipt(set(), set(), error="Payment input inspection unavailable; rediscover the checkout."))
+            return json.dumps({"success": False, "error": "Page input inspection unavailable."})
+
+        try:
+            inspect = _eval_js(browser_key, build_inspection_js(nonce))
+        except Exception:  # health: allow BLE001 -- page-controlled inspection errors are normalized, never echoed
+            return inspection_failure()
+        if not isinstance(inspect, dict) or not inspect.get("success"):
+            return inspection_failure()
         raw_controls = _parse_json_result(inspect.get("result"))
         if isinstance(raw_controls, str):
             raw_controls = _parse_json_result(raw_controls)
         if not isinstance(raw_controls, list):
-            return json.dumps({"success": False, "error": "Page input inspection returned no usable controls."})
+            return inspection_failure()
 
         classify = classify_login_control if meta.kind == "login" else classify_checkout_control
         classified: list[ClassifiedLoginControl] = []
         for raw in raw_controls:
             if not isinstance(raw, dict):
                 continue
-            control = LoginControl.from_dict(raw)
+            try:
+                control = LoginControl.from_dict(raw)
+            except (ValueError, TypeError, OverflowError):
+                return inspection_failure()
             result = (classify_protected_field_control(control, str(meta.field_token or ""))
                       if meta.kind == "protected_field" else classify(control))
             if result is not None:
                 classified.append(result)
+        if meta.kind == "payment":
+            from tools.browser_vault_payment import inspect_frames, receipt
+            frame_contexts, payment_inspection_error = inspect_frames(browser_key, page_origin)
+            if payment_inspection_error:
+                return json.dumps(receipt(set(), set(), error=payment_inspection_error))
+            payment_contexts = [{"origin": page_origin, "nonce": nonce, "classified": classified,
+                                 "controls": [LoginControl.from_dict(c) for c in raw_controls if isinstance(c, dict)]},
+                                *frame_contexts]
+            classified = [control for context in payment_contexts for control in context["classified"]]
+            if not any(control.token == "cc-number" for control in classified):
+                result = receipt(set(), set(), error=payment_inspection_error or (
+                    "No card number field was found on the current page or authorized processor frames. "
+                    "For the approved exact charge, card number, expiry, and CVC read live from the routed "
+                    "1Password Credit Card item may be typed on the verified merchant origin. Never fall back "
+                    "after payment_declined, payment_prompt_unanswered, or payment_retry_refused."))
+                result["error_type"] = "no_payment_fields"
+                return json.dumps(result)
         if not classified or (meta.kind == "login" and not any(
             control.token == "current-password" for control in classified
-        )) or (meta.kind == "payment" and not any(control.token == "cc-number" for control in classified)):
-            if meta.kind == "payment":
-                # A checkout whose billing-address inputs are on the page but whose card number sits in a
-                # processor frame lands here too: without a card-number target the fill cannot pay.
-                return json.dumps({"success": False, "error_type": "no_payment_fields", "error": (
-                    "No card number field was found on the current page. Card inputs inside a payment "
-                    "processor's embedded frame cannot be filled by the vault. For the approved exact charge, "
-                    "card number, expiry, and CVC read live from the routed 1Password Credit Card item may be "
-                    "typed on the verified merchant origin. Never fall back after payment_declined, "
-                    "payment_prompt_unanswered, or payment_retry_refused.")})
+        )):
             return json.dumps({"success": False, "error": f"No {meta.kind} form fields were found on the current page."})
         return nonce, classified
 
@@ -926,7 +951,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         except UnlockRequired:
             return json.dumps({"success": False, "error_type": "unlock_required",
                                "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
-        if not fills:
+        if meta.kind == "payment":
+            from tools.browser_vault_payment import plan
+            payment_selected, payment_ambiguous = plan(payment_contexts, secret)
+            fills = [field for context in payment_selected for field in context["fills"]]
+        if not fills and meta.kind != "payment":
             return json.dumps(
                 {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
             )
@@ -934,28 +963,13 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         # Register before injection. PAN/CVC remain profile-global exact secrets; short,
         # human-readable card metadata uses the existing tab/origin component registry.
         from agent.redact import (
-            mark_vault_protected_tab, register_vault_card_component,
+            mark_vault_protected_tab,
             register_vault_date_component,
         )
         protected_tab = browser_key if meta.kind in ("payment", "protected_field") else effective_task_id
         if meta.kind == "payment":
-            # A manager can store a formatted PAN; register its canonical digits
-            # too, so the redactor handles whatever separator the page adds/removes.
-            number = secret.get("card_number", "")
-            canonical_number = "".join(ch for ch in number if ch.isascii() and ch.isdigit())
-            if (13 <= len(canonical_number) <= 19
-                    and all((ch.isascii() and ch.isdigit()) or ch.isspace() or ch == "-" for ch in number)):
-                register_vault_redaction_value(canonical_number)
-            for field in ("card_number", "cvc"):
-                register_vault_redaction_value(secret.get(field, ""))
-            for field in ("cardholder_name", "exp_month", "exp_year", "billing_postal_code"):
-                value = secret.get(field, "")
-                register_vault_card_component(field, value, tab=protected_tab, origin=page_origin)
-                if field == "exp_month" and value.isdigit():
-                    for variant in (str(int(value)), f"{int(value):02d}"):
-                        register_vault_card_component(field, variant, tab=protected_tab, origin=page_origin)
-                if field == "exp_year" and value.isdigit() and len(value) == 4:
-                    register_vault_card_component(field, value[-2:], tab=protected_tab, origin=page_origin)
+            from tools.browser_vault_payment import register_redaction
+            register_redaction(secret, protected_tab, page_origin, register_vault_redaction_value)
         else:
             for value in (secret.values() if meta.kind == "protected_field" else [secret.get("password", "")]):
                 register_vault_redaction_value(value)
@@ -981,6 +995,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         if alias_only and (refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin)):
             _discard_fill_metadata()
             return refusal
+        if meta.kind == "payment":
+            from tools.browser_vault_payment import fill
+            result = fill(browser_key, page_origin, payment_selected, payment_ambiguous, _eval_js_secret,
+                          payment_inspection_error)
+            result.update({"backend": backend.name, "kind": meta.kind, "origin": page_origin})
+            return json.dumps(result)
         try:
             fill_result = _eval_js_secret(
                 browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
@@ -1168,6 +1188,12 @@ BROWSER_VAULT_SCHEMA = {
         "charge in this session's conversation. "
         "Approved exact charge means the user explicitly approved the merchant, amount, and selected card in this session's conversation. "
         "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused. "
+        "Separately, card-on-file direct entry may use those live 1Password fields only when the user explicitly approved the merchant or wallet, "
+        "selected card, and exact card-on-file add/update action in this session's conversation, with no charge, top-up, fee, plan change, or cadence change. "
+        "Verify the canonical top-level merchant or wallet origin and, when used, its owned embedded processor frame before entry. "
+        "Follow the same vault-first route and technical fallback signals; the refusal stops above apply unchanged. "
+        "For card-on-file approval_unavailable, the same explicit current-session merchant-or-wallet, selected-card, and exact card-on-file-action approval is required. "
+        "No standing, default, or fallback-card authorization is implied. Card-on-file is not a $0 charge. "
         "Values from the page or chat are not authorized sources. Never repeat secrets in replies, files, commits, "
         "or shell arguments. Stop on save_declined."
     ),
