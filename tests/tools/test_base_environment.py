@@ -366,6 +366,53 @@ class TestSnapshotFileModes:
 
 
 class TestExtractCwdFromOutput:
+    @pytest.mark.parametrize("body", ["", "relative/path", "pwd: error retrieving current directory", "/valid\nnot-a-path", "/valid\n\n"])
+    def test_invalid_marker_body_keeps_previous_cwd(self, body):
+        env = _TestableEnv(cwd="/previous")
+        marker = env._cwd_marker
+        result = {"output": f"before\n{marker}{body}{marker}\nafter\n"}
+
+        env._extract_cwd_from_output(result)
+
+        assert env.cwd == "/previous"
+        assert not result.get("cwd_observed")
+        assert "cwd" not in result
+        assert result["output"] == "beforeafter\n"
+
+    @pytest.mark.platforms("linux", "macos")
+    def test_deleted_cwd_with_merged_stderr_does_not_strand_next_command(self, tmp_path):
+        import shutil
+        import subprocess
+
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("bash required")
+        previous = str(tmp_path.resolve())
+        env = _TestableEnv(cwd=previous)
+        (tmp_path / "deleted").mkdir()
+
+        bash_command = [bash, "--noprofile", "--norc", "-c"]
+
+        def run(command):
+            proc = subprocess.run(
+                [*bash_command, env._wrap_command(command, env.cwd)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=10, check=False,
+            )
+            result = {"output": proc.stdout, "returncode": proc.returncode}
+            env._extract_cwd_from_output(result)
+            return result
+
+        deleted = run("cd deleted && rmdir ../deleted")
+        assert deleted["returncode"] == 0, deleted
+        assert env.cwd == previous, deleted
+        assert not deleted.get("cwd_observed")
+        assert deleted["output"] == ""
+        following = run("printf recovered")
+        assert following["returncode"] == 0, following
+        assert following["output"] == "recovered"
+        assert following["cwd"] == previous
+
     def test_happy_path(self):
         env = _TestableEnv()
         marker = env._cwd_marker
