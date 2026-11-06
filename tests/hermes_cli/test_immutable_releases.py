@@ -74,7 +74,7 @@ def test_release_plist_executes_selected_release_with_managed_source_launcher(tm
     runtime = store_root(source)
     tool = runtime / "python-test" / "bin" / "python3"
     tool.parent.mkdir(parents=True)
-    tool.symlink_to(sys.executable)
+    tool.symlink_to(getattr(sys, "_base_executable", sys.executable))
     (runtime / "facts.json").write_text(json.dumps({"packages": {"python": {"entry": "python-test"}}}), encoding="utf-8")
     assert resolve_store_python(source) == tool
     launcher = source / ".hermes" / "bin" / "hermes"
@@ -1136,7 +1136,7 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
             "documents=['docx-pkg==1.0']\ngated=['gated-pkg==1.0; sys_platform == \"none\"']\n",
             encoding="utf-8")
         (release / ".venv" / "bin" / "python").unlink()
-        (release / ".venv" / "bin" / "python").symlink_to(sys.executable)
+        (release / ".venv" / "bin" / "python").symlink_to(getattr(sys, "_base_executable", sys.executable))
     releases.promote(home, a)
     generation = _fake_release_generation(a, ["documents", "gated", "slack", "telegram"])
 
@@ -1743,7 +1743,7 @@ def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_pat
     }), encoding="utf-8")
     source = Path(__file__).resolve().parents[2]
 
-    with pytest.raises(RuntimeError, match="disabled via config"):
+    with pytest.raises(RuntimeError, match="listed in both plugins.enabled and plugins.disabled"):
         releases.smoke_plugins(source, home)
 
 
@@ -1761,5 +1761,5 @@ def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_
     (plugin / "locales" / "pl.yaml").write_text("name: Polski\n", encoding="utf-8")
     source = Path(__file__).resolve().parents[2]
 
-    with pytest.raises(RuntimeError, match="disabled via config"):
+    with pytest.raises(RuntimeError, match="listed in both plugins.enabled and plugins.disabled"):
         releases.smoke_plugins(source, home)

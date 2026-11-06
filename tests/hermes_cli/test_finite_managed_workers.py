@@ -21,7 +21,7 @@ def test_private_worker_discovery_verifies_the_reserved_adoption_claim(tmp_path,
     from gateway.session_worker_discovery import worker_discovery_handler
     from gateway.session_admission import admission_fingerprint
     from gateway.session_authorities import SessionAuthorities
-    from hermes_cli.process_identity import process_birth
+    from hermes_cli.process_identity import worker_birth
     from hermes_state import SessionDB
     from hermes_state_runtime import RuntimeStoreError, register_worker_execution, mutate_worker_execution
     from tests.fakes.runtime_owner import begin_runtime_epoch
@@ -31,7 +31,7 @@ def test_private_worker_discovery_verifies_the_reserved_adoption_claim(tmp_path,
         db.create_session("session", source="cli")
         epoch = begin_runtime_epoch(db, instance_id="finite")
         scope = dict(profile_id=str(tmp_path.resolve()), session_id="session", execution_id="worker",
-                     generation=0, pid=worker.pid, birth=process_birth(psutil.Process(worker.pid)),
+                     generation=0, pid=worker.pid, birth=worker_birth(psutil.Process(worker.pid)),
                      secret="owner-issued-private-secret")
         principal = "uid:" + str(os.getuid())
         claim = admission_fingerprint(canonical_target="session", payload=scope | {"principal": principal})

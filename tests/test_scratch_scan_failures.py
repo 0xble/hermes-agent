@@ -136,7 +136,7 @@ def test_post_selection_scan_failure_keeps_entry_with_honest_audit(
 
 @pytest.mark.parametrize('kind,error', [
     ('malformed', ValueError), ('shape', ValueError),
-    ('permission', PermissionError), ('overflow', OverflowError),
+    ('permission', PermissionError), ('overflow', None),
 ])
 def test_process_registry_uncertainty_is_not_reported_as_no_owners(tmp_path, monkeypatch, kind, error):
     import json
@@ -163,8 +163,12 @@ def test_process_registry_uncertainty_is_not_reported_as_no_owners(tmp_path, mon
                     raise PermissionError('registry unavailable')
                 return original(path, *args, **kwargs)
             fault.setattr(Path, 'read_text', unreadable)
-        with pytest.raises(error):
-            scratch._registered_live_pids(home)
+        if error is None:
+            # The maintained process-identity owner pins an uninspectable incarnation.
+            assert os.getpid() in scratch._registered_live_pids(home)
+        else:
+            with pytest.raises(error):
+                scratch._registered_live_pids(home)
     registry.write_text('[]', encoding='utf-8')
     assert scratch._registered_live_pids(home) == set()
 
@@ -188,7 +192,7 @@ def test_process_inspection_failure_defers_deletion_until_retry(tmp_path, monkey
         assert payload.read_text(encoding='utf-8') == 'keep'
         assert payload.stat().st_mtime == old
     audit = log.read_text(encoding='utf-8-sig')
-    assert 'cleanup deferred, process inspection/reaping failed' in audit
+    assert 'process check failed' in audit and 'nothing deleted this pass' in audit
     assert 'scratch prune: removed' not in audit
     monkeypatch.setattr(scratch, 'reap_processes_rooted_in', lambda *_args, **_kwargs: 0)
     assert scratch.prune_idle_entries(root, 24, frozenset(), log) == 1

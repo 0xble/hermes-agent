@@ -249,8 +249,16 @@ class GatewaySessionCommandsMixin:
             _reset_process_scoped_tool_state()
 
             from agent.incognito import is_incognito
+            from gateway.session_automation import move_route_wakes, route_owner_lock
             was_private = is_incognito()
-            new_entry = await self.async_session_store.reset_session(session_key)
+            async with route_owner_lock(self, old_session_id):
+                new_entry = await self.async_session_store.reset_session(session_key)
+                if was_private:
+                    from gateway.incognito import ended_private_topic
+                    with ended_private_topic(new_entry.session_id if new_entry else None):
+                        await move_route_wakes(self, session_key, old_session_id)
+                else:
+                    await move_route_wakes(self, session_key, old_session_id)
         if not was_private:
             return await self._finish_session_reset(event, source, session_key, old_entry, new_entry)
         # The reset ended the private interval. Bind, title and announce the new public
@@ -262,8 +270,6 @@ class GatewaySessionCommandsMixin:
     async def _finish_session_reset(self, event: MessageEvent, source: SessionSource, session_key: str,
                                     old_entry, new_entry) -> str | EphemeralReply:
         _old_sid = old_entry.session_id if old_entry else None
-        from gateway.session_automation import move_route_wakes
-        await move_route_wakes(self, session_key, _old_sid)  # main #114456: a parked wake survives /new
         await self._fire_session_reset_hooks(source, session_key, _old_sid,
                                              new_entry.session_id if new_entry else None)
         # Scoped to the profile serving this source so a multiplexed /new banner reports the
@@ -1194,6 +1200,12 @@ class GatewaySessionCommandsMixin:
         if isinstance(resolved, str):
             return resolved
         target_id, name = resolved
+        # A local conversation moves onto this lane from its current head, as /handoff carries it: a
+        # title naming its first segment (a local /new moved on) would strand the live one (#143286).
+        from gateway.session_route_recovery import conversation_head, follow_hand_off
+        authority, local_owner, head = await conversation_head(self, target_id)
+        if local_owner is not None:
+            target_id = head
         denied = await self._resume_access_denied_reply(source, target_id, name, allow_all, allow_cross_room)
         if denied is not None:
             return denied
@@ -1207,6 +1219,8 @@ class GatewaySessionCommandsMixin:
             )
             if not new_entry:
                 return t("gateway.resume.switch_failed")
+            if local_owner is not None and authority is not None:
+                follow_hand_off(authority, source, session_key, authority.logical_owner(target_id), local_owner)
             # Conversation boundary: all conversation-scoped state + security state in one funnel call.
             # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
             # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security

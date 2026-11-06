@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_backends.onepassword import OnePasswordLoginBackend, _normalize_protected_date
 from agent.vault_login_classifier import (
     LoginControl,
@@ -47,6 +48,15 @@ def _protected_config(**overrides):
     }
     entry.update(overrides)
     return entry
+
+
+def _protected_backend(meta):
+    backend = LocalLoginBackend()
+    backend.name = "onepassword"
+    backend.display_name = "1Password"
+    backend.get_meta = Mock(return_value=meta)
+    backend.resolve_secret = Mock(return_value={"value": "1990-04-12"})
+    return backend
 
 
 def test_protected_birth_date_classifier_prefers_standard_tokens_and_bounded_dob_labels():
@@ -237,7 +247,7 @@ def test_browser_vault_fill_injects_configured_protected_field_without_disclosin
         field_token="bday",
     )
 
-    class Backend:
+    class Backend(LocalLoginBackend):
         name = "onepassword"
         display_name = "1Password"
         needs_unlock = False
@@ -301,11 +311,7 @@ def test_protected_field_origin_mismatch_never_resolves_secret():
         allowed_origins=("https://allowed.example",),
         field_token="bday",
     )
-    backend = Mock(
-        name="onepassword", display_name="1Password", needs_unlock=False,
-        binds_cards_to_page=False,
-    )
-    backend.get_meta.return_value = meta
+    backend = _protected_backend(meta)
     with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
          patch.object(browser_vault_tool, "_focus_bound_origin", return_value=None), \
          patch.object(browser_vault_tool, "_current_page_origin", return_value="https://other.example"):
@@ -324,11 +330,7 @@ def test_split_protected_date_components_are_redacted_before_page_write():
         origin="https://allowed.example", created_at="",
         allowed_origins=("https://allowed.example",), field_token="bday",
     )
-    backend = Mock(display_name="1Password", needs_unlock=False,
-                   binds_cards_to_page=False)
-    backend.name = "onepassword"
-    backend.get_meta.return_value = meta
-    backend.resolve_secret.return_value = {"value": "1990-04-12"}
+    backend = _protected_backend(meta)
     controls = [
         {"autocomplete": f"bday-{part}", "formIndex": 0, "index": i,
          "label": part, "name": f"birth_{part}", "type": "select"}
@@ -363,10 +365,7 @@ def test_partial_split_date_fill_reports_failure_not_success():
         origin="https://allowed.example", created_at="",
         allowed_origins=("https://allowed.example",), field_token="bday",
     )
-    backend = Mock(display_name="1Password", needs_unlock=False, binds_cards_to_page=False)
-    backend.name = "onepassword"
-    backend.get_meta.return_value = meta
-    backend.resolve_secret.return_value = {"value": "1990-04-12"}
+    backend = _protected_backend(meta)
     controls = [
         {"autocomplete": f"bday-{part}", "formIndex": 0, "index": i,
          "label": part, "name": f"birth_{part}", "type": "select"}
@@ -397,10 +396,7 @@ def test_zero_based_and_opaque_selected_option_values_are_masked():
         origin="https://allowed.example", created_at="",
         allowed_origins=("https://allowed.example",), field_token="bday",
     )
-    backend = Mock(display_name="1Password", needs_unlock=False, binds_cards_to_page=False)
-    backend.name = "onepassword"
-    backend.get_meta.return_value = meta
-    backend.resolve_secret.return_value = {"value": "1990-04-12"}
+    backend = _protected_backend(meta)
     controls = [
         {"autocomplete": f"bday-{part}", "formIndex": 0, "index": i,
          "label": part, "name": f"birth_{part}", "type": "select"}
@@ -436,10 +432,7 @@ def test_split_date_selected_option_label_is_redacted_without_masking_unrelated_
         origin="https://allowed.example", created_at="",
         allowed_origins=("https://allowed.example",), field_token="bday",
     )
-    backend = Mock(display_name="1Password", needs_unlock=False, binds_cards_to_page=False)
-    backend.name = "onepassword"
-    backend.get_meta.return_value = meta
-    backend.resolve_secret.return_value = {"value": "1990-04-12"}
+    backend = _protected_backend(meta)
     controls = [
         {"autocomplete": f"bday-{part}", "formIndex": 0, "index": i,
          "label": part, "name": f"birth_{part}", "type": "select"}

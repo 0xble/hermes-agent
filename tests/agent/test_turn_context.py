@@ -42,6 +42,7 @@ class _FakeAgent:
 
     def __init__(self):
         self.session_id = "sess-1"
+        self._session_db = None
         self.model = "test/model"
         self.provider = "openrouter"
         self.requested_provider = "openrouter"
