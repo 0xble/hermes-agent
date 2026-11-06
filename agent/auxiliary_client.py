@@ -33,6 +33,7 @@ from agent.error_classifier import (
     is_reasoning_field_rejection,
     is_reasoning_required_rejection,
 )
+from agent.auxiliary_client_urls import _to_openai_base_url
 from agent.auxiliary_managed_local import _is_managed_local_endpoint
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
 from agent.auxiliary_structured_output import _route_key, _without_structured_output_format, remember_structured_output_rejection
@@ -122,7 +123,7 @@ def aux_probe_mode():
 from agent.credential_pool import load_pool
 from agent.auxiliary_call_policy import (
     CallFallbackPolicy, call_fallback_chain, has_call_fallback_chain, prepare_fallback_request, resolve_unavailable_client,
-    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response,
+    scoped_fallback_policy, scoped_fallback_stream, stream_with_recovery, release_sync_semaphore_after_stream, is_stream_response, private_route_scope, private_route_active,
 )
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
@@ -577,7 +578,8 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
         suffix = normalized.split(":", 1)[1].strip()
         if not suffix:
             return "custom"
-        normalized = suffix
+        # A saved entry owns this identity even when its name is a built-in or alias.
+        return f"custom:{suffix}"
     if normalized == "codex":
         return "openai-codex"
     if normalized == "main":
@@ -984,53 +986,6 @@ def _auth_json_path():
     would otherwise authenticate to Nous with the default profile's token."""
     from hermes_cli.auth import _auth_file_path
     return _AUTH_JSON_PATH if _AUTH_JSON_PATH != _AUTH_JSON_PATH_AT_IMPORT else _auth_file_path()
-
-# Hosts exposing BOTH ``…/anthropic`` and a sibling OpenAI ``…/v1``. Matched on the URL *host*
-# only: unconditional rewrites break Anthropic-only gateways.
-_DUAL_SURFACE_ANTHROPIC_HOST_SUFFIXES = ("minimax.io", "minimax.chat", "minimaxi.com")
-_DUAL_SURFACE_ANTHROPIC_HOST_PREFIXES = ("api.minimax.",)
-
-
-def _is_dual_surface_anthropic_host(url: str) -> bool:
-    """True when the URL's host is a known dual-surface (MiniMax-family) host."""
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return any(
-        host == suffix or host.endswith("." + suffix) for suffix in _DUAL_SURFACE_ANTHROPIC_HOST_SUFFIXES
-    ) or any(host.startswith(prefix) for prefix in _DUAL_SURFACE_ANTHROPIC_HOST_PREFIXES)
-
-
-def _to_openai_base_url(base_url: str) -> str:
-    """Normalize dual-surface Anthropic URLs to their OpenAI-compatible sibling.
-
-    MiniMax-family: ``/anthropic`` → ``/v1``; ZAI Coding Plan → ``/coding/paas/v4`` (the general
-    endpoint bills separately); Kimi Code ``/coding`` → ``/coding/v1`` (the OpenAI SDK path 404s
-    without it). Anthropic-only gateways keep their path.
-    """
-    url = str(base_url or "").strip().rstrip("/")
-    if base_url_hostname(url) == "api.actual.inc":
-        from hermes_cli.auth import normalize_actual_base_url
-        return normalize_actual_base_url(url)
-    if url.endswith("/anthropic"):
-        if base_url_host_matches(url, "open.bigmodel.cn") or base_url_host_matches(url, "api.z.ai"):
-            rewritten = url[: -len("/anthropic")] + "/coding/paas/v4"
-            logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
-            return rewritten
-        if _is_dual_surface_anthropic_host(url):
-            rewritten = url[: -len("/anthropic")] + "/v1"
-            logger.debug("Auxiliary client: rewrote dual-surface base URL %s → %s", url, rewritten)
-            return rewritten
-        logger.debug(
-            "Auxiliary client: keeping Anthropic-only base URL %s (no dual-surface host match)", url)
-        return url
-    if base_url_host_matches(url, "api.kimi.com") and url.endswith("/coding"):
-        rewritten = url + "/v1"
-        logger.debug("Auxiliary client: rewrote Kimi base URL %s → %s", url, rewritten)
-        return rewritten
-    return url
-
 
 def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
     """``load_pool(provider)`` when it has credentials, else None (never raises)."""
@@ -2590,10 +2545,10 @@ def _relay_aux_call_scope(args: tuple, kwargs: dict):
 
 
 def _relay_auxiliary_call(callback):
-    """Give every physical retry in one auxiliary call a shared Relay identity."""
+    """Give every physical retry in one auxiliary call a shared Relay identity and its private route."""
     @functools.wraps(callback)
     def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
+        with _relay_aux_call_scope(args, kwargs), private_route_scope(args, kwargs, sync=True) as kwargs:
             return callback(*args, **kwargs)
     return wrapped
 
@@ -2602,7 +2557,7 @@ def _relay_auxiliary_call_async(callback):
     """Async counterpart to :func:`_relay_auxiliary_call`."""
     @functools.wraps(callback)
     async def wrapped(*args, **kwargs):
-        with _relay_aux_call_scope(args, kwargs):
+        with _relay_aux_call_scope(args, kwargs), private_route_scope(args, kwargs, sync=False) as kwargs:
             return await callback(*args, **kwargs)
     return wrapped
 
@@ -4008,6 +3963,7 @@ def _prepare_same_provider_retry(
         effective_provider = _effective_provider_for_client(retry_client, resolved_provider)
     if retry_client is None:
         raise RuntimeError(f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery")
+    retry_model = _recovery_model(final_model, retry_model)
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     if rebuild is not None:
         # The selected destination owns recovery, not the unavailable primary.
@@ -5764,6 +5720,15 @@ def resolve_provider_client(
             if explicit_base_url and str(explicit_base_url).lower().startswith("moa://"):
                 explicit_base_url = None
                 explicit_api_key = None
+    if provider.startswith("custom:"):
+        # Resolve saved entries before built-ins, aliases, auto discovery, and model
+        # defaults. Missing/disabled entries must not borrow a namesake's route.
+        req = _ResolveRequest(
+            provider, original_provider, model, async_mode, raw_codex,
+            explicit_base_url, explicit_api_key, api_mode, main_runtime, is_vision, task,
+        )
+        result = _resolve_named_custom_branch(req)
+        return result if result is not None else (None, None)
     from agent.auxiliary_local_runtime import bare_llamacpp_endpoint
     local = bare_llamacpp_endpoint(original_provider, explicit_base_url, explicit_api_key)
     if local is not None:
@@ -6499,7 +6464,7 @@ def _resolve_task_provider_model(
     shaping still applies. api_mode is "chat_completions", "codex_responses", or None (auto).
     """
     cfg_provider = cfg_model = cfg_base_url = cfg_api_key = resolved_api_mode = None
-    if task:
+    if task and not private_route_active():  # a private call's endpoint is its incognito route only
         task_config = _get_auxiliary_task_config(task)
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
@@ -7724,7 +7689,7 @@ def _resolve_call_client(
             model=resolved_model or model, base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key, async_mode=async_mode, main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if client is None and resolved_provider != "auto" and not resolved_base_url and not private_route_active():
             logger.warning("Vision provider %s unavailable, falling back to auto vision backends",
                            resolved_provider)
             effective_provider, client, final_model = resolve_vision_provider_client(
@@ -7779,7 +7744,7 @@ def _prepare_aux_request(
         task, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
-    effective_extra_body = _get_task_extra_body(task)
+    effective_extra_body = {} if private_route_active() else _get_task_extra_body(task)  # task shaping is for its own route
     effective_extra_body.update(extra_body or {})
     client, final_model, resolved_provider, effective_provider, fallback_label = _resolve_call_client(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
@@ -7999,6 +7964,11 @@ def _ladder_parameter_rungs(
     return None, first_err, kwargs
 
 
+def _recovery_model(pinned_model: Optional[str], candidate: Optional[str]) -> Optional[str]:
+    """Credential/connection recovery may not replace a private route's chosen model."""
+    return pinned_model if private_route_active() else candidate
+
+
 def _refreshed_nous_step(route: _LadderRoute, kwargs: dict[str, Any], message: str) -> Optional[_LadderStep]:
     """Rebuild the Nous client after a credential event; None when nothing refreshed."""
     refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
@@ -8011,6 +7981,7 @@ def _refreshed_nous_step(route: _LadderRoute, kwargs: dict[str, Any], message: s
     if refreshed_client is None:
         return None
     logger.info(message, route.task or "call", route.tag)
+    refreshed_model = _recovery_model(route.final_model, refreshed_model)
     if refreshed_model and refreshed_model != kwargs.get("model"):
         kwargs["model"] = refreshed_model
     return _LadderStep("call", (refreshed_client, kwargs))
@@ -8024,7 +7995,7 @@ def _ladder_nous_rungs(
     client, task, tag = route.client, route.task, route.tag
     # A long-lived process can pin a Portal model since dropped from the catalog (every call
     # 404s); force a fresh Portal fetch and retry once.
-    if _is_model_not_found_error(first_err) and client_is_nous:
+    if _is_model_not_found_error(first_err) and client_is_nous and not private_route_active():
         healed_model = _refresh_nous_recommended_model(
             vision=(task == "vision"), stale_model=kwargs.get("model"))
         if healed_model and healed_model != kwargs.get("model"):
@@ -8065,6 +8036,7 @@ def _ladder_credential_rungs(
     auth_refresh_provider = _auth_refresh_provider_for_route(
         resolved_provider, route.base_info, _effective_provider_for_client(client, ""))
     if (_is_auth_error(first_err) and auth_refresh_provider not in {"auto", "", None}
+            and not (private_route_active() and str(resolved_provider or "").startswith("custom:"))
             and not client_is_nous):
         refresh_kwargs = ({"failed_api_key": getattr(client, "api_key", "")}
                           if auth_refresh_provider == "anthropic" else {})
@@ -8265,6 +8237,10 @@ def _aux_recovery_ladder(
         return resp
     client_is_nous = (resolved_provider == "nous"
                       or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
+    if (resolved_provider.startswith("custom:")
+            or (private_route_active() and resolved_provider != "nous")):
+        # Saved entries own credentials and model policy even when hosted on Nous.
+        client_is_nous = False
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
         return resp

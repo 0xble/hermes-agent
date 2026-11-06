@@ -80,14 +80,28 @@ def named_custom_entry(provider_name: Optional[str], config: Optional[dict] = No
 
 
 def pool_for_aux_provider(provider: Optional[str], pool_key: str, load: Callable[[str], Any]) -> Any:
-    """``load(pool_key)`` for an auxiliary pool read (the key peek, credential recovery). A pinned
-    ``custom:<name>`` normalizes to its entry's slug, which may also be a same-named built-in's pool,
-    so it gets the entry-scoped view; a bare built-in name keeps its whole pool."""
-    pool = load(pool_key)
-    if pool is None or not str(provider or "").strip().lower().startswith("custom:"):
-        return pool
+    """Load an auxiliary route's credential owner, not its route-identity string.
+
+    Named custom routes keep their identity through routing, while auth stores use the entry's
+    durable slug or a legacy key. Share initial resolution's candidate order and ownership view;
+    a missing named owner must not fall through to an orphan or same-named built-in pool.
+    """
+    if not str(provider or "").strip().lower().startswith("custom:"):
+        return load(pool_key)
     match = named_custom_entry(provider)
-    return entry_scoped_pool(pool, pool_key, match[1] if match else None)
+    if match is None:
+        return None
+    from agent.credential_pool import custom_provider_pool_key_candidates
+    name, entry = match
+    for key in custom_provider_pool_key_candidates(entry.get("base_url"), entry.get("provider_key") or name):
+        try:
+            pool = entry_scoped_pool(load(key), key, entry)
+        except (OSError, ValueError, TypeError, AttributeError):
+            # Store I/O and malformed persisted rows must not hide the legacy candidate.
+            continue
+        if pool is not None and pool.has_credentials():
+            return pool
+    return None
 
 
 def _custom_identity(provider: Optional[str], requested_provider: Optional[str]) -> tuple[bool, Optional[str]]:

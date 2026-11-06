@@ -15,7 +15,7 @@ import unittest
 
 # Compare off-mode behavior with the exact main revision this feature extends.
 # An older schema changes page bytes and SQL traces even without incognito.
-BASE = "b03250439b8a5abd8e6940e2805cad363201c16c"
+BASE = "64bdd2d1e87a85645ac292cbfbc6e6e6d9fc0afa"
 ROOT = Path(__file__).resolve().parents[2]
 
 

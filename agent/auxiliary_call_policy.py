@@ -28,6 +28,56 @@ def scoped_fallback_policy(policy: CallFallbackPolicy):
         _policy.reset(token)
 
 
+BARE_CUSTOM_ROUTE_REFUSAL = "incognito.model must use a named provider (e.g. custom:venice)"
+
+# Run outside any conversation (dashboard, CLI, cron), so they never carry private turn content.
+CONTENT_FREE_TASKS = frozenset({
+    "profile_describer", "kanban_estimator", "kanban_decomposer", "triage_specifier", "monitor",
+})
+
+
+_private_routed: ContextVar[bool] = ContextVar("aux_call_private_routed", default=False)
+
+
+def private_route_active() -> bool:
+    """True inside an auxiliary call moved onto a private session's incognito route.
+
+    Resolution must then ignore the task's own endpoint and every auto backend, since either
+    would carry private content off the route.
+    """
+    return _private_routed.get()
+
+
+@contextmanager
+def private_route_scope(args: tuple, kwargs: dict, *, sync: bool) -> Iterator[dict]:
+    """Yield the call's kwargs, moved onto the private session's incognito route when one is bound.
+
+    Private turn content must not reach a provider the user did not choose for the interval, so
+    the configured incognito.model replaces the task's route, the main runtime and every fallback
+    hop. Credentials resolve from that provider's own configuration.
+    """
+    from agent.incognito import private_route
+    task = args[0] if args else kwargs.get("task")
+    route = None if task in CONTENT_FREE_TASKS else private_route()
+    if not (route and route.get("provider") and route.get("model")):
+        yield kwargs
+        return
+    if route["provider"] == "custom":
+        # A bare custom route names no provider entry to take its key from, so resolution would
+        # pair the endpoint with some other entry's credential. Only named providers are routed.
+        raise RuntimeError(BARE_CUSTOM_ROUTE_REFUSAL)
+    routed = {**kwargs, "provider": route["provider"], "model": route["model"],
+              "base_url": None, "api_key": None, "main_runtime": None}
+    if sync:
+        routed.update(api_mode=None, fallback_chain=[])
+    token = _private_routed.set(True)
+    try:
+        with scoped_fallback_policy(CallFallbackPolicy(task, [])):
+            yield routed
+    finally:
+        _private_routed.reset(token)
+
+
 def has_call_fallback_chain(task: str | None) -> bool:
     policy = _policy.get()
     return policy is not None and policy.task == task and policy.chain is not None
@@ -118,14 +168,17 @@ def scoped_fallback_stream(stream: Any, policy: CallFallbackPolicy, progress_hoo
     """Bind only while advancing/closing, never while control belongs to its consumer."""
     from agent.auxiliary_client import _RELAY_AUX_CALL_CONTEXT, aux_progress_hook, scoped_runtime_main
     relay_context = _RELAY_AUX_CALL_CONTEXT.get()
+    private_routed = _private_routed.get()
 
     @contextmanager
     def scope():
         token = _RELAY_AUX_CALL_CONTEXT.set(relay_context)
+        private_token = _private_routed.set(private_routed)
         try:
             with scoped_fallback_policy(policy), aux_progress_hook(progress_hook), scoped_runtime_main(main_runtime):
                 yield
         finally:
+            _private_routed.reset(private_token)
             _RELAY_AUX_CALL_CONTEXT.reset(token)
 
     def advance():

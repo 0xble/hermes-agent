@@ -94,8 +94,10 @@ class SamplingHandler:
     _STOP_REASON_MAP = {"stop": "endTurn", "length": "maxTokens", "tool_calls": "toolUse"}
     _LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING}
 
-    def __init__(self, server_name: str, config: dict):
+    def __init__(self, server_name: str, config: dict,
+                 call_context: Callable[[], Optional[Context]] = lambda: None):
         self.server_name = server_name
+        self._call_context = call_context
         self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
         self.timeout = _safe_numeric(config.get("timeout", 30), 30, float)
         self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 4096), 4096, int)
@@ -211,8 +213,13 @@ class SamplingHandler:
             for t in server_tools] if server_tools else None
         logger.log(self.audit_level, "MCP server '%s' sampling request: model=%s, max_tokens=%d, messages=%d",
                    self.server_name, resolved_model, max_tokens, len(messages))
-        return lambda: call_llm(task="mcp", model=resolved_model or None, messages=messages, max_tokens=max_tokens,
-                                temperature=getattr(params, "temperature", None), tools=tools, timeout=self.timeout)
+        call = functools.partial(call_llm, task="mcp", model=resolved_model or None, messages=messages,
+                                 max_tokens=max_tokens, temperature=getattr(params, "temperature", None),
+                                 tools=tools, timeout=self.timeout)
+        # The recv-loop task does not inherit the calling turn's contextvars. Replay the tool call's
+        # snapshot so a private turn's sampling stays on its incognito route.
+        captured = self._call_context()
+        return call if captured is None else (lambda: captured.copy().run(call))
 
     async def __call__(self, context, params):
         """SDK ``SamplingFnT``: CreateMessageResult, CreateMessageResultWithTools, or ErrorData."""
