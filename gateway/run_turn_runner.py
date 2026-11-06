@@ -566,7 +566,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
     def _setup_stream_consumer(self, platform_key):
         from gateway.stream_recovery import preview_recorder, restore_preview
         ctx = self._ctx
-        if ctx.mute_notification_reply:
+        if ctx.mute_notification_reply or ctx.persist_user_display_kind == "supervisor_checkin":
             return None, None, None, False
         stream_consumer = None
         # The streaming-TTS consumer is created on the outer loop thread before run_sync launches;
