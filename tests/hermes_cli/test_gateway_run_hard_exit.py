@@ -8,6 +8,7 @@ in-flight cron ThreadPoolExecutor jobs) and delay service-managed restarts.
 
 from __future__ import annotations
 
+import asyncio
 import types
 
 import pytest
@@ -43,36 +44,46 @@ def _prepare(monkeypatch):
     return gateway_cli
 
 
-def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
+@pytest.mark.parametrize("outcome", [True, False, SystemExit(78), KeyboardInterrupt(), asyncio.CancelledError()])
+def test_run_gateway_records_exit_before_hard_exit(monkeypatch, tmp_path, outcome):
+    import json
+    import gateway.run as gateway_run
+
     gateway_cli = _prepare(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_EXIT_DIAG", "1")
+    monkeypatch.setattr(gateway_cli, "_respawn_storm_backoff", lambda: None)
 
-    def _fake_run(coro):
-        coro.close()
-        return True
+    async def start_gateway(**kwargs):
+        try:
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        finally:
+            (tmp_path / "durable-stop").write_text("persisted")
 
-    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
+    observed = []
 
+    def hard_exit(code):
+        assert (tmp_path / "durable-stop").read_text() == "persisted"
+        records = [json.loads(line) for line in (tmp_path / "logs" / "gateway-exit-diag.log").read_text().splitlines()]
+        observed.extend(records)
+        raise _HardExitObserved(code)
+
+    monkeypatch.setattr(gateway_run, "start_gateway", start_gateway)
+    monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", hard_exit)
     with pytest.raises(_HardExitObserved) as excinfo:
         gateway_cli.run_gateway()
-
-    assert excinfo.value.code == 0
-
-
-def test_run_gateway_hard_exits_after_keyboard_interrupt(monkeypatch):
-    """KeyboardInterrupt (console Ctrl+C) must also hard-exit, not return.
-
-    A bare ``return`` would let Python finalization join non-daemon worker
-    threads, the same wedge this backstop prevents on the other exit paths.
-    """
-    gateway_cli = _prepare(monkeypatch)
-
-    def _fake_run(coro):
-        coro.close()
-        raise KeyboardInterrupt()
-
-    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
-
-    with pytest.raises(_HardExitObserved) as excinfo:
-        gateway_cli.run_gateway()
-
-    assert excinfo.value.code == 0
+    expected_code = 78 if isinstance(outcome, SystemExit) else 1 if outcome is False else 0
+    assert excinfo.value.code == expected_code
+    tags = [record["tag"] for record in observed]
+    if isinstance(outcome, SystemExit):
+        assert "asyncio.run.SystemExit" in tags
+        assert next(record for record in observed if record["tag"] == "asyncio.run.SystemExit")["code"] == 78
+    elif isinstance(outcome, KeyboardInterrupt):
+        assert "asyncio.run.KeyboardInterrupt" in tags
+    elif isinstance(outcome, BaseException):
+        assert "asyncio.run.exception" in tags
+    else:
+        assert "asyncio.run.returned" in tags
+        assert ("gateway.exit_clean" if outcome else "gateway.exit_nonzero") in tags
