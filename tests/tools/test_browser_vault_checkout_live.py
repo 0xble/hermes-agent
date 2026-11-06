@@ -508,3 +508,116 @@ def test_unsupported_brand_yields_partial_value_free_payment_receipt(bridge, kin
     assert receipt['field_results']['cc-number'] == 'filled'
     assert all(value not in json.dumps(receipt) for value in CARD.values())
     assert call('eval', expression="document.getElementById('target').selectedOptions?.[0]?.textContent||document.getElementById('target').textContent")['result'] == 'Choose'
+
+
+@pytest.mark.parametrize('target', ['month', 'year'])
+@pytest.mark.parametrize('stale', ['value', 'aria-valuetext'])
+@pytest.mark.parametrize('reset', ['none', 'clear', 'wrong', 'blank'])
+@pytest.mark.parametrize('phase', ['option', 'cvc'])
+def test_required_expiry_combobox_visible_state_controls_payment_receipt(bridge, target, stale, reset, phase):
+    ready, call = bridge
+    assert call('load', kind='native')['ok']
+    html = '''<form onsubmit="event.preventDefault();window.submissions++">
+      <input autocomplete=cc-number>
+      <button id=month type=button role=combobox aria-label="Expiry month" aria-controls=months>Month</button>
+      <div id=months role=listbox><div role=option>July</div></div>
+      <button id=year type=button role=combobox aria-label="Expiry year" aria-controls=years>Year</button>
+      <div id=years role=listbox><div role=option>2029</div></div>
+      <input id=cvc aria-label=CVC></form>'''
+    assert call('eval', expression='document.body.innerHTML=' + json.dumps(html))['ok']
+    setup = '''(() => {
+      window.submissions=0;
+      const reset=()=>{
+        if(RESET==='none') return;
+        document.getElementById(TARGET).textContent=RESET==='blank'?'':RESET==='clear'
+          ? (TARGET==='month'?'Month':'Year') : (TARGET==='month'?'August':'2030');
+      };
+      for(const id of ['month','year']) {
+        const trigger=document.getElementById(id);
+        document.getElementById(trigger.getAttribute('aria-controls')).firstChild.onclick=function(){
+          trigger.textContent=this.textContent;
+          if(STALE==='value') trigger.value=id==='month'?'07':'2029';
+          else trigger.setAttribute('aria-valuetext',id==='month'?'July':'2029');
+          this.setAttribute('aria-selected','true');
+          if(PHASE==='option' && id===TARGET) reset();
+        };
+      }
+      document.getElementById('cvc').onchange=()=>{if(PHASE==='cvc') reset();};
+    })()'''
+    for key, value in {'RESET': reset, 'TARGET': target, 'STALE': stale, 'PHASE': phase}.items():
+        setup = setup.replace(key, json.dumps(value))
+    assert call('eval', expression=setup)['ok']
+    context = inspected(call, ready['origin'])
+    selected, ambiguous = payment.plan([context], CARD)
+    def evaluate(task, expression):
+        response = call('eval', expression=expression)
+        return {'success': response['ok'], 'result': response.get('result')}
+    receipt = payment.fill('fixture', ready['origin'], selected, ambiguous, evaluate)
+    assert all(value not in json.dumps(receipt) for value in CARD.values())
+    state = call('eval', expression='({month:document.getElementById("month").innerText,year:document.getElementById("year").innerText,submissions:window.submissions,stamps:document.querySelectorAll("[data-hermes-vault-slot],[data-hermes-vault-aria-only]").length})')['result']
+    assert state['submissions'] == state['stamps'] == 0
+    expected = 'July' if target == 'month' else '2029'
+    if reset != 'none':
+        expected = '' if reset == 'blank' else ('Month' if target == 'month' else 'Year') if reset == 'clear' else ('August' if target == 'month' else '2030')
+    assert state[target] == expected
+    assert receipt['success'] is (reset == 'none')
+    assert receipt['partial'] is (reset != 'none')
+    assert receipt['field_results']['cc-exp-' + target] == ('filled' if reset == 'none' else 'missing')
+    assert receipt['field_results']['cc-number'] == receipt['field_results']['cc-csc'] == 'filled'
+
+
+@pytest.mark.parametrize('kind', ['input', 'button', 'aria-only', 'aria-to-visible'])
+@pytest.mark.parametrize('target', ['month', 'year'])
+@pytest.mark.parametrize('reset', ['none', 'clear', 'wrong'])
+@pytest.mark.parametrize('verify_only', [False, True])
+def test_expiry_combobox_readback_uses_authoritative_representation(bridge, kind, target, reset, verify_only):
+    from agent.vault_login_classifier import build_fill_js
+
+    ready, call = bridge
+    assert call('load', kind='native')['ok']
+    label, value = ('July', '07') if target == 'month' else ('2029', '2029')
+    placeholder, wrong = ('Month', 'August') if target == 'month' else ('Year', '2030')
+    attributes = f'id=target role=combobox aria-label="Expiry {target}" aria-controls=choices'
+    trigger = ('<input ' + attributes + '>' if kind == 'input' else
+               '<button type=button ' + attributes + '><span hidden>' + label + '</span><span id=display>' + (placeholder if kind == 'button' else '') + '</span></button>')
+    html = '<form onsubmit="event.preventDefault();window.submissions++">' + trigger + '<div id=choices role=listbox><div role=option>' + label + '</div></div></form>'
+    assert call('eval', expression='document.body.innerHTML=' + json.dumps(html))['ok']
+    setup = '''(() => {
+      window.submissions=0;window.optionClicks=0;
+      const trigger=document.getElementById('target');
+      window.setDisplay=text=>{
+        if(KIND==='input') trigger.value=text;
+        else if(KIND==='button' || KIND==='aria-to-visible') document.getElementById('display').textContent=text;
+        else trigger.setAttribute('aria-valuetext',text);
+      };
+      // A textless trigger that renders a value loses ARIA-only authority once
+      // observed; verify-only must not restore it after a later blank reset.
+      window.resetDisplay=()=>setDisplay(RESET==='clear'
+        ? (KIND==='button' || (KIND==='aria-to-visible' && !VERIFY) ? PLACEHOLDER : '') : WRONG);
+      document.querySelector('[role=option]').onclick=function(){
+        window.optionClicks++;
+        // Stale non-authoritative state must not overrule the displayed value.
+        if(KIND==='input') {trigger.textContent=LABEL;trigger.setAttribute('aria-valuetext',LABEL);}
+        else trigger.value=VALUE;
+        if(KIND==='button' || KIND==='aria-to-visible') trigger.setAttribute('aria-valuetext',LABEL);
+        setDisplay(LABEL);this.setAttribute('aria-selected','true');
+        if(!VERIFY && RESET!=='none') resetDisplay();
+      };
+    })()'''
+    for key, item in {'KIND': kind, 'RESET': reset, 'PLACEHOLDER': placeholder, 'WRONG': wrong,
+                      'LABEL': label, 'VALUE': value, 'VERIFY': verify_only}.items():
+        setup = setup.replace(key, json.dumps(item))
+    assert call('eval', expression=setup)['ok']
+    receipt = direct_fill(call, ready['origin'], 'cc-exp-' + target, value, retain_stamps=verify_only)
+    if verify_only:
+        assert receipt['filled'] == 1
+        if reset != 'none':
+            assert call('eval', expression='resetDisplay()')['ok']
+        response = call('eval', expression=build_fill_js([{'index': 0, 'token': 'cc-exp-' + target, 'value': value}],
+                        ready['origin'], 'synthetic', verify_only=True))
+        assert response['ok']
+        receipt = json.loads(response['result'])
+    assert receipt['filled'] == int(reset == 'none')
+    assert receipt['fieldResults'] == [{'token': 'cc-exp-' + target, 'status': 'filled' if reset == 'none' else 'missing'}]
+    assert all(item not in json.dumps(receipt) for item in CARD.values())
+    assert call('eval', expression='[window.submissions,window.optionClicks,document.querySelectorAll("[data-hermes-vault-slot],[data-hermes-vault-aria-only]").length]')['result'] == [0, 1, 0]

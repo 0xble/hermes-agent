@@ -527,7 +527,15 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       .forEach(control => control.remove());
     return copy.textContent || "";
   };
-  elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
+  elements.forEach((element, index) => {
+    const stamp = nonce + ":" + index;
+    element.setAttribute("data-hermes-vault-slot", stamp);
+    // Remember textless triggers at inspection: clearing displayed text later
+    // must not promote stale aria-valuetext into authoritative evidence.
+    element.removeAttribute("data-hermes-vault-aria-only");
+    if (element.getAttribute('role') === 'combobox' && !['INPUT', 'TEXTAREA'].includes(element.tagName) &&
+        !String(element.innerText || '').trim()) element.setAttribute("data-hermes-vault-aria-only", stamp);
+  });
   const out = elements.flatMap((element, index) => {
     if (element.matches(":disabled") || element.readOnly) return [];
     if (["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"].includes(element.type) &&
@@ -641,9 +649,9 @@ _FILL_JS_TEMPLATE = """(async () => {
         const popup = el.getRootNode().getElementById(ids[0]);
         const options = popup && popup.getAttribute('role') === 'listbox'
           ? Array.from(popup.querySelectorAll('[role=option]')).filter(o => !o.matches(':disabled,[aria-disabled=true]')) : [];
-        return !!chooseOption(options, f, true) && optionMatch(norm(el.textContent) || el.getAttribute('aria-valuetext'), f.value, f.token);
+        return !!chooseOption(options, f, true) && comboboxMatches(el, f);
       }
-      return [el.value, el.getAttribute('aria-valuetext'), el.textContent].some(t => optionMatch(t, f.value, f.token));
+      return comboboxMatches(el, f);
     }
     if (el.tagName === 'SELECT') {
       const options = Array.from(el.options).filter(o => !o.matches(':disabled'));
@@ -747,6 +755,9 @@ _FILL_JS_TEMPLATE = """(async () => {
     fieldResults[index].status = confirmed ? 'filled' : 'missing';
     if (confirmed) filled++;
   });
-  if (!retainStamps) stamped.forEach(n => n.removeAttribute('data-hermes-vault-slot'));
+  if (!retainStamps) stamped.forEach(n => {
+    n.removeAttribute('data-hermes-vault-slot');
+    n.removeAttribute('data-hermes-vault-aria-only');
+  });
   return JSON.stringify({ filled, selectedOptions, fieldResults });
 })()"""

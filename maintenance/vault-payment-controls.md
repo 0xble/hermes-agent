@@ -21,7 +21,13 @@ Each mutation/event and readback rechecks the exact inspection nonce/index,
 origin, and control liveness. ARIA popup readiness is bounded to ten 25ms DOM
 checks against the trigger's unique explicit association, with authority checked
 after every yield; nonce revocation prevents the option click, not just its
-receipt. Brand selection and final verification require a unique supported
+receipt. Combobox readback uses the native displayed value for input-backed
+controls, and rendered text for button-like triggers. Only a trigger that was
+textless at inspection may use `aria-valuetext`, bound to that inspection stamp;
+stale button values, hidden descendant text, selected popup options or ARIA state
+cannot override a visible placeholder, wrong expiry or cleared display.
+Post-click, final and verify-only checks share this authority rule. Brand selection
+and final verification require a unique supported
 visible option label, never a plausible opaque provider value. Duplicate,
 missing, unsupported, and conflicting labels remain missing without selection.
 Wrapping-label evidence excludes descendant widget state (button text and select

@@ -61,6 +61,16 @@ FILL_HELPERS = r"""
     const hits = options.filter(o => optionMatch(aria ? o.getAttribute('data-value') : o.value, f.value, f.token));
     return hits.length === 1 ? hits[0] : null;
   };
+  // Native input values are displayed state, even when empty. Button values
+  // and hidden text are not: rendered trigger text wins over stale ARIA state.
+  // Only an inspection-bound textless trigger may use its accessible value.
+  const comboboxMatches = (el, f) => {
+    if (['INPUT', 'TEXTAREA'].includes(el.tagName)) return optionMatch(el.value, f.value, f.token);
+    const text = norm(el.innerText);
+    if (text) el.removeAttribute('data-hermes-vault-aria-only');
+    const ariaOnly = el.getAttribute('data-hermes-vault-aria-only') === nonce + ':' + f.index;
+    return optionMatch(text || (ariaOnly ? el.getAttribute('aria-valuetext') : ''), f.value, f.token);
+  };
   const fillAria = async (el, f) => {
     if ((!f.token.startsWith('cc-exp') && f.token !== 'cc-type') || !usable(el, f) || !safeClick(el)) return false;
     const root = el.getRootNode(), role = el.getAttribute('role');
@@ -91,8 +101,7 @@ FILL_HELPERS = r"""
     await new Promise(resolve => setTimeout(resolve, 0));
     if (!bound()) return false;
     if (f.token === 'cc-type' && !optionMatch(option.textContent, f.value, f.token)) return false;
-    return option.getAttribute('aria-selected') === 'true' ||
-      [el.value, el.getAttribute('aria-valuetext'), el.textContent].some(t => optionMatch(t, f.value, f.token));
+    return role === 'listbox' ? option.getAttribute('aria-selected') === 'true' : comboboxMatches(el, f);
   };
 """
 
