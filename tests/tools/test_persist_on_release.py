@@ -190,7 +190,7 @@ def test_checkpoint_carries_persist_on_release():
 
 
 @pytest.mark.platforms("posix")
-def test_persist_on_release_local_spawn_is_file_backed_and_readable_after_readoption(tmp_path, monkeypatch):
+def test_persist_on_release_local_spawn_is_file_backed_and_readable_after_readoption(tmp_path, monkeypatch, registry):
     """A persisted job must not write into a pipe owned by the gateway that spawned it:
     once that gateway exits the next write raises BrokenPipeError and the re-adopted job
     dies. Its stdout/stderr go to a file-backed log that a successor can still read."""

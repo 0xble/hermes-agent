@@ -1908,7 +1908,7 @@ class TestSpawnEnvSanitization:
         fake_thread = MagicMock()
 
         with patch.dict(os.environ, {
-            "PATH": "/usr/bin:/bin",
+            "PATH": "/usr/bin:/bin", "HERMES_RUNTIME_DIR": os.environ["HERMES_RUNTIME_DIR"],
             "HOME": "/home/user",
             "USER": "tester",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
