@@ -43,6 +43,24 @@ after diff are recorded. A removal quote is rechecked under the commit lock so a
 newer user message cannot inherit stale authority. Starting another goal after
 completion retains the preceding goal's completion history.
 
+Removal names may be unquoted, including exact existing names beginning with
+negation or containing conditions. The parser binds the bounded complete existing
+item before evaluating instruction authority; `constraint`, `requirement`,
+`criterion` and `rule` are noun wrappers, not part of its identity. Case and
+terminal punctuation do not change the binding. An inclusive-scope suffix applies
+only to that same named removal and cannot authorize any other contract delta. Its
+scope phrases come from a closed allowlist (anywhere mentioned, everywhere, memory),
+so free-text qualifiers such as pending, while, for now or effective dates fail closed.
+Overlapping target interpretations, questions, negated/conditional instructions,
+examples, unrelated text and stale or synthetic messages still fail closed.
+Binding uses the staged pre-edit requirements and the same expected pre-edit
+snapshot under the writer lock; source provenance, current-input freshness and
+full-snapshot CAS remain unchanged. There is no historical replay bypass.
+The synthetic native regressions in `tests/hermes_cli/test_goal_removal_targets.py`
+retain multiple independent constraints, verification items and subgoals, and
+compare persisted goal bytes after refused edits. They cover the unquoted-name,
+noun-wrapper and inclusive-scope failure shapes without private transcript data.
+
 PR #781 owns preservation for the existing user-authorized replacement path.
 This patch leaves that draft's broader default-off behavior separate and extends
 the shared manager and payload normalizer only for autonomous edits.
