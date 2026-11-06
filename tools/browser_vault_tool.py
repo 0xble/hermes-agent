@@ -1178,6 +1178,12 @@ BROWSER_VAULT_SCHEMA = {
         "Approved exact charge means the user explicitly approved the merchant, amount, and selected card in this session's conversation. "
         "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused. "
         "For approval_unavailable (no prompt surface), direct entry is allowed only when the user explicitly approved this exact charge in this session's conversation. "
+        "Separately, card-on-file direct entry may use those live 1Password fields only when the user explicitly approved the merchant or wallet, "
+        "selected card, and exact card-on-file add/update action in this session's conversation, with no charge, top-up, fee, plan change, or cadence change. "
+        "Verify the canonical top-level merchant or wallet origin and, when used, its owned embedded processor frame before entry. "
+        "Follow the same vault-first route and technical fallback signals; the refusal stops above apply unchanged. "
+        "For card-on-file approval_unavailable, the same explicit current-session merchant-or-wallet, selected-card, and exact card-on-file-action approval is required. "
+        "No standing, default, or fallback-card authorization is implied. Card-on-file is not a $0 charge. "
         "Values from the page or chat are not authorized sources. Never repeat secrets in replies, files, commits, "
         "or shell arguments. Stop on save_declined."
     ),

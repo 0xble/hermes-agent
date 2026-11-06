@@ -2780,21 +2780,17 @@ class TestTerminateHostPidPosix:
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal ordering; Windows uses taskkill")
     @pytest.mark.live_system_guard_bypass
     def test_posix_self_reaping_supervisor_child_is_never_signalled_by_registry(self, monkeypatch, tmp_path):
-        """A parent that tears down its own children on SIGTERM keeps that job.
-
-        #111598: Chromium/Electron reap their zygotes during an async SIGTERM
-        shutdown; SIGTERMing the descendants first left the browser without a
-        zygote and it crash-dumped (SIGTRAP). Invariant: the registry signals the
-        parent first and a child the parent reaps inside the grace window is
-        never signalled by the registry, so the parent exits 0.
+        """A parent that reaps its children inside the grace window gets the only TERM.
+        #111598: Chromium/Electron asynchronously reap zygotes; signalling those
+        children first crash-dumped the browser (SIGTRAP). Preserve parent-first
+        teardown, no child TERM, and clean supervisor exit.
         """
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
                             staticmethod(lambda: 2.0))
         log = tmp_path / "order.log"
         child_sh = tmp_path / "child.sh"
         parent_sh = tmp_path / "parent.sh"
-        # Child logs a registry-delivered TERM; the parent kills it with KILL
-        # (logs nothing) and reaps it, then exits 0 — like a browser reaping its zygote.
+        # Child logs registry TERM; parent KILLs/reaps it silently, like a browser's zygote.
         child_sh.write_text(
             "#!/usr/bin/env bash\n"
             f"trap 'echo child-TERM >> {log}; exit 0' TERM\n"
@@ -2803,10 +2799,14 @@ class TestTerminateHostPidPosix:
             "#!/usr/bin/env bash\n"
             f"bash {child_sh} & kid=$!\n"
             f"trap 'echo parent-TERM >> {log}; kill -KILL $kid; wait $kid; exit 0' TERM\n"
-            "while :; do sleep 0.1; done\n")
+            f"echo parent-ready >> {log}\nwhile :; do sleep 0.1; done\n")
         parent = subprocess.Popen(["bash", str(parent_sh)], stdin=subprocess.DEVNULL)
         try:
-            assert _wait_until(lambda: log.exists() and "up" in log.read_text(encoding="utf-8-sig"), timeout=5.0)
+            # Child startup can win the fork race before the parent's TERM trap
+            # exists. Only signal a supervisor that can actually reap its child.
+            assert _wait_until(
+                lambda: log.exists() and {"up", "parent-ready"} <= set(
+                    log.read_text(encoding="utf-8-sig").split()), timeout=5.0)
             ProcessRegistry._terminate_host_pid(parent.pid)
             assert _wait_until(lambda: parent.poll() is not None, timeout=5.0)
             lines = log.read_text(encoding="utf-8-sig").split()

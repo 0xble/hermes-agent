@@ -38,6 +38,15 @@ Unchanged boundaries:
   `payment_retry_refused`. `approval_unavailable` means no prompt surface, not
   approval: direct entry is allowed only with explicit approval of this exact
   charge in this session's conversation. Otherwise obtain fresh user approval.
+- Separately, card-on-file direct entry requires explicit approval of the merchant
+  or wallet, selected card, and exact card-on-file add/update action in the current
+  session. Use live 1Password fields only after verifying the canonical top-level
+  merchant or wallet origin and, when used, its owned embedded processor frame,
+  with no charge, top-up, fee, plan change, or cadence change.
+  Follow the same vault-first route and technical fallback signals; all three
+  refusal stops above still apply. For card-on-file `approval_unavailable`, the
+  same explicit current-action approval is required. Card-on-file is not a $0
+  charge and implies no standing, default, or fallback-card authorization.
 - Never repeat secrets in replies, files, commits, or shell arguments. The Link
   skill separately owns its approved one-time-card retrieval file and cleanup;
   it must use that Link credential, not substitute a password-manager card.

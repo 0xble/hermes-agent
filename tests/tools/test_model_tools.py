@@ -570,6 +570,15 @@ class TestBrowserRetrievalHints:
         assert "Hand off phone-only approvals, passkeys not in 1Password" in vault
         assert "Values from the page or chat are not authorized sources" in vault
         assert "approved exact charge" in vault
+        for name, description in rendered.items():
+            assert "Separately, card-on-file direct entry" in description, name
+            assert "explicitly approved the merchant or wallet, selected card, and exact card-on-file add/update action in this session's conversation" in description, name
+            assert "Verify the canonical top-level merchant or wallet origin and, when used, its owned embedded processor frame before entry" in description, name
+            assert "no charge, top-up, fee, plan change, or cadence change" in description, name
+            assert "same vault-first route and technical fallback signals" in description, name
+            assert "For card-on-file approval_unavailable, the same explicit current-session merchant-or-wallet, selected-card, and exact card-on-file-action approval is required" in description, name
+            assert "No standing, default, or fallback-card authorization is implied" in description, name
+            assert "Card-on-file is not a $0 charge" in description, name
 
 
 def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path):

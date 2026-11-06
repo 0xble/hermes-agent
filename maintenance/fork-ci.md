@@ -87,6 +87,15 @@ but, on failure, reports per-profile request counts, heartbeat/success age, and
 canary job state (no prompts or keys) so the next missed fire can be attributed
 to enumeration, ticker liveness, claim, or execution instead of an opaque timeout.
 
+The real-process self-reaping-supervisor fixture waits for both the child's
+startup and a parent-ready marker written after its TERM trap is installed.
+A controlled FIFO hold after the fork reproduced the old fixture accepting
+child readiness alone: the actual registry delivered TERM before the handler
+existed and the supervisor exited -15. Holding that same point now keeps the
+readiness predicate false until release. Exit-zero and parent-only TERM
+assertions remain unchanged, as do production parent-first signalling, grace
+windows, worker counts and timeouts.
+
 Prompt-surface review keeps full commit ancestry for the merge-base comparison,
 but its checkout uses Git's `blob:none` partial-clone filter. Fetching every
 historical blob exhausted the job's 5-minute budget before review could run,

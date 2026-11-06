@@ -119,6 +119,45 @@ def test_card_fallback_never_routes_around_approval_refusal(name, code):
     assert "Approved exact charge means the user explicitly approved the merchant, amount, and selected card" in text
 
 
+def _descriptions():
+    from tools.browser_tool import BROWSER_TOOL_SCHEMAS
+    from tools.browser_use_cli import BROWSER_EXEC_SCHEMA
+    from tools.browser_vault_tool import BROWSER_VAULT_SCHEMA
+
+    browser_type = next(s for s in BROWSER_TOOL_SCHEMAS if s["name"] == "browser_type")
+    defs = [{"type": "function", "function": schema} for schema in
+            (browser_type, BROWSER_EXEC_SCHEMA, BROWSER_VAULT_SCHEMA,
+             {"name": "terminal", "description": "terminal"})]
+    return {d["function"]["name"]: d["function"]["description"]
+            for d in _apply_dynamic_schemas(defs)}
+
+
+@pytest.mark.parametrize("name", ["browser_type", "browser_exec", "browser_vault"])
+@pytest.mark.parametrize("destination", ["merchant", "wallet"])
+def test_card_on_file_requires_current_action_merchant_or_wallet_and_card_approval(name, destination):
+    text = _descriptions()[name]
+    assert "Separately, card-on-file direct entry" in text
+    approval = next(sentence for sentence in text.split(". ")
+                    if sentence.startswith("Separately, card-on-file direct entry"))
+    assert "explicitly approved the merchant or wallet, selected card, and exact card-on-file add/update action in this session's conversation" in approval
+    assert destination in approval
+    assert "Verify the canonical top-level merchant or wallet origin and, when used, its owned embedded processor frame before entry" in text
+    assert "no charge, top-up, fee, plan change, or cadence change" in text
+    assert "same vault-first route and technical fallback signals" in text
+    assert "No standing, default, or fallback-card authorization is implied" in text
+    assert "Card-on-file is not a $0 charge" in text
+
+
+@pytest.mark.parametrize("name", ["browser_type", "browser_exec", "browser_vault"])
+def test_card_on_file_missing_prompt_still_needs_current_action_approval(name):
+    text = _descriptions()[name]
+    assert "For card-on-file approval_unavailable, the same explicit current-session merchant-or-wallet, selected-card, and exact card-on-file-action approval is required" in text
+    assert "only when the user explicitly approved this exact charge in this session's conversation" in text
+    assert "Approved exact charge means the user explicitly approved the merchant, amount, and selected card" in text
+    assert "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused" in text
+    assert "no_payment_fields, a partial fill, missed fields, or a processor frame" in text
+
+
 def test_link_checkout_keeps_its_approved_one_time_card_source():
     text = (ROOT / "optional-skills/payments/stripe-link-cli/SKILL.md").read_text()
     retrieval = text.split("### 5.", 1)[1].split("### 7.", 1)[0]
