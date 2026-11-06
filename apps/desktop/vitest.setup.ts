@@ -1,6 +1,8 @@
 import { configure } from '@testing-library/react'
 import { afterAll } from 'vitest'
+import { afterEach } from 'vitest'
 
+import { clearPlaybackSourceCache } from './src/lib/playback-source-cache'
 import { InertResizeObserver } from './src/test/jsdom'
 
 // Radix defers unmount focus work to a timer. Drain it before Vitest replaces
@@ -85,3 +87,7 @@ if ('Element' in globalThis) {
 // as the 15s testTimeout above it while still finishing below it, so a
 // genuinely hung await still surfaces as this assertion, not a test timeout.
 configure({ asyncUtilTimeout: 12_000 })
+
+// Resolved stream URLs outlive a mount on purpose; a test file reusing one path must not
+// inherit the previous case's source.
+afterEach(() => clearPlaybackSourceCache())

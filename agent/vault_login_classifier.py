@@ -477,7 +477,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
-      .map((id) => { const n = element.getRootNode().getElementById(id); return n ? (n.textContent || "") : ""; })
+      .map((id) => { const r = element.getRootNode(); const n = (r.getElementById ? r.getElementById(id) : null) || document.getElementById(id); return n ? (n.textContent || "") : ""; })
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
     const container = containerFor(element);
@@ -574,7 +574,7 @@ _FILL_JS_TEMPLATE = """(() => {
         }
         if (opt) {
           el.value = opt.value;
-          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
           selectedOptions.push({ token: f.token, value: opt.value, label: opt.textContent });
           filled += 1;
         }
@@ -585,7 +585,7 @@ _FILL_JS_TEMPLATE = """(() => {
         const tokens = String(el.getAttribute("autocomplete") || "").toLowerCase().split(/\\s+/);
         const labels = Array.from(el.labels || []).map((l) => l.textContent).join(" ");
         const ariaText = (el.getAttribute("aria-labelledby") || "").split(/\\s+/).filter(Boolean)
-          .map((id) => { const n = el.getRootNode().getElementById(id); return n ? n.textContent : ""; }).join(" ");
+          .map((id) => { const r = el.getRootNode(); const n = (r.getElementById ? r.getElementById(id) : null) || document.getElementById(id); return n ? n.textContent : ""; }).join(" ");
         const purpose = [el.name, el.id, labels, el.getAttribute("aria-label"), ariaText, el.placeholder, el.title]
           .filter(Boolean).join(" ").normalize("NFKD").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
         const style = getComputedStyle(el);
@@ -598,8 +598,9 @@ _FILL_JS_TEMPLATE = """(() => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
       // one-time-code split into single-character boxes: f.value is the slice for THIS box (see build_otp_fills)
       if (setter && setter.set) { setter.set.call(el, f.value); } else { el.value = f.value; }
+      // composed: a component listening on its shadow host must see the value change too.
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
       if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
   }

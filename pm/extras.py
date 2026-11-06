@@ -62,6 +62,7 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "documents": ("docx", "pptx", "openpyxl", "pypdf", "pdfplumber", "pypdfium2", "lxml",
                   "pandas", "matplotlib", "bs4", "fontTools", "playwright.sync_api", "fitz",
                   "reportlab"),
+    "documents-pdf": ("pdfplumber", "pypdfium2"),
     "computer-use": "mcp",
     "trace-upload": "huggingface_hub",
     # Pillow resize recovery for vision tools (the `vision` extra is a no-op
@@ -344,8 +345,9 @@ def _core_anchor_keys(tree: Path, core: set[str]) -> set[str]:
 
 
 def _selection_from_trees(project_root: Path, trees: list[Path], *, include_all: bool) -> list[str]:
-    """Select extras from site-packages while excluding core-only anchors."""
+    """Select extras from site-packages while excluding core-only anchors and declined extras."""
     core = _declared_core_distributions(project_root)
+    refused = declined_extras(project_root)
     carried: set[str] = set()
     for tree in trees:
         if not tree.is_dir():
@@ -355,7 +357,7 @@ def _selection_from_trees(project_root: Path, trees: list[Path], *, include_all:
             # Umbrella extras share anchors with individual extras. Carry only
             # concrete extras, otherwise one telegram module selects the full
             # messaging bundle on the first replacement sync.
-            if extra in {"messaging", "voice", "wake"}:
+            if extra in {"messaging", "voice", "wake"} or extra in refused:
                 continue
             if not extra_supported(extra, importable=lambda _anchor: False):
                 continue
@@ -397,6 +399,106 @@ def _installed_in(site_packages: Path, anchor: str) -> bool:
     # A top-level module can be a plain file or a compiled extension.
     return any(entry.name.rsplit(".", 1)[-1] in {"py", "so", "pyd"}
                for entry in parent.glob(f"{leaf}.*"))
+
+
+DECLINED_EXTRAS_FILENAME = "declined-extras.json"
+
+
+def declined_extras_path(project_root: Path | None = None) -> Path:
+    from pm.environments import install_state_dir
+    from pm.paths import repo_root
+
+    return install_state_dir(repo_root() if project_root is None else Path(project_root)) / DECLINED_EXTRAS_FILENAME
+
+
+def declined_extras(project_root: Path | None = None) -> frozenset[str]:
+    """Extras the user dropped with ``hermes pm install --without NAME``.
+
+    Recorded beside the dependency facts, so a carried selection (legacy
+    migration, recorded extras, configured-feature auto-installs) never
+    re-adds one; only an explicit request (``--extra NAME``) opts back in.
+    """
+    import json
+
+    path = declined_extras_path(project_root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return frozenset()
+    except (OSError, ValueError) as exc:
+        # Reading a damaged record as "nothing declined" would re-add what the user removed.
+        from pm.package import InstallError
+
+        raise InstallError("venv", f"cannot read {path}: {exc}", "fix or delete the file, then retry") from exc
+    names = data.get("declined") if isinstance(data, dict) else None
+    return frozenset(_canonical(name) for name in names or () if isinstance(name, str))
+
+
+def record_declined_extras(*, add=(), remove=(), reasons: dict[str, str] | None = None,
+                           project_root: Path | None = None) -> frozenset[str]:
+    """Update the declined extras; returns the new set. Writes only on change.
+
+    *reasons* marks extras an update left out on its own (``pm.carried_extras``) with why,
+    so a later refusal names the cause instead of a ``--without`` the user never ran.
+    """
+    import json
+
+    from pm.filesystem import durable_write_bytes
+
+    current = declined_extras(project_root)
+    updated = (current | {_canonical(name) for name in add}) - {_canonical(name) for name in remove}
+    known = declined_reasons(project_root)
+    noted = {name: text for name, text in {**known, **{_canonical(name): " ".join(text.split())[:300]
+                                                          for name, text in (reasons or {}).items()}}.items()
+             if name in updated}
+    if updated != current or noted != known:
+        record: dict = {"schema": 1, "declined": sorted(updated)}
+        if noted:
+            record["left_out_by_update"] = dict(sorted(noted.items()))
+        durable_write_bytes(declined_extras_path(project_root), (json.dumps(record, indent=2) + "\n").encode("utf-8"))
+    return frozenset(updated)
+
+
+def declined_reasons(project_root: Path | None = None) -> dict[str, str]:
+    """Why an update left each automatically declined extra out (absent for a user's ``--without``)."""
+    import json
+
+    try:
+        data = json.loads(declined_extras_path(project_root).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}  # declined_extras() is the reader that refuses a damaged record
+    notes = data.get("left_out_by_update") if isinstance(data, dict) else None
+    return {name: text for name, text in (notes or {}).items() if isinstance(name, str) and isinstance(text, str)}
+
+
+def _canonical(name: str) -> str:
+    """The PEP 685 name uv matches an extra by (``foo_bar`` is ``foo-bar``)."""
+    import re
+
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def droppable_extras(project_root: Path) -> list[str]:
+    """Declared extras ``--without`` may drop: not ``all`` and nothing ``all`` pulls in.
+
+    The default sync selects ``[all]``, so dropping one of its members would be a no-op.
+    """
+    import re
+    import tomllib
+
+    with (Path(project_root) / "pyproject.toml").open("rb") as f:
+        project = tomllib.load(f).get("project", {})
+    table = project.get("optional-dependencies", {})
+    self_ref = re.compile(rf"^{re.escape(project.get('name', ''))}\[([^\]]+)\]", re.IGNORECASE)
+    kept, pending = {"all"}, ["all"]
+    while pending:
+        for requirement in table.get(pending.pop(), ()):
+            match = self_ref.match(requirement.replace(" ", ""))
+            for member in (match.group(1).split(",") if match else ()):
+                if member not in kept:
+                    kept.add(member)
+                    pending.append(member)
+    return sorted(extra for extra in table if extra not in kept)
 
 
 def legacy_selection(project_root: Path) -> list[str]:

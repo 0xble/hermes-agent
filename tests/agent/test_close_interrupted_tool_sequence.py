@@ -12,6 +12,8 @@ pin the helper's contract and prove the post-interrupt + next-user-message
 transcript is alternation-safe.
 """
 
+import pytest
+
 from agent.message_sanitization import close_interrupted_tool_sequence
 
 
@@ -56,13 +58,16 @@ def test_closing_makes_next_user_message_alternation_safe():
     assert "display_kind" not in bannered[-1]
 
 
-def test_local_diagnostic_from_early_abort_is_not_persisted_as_assistant_reply():
+@pytest.mark.parametrize("stopped", [False, True])
+def test_local_diagnostic_from_early_abort_is_not_persisted_as_assistant_reply(stopped):
     messages = _tool_tail()
-    close_interrupted_tool_sequence(messages, "Operation interrupted: handling API error (timeout).")
+    close_interrupted_tool_sequence(messages, "Operation interrupted: handling API error (timeout).", stopped=stopped)
     assert messages[-1]["content"] == (
         "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
     )
     assert messages[-1]["role"] == "assistant"
+    assert len(messages) == 4
+    assert messages[-1].get("display_metadata", {}) == ({"interrupted": True} if stopped else {})
 
 
 def test_real_partial_response_closes_tool_tail_unchanged():
@@ -86,3 +91,13 @@ def test_user_tail_is_left_untouched():
     assert close_interrupted_tool_sequence(messages, None) is False
     assert len(messages) == 1
 
+
+
+def test_only_an_interrupted_close_carries_the_stopped_mark():
+    """The closing row is the turn's last stored row: it alone tells a reopened transcript the turn was stopped."""
+    stopped = _tool_tail()
+    assert close_interrupted_tool_sequence(stopped, None, stopped=True) is True
+    assert stopped[-1]["display_metadata"] == {"interrupted": True}
+    truncated = _tool_tail()
+    assert close_interrupted_tool_sequence(truncated, "Response truncated.") is True
+    assert "display_metadata" not in truncated[-1]

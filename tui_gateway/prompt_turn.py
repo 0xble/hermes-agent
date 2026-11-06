@@ -26,8 +26,11 @@ def _bot_mode_delivery_text(response: Any, *, successful: bool) -> Any:
     Mode delivery boundary.  Failed turns intentionally fail open so their
     diagnostic text is never swallowed.
     """
-    from gateway.response_filters import is_intentional_silence_response
-    return "" if successful and is_intentional_silence_response(response) else response
+    from gateway.response_filters import is_intentional_silence_response, strip_edge_silence_markers
+    if not successful:
+        return response
+    delivered = strip_edge_silence_markers(response)
+    return "" if is_intentional_silence_response(delivered) else delivered
 
 
 def _silence_hidden_turn(session: dict, prompt: Any) -> bool:
@@ -777,6 +780,16 @@ def _restore_moa_one_shot(sid: str, session: dict) -> None:
         pending_moa.consume(session, token)
 
 
+def _sync_agent_daybreak(agent) -> None:
+    """``agent.daybreak`` for this turn, read inside the turn's profile scope once the final agent is selected,
+    so a build that raced a flip, a model switch and a compute-host child all take the saved value. Only the
+    owner's own surfaces carry it (agent.session_source.DAYBREAK_SOURCES): OpenAI allows no third-party use."""
+    from agent.session_source import DAYBREAK_SOURCES
+    if agent is not None:
+        agent.daybreak = (getattr(agent, "platform", None) in DAYBREAK_SOURCES
+                          and (_load_cfg().get("agent") or {}).get("daybreak") is True)
+
+
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str], queue_token: str | None = None):
     """Bind scopes, sync the agent, snapshot history, build the run message; returns
     ``(prompt, run_message, cols, streamer)`` or None when @-expansion was refused.
@@ -815,6 +828,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     _sync_bot_capabilities(sid, session)  # Bot Chat: adopt Settings->Capabilities edits
     _adopt_out_of_band_turns(session)
     st.agent = agent = session["agent"]
+    _sync_agent_daybreak(agent)
     # Snapshot after the model sync: a deferred switch's history mutation belongs to this turn.
     with session["history_lock"]:
         st.history = list(session["history"])
@@ -868,11 +882,9 @@ def _invoke_agent(
     ``text`` is the turn's raw submit, matched against the row staged by prompt.submit."""
     agent = st.agent
     st.compression_count = getattr(getattr(agent, "context_compressor", None), "compression_count", None)
-    # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
-    # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
-    # shown and then retracted (the client keeps streamed text when message.complete is "").
-    # Heartbeat and /loop wakeups ask for a bare [SILENT] on a no-change tick: hold it the same way.
-    hold = {"buf": "", "held": ""} if _silence_hidden_turn(session, prompt) else None
+    # Bot Chat and quiet wakeups withhold bare and closing markers before display or speech.
+    from gateway.response_filters import SilenceMarkerStreamHold
+    hold = SilenceMarkerStreamHold() if _silence_hidden_turn(session, prompt) else None
     loop_hold = {"text": "", "seen": ""}
     from gateway.copy_blocks import CopyMarkerStreamFilter
     copy_filter = CopyMarkerStreamFilter()
@@ -921,8 +933,7 @@ def _invoke_agent(
                 loop_hold["text"] = ""
             loop_hold["seen"] += delta
         if hold is not None and isinstance(delta, str):
-            from gateway.response_filters import hold_silence_delta
-            if not (delta := hold_silence_delta(hold, delta)):
+            if not (delta := hold.feed(delta)):
                 return
         if isinstance(delta, str):
             # Control markers are already withheld here; speech then drops copy bodies and
@@ -976,6 +987,10 @@ def _invoke_agent(
         from agent.notification_presentation import notification_turn, event_presentation_muted
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
             st.result = agent.run_conversation(run_message, **st.run_kwargs)
+            if hold is not None and (rest := hold.finish()) and not getattr(agent, "_mute_notification_reply", False):
+                _speak(rest)
+                if visible := copy_filter.feed(rest):
+                    _deliver_delta(visible)
             if copy_tail := copy_filter.flush():
                 _deliver_delta(copy_tail)
             if st.tts_queue is not None and (spoken_tail := speech_filter.flush()):
@@ -1058,6 +1073,8 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         except Exception:
             _error_surface = None
     raw, status, last_reasoning = _turn_outcome(result, _error_surface)
+    # The receipt binds the stored model text, not the filtered delivery copy.
+    receipt = _persisted_turn_receipt(st, raw, status)
     delivered = raw
     if _silence_hidden_turn(session, st.prompt_text):
         delivered = _bot_mode_delivery_text(raw, successful=status == "complete")
@@ -1067,7 +1084,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     # The TUI shows one message per turn, so copy blocks render inline without markers.
     visible_raw = render_copy_blocks_inline(strip_trailing_loop_complete_marker(delivered))
     payload = {"text": visible_raw, "usage": _get_usage(agent), "status": status}
-    if receipt := _persisted_turn_receipt(st, raw, status):
+    if receipt:
         payload["persisted_turn"] = receipt
     if last_reasoning:
         payload["reasoning"] = last_reasoning
@@ -1204,7 +1221,7 @@ def _post_turn_housekeeping(sid: str, session: dict, st: _TurnRun) -> None:
         from hermes_cli.mem_trim import trim_memory
         # Every OTHER session must be idle (#58576).
         if _sessions_quiescent(exclude=sid):
-            trim_memory(reason="tui turn completion")
+            trim_memory(reason="tui turn completion", collect=False)
     except Exception:
         logger.debug("post-turn memory trim failed", exc_info=True)
     if st.scopes.home is not None:
@@ -1286,6 +1303,10 @@ def _run_prompt_submit(
         "kind=%s chars=%s images=%d",
         sid, session.get("session_key") or "", getattr(agent, "session_id", "") or "",
         display_kind or "user", len(text) if isinstance(text, str) else "-", len(images))
+    # The turn's wire identity: _emit stamps its message.* frames from it (stream_segments.py), so the
+    # frames are the same here and in a compute-host child; dropped in run_body's finally.
+    from tui_gateway.stream_segments import SESSION_KEY, TurnSegments  # bound functions run in server's globals
+    session[SESSION_KEY] = segments = TurnSegments()
     if not muted:
         _emit("message.start", sid)
 
@@ -1351,6 +1372,8 @@ def _run_prompt_submit(
                     if not st.error_retained:
                         _clear_inflight_turn(session)
                     _release_hosted_room_turn_slot(session)
+                    if session.get(SESSION_KEY) is segments:
+                        session.pop(SESSION_KEY)
                 # Closing bookend of "tui prompt accepted" — exactly one per accepted prompt.
                 # agent.session_id is re-read because compression may have rotated it (an
                 # accepted/finished pair whose id changed IS a rotation trace).
@@ -1399,6 +1422,8 @@ def _run_prompt_submit(
     if not can_start:
         with session["history_lock"]:
             session["running"] = False
+            if session.get(SESSION_KEY) is segments:
+                session.pop(SESSION_KEY)
     return can_start
 
 

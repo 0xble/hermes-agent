@@ -56,8 +56,13 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     """Return chat text, failure reason and retryability for pre-turn resolution failures."""
     from agent.error_classifier import FailoverReason
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.runtime_provider_custom import LocalRuntimeUnavailableError
     from hermes_state_runtime import RuntimeStoreError
     auth_permanent = FailoverReason.auth_permanent.value
+    if isinstance(exc, LocalRuntimeUnavailableError):
+        # The chosen model is configured; its local server is down. Not a credential verdict, so
+        # the client must not offer "Update API key" or sign-in: the sentence names the fix.
+        return f"⚠️ {exc}", exc.error_code, exc.retryable
     if isinstance(exc, RuntimeStoreError) and exc.reason == 'launch_credentials_unavailable':
         # The session's launch key is gone (a restart revoked a CLI --api-key, a route key changed):
         # the shared refusal copy names /new, never a resend.
@@ -159,8 +164,19 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
     def _publish_execution(self, event_type, payload):
         if self._approval_owner is not None:
             authority, session_id, generation = self._approval_owner
-            return authority.publish_execution(session_id, generation, event_type, payload)
+            return authority.publish_execution(
+                session_id, generation, event_type, self._stamp_segment(generation, event_type, payload))
         return False
+
+    def _stamp_segment(self, generation, event_type, payload):
+        """The turn's wire identity on its reply frames (tui_gateway/stream_segments.py), so a viewer
+        upserts a re-sent delta or seal instead of painting a second copy (#144609). The same
+        stamping rule as tui_gateway's ``_emit``, with one cursor per execution generation."""
+        from tui_gateway.stream_segments import TurnSegments, stamp_reply_frame
+        segments = getattr(self, "_segments", None)
+        if segments is None or segments[0] != generation:
+            segments = self._segments = (generation, TurnSegments())
+        return stamp_reply_frame(segments[1], event_type, payload)
 
     def _publish_api_tool(self, event_type, call_id, tool_name, args, result=None):
         if self._approval_owner is not None:
@@ -833,7 +849,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         sync worker thread; hop onto the gateway loop. Fired-once latch lives on the cached agent."""
         from gateway.run import render_notice_line
         from gateway.warning_notifications import is_diagnostic_notice, render_notification
-        if self._ctx.mute_notification_reply or not self._status_live():
+        from gateway.bot_peer_notices import automatic_notices_allowed
+        if self._ctx.mute_notification_reply or not self._status_live() or not automatic_notices_allowed(self._ctx.source):
             return
         # A usage-window limit line repeats the turn's own reply, which carries the sentence and the
         # switch button (a chat message cannot be cleared, so it would only pile up). The 90% heads-up
@@ -1148,6 +1165,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         from agent.fast_mode import set_gateway_fast_expiry_state
         set_gateway_fast_expiry_state(agent, expiry_at, runner._service_tier)
         agent._pre_fallback_reasoning_override = None  # a live pick supersedes a set-aside one
+        _load_daybreak = getattr(runner, "_load_daybreak", None)  # absent on minimal test runners
+        agent.daybreak = callable(_load_daybreak) and _load_daybreak(ctx.source) is True
         self._merge_turn_request_overrides(agent, turn_route)
         from gateway.session_surface import arm_surface_turn
         arm_surface_turn(agent, runner._consume_pending_turn_sidecar_notes(ctx.session_key), voice_turn=ctx.voice_turn)
@@ -1402,7 +1421,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         self._close_native_stream_boundary("Approval")
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
-        desc = approval_data.get("description") or ea_default_reason_text()
+        desc = _redact_approval_command(approval_data.get("description")) or ea_default_reason_text()
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
@@ -1410,7 +1429,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
                 fut = self._schedule(
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        description=desc, metadata=ctx._status_thread_metadata,
+                        request_id=approval_data.get("request_id"), **flags,
                     ),
                     "send_exec_approval scheduling error",
                 )
@@ -1707,8 +1727,16 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx), scoped_turn_message(ctx.source, ctx.inbound_message_id or getattr(ctx.source, "message_id", None)), reaction_acknowledgement():
-                result = agent.run_conversation(api_message, **kwargs)
-                result["acknowledged_by_reaction"] = current_message_reaction_acknowledged()
+                from gateway.response_filters import silence_allowed
+                # Where a bare marker would become the "needed a reply" warning, the agent ends a
+                # marker that follows a written reply on that reply, before transform/persistence.
+                agent._silence_marker_needs_reply = not silence_allowed(
+                    ctx.persist_user_display_kind, ctx.reply_expected)
+                try:
+                    result = agent.run_conversation(api_message, **kwargs)
+                    result["acknowledged_by_reaction"] = current_message_reaction_acknowledged()
+                finally:
+                    agent._silence_marker_needs_reply = False
             if captured is not None:
                 incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])

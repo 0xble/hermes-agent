@@ -8,7 +8,7 @@ import pytest
 
 from gateway.session import SessionSource
 from gateway.session_authority import LiveSession, SessionAuthority
-from gateway.session_contract import Principal, SessionRef, Submission
+from gateway.session_contract import SessionActor, SessionRef, Submission
 from gateway.config import Platform
 from hermes_state import SessionDB
 from hermes_state_runtime import RuntimeStoreError, admit_session_input, claim_session_input, list_session_admissions, settle_session_input
@@ -54,7 +54,7 @@ async def test_client_cannot_submit_private_operator_provenance(tmp_path):
         authority._publish_pending = lambda ref: None
         authority._schedule = lambda ref: None
 
-        actor = Principal(
+        actor = SessionActor(
             "authenticated-viewer", "default", frozenset({"session:submit"}), "viewer")
         with pytest.raises(RuntimeStoreError) as caught:
             await authority.submit(

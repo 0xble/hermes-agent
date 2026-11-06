@@ -21,3 +21,27 @@ def test_profile_serve_signature_changes_on_replacement_with_pinned_mtime(tmp_pa
     assert (cfg.stat().st_mtime_ns, cfg.stat().st_size) == (st.st_mtime_ns, st.st_size)
     assert cfg.stat().st_ino != st.st_ino
     assert profile_serve_signature(tmp_path) != before
+
+
+def test_profile_serve_signature_follows_the_config_backend_version(tmp_path, monkeypatch):
+    """Remote Config (#122509): a remote layer changes with no local config.yaml change, so the
+    signature must come from the config backend's version, not a stat of the local file."""
+    from hermes_cli import config_backend
+
+    class _Backend:
+        name = "remote"
+        version_now = ("etag-1",)
+
+        def version(self, home):
+            return self.version_now
+
+        def supports_file_tooling(self):
+            return False
+
+    backend = _Backend()
+    monkeypatch.setattr(config_backend, "get_config_backend", lambda: backend)
+    before = profile_serve_signature(tmp_path)
+    assert profile_serve_signature(tmp_path) == before
+    backend.version_now = ("etag-2",)
+    assert not (tmp_path / "config.yaml").exists()
+    assert profile_serve_signature(tmp_path) != before

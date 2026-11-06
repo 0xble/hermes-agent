@@ -197,7 +197,7 @@ async def _local(tmp_path, monkeypatch):
     from gateway.run import GatewayRunner
     from gateway.session_authority import SessionAuthority
     from tests.fakes.runtime_owner import initialize_session_authority
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_local import create_local_session
     from hermes_state import AsyncSessionDB, SessionDB
 
@@ -208,7 +208,7 @@ async def _local(tmp_path, monkeypatch):
     runner.session_store._db = db
     runner._session_db = AsyncSessionDB(db)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='lc7', db=db)
-    actor = Principal('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}),
+    actor = SessionActor('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}),
                       'fixture')
     ref = create_local_session(authority, actor, dict(request_id='lc7', source='cli', model='fixture', toolsets=[]))
     return runner, authority, ref, actor

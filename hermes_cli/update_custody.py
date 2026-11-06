@@ -14,7 +14,8 @@ can still write the checkout, and must NOT leak into processes that outlive the 
   needs as a child holding the fd (and start the daemon under it), so before a move the objects
   are fetched without the fd and with the user's helpers (:func:`_prefetch_for_move`); a lazy
   fetch the prefetch missed still runs, just without a helper. A killed fetch that leaves
-  ``*.lock`` ref files is recovered by the stale-lock rules (``gitlock.clear_stale_git_locks``).
+  ``*.lock`` ref files or ``shallow.lock`` is recovered by the stale-lock rules (``gitlock.release_dead_fetch_locks``
+  once its update is proven dead, ``gitlock.clear_stale_git_locks`` by age otherwise).
 * Windows has no fd inheritance: while this process holds (or joined) the checkout lock, every
   child started here is created SUSPENDED, assigned to the update's kill-on-close job and only
   then resumed, so it and everything it spawns die with the lock owner. The Node build goes
@@ -328,22 +329,19 @@ def run_git(git_cmd: Sequence[str], args: Sequence[str], **kwargs) -> subprocess
     mutator = is_local_mutator(argv[1:])
     if mutator:
         _prefetch_for_move(list(git_cmd), list(args), kwargs)
-    elif git_subcommand(argv[1:]) in _FD_LESS_REF_WRITERS and sys.platform != "win32" \
-            and _held() is not None and "preexec_fn" not in kwargs and _death_signal_preexec() is None:
-        return _run_owner_watched(argv, kwargs)
+    if sys.platform != "win32" and _held() is not None and "preexec_fn" not in kwargs \
+            and _death_signal_preexec() is None:
+        # No parent-death signal (macOS): the tree runner owns git AND the helpers it starts. A
+        # local mutator holds the lock fd and finishes its write if the owner dies, as on Linux.
+        return _run_owner_watched(argv, _custody_kwargs(mutator, kwargs), watch_owner=not mutator)
     return run(argv, inherit_lock=mutator, **kwargs)
 
 
-# git commands that write refs WITHOUT the lock fd (m3: their network half must not hold it). On
-# Linux the parent-death signal ends one whose owner died; where there is none (macOS) a watchdog
-# does (R3), or it would go on rewriting refs and leave live `*.lock` files under the next owner.
-_FD_LESS_REF_WRITERS = frozenset({"fetch"})
-
 # The watchdog: stdin is a pipe only the owner writes, plus the child's own pid line (written by
 # the child itself between fork and exec). A byte after the pid = the child finished; EOF with no
-# byte = the owner died (the kernel closed its end), so SIGKILL the child, as PR_SET_PDEATHSIG
-# would. EOF before any pid = no child started: nothing to watch. It holds no lock fd and runs in
-# its own session (a terminal's ^C/hang-up is the owner's).
+# byte = the owner died (the kernel closed its end), so SIGKILL the child's whole process group.
+# EOF before any pid = no child started: nothing to watch. It holds no lock fd and runs in its
+# own session (a terminal's ^C/hang-up is the owner's).
 _OWNER_WATCH = (
     "import os, signal, sys\n"
     "data = b''\n"
@@ -355,7 +353,7 @@ _OWNER_WATCH = (
     "pid, done = data.split(b'\\n', 1)\n"
     "if not done and not os.read(0, 1):\n"
     "    try:\n"
-    "        os.kill(int(pid), signal.SIGKILL)\n"  # windows-footgun: ok -- POSIX only (run_git gates win32 out)
+    "        os.killpg(int(pid), signal.SIGKILL)\n"  # windows-footgun: ok -- POSIX only (run_git gates win32 out)
     "    except OSError:\n"
     "        pass\n"
 )
@@ -371,6 +369,7 @@ def _owner_watch():
     read_end, write_end = os.pipe()  # non-inheritable: open in the forked child only until exec
     try:
         watcher = subprocess.Popen([sys.executable, "-I", "-S", "-c", _OWNER_WATCH], stdin=read_end,
+                                   # detached-spawn: ok — must outlive the owner to kill its fetch group
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as exc:
         os.close(write_end)
@@ -396,17 +395,55 @@ def _owner_watch():
     return announce, dismiss
 
 
-def _run_owner_watched(argv: Sequence[str], kwargs: dict) -> subprocess.CompletedProcess:
-    """:func:`run` for an fd-less ref writer, under :func:`_owner_watch` while it runs. The child
-    still starts through ``run`` (off Windows: ``subprocess.run``), the one spawn seam."""
-    watch = _owner_watch()
-    if watch is None:
-        return run(argv, **kwargs)
-    announce, dismiss = watch
-    try:
-        return run(argv, preexec_fn=announce, **kwargs)
-    finally:
-        dismiss()
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """SIGKILL ``proc``'s process group: the child leads it (``start_new_session``), and while it
+    is unreaped its pid, hence the group id, cannot be reused. Once reaped (``communicate`` reaps
+    on a Ctrl-C inside its wait window) the id may already name another session, so it is never
+    signalled; ``returncode`` is read, not ``poll()``ed, since polling would reap a live zombie
+    and skip the helpers a timed-out git leaves running."""
+    import os
+    import signal
+
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(OSError):  # already gone
+        os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX only (run_git gates win32 out)
+
+
+def _run_owner_watched(argv: Sequence[str], kwargs: dict, *, watch_owner: bool = True) -> subprocess.CompletedProcess:
+    """``subprocess.run`` for updater git where no parent-death signal exists, under
+    :func:`_owner_watch` while it runs. git leads a session of its own, so a timeout, a cancel or
+    the owner's death ends its helpers with it, not git's pid alone (#144439)."""
+    input, timeout = kwargs.pop("input", None), kwargs.pop("timeout", None)
+    check = kwargs.pop("check", False)
+    if input is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    if kwargs.pop("capture_output", False):
+        kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
+    with contextlib.ExitStack() as cleanup:
+        watch = _owner_watch() if watch_owner else None
+        if watch is not None:
+            kwargs["preexec_fn"] = watch[0]
+            cleanup.callback(watch[1])
+        # detached-spawn: ok — awaited; the watcher kills a fetch group on owner death, mutators finish their write
+        with subprocess.Popen(list(argv), start_new_session=True, **kwargs) as proc:
+            try:
+                stdout, stderr = proc.communicate(input, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                _kill_tree(proc)
+                try:
+                    exc.stdout, exc.stderr = proc.communicate(timeout=_DRAIN_SECONDS)
+                except subprocess.TimeoutExpired:
+                    # A helper escaped the group and still holds a pipe: leave it to the reader threads.
+                    proc.stdin = proc.stdout = proc.stderr = None
+                raise
+            except BaseException:
+                _kill_tree(proc)
+                raise
+            code = proc.poll()
+    if check and code:
+        raise subprocess.CalledProcessError(code, proc.args, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(proc.args, code, stdout, stderr)
 
 
 def _partial_clone(git_cmd: Sequence[str], kwargs: dict) -> bool:

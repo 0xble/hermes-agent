@@ -114,7 +114,8 @@ def retire_expired_oneshot(d) -> bool:
     # Dead/expired claims cannot pin its record, but local live runners must keep it.
     if occurrence_started(d.job, now=d.scan.now):
         if not in_flight:
-            jobs._write_retired_oneshot_diagnostic(d.job, d.next_run)
+            from cron.jobs_oneshot_diagnostics import write_retired
+            write_retired(d.job, d.next_run)
             d.scan.retire(d.job["id"])
             d.scan.on_saved.append(lambda job=d.job: jobs.record_cron_missed(job))
         return True

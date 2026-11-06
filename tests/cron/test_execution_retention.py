@@ -27,7 +27,7 @@ def _seed(executions, *, count, claimed_at, finished_at):
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, status, claimed_at, finished_at)
                VALUES (?, 'audit', 'builtin', 'seed', 1, ?, ?, ?)""",
-            ((f"seed-{index:04}", ("completed", "failed", "unknown")[index % 3],
+            ((f"seed-{index:04}", ("completed", "failed", "unknown", "cancelled", "missed")[index % 5],
               claimed_at, finished_at) for index in range(count)),
         )
 
@@ -35,7 +35,7 @@ def _seed(executions, *, count, claimed_at, finished_at):
 def _count(executions):
     with executions._transaction() as conn:
         return conn.execute(
-            "SELECT COUNT(*) FROM executions WHERE status IN ('completed','failed','unknown')"
+            "SELECT COUNT(*) FROM executions WHERE status IN ('completed','failed','unknown','cancelled','missed')"
         ).fetchone()[0]
 
 

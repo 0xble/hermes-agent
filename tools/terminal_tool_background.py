@@ -55,8 +55,8 @@ _AUTO_BACKGROUND_NOTE = (
 
 _ASYNC_UNSUPPORTED_NOTE = (
     'notify_on_complete / watch_patterns are not available in this session — it cannot receive '
-    'an async completion after the turn ends (a one-shot runner such as `hermes -z`, a cron '
-    'job, a Kanban worker, or a stateless HTTP endpoint). The process is running in the '
+    'an async completion after the turn ends (a one-shot runner such as `hermes -z`, a /bg '
+    'background task, a cron job, a Kanban worker, or a stateless HTTP endpoint). The process is running in the '
     "background; retrieve its result with process(action='poll') or process(action='wait')."
 )
 
@@ -102,7 +102,8 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
-            survive_restart=survive_restart, **common)
+            survive_restart=survive_restart,
+            restore_login_path=True, **common)
     return process_registry.spawn_via_env(env=env, **common)
 
 

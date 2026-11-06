@@ -22,6 +22,7 @@ from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
     _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
+from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_tool_copy_sql
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_identity import (
@@ -924,6 +925,9 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         platform_message_id, token counts, reasoning sidecars all survive byte-exact, and the FTS triggers
         index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
+        A tail row that *compacted_messages* already carries (the compressor held it, and it was flushed
+        above the watermark or left unnamed) is not cloned: the carried copy is its one live row and the
+        original takes rewind flags (#137197).
         """
         # The display re-fold's history read happens here, before the writer lock (see _display_fold_plan).
         fold_plan = self._display_fold_plan(session_id)
@@ -944,16 +948,24 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             self._message_columns_cache = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
         return self._message_columns_cache
 
-    def set_user_message_content(self, session_id: str, row_id: int, content: Any) -> int:
+    def set_user_message_content(self, session_id: str, row_id: int, content: Any,
+                                 display_metadata: Optional[dict[str, Any]] = None) -> int:
         """Rewrite the content of ONE known active user row. Used when a user turn was written at submit
         time (before the agent ran) and the turn prologue then rewrote the prompt it persists (@-file
-        expansion, native image parts): the early row must show what the transcript will replay, not the
-        raw keystrokes, and the turn must not append a second row for the same input."""
+        expansion, native image parts, a ``pre_llm_call`` veto's placeholder): the early row must show what
+        the transcript will replay, not the raw keystrokes, and the turn must not append a second row for
+        the same input. ``display_metadata``, when given, replaces the row's (and clears ``api_content``)."""
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
+        if display_metadata is None:
+            return self._write_rowcount(
+                f"UPDATE messages SET content = ? WHERE {_VISIBLE_MESSAGE_SQL} AND id = ? AND session_id = ? AND role = 'user' AND active = 1",
+                (self._encode_content(content), row_id, session_id), session_ids=(session_id,))
         return self._write_rowcount(
-            f"UPDATE messages SET content = ? WHERE {_VISIBLE_MESSAGE_SQL} AND id = ? AND session_id = ? AND role = 'user' AND active = 1",
-            (self._encode_content(content), row_id, session_id), session_ids=(session_id,))
+            "UPDATE messages SET content = ?, api_content = NULL, display_metadata = ? "
+            f"WHERE {_VISIBLE_MESSAGE_SQL} AND id = ? AND session_id = ? AND role = 'user' AND active = 1",
+            (self._encode_content(content), self._encode_display_metadata(display_metadata), row_id, session_id),
+            session_ids=(session_id,))
 
     def deactivate_message(self, session_id: str, row_id: int) -> int:
         """Deactivate ONE known row (id-addressed, idempotent; returns the affected row count). Used by
@@ -1051,8 +1063,9 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         removed: dict[Any, bool] = {}  # copy identity -> its newest copy is removed (rows come in id order)
         identities: dict[tuple[Any, ...], list[Any]] = {}
         removed_ts: set[Any] = set()
+        rows = rows if isinstance(rows, list) else list(rows)
+        later_copies = later_tool_copy_ids(self, rows)  # a compacted tool result paints once, as its original
         if drop_removed:
-            rows = rows if isinstance(rows, list) else list(rows)
             # Every display key carries the row's timestamp third, so a live row can share a removed row's identity
             # only at one of the removed rows' timestamps; hash just those (a sha256 per live row cost a warm
             # 30k-row resume ~0.17 s, RT-39). No removed row at all: nothing can hide a copy.
@@ -1072,7 +1085,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
                 removed.update(dict.fromkeys(copies, gone))
                 if gone:
                     continue
-            if self._is_model_only_row(row):
+            if self._is_model_only_row(row) or row["id"] in later_copies:
                 continue
             key = key or self._display_dedupe_key(row)
             # Only the summary carrier folds by uid: other rewritten copies (a pruned tool stub) must keep
@@ -1185,7 +1198,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         return conn.execute(
             f"""WITH page AS (
                    SELECT display_order FROM messages
-                   WHERE {_VISIBLE_MESSAGE_SQL} AND session_id = ? AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}
+                   WHERE {_VISIBLE_MESSAGE_SQL} AND session_id = ? AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}{not_a_later_tool_copy_sql("messages")}
                    GROUP BY display_order ORDER BY display_order {direction}
                    LIMIT ? OFFSET ?
                )
@@ -1194,7 +1207,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
                    SELECT candidate.id FROM messages AS candidate
                    WHERE candidate.session_id = ?
                      AND candidate.display_order = page.display_order
-                     AND (candidate.active = 1 OR candidate.compacted = 1){DISPLAY_VISIBLE_SQL}
+                     AND (candidate.active = 1 OR candidate.compacted = 1){DISPLAY_VISIBLE_SQL}{not_a_later_tool_copy_sql("candidate")}
                    ORDER BY candidate.active DESC, candidate.id DESC LIMIT 1
                )
                ORDER BY page.display_order ASC""",
@@ -1207,7 +1220,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         backfills them), so the count is zero exactly when the read paints nothing."""
         row = self._read_one(
             "SELECT COUNT(*) FROM (SELECT DISTINCT display_order FROM messages"
-            f" WHERE {_VISIBLE_MESSAGE_SQL} AND session_id = ?{_DISPLAY_ACTIVE_CLAUSE}{DISPLAY_VISIBLE_SQL})", (session_id,))
+            f" WHERE {_VISIBLE_MESSAGE_SQL} AND session_id = ?{_DISPLAY_ACTIVE_CLAUSE}{DISPLAY_VISIBLE_SQL}"
+            f"{not_a_later_tool_copy_sql('messages')})", (session_id,))
         return int(row[0])
 
     def _display_messages_from_conn(self, conn, session_id: str) -> Optional[list[dict[str, Any]]]:
@@ -1488,7 +1502,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         and would break tool-call adjacency). ``with_compacted``: the display set (``active_clause`` is
         ignored) with the ``compacted`` column, plus the removed rows' identities for ``drop_removed``."""
         rows = self._read_conversation_all(
-            f"SELECT {'session_id, ' if with_session_id else ''}{'compacted, ' if with_compacted else ''}"
+            f"SELECT {'session_id, ' if with_session_id or with_compacted else ''}{'compacted, display_order, ' if with_compacted else ''}"
             f"{self._CONVERSATION_ROW_COLUMNS} "
             f"FROM messages WHERE session_id IN ({_placeholders(session_ids)}) AND {_VISIBLE_MESSAGE_SQL}"
             f"{_DISPLAY_ACTIVE_CLAUSE if with_compacted else active_clause} ORDER BY {'+id' if active_clause == ' AND active = 1' and not with_compacted else 'id'}", tuple(session_ids), resident_only=resident_only)

@@ -11,7 +11,7 @@ from agent.notice_style import ContextNotice
 
 from dataclasses import dataclass
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from agent.message_metadata import append_message
 from agent.reasoning_promotion import answer_in_reasoning_capability
@@ -19,7 +19,9 @@ from agent.reasoning_summaries import is_responses_reasoning_summary
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.stream_delivery import publish_held_final_row
 from agent.turn_failure_copy import stamp_failure
-from agent.turn_empty_response import recover_empty_response
+from agent.turn_empty_response import (
+    housekeeping_reply_line, recover_empty_response, take_housekeeping_reply_line,
+)
 from agent.turn_stop_gates import apply_stop_gates
 from agent.turn_truncation import partial_result, repetition_copy
 
@@ -94,6 +96,39 @@ def _is_contentless_stop(assistant_message: Any, finish_reason: Any) -> bool:
     content = assistant_message.content
     return (finish_reason == "stop" and not assistant_message.tool_calls
             and (content is None or (isinstance(content, str) and not content.strip())))
+
+
+def _bare_marker_after_reply(agent: Any, final_response: Any, *, truncated_parts: Any = None,
+                             promoted: Any = None) -> bool:
+    """End this turn on the reply written beside a housekeeping round instead of its bare marker:
+    only when the host says a marker may not stay silent (``_silence_marker_needs_reply``), for a
+    complete uninterrupted response, and only when a real (non-marker) reply line exists."""
+    from gateway.response_filters import is_intentional_silence_response
+
+    if (getattr(agent, "_silence_marker_needs_reply", False) is not True or truncated_parts or promoted
+            or getattr(agent, "_interrupt_requested", False)):
+        return False
+    reply = housekeeping_reply_line(agent)
+    return (bool(reply) and not is_intentional_silence_response(reply)
+            and is_intentional_silence_response(agent._strip_think_blocks(final_response or "").strip()))
+
+
+def _recover_marker_reply(
+    agent: Any, final_response: Any, verdict: Callable[[str], FinalResponseVerdict], *,
+    truncated_parts: Any, promoted: Any,
+) -> Optional[FinalResponseVerdict]:
+    """Select a completed housekeeping reply before output transforms and persistence.
+
+    Keep the caller's loop state, changing only the chosen final and its exit reason.
+    Other hosts and permitted silence continue through normal text handling.
+    """
+    if not _bare_marker_after_reply(agent, final_response, truncated_parts=truncated_parts, promoted=promoted):
+        return None
+    result = verdict("break")
+    result.final_response = take_housekeeping_reply_line(agent)
+    result._turn_exit_reason = "fallback_prior_turn_content"
+    logger.info("Silence marker after a written reply: using that reply as the final response")
+    return result
 
 
 def _absorb_continuation_fragments(final_response: Any, parts: Any, messages: Any) -> tuple[Any, bool]:
@@ -218,11 +253,7 @@ def finish_text_response(
         active_system_prompt = _ev.active_system_prompt
         _preflight_compression_blocked = _ev.preflight_compression_blocked
         api_call_count = _ev.api_call_count
-        if _ev.action == "return":
-            return _verdict("return", _ev.result)
-        if _ev.action == "break":
-            return _verdict("break")
-        return _verdict("continue")
+        return _verdict(_ev.action, _ev.result)
 
     agent._empty_content_retries = 0
     agent._thinking_prefill_retries = 0
@@ -230,6 +261,10 @@ def finish_text_response(
     # provider/model switch stays visible on success.
     agent._emit_pending_fallback_notice()
     agent._clear_status_buffer()
+
+    if marker_verdict := _recover_marker_reply(
+            agent, final_response, _verdict, truncated_parts=truncated_response_parts, promoted=_promoted):
+        return marker_verdict
 
     # Defensive: repair malformed role-alternation before API call. Catches cases where the history got
     # wedged into a ``tool → user`` or ``user → user`` tail (e.g. after empty- response scaffolding was

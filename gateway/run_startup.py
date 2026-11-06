@@ -38,6 +38,7 @@ from gateway.restart import (
 #: restartable exit introduces: a permanently dead backend looping forever unnoticed.
 _TRANSIENT_EXIT_STREAK_LIMIT = 5
 from gateway.run_shutdown import _log_suppressed, _send_error
+from hermes_cli.observability.shared_metrics_busy import note_running_chat_owner
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
@@ -781,6 +782,12 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
+        # Canonical admissions, including paused unknown outcomes, own their restart decisions.
+        # This snapshot already runs off-loop, so its FIFO ownership probes do too.
+        from gateway.session_authorities import all_authorities, holds_admission
+        authorities = all_authorities(self)
+        candidates[:] = [entry for entry in candidates
+                         if not any(holds_admission(authority, entry.session_id) for authority in authorities)]
         # Only boots with restart-interrupted sessions count. Shutdown stamps one-shot planned
         # intent after draining; recent chat/home notification markers remain a fallback.
         # The guard gives the first planned boot one chain-local allowance; repeated planned boots count.
@@ -1014,8 +1021,9 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
+            decision = await self.async_session_store.get_session_metadata(key, "room_silence_decision", {})
             text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                          started, origin)
+                                          started, origin, silence_decision=decision, active_token=token)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
@@ -1060,7 +1068,9 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                 owed.append((ref, content))
         return owed
 
-    def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
+    def _crash_left_reply(
+        self, history: list, started: float, origin, *, silence_decision=None, active_token=None,
+    ) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
         persisted a final reply after *started*; ``""`` when nothing would have been presented (a
         silence marker on a machinery turn or on a turn the adapter reported as not addressed to the
@@ -1069,6 +1079,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         from gateway.platforms.base import _strip_media_directives
         from gateway.response_filters import (
             is_intentional_silence_response, is_machinery_display_kind, silence_allowed,
+            strip_trailing_silence_marker,
         )
         from gateway.run import _sanitize_gateway_final_response
         from gateway.run_turn import _unexpected_silence_reply
@@ -1090,8 +1101,13 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                 if diagnostic_turn_muted(prompt.get("display_metadata"), origin.platform):
                     return ""
         if is_intentional_silence_response(last["content"]):
+            decision = silence_decision or {}
+            proven_silent = (active_token is not None and decision.get("token") == active_token
+                             and decision.get("timestamp") == last.get("timestamp")
+                             and decision.get("silent") is True)
             silent_ok = silence_allowed(
-                prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"))
+                prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"),
+                allow_silence=proven_silent, agent_result={})
             return "" if silent_ok else _unexpected_silence_reply()
         # The ledger redelivers text only, so a reply that carries attachments is not settled here:
         # it stays marked and resumes, instead of being redelivered with its attachments dropped.
@@ -1108,7 +1124,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         # Sanitize first (provider terminal tokens), then hide the /loop marker, matching the
         # normal and queued delivery lanes. Markers stay so redelivery can split or inline them.
         sanitized = strip_trailing_loop_complete_marker(
-            _sanitize_gateway_final_response(origin.platform, last["content"]))
+            _sanitize_gateway_final_response(origin.platform, strip_trailing_silence_marker(last["content"])))
         return map_outside_copy_blocks(sanitized, _strip_media_directives, keep_markers=True).strip() or None
 
     @staticmethod
@@ -1385,6 +1401,26 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             logger.warning("relay adapter registration failed at gateway startup", exc_info=True)
         GatewayStartupMixin._register_launch_profile_config_hooks()
 
+    def _start_relay_provision_retry(self) -> None:
+        """Keep provisioning in the background when the boot attempt left the relay without
+        credentials; cancelled with ``_background_tasks`` at shutdown. Never raises."""
+        try:
+            from gateway.relay import relay_provision_pending, retry_self_provision
+            if relay_provision_pending():
+                self._retain_background_task(asyncio.create_task(
+                    retry_self_provision(self._on_relay_provisioned), name="relay-provision-retry"))
+        except Exception:
+            logger.warning("relay self-provision retry could not start", exc_info=True)
+
+    def _on_relay_provisioned(self) -> None:
+        """Credentials arrived after boot: the reconnect watcher builds every relay adapter from
+        the live env, so pull its queued retry forward instead of waiting out the backoff.
+        ``retry_now`` keeps it forward if a pass that began without them is still dialing."""
+        info = getattr(self, "_failed_platforms", {}).get(Platform.RELAY)
+        if info is not None:
+            info["next_retry"] = 0.0
+            info["retry_now"] = True
+
     @staticmethod
     def _register_launch_profile_config_hooks() -> None:
         """The launch profile's ``hooks:`` block, registered under ITS runtime scope when multiplexing.
@@ -1536,7 +1572,6 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
         from gateway.run import _platform_has_bot_credential
-        from gateway.run_adapters import _adapter_unavailable_message
         enabled_platform_count = 0
         _multiplex_on = self._multiplex_on()
         _multiplex_skipped_platforms: list[Platform] = []
@@ -1572,12 +1607,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                 # Only a platform that can heal on its own is queued for the reconnect watcher; either way
                 # flag it so the unserved enabled platform is visible.
                 heals = self._adapter_may_heal(platform, platform_config)
-                self._update_platform_runtime_status(
-                    platform.value, platform_state="retrying" if heals else "fatal",
-                    error_code="adapter_unavailable",
-                    error_message=_adapter_unavailable_message(platform, retrying=heals),
-                    needs_attention=True,
-                )
+                self._mark_adapter_unavailable(platform.value, platform, retrying=heals, needs_attention=True)
                 if heals:
                     self._failed_platforms[platform] = self._startup_retry_entry(platform, None, platform_config)
                 continue
@@ -2110,6 +2140,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         # Register plugins, the relay adapter, and hooks before creating platform adapters. Relay
         # self-provisioning may disable direct platforms, leaving Platform.RELAY as the only ingress.
         await asyncio.to_thread(self._start_register_plugins_relay_hooks)
+        self._start_relay_provision_retry()
         # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
         with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
             from hermes_cli.plugins import get_plugin_manager
@@ -2283,6 +2314,9 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             user_name="Handoff", thread_id=effective_thread_id, profile=profile_name,
             scope_id=scope_id,
         )
+        # The handoff turn answers through the queuing profile's own bot; naming it keeps the
+        # turn's authorization home and the saved receiving bot on that profile, not a primary guess.
+        self._canonicalize(dest_source, transport_profile=profile_name)
         return self._HandoffDestination(
             platform=platform, platform_name=platform_name, transport=transport, home=home,
             home_chat_id=home_chat_id, effective_thread_id=effective_thread_id, source=dest_source,

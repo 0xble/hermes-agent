@@ -27,6 +27,7 @@ from hermes_cli import gateway_service_owner
 from hermes_cli.gateway_launchd_lifetime import (
     configured_launchd_domain, migrate_launchd_domain, uninstall_launchd_lifetime,
 )
+from agent.deadline import poll_until
 
 
 def _gw():
@@ -380,6 +381,7 @@ def _spawn_detached_gateway() -> bool:
                 _timestamped_stderr_gateway_command(log_dir / "gateway.error.log"),
                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
                 env=child_env,
+                # detached-spawn: ok — foreground-less gateway launch, a service meant to outlive the CLI
                 **windows_detach_popen_kwargs(),
             )
     except OSError:
@@ -1056,14 +1058,11 @@ def _wait_for_launchd_service_pid(
 ) -> bool:
     """Poll ``domain/label`` (0.5s) until it runs on a fresh PID or ``timeout`` passes — KeepAlive respawn
     isn't instantaneous. launchctl ``TimeoutExpired`` propagates; callers own failure accounting."""
-    deadline = time.monotonic() + max(timeout, 0.5)
-    while True:
-        _loaded, pid = _gw()._launchd_print_service_pid(domain, label)
-        if pid is not None and pid > 0 and pid != old_pid:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.5)
+    def _fresh_pid() -> bool:
+        pid = _gw()._launchd_print_service_pid(domain, label)[1]
+        return pid is not None and pid > 0 and pid != old_pid
+
+    return poll_until(_fresh_pid, max(timeout, 0.5), 0.5)
 
 
 def launchd_restart():
@@ -1205,14 +1204,11 @@ def wait_for_launchd_gateway_supervision(
         return True
 
     label = label or _gw().get_launchd_label()
-    deadline = time.monotonic() + max(timeout, 0.0)
-    while True:
+    def _supervised() -> bool:
         pid = _gw()._launchctl_supervised_pid(label)
-        if pid is not None and pid != old_pid:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(max(poll_interval, 0.01))
+        return pid is not None and pid != old_pid
+
+    return poll_until(_supervised, max(timeout, 0.0), max(poll_interval, 0.01))
 
 
 def launchd_status(deep: bool = False):

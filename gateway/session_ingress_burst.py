@@ -20,6 +20,7 @@ import logging
 import time
 
 from gateway.platforms.event import MessageEvent, MessageType
+from hermes_cli.observability.shared_metrics_busy import note_busy_merged, settle_busy_arrival, stamp_busy_arrival
 
 logger = logging.getLogger(__name__)
 
@@ -129,12 +130,14 @@ async def _dispatch_busy_burst(adapter, runner, event, session_key):
             home = runner._resolve_profile_home_for_source(event.source)
             return runner._async_scope_or_null(_async_profile_runtime_scope, home)
         schedule(event, event.source, session_key, profile_scope=profile_scope)
+    stamp_busy_arrival(adapter, event)
     kind, bursts = _kind(adapter, event), _state(adapter, '_shared_bursts')
     while (burst := bursts.get(session_key)) is not None:
         if kind is not None and kind == _kind(adapter, burst.head) and adapter._can_merge_text_debounce_events(
                 burst.head, event):
             merge_pending_message_event({session_key: burst.head}, session_key, event, merge_text=kind == 'text')
             burst.absorbed.append(event)
+            note_busy_merged(burst.head, event)
             burst.last_ts = time.monotonic()
             _arm(adapter, session_key, burst)
             return await _accepted(adapter, burst, event)
@@ -267,4 +270,5 @@ def discard_busy_burst(adapter, session_key):
                 guard, conversation, charge = receipt
                 guard.refund(conversation, charge)
                 event._bot_loop_admitted = False
+        settle_busy_arrival(burst.head, discarded=True)
         burst.done.done() or burst.done.set_result(None)

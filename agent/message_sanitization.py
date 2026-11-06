@@ -292,7 +292,7 @@ INTERRUPTED_TAIL_MARKER = (
 )
 
 
-def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
+def close_interrupted_tool_sequence(messages: list, final_response: Any = None, *, stopped: bool = False) -> bool:
     """Append a synthetic assistant turn when an interrupted tail is a tool result: a transcript
     ending on a raw ``tool`` message makes the next user message land as ``tool → user``, an
     alternation violation strict providers (Gemini, Claude) answer by hallucinating a
@@ -306,7 +306,12 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     (truncation notices, partial-delivery text) stays visible: it is the turn's only
     user-facing explanation. A local interrupt diagnostic is neither: persisting it after a tool
     result feeds it back to the next model turn as if the assistant had said it, so it closes with
-    the internal ``INTERRUPTED_TAIL_MARKER`` instead."""
+    the internal ``INTERRUPTED_TAIL_MARKER`` instead.
+
+    ``stopped`` (an interrupted turn: a user stop or any other interrupt, not a truncation or
+    overflow exit) puts the stopped mark on the closing row, as ``turn_api_call.py`` does on every
+    interrupted partial reply: it is the turn's last stored row, so a reopened transcript still says
+    the turn was stopped."""
     last = messages[-1] if messages else None
     if not isinstance(last, dict) or last.get("role") != "tool":
         return False
@@ -315,12 +320,16 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     from agent.message_metadata import append_message
 
     stripped = text.strip()
+    row: dict[str, Any]
     if not stripped or stripped == _INTERRUPTED_PLACEHOLDER:
-        append_message(messages, hidden_interrupt_placeholder_row())
+        row = hidden_interrupt_placeholder_row()
     elif is_interrupt_diagnostic(stripped):
-        append_message(messages, {"role": "assistant", "content": INTERRUPTED_TAIL_MARKER})
+        row = {"role": "assistant", "content": INTERRUPTED_TAIL_MARKER}
     else:
-        append_message(messages, {"role": "assistant", "content": stripped})
+        row = {"role": "assistant", "content": stripped}
+    if stopped:
+        row["display_metadata"] = {"interrupted": True}
+    append_message(messages, row)
     return True
 
 
@@ -425,6 +434,9 @@ _IMAGE_REJECTION_PHRASES = (
     # request until exhaustion, and the gateway leaves every subsequent message queued behind the stuck turn
     # — the P1 in issue #21160.
     "no endpoints found that support image input",
+    # vLLM and other text-only OpenAI-compatible hosts answer imaged history with HTTP 400
+    # "<model-id> is not a multimodal model"; unmatched, every retry re-sends the image and fails.
+    "is not a multimodal model",
 )
 
 # Provider error bodies meaning "this particular image payload is bad" — the model CAN see, it
@@ -458,6 +470,15 @@ def strip_images_for_rejecting_model(agent: Any, api_messages: Any) -> bool:
     return isinstance(api_messages, list) and _strip_images_from_messages(api_messages)
 
 
+def _messages_carry_images(messages: Any) -> bool:
+    """True when any message holds an image part in Hermes's own message format."""
+    return isinstance(messages, list) and any(
+        isinstance(m, dict) and isinstance(m.get("content"), list)
+        and any(isinstance(p, dict) and p.get("type") in _IMAGE_PART_TYPES for p in m["content"])
+        for m in messages
+    )
+
+
 def _looks_like_image_content_rejection(error_body: str) -> bool:
     """Return True when a provider error says image/multimodal input is unsupported."""
     body = str(error_body or "").lower()
@@ -471,7 +492,7 @@ def _looks_like_corrupt_image_rejection(error_body: str) -> bool:
 
 
 __all__ = [
-    "_SURROGATE_RE", "_escape_invalid_chars_in_json_strings", "_repair_tool_call_arguments",
+    "_SURROGATE_RE", "_escape_invalid_chars_in_json_strings", "_messages_carry_images", "_repair_tool_call_arguments",
     "_sanitize_messages_non_ascii", "_sanitize_messages_surrogates", "_sanitize_structure_non_ascii",
     "_sanitize_structure_surrogates", "_sanitize_surrogates", "_sanitize_tools_non_ascii",
     "_strip_images_from_messages", "_strip_non_ascii", "apply_reasoning_content_policy",

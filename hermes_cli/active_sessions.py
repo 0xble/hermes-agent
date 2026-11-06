@@ -13,6 +13,7 @@ import collections
 import errno
 import math
 import os
+import threading
 import time
 import uuid
 from contextlib import contextmanager, suppress
@@ -195,8 +196,15 @@ def _lease_paths(
     return home / "runtime" / "active_sessions.json", home / "runtime" / "active_sessions.lock"
 
 
-def _flock(fh, *, lock: bool, nonblocking: bool = False) -> None:
-    """Exclusive whole-file lock/unlock on ``fh`` (fcntl on POSIX, msvcrt on Windows)."""
+def _flock(fh, *, lock: bool, nonblocking: bool = False, timeout: Optional[float] = None) -> None:
+    """Exclusive whole-file lock/unlock on ``fh`` (fcntl on POSIX, msvcrt on Windows). With ``timeout``
+    the lock is retried only while another holder has it, then BlockingIOError is raised, so a holder
+    stopped mid-write (SIGSTOP, a debugger) cannot stall the caller; other errors raise at once."""
+    if lock and timeout is not None:
+        from pm.filesystem import lock_fd
+        if not lock_fd(fh.fileno(), wait=True, timeout=timeout):
+            raise BlockingIOError(errno.EWOULDBLOCK, f"file lock still held after {timeout}s")
+        return
     if os.name == "nt":
         import msvcrt
         fh.seek(0)
@@ -219,7 +227,7 @@ class _FileLock:
         self._fh = open(self.path, "a+b")
         try:
             if self.timeout is None:
-                _flock(self._fh, lock=True)
+                _flock(self._fh, lock=True, timeout=self.timeout)
             else:
                 deadline = time.monotonic() + self.timeout
                 while True:
@@ -236,7 +244,7 @@ class _FileLock:
         except Exception as exc:
             self._fh.close()
             self._fh = None
-            raise RuntimeError("active session file lock unavailable") from exc
+            raise RuntimeError(f"file lock unavailable: {self.path}") from exc
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -268,7 +276,7 @@ def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
         return []
     valid = [entry for entry in entries if isinstance(entry, dict)]
     if not strict:
-        return valid
+        return _without_queued_releases(path, valid)
     if len(valid) != len(entries):
         raise invalid("contains invalid entries")
     seen_leases: set[str] = set()
@@ -289,7 +297,50 @@ def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
             if bad():
                 raise invalid(f"contains {what}")
         seen_leases.add(lease_id)
-    return valid
+    return _without_queued_releases(path, valid)
+
+
+# Leases this process has queued for release (gateway/active_lease_io.py) whose durable drop has not
+# landed yet, keyed by registry file. Every in-process read hides them, so a claim, count or
+# ownership check made right after a turn end sees the registry as if the release had already run
+# (a slot freed, the session unowned); the next locked write persists the drop. Other processes
+# still see the entry until the release worker rewrites the file.
+_queued_releases: dict[str, set[str]] = {}
+_queued_releases_lock = threading.Lock()
+
+
+def _registry_key(path: Path) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def mark_release_queued(lease: ActiveSessionLease) -> None:
+    """Retire ``lease`` from this process's view of the registry now; its file write comes later."""
+    if not isinstance(lease, ActiveSessionLease) or not lease.enabled or lease.released:
+        return
+    state_path, _ = _lease_paths(lease)
+    with _queued_releases_lock:
+        _queued_releases.setdefault(_registry_key(state_path), set()).add(lease.lease_id)
+
+
+def _unmark_release_queued(state_path: Path, lease_id: str) -> None:
+    """Make ``lease_id`` visible again to the caller holding the registry lock, which drops it."""
+    key = _registry_key(state_path)
+    with _queued_releases_lock:
+        queued = _queued_releases.get(key)
+        if queued is not None:
+            queued.discard(lease_id)
+            if not queued:
+                del _queued_releases[key]
+
+
+def _without_queued_releases(path: Path, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not _queued_releases:
+        return entries
+    with _queued_releases_lock:
+        queued = set(_queued_releases.get(_registry_key(path), ()))
+    if not queued:
+        return entries
+    return [e for e in entries if str(e.get("lease_id") or "") not in queued]
 
 
 def _nonblank_str(v: Any) -> bool:
@@ -603,6 +654,7 @@ def release_active_session(lease: ActiveSessionLease) -> None:
     # See #85431.
     state_path, lock_path = _lease_paths(lease)
     with _FileLock(lock_path):
+        _unmark_release_queued(state_path, lease.lease_id)
         if lease.released:
             return
         loaded = _read_live_entries(
@@ -798,6 +850,7 @@ def release_active_session_liveness_guard(
 
     state_path, lock_path = _lease_paths(lease)
     with _FileLock(lock_path):
+        _unmark_release_queued(state_path, lease.lease_id)
         entries = _prune_dead(
             _read_entries(state_path, strict=True), strict=True, target_session_id=session_id,
         )

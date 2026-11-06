@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Vault-backed model-blind browser autofill tools.
 
-Two model-facing tools, gated on the local vault having at least one item
-(zero schema cost otherwise, same ``check_fn`` pattern as the Home Assistant
-tools):
+Vault actions are available alongside a built-in browser, Browser Use, or a
+registered browser page backend, including when the vault is empty so a first
+login can be saved:
 
 - ``browser_vault_list``  → handles + metadata (for logins this includes the
   identifier — it is NOT a secret; the agent types it itself). Passwords are
@@ -15,7 +15,8 @@ tools):
   resolved locally, the page origin must EXACTLY match the item's bound
   origin (pre-checked AND re-asserted synchronously inside the fill script),
   the field is chosen by the ported login-control classifier, injection runs
-  exclusively over the supervisor CDP WebSocket (never argv), and the tool
+  exclusively over the supervisor CDP WebSocket (never argv) — or, for a plugin browser with no CDP
+  endpoint, through its registered ``BrowserPageBackend`` (Camofox's REST evaluate) — and the tool
   result reports only ``{filled_fields, kind, origin, success}`` — the
   password never appears in tool results, logs, or the session DB, and its
   exact bytes are registered with the browser-result redaction boundary so
@@ -113,11 +114,12 @@ def _check_vault_available() -> bool:
     """Schema-gate: the vault tools ride with the browser. An empty vault still needs
     browser_vault_save_login so the agent can offer to remember a login the first time it meets a
     form; hiding the tools until an item exists meant nobody ever discovered the feature."""
+    from agent.browser_page_registry import list_providers
     from tools.browser_tool_install import check_browser_requirements
     from tools.browser_use_cli import is_browser_use_cli_mode
     # check_browser_requirements() is False by design in Browser Use mode (browser_exec replaces the
     # built-in surface); the vault serves both stacks.
-    return bool(is_browser_use_cli_mode() or check_browser_requirements())
+    return bool(is_browser_use_cli_mode() or check_browser_requirements() or list_providers())
 
 _check_vault_available = no_cache_check_fn(_check_vault_available)
 
@@ -134,10 +136,39 @@ def _browser_key(task_id: str) -> str:
     return _last_session_key(task_id)
 
 
+# A secret-bearing script runs inside this wrapper on a page backend, so a page exception is answered
+# in-page and its message (which may quote the script) never reaches the backend's error path or logs.
+_PAGE_FILL_FAILED = {"hermes_vault_eval_failed": True}
+
+
+def _page_backend(task_id: str):
+    """The plugin browser holding this task's live page (e.g. Camofox), or None for the CDP session."""
+    from agent.browser_page_registry import backend_for_task
+    return backend_for_task(task_id)
+
+
+def _page_eval(backend: Any, task_id: str, expression: str, *, secret: bool) -> dict[str, Any]:
+    """Evaluate on a plugin page backend. On the secret path every failure gets fixed text."""
+    if secret:
+        expression = ("(() => { try { return (" + expression + "); } catch (_) { return "
+                      + json.dumps(_PAGE_FILL_FAILED) + "; } })()")
+    try:
+        result = backend.evaluate(task_id, expression, secret=secret)
+    except Exception as exc:  # health: allow BLE001 -- plugin failure becomes a typed refusal
+        detail = "" if secret else f": {str(exc)[:200]}"
+        return {"success": False, "error_type": "eval_failed",
+                "error": f"The {backend.name} browser could not run the vault script{detail}"}
+    if secret and _parse_json_result(result) == _PAGE_FILL_FAILED:
+        return {"success": False, "error_type": "eval_failed",
+                "error": f"The {backend.name} browser could not run the vault script"}
+    return {"success": True, "result": result}
+
+
 def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
 
-    Prefers the supervisor's persistent CDP WebSocket, falls back to the
+    Uses the active native Camofox or plugin page when present, otherwise
+    prefers the supervisor's persistent CDP WebSocket and falls back to the
     agent-browser CLI ``eval`` command. Never use this for expressions that
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
@@ -145,6 +176,9 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     from tools.browser_camofox import is_camofox_mode
     if is_camofox_mode():
         return _eval_js_secret(task_id, expression)
+    page = _page_backend(task_id)
+    if page is not None:
+        return _page_eval(page, task_id, expression, secret=False)
     try:
         supervisor = _ensure_supervisor(task_id)
         if supervisor is not None:
@@ -199,13 +233,14 @@ def _ensure_supervisor(task_id: str):
 
 
 def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
-    """Evaluate a SECRET-BEARING JS expression. Supervisor CDP-WS only.
+    """Evaluate a SECRET-BEARING JS expression over CDP or a protected page transport.
 
-    Fails closed: there is deliberately NO fallback to the agent-browser CLI
-    ``eval`` path, because that places the expression — and therefore the
-    credential bytes — in subprocess argv, visible to any process listing.
-    When no supervisor session is available the caller gets a typed refusal
-    (``error_type='supervisor_required'``) and nothing is written.
+    Fails closed: there is deliberately NO subprocess path, because that would
+    place the expression — and therefore the credential bytes — in argv,
+    visible to any process listing. When no supervisor session is available
+    the caller gets a typed refusal (``error_type='supervisor_required'``) and
+    nothing is written. A plugin browser holding the task's page (no CDP endpoint) carries the
+    expression over its own transport instead; see ``agent.browser_page_backend``.
     """
     from tools.browser_camofox import is_camofox_mode
     if is_camofox_mode():
@@ -237,13 +272,15 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
             pass
         return {"success": False, "error_type": "eval_failed", "error": "Camofox vault evaluation failed"}
 
-    try:
-        supervisor = _ensure_supervisor(task_id)
-    except Exception as exc:
-        logger.debug("vault fill: supervisor unavailable (%s)", exc)
-        supervisor = None
+    page = _page_backend(task_id)
+    supervisor = None
+    if page is None:
+        try:
+            supervisor = _ensure_supervisor(task_id)
+        except Exception as exc:
+            logger.debug("vault fill: supervisor unavailable (%s)", exc)
 
-    if supervisor is None:
+    if page is None and supervisor is None:
         return {
             "success": False,
             "error_type": "supervisor_required",
@@ -267,6 +304,8 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
         except _bd_lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
+    if page is not None:
+        return _page_eval(page, task_id, expression, secret=True)
     sup = supervisor.evaluate_runtime(expression)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
@@ -320,8 +359,8 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     (browser_exec sessions open their own tabs, so the tab the supervisor attached to first is rarely the
     login page). Returns the origin when a tab was focused, else None (caller falls back to the current page)."""
     from tools.browser_camofox import is_camofox_mode
-    if is_camofox_mode():
-        # Camofox already binds the current tab to its dedicated user identity.
+    if is_camofox_mode() or _page_backend(task_id) is not None:
+        # Native Camofox and plugin pages already bind the tab the agent drove.
         return None
     try:
         supervisor = _ensure_supervisor(task_id)

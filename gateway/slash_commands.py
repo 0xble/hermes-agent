@@ -168,6 +168,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
         subprocess.Popen(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path.parent / ".update_process_exit_code"),
              *hermes_cmd, "update", "--gateway"],
+            # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
@@ -187,6 +188,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     setsid_bin = shutil.which("setsid")
     argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
     scoped_argv, scoped_env = _systemd_scope_wrap_if_supervised(argv)
+    # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
     if scoped_env is not None:
         subprocess.Popen(scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, env=scoped_env)
@@ -503,13 +505,16 @@ class GatewaySlashCommandsMixin(
             await self._interrupt_and_clear_session(
                 key, stop_source, interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason=invalidation_reason)
-        agent = self._running_agents.get(session_key)
+        # A turn the app started while the chat was elsewhere still runs on its own key (/resume).
+        from gateway.session_detached import chat_running_key
+        run_key = chat_running_key(self, session_key, session_entry)
+        agent = self._running_agents.get(run_key)
         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
-            await _stop(session_key, "stop_command_pending")
-            logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
+            await _stop(run_key, "stop_command_pending")
+            logger.info("STOP (pending) for session %s — sentinel cleared", run_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
-            await _stop(session_key, "stop_command_handler")
+            await _stop(run_key, "stop_command_handler")
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No run under the caller's own key: a live turn in THIS chat may still carry a differently

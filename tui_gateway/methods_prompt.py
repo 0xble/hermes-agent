@@ -271,12 +271,15 @@ def _typed_stop_phrase_response(rid, text, sid=None):
 _HOSTED_TASK_FIELDS = {"room_id", "task_id", "thread_id", "turn_id", "execution_generation", "member_id"}
 
 
-def _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback):
-    """Validate the hosted-room turn proof carried by an internal submit."""
+def _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback, hosted_images=None):
+    """Validate the hosted-room turn proof carried by an internal submit. ``hosted_images`` are the
+    member's event-bound images, already materialized under the image cache by the room worker."""
     if session.get("source") != "bot_room":
         return _err(rid, 4120, "hosted room turns require a bot_room session")
     valid = (
         isinstance(hosted_task, dict) and callable(hosted_terminal_callback)
+        and (hosted_images is None or (isinstance(hosted_images, list)
+                                       and all(isinstance(p, str) and p for p in hosted_images)))
         and set(hosted_task) == _HOSTED_TASK_FIELDS
         and all(isinstance(hosted_task.get(f), str) and hosted_task[f]
                 for f in _HOSTED_TASK_FIELDS - {"execution_generation"})
@@ -670,7 +673,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
 
 def _run_after_agent_ready(
     rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
-    queue_token=None
+    queue_token=None, hosted_images=None,
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -701,7 +704,7 @@ def _run_after_agent_ready(
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author,
+        image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author,
         user_turn=display_kind is None and turn_author is None, queue_token=queue_token)
 
 
@@ -810,8 +813,8 @@ def _lock_in_submit_turn(
     return None, fields
 
 
-# Per-turn client surfaces that carry a model-bound note (session_notifications._surface_note).
-_CLIENT_SURFACES = frozenset({"hud", "voice-live"})
+# Per-turn client surfaces shared with canonical admission (gateway.session_surface).
+from gateway.session_surface import SURFACES as _CLIENT_SURFACES
 
 
 @method("prompt.submit")
@@ -847,9 +850,11 @@ def _(rid, params: dict) -> dict:
     turn_author = raw_author.author if raw_author is not None else None
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
-    internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
+    hosted_images = params.get("_hosted_images")
+    internal_hosted_submit = (
+        hosted_task is not None or hosted_terminal_callback is not None or hosted_images is not None)
     err = (
-        _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback)
+        _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback, hosted_images)
         if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
     if err is not None:
         return err
@@ -864,6 +869,7 @@ def _(rid, params: dict) -> dict:
     voice_context = params.get("voice_context")
     session["voice_live_context"] = (
         voice_context[:6000] if session["client_surface"] == "voice-live" and isinstance(voice_context, str) else "")
+    session["voice_turn"] = params.get("voice_turn") is True
     has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)
     if has_truncation and isinstance(text, str):
         # A rewind replays what the transcript shows: re-expand a skill invocation or
@@ -972,7 +978,7 @@ def _(rid, params: dict) -> dict:
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
             rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
-            params.get("moa_token")),
+            queue_token=params.get("moa_token"), hosted_images=hosted_images),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
@@ -1096,7 +1102,7 @@ def _(rid, params: dict) -> dict:
             # thread on locale-mismatched Windows.
             res = subprocess.run(
                 argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
-                encoding="utf-8", errors="replace", creationflags=windows_hide_flags())
+                encoding="utf-8", errors="replace", creationflags=windows_hide_flags(), check=False)
         except subprocess.TimeoutExpired:
             return _err(rid, 5028, "pdftoppm timed out (>120s)")
         if res.returncode != 0:
@@ -1241,17 +1247,10 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4012, "url required")
     task_id = f"preview_{uuid.uuid4().hex[:6]}"
     parent = params.get("session_id", "")
-    parent_history = _preview_restart_history(session)
-    prompt = "\n".join(
-        line
-        for line in [
-            "The desktop preview pane cannot load a local server URL.",
-            f"Preview URL: {url}",
-            f"Current working directory: {cwd or '(unknown)'}",
-            f"Preview console:\n{context}" if context else "",
-            _PREVIEW_RESTART_HISTORY_NOTE if parent_history else None,
-            *_PREVIEW_RESTART_RULES]
-        if line)
+    with session.get("history_lock") or contextlib.nullcontext():
+        snapshot = list(session.get("history") or [])
+    parent_history = _preview_restart_history(snapshot)
+    prompt = _preview_restart_prompt(url, cwd, context, bool(parent_history))
     preview_cwd = _validated_preview_cwd(cwd)
 
     def body():

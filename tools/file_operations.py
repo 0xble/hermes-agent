@@ -1721,6 +1721,5 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 "Skipped macOS protected folders during broad search to avoid "
                 f"an unattended privacy prompt: {skipped}. Search a protected "
                 "folder directly when access is intentional.")
-            # Append: earlier disclosures (e.g. a literal-search retry) must survive.
             result.warning = f"{result.warning} {protected}" if result.warning else protected
         return result

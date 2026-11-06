@@ -147,3 +147,29 @@ def test_trailing_marker_inside_sentence_or_fenced_code_is_untouched():
 def test_bare_marker_keeps_existing_silence_path():
     for marker in ("NO_REPLY", "[SILENT]", "no reply"):
         assert response_filters.strip_edge_silence_markers(marker) == marker
+
+
+def test_stream_hold_preserves_fences_and_hides_edge_marker_runs():
+    cases = (
+        (["Paris.\n", "NO_REPLY\n", "[SIL", "ENT]"], "Paris."),
+        (["NO_REPLY\n", "[SILENT]\n", "Paris.\nNO_REPLY"], "Paris."),
+        (["NO_REPLY\n", "[SILENT]"], ""),
+        (["```text\n", "NO_REPLY\n", "```"], "```text\nNO_REPLY\n```"),
+        (["Example:\n```text\n", "NO_REPLY\n", "```\nNO_REPLY"], "Example:\n```text\nNO_REPLY\n```"),
+        (["Paris.\n", "NO", " problem"], "Paris.\nNO problem"),
+    )
+    for chunks, expected in cases:
+        hold = response_filters.SilenceMarkerStreamHold()
+        frames = [hold.feed(chunk) for chunk in chunks]
+        frames.append(hold.finish())
+        assert "".join(frames).strip() == expected
+        if expected in {"", "Paris."}:
+            assert not any(marker in frame for frame in frames for marker in ("NO_REPLY", "[SILENT]"))
+
+
+def test_room_silence_opt_in_does_not_suppress_mandatory_checkin():
+    healthy = {"completed": True, "final_response": "NO_REPLY"}
+    assert response_filters.silence_allowed(None, True, allow_silence=True, agent_result=healthy)
+    assert not response_filters.silence_allowed(
+        response_filters.MANDATORY_STATUS_DISPLAY_KIND, False, allow_silence=True, agent_result=healthy,
+    )

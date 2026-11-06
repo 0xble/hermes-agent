@@ -39,6 +39,8 @@ async def test_commit_then_error_still_releases_terminal_native_media(tmp_path, 
         # Terminal media cleanup is queued off the FIFO path; it still runs after a commit-then-error.
         from gateway.session_ingress_media import media_releases_idle
         await asyncio.wait_for(media_releases_idle(authority), 5)
+        from gateway.session_runtime_workers import join_authority_work
+        await join_authority_work(authority, timeout=5)
         assert not retained.exists(), 'commit-then-error skipped terminal media cleanup'
 
 

@@ -296,9 +296,12 @@ one-time codes to tasks whose browser uses that named account.
 this path: not in tool results, logs, the session database, or process arguments.
 Fills happen over the supervised browser session's direct CDP socket and are
 refused unless the page origin exactly matches the saved origin, checked again
-inside the page immediately before the write. These guarantees do not apply to
-authorized direct entry, where model, session-record and provider-log exposure
-is explicitly accepted.
+inside the page immediately before the write. With native Camofox or a registered
+browser page backend that has no CDP endpoint, the same origin checks run and
+the fill goes through that browser's protected evaluate transport. Native
+Camofox permits only HTTPS or loopback HTTP for its REST endpoint. These
+guarantees do not apply to authorized direct entry, where model, session-record
+and provider-log exposure is explicitly accepted.
 
 **Does not:** protect against the page itself. Once a password is typed into a
 site, that site (and any script it runs) has it, exactly as when you type it

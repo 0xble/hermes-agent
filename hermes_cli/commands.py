@@ -196,7 +196,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("attend", "Pin the attended model permanently or for a duration", "Configuration",
                gateway_only=True, args_hint="[duration|off|status]", subcommands=("off", "status"), busy_policy="dispatch"),
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
-               args_hint="[model] [--provider name] [--reasoning level] [--global|--session|--once] [--refresh] [--all]",
+               args_hint="[model|reset] [--provider name] [--reasoning level] [--global|--session|--once] [--refresh] [--all]",
                busy_policy="defer_until_idle", desktop="hidden"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",), args_hint="[auto|codex_app_server]",
@@ -315,7 +315,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[connect|disconnect|status]",
                subcommands=("connect", "disconnect", "status")),
     CommandDef("plugins", "List installed plugins and their status",
-               "Tools & Skills", cli_only=True, desktop="terminal"),
+               "Tools & Skills", cli_only=True, desktop="terminal", args_hint="[update|auto-update [on|off]]",
+               subcommands=("update", "auto-update")),
 
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",

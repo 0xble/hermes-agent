@@ -31,6 +31,7 @@ from agent.skill_utils import (
 )
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 from utils import atomic_json_write, file_signature, filesystem_poll_seconds
+from utils import atomic_json_write, file_cache_version
 
 logger = logging.getLogger(__name__)
 
@@ -1150,7 +1151,7 @@ def _walk_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
             try:
                 if filename in files:
                     st = os.stat(path)
-                    manifest[path[prefix_len:]] = list(file_signature(st))
+                    manifest[path[prefix_len:]] = list(file_cache_version(path, st, always_digest=True))
             except OSError:
                 pass
     return manifest

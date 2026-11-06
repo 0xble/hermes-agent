@@ -89,39 +89,6 @@ _CAPTURE_LIMIT = {_RUNNER_CAPTURE_BYTES}
 _SPILL_DIR = os.environ.get("HERMES_KERNEL_SPILL_DIR", "")
 _SPILL_CAP = {5_000_000}
 _PARENT_PROCESS_HANDLE = os.environ.pop("HERMES_KERNEL_PARENT_PROCESS_HANDLE", "")
-_PARENT_DEATH_FD = os.environ.pop("HERMES_KERNEL_PARENT_DEATH_FD", "")
-
-
-def _start_parent_death_pipe_watchdog():
-    """POSIX twin of the Windows handle watchdog: exit when the parent dies.
-
-    The host holds the only write end of an inherited pipe; a blocking read
-    returns EOF the instant the host exits by ANY means (SIGKILL, OOM, crash),
-    exactly like the MCP death supervisor. Stdin EOF alone is not enough: the
-    main loop only sees it between cells, so a kernel SIGKILLed mid-cell
-    outlived its host. Not PR_SET_PDEATHSIG — that is bound to the spawning
-    THREAD, and kernels are spawned from per-cell threads that exit.
-    """
-    global _PARENT_DEATH_FD
-    raw_fd = _PARENT_DEATH_FD
-    _PARENT_DEATH_FD = ""
-    if sys.platform == "win32" or not raw_fd:
-        return
-    try:
-        fd = int(raw_fd)
-        os.set_inheritable(fd, False)
-    except (OSError, ValueError):
-        return
-
-    def _wait():
-        try:
-            while os.read(fd, 1):
-                pass
-        except OSError:
-            pass
-        os._exit(0)
-
-    threading.Thread(target=_wait, name="hermes-parent-watchdog", daemon=True).start()
 
 
 def _start_parent_process_watchdog():
@@ -175,7 +142,6 @@ def _start_parent_process_watchdog():
 
 
 _start_parent_process_watchdog()
-_start_parent_death_pipe_watchdog()
 
 _real_stdout = sys.stdout
 
@@ -328,7 +294,6 @@ class SessionKernel:
         self.sock_path: Optional[str] = None
         self.server_sock: Optional[socket.socket] = None
         self.stop_event = threading.Event()
-        self.death_pipe_w: Optional[int] = None
         self.tool_call_log: list = []
         self.cell_log_start = 0
         self.tool_call_counter: list[int] = [0]
@@ -373,21 +338,17 @@ class SessionKernel:
             self.closed = True
             self.stop_event.set()
             proc = self.proc
-            death_pipe_w = self.death_pipe_w
-            self.death_pipe_w = None
             sock, self.server_sock = self.server_sock, None
             sock_path, self.sock_path = self.sock_path, None
             tmpdir, self.tmpdir = self.tmpdir, ""
         _log_kernel_lifecycle(self, "retire", task_id=self.current_task,
                               caller=self.current_caller, reason=reason, proc=proc)
-        if death_pipe_w is not None:
-            try:
-                os.close(death_pipe_w)
-            except OSError:
-                pass
         if proc is not None and proc.poll() is None:
             from tools.code_execution_tool import _kill_process_group
             _kill_process_group(proc, escalate=True)
+        if proc is not None and not _IS_WINDOWS:
+            from hermes_cli.process_identity import release_process_group_once_empty
+            release_process_group_once_empty(proc.pid, proc=proc)
         try:
             if sock is not None:
                 sock.close()
@@ -786,30 +747,25 @@ def _spawn_locked(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     child_env["HERMES_KERNEL_SPILL_DIR"] = kernel.tmpdir
     # Generated client reconnects after the RPC server's 300s idle timeout between cells.
     child_env["HERMES_RPC_PERSISTENT"] = "1"
-    # Parent-death watchdog plumbing: Windows inherits a SYNCHRONIZE handle to this process; POSIX
-    # inherits the read end of a pipe whose only write end we hold (EOF == host gone, any cause).
+    # Owner death: Windows inherits a SYNCHRONIZE handle to this process for the runner's watchdog.
     parent_handle, close_handle, startupinfo = _parent_process_handle(child_env) if _IS_WINDOWS else (None, None, None)
-    death_r: Optional[int] = None
-    pass_fds: tuple[int, ...] = ()
-    if not _IS_WINDOWS:
-        death_r, kernel.death_pipe_w = os.pipe()
-        child_env["HERMES_KERNEL_PARENT_DEATH_FD"] = str(death_r)
-        pass_fds = (death_r,)
+    # POSIX: spawn_owned makes the kernel lead its own group, which everything a cell spawns joins,
+    # and hands that group to the owner-death supervisor: the whole group dies the moment this
+    # process dies, by any cause. A kernel-only death pipe let a cell's subprocesses outlive the host.
+    from hermes_cli.process_identity import spawn_owned
     try:
         kernel.ensure_open()
-        kernel.proc = subprocess.Popen(
-            [child_python, os.path.join(kernel.tmpdir, "hermes_kernel_runner.py")],
+        kernel.proc = spawn_owned(
+            [child_python, os.path.join(kernel.tmpdir, "hermes_kernel_runner.py")], purpose="code-kernel",
             # Strict mode passes an empty cwd: the kernel's staging dir plays the per-call tmpdir's role.
-            cwd=child_cwd or kernel.tmpdir, env=child_env, start_new_session=True,
+            cwd=child_cwd or kernel.tmpdir, env=child_env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-            close_fds=True, pass_fds=pass_fds, startupinfo=startupinfo,
+            close_fds=True, startupinfo=startupinfo,
         )
     finally:
         if parent_handle and close_handle is not None:
             close_handle(parent_handle)
-        if death_r is not None:
-            os.close(death_r)
     _log_kernel_lifecycle(kernel, "start", task_id=kernel.current_task, caller=kernel.current_caller, reason="spawn")
     kernel.ensure_open()
     # Deliberately NOT propagate_context_to_thread: that would freeze the spawning cell's

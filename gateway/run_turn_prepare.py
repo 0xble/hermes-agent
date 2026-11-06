@@ -23,6 +23,7 @@ from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
+from gateway.response_filters import display_kind_for_event
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
@@ -142,12 +143,9 @@ class GatewayTurnPrepareMixin:
         )
         return self._commit_session_agent_runtime(skey, resolved)
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict, *,
-                                   tier: Any = _TIER_FROM_RUNNER) -> dict:
+    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Effective model/runtime config for one turn. With `/fast` priority on, fast-mode
-        ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model.
-        ``tier`` defaults to the runner's per-turn ``_service_tier``; an off-turn builder (a cold
-        ``/review``) passes the session's own instead of writing that shared slot."""
+        ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
         from gateway.run import _deep_merge_request_overrides
         from agent.fast_mode import STATIC_TIERS
         from hermes_cli.models import resolve_fast_mode_overrides
@@ -170,8 +168,7 @@ class GatewayTurnPrepareMixin:
                 runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
             ),
         }
-        if tier is _TIER_FROM_RUNNER:
-            tier = getattr(self, "_service_tier", None)
+        tier = getattr(self, "_service_tier", None)
         if tier not in STATIC_TIERS:
             # None / auto / cold: the bounded window is applied per request by agent.fast_mode.
             route["request_overrides"] = base_request_overrides
@@ -195,14 +192,7 @@ class GatewayTurnPrepareMixin:
         model = getattr(agent, "model", None)
         if not model:
             return
-        from hermes_cli.runtime_provider_custom import session_provider_identity
-        runtime = {
-            "provider": session_provider_identity(getattr(agent, "provider", None),
-                                                  getattr(agent, "requested_provider", None),
-                                                  getattr(agent, "base_url", None), model),
-            "base_url": getattr(agent, "base_url", None),
-            "api_mode": getattr(agent, "api_mode", None),
-        }
+        runtime = {k: getattr(agent, k, None) for k in ("provider", "base_url", "api_mode")}
         runtime["fallback_active"] = bool(getattr(agent, "_fallback_activated", False))
         runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
         try:
@@ -240,10 +230,7 @@ class GatewayTurnPrepareMixin:
         # cross-topic Reply doesn't fragment the conversation.
         event_metadata = getattr(event, "metadata", None) or {}
         expected_session_key = str(event_metadata.get("gateway_session_key") or "").strip()
-        # Plain lobby recovery here even with ``dm_topic_auto_transfer`` on: the opt-in topic transfer
-        # already ran at adapter ingress (``apply_root_dm_topic_transfer`` -> runner hook
-        # ``_transfer_telegram_root_dm``), before session keying.
-        recovered = (await asyncio.to_thread(self._recover_telegram_lobby_thread_id, source)
+        recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
                      if not expected_session_key else None)
         if recovered is not None:
             logger.info(
@@ -282,23 +269,6 @@ class GatewayTurnPrepareMixin:
                 source, touch_activity=not bool(getattr(event, "internal", False)),
             )
         session_key = session_entry.session_key
-        claim = getattr(event, "_claimed_owner", None)
-        if claim is not None:
-            from gateway.session_authorities import active_authority
-            authority, (owner, generation) = active_authority(self), claim
-            # /new and /reset latch a Stop for the claimed generation before they move the route;
-            # /resume, /branch and compression don't, so those turns run where the route points.
-            stopped = generation in (authority.pending_stops.get(owner), authority.delivered_stops.get(owner))
-            if stopped and session_entry.session_id not in await asyncio.to_thread(
-                    authority.db.get_compression_chain, owner):  # preflight's continuation walk
-                # It settles interrupted, as that Stop would have, and never runs on the fresh one.
-                logger.warning("Dropping a stopped claimed turn: its route moved from %s to %s before it ran",
-                               owner, session_entry.session_id)
-                from gateway.session_results import execution_result
-                captured = execution_result.get()
-                if captured is not None:
-                    captured['result'] = {'final_response': '', 'messages': [], 'interrupted': True}
-                return
         if not strict_session and pinned_session_id:
             resolved_entry = await self._resolve_async_delegation_session(session_entry, pinned_session_id, event_metadata.get("gateway_proven_session_id") or "", event_metadata.get("gateway_completion_ids") or ())
             if resolved_entry is None:
@@ -445,7 +415,8 @@ class GatewayTurnPrepareMixin:
         turn_sidecar_notes.append(context_note)
 
         try:
-            should_notify = reset_reason == "suspended"
+            from gateway.bot_peer_notices import automatic_notices_allowed
+            should_notify = reset_reason == "suspended" and automatic_notices_allowed(source)
             adapter = self._delivery_adapter_for(source) if should_notify else None
             if adapter:
                 notice = t("gateway.session.auto_reset_notice")
@@ -524,9 +495,6 @@ class GatewayTurnPrepareMixin:
         from gateway.run import _gateway_config_home, _home_target_env_var, _load_gateway_config
         if history or internal:  # internal = plugin/system turn: no human made first contact
             return
-        # LOCAL sessions (one-shot, chat -q, ACP, TUI attach) are the classic in-process CLI's
-        # surfaces: it never appended this note, and mark_seen would rewrite config.yaml under
-        # an ordinary launch that promises to leave the profile's files untouched.
         human_platform = bool(source.platform) and source.platform not in (Platform.LOCAL, Platform.WEBHOOK)
         if human_platform and source.chat_type == "dm" and not await self.async_session_store.has_any_sessions():
             # Same branch logic as the TUI (profile-build offer once when "ask", else plain intro);
@@ -547,16 +515,10 @@ class GatewayTurnPrepareMixin:
         # Multiplex: the home channel may live only in the profile secret scope, not os.environ.
         home_env = ""
         if env_key:
-            # A secondary with no home channel must not borrow the default profile's from
-            # os.environ; only an UNSCOPED single-profile read may fall back to the process env.
-            from agent.secret_scope import UnscopedSecretError, get_secret
-            try:
+            with suppress(Exception):
+                from agent.secret_scope import get_secret
                 home_env = (get_secret(env_key) or "").strip()
-            except UnscopedSecretError:
-                home_env = (os.getenv(env_key) or "").strip()
-            except Exception:
-                logger.debug("Home-channel secret %s unreadable; treating it as unset", env_key, exc_info=True)
-                home_env = ""
+            home_env = home_env or (os.getenv(env_key) or "").strip()
         # Also honor in-memory / yaml home_channel on this platform.
         with suppress(Exception):
             if not home_env and self.config.get_home_channel(source.platform):
@@ -626,12 +588,11 @@ class GatewayTurnPrepareMixin:
         """Everything between session resolution and the agent run: session open, task-local env,
         context prompt, sidecar notes, turn lease, transcript load + hygiene, inbound text. Returns
         ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
-        running (history unreadable, a local turn's refused ``@`` references); ``None`` drops the turn
-        (inbound text rejected)."""
+        running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
         from gateway.run import _load_gateway_config
-        from tools.approval_yolo import restore_gateway_yolo
+        from tools.approval_yolo import restore_session_yolo
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
-        restore_gateway_yolo(session_key, session_entry.yolo)  # None: TurnRunner seeds the launch policy
+        restore_session_yolo(session_key, session_entry.yolo is True)  # a restarted gateway's set starts empty
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -639,7 +600,6 @@ class GatewayTurnPrepareMixin:
         from gateway.platforms.event import turn_origin_for_event
         set_turn_origin(turn_origin_for_event(event))
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.
-        from gateway.response_filters import display_kind_for_event
         persist_user_display_kind = display_kind_for_event(event)
         _redact_pii = False  # privacy.redact_pii, re-read per message
         with suppress(Exception):
@@ -647,13 +607,6 @@ class GatewayTurnPrepareMixin:
 
         # The context prompt render is pinned per session, keyed by a hash of the renderer inputs, so
         # the system prompt cannot drift turn-over-turn; a miss (thread rename, /sethome) re-renders.
-        # A LOCAL session (CLI one-shot, ACP, cron run-now, TUI attach) is the operator's own machine:
-        # the messaging block ("Source: Local", connected platforms, cron delivery targets) was never
-        # part of the classic in-process prompt, and the TUI gateway still builds that prompt in-process.
-        # Rendering it here would make every surface hop of one durable session a system-prompt
-        # (and prompt-cache) break.
-        # Synthetic goal/heartbeat/resume turns carry no prompt inputs of their own, so they reuse the
-        # pins exactly like internal events do (and still pass authorization, unlike internal ones).
         _reuse_pins = event.internal or getattr(event, "inherit_channel_pin", False)
         if source.platform != Platform.LOCAL and _reuse_pins and session_key:
             await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
@@ -690,8 +643,14 @@ class GatewayTurnPrepareMixin:
             )
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
-            from gateway.session_results import record_unexecuted_failure
-            return record_unexecuted_failure(t("gateway.errors.history_unavailable")), _session_env_tokens
+            return t("gateway.errors.history_unavailable"), _session_env_tokens
+
+        # Hygiene may have started its worker during this very turn and released
+        # the inline wait without releasing the compression lock. Do not enter
+        # preflight on the old transcript or consume the input as a retry notice.
+        if await self._defer_compression_locked_event(session_key, event, prepend=True):
+            self._clear_session_env(_session_env_tokens)
+            return None, _session_env_tokens
 
         # A detached hygiene worker still owns the old transcript until its compression lock clears.
         if await self._defer_compression_locked_event(session_key, event, prepend=True):

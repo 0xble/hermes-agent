@@ -260,8 +260,7 @@ class TestFirecrawlScrapeTimeout:
 
     @pytest.mark.parametrize("address, content", [("93.184.216.34", "content"), ("198.18.4.8", "")])
     def test_extract_passes_timeout_ms_to_scrape(
-        self, monkeypatch: pytest.MonkeyPatch, address: str, content: str,
-    ) -> None:
+        self, monkeypatch: pytest.MonkeyPatch, address: str, content: str, public_dns) -> None:
         """scrape() must receive timeout=60000 (ms) so the server-side
         deadline matches the 60 s asyncio.wait_for deadline.  Without this
         the API uses its 30 s default, causing SCRAPE_TIMEOUT."""

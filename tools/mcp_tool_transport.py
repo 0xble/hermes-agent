@@ -17,6 +17,7 @@ from tools.mcp_tool_lifecycle import (
     _filter_mcp_children, _leader_start_time, _orphan_stdio_pid_servers, _orphan_stdio_pids,
     _stdio_pgids, _stdio_processes, _stdio_sessions, _stdio_pids, _stdio_starttimes,
 )
+from hermes_cli.process_identity import own_process_groups, register_child, release_process_groups
 from tools.mcp_tool_common import _core
 from tools.mcp_tool_node_abi import node_abi_error
 from tools import mcp_tool_config as _config
@@ -329,7 +330,6 @@ class MCPServerTransportMixin:
         # Machine spawn ledger (startup sweeps reap orphans after an unclean exit); best-effort.
         for _pid in new_pids:
             try:
-                from hermes_cli.process_identity import register_child
                 register_child(_pid, "mcp-helper")
             except Exception:
                 logger.debug("spawn-ledger register_child failed for MCP helper pid %s", _pid, exc_info=True)
@@ -337,7 +337,7 @@ class MCPServerTransportMixin:
         # process (kill -9, crash, force-quit) can't leave this server — or its descendants, e.g.
         # mcp-remote's spawned `node` — running forever. The graceful paths (shutdown,
         # _kill_orphaned_mcp_children) still reap as before; this only covers when they never run.
-        _core._update_death_supervisor("register", new_pgids.values())
+        own_process_groups(new_pgids.values())
 
     def _release_spawned_children(self, new_pids: set[int]) -> None:
         """Drop the ledger entries; a child (or its pgroup) still alive means SDK teardown failed
@@ -382,7 +382,7 @@ class MCPServerTransportMixin:
         # Do not unregister a recorded POSIX group merely because its current
         # members were temporarily unverifiable; the death supervisor remains
         # the safety net for that group.
-        _core._update_death_supervisor("unregister", released_pgids)
+        release_process_groups(released_pgids)
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
