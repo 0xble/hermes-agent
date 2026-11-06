@@ -39,18 +39,32 @@ def _runner(decision, runtime=None):
     return turn, runner, state
 
 
-def test_fallback_is_not_undone_when_desired_route_changes_mid_turn():
+@pytest.mark.parametrize(
+    "fallback_activated,provider_fallback_active",
+    [(True, False), (False, True)],
+    ids=["model-fallback", "provider-fallback"],
+)
+@pytest.mark.parametrize("commit", [False, True], ids=["preflight", "committed"])
+def test_fallback_is_not_undone_when_desired_route_changes_mid_turn(
+    fallback_activated, provider_fallback_active, commit,
+):
     decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
     turn, _runner_obj, _state = _runner(decision)
     agent = SimpleNamespace(
         model="fallback", provider="fallback-provider", api_mode="chat_completions",
         _gateway_attended_decision_key=("default", "nous", "xhigh", "default", False),
-        _fallback_activated=True, _provider_fallback_active=False,
+        _fallback_activated=fallback_activated, _provider_fallback_active=provider_fallback_active,
+        reasoning_config={"enabled": True, "effort": "xhigh"},
     )
 
-    turn._apply_attended_before_api_call(agent)
+    with patch("agent.agent_runtime_helpers.switch_model") as switch:
+        turn._apply_attended_before_api_call(agent, commit=commit)
 
-    assert agent.model == "fallback"
+    switch.assert_not_called()
+    assert (agent.model, agent.provider, agent.api_mode) == (
+        "fallback", "fallback-provider", "chat_completions",
+    )
+    assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
     assert agent._gateway_attended_decision_key == decision.decision_key
 
 
