@@ -50,6 +50,14 @@ handles in the existing service route and redacted field receipts in Hermes.
 No upstream contribution is created here; this is a fork integration and private
 browser-service companion, not a claim of upstream release support.
 
+Integration with fork main `fd9ed95c549a05d44efb888675409d2665e67c1a`
+retains its plugin backend `fill_context` and in-context origin snapshot check
+around secret resolution, payment planning, writes and final readback. The
+manager-card regression covers the matching snapshot and changed-origin refusal;
+no secret is resolved or written after a snapshot mismatch. Prompt fixtures are
+rendered against the integrated tool contract, including main's unrelated browser
+and memory schema changes, rather than restoring the older snapshots.
+
 ## Verification
 
 Contract tests: `tests/tools/test_browser_vault_manager_card.py`
