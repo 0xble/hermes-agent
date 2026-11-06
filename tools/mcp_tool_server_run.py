@@ -267,15 +267,16 @@ class MCPServerRunMixin:
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
         # The _MCP_*_TYPES flags are False until the lazy SDK import runs.
         _core._ensure_mcp_sdk()
+        from tools.mcp_tool_callback_context import callback_owner
         sampling_config = config.get("sampling", {})
         self._sampling = (_sampling.SamplingHandler(self.name, sampling_config,
-                                                    call_context=lambda: self._pending_call_context)
+                                                    call_context=lambda: callback_owner(self))
                           if sampling_config.get("enabled", True) and _core._MCP_SAMPLING_TYPES else None)
         # elicitation/create lets a server ask for structured input mid-call; the handler
         # routes it through Hermes' approval system.
         elicitation_config = config.get("elicitation", {})
         self._elicitation = (_sampling.ElicitationHandler(self.name, elicitation_config,
-                                                       call_context=lambda: self._pending_call_context)
+                                                       call_context=lambda: callback_owner(self))
                              if elicitation_config.get("enabled", True) and _core._MCP_ELICITATION_TYPES else None)
         if "url" in config and "command" in config:
             logger.warning("MCP server '%s' has both 'url' and 'command' in config. Using HTTP transport "
@@ -334,6 +335,18 @@ class MCPServerRunMixin:
         and transport errors charge a rapid-drop budget with jittered backoff; exhausting it (or
         a permanent error) parks via :meth:`_park` rather than exiting, so the server stays
         revivable. Branch helpers return True to keep looping, False to exit."""
+        if getattr(self, '_private_transport', False):
+            # One-shot lifetime: failures must not park/reset the public source
+            # or leave an SDK reader available to a subsequent normal request.
+            try:
+                if await self._prepare_run(config):
+                    await (self._run_http(config) if self._is_http() else self._run_stdio(config))
+            except Exception as exc:
+                self._publish_error(exc)
+            finally:
+                self.session = None
+                self._ready.set()
+            return
         if not await self._prepare_run(config):
             return
         self._reconnect_retries = 0
@@ -547,7 +560,9 @@ class MCPServerRunMixin:
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
-        self._task = asyncio.ensure_future(self.run(config))
+        from agent.incognito import shared_worker_context
+        context = None if getattr(self, '_private_transport', False) else shared_worker_context()
+        self._task = asyncio.create_task(self.run(config), context=context)
         try:
             await self._ready.wait()
         except asyncio.CancelledError:

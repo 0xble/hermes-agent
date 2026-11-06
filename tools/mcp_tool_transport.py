@@ -82,6 +82,17 @@ def _mcp_proxy_mounts(httpx_mod, url: str, ssl_verify, client_cert, server_name:
     return mounts or None
 
 
+def _mcp_http_transport_kwargs(httpx_mod, url: str, ssl_verify=True, client_cert=None,
+                               server_name: str = "") -> dict:
+    """One configured TLS/proxy policy for MCP sessions and saved-auth maintenance.
+
+    TLS belongs on every inner transport, not on a client with a custom transport.
+    """
+    inner = httpx_mod.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
+    return {"transport": _make_mcp_body_cap_transport(httpx_mod, inner),
+            **_present(mounts=_mcp_proxy_mounts(httpx_mod, url, ssl_verify, client_cert, server_name))}
+
+
 class LiveEndpointUnavailable(ConnectionError):
     """A declared runtime file did not provide a usable live endpoint."""
 
@@ -254,6 +265,11 @@ class MCPServerTransportMixin:
         self.session = session
         if mark_lifecycle:
             self._mark_lifecycle_started()
+        if getattr(self, '_private_transport', False):
+            # No private discovery/Events publication into the shared registry.
+            self._ready.set()
+            self._ever_connected = True
+            return await self._wait_for_lifecycle_event()
         await self._discover_tools()
         self._ready.set()
         self._ever_connected = True
@@ -300,7 +316,7 @@ class MCPServerTransportMixin:
         """Ledger the freshly spawned stdio children (pids, pgids, machine spawn ledger). pgids are
         captured while alive (getpgid fails after exit; the sweep needs them for reparented descendants)."""
         new_pgids: dict[int, int] = {}
-        new_sessions: Dict[int, int] = {}
+        new_sessions: dict[int, int] = {}
         new_starts: dict[int, int] = {}
         _lifecycle._remember_mcp_processes(new_pids)
         for pid in new_pids:
@@ -330,7 +346,14 @@ class MCPServerTransportMixin:
         for _pid in new_pids:
             try:
                 from hermes_cli.process_identity import register_child
-                register_child(_pid, "mcp-helper")
+                # Direct native entry must retain incognito ownership even when
+                # its caller failed to mark a registered session.
+                from agent.incognito import is_incognito
+                private = getattr(self, "_private_transport", False) or is_incognito()
+                if private:
+                    register_child(_pid, "mcp-helper", include_argv=False)
+                else:
+                    register_child(_pid, "mcp-helper")
             except Exception:
                 logger.debug("spawn-ledger register_child failed for MCP helper pid %s", _pid, exc_info=True)
         # Hand the pgroups to the shared parent-death supervisor so an ungraceful exit of this
@@ -419,7 +442,8 @@ class MCPServerTransportMixin:
             logger.debug("job-object self-attach failed before stdio spawn", exc_info=True)
         # Reap orphans of prior attempts first (else retries pile up zombie pairs); unscoped on purpose;
         # off-loop because the reaper blocks up to 2s.
-        await asyncio.to_thread(_lifecycle._kill_orphaned_mcp_children)
+        if not getattr(self, '_private_transport', False):
+            await asyncio.to_thread(_lifecycle._kill_orphaned_mcp_children)
         pids_before = _lifecycle._snapshot_child_pids()  # so the new child can be identified after spawn
         # Reap any orphaned subprocesses from prior failed connection attempts before spawning a new one.
         # Without this, each retry in the run() reconnect loop spawns a fresh process pair while the
@@ -430,8 +454,11 @@ class MCPServerTransportMixin:
         # otherwise stall the shared MCP event loop.
         new_pids: set = set()
         # Subprocess stderr goes to ~/.hermes/logs/mcp-stderr.log so banners can't corrupt the TUI.
-        _config._write_stderr_log_header(self.name)
-        stderr = _config._StderrTee(_config._get_mcp_stderr_log())
+        if getattr(self, '_private_transport', False):
+            stderr = _config._StderrTee(None)
+        else:
+            _config._write_stderr_log_header(self.name)
+            stderr = _config._StderrTee(_config._get_mcp_stderr_log())
         try:
             async with _core.stdio_client(server_params, errlog=stderr.sink) as (read_stream, write_stream):
                 # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
@@ -554,7 +581,17 @@ class MCPServerTransportMixin:
             return None
         try:
             from tools.mcp_oauth_manager import get_manager
-            return get_manager().get_or_build_provider(self.name, url, config.get("oauth"))
+            provider = get_manager().get_or_build_provider(self.name, url, config.get("oauth"))
+            if provider is not None:
+                # Capture only independent configuration, before any SDK request/challenge.
+                # Never reconstruct maintenance authority from mutable private Context fields.
+                provider._hermes_auth_policy = {
+                    "ssl_verify": config.get("ssl_verify", True),
+                    "client_cert": _resolve_client_cert(self.name, config),
+                    "protocol_version": next((value for key, value in (config.get("headers") or {}).items()
+                                              if key.lower() == "mcp-protocol-version"), _core.LATEST_HANDSHAKE_VERSION),
+                }
+            return provider
         except Exception as exc:
             logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
             raise
@@ -579,13 +616,11 @@ class MCPServerTransportMixin:
         # would otherwise suppress. Client MUST come from the SDK's httpx (httpx2 on mcp >= 2.0).
         _httpx_mod = _core.sdk_httpx()
         def _sse_client_factory(headers=None, timeout=None, auth=None):
-            inner_transport = _httpx_mod.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
             return _httpx_mod.AsyncClient(
                 follow_redirects=True,
                 timeout=timeout if timeout is not None else _httpx_mod.Timeout(30.0, read=300.0),
-                transport=_make_mcp_body_cap_transport(_httpx_mod, inner_transport),
-                **_present(mounts=_mcp_proxy_mounts(_httpx_mod, url, ssl_verify, client_cert, self.name),
-                           headers=headers, auth=auth))
+                **_mcp_http_transport_kwargs(_httpx_mod, url, ssl_verify, client_cert, self.name),
+                **_present(headers=headers, auth=auth))
         sse_kwargs["httpx_client_factory"] = _sse_client_factory
         return _core.sse_client(**sse_kwargs)
 
@@ -608,13 +643,11 @@ class MCPServerTransportMixin:
             httpx, httpx.URL(url), strict=strict_cfg_headers, configured_header_names=configured_header_names)
         # verify/cert live on the inner transport: a custom transport= makes client-level TLS kwargs
         # inert — and suppresses httpx's own proxy auto-detection, hence the explicit mounts=.
-        inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
         client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
                                "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
-                               "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
-                               **_present(mounts=_mcp_proxy_mounts(httpx, url, ssl_verify, client_cert, self.name),
-                                          auth=oauth_auth)}
+                               **_mcp_http_transport_kwargs(httpx, url, ssl_verify, client_cert, self.name),
+                               **_present(auth=oauth_auth)}
 
         @asynccontextmanager
         async def _owned_client_streams():  # the SDK skips cleanup when http_client is provided

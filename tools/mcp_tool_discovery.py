@@ -314,6 +314,15 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
         key = _resolve_server_key(server_name)
         server = _core._servers.get(key)
         is_lazy = key in _core._lazy_server_configs
+    from agent.incognito import is_incognito
+    if is_incognito():
+        if server is not None:return server
+        with _core._lock:config = _core._lazy_server_configs.get(key)
+        if config:
+            carrier = _core.MCPServerTask(server_name)
+            carrier._config = dict(config)
+            return carrier  # never register, wake or mark the public transport
+        return None
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
     elif server is not None and server.session is None and server._is_recycled_stdio():

@@ -443,10 +443,12 @@ def _make_events_handler(op: str, label: str, rpc, *, needs_name: bool = True, n
     """Like ``mcp_tool_handlers._make_utility_handler``, with ``name`` required and an optional consent gate."""
     def _factory(server_name: str, tool_timeout: float):
         def _handler(args: dict, **kwargs) -> str:
-            from tools import mcp_tool_discovery as _discovery  # lazy: import cycle
+            from agent.incognito import is_incognito
+            if op in {"events/subscribe", "events/unsubscribe"} and is_incognito():
+                return tool_error("Incognito: durable MCP event subscriptions are disabled")
             from tools import mcp_tool_handlers as _handlers
-            server = _discovery._get_connected_server_for_call(server_name)
-            if not server or not server.session:
+            server = _handlers._acquire_utility_server(server_name)
+            if server is None:
                 return tool_error(f"MCP server '{server_name}' is not connected")
             if needs_name and not isinstance(args.get("name"), str):
                 return tool_error("Missing required parameter 'name'")
@@ -459,8 +461,12 @@ def _make_events_handler(op: str, label: str, rpc, *, needs_name: bool = True, n
                     return error
 
             async def _call():
-                async with server._rpc_lock:
-                    result = await rpc(server.session, args, server_name)
+                from tools.mcp_tool_callback_context import rpc_target
+                target = rpc_target(server)
+                async with target._rpc_lock:
+                    async with _handlers._track_inflight_rpc(target, server_name, op,
+                                                            retry_safe=op == "events/list"):
+                        result = await rpc(target.session, args, server_name)
                 return json.dumps(result, ensure_ascii=False)
             return _handlers._dispatch(
                 server_name, server, op, _call, tool_timeout,
