@@ -331,6 +331,16 @@ def test_card_fill_that_cannot_pay_never_prompts(controls):
     out = json.loads(raw)
     assert out["success"] is False and out["error_type"] == "no_payment_fields"
     assert prompts == [] and secret_exprs == []
+    # The error sits at the fallback decision point: it must permit the authorized
+    # typed entry, not order a user handoff.
+    error = out["error"]
+    assert "hand the card entry to the user" not in error.lower()
+    assert "may be typed" in error
+    assert "approved exact charge" in error
+    assert "verified merchant origin" in error
+    assert "read live from the routed 1Password Credit Card item" in error
+    for code in ("payment_declined", "payment_prompt_unanswered", "payment_retry_refused"):
+        assert code in error
 
 
 def test_slow_card_confirmation_without_refresh_support_preserves_base_fill(monkeypatch):
