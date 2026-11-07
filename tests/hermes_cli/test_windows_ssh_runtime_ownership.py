@@ -10,10 +10,12 @@ import psutil
 import pytest
 
 from hermes_cli.windows_ssh_runtime import process_state
+from tests.waiting import wait_until
 
 
 @pytest.mark.platforms("posix")
-def test_isolated_bootstrap_is_owned_without_accepting_foreign_source(tmp_path):
+@pytest.mark.parametrize("argv_initially_unavailable", [False, True])
+def test_isolated_bootstrap_is_owned_without_accepting_foreign_source(tmp_path, monkeypatch, argv_initially_unavailable):
     package = tmp_path / "hermes_cli"
     package.mkdir()
     (package / "__init__.py").write_text("")
@@ -27,7 +29,27 @@ def test_isolated_bootstrap_is_owned_without_accepting_foreign_source(tmp_path):
     try:
         created = int(psutil.Process(child.pid).create_time() * 1_000_000_000)
         launcher = str(tmp_path / "hermes.exe")
-        state = process_state(child.pid, created, launcher, nonce)
+        if argv_initially_unavailable:
+            cmdline = psutil.Process.cmdline
+            unavailable = True
+
+            def initially_unavailable(process):
+                nonlocal unavailable
+                if process.pid == child.pid and unavailable:
+                    unavailable = False
+                    return []
+                return cmdline(process)
+
+            monkeypatch.setattr(psutil.Process, "cmdline", initially_unavailable)
+
+        # A spawned process can be alive before its argv is observable. Retry only
+        # that indeterminate observation, never a determinate ownership rejection.
+        def observable_state():
+            state = process_state(child.pid, created, launcher, nonce)
+            return state if state["reason"] != "argv-unavailable" else None
+
+        state = wait_until(observable_state, what="the bootstrap child's argv to become observable")
+        assert state is not None
         assert state["alive"] and state["owned"], state
         assert not process_state(child.pid, created, launcher, "b" * 16)["owned"]
         assert not process_state(child.pid, created + 1, launcher, nonce)["owned"]
