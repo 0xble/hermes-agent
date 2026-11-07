@@ -374,8 +374,6 @@ _LONG_SIZE_THRESHOLDS = (
 )
 
 
-def long_size_bucket(count: int) -> str:
-    return _bucket(max(0, int(count)), _LONG_SIZE_THRESHOLDS, "gte_1001")
 # ---- end v5 engagement ----
 
 # ---- v4 reliability ----
@@ -572,16 +570,8 @@ INSTALL_RUN_FAILURE_CLASSES = frozenset({
 # ---- end iuf c2 ----
 
 
-def update_duration_bucket(duration_ms: Any) -> str:
-    """Bucket an update (or update stage) wall time; non-numbers count as instant."""
-    value = _non_negative_number(duration_ms) or 0
-    return _bucket(value, _UPDATE_DURATION_THRESHOLDS, "gte_15m")
 
 
-def version_age_bucket(age_ms: Any) -> str:
-    """Bucket the age of the version an update started from; unknown when not measurable."""
-    value = _non_negative_number(age_ms)
-    return "unknown" if value is None else _bucket(value, _VERSION_AGE_THRESHOLDS, "gte_90d")
 # ---- end v4 reliability ----
 
 # ---- v5 harness ----
@@ -731,10 +721,6 @@ _DESKTOP_ACTIVE_THRESHOLDS = ((300_000, "lt_5m"), (1_800_000, "5m_to_30m"), (7_2
                               (21_600_000, "2h_to_6h"))
 
 
-def desktop_active_minutes_bucket(active_ms: Any) -> str:
-    """Bucket a day's active time in one Desktop mode; nothing measurable reads 0."""
-    value = _non_negative_number(active_ms) or 0
-    return "0" if value <= 0 else _bucket(value, _DESKTOP_ACTIVE_THRESHOLDS, "gte_6h")
 # ---- end v5 desktop ----
 
 # ---- v5 desktop actions ----
@@ -1720,18 +1706,10 @@ _LATENCY_THRESHOLDS = (
 )
 
 
-def _bucket(value: float, thresholds: tuple[tuple[float, str], ...], last: str) -> str:
-    return next((label for upper, label in thresholds if value < upper), last)
 
 
-def duration_bucket(duration_ms: int) -> str:
-    """Bucket a non-negative task duration into a fixed low-cardinality range."""
-    return _bucket(max(0, int(duration_ms)), _DURATION_THRESHOLDS, "gte_10m")
 
 
-def count_bucket(count: int) -> str:
-    """Bucket a non-negative per-task count into a fixed range."""
-    return _bucket(max(0, int(count)), _COUNT_THRESHOLDS, "gte_11")
 
 
 _TOOL_CATEGORY_EXACT = {
@@ -1889,21 +1867,8 @@ def _result_error(result: Any) -> dict[str, Any]:
     return error if isinstance(error, dict) else {}
 
 
-def tool_latency_bucket(value: Any, *, fallback_duration_ms: int | None = None) -> str:
-    """Bucket a tool duration reported in milliseconds."""
-    duration_ms = _non_negative_number(value)
-    if duration_ms is None:
-        duration_ms = _non_negative_number(fallback_duration_ms)
-    if duration_ms is None:
-        return "unknown"
-    return _bucket(duration_ms, _LATENCY_THRESHOLDS, "gte_30s")
 
 
-def tool_retry_bucket(value: Any) -> str:
-    """Bucket only explicit tool retries; missing relationships stay unknown."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return "unknown"
-    return count_bucket(value)
 
 
 def _non_negative_number(value: Any) -> float | None:
@@ -1955,9 +1920,6 @@ _SIZE_THRESHOLDS = (
 )
 
 
-def size_bucket(count: int) -> str:
-    """Bucket a non-negative install-scale count."""
-    return _bucket(max(0, int(count)), _SIZE_THRESHOLDS, "gte_251")
 
 
 def install_snapshot_fields(
@@ -1999,3 +1961,9 @@ def _metric_identifier(value: Any, *, max_length: int) -> str:
     ):
         return "unknown"
     return identifier
+
+
+from hermes_cli.observability.shared_metrics_buckets import (
+    long_size_bucket, update_duration_bucket, version_age_bucket, desktop_active_minutes_bucket,
+    _bucket, duration_bucket, count_bucket, tool_latency_bucket, tool_retry_bucket, size_bucket,
+)
