@@ -26,6 +26,32 @@ Cost estimate (billed Linux runner minutes; workload dependent): before retireme
 
 A passing source gate does not certify external integrations, Nix, native installers, image publication, or signed desktop releases. GitHub Actions billing limits may prevent all jobs from starting; until an actual hosted run executes, local verification is evidence only and `qualification` cannot be claimed green.
 
+## Upstream Guard Consolidation
+
+Upstream consolidated its cheap CI jobs into `repo-guards.yml` in
+https://github.com/NousResearch/hermes-agent/pull/149786. Its caller is the
+upstream `ci.yaml` orchestrator, which this fork intentionally does not ship.
+The fork must not import the reusable child without that owner or wire it into
+`gate.yml` solely to satisfy a workflow-graph check. Remove the orphan child
+and its `test_combined_check_jobs.py` test, whose other owner, `lint.yml`, is
+also retired here.
+
+The fork's portable static aggregation, exact-SHA admission and qualification
+graph remain unchanged. History, attribution, infographics, profile archives,
+case collisions, dependency bounds and locked resolution retain their existing
+portable owners. Prompt-surface reporting retains its separately called workflow.
+Container lint remains a separate lane. Semantic lockfile and supply-chain
+review remain advisory under the allocation above. Blob-size and lazy-import
+checks remain available through `scripts/check`, and icon generation retains
+its native `scripts/generate-icons.mjs` command. These manual commands are not
+claimed as new gate coverage.
+
+Keep the generic reusable-workflow caller check and the portable aggregation
+regression that verifies a failed check does not hide later results. This is
+fork workflow reconciliation, not an upstream defect or an upstream contribution.
+Retire this adaptation only when the fork deliberately adopts the upstream
+orchestrator and requalifies its complete workflow graph.
+
 ## Bounded channel metadata smoke
 
 The complete-request smoke test keeps its 15-second deadline and real CLI
