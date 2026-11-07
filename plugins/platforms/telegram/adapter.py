@@ -38,6 +38,7 @@ from plugins.platforms.telegram.private_ingress import (
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.telegram_reconnect import TelegramReconnectMixin
+from plugins.platforms.telegram.progress import TelegramProgressMixin
 from plugins.platforms.telegram.telegram_media_download import fetch_telegram_file as _fetch_telegram_file
 from plugins.platforms.telegram.daily_quota import DailyQuota, quota_from_platform_extra, send_outbound_class
 from plugins.platforms.telegram.session_control_cards import session_control_outcome
@@ -461,19 +462,6 @@ _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
 # pass shares its boundaries with the inline pass so code inside a block is never rewritten.
 _MULTI_TICK_CODE_SPAN_RE = re.compile(r'(?<![`\\])(?P<ticks>`{2,})(?!`)(?P<body>[^\n]+?)(?<!`)(?P=ticks)(?!`)')
 _MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
-_BACKTICK_RUN_RE = re.compile(r'`+')
-
-
-def _progress_code_span(text: str) -> str:
-    """``text`` as one CommonMark inline code span: a backtick run longer than any inside it, padded
-    with a space when it starts or ends with a backtick (or with a space on both sides, which
-    CommonMark would otherwise strip). Newlines fold to spaces, as a code span renders them anyway."""
-    text = " ".join(str(text).split("\n"))
-    if not text.strip():
-        return text
-    fence = "`" * (max((len(run) for run in _BACKTICK_RUN_RE.findall(text)), default=0) + 1)
-    pad = " " if text[0] == "`" or text[-1] == "`" or (text[0] == " " and text[-1] == " ") else ""
-    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 def _escape_mdv2(text: str) -> str:
@@ -977,7 +965,8 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramProgressMixin, TelegramReconnectMixin, TelegramHeldInboundMixin,
+                      TelegramTopicRoutingMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, thread_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -7268,12 +7257,6 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             logger.error("[%s] Failed to get Telegram chat info for %s: %s", self.name, chat_id, _redact_telegram_error_text(
                 e), exc_info=True)
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
-
-    def format_progress_literal(self, text: str) -> str:
-        """Tool names and previews in progress lines are code spans, so neither the rich Markdown
-        parser nor ``format_message`` reads ``mcp__a__b``, ``**/*.md``, ``README.md`` or ``\\s+``
-        as markup or a link."""
-        return _progress_code_span(text)
 
     @staticmethod
     def truncate_message(content: str, max_length: int = 4096,
