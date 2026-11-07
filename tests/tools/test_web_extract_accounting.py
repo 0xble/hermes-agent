@@ -121,11 +121,13 @@ def test_provider_exception_is_a_per_url_error_not_a_lost_batch(offline):
     assert all(result["fallback_from"] == "direct_http" for result in results)
 
 
-@pytest.mark.parametrize("mode", ["success", "redirect", "thin", "error", "rescue"])
+@pytest.mark.parametrize("mode", ["success", "redirect", "unrelated", "thin", "error", "rescue"])
 def test_direct_miss_reuses_only_successful_provider_pages_within_ttl(offline, mode):
     now = [100000.0]
     offline.setattr(cache.time, "time", lambda: now[0])
-    result = page(FINAL if mode == "redirect" else A)
+    result = page(FINAL if mode in ("redirect", "unrelated") else A)
+    if mode == "unrelated":
+        result["metadata"] = {"sourceURL": B}
     if mode == "thin":
         result["content"] = "Thin teaser"
     if mode == "error":
@@ -141,6 +143,8 @@ def test_direct_miss_reuses_only_successful_provider_pages_within_ttl(offline, m
         return json.loads(asyncio.run(wt.web_extract_tool([A], char_limit=10000)))["results"][0]
 
     first = public_run()
+    if mode == "unrelated":
+        assert first["url"] == A and first["error"] and not first["content"]
     now[0] += 58
     second = public_run()
     cacheable = mode in ("success", "redirect")

@@ -90,7 +90,9 @@ def _match_extract_results(urls: list[str], results: list[dict]) -> list[dict]:
             matched[identity] = result
     if len(requested) == 1 and not matched and len(unmatched) == 1:
         result = unmatched[0]
-        if result.get("url"):
+        metadata = result.get("metadata")
+        source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+        if result.get("url") and (not source or source == result["url"]):
             matched[urls[0]] = result
     ordered = []
     for url in urls:
@@ -225,6 +227,7 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
             return failed
         return _match_extract_results(fetch_urls, await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed))
     except Exception as exc:
+        logger.exception("web_extract provider %s failed", provider.name)
         failed = [_result_entry(u, str(exc)) for u in fetch_urls]
         if not _rescue_eligible(provider):
             return failed
