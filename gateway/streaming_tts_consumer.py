@@ -36,6 +36,8 @@ class StreamingTTSConsumer:
                  audio_format: Optional[AudioFormat] = None) -> None:
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
         self._adapter, self._chat_id, self._loop, self._metadata = adapter, chat_id, loop, metadata
+        from gateway.reply_latency import current_receipt
+        self._reply_latency_receipt = current_receipt()
         # Resolved once; None => inactive, gateway falls back to whole-file TTS.
         self._streamer = resolve_streaming_provider(tts_config)
         self._chunker = SentenceChunker.from_config(tts_config)
@@ -221,6 +223,8 @@ class StreamingTTSConsumer:
             await self._adapter.write_streaming_tts(self._handle, chunk)
             if not was_audible:
                 self._handle.audible = self._suppress_whole_file = True
+                from gateway.reply_latency import record_first_reply
+                record_first_reply(getattr(self, "_reply_latency_receipt", None), "audio")
 
     async def _safe_abort(self, reason: str) -> None:
         """Abort the adapter stream, swallowing errors (idempotent)."""

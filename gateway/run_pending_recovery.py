@@ -252,6 +252,15 @@ def _recovered_followup_event(data, source, author_id):
             or (isinstance(receipt, float) and not math.isfinite(receipt))):
         receipt = None
     setattr(event, "_attended_activity_received_at", receipt)
+    if isinstance(receipt_id := data.get('_reply_latency_receipt_id'), str) and receipt_id:
+        event._reply_latency_receipt_id = receipt_id
+    reply_stamp = data.get('_reply_latency_received_at', receipt)
+    if (isinstance(reply_stamp, (int, float)) and not isinstance(reply_stamp, bool)
+            and math.isfinite(reply_stamp)):
+        event._reply_latency_received_at = reply_stamp
+    if isinstance(inputs := data.get('_reply_latency_inputs'), list) and inputs:
+        from gateway.reply_latency import restore_inputs
+        restore_inputs(event, inputs)
     if recovery_id is not None:
         setattr(event, "_hermes_recovery_id", recovery_id)
     return event

@@ -68,6 +68,14 @@ def _isolate_camofox_leases(tmp_path, monkeypatch):
         leases._local_claims.clear()
 
 
+@pytest.fixture(autouse=True)
+def _stop_reply_latency_writers():
+    yield
+    sinks = sys.modules.get("gateway.reply_latency_sink")
+    if sinks is not None:
+        assert sinks.shutdown_sinks(timeout=2.0), "reply-latency writer did not stop"
+
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:

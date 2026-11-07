@@ -163,6 +163,8 @@ async def _hand_over_turn_marker(authority, admission_id, event):
     no-waiter reply keeps it until ``deliver_settled``; any other turn releases it here."""
     adopter = _marker_adopters(authority).get(admission_id)
     if adopter is not None:
+        from gateway.reply_latency import hand_over_receipt
+        hand_over_receipt(event, adopter)
         _move_marker(event, adopter)
         return
     if admission_id in authority.pending_deliveries:
@@ -587,6 +589,8 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             response = await adapter._message_handler(event)
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
+            from gateway.reply_latency import hand_over_receipt
+            hand_over_receipt(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
             await deliver_response(adapter, delivery_event, session_key, response)
         except Exception as exc:

@@ -275,11 +275,14 @@ def _serialise_value(value: Any) -> Optional[dict]:
         if recovery_id is not None and _json_safe(recovery_id):
             result["recovery_id"] = recovery_id
         for attr in ("user_id", "user_name", "media_urls", "media_types", "media_text_inlined",
-                     "_attended_activity_received_at",
+                     "_attended_activity_received_at", "_reply_latency_received_at", "_reply_latency_receipt_id",
                      "reply_to_message_id", "reply_to_text", "reply_to_author_id", "reply_to_author_name"):
             val = getattr(value, attr, None)
             if val is not None and _json_safe(val):
                 result[attr] = val
+        if getattr(value, '_hermes_absorbed_events', ()) or getattr(value, '_reply_latency_inputs', None):
+            from gateway.reply_latency import snapshot_inputs
+            result['_reply_latency_inputs'] = snapshot_inputs(value)
         # Voice vs audio-file vs document routing reads the message-level type, not just MIME.
         message_type = getattr(getattr(value, "message_type", None), "value", None)
         if isinstance(message_type, str):

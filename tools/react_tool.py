@@ -50,6 +50,8 @@ def _react_gateway(platform, emoji: str) -> str:
     if result is not True:
         return tool_error(f"Platform '{platform.value}' does not support this reaction or delivery failed.")
     acknowledge_current_message_reaction()
+    from gateway.reply_latency import record_tool_reply
+    record_tool_reply(platform.value, chat_id, routing.get("thread_id"))
     return json.dumps({"success": True, "platform": platform.value, "chat_id": chat_id,
                        "message_id": message_id, "emoji": emoji}, ensure_ascii=False)
 
