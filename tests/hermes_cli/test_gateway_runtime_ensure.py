@@ -10,7 +10,8 @@ import time
 
 import pytest
 
-def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypatch):
+@pytest.mark.parametrize('launchd_available', [False, True])
+def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypatch, launchd_available):
     from types import SimpleNamespace
     from hermes_cli import gateway_runtime_start as start
     from hermes_cli import gateway_windows
@@ -27,6 +28,8 @@ def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypat
         captured.update(kwargs)
         return child
     monkeypatch.setattr(start.subprocess, 'Popen', spawn)
+    monkeypatch.setattr(start, 'start_gateway_job',
+                        lambda command, **kwargs: spawn(command, **kwargs) if launchd_available else None)
     assert start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5) is child
     assert all(key not in captured['env'] for key in flags)
     assert captured['env']['RUNTIME_TEST_SENTINEL'] == 'retained'

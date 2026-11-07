@@ -11,6 +11,7 @@ import pytest
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry
+from gateway.turn_context import TurnContext
 from gateway.shutdown_flush import flush_overflow_to_file, flush_pending_to_file, recover_pending_to_db
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
@@ -137,7 +138,7 @@ async def test_idle_drain_silently_recovers_human_message(tmp_path, monkeypatch)
 async def test_queued_interrupt_placeholder_does_not_send_before_followup():
     runner, adapter = make_restart_runner()
     source = make_restart_source()
-    ctx = SimpleNamespace(
+    ctx = TurnContext(
         session_key="agent:main:telegram:dm:123456", stream_consumer_holder=[None],
         mute_notification_reply=False, persist_user_display_kind=None, source=source,
         _status_thread_metadata=None, event_message_id=None, inbound_message_id="101",
@@ -171,7 +172,7 @@ async def test_queued_model_echo_of_interrupt_diagnostic_never_sends_before_foll
     runner._is_goal_continuation_event = MagicMock(return_value=False)
     runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="follow-up")
     runner._refresh_agent_cache_message_count = AsyncMock()
-    ctx = SimpleNamespace(
+    ctx = TurnContext(
         session_key=key, session_id="sid", source=source, stream_consumer_holder=[None],
         mute_notification_reply=False, persist_user_display_kind=None,
         _status_thread_metadata=None, event_message_id=None, inbound_message_id="101",
@@ -315,7 +316,6 @@ async def test_adapter_drain_preserves_one_turn_without_reentering_handler(
         async def active_handler(first):
             entered.set()
             await active.wait()
-            return None
 
         adapter.set_message_handler(active_handler)
         await adapter.handle_message(MessageEvent(text="existing turn", source=source, user_id="u1"))
@@ -629,7 +629,7 @@ def test_ordinary_queued_head_precedes_later_drain_spool(tmp_path, monkeypatch):
 
 def test_failed_drain_authorization_keeps_spool_for_next_pass(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    runner, adapter = make_restart_runner()
+    runner, _adapter = make_restart_runner()
     source = make_restart_source()
     key = runner._session_key_for_source(source)
     event = MessageEvent(text="keep", source=source, user_id="u1")
@@ -658,7 +658,7 @@ def test_failed_drain_authorization_keeps_spool_for_next_pass(tmp_path, monkeypa
 @pytest.mark.asyncio
 async def test_reconnect_during_drain_does_not_claim_arrival(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    runner, adapter = make_restart_runner()
+    runner, _adapter = make_restart_runner()
     source = make_restart_source()
     key = runner._session_key_for_source(source)
     event = MessageEvent(text="later", source=source, user_id="u1")

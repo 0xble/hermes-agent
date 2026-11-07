@@ -20,6 +20,11 @@ def _host_attach_gate_is_not_under_test(monkeypatch, tmp_path):
     """
     # A runner process pins its launch home at module import. These tests simulate separate
     # launches in tmp_path, including their real control sockets and clean-shutdown markers.
+    # Keep the root fixture's explicit DB override with that same reserved profile.
+    import hermes_state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
     monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
     monkeypatch.setattr("gateway.run._host_attach_or_none", AsyncMock(return_value=None))
     yield
@@ -113,11 +118,9 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
     class _CleanExitRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
-            self.session_store._db = self._session_db
+            self._session_db = self.session_store._db
             self._draining = False
             self.config = config
             self.should_exit_cleanly = True
@@ -131,7 +134,6 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
 
         async def stop(self):
             await asyncio.to_thread(self.session_store.close_all_db_handles)
-            await asyncio.to_thread(self._session_db.close)
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
@@ -307,11 +309,9 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
     class _CleanExitRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
-            self.session_store._db = self._session_db
+            self._session_db = self.session_store._db
             self._draining = False
             self.config = config
             self.should_exit_cleanly = True
@@ -324,7 +324,6 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
 
         async def stop(self):
             await asyncio.to_thread(self.session_store.close_all_db_handles)
-            await asyncio.to_thread(self._session_db.close)
 
     _pid_state = {"alive": True}
     def _mock_get_running_pid():
@@ -545,11 +544,9 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
     class _FatalConfigRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
-            self.session_store._db = self._session_db
+            self._session_db = self.session_store._db
             self._draining = False
             self.config = config
             self.should_exit_cleanly = True
@@ -562,7 +559,6 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
 
         async def stop(self):
             await asyncio.to_thread(self.session_store.close_all_db_handles)
-            await asyncio.to_thread(self._session_db.close)
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)

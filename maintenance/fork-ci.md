@@ -48,6 +48,16 @@ parked bot keeps the gateway serving local clients, while ownership conflicts
 still terminate startup. Assertions must verify those outcomes, not merely
 relax an exit-code expectation. Regenerate prompt-surface fixtures through
 `scripts/ci/prompt_surface.py render` after changing tool catalog descriptions.
+Startup fakes borrow their real SessionStore's registry-owned handle instead of
+opening another SessionDB on the gateway event loop. Keep the explicit
+`DEFAULT_DB_PATH` test override in the same temporary home as the startup
+reservation, including fatal-exit and takeover cases. Drain fixtures use the
+native `TurnContext` defaults so reply-expected handling remains covered.
+Unmanaged-daemon environment tests intercept both the native launchd adapter
+and the plain-child boundary without touching host services. Preserve the
+exit-code, marker ordering, silence, queued-delivery and environment assertions.
+Retire these adaptations when the accepted upstream fixtures supply the same
+native contracts and profile-owned resource cleanup.
 
 Login PATH fixtures distinguish inherited launcher entries from an explicit
 backend/client toolchain. Exercise dropped-entry restoration with inherited
