@@ -103,7 +103,7 @@ async def test_receipt_is_once_and_only_confirmed_text_ends_its_own_turn(caplog,
     await adapter.send_final_ledgered(first, "session", "final answer", {}, reply_to=None)
     logs = records(caplog)
     assert [r["event"] for r in logs] == ["received", "agent_start", "received", "agent_start",
-                                             "first_reply", "first_reply"]
+                                             "first_reply", "first_reply", "final_delivery"]
     assert [(r["message_id"], r["thread_id"]) for r in logs if r["event"] == "first_reply"] == [
         ("one", "a"), ("two", "b")]
     assert logs[0]["timestamp"] == 1700000000.0
@@ -130,7 +130,7 @@ async def test_final_send_failure_and_internal_turn_never_stop_human_receipt(cap
     assert [r["event"] for r in records(caplog)] == ["received", "agent_start"]
     adapter.ok = True
     await adapter.send_final_ledgered(human, "session", "answer", {}, reply_to=None)
-    assert [r["event"] for r in records(caplog)] == ["received", "agent_start", "first_reply"]
+    assert [r["event"] for r in records(caplog)] == ["received", "agent_start", "first_reply", "final_delivery"]
 
 
 @pytest.mark.asyncio

@@ -13,8 +13,9 @@ but its execution-start, chat-keyed clock does not include pre-execution wait.
 Contribution route: keep this local log contract until upstream offers an
 unconditional receipt-to-confirmed-text event pair with message-level identity.
 Upstream disposition: not submitted. Fork delivery: source patch only, runtime
-activation remains a separate decision. The companion reader belongs to
-[`0xble/scripts`](https://github.com/0xble/scripts/pull/452), not this repository.
+activation remains a separate decision. The gateway now owns a local JSONL
+reader, `python -m gateway.reply_latency_report --since 7d`. The earlier
+responsiveness reader in `0xble/scripts` remains a separate consumer.
 
 ## Update Boundary
 
@@ -25,10 +26,15 @@ receipt timestamp and successful-send meaning owned by their existing helpers.
 Do not replace a confirmed send with the optimistic pre-send journal, an outbox
 admission timestamp, an empty native seed frame or an inherited chat clock.
 
-The record's `turn_id` is the existing `outbox.transport_id(event)` known before
-admission, not the later randomly allocated outbox admission UUID. Preserve
-this distinction when adopting upstream event identities, or migrate the
-reader and producer together. Missing transport identities stay nullable.
+The immutable inbound key is platform, chat, thread and inbound message ID.
+`turn_id` remains diagnostic, because rehydration changes it from the transport
+identity to the durable admission identity. The reader folds append-only
+observations into 1 record per inbound. Missing transport identities stay nullable.
+The profile-owned writer appends receipt, durable admission, agent start, first
+visible delivery kind and final-delivery confirmations to the existing daily
+`logs/reply-latency/` JSONL files. Progress sends, status cards and edits count only
+after transport success. Deferred outbox acceptance is not delivery. Telegram
+split sends stamp each acknowledged chunk before outbox/bookkeeping waits.
 The local logging must stay independent of the shared-telemetry opt-in. Stamp
 arrival before buffering, but emit `received` only after authorization. Diagnostic
 identity or log failures must not interrupt intake. Recursive queued follow-ups
@@ -43,10 +49,13 @@ exercises the confirmed transport boundaries and cross-event isolation.
 [`test_reply_latency_followups.py`](../tests/gateway/test_reply_latency_followups.py)
 drives the real in-band drain through queued, interrupting and nested turns,
 including streaming, final-send attribution, failure and cancellation. It also
-covers unauthorized DMs and diagnostic failures during admission. Run these
+covers unauthorized DMs and diagnostic failures during admission. The delivery
+tests also cover progress/status sends and edits, admission rehydration, skipped
+and deferred sends, split Telegram confirmations, fresh streamed finals and
+fallback continuation chunks. Run these
 with the existing shared-metrics, stream-consumer and attended-activity tests
 when these lifecycles move. A native-frame or adapter-internal split cannot
-claim a delivery instant earlier than the acknowledgement the caller observes.
+claim delivery before its actual transport acknowledgement.
 
 Retire this patch and its companion reader contract only after the upstream
 replacement proves original-receipt coverage and confirmed-send semantics for

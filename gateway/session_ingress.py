@@ -45,6 +45,8 @@ async def admit_message(authority, event):
     ingress = messaging_admission.set(True if accepted is None else accepted)
     try:
         receipt = await authority.admit_native(event)
+        from gateway.reply_latency import record_admitted
+        record_admitted(event)
         if committed is not None and not committed.done():
             committed.set_result(None)  # the row is durable (any status): a barrier may go on
     except RuntimeStoreError as exc:
@@ -173,6 +175,9 @@ async def _hand_over_turn_marker(authority, admission_id, event):
 
 
 def _move_marker(source, target):
+    for name in ('_reply_latency_receipt', '_terminal_reply_latency_receipt'):
+        if hasattr(source, name):
+            setattr(target, name, getattr(source, name))
     for name in _MARKER_FIELDS:
         if hasattr(source, name):
             setattr(target, name, getattr(source, name))
