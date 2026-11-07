@@ -548,3 +548,89 @@ async def test_not_found_reresolve_is_compression_only(parked, monkeypatch, rota
         assert goals.load_goal(sid).waiting_since > 0
         assert goals.load_goal(sid).last_automatic_continuation_at == 0
         assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_wait_admits_without_taking_launch_db_lock(tmp_path, monkeypatch):
+    from gateway.run import _profile_runtime_scope
+    from gateway.run_goal_wait import goal_wait_guard
+    from gateway.run_runtime import initialize_gateway_runtime
+    from gateway.runtime_ownership import process_ownership
+    from gateway.session import SessionSource
+    from hermes_state_runtime import admit_session_input
+    from tests.gateway.test_session_authorities_multiplex import _reserve_homes, _runner
+
+    root, homes = _reserve_homes(tmp_path, monkeypatch, names=('alpha',))
+    process_ownership.reserve([home for _, home in homes])
+    runner = _runner(root, homes)
+    try:
+        await initialize_gateway_runtime(runner)
+        with _profile_runtime_scope(homes[1][1], {}):
+            authority = runner.session_authorities.for_home(homes[1][1])
+            source = SessionSource(platform=Platform.DISCORD, chat_id='42', user_id='42',
+                                   chat_type='dm', profile='alpha')
+            entry = runner.session_store.get_or_create_session(source)
+            key, sid = entry.session_key, entry.session_id
+            authority.db.create_session(sid, source='discord', session_key=key)
+            runner.session_store._save_entry(key)
+            routing_db = runner.session_store._routing_db
+            assert routing_db is not authority.db
+            scope = runner.session_store._routing_scope()
+            with routing_db._read_ctx() as conn:
+                assert conn.execute('SELECT 1 FROM gateway_routing WHERE scope=? AND session_key=?',
+                                    (scope, key)).fetchone()
+            await runner._warm_goals_session_db('multiplex wait fixture')
+            manager = goals.GoalManager(sid)
+            manager.set('finish the secondary profile goal')
+            manager.wait_for_seconds(1, 'disposable evidence')
+            guard = await asyncio.to_thread(goal_wait_guard, authority,
+                                           captured_event(runner, source, sid, manager))
+            # A routing writer may itself wait on this authority. Never borrow its
+            # lock from the authority writer, even though both handles are SQLite.
+            with monkeypatch.context() as locked:
+                def forbidden_read(*args, **kwargs):
+                    raise AssertionError('authority writer acquired the launch routing DB')
+                locked.setattr(routing_db, '_read_ctx', forbidden_read)
+                await asyncio.to_thread(admit_session_input, authority.db, epoch=authority.epoch,
+                    principal_id='automation:' + key, session_id=sid, request_id='multiplex-goal-wait',
+                    payload={'text': 'secondary goal wake'}, _authorize_write=guard)
+            assert len(list_session_admissions(authority.db, session_id=sid)) == 1
+            assert goals.load_goal(sid).waiting_since == 0
+            assert goals.load_goal(sid).last_automatic_continuation_at > 0
+    finally:
+        for authority in list(getattr(runner, 'session_authorities', []) or []):
+            authority.db.close()
+        runner.session_store.close_all_db_handles()
+        for _, home in homes:
+            process_ownership.release(home)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('route', ['incognito', 'missing_durable_route'])
+async def test_unfenceable_wait_is_terminal_once_without_retry_tracebacks(parked, monkeypatch, caplog, route):
+    runner, _adapter, authority, _source, sid, key, _manager, rows, adapter_calls = parked
+    store = runner.session_store
+    authority.db._execute_write(lambda conn: conn.execute(
+        'DELETE FROM gateway_routing WHERE scope=? AND session_key=?', (store._routing_scope(), key)))
+    before = goals.load_goal(sid).to_json()
+    from itertools import count
+    clock = count(1e12, 1000)
+    monkeypatch.setattr('gateway.run_goal_wait.monotonic', lambda: next(clock))
+    try:
+        if route == 'incognito':
+            store.set_incognito(key, True)
+        with caplog.at_level('WARNING', logger='gateway.run_goal_wait'):
+            for _ in range(3):
+                await runner._goal_wakeup_fire_one(sid)
+    finally:
+        if route == 'incognito':
+            store.set_incognito(key, False)
+    assert sid not in getattr(runner, '_goal_wait_retries', {}), 'permanent refusal kept retrying'
+    warnings = [r for r in caplog.records if r.name == 'gateway.run_goal_wait' and r.levelname == 'WARNING']
+    assert len(warnings) == 1
+    assert route in warnings[0].message and sid in warnings[0].message
+    assert warnings[0].exc_info is None
+    assert rows() == []
+    assert goals.load_goal(sid).to_json() == before
+    assert runner._get_replay_scheduler().gate.load() == 0
+    adapter_calls.assert_not_called()
