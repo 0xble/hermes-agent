@@ -22,6 +22,19 @@ clears the goal once with one short notice, before dispute pause or timed backof
 
 ## Provenance and adaptation
 
+- Fork patch identity: `post-turn-delivery-latency`. Goal/loop bookkeeping uses
+  the existing post-delivery callback owner so an auxiliary judge cannot hold
+  a completed response before durable FIFO settlement and final delivery.
+  The assistant transcript and terminal admission still commit before the send.
+  Recovered, waiting and silent turns retain the existing callback handoff, with
+  the owning profile and captured turn result restored. A judge running longer
+  than the cosmetic cleanup budget remains a tracked task. Notices produced by
+  that callback deliver immediately instead of registering behind a callback
+  that already fired. Regression: `tests/gateway/test_post_turn_delivery_latency.py`.
+  Retire when upstream delivers before equivalent nonessential bookkeeping
+  under the same durability contract. Rollback reverts this scheduling slice,
+  leaving goal state, judge policy and storage locking unchanged.
+
 - Fork patch identity: `goal-done-loop-prompts`. Standing-goal continuation guidance treats restarts, updates,
   and new releases without changed results as unchanged and silent. The contract judge accepts recorded test
   evidence for a case that the goal's boundaries or constraints forbid demonstrating live when tool output names
