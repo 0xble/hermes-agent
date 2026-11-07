@@ -26,6 +26,22 @@ Cost estimate (billed Linux runner minutes; workload dependent): before retireme
 
 A passing source gate does not certify external integrations, Nix, native installers, image publication, or signed desktop releases. GitHub Actions billing limits may prevent all jobs from starting; until an actual hosted run executes, local verification is evidence only and `qualification` cannot be claimed green.
 
+## Receipt-gated merge queue
+
+The fork-only `.mergify.yml` uses explicit queue commands, two-item serial batches,
+`qualification` plus `landing/reviewed-gated` on each original PR at admission,
+and `qualification` on the generated draft batch PR before fast-forwarding the
+exact tested head. Distinct admission and merge conditions must remain: copying
+the review status onto generated heads or requiring it there would respectively
+misrepresent review or deadlock the queue. Do not rebase original heads or carry
+review attestations across head changes. All draft batch lanes must execute;
+skipped/cancelled results remain failures. `gate.yml` deliberately runs on opened,
+synchronize, reopened and ready_for_review PR events, not native merge_group.
+Activation depends on a separately reviewed exact-head landing publisher,
+queue-only main protection, and retiring the external native-auto-merge updater
+for this repository. The config alone is not a completed cutover. Retire it only
+when another queue preserves exact-head review and tests the precise landed head.
+
 ## Bounded channel metadata smoke
 
 The complete-request smoke test keeps its 15-second deadline and real CLI
