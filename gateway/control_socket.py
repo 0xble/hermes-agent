@@ -200,8 +200,11 @@ def build_status_payload() -> dict[str, Any]:
     """Default ``status`` answer — current runtime status, answered live."""
     from gateway.status import read_runtime_status
     from gateway import zero_cut_standby as zcs
+    from hermes_cli.plugins import get_plugin_manager
+    from hermes_cli.plugins_identity import compact_plugin_rows
     return {**(read_runtime_status() or {}), **zcs.readiness(), "protocol": CONTROL_PROTOCOL_VERSION,
-            "answered_at": time.time(), "answering_pid": os.getpid()}
+            "answered_at": time.time(), "answering_pid": os.getpid(),
+            "plugins": compact_plugin_rows(get_plugin_manager())}
 
 
 class GatewayControlServer:

@@ -46,16 +46,16 @@ async def list_plugins(authority, actor, params):
 
     def rows():
         from gateway.run import _profile_runtime_scope
-        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        from hermes_cli.plugins import get_plugin_manager
         from hermes_cli.plugins import get_plugin_toolsets
-        with _profile_runtime_scope(Path(authority.profile_id)):
-            discover_plugins()  # idempotent: the profile's plugins are normally loaded already
+        with _profile_runtime_scope(Path(authority.profile_id), hydrate_secrets=False):
             manager = get_plugin_manager()
             loaded, toolsets = manager.list_plugins(), get_plugin_toolsets()
             portable = sorted(manager.get_portable_mcp_servers())
         return {'plugins': [{'name': str(p['name']), 'key': str(p['key']), 'version': str(p['version'] or ''),
                              'enabled': bool(p['enabled']), 'tools': int(p['tools']), 'hooks': int(p['hooks']),
-                             'commands': int(p['commands']), 'error': str(p['error'] or '')} for p in loaded],
+                             'commands': int(p['commands']), 'error': str(p['error'] or ''),
+                             'code_identity': p.get('code_identity')} for p in loaded],
                 # The CLI's /tools and its completion validate plugin toolsets against these.
                 'toolsets': [{'key': str(key), 'label': str(label), 'description': str(desc or '')}
                              for key, label, desc in toolsets],

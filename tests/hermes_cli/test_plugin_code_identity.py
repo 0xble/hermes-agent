@@ -3,14 +3,17 @@
 import asyncio
 import hashlib
 import os
+import py_compile
+import sys
 import threading
 from datetime import datetime
+from importlib.metadata import EntryPoint
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli import plugins
-from hermes_cli.plugins import PluginManifest
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 
 @pytest.fixture
@@ -25,15 +28,21 @@ def identity_env(tmp_path, monkeypatch):
     monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: bundled)
     monkeypatch.setattr(plugins.PluginManager, "_scan_entry_points", lambda self: [])
     plugins._reset_plugin_managers_for_tests()
-    yield tmp_path
-    plugins._reset_plugin_managers_for_tests()
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    was_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        yield tmp_path
+    finally:
+        plugins._reset_plugin_managers_for_tests()
+        set_multiplex_active(was_multiplex)
 
 
-def _plugin(home, *, isolation="in_process", value=b"old", body=None):
+def _plugin(home, *, isolation="in_process", value=b"old"):
     directory = home / "plugins" / "identity-probe"
     directory.mkdir(parents=True)
     (directory / "plugin.yaml").write_text("name: identity-probe\nversion: '1.2.3'\n")
-    source = body or (
+    source = (
         b"from . import helper\n"
         b"def register(ctx):\n"
         b"    from . import registered\n"
@@ -66,12 +75,16 @@ def _row():
 def test_loaded_sources_survive_disk_replacement_until_real_profile_reload(identity_env, monkeypatch, isolation):
     homes = [identity_env / name for name in ("a", "b")]
     first_dir, first_sources = _plugin(homes[0], isolation=isolation)
+    py_compile.compile(str(first_dir / "helper.py"), doraise=True)
     _, second_sources = _plugin(homes[1], isolation=isolation, value=b"two")
     identities = []
     for home, sources in zip(homes, (first_sources, second_sources)):
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        plugins.discover_plugins(force=True)
-        row = _row()
+        token = set_hermes_home_override(home)
+        try:
+            plugins.discover_plugins(force=True)
+            row = _row()
+        finally:
+            reset_hermes_home_override(token)
         assert row["enabled"] and row["error"] is None
         identity = row["code_identity"]
         assert identity["digest"] == _digest(sources)
@@ -102,9 +115,41 @@ def test_loaded_sources_survive_disk_replacement_until_real_profile_reload(ident
     assert _row()["code_identity"] == identities[1]
 
 
+@pytest.mark.parametrize("target", ["identity_entry", "identity_entry:register"])
+def test_entrypoint_identity_uses_executed_bytes_even_when_import_overwrites_disk(identity_env, monkeypatch, target):
+    home = identity_env / "ep-home"
+    directory = home / "identity_entry"
+    directory.mkdir(parents=True)
+    sources = {
+        "__init__.py": b"from . import helper\ndef register(ctx):\n    from . import registered\n",
+        "helper.py": (b"VALUE = 1\nfrom pathlib import Path\n"
+                      b"Path(__file__).write_bytes(b'VALUE = 2\\n')\n"),
+        "registered.py": b"REGISTERED = True\n",
+    }
+    for name, data in sources.items():
+        (directory / name).write_bytes(data)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.syspath_prepend(str(home))
+    ep = EntryPoint(name="entry", value=target, group=plugins.ENTRY_POINTS_GROUP)
+    monkeypatch.setattr("hermes_cli.plugins_loader._select_entry_point_group", lambda *a: [ep])
+    manager = plugins.get_plugin_manager()
+    try:
+        manager._load_plugin(plugins.PluginManifest(name="entry", version="1", source="entrypoint", path=target))
+        loaded = manager._plugins["entry"]
+        assert loaded.enabled and loaded.error is None
+        assert loaded.module.helper.VALUE == 1
+        assert (directory / "helper.py").read_bytes() == b"VALUE = 2\n"
+        assert loaded.code_identity["digest"] == _digest(sources)
+        assert loaded.code_identity["module_count"] == len(sources)
+    finally:
+        for name in list(sys.modules):
+            if name == "identity_entry" or name.startswith("identity_entry."):
+                sys.modules.pop(name, None)
+
+
 def _snapshot(home):
-    return {p.relative_to(home).as_posix(): (p.read_bytes(), p.stat().st_mtime_ns)
-            for p in home.rglob("*") if p.is_file()}
+    return {p.relative_to(home).as_posix(): (p.read_bytes() if p.is_file() else None, p.stat().st_mtime_ns)
+            for p in (home, *home.rglob("*"))}
 
 
 def test_existing_surfaces_report_identity_without_running_plugins_or_writing(identity_env, monkeypatch):
@@ -115,22 +160,28 @@ def test_existing_surfaces_report_identity_without_running_plugins_or_writing(id
     home = identity_env / "profile"
     _plugin(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    for name in ("broken", "disabled", "unloaded"):
+        directory = home / "plugins" / name
+        directory.mkdir()
+        (directory / "plugin.yaml").write_text(f"name: {name}\n")
+        (directory / "__init__.py").write_text("def register(ctx):\n    raise ValueError('broken')\n")
+    deferred_dir = identity_env / "bundled" / "deferred"
+    deferred_dir.mkdir()
+    (deferred_dir / "plugin.yaml").write_text("name: deferred\nkind: platform\n")
+    (deferred_dir / "__init__.py").write_text("raise AssertionError('deferred plugin imported')\n")
+    (home / "config.yaml").write_text("plugins:\n  enabled: [identity-probe, broken]\n  disabled: [disabled]\n")
     plugins.discover_plugins(force=True)
     manager = plugins.get_plugin_manager()
-    broken = home / "broken"
-    broken.mkdir()
-    (broken / "__init__.py").write_text("def register(ctx):\n    raise ValueError('broken')\n")
-    manager._load_plugin(PluginManifest(name="broken", path=str(broken), source="user"))
-    disabled = plugins.LoadedPlugin(PluginManifest(name="disabled"), error="disabled via config")
-    deferred = plugins.LoadedPlugin(PluginManifest(name="deferred"), enabled=True, deferred=True)
-    manager._plugins.update(disabled=disabled, deferred=deferred)
     for key, enabled, error in (("broken", False, "broken"), ("disabled", False, "disabled via config"),
                                 ("deferred", True, None)):
         row = next(p for p in manager.list_plugins() if p["key"] == key)
         assert row["code_identity"] is None
         assert (row["enabled"], row["error"], row["tools"], row["hooks"], row["commands"]) == (
             enabled, error, 0, 0, 0)
-    assert deferred.deferred is True
+    assert manager._plugins["deferred"].deferred is True
+    unloaded = next(p for p in manager.list_plugins() if p["key"] == "unloaded")
+    assert unloaded["code_identity"] is None and not unloaded["enabled"]
+    assert "not enabled" in unloaded["error"]
     actor = SimpleNamespace(capabilities={"session:read"}, profile_id=str(home))
     authority = SimpleNamespace(profile_id=str(home))
     # A status/discovery read must not turn into a discovery sweep, even on an uninitialized manager.

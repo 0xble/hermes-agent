@@ -47,6 +47,20 @@ source tree cannot be recreated.
 
 ## Verification
 
+### Loaded Plugin Code Identity
+
+Fork patch identity: `plugin-loaded-identity`.
+
+The Hermes manager owns the registration-time source snapshot described in
+[Loaded Code Identity](../website/docs/developer-guide/plugins/index.md#loaded-code-identity).
+Keep capture on the actual compiling loader, including isolated-host imports and deferred
+pre-imports. Never replace this with a status-time disk hash. Preserve the existing discovery,
+status and reload fields when adopting upstream equivalents. No profile data migration is needed.
+Rollback removes the additive identity fields without changing installed plugin source.
+Retire this patch when upstream supplies equivalent imported-byte snapshots and read-only reporting.
+
+Contract tests: `tests/hermes_cli/test_plugin_code_identity.py`
+
 When Hermes runtime contracts change, run the affected Hermes tests from this
 repository. When profile plugin behavior or source changes, run the canonical
 plugin tests from `agents/sources/plugins/` with the Hermes runtime on the test path.
