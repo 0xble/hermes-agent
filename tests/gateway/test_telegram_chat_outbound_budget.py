@@ -57,6 +57,48 @@ async def test_concurrent_typing_loops_share_one_chat_budget():
     assert adapter._bot.send_chat_action.await_count == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metered", [False, True])
+async def test_concurrent_topics_share_typing_windows_and_other_chats_stay_independent(monkeypatch, metered):
+    from plugins.platforms.telegram import chat_budget as cb
+
+    clock = _Clock()
+    adapter = _adapter()
+    budget = cb.ChatOutboundBudget(clock=clock)
+    adapter._telegram_chat_budget = budget
+    fired = []
+
+    async def send_action(**kwargs):
+        fired.append((str(kwargs["chat_id"]), clock.t))
+        await asyncio.sleep(0)  # Keep transport in flight while sibling turns enter.
+        return True
+
+    if metered:
+        limiter = cb.ChatBudgetRateLimiter(budget)
+        adapter._bot.rate_limiter = limiter
+
+        async def metered_action(**kwargs):
+            return await limiter.process_request(send_action, (), kwargs, "sendChatAction", kwargs, None)
+
+        adapter._bot.send_chat_action = metered_action
+    else:
+        adapter._bot.send_chat_action = send_action
+
+    async def burst(chat):
+        await asyncio.gather(*(adapter.send_typing(chat, metadata={"thread_id": str(n)}) for n in range(30)))
+
+    start = clock.t
+    await burst("12345")
+    for offset in (0.5, 2.0, 4.0, 4.49):
+        clock.t = start + offset
+        await burst("12345")
+    assert fired == [("12345", start)]
+    await burst("67890")  # Not held by the first chat's typing lease.
+    clock.t = start + 4.5
+    await burst("12345")
+    assert [stamp for chat, stamp in fired if chat == "12345"] == [start, start + 4.5]
+
+
 def test_documented_rates_leave_headroom_under_each_class_ceiling():
     from plugins.platforms.telegram import chat_budget as cb
 

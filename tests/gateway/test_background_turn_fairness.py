@@ -101,6 +101,37 @@ async def test_watch_retry_deadline_keeps_one_event_and_preserves_the_resume_bou
 
 
 @pytest.mark.asyncio
+async def test_new_matching_output_every_two_seconds_coalesces_while_gate_is_full(monkeypatch):
+    runner, adapter = _runner(1)
+    completions, evt, clock, inject = _watch_queue(runner, adapter, monkeypatch)
+    evt.update(event_id="first", started_at=1.0, output="ready 0", suppressed=0)
+    await adapter.handle_message(_event("busy"))
+    attempts = []
+    for second in range(0, 130, 2):
+        clock.now = float(second)
+        if second:
+            completions.put({**evt, "event_id": f"match-{second}", "output": f"ready {second}",
+                             "suppressed": 0, "_watch_retry_step": 0, "_watch_next_retry_at": 0})
+        before = inject.await_count
+        await runner._drain_watch_notifications(completions)
+        if inject.await_count > before:
+            attempts.append(second)
+        assert completions.qsize() == 1
+    assert attempts == [0, 10, 30, 70]  # New matches cannot reset exponential backoff.
+    pending = completions.get_nowait()
+    assert pending["output"] == "ready 128"
+    assert pending["suppressed"] == 64
+    completions.put(pending)
+    adapter.end_turn("busy")
+    clock.now = 130.0
+    await runner._drain_watch_notifications(completions)
+    assert adapter.admitted.count(evt["session_key"]) == 1
+    assert completions.empty()
+    await runner._drain_watch_notifications(completions)
+    assert adapter.admitted.count(evt["session_key"]) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("spooled", [True, False])
 async def test_drain_offers_a_held_watch_once_then_honors_backoff(monkeypatch, spooled):
     runner, adapter = _runner(1)
