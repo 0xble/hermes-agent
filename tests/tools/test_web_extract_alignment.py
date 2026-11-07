@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.tools.test_web_extract_accounting import A, B, C, FINAL, offline, page, run
+from tests.tools.test_web_extract_accounting import A, B, C, FINAL, page, run
+from tests.tools.test_web_extract_accounting import offline as offline
 from tools import web_result_cache as cache
 
 
