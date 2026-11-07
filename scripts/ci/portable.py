@@ -653,6 +653,7 @@ def prepare_pnpm(env: dict[str, str], *, install: bool) -> Path:
     output = subprocess.check_output(
         [str(executable), '-c', code, str(store), 'install' if install else 'read'],
         cwd=ROOT, env=child_env, text=True, encoding='utf-8', errors='replace',
+        timeout=600,
     )
     binary = Path(json.loads(output.splitlines()[-1]))
     env['PATH'] = os.pathsep.join(dict.fromkeys([str(binary.parent), *env['PATH'].split(os.pathsep)]))
