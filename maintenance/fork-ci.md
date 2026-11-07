@@ -53,7 +53,9 @@ Login PATH fixtures distinguish inherited launcher entries from an explicit
 backend/client toolchain. Exercise dropped-entry restoration with inherited
 PATH and real directories, since missing absolute directories are deliberately
 excluded. Keep explicit-path precedence, login functions and persistent shell
-edits covered by `tests/tools/test_session_tool_env.py`. The pipeline wrapper
+edits covered by `tests/tools/test_session_tool_env.py`. Session environment
+fixtures capture the actual launch boundary, both the macOS launchd adapter and
+the plain-child fallback, without invoking host services. The pipeline wrapper
 contract compares parse-error status and trailing-backslash output to native
 eval on each available Bash executable, not one version's constants. Keep exact
 per-segment status assertions and the Bash parser-recovery crash regressions.
