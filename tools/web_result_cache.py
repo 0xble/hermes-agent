@@ -590,11 +590,14 @@ def extract_cache_get(url: str, format: Optional[str] = None, provider: str = ""
         content = file_path.read_text(encoding="utf-8-sig")
     except Exception:
         return None
+    provenance = entry.get("provenance", {})
+    if not isinstance(provenance, dict):
+        return None
     logger.info("web_extract cache hit: %s", url)
     result = {"url": entry.get("result_url", url), "title": entry.get("title", ""), "content": content, "error": None, "cached": True}
     if result["url"] != url:
         result["requested_url"] = url
-    result.update({key: value for key, value in entry.get("provenance", {}).items()
+    result.update({key: value for key, value in provenance.items()
                    if key in ("fallback_from", "extract_backend", "direct_fetch_error")})
     return result
 

@@ -169,3 +169,12 @@ def test_direct_miss_reuses_only_successful_provider_pages_within_ttl(offline, m
         assert provider.extract.await_count == 2
     else:
         assert not second.get("cached")
+
+
+@pytest.mark.parametrize("provenance", [None, [], "malformed", 7])
+def test_malformed_cached_provenance_is_a_miss(offline, provenance):
+    cache.extract_cache_put(A, "Cached page", provider="exa")
+    index = cache._load_index()
+    index[cache._url_digest(A, None, "exa")]["provenance"] = provenance
+    cache._save_index(index)
+    assert cache.extract_cache_get(A, provider="exa") is None

@@ -125,6 +125,9 @@ def _match_extract_results(urls: list[str], results: list[dict]) -> list[dict]:
         elif identity not in matched or (matched[identity].get("error") and not result.get("error")):
             matched[identity] = result
     remaining = requested - matched.keys()
+    # Deliberate tradeoff: infer this lone pair as a redirect without source
+    # evidence, then cache its content under the requested key for the TTL.
+    # Multiple leftovers remain errors rather than risk positional misattribution.
     if len(remaining) == 1 and len(unmatched) == 1:
         result = unmatched[0]
         if _infer_extract_redirect(result, keys):
