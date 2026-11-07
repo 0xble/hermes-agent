@@ -153,7 +153,8 @@ def test_adoption_and_concurrent_resolution_cannot_rearm_terminal_admission(work
 def test_adoption_preserves_validation_failures(worker, invalid, reason):
     db, epoch, assignment, _ = worker
     args = dict(epoch=epoch, **assignment, adoption_secret='private')
-    if invalid == 'missing':
+
+    def setup_missing():
         db._execute_write(lambda c: c.execute("DELETE FROM worker_executions"))
         db._execute_write(lambda c: c.execute("DELETE FROM session_admissions"))
         db._execute_write(lambda c: c.execute("DELETE FROM sessions WHERE id='s'"))
@@ -164,23 +165,40 @@ def test_adoption_preserves_validation_failures(worker, invalid, reason):
             VALUES('worker','s','compute',?,?,'registered',?)''',
             (epoch, assignment['generation'], rt._secret_digest('private'))))
         db._conn.execute('PRAGMA foreign_keys=ON')
-    elif invalid == 'retired':
+
+    def setup_retired():
         from hermes_state_mutation_retirement import RETIRED_PREFIX
         db._execute_write(lambda c: c.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
                                              (RETIRED_PREFIX + 's', '{}')))
-    elif invalid == 'generation':
+
+    def setup_generation():
         db._execute_write(lambda c: c.execute("UPDATE sessions SET runtime_generation=runtime_generation+1 WHERE id='s'"))
-    elif invalid == 'epoch':
+
+    def setup_epoch():
         args['epoch'] += 1
-    elif invalid == 'secret':
+
+    def setup_secret():
         args['adoption_secret'] = 'wrong'
-    elif invalid == 'terminal':
+
+    def setup_terminal():
         db._execute_write(lambda c: c.execute("UPDATE worker_executions SET status='terminal' WHERE execution_id='worker'"))
-    else:
+
+    def setup_reserved_epoch():
         args['epoch'] = begin_runtime_epoch(db, instance_id='replacement')
         args['execution_id'] = 'admission-worker:reserved'
         db._execute_write(lambda c: c.execute("UPDATE worker_executions SET execution_id=? WHERE execution_id='worker'",
                                              (args['execution_id'],)))
+
+    setups = {
+        'missing': setup_missing,
+        'retired': setup_retired,
+        'generation': setup_generation,
+        'epoch': setup_epoch,
+        'secret': setup_secret,
+        'terminal': setup_terminal,
+        'reserved_epoch': setup_reserved_epoch,
+    }
+    setups[invalid]()
     with pytest.raises(rt.RuntimeStoreError, match=reason):
         rt.adopt_worker_execution(db, **args)
 
