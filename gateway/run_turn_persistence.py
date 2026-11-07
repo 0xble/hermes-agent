@@ -803,7 +803,7 @@ class GatewayTurnPersistenceMixin:
                     try:
                         from gateway.run import _strip_response_attachments_for_direct_send
                         streamed_text = bool(_strip_response_attachments_for_direct_send(response, adapter))
-                    except Exception:
+                    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
                         streamed_text = True  # fail open to the historical unconditional reconcile
                 if streamed_text or media_delivered or (copy_delivered and not copy_failed):
                     await adapter._reconcile_restart_note_after_delivery(event, session_key)

@@ -444,7 +444,7 @@ class GatewayTurnHygieneMixin:
             if _adapter and source.chat_id:
                 await _adapter.emit_warning(source.chat_id, message, metadata=meta,
                                             logical_platform=source.platform)
-        except Exception as _werr:
+        except (OSError, RuntimeError, ValueError) as _werr:
             logger.warning("Failed to deliver %s to user: %s", what, _werr)
 
     async def _hmwa_hygiene_record_failure_cooldown(self, hs, session_key, session_id, reason):
