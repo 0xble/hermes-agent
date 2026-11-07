@@ -457,6 +457,8 @@ class GatewayTurnProgressMixin:
             return True
         if st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]))
+            if (result.raw_response or {}).get("skipped"):
+                return True
             if result.success:
                 st.reanchored = False
                 groups = groups[1:]
@@ -536,6 +538,8 @@ class GatewayTurnProgressMixin:
         """
         if st.can_edit and st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
+            if (result.raw_response or {}).get("skipped"):
+                return True
             if result.success:
                 st.reanchored = False
                 return True
