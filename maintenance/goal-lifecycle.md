@@ -30,7 +30,11 @@ clears the goal once with one short notice, before dispute pause or timed backof
   the owning profile and captured turn result restored. A judge running longer
   than the cosmetic cleanup budget remains a tracked task. Notices produced by
   that callback deliver immediately instead of registering behind a callback
-  that already fired. Regression: `tests/gateway/test_post_turn_delivery_latency.py`.
+  that already fired. Direct handler callers without a delivery owner, including
+  adapters without callback support, finish bookkeeping inline. Superseded run
+  generations skip deferred bookkeeping and cannot enqueue a goal continuation.
+  Progress cleanup still runs when a newer generation sweeps stale callbacks.
+  Regression: `tests/gateway/test_post_turn_delivery_latency.py`.
   Retire when upstream delivers before equivalent nonessential bookkeeping
   under the same durability contract. Rollback reverts this scheduling slice,
   leaving goal state, judge policy and storage locking unchanged.
