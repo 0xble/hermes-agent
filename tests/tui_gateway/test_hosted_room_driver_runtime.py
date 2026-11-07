@@ -658,6 +658,8 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
 
     waiting = FakeSessionRPC(auto_complete=False)
     healthy = FakeSessionRPC()
+    # Lease expiry is not the fault under test.
+    now = time.time()
     runtime = HostedRoomRuntime(
         db_path=db,
         rooms=bindings,
@@ -665,6 +667,7 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
             waiting if binding.room_id == "room-waiting" else healthy
         ),
         turn_lock=RecordingTurnLocks(),
+        clock=lambda: now,
         lease_ttl_seconds=0.4,
         poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
