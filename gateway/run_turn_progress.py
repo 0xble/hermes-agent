@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-import queue
 import re
 import threading
 import time
@@ -555,6 +554,43 @@ class GatewayTurnProgressMixin:
             st.progress_msg_id = result.message_id
         return True
 
+    def _progress_interval_for_chat(self, adapter) -> float:
+        """An adapter may tighten its normal progress floor for a particular chat."""
+        floor = self._progress_edit_interval(adapter)
+        hook = getattr(type(adapter), "progress_edit_interval_for_chat", None)
+        return max(floor, hook(adapter, self._ctx.source.chat_id)) if hook is not None else floor
+
+    async def _collect_progress_batch(self, st) -> None:
+        """Include arrivals during the wait without erasing a buffer at a content reset."""
+        while not self._ctx.progress_queue.empty():
+            raw = self._ctx.progress_queue.get_nowait()
+            if self._is_reset_marker(raw):
+                await self._roll_progress_overflow_if_needed(st)
+                await self._flush_progress_edit(st)
+                self._reset_progress_bubble(st)
+            else:
+                self._progress_absorb(st, raw)
+
+    async def _wait_for_progress_batch(self, st, last_edit_ts: float) -> None:
+        while st.progress_msg_id is not None:
+            now = time.monotonic()
+            remaining = max(st.defer_until - now,
+                            self._progress_interval_for_chat(st.adapter) - (now - last_edit_ts))
+            if remaining <= 0:
+                break
+            await asyncio.sleep(remaining)
+        if st.can_edit:
+            await self._collect_progress_batch(st)
+
+    async def _next_progress_line(self, st):
+        while self._ctx.progress_queue.empty():
+            if not self._ctx._run_still_current():
+                return None
+            if st.defer_until and st.progress_lines and not self._agent_interrupted():
+                return None  # Retry a refused batch even if no further tool event arrives.
+            await asyncio.sleep(0.3)
+        return self._ctx.progress_queue.get_nowait()
+
     async def send_progress_messages(self):
         ctx = self._ctx
         if ctx.persist_user_display_kind == "supervisor_checkin":
@@ -575,45 +611,36 @@ class GatewayTurnProgressMixin:
             return
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
-        EDIT_INTERVAL = self._progress_edit_interval(adapter)
         while True:
             try:
                 if not ctx._run_still_current():
                     self._drain_progress_queue()
                     return
-                raw = ctx.progress_queue.get_nowait()
+                raw = await self._next_progress_line(st)
                 # Drain silently when interrupted: events queued in the window between tool parse
                 # and interrupt processing should not render as bubbles.
                 if self._agent_interrupted():
                     await asyncio.sleep(0)
                     continue
                 if self._is_reset_marker(raw):
+                    await self._roll_progress_overflow_if_needed(st)
+                    await self._flush_progress_edit(st)
                     self._reset_progress_bubble(st)
                     continue
-                msg = self._progress_absorb(st, raw)
-                defer_remaining = st.defer_until - time.monotonic()
-                if defer_remaining > 0:
-                    # Inside a flood refusal: wait it out, then edit once with everything buffered
-                    # meanwhile, instead of retrying the refused bubble once per incoming line.
-                    await asyncio.sleep(defer_remaining)
-                    if not ctx._run_still_current():
-                        return
+                if raw is not None:
+                    self._progress_absorb(st, raw)
+                await self._wait_for_progress_batch(st, last_edit_ts)
+                if not ctx._run_still_current():
+                    return
+                if not st.progress_lines:
+                    continue
                 if not await self._roll_progress_overflow_if_needed(st):
-                    # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
-                    # proactively rate-limit rather than react to 429s). Loop back to drain further
-                    # queued messages before sending a single batched edit.
-                    remaining = EDIT_INTERVAL - (time.monotonic() - last_edit_ts)
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                        continue
-                    if not ctx._run_still_current():
-                        return
-                    if not await self._progress_send_or_edit(st, msg):
+                    if not await self._progress_send_or_edit(st, st.progress_lines[-1]):
                         continue
                 last_edit_ts = time.monotonic()
+                if not self._progress_deferred(st):
+                    st.defer_until = 0.0
                 await self._progress_restore_typing(st)
-            except queue.Empty:
-                await asyncio.sleep(0.3)
             except asyncio.CancelledError:
                 await self._drain_progress_on_cancel(st)
                 return

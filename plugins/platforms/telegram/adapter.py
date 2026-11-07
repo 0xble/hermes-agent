@@ -40,7 +40,7 @@ from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.telegram_reconnect import TelegramReconnectMixin
 from plugins.platforms.telegram.progress import TelegramProgressMixin
 from plugins.platforms.telegram.telegram_media_download import fetch_telegram_file as _fetch_telegram_file
-from plugins.platforms.telegram.daily_quota import DailyQuota, quota_from_platform_extra, send_outbound_class
+from plugins.platforms.telegram.daily_quota import TelegramDailyQuotaMixin, send_outbound_class
 from plugins.platforms.telegram.session_control_cards import session_control_outcome
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
@@ -965,8 +965,8 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramProgressMixin, TelegramReconnectMixin, TelegramHeldInboundMixin,
-                      TelegramTopicRoutingMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramReconnectMixin,
+                      TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, thread_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -7121,29 +7121,6 @@ class TelegramAdapter(TelegramProgressMixin, TelegramReconnectMixin, TelegramHel
                 daily=self._daily_quota(),
             )
         return limiter
-
-    def _daily_quota(self) -> DailyQuota:
-        """Per-chat daily volume ledger; ``daily_message_soft_ceiling`` and ``daily_call_soft_ceiling``
-        in the platform extra set the budgets (0 disables that budget's shedding, counting continues)."""
-        quota = self.__dict__.get("_telegram_daily_quota")
-        if quota is None:
-            quota = self.__dict__["_telegram_daily_quota"] = quota_from_platform_extra(
-                getattr(getattr(self, "config", None), "extra", None),
-                profile_dir=getattr(self, "_update_receipt_dir", None), label=self.name)
-        return quota
-
-    def _daily_sheds(self, chat_id: Any, kind: Optional[str]) -> bool:
-        """True when the chat's daily volume says this outbound class must not spend a call."""
-        if kind is None:
-            return False
-        try:
-            shed = self._daily_quota().sheds(str(normalize_telegram_chat_id(chat_id)), kind, current_trigger())
-        except Exception:
-            logger.debug("[%s] daily volume check failed", self.name, exc_info=True)
-            return False
-        if shed:
-            logger.debug("[%s] shedding %s traffic for chat %s: daily volume budget", self.name, kind, chat_id)
-        return shed
 
     def _flood_inline_wait_cap(self, chat_id: Any) -> float:
         """Longest server ``retry_after`` slept inline. Floored at the chat's own routine gap so a

@@ -56,6 +56,8 @@ COSMETIC_FRACTION = 0.7
 # bans came at 24296 and 26174. 12000 keeps a normal day near half of those.
 DEFAULT_CALL_SOFT_CEILING = 12000
 BACKGROUND_CALL_FRACTION = 0.5
+# Batch cosmetic progress before shedding starts, using the same effective call ceiling.
+PROGRESS_EDIT_BANDS = ((BACKGROUND_CALL_FRACTION, 3.0), (0.8, 6.0))
 STRICT_PENALTY_SECS = 600.0
 STRICT_WINDOW_SECS = 86400.0
 STRICT_FACTOR = 0.5
@@ -100,6 +102,7 @@ class _Window:
     messages: int = 0
     dirty: Dict[str, int] = field(default_factory=dict)
     dirty_messages: int = 0
+    edit_classes: Dict[str, int] = field(default_factory=dict)
 
 
 class DailyQuota:
@@ -146,6 +149,9 @@ class DailyQuota:
         window = self._window(chat_key)
         window.calls[endpoint] = window.calls.get(endpoint, 0) + 1
         window.dirty[endpoint] = window.dirty.get(endpoint, 0) + 1
+        if endpoint == "editMessageText":
+            kind = current_outbound_class() or "unclassified"
+            window.edit_classes[kind] = window.edit_classes.get(kind, 0) + 1
         created = messages_created(endpoint, data)
         window.messages += created
         window.dirty_messages += created
@@ -188,6 +194,14 @@ class DailyQuota:
         if ceiling is None:
             return 0.0
         return sum(self._window(chat_key).calls.values()) / ceiling
+
+    def progress_edit_interval(self, chat_key: str, floor: float) -> float:
+        """Slow full-text progress snapshots as today's effective call budget fills."""
+        pressure = self.call_pressure(chat_key)
+        for fraction, multiplier in reversed(PROGRESS_EDIT_BANDS):
+            if pressure >= fraction:
+                return floor * multiplier
+        return floor
 
     def sheds(self, chat_key: str, kind: Optional[str], trigger: Optional[str] = None) -> bool:
         """Whether a call of this outbound class must be shed now. Finals (``None``) never are.
@@ -236,11 +250,15 @@ class DailyQuota:
     def log_summary(self) -> None:
         for key, window in list(self._windows.items()):
             ceiling = self.call_ceiling(key)
+            edit_classes = dict(window.edit_classes)
+            # Class counts are process-local. Persisted/other-writer calls have no provenance.
+            edit_classes["unobserved"] = window.calls.get("editMessageText", 0) - sum(edit_classes.values())
             logger.info("Telegram chat %s daily volume since %s: %d messages (soft ceiling %s), %d calls "
-                        "(call ceiling %s) %s",
+                        "(call ceiling %s) %s, edit classes %s",
                         key, time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(window.start)), window.messages,
                         self.soft_ceiling, sum(window.calls.values()),
-                        "off" if ceiling is None else f"{ceiling:.0f}", _top(window.calls))
+                        "off" if ceiling is None else f"{ceiling:.0f}", _top(window.calls),
+                        json.dumps(edit_classes, separators=(",", ":")))
 
     # --- persistence ------------------------------------------------------------------------
     def _db(self):
@@ -283,6 +301,7 @@ class DailyQuota:
         # Calls counted in memory while the store was unreadable are not in the rows yet: keep them.
         pending = self._windows.get(key)
         if pending is not None and pending.start == start:
+            window.edit_classes = pending.edit_classes
             window.dirty, window.dirty_messages = pending.dirty, pending.dirty_messages
             window.messages += pending.dirty_messages
             for endpoint, count in pending.dirty.items():
@@ -349,6 +368,38 @@ class DailyQuota:
                 conn.commit()
         except (OSError, sqlite3.Error):
             logger.warning("Could not persist Telegram long penalty for chat %s", key, exc_info=True)
+
+
+class TelegramDailyQuotaMixin:
+    """Adapter-facing daily budget policy, shared by progress batching and shedding."""
+
+    def _daily_quota(self) -> DailyQuota:
+        quota = self.__dict__.get("_telegram_daily_quota")
+        if quota is None:
+            quota = self.__dict__["_telegram_daily_quota"] = quota_from_platform_extra(
+                getattr(getattr(self, "config", None), "extra", None),
+                profile_dir=getattr(self, "_update_receipt_dir", None), label=self.name)
+        return quota
+
+    def progress_edit_interval_for_chat(self, chat_id: Any) -> float:
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+        return self._daily_quota().progress_edit_interval(
+            str(normalize_telegram_chat_id(chat_id)), self.PROGRESS_EDIT_INTERVAL)
+
+    def _daily_sheds(self, chat_id: Any, kind: Optional[str]) -> bool:
+        """True when the chat's daily volume says this outbound class must not spend a call."""
+        if kind is None:
+            return False
+        from plugins.platforms.telegram.chat_budget import current_trigger
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+        try:
+            shed = self._daily_quota().sheds(str(normalize_telegram_chat_id(chat_id)), kind, current_trigger())
+        except Exception:
+            logger.debug("[%s] daily volume check failed", self.name, exc_info=True)
+            return False
+        if shed:
+            logger.debug("[%s] shedding %s traffic for chat %s: daily volume budget", self.name, kind, chat_id)
+        return shed
 
 
 def send_outbound_class(explicit: Optional[str], metadata: Any, trigger: Optional[str]) -> Optional[str]:

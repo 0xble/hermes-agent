@@ -245,6 +245,23 @@ the runner default (`TurnRunner._PROGRESS_EDIT_INTERVAL`, 3.0s). Telegram used 3
 2026-10-06, when the daily call counter showed progress-bubble edits were the largest share of
 typed-turn calls on a chat that hit a daily volume ban; Brian approved slower bubble updates.
 
+Progress cards widen that floor against `DailyQuota.call_pressure`: 10s below 50% of the
+effective daily call ceiling, 30s from 50% to 80%, and 60s from 80% onward. The fractions and
+multipliers live once in `daily_quota.PROGRESS_EDIT_BANDS`; a disabled call budget keeps 10s,
+and the existing recent-penalty scaling still applies. The progress consumer rechecks pressure
+between batches, sends the full accumulated text after each wait, and drains immediately at
+turn end. Overflow, reset markers and flood-refused batches retain their buffered text.
+Initial tool bubbles, cleanup, daily shedding and final-reply delivery retain their existing rules.
+
+The hourly daily-volume INFO line also includes `edit classes`, counted at the existing request
+metering point. `progress` includes tool-card edits, while `unclassified` has no outbound label.
+These counters are process-local, with persisted edits from before process startup and edits from
+other writers reported as `unobserved`. They do not change the persistent ledger or its totals.
+They distinguish outbound classes, not every producer within a class. The 2026-11-06 retained
+logs had no class attribution: the call ledger could split 6,457 edits into 4,707 untagged,
+1,498 goal-triggered and 252 typed-triggered edits, but could not identify a dominant producer.
+Regression: `tests/gateway/test_telegram_progress_batch.py` plus the existing daily-quota suite.
+
 | Path | Private worst case | Group worst case |
 | --- | --- | --- |
 | All metered calls to one chat (one shared slot) | 45/min (1.33s gap) | 15/min (4.0s gap) |
