@@ -276,11 +276,16 @@ def _canonical_silence_candidates(text: Any) -> tuple[str, ...]:
 
 
 def is_intentional_silence_response(response: Any) -> bool:
-    """True only when ``response`` is exactly a silence marker.
+    """True when the display text is exactly a silence marker.
 
+    ``LOOP_COMPLETE`` is a control marker, not assistant content. Strip a trailing
+    top-level completion line before judging silence so every gateway delivery lane uses
+    the same display-text verdict while loop detection retains the raw response.
     Prose that merely mentions ``NO_REPLY`` must be delivered normally. A blank
     response is not silence either — that is the empty-response failure path.
     """
+    if isinstance(response, str):
+        response = strip_trailing_loop_complete_marker(response)
     return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(response))
 
 
@@ -583,8 +588,17 @@ def is_partial_silence_marker(text: Any) -> bool:
     A buffer whose canonical form is a non-empty *prefix* of a marker (``"NO"`` on
     the way to ``"NO_REPLY"``, or an exact marker not yet terminated by stream-end)
     is held back so a raw marker is never shown and then retracted.  Divergence
-    from every marker, or exceeding the cap, resumes normal streaming.
+    from every marker, or exceeding the cap, resumes normal streaming.  A trailing
+    complete or partial ``LOOP_COMPLETE`` line is ignored, so ``[SILENT]\\nLOOP``
+    stays held on its way to a combined silent response.
     """
+    if isinstance(text, str):
+        head, sep, tail = text.rstrip().rpartition("\n")
+        tail_key = tail.strip().upper()
+        if sep and tail_key and (
+            _LOOP_COMPLETE_MARKER.startswith(tail_key) or is_loop_complete_marker(tail)
+        ):
+            text = head
     return any(
         c and any(marker.startswith(c) for marker in LIVE_GATEWAY_SILENT_MARKERS)
         for c in _canonical_silence_candidates(text)

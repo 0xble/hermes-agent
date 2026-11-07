@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from gateway import response_filters
 from gateway.response_filters import (
     apply_agent_origin_reply_expectation,
@@ -95,6 +97,19 @@ def test_fyi_relay_title_matches_relay_emoji_graphemes():
 def test_exact_silence_tokens_are_intentional_silence():
     for token in ("[SILENT]", " SILENT ", "NO_REPLY", "no reply"):
         assert is_intentional_silence_response(token)
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ("[SILENT]" + chr(10) + "LOOP_COMPLETE", True),
+        ("NO_REPLY" + chr(10) + "LOOP_COMPLETE", True),
+        ("LOOP_COMPLETE", False),
+        ("Queue depth changed." + chr(10) + "LOOP_COMPLETE", False),
+    ],
+)
+def test_silence_predicate_uses_display_text_without_loop_completion_marker(response, expected):
+    assert is_intentional_silence_response(response) is expected
 
 
 def test_autonomous_silence_accepts_marker_with_own_line_note():
