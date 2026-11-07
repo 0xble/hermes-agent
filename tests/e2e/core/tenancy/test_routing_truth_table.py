@@ -52,6 +52,8 @@ from ._routing_helpers import (
     write_home,
 )
 
+from ._routing_processes import stop_case_processes
+
 ROLES = ("main", "alias", "named", "legacy", "fallback", "pool", "aux", "deleg", "profile", "decoy", "cloud", "vendor")
 Q = ["chat", "-q", "hello"]
 
@@ -287,8 +289,12 @@ def _run_case(case: Case, root: Path) -> tuple[Fleet, list[LegOutcome]]:
             outcomes.append(LegOutcome(leg, run, fleet.since(marks), trap.attempts[egress_mark:]))
         return fleet, outcomes
     finally:
-        fleet.stop()
-        trap.stop()
+        try:
+            # Auto-started gateways detach into another session, beyond run_hermes's killpg.
+            stop_case_processes(root / case.id)
+        finally:
+            fleet.stop()
+            trap.stop()
 
 
 @pytest.fixture(scope="module")
