@@ -215,6 +215,14 @@ accounting and plugin-only resolution tests stub the DeepInfra inventory,
 OpenRouter pricing catalog and models.dev provider catalog respectively, without
 replacing the behavior each test actually asserts.
 
+ACP attachment uses cache-only registry, label, aggregator and recommendation
+metadata plus shared endpoint caches. The background picker warmer also enumerates
+named proxies whose slugs collide with canonical providers. Ordinary inventory
+readers keep their live discovery behavior. Nous policy, tier, free-tier and
+Portal recommendation behavior is unchanged from base: unknown policy remains
+unfiltered, and expired governed catalogs synchronously refresh with the existing
+8-second request timeout. This change does not invent a second entitlement cache.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind

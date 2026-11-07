@@ -56,6 +56,24 @@ class TestNamedCustomProviderCatalogs:
         assert [m for m, _ in models] == ["model-a", "model-b"]
 
 
+    def test_cached_discovery_extends_declared_models_without_live_probe(self, monkeypatch):
+        monkeypatch.setenv("SOME_KEY", "k")
+        cfg = _cfg(providers={"relay": {
+            "name": "Relay", "base_url": "https://relay.example/v1",
+            "key_env": "SOME_KEY", "default_model": "model-a",
+        }})
+        with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+            "hermes_cli.models.cached_fetch_api_models", return_value=["model-b"],
+        ) as cached, patch(
+            "hermes_cli.model_switch_providers._fetch_picker_live_models",
+            side_effect=AssertionError("cache-only catalog probed the endpoint"),
+        ) as live:
+            catalogs = _named_custom_provider_catalogs(cache_only=True)
+
+        assert [model for model, _ in catalogs[0][2]] == ["model-a", "model-b"]
+        assert cached.call_args.kwargs["cache_only"] is True
+        live.assert_not_called()
+
     def test_disabled_provider_skipped(self, monkeypatch):
         monkeypatch.setenv("SOME_KEY", "k")
         cfg = _cfg(
