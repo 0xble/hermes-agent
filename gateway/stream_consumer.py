@@ -350,6 +350,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._final_content_delivered = True
         if record is not None:
             self._record_turn_final_payload(record)
+        from gateway.reply_latency import record_stream_final
+        record_stream_final(getattr(self, "_reply_latency_receipt", None),
+                            self._display_payload(self._accumulated))
 
     def _display_payload(self, text: str) -> str:
         """Normalize like ``_send_or_edit`` output: directive strip + fence close + strip."""

@@ -572,8 +572,8 @@ class GatewayNotificationsMixin(
                             chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
                         )
                         if getattr(_edit_res, "success", False):
-                            from gateway.reply_latency import current_receipt, record_first_reply
-                            record_first_reply(current_receipt(), text_content, _edit_res)
+                            from gateway.reply_latency import current_receipt, record_final_reply
+                            record_final_reply(current_receipt(), text_content, _edit_res, kind="text_edit")
                             _reconciled = True
                             delivered_confirmed = True
                             logger.info(
@@ -692,8 +692,8 @@ class GatewayNotificationsMixin(
                 session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
             result = await adapter.send(source.chat_id, text_content, metadata=metadata)
-        from gateway.reply_latency import current_receipt, record_first_reply
-        record_first_reply(current_receipt(), text_content, result)
+        from gateway.reply_latency import current_receipt, record_final_reply
+        record_final_reply(current_receipt(), text_content, result)
         if not getattr(result, "success", False):
             logger.warning(
                 "Queued-lane final send to %s failed: %s", getattr(source, "chat_id", "?"),

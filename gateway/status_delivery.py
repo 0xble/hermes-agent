@@ -44,15 +44,19 @@ class StatusDelivery:
 
     async def send(self, adapter, chat_id, event_type, content, metadata):
         from gateway.run import _send_or_update_status_coro
+        from gateway.reply_latency import delivery_scope, record_first_reply
 
         async with self.locks[event_type]:
             if not self.live(adapter):
                 return
             # The token prevents a later turn reusing an earlier turn's editable bubble.
             # Thread identity additionally partitions the adapter's status cache.
-            result = await _send_or_update_status_coro(
-                adapter, chat_id, f"{self.token}:{event_type}", content,
-                dict(metadata) if metadata else None,
-            )
+            receipt = getattr(self.ctx, "_reply_latency_receipt", None)
+            with delivery_scope(receipt, "progress_send"):
+                result = await _send_or_update_status_coro(
+                    adapter, chat_id, f"{self.token}:{event_type}", content,
+                    dict(metadata) if metadata else None,
+                )
+            record_first_reply(receipt, content, result, kind="progress_send")
             self.track(result, adapter)
             return result

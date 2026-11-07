@@ -418,7 +418,13 @@ class GatewayTurnProgressMixin:
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
             kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        from gateway.reply_latency import delivery_scope, record_first_reply
+        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
+        receipt = getattr(ctx, "_reply_latency_receipt", None)
+        with outbound_class(OUTBOUND_PROGRESS), delivery_scope(receipt, "progress_edit"):
+            result = await st.adapter.edit_message(**kwargs)
+        record_first_reply(receipt, content, result, kind="progress_edit")
+        return result
 
     @staticmethod
     def _progress_text(lines: list) -> str:

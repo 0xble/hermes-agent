@@ -1,5 +1,6 @@
 """Display-only copy sentinels never cross Telegram's media caption boundary."""
 import json
+import socket
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -73,6 +74,11 @@ async def test_plain_media_captions_render_markers_before_truncating(monkeypatch
     import telegram
 
     monkeypatch.setattr(telegram, "InputMediaPhoto", lambda **kw: SimpleNamespace(**kw))
+    # Caption rendering has a fake transport. Keep the real URL guard, but give
+    # it a deterministic public DNS answer rather than the host's proxy DNS.
+    monkeypatch.setattr("tools.url_safety.socket.getaddrinfo", lambda *a, **kw: [
+        (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443)),
+    ])
     adapter = _make_adapter()
     for method in ["send_document", "send_photo", "send_video", "send_animation", "send_media_group"]:
         setattr(adapter._bot, method, AsyncMock(return_value=SimpleNamespace(message_id=4)))
