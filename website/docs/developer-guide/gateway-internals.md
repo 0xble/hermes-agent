@@ -647,6 +647,13 @@ delivery confirmations. Legacy text-only first-reply observations cannot establi
 first-visible latency and remain missing. These are local transport confirmations,
 not proof that a person read the reply. Historical progress times cannot be recovered.
 
+Goal and loop post-turn bookkeeping runs through the existing post-delivery callback
+owner. Durable settlement still precedes the final send, while a slow auxiliary
+judge no longer delays the answer it evaluates. A direct handler caller without
+a delivery owner runs bookkeeping inline. Deferred bookkeeping checks its run
+generation before starting, judging and continuing so a stale callback cannot
+continue a superseded turn. Stale progress cleanup remains independent.
+
 ## Hooks
 
 Gateway hooks are Python modules that respond to lifecycle events:
