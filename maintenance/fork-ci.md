@@ -98,6 +98,31 @@ before running. Keep the checkout's pinned toolchain and every assertion intact,
 then detach and remove only the invocation's disposable image after all owned
 processes have exited.
 
+Electron fixture cost must stay proportional to the assertion under the full
+project's default worker concurrency. The channel-version MSIX test shares the
+checkout's import-only PM and release packages through directory junctions,
+as it already does for Node dependencies, and admits each exact request once
+through the existing synchronous batch validator before loading the real
+packager configs. All four rollover cases still use the real MSIX writer and
+Python artifact recorder, including the wrong-application rejection, but share
+one in-process Node module and one Python recorder instead of eight cold
+process starts. The writer module stays beside its disposable packaging tree
+so its real module resolution and build hooks retain the fixture boundary.
+
+The review payload-cap fixture uses Git's index and one shared blob for most
+of its over-cap rows, plus real untracked files on both sides of the cutoff.
+It still exercises real Git status/diffs, line counting and the renderer cap,
+without creating, reading and deleting thousands of physical files. The
+source-handoff fixture gets the canonical install key from Python once and
+stages channel records directly. One Git fast-import creates its four empty
+commits instead of a commit/rev-parse subprocess pair per commit. The config
+writer has its own Python tests;
+both release-channel forced handoff probes remain real. Main's unchanged
+branch snapshot is reused for the UI fallbacks, with the no-publication-I/O
+assertion starting before its real Python check. Keep existing
+deadlines, worker policy and behavior assertions. Retire these adaptations
+when upstream fixtures provide the same bounded work and coverage.
+
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning
 clears only after a gateway serves the new commit.
