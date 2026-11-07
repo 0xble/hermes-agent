@@ -18,7 +18,8 @@ def _typed_card_parts(token: str, text: str) -> list[tuple[str, str]]:
     if token == "cc-exp-year" and text.isdigit() and len(text) in (2, 4):
         return [("exp_year", text)]
     if token == "cc-exp":
-        match = re.fullmatch(r"(0?[1-9]|1[0-2])\s*/\s*(\d{2}|\d{4})", text)
+        match = (re.fullmatch(r"(0?[1-9]|1[0-2])\s*/\s*(\d{2}|\d{4})", text)
+                 or re.fullmatch(r"(0[1-9]|1[0-2])(\d{2})", text))
         if match:
             return [("expiry", text), ("exp_month", match[1]), ("exp_year", match[2])]
     return []
