@@ -123,6 +123,7 @@ class _EmbeddedCuaDaemon:
         self.permission_mode, self._driver_cmd, self._command = permission_mode, driver_cmd, driver_cmd
         self._mcp_args: list[str] = list(_driver._CUA_DRIVER_ARGS)
         self._process: Any = None
+        self._lifetime: Any = None
         self._owns_runtime = self._running = False
         self._stderr_tail: deque[str] = deque(maxlen=20)
         token = uuid.uuid4().hex[:12]
@@ -167,10 +168,15 @@ class _EmbeddedCuaDaemon:
             raise RuntimeError(_driver.cua_driver_install_hint())
         self._command, self._mcp_args = _driver._resolve_mcp_invocation(driver_cmd)
         env = self._sanitized_env()
-        command = _embedded_daemon_spawn_command(self._command, self._serve_args(), platform=sys.platform)
-        self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                                         env=env)
+        self._arm_lifetime()
+        try:
+            command = _embedded_daemon_spawn_command(self._command, self._serve_args(), platform=sys.platform)
+            self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                                             env=env)
+        except Exception:
+            self._disarm_lifetime()
+            raise
         self._owns_runtime = True
         threading.Thread(target=self._drain_stderr, args=(self._process,), name="hermes-cua-daemon-stderr", daemon=True).start()
         deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
@@ -178,6 +184,7 @@ class _EmbeddedCuaDaemon:
             return_code = self._process.poll()
             # `open` exits 0 once LaunchServices took the request: on macOS only a non-zero exit means the daemon died.
             if return_code is not None and (sys.platform != "darwin" or return_code != 0):
+                self._disarm_lifetime()
                 self._startup_failure("embedded cua-driver exited during startup", "no diagnostic output")
             if self._socket_ready(env):
                 self._running = True
@@ -205,8 +212,45 @@ class _EmbeddedCuaDaemon:
         if owns_runtime:
             _cb()._run_quiet([self._command, "stop", "--socket", self.socket_path], timeout=3.0, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, env=self._sanitized_env(), swallow=_QUIET_ERRORS)
+            self._reap_detached_driver()
         if process is not None:
             _wait_or_kill(process)
         if sys.platform != "win32" and os.path.exists(self.socket_path):
             with contextlib.suppress(OSError):
                 os.remove(self.socket_path)
+        self._disarm_lifetime()
+
+    def _arm_lifetime(self) -> None:
+        """Record this process as the owner and arm a pipe-EOF watchdog.
+
+        ``open`` cannot pass ``--parent-liveness-stdio`` through to the driver, so the
+        watchdog is the parent-death watch. A failure here must not block the driver.
+        """
+        if self._lifetime is not None:
+            return
+        try:
+            from tools.computer_use.cua_driver_lifetime import arm_owner
+            self._lifetime = arm_owner(self.socket_path, self._command)
+        except Exception:
+            logger.debug("embedded cua-driver lifetime watch failed", exc_info=True)
+            self._lifetime = None
+
+    def _reap_detached_driver(self) -> None:
+        try:
+            from tools.computer_use.cua_driver_lifetime import terminate_embedded_driver
+            terminate_embedded_driver(self.socket_path, self._command)
+        except Exception:
+            logger.debug("embedded cua-driver process-group reap failed", exc_info=True)
+
+    def _disarm_lifetime(self) -> None:
+        watch, self._lifetime = self._lifetime, None
+        if watch is not None:
+            try:
+                watch.close()
+            except Exception:
+                logger.debug("embedded cua-driver watchdog close failed", exc_info=True)
+        try:
+            from tools.computer_use.cua_driver_lifetime import remove_owner_record
+            remove_owner_record(self.socket_path)
+        except Exception:
+            logger.debug("embedded cua-driver owner record cleanup failed", exc_info=True)
