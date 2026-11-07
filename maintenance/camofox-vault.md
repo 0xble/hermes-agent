@@ -272,7 +272,16 @@ argv or a staging file. CLI output is bounded in memory; inherited daemon
 handles are drained without waiting for daemon exit or retaining late output.
 Raw stdout/stderr and malformed/timeout diagnostics are not logged.
 
+- Candidates accepted by this owner include compact `MMYY` or `MMYYYY` (four or
+  six ASCII digits with a valid month) and slash-separated `MM/YY` or `MM/YYYY`.
+  Compact entries register their raw spelling plus month/year components before
+  injection, so later browser-normalized `MM / YYYY` and shortened `MM / YY`
+  values are masked without a global short-number filter. Labels such as `Expiration date`,
+  `Expiration (MM/YY)`, and `MM/YY` already share the checkout classifier; issue
+  dates, search fields and order numbers still do not register card metadata.
+
 Verify with `scripts/run_tests.sh tests/tools/test_browser_typed_card_privacy.py
+ tests/tools/test_browser_typed_expiry_privacy.py
  tests/tools/test_browser_typed_card_expiry.py tests/tools/test_browser_open_timeout.py
  tests/agent/test_browser_output_egress.py` and the browser transport, cleanup,
 redaction and PM fixture regressions. Windows pipe behavior needs the native

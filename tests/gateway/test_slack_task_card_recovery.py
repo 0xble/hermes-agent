@@ -176,6 +176,19 @@ async def test_idle_consumer_retries_latest_projection_without_new_events(monkey
     runner, state, client = make_runner(
         monkeypatch, failure_method="chat.appendStream", error=TimeoutError(),
     )
+    failed_publication = asyncio.Event()
+    recovered = asyncio.Event()
+    original_send = state.adapter.send_native_task_card_progress
+
+    async def send(*args, **kwargs):
+        result = await original_send(*args, **kwargs)
+        if result.retryable and not result.success:
+            failed_publication.set()
+        elif result.success and failed_publication.is_set():
+            recovered.set()
+        return result
+
+    monkeypatch.setattr(state.adapter, "send_native_task_card_progress", send)
     # A shorter test clock interval, not a different retry path.
     original_publish = runner._task_card_publish
 
@@ -188,12 +201,84 @@ async def test_idle_consumer_retries_latest_projection_without_new_events(monkey
     runner._ctx.progress_queue = queue.Queue()
     runner._ctx.progress_queue.put({"type": "tool.started", "tool_call_id": "call-1",
                                     "tool_name": "terminal", "preview": "pwd"})
-    runner._ctx._run_still_current = lambda: client.api_call.await_count < 3
+    runner._ctx._run_still_current = lambda: not recovered.is_set()
     runner._ctx.agent_holder = [None]
     task = asyncio.create_task(runner._send_native_task_card_progress(state.adapter))
-    await asyncio.wait_for(task, timeout=2)
+    try:
+        # A timeout must fail before cleanup cancellation can look like recovery.
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done, "Idle consumer did not recover before the deadline"
+        assert task.result() is None
+        assert failed_publication.is_set()
+        assert recovered.is_set()
+        assert task.cancelling() == 0
+        assert not task.cancelled()
+    finally:
+        if not task.done():
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=2)
+            assert task in done, "Progress consumer did not finalize during cleanup"
+        if not task.cancelled():
+            task.result()
     # Turn end seals and then deletes the recovered card (ephemeral task cards, the default).
     assert [c.args[0] for c in client.api_call.await_args_list] == [
         "chat.startStream", "chat.appendStream", "chat.appendStream", "chat.stopStream", "chat.delete",
     ]
+    appends = [c.kwargs["json"] for c in client.api_call.await_args_list
+               if c.args[0] == "chat.appendStream"]
+    assert appends[1] == appends[0]
+    assert appends[1]["ts"] == "stream-1"
+    projection = appends[1]["chunks"][-1]
+    assert projection["id"] == "call-1"
+    assert projection["status"] == "in_progress"
+    assert projection["title"] and "pwd" not in projection["title"]
     state.adapter.send.assert_not_awaited()
+    state.adapter.edit_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_turn_end_cancellation_finalizes_without_retry_for_empty_queue(monkeypatch):
+    runner, state, client = make_runner(
+        monkeypatch, failure_method="chat.appendStream", error=TimeoutError(),
+    )
+    failed_publication = asyncio.Event()
+    hold_publish = asyncio.Event()
+    original_publish = runner._task_card_publish
+
+    async def publish(st):
+        await original_publish(st)
+        if st.native_retry_at:
+            # Keep idle retry ineligible and gate cancellation at the failed publish.
+            st.native_retry_at = float("inf")
+            failed_publication.set()
+            await hold_publish.wait()
+
+    monkeypatch.setattr(runner, "_task_card_publish", publish)
+    runner._ctx.progress_queue = queue.Queue()
+    runner._ctx.progress_queue.put({"type": "tool.started", "tool_call_id": "call-1",
+                                    "tool_name": "terminal", "preview": "pwd"})
+    runner._ctx._run_still_current = lambda: True
+    runner._ctx.agent_holder = [None]
+    task = asyncio.create_task(runner._send_native_task_card_progress(state.adapter))
+    try:
+        await asyncio.wait_for(failed_publication.wait(), timeout=2)
+        assert runner._ctx.progress_queue.empty()
+        assert task.cancelling() == 0
+        assert task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done, "Cancelled consumer did not finalize before the deadline"
+        assert task.result() is None
+        assert task.cancelling() == 1
+        assert not task.cancelled()
+    finally:
+        if not task.done():
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=2)
+            assert task in done, "Progress consumer did not finalize during cleanup"
+        if not task.cancelled():
+            task.result()
+    assert [c.args[0] for c in client.api_call.await_args_list] == [
+        "chat.startStream", "chat.appendStream", "chat.stopStream", "chat.delete",
+    ]
+    state.adapter.send.assert_not_awaited()
+    state.adapter.edit_message.assert_not_awaited()
