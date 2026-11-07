@@ -1307,10 +1307,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         unrelated message arrives. Managed admission acknowledges the exact wait atomically
         with its durable FIFO row; a refusal keeps it for a later scan."""
         from hermes_cli.goals import GoalManager
+        from gateway.run_goal_wait import forget_goal_wait
 
         store = getattr(self, "session_store", None)
         entry = await self.async_session_store.lookup_by_session_id(sid) if store is not None else None
         if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
+            forget_goal_wait(self, sid)
             return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
         assert store is not None
         source = self._restored_source(entry)
@@ -1339,6 +1341,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         mgr, prompt = await self._run_in_executor_with_context(_check)
         if not prompt:
+            if not mgr.state or mgr.state.status != 'active' or not mgr.state.waiting_since:
+                forget_goal_wait(self, sid)
             return
         from gateway.wake import automatic_route_available
 
@@ -1405,6 +1409,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 for sid, state in active_loops:
                     await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
                 parked_goals = await self._run_in_executor_with_context(list_parked_goals)
+                parked_sids.update(sid for sid, _state in parked_goals)
             finally:
                 reset_hermes_home_override(home_token)
             if parked_goals:
@@ -1416,6 +1421,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                             logger.warning("goal wakeup failed for %s: %s", sid, exc)
 
         while self._running:
+            parked_sids = set()
             try:
                 # Multiplex resolution walks the filesystem off-loop; a stalled walk on the loop
                 # trips the loop-liveness watchdog (exit 75).
@@ -1426,6 +1432,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                             _has_idle_work, profile_home):
                         continue
                     await _scan_one_store(profile_name, profile_home)
+                from gateway.run_goal_wait import prune_goal_wait_attempts
+                prune_goal_wait_attempts(self, parked_sids)
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)

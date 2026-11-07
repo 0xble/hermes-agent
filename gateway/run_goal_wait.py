@@ -16,6 +16,41 @@ def goal_wait_identity(authority, session_id, state):
                       separators=(',', ':'))
 
 
+class _TerminalGoalWait(RuntimeStoreError):
+    """This wait cannot use durable admission; retain it for explicit repair."""
+
+    def __init__(self, reason):
+        super().__init__('admission_conflict', field='goal_route', detail=reason)
+
+
+def _route_snapshot(authority, key):
+    store = authority.runner.session_store
+    # Routing saves take Store -> DB; finish both reads before the authority writer.
+    with store._lock:
+        entry = store._entry_locked(key)
+        session_id = entry.session_id if entry is not None else None
+        suspended = bool(entry.suspended) if entry is not None else True
+        private = bool(entry and entry.incognito)
+    from agent.incognito import is_incognito
+    if private or is_incognito(session_id) or is_incognito(key):
+        # Incognito keeps its tail in RAM. Never persist its prompt into the FIFO
+        # or fall back to the public route that preceded the private interval.
+        raise _TerminalGoalWait('incognito')
+    routing_db, scope = store._routing_db, store._routing_scope()
+    if routing_db is None:
+        raise _TerminalGoalWait('missing_durable_route')
+    with routing_db._read_ctx() as conn:
+        row = conn.execute('SELECT entry_json FROM gateway_routing WHERE scope=? AND session_key=?',
+                           (scope, key)).fetchone()
+    if row is None:
+        raise _TerminalGoalWait('missing_durable_route')
+    route = json.loads(row[0])
+    if (not session_id or suspended or route.get('session_id') != session_id
+            or bool(route.get('suspended', False)) != suspended):
+        raise RuntimeStoreError('admission_conflict', field='goal_session')
+    return session_id, scope, routing_db is authority.db
+
+
 def goal_wait_guard(authority, event):
     """Fenced acknowledgement in the same writer transaction as a NEW admission.
 
@@ -23,27 +58,35 @@ def goal_wait_guard(authority, event):
     effects and may run again on SQLite retry; a failed insert rolls it back too.
     """
     metadata = copy.deepcopy(event.metadata)
-    store = authority.runner.session_store
     key = metadata.get('gateway_session_key')
     waiting_since = metadata.get('goal_waiting_since', 0)
-    # Routing saves take Store -> DB. Snapshot BEFORE entering the DB writer;
-    # the callback below must never acquire the Store (or any other live lock).
-    with store._lock:
-        entry = store._entry_locked(key)
-        session_id = entry.session_id if entry is not None else None
-        suspended = bool(entry.suspended) if entry is not None else True
-    scope = store._routing_scope()
+    session_id, scope, same_db = _route_snapshot(authority, key)
 
     def acknowledge(conn):
         from hermes_cli.goals import GoalState, _meta_key
-        from hermes_cli.session_controls import _definition_fingerprint, _wake_session_matches
+        from hermes_cli.session_controls import (
+            _definition_fingerprint, _wake_session_matches, compression_successor,
+        )
         stamped = metadata.get('goal_continuation_session_id')
-        row = conn.execute('SELECT entry_json FROM gateway_routing WHERE scope=? AND session_key=?',
-                           (scope, key)).fetchone()
-        route = json.loads(row[0]) if row else {}
-        if (not session_id or suspended or route.get('session_id') != session_id
-                or bool(route.get('suspended', False)) != suspended or not stamped
-                or not _wake_session_matches(stamped, session_id, cursor=conn)):
+        if same_db:
+            row = conn.execute('SELECT entry_json FROM gateway_routing WHERE scope=? AND session_key=?',
+                               (scope, key)).fetchone()
+            if row is None:
+                raise _TerminalGoalWait('missing_durable_route')
+            route = json.loads(row[0])
+            if route.get('session_id') != session_id or route.get('suspended', False):
+                raise RuntimeStoreError('admission_conflict', field='goal_session')
+        else:
+            # A secondary's route lives in the launch DB. Do not acquire that DB's
+            # lock here: its writer can be waiting for this authority. Route-only
+            # suspension/rebind can race the snapshot; the FIFO remains pinned to
+            # this exact owner, and drain revalidates the route before execution.
+            row = conn.execute('SELECT ended_at,end_reason,archived FROM sessions WHERE id=?',
+                               (session_id,)).fetchone()
+            head = compression_successor(stamped, cursor=conn) or stamped
+            if row is None or row[0] is not None or row[1] is not None or row[2] or head != session_id:
+                raise RuntimeStoreError('admission_conflict', field='goal_session')
+        if not stamped or not _wake_session_matches(stamped, session_id, cursor=conn):
             raise RuntimeStoreError('admission_conflict', field='goal_session')
         row = conn.execute('SELECT value FROM state_meta WHERE key=?', (_meta_key(session_id),)).fetchone()
         raw = row[0] if row else None
@@ -64,6 +107,8 @@ def goal_wait_guard(authority, event):
 
 def _retry_due(runner, sid, identity):
     retries = getattr(runner, '_goal_wait_retries', {})
+    if getattr(runner, '_goal_wait_terminal', {}).get(sid, (None,))[0] == identity:
+        return False
     prior = retries.get(sid)
     return prior is None or prior[0] != identity or monotonic() >= prior[2]
 
@@ -75,6 +120,30 @@ def _retry_later(runner, sid, identity):
     prior = retries.get(sid)
     attempts = min(4, prior[1] + 1) if prior and prior[0] == identity else 0
     retries[sid] = (identity, attempts, monotonic() + min(60, 5 * 2 ** attempts))
+
+
+def forget_goal_wait(runner, sid):
+    for name in ('_goal_wait_retries', '_goal_wait_terminal'):
+        getattr(runner, name, {}).pop(sid, None)
+
+
+def prune_goal_wait_attempts(runner, parked_sids):
+    """A cleared/reset goal no longer appears in the watcher's parked-goal scan."""
+    for name in ('_goal_wait_retries', '_goal_wait_terminal'):
+        attempts = getattr(runner, name, {})
+        for sid in set(attempts) - parked_sids:
+            attempts.pop(sid, None)
+
+
+def _refuse_wait(runner, sid, key, identity, reason):
+    getattr(runner, '_goal_wait_retries', {}).pop(sid, None)
+    terminal = getattr(runner, '_goal_wait_terminal', None)
+    if terminal is None:
+        terminal = runner._goal_wait_terminal = {}
+    if terminal.get(sid) != (identity, reason):
+        logger.warning('goal wakeup: session %s route %s wait %s terminal refusal (%s); '
+                       'wait retained; repair route/privacy mode and re-arm the wait', sid, key, identity, reason)
+    terminal[sid] = (identity, reason)
 
 
 async def dispatch_goal_wait(runner, adapter, source, key, sid, manager, prompt, resume_marker):
@@ -123,6 +192,8 @@ async def _dispatch_reserved(runner, authority, managed, adapter, source, key, s
             if authority is None:
                 _retry_later(runner, sid, identity)
                 return
+            # Classify unfenceable routes even if capture cannot borrow provenance.
+            await runner._run_in_executor_with_context(_route_snapshot, authority, key)
             receipt = await admit_route_wake_receipt(
                 runner, adapter, source, prompt, 'goal-wait', event=event, identity=identity,
                 _authorize_write_factory=lambda: goal_wait_guard(authority, event))
@@ -133,8 +204,10 @@ async def _dispatch_reserved(runner, authority, managed, adapter, source, key, s
         else:
             await _classic_dispatch(runner, adapter, event, manager, sid, manager.state.waiting_since)
         admitted = True
-        getattr(runner, '_goal_wait_retries', {}).pop(sid, None)
+        forget_goal_wait(runner, sid)
         logger.info('goal wakeup: continuation for session %s admitted', sid)
+    except _TerminalGoalWait as exc:
+        _refuse_wait(runner, sid, key, identity, exc.detail)
     except Exception as exc:
         # A producer can lose its receipt after commit. Keep capacity for that row,
         # not for a failed attempt, while the stable identity prevents another row.

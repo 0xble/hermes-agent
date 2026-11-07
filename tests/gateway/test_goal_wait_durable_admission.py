@@ -92,7 +92,7 @@ def captured_event(runner, source, sid, manager):
 @pytest.mark.parametrize('reason', ['not_found', 'queue_full', 'runtime_draining', 'prepare_failure',
                                     'missing_authority', 'missing_provenance', 'suspended'])
 async def test_refusal_keeps_exact_wait_then_retry_admits_once(parked, monkeypatch, reason):
-    runner, adapter, authority, source, sid, key, manager, rows, adapter_calls = parked
+    runner, _adapter, authority, _source, sid, key, _manager, rows, adapter_calls = parked
     before = goals.load_goal(sid)
     original = authority.admit_automation
 
@@ -187,7 +187,7 @@ async def test_private_goal_receipt_is_idempotent_and_metadata_is_not_a_capabili
 @pytest.mark.asyncio
 async def test_only_private_goal_kind_can_cross_noninternal_automation_boundary(parked):
     from gateway.session_synthetic import mark_synthetic
-    runner, adapter, authority, source, sid, key, manager, rows, _ = parked
+    _runner, adapter, authority, source, sid, key, _manager, rows, _ = parked
     for kind in ('loop', 'recovery', 'notification', 'heartbeat'):
         event = MessageEvent(text='other synthetic kind', source=source, internal=False,
                              metadata={kind: True, 'gateway_session_key': key, 'gateway_session_id': sid})
@@ -235,7 +235,7 @@ async def test_goal_ack_and_admission_are_one_fenced_transaction(parked, monkeyp
 
 @pytest.mark.asyncio
 async def test_cancelled_observer_does_not_split_commit_from_goal_ack(parked, monkeypatch):
-    runner, adapter, authority, source, sid, key, manager, rows, _ = parked
+    runner, _adapter, authority, _source, sid, _key, _manager, rows, _ = parked
     entered, release = threading.Event(), threading.Event()
     original = authority.db._execute_write
 
@@ -263,7 +263,7 @@ async def test_cancelled_observer_does_not_split_commit_from_goal_ack(parked, mo
 
 @pytest.mark.asyncio
 async def test_fast_drain_reparks_without_old_ack_erasing_new_wait(parked, monkeypatch):
-    runner, adapter, authority, source, sid, key, manager, rows, adapter_calls = parked
+    runner, _adapter, authority, _source, sid, _key, _manager, rows, adapter_calls = parked
     monkeypatch.setattr(authority, '_schedule', type(authority)._schedule.__get__(authority))
     reparked = []
 
@@ -289,7 +289,7 @@ async def test_fast_drain_reparks_without_old_ack_erasing_new_wait(parked, monke
 
 @pytest.mark.asyncio
 async def test_duplicate_watchers_and_new_wait_generation_admit_once_each(parked, monkeypatch):
-    runner, adapter, authority, source, sid, key, manager, rows, adapter_calls = parked
+    runner, _adapter, authority, _source, sid, key, _manager, rows, adapter_calls = parked
     await asyncio.gather(*(runner._goal_wakeup_fire_one(sid) for _ in range(3)))
     assert len(rows()) == 1
     old_identity = rows()[0]['request_id']
@@ -317,7 +317,7 @@ async def test_duplicate_watchers_and_new_wait_generation_admit_once_each(parked
 
 @pytest.mark.asyncio
 async def test_background_full_keeps_wait_without_admission(parked, monkeypatch):
-    runner, adapter, authority, source, sid, key, manager, rows, adapter_calls = parked
+    runner, _adapter, _authority, _source, sid, _key, _manager, rows, adapter_calls = parked
     monkeypatch.setattr(runner, '_reserve_background_turn', lambda *args: None)
     before = goals.load_goal(sid).to_json()
     await runner._goal_wakeup_fire_one(sid)
@@ -333,7 +333,7 @@ async def test_admitted_goal_lost_head_settles_interrupted_not_human_loss(parked
     from gateway.session_unattended_unknown import settle_unattended_unknown
     from hermes_state_runtime import claim_session_input
     from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
-    runner, adapter, authority, source, sid, key, manager, rows, _ = parked
+    runner, _adapter, authority, _source, sid, _key, _manager, rows, _ = parked
     await runner._goal_wakeup_fire_one(sid)
     claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=sid)
     assert isinstance(claimed, dict)
@@ -351,7 +351,7 @@ async def test_admitted_goal_lost_head_settles_interrupted_not_human_loss(parked
 
 
 @pytest.mark.asyncio
-async def test_goal_ack_does_not_invert_routing_save_locks(parked, monkeypatch):
+async def test_single_profile_goal_ack_does_not_invert_routing_save_locks(parked, monkeypatch):
     from gateway.run_goal_wait import goal_wait_guard
     from hermes_state_runtime import admit_session_input
 
@@ -496,7 +496,7 @@ async def test_receipt_lookup_failure_still_backs_off_and_logs_refusal(parked, m
 
 @pytest.mark.asyncio
 async def test_receipt_loss_after_commit_cannot_admit_twice(parked, monkeypatch):
-    runner, adapter, authority, source, sid, key, manager, rows, _ = parked
+    runner, _adapter, authority, _source, sid, _key, _manager, rows, _ = parked
     original = authority.admit_automation
 
     async def lose_receipt(*args, **kwargs):
@@ -515,7 +515,7 @@ async def test_receipt_loss_after_commit_cannot_admit_twice(parked, monkeypatch)
 @pytest.mark.asyncio
 @pytest.mark.parametrize('rotation', ['compression', 'reset', 'fork'])
 async def test_not_found_reresolve_is_compression_only(parked, monkeypatch, rotation):
-    runner, adapter, authority, source, sid, key, manager, rows, _ = parked
+    runner, _adapter, authority, _source, sid, key, _manager, rows, _ = parked
     original = authority.admit_automation
     attempts = []
     child = sid + '-child'
@@ -551,7 +551,8 @@ async def test_not_found_reresolve_is_compression_only(parked, monkeypatch, rota
 
 
 @pytest.mark.asyncio
-async def test_secondary_profile_wait_admits_without_taking_launch_db_lock(tmp_path, monkeypatch):
+@pytest.mark.parametrize('session_change', ['none', 'ended', 'archived', 'new_head'])
+async def test_secondary_profile_wait_admits_without_taking_launch_db_lock(tmp_path, monkeypatch, session_change):
     from gateway.run import _profile_runtime_scope
     from gateway.run_goal_wait import goal_wait_guard
     from gateway.run_runtime import initialize_gateway_runtime
@@ -585,18 +586,39 @@ async def test_secondary_profile_wait_admits_without_taking_launch_db_lock(tmp_p
             manager.wait_for_seconds(1, 'disposable evidence')
             guard = await asyncio.to_thread(goal_wait_guard, authority,
                                            captured_event(runner, source, sid, manager))
+            before = goals.load_goal(sid).to_json()
+            if session_change == 'ended':
+                authority.db._execute_write(lambda conn: conn.execute(
+                    'UPDATE sessions SET ended_at=1 WHERE id=?', (sid,)))
+            elif session_change == 'archived':
+                authority.db._execute_write(lambda conn: conn.execute(
+                    'UPDATE sessions SET archived=1 WHERE id=?', (sid,)))
+            elif session_change == 'new_head':
+                authority.db._execute_write(lambda conn: conn.execute(
+                    "UPDATE sessions SET ended_at=1,end_reason='compression' WHERE id=?", (sid,)))
+                authority.db.create_session('new-head', source='discord', parent_session_id=sid)
             # A routing writer may itself wait on this authority. Never borrow its
             # lock from the authority writer, even though both handles are SQLite.
             with monkeypatch.context() as locked:
                 def forbidden_read(*args, **kwargs):
                     raise AssertionError('authority writer acquired the launch routing DB')
                 locked.setattr(routing_db, '_read_ctx', forbidden_read)
-                await asyncio.to_thread(admit_session_input, authority.db, epoch=authority.epoch,
-                    principal_id='automation:' + key, session_id=sid, request_id='multiplex-goal-wait',
-                    payload={'text': 'secondary goal wake'}, _authorize_write=guard)
-            assert len(list_session_admissions(authority.db, session_id=sid)) == 1
-            assert goals.load_goal(sid).waiting_since == 0
-            assert goals.load_goal(sid).last_automatic_continuation_at > 0
+                async def admit():
+                    return await asyncio.to_thread(admit_session_input, authority.db, epoch=authority.epoch,
+                        principal_id='automation:' + key, session_id=sid, request_id='multiplex-goal-wait',
+                        payload={'text': 'secondary goal wake'}, _authorize_write=guard)
+                if session_change == 'none':
+                    await admit()
+                else:
+                    with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+                        await admit()
+            if session_change == 'none':
+                assert len(list_session_admissions(authority.db, session_id=sid)) == 1
+                assert goals.load_goal(sid).waiting_since == 0
+                assert goals.load_goal(sid).last_automatic_continuation_at > 0
+            else:
+                assert list_session_admissions(authority.db, session_id=sid) == []
+                assert goals.load_goal(sid).to_json() == before
     finally:
         for authority in list(getattr(runner, 'session_authorities', []) or []):
             authority.db.close()
@@ -634,3 +656,87 @@ async def test_unfenceable_wait_is_terminal_once_without_retry_tracebacks(parked
     assert goals.load_goal(sid).to_json() == before
     assert runner._get_replay_scheduler().gate.load() == 0
     adapter_calls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_watcher_uses_native_goal_only_admission(tmp_path, monkeypatch):
+    from gateway.run import _profile_runtime_scope
+    from gateway.run_runtime import initialize_gateway_runtime
+    from gateway.runtime_ownership import process_ownership
+    from gateway.session_synthetic import is_synthetic
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    from tests.gateway.test_session_authorities_multiplex import _reserve_homes, _runner
+
+    root, homes = _reserve_homes(tmp_path, monkeypatch, names=('alpha',))
+    process_ownership.reserve([home for _, home in homes])
+    runner = _runner(root, homes)
+    (homes[1][1] / '.env').write_text('DISCORD_ALLOWED_USERS=42\n')
+    try:
+        await initialize_gateway_runtime(runner)
+        with _profile_runtime_scope(homes[1][1], {}):
+            monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture', typing_indicator=False))
+            adapter.gateway_runner = runner
+            runner._profile_adapters = {'alpha': {Platform.DISCORD: adapter}}
+            runner._configure_profile_adapter(adapter, 'alpha', Platform.DISCORD)
+            source = adapter.build_source(chat_id='42', user_id='42', chat_type='dm')
+            monkeypatch.setattr(adapter, 'send', AsyncMock(return_value=SendResult(success=True)))
+            monkeypatch.setattr(runner, '_handle_message_with_agent', AsyncMock(return_value='seed reply'))
+            await adapter.handle_message(MessageEvent(text='seed', source=source, message_id='seed'))
+            await async_wait_until(lambda: not adapter._background_tasks, timeout=20, what='secondary seed')
+            key = runner._session_key_for_source(source)
+            sid = runner.session_store.peek_session_id(key)
+            assert sid is not None
+            authority = runner.session_authorities.for_home(homes[1][1])
+            seed = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+            assert len(seed) == 1 and seed[0]['status'] == 'terminal'
+            await runner._warm_goals_session_db('secondary goal wait')
+            manager = goals.GoalManager(sid)
+            manager.set('finish the secondary profile goal')
+            manager.wait_for_seconds(1, 'disposable evidence')
+            manager.state.waiting_until = time.time() - 1
+            manager._save()
+            monkeypatch.setattr(authority, '_schedule', lambda *args: None)
+            adapter_calls = AsyncMock(wraps=adapter.handle_message)
+            monkeypatch.setattr(adapter, 'handle_message', adapter_calls)
+            await runner._goal_wakeup_fire_one(sid)
+            rows = list_session_admissions(authority.db, session_id=sid)
+            assert len(rows) == 1
+            descriptor = rows[0]['payload']['native_text_v1']['synthetic']
+            assert descriptor['metadata']['goal_continuation'] is True and descriptor['internal'] is False
+            assert goals.load_goal(sid).waiting_since == 0
+            assert sid not in getattr(runner, '_goal_wait_retries', {})
+            from gateway.session_envelope import restore_native, check_native_route
+            event = restore_native(rows[0]['payload'], runner)
+            _bound_source, bound_key = await check_native_route(runner, rows[0]['payload'], sid, source, adapter)
+            assert bound_key == key and is_synthetic(event)
+            adapter_calls.assert_not_called()
+    finally:
+        for authority in list(getattr(runner, 'session_authorities', []) or []):
+            authority.db.close()
+        runner.session_store.close_all_db_handles()
+        for _, home in homes:
+            process_ownership.release(home)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['clear', 'reset'])
+async def test_retry_and_terminal_maps_pruned_when_goal_no_longer_parked(parked, monkeypatch, change):
+    runner, _adapter, _authority, _source, sid, key, manager, _rows, _calls = parked
+    runner._goal_wait_retries = {sid: ('stale-wait', 2, 1e12)}
+    runner._goal_wait_terminal = {sid: ('stale-wait', 'missing_durable_route')}
+    if change == 'clear':
+        manager.clear()
+    else:
+        runner.session_store.reset_session(key)
+    runner._running = True
+    sleeps = 0
+    async def one_scan(_interval):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:  # first sleep is the startup connection grace period
+            runner._running = False
+    monkeypatch.setattr('gateway.run_goals.asyncio.sleep', one_scan)
+    await runner._loop_wakeup_watcher(interval=0)
+    assert sid not in runner._goal_wait_retries
+    assert sid not in runner._goal_wait_terminal
