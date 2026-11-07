@@ -7,4 +7,20 @@ the real install root through ``hermes_constants`` and exits the process when th
 Importing it once here, before any window opens, keeps boot out of the mocked import.
 """
 
+import threading
+import types
+
+import pytest
+
 import hermes_bootstrap
+
+
+@pytest.fixture(autouse=True)
+def _isolate_server_thread_factory(_hermetic_environment, monkeypatch):
+    # Inline turn workers must not make unrelated process-wide daemons synchronous.
+    from agent import memory_provider
+    from tui_gateway import server
+
+    namespace = types.SimpleNamespace(**vars(threading))
+    monkeypatch.setattr(server, "threading", namespace)
+    monkeypatch.setattr(memory_provider, "threading", namespace)

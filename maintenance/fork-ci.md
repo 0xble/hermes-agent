@@ -56,6 +56,17 @@ inherited through `GatewayTurnMixin`, not before it as a second direct base:
 the reversed ancestor order prevents `GatewayRunner` from importing. Preserve
 the real gateway route and scratch-runner regressions when reconciling this split.
 
+TUI fixture thread replacements stay local to the server's threading namespace.
+Inline turn workers must not replace the process-wide `threading.Thread`: a real
+state write starts the fork's macOS write-stall helper, whose serving thread waits
+for its child until shutdown. Running that helper inline deadlocks the test.
+The shared TUI fixture gives server workers and the context-thread factory one
+local threading namespace, preserving real diagnostic threads, inherited profile
+context and existing inline-worker assertions. The regression in
+`tests/tui_gateway/test_thread_fixture_isolation.py` proves those execution modes
+and a real isolated SessionDB write. Retire this adaptation
+when upstream's TUI fixtures no longer mutate the shared threading module.
+
 Queued-row cancellation regressions follow upstream's detached-conversation
 contract, not the retired read-only `superseded` flag. Preserve terminal
 cancellation and deletion assertions, and prove the old conversation mounts
