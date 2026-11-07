@@ -1,5 +1,6 @@
 """Portable HOME ownership survives abrupt process death without sharing test state."""
 import json
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import re
@@ -35,6 +36,57 @@ def test_sweep_reclaims_dead_owner_and_reports_bytes(tmp_path, capsys):
     output = capsys.readouterr().out
     match = re.search(r'reclaimed 1 home\(s\), (\d+) allocated bytes', output)
     assert match and int(match[1]) >= 8192
+
+
+@pytest.mark.parametrize('cleanup', ['teardown', 'sweep'])
+def test_readonly_home_is_removed(tmp_path, cleanup):
+    context = (ci.external_temporary_directory('hermes-ci-home-', parent=tmp_path)
+               if cleanup == 'teardown' else nullcontext(marked_home(tmp_path, pid=2**30, start='dead')))
+    with context as home:
+        readonly = home / 'tmp' / 'ro'
+        readonly.mkdir(parents=True)
+        (readonly / 'payload').write_bytes(b'x' * 8192)
+        (readonly / 'payload').chmod(0o400)
+        readonly.chmod(0o500)
+    if cleanup == 'sweep':
+        sweep(tmp_path)
+    assert not home.exists()
+
+
+def test_sweep_partial_failure_preserves_ownership_for_retry(tmp_path, monkeypatch, capsys):
+    home = marked_home(tmp_path, pid=2**30, start='dead')
+    marker = (home / '.owner.json').read_bytes()
+    lock = home / '.owner.lock'
+    lock.touch()
+    lock_identity = lock.stat().st_ino
+    readonly = home / 'tmp' / 'ro'
+    readonly.mkdir(parents=True)
+    blocked = readonly / 'blocked'
+    blocked.write_bytes(b'x')
+    readonly.chmod(0o500)
+    unlink = os.unlink
+    removed = []
+
+    def fail_after_partial_removal(path, *args, **kwargs):
+        if Path(path).name == 'blocked':
+            if (home / 'payload').exists():
+                unlink(home / 'payload')
+                removed.append('payload')
+            raise OSError(5, 'injected filesystem failure', str(path))
+        result = unlink(path, *args, **kwargs)
+        removed.append(Path(path).name)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'unlink', fail_after_partial_removal)
+        sweep(tmp_path)
+    assert 'payload' in removed, 'the failure must follow actual partial removal'
+    assert blocked.exists()
+    assert (home / '.owner.json').read_bytes() == marker
+    assert lock.stat().st_ino == lock_identity
+    assert 'injected filesystem failure' in capsys.readouterr().err
+    sweep(tmp_path)
+    assert not home.exists(), 'a fresh partial home must be retried without the legacy age delay'
 
 
 def test_sweep_preserves_live_locked_home_and_publishes_identity(tmp_path):

@@ -329,6 +329,50 @@ def _home_reparse_point(info: os.stat_result) -> bool:
     return bool(getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0))
 
 
+def _rmtree_readonly(path: Path, *, repeated: bool = False) -> None:
+    # utils imports application dependencies unavailable during CI bootstrap.
+    # Match TemporaryDirectory's permission recovery, including unreadable dirs.
+    def retry(_function, failed, error):
+        if not isinstance(error, PermissionError) or (repeated and Path(failed) == path):
+            raise error
+        target = Path(failed)
+        for candidate in (target.parent, target):
+            if not candidate.is_symlink() and not _home_reparse_point(candidate.lstat()):
+                candidate.chmod(candidate.stat().st_mode | 0o700)
+        try:
+            os.unlink(target)
+        except IsADirectoryError:
+            _rmtree_readonly(target)
+        except PermissionError:
+            if not target.is_dir() or target.is_symlink() or _home_reparse_point(target.lstat()):
+                raise
+            _rmtree_readonly(target, repeated=(target == path))
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=lambda function, failed, info: retry(function, failed, info[1]))
+
+
+def remove_ci_home(home: Path) -> None:
+    """Keep abandoned ownership discoverable until every payload entry is gone."""
+    home.chmod(home.stat().st_mode | 0o700)
+    for child in home.iterdir():
+        if child.name in ('.owner.json', '.owner.lock'):
+            continue
+        if child.is_dir() and not child.is_symlink():
+            _rmtree_readonly(child)
+        else:
+            try:
+                child.unlink()
+            except PermissionError:
+                if child.is_symlink() or _home_reparse_point(child.lstat()):
+                    raise
+                child.chmod(child.stat().st_mode | 0o700)
+                child.unlink()
+    _rmtree_readonly(home)
+
+
 def sweep_ci_homes(parent: Path) -> None:
     """Called under the parent lock, including publication of the next owner."""
     count = reclaimed = 0
@@ -349,12 +393,9 @@ def sweep_ci_homes(parent: Path) -> None:
                 if not held:
                     continue
                 size = ci_home_bytes(home)
-                if os.name != 'nt':
-                    shutil.rmtree(home)
-            if os.name == 'nt':
-                # Windows cannot remove an open lock file. The parent lock
-                # still fences all creators and sweepers after this close.
-                shutil.rmtree(home)
+            # Windows cannot remove an open lock file. The parent lock
+            # still fences all creators and sweepers after this close.
+            remove_ci_home(home)
             count += 1
             reclaimed += size
         except FileNotFoundError:
@@ -379,7 +420,7 @@ def owned_ci_home(parent: Path) -> Iterator[Path]:
                 (home / '.owner.json').write_text(json.dumps(ci_owner_identity()), encoding='utf-8')
             except BaseException:
                 owner.close()
-                shutil.rmtree(home)
+                remove_ci_home(home)
                 raise
         try:
             yield home
@@ -389,7 +430,7 @@ def owned_ci_home(parent: Path) -> Iterator[Path]:
                 if not held:
                     raise RuntimeError('Could not acquire temporary HOME cleanup lock')
                 owner.close()
-                shutil.rmtree(home)
+                remove_ci_home(home)
 
 
 def windows_appdata_environment(home: Path) -> dict[str, str]:

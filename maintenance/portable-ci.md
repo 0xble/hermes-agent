@@ -129,6 +129,14 @@ deletion. Windows uses the equivalent kernel byte lock and closes it before
 removing its file under the registry lock. Native Windows execution remains
 separate qualification.
 
+Removal restores owner permissions on read-only entries before retrying the
+failed operation, preserving `TemporaryDirectory`'s normal teardown behavior.
+The portable runner keeps this stdlib-only because importing `utils` also loads
+the application's YAML dependency. Payload entries are removed before
+`.owner.json` and `.owner.lock`. A partial payload failure therefore retains
+both ownership files, so the next sweep retries immediately instead of applying
+the 24-hour legacy delay.
+
 ### Environment materialization
 
 The wrapper creates an empty HOME, not a copy of the installed runtime. PM's
@@ -159,8 +167,9 @@ fix rather than redirecting test dependency state into a shared runtime.
 
 Contract tests: `tests/scripts/ci/test_portable_homes.py`. They exercise dead
 owners, a held lock despite a bad PID, PID reuse, fresh and old legacy homes,
-top-level activity, symlink boundaries, and SIGKILL followed by a fresh process
-using the real wrapper. All parents are test-owned. Retire this fork patch only
+top-level activity, symlink boundaries, read-only teardown and reclamation,
+retry after partial removal, and SIGKILL followed by a fresh process using the
+real wrapper. All parents are test-owned. Retire this fork patch only
 when the replacement wrapper proves the same crash reclamation and live-owner
 preservation contracts. Reverting the patch restores normal-exit cleanup only.
 
