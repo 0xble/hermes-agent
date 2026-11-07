@@ -272,11 +272,11 @@ argv or a staging file. CLI output is bounded in memory; inherited daemon
 handles are drained without waiting for daemon exit or retaining late output.
 Raw stdout/stderr and malformed/timeout diagnostics are not logged.
 
-- Candidates accepted by this owner include compact `MMYY` (four ASCII digits
-  with a valid month) and the existing slash-separated `MM/YY` or `MM/YYYY`.
+- Candidates accepted by this owner include compact `MMYY` or `MMYYYY` (four or
+  six ASCII digits with a valid month) and slash-separated `MM/YY` or `MM/YYYY`.
   Compact entries register their raw spelling plus month/year components before
-  injection, so later browser-normalized `MM / YY` values are masked without
-  a global four-digit filter. Labels such as `Expiration date`,
+  injection, so later browser-normalized `MM / YYYY` and shortened `MM / YY`
+  values are masked without a global short-number filter. Labels such as `Expiration date`,
   `Expiration (MM/YY)`, and `MM/YY` already share the checkout classifier; issue
   dates, search fields and order numbers still do not register card metadata.
 

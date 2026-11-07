@@ -13,7 +13,7 @@ ORIGIN = "https://checkout.example"
 @pytest.mark.parametrize("backend", ["camofox", "agent-browser"])
 @pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize("label", ["Expiration date", "Expiration (MM/YY)", "MM/YY"])
-@pytest.mark.parametrize("value", ["1229", "12 /29", "12/2029", "0129"])
+@pytest.mark.parametrize("value", ["1229", "12 /29", "12/2029", "0129", "122029", "012029"])
 @pytest.mark.parametrize("surface", ["type", "snapshot"])
 def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path, backend, failure, label, value, surface):
     from tools import browser_vault_tool
@@ -28,11 +28,12 @@ def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path
     monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: ORIGIN)
     monkeypatch.setattr(cf, "_require_tab", lambda *a: ({"task_id": "expiry", "tab_id": "fixture", "user_id": "fixture"}, None))
     typed = []
-    month = "01" if value == "0129" else "12"
+    month = "01" if value.startswith("01") else "12"
     year = "2029" if "2029" in value else "29"
     formatted = f"{month} / {year}"
+    shortened = f"{month} / {year[-2:]}"
     def tree():
-        return f'- textbox "{label}" [e1]' + (f': {formatted}\n- paragraph "echo {value}"' if typed else '')
+        return f'- textbox "{label}" [e1]' + (f': {formatted}\n- paragraph "echo {value}, shortened {shortened}"' if typed else '')
     monkeypatch.setattr(cf, "_snapshot_data", lambda *a: {"snapshot": tree(), "refsCount": 1})
     def post(path, body, **kw):
         typed.append(body["text"])
@@ -58,7 +59,7 @@ def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path
             assert value not in output
         output = call("browser_snapshot", {"full": True})
         if surface == "snapshot":
-            assert value not in output and formatted not in output
+            assert value not in output and formatted not in output and shortened not in output
         assert "[e1]" in json.loads(output)["snapshot"]
         # Exercise the real automatic truncated-snapshot cache before disk writes.
         monkeypatch.setattr(bt, "get_browser_snapshot_threshold", lambda: 10)
@@ -67,13 +68,14 @@ def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path
         assert files
         for path in files:
             saved = path.read_text()
-            assert value not in saved and formatted not in saved
-        ordinary = json.dumps({"snapshot": f'- textbox "Order" [e1]: {value}'})
+            assert value not in saved and formatted not in saved and shortened not in saved
+        ordinary = json.dumps({"snapshot": f'- textbox "Order" [e1]: {value}, {formatted}, {shortened}'})
         assert scrub_browser_result("browser_snapshot", ordinary, "other-tab") == ordinary
         monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: "https://other.example")
         assert scrub_browser_result("browser_snapshot", ordinary, "expiry") == ordinary
         monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: ORIGIN)
-        assert value not in scrub_browser_result("browser_snapshot", ordinary, "expiry")
+        owned = scrub_browser_result("browser_snapshot", ordinary, "expiry")
+        assert all(v not in owned for v in (value, formatted, shortened))
         monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: "")
         assert value not in scrub_browser_result("browser_snapshot", ordinary, "expiry")
         monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: ORIGIN)
@@ -91,6 +93,10 @@ def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path
     ("Issue date (MM/YY)", "1229", False), ("Valid from (MM/YY)", "1229", False),
     ("Expiration date", "1329", False), ("Expiration date", "0029", False),
     ("Expiration date", "122", False), ("Expiration date", "12299", False),
+    ("Expiration date", "122029", True), ("Expiration date", "012029", True),
+    ("Search", "122029", False), ("Order number", "012029", False),
+    ("Issue date (MM/YY)", "122029", False), ("Valid from (MM/YY)", "012029", False),
+    ("Expiration date", "132029", False), ("Expiration date", "002029", False),
 ])
 def test_expiry_registration_requires_classified_field_and_valid_format(monkeypatch, label, value, expected):
     from agent.redact import has_vault_scoped_components
