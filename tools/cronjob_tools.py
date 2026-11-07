@@ -709,6 +709,11 @@ def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optiona
     return result
 
 
+def _parse_send_freshness(raw: Optional[str]) -> Optional[dict]:
+    from cron.scheduled_send import parse_send_freshness
+    return parse_send_freshness(raw)
+
+
 def _review_value(raw: Optional[str], *, clear: bool = False) -> Optional[dict]:
     if clear and raw is not None:
         raise ValueError("review_json and clear_review are mutually exclusive")
@@ -787,6 +792,9 @@ def _action_create(a: dict[str, Any]) -> str:
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False,
             review=_review_value(a["review_json"], clear=bool(a["clear_review"])),
+            payload_sha256=a.get("payload_sha256") or None,
+            payload_path=a.get("payload_path") or None,
+            send_freshness=_parse_send_freshness(a.get("send_freshness_json")),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
@@ -956,6 +964,7 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
         updates["pinned"] = bool(a["pinned"])
     if a["base_url"] is not None:
         updates["base_url"] = _normalize_optional_job_value(a["base_url"], strip_trailing_slash=True)
+    _update_scheduled_send_fields(a, updates)
     # Preserve strict zero and explicit '' clears; None means unchanged. These values
     # share the same forwarding contract, with field-specific validation in update_job.
     for key in ("hard_wall_timeout_seconds", "max_catch_up_lateness_seconds",
@@ -971,6 +980,15 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
     return _validate_cron_base_url(_pick(updates, job, "provider"), _pick(updates, job, "base_url"))
+
+
+def _update_scheduled_send_fields(a: dict[str, Any], updates: dict[str, Any]) -> None:
+    if a.get("payload_sha256") is not None:
+        updates["payload_sha256"] = a["payload_sha256"]
+    if a.get("payload_path") is not None:
+        updates["payload_path"] = a["payload_path"]
+    if a.get("send_freshness_json") is not None:
+        updates["send_freshness"] = _parse_send_freshness(a["send_freshness_json"])
 
 
 def _update_script_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
@@ -1130,7 +1148,10 @@ def cronjob(
     max_catch_up_lateness_seconds: Optional[float | str] = None,
     review_json: Optional[str] = None,
     clear_review: bool = False,
-    allow_shrink: bool = False) -> str:
+    allow_shrink: bool = False,
+    payload_sha256: Optional[str] = None,
+    payload_path: Optional[str] = None,
+    send_freshness_json: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     from agent.incognito import is_incognito
@@ -1242,6 +1263,18 @@ CRONJOB_SCHEMA = {
                 "type": "boolean",
                 "description": "CLI/operator lane: clear the job's review declaration."
             },
+            "payload_sha256": {
+                "type": "string",
+                "description": "Optional SHA-256 of an approved send payload. Must be 64 hex characters. Rejected at create/update when malformed."
+            },
+            "payload_path": {
+                "type": "string",
+                "description": "Optional absolute path of the approved send payload. Requires payload_sha256 and must match that digest at create/update."
+            },
+            "send_freshness_json": {
+                "type": "string",
+                "description": "Optional JSON object for a delayed person-facing send: channel, conversation, script (existing shared freshness checker), and optional account, recipient, sender. The scheduler re-reads the thread before sending and holds the job if it is stale."
+            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1311,7 +1344,7 @@ _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "keep_pinned_lane", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
     "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review",
-    "max_catch_up_lateness_seconds")
+    "max_catch_up_lateness_seconds", "payload_sha256", "payload_path", "send_freshness_json")
 
 
 def _cronjob_handler(args, **kw):
