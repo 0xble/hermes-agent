@@ -124,8 +124,11 @@ def test_dropped_spawn_path_dirs_return_after_the_login_path(tmp_path, monkeypat
     _managed_setup(tmp_path, monkeypatch,
                    profile_body=f'PATH="/usr/local/bin:/usr/bin:/bin"\nPATH="{user_bin}:$PATH"\n')
     # A relative entry resolves against the terminal's cwd, not this process's.
+    # Inherited launcher PATH regains dropped entries after the login PATH. An explicit
+    # backend PATH is a selected toolchain and intentionally wins over the login PATH.
+    monkeypatch.setenv("PATH", f"{extra_a}:{extra_b}:rel-bin:/usr/bin:/bin")
     monkeypatch.chdir(user_bin)
-    env = LocalEnvironment(cwd=str(tmp_path), env={"PATH": f"{extra_a}:{extra_b}:rel-bin:/usr/bin:/bin"})
+    env = LocalEnvironment(cwd=str(tmp_path))
     try:
         entries = _snapshot_path_value(env)
         assert entries.index(str(user_bin)) < entries.index("/usr/bin") < entries.index(str(extra_a)) \

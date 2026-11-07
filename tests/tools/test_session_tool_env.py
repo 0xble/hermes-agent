@@ -25,23 +25,31 @@ def _parts(env):
 
 
 @pytest.mark.platforms('linux', 'macos')
-@pytest.mark.parametrize('client,backend_path,first', [
-    ({'PATH': '/client/bin:/usr/bin:/bin'}, None, '/client/bin'),
-    ({}, None, '/daemon/bin'),
-    (None, None, '/login/bin'),
-    ({'PATH': '/client/bin:/usr/bin:/bin'}, '/configured/bin:/usr/bin:/bin', '/configured/bin'),
+@pytest.mark.parametrize('client_mode,backend_override,first', [
+    ('selected', False, 'client'),
+    ('empty', False, 'daemon'),
+    ('unbound', False, 'login'),
+    ('selected', True, 'configured'),
 ])
-def test_login_startup_cannot_discard_the_selected_path(tmp_path, monkeypatch, client, backend_path, first):
+def test_login_startup_cannot_discard_the_selected_path(tmp_path, monkeypatch, client_mode, backend_override, first):
     from pathlib import Path
+    import shlex
     from agent.session_client_env import client_env_scope
     from tools.environments import local
+    # Unbound login restoration deliberately skips nonexistent absolute directories.
+    bins = {name: tmp_path / name / 'bin' for name in ('client', 'daemon', 'login', 'configured')}
+    for directory in bins.values():
+        directory.mkdir(parents=True)
+    paths = {name: f'{directory}:/usr/bin:/bin' for name, directory in bins.items()}
+    client = {'selected': {'PATH': paths['client']}, 'empty': {}, 'unbound': None}[client_mode]
+    first = str(bins[first])
     rc = tmp_path / 'login.rc'
-    rc.write_text('export PATH=/login/bin:/usr/bin:/bin\n'
+    rc.write_text(f'export PATH={shlex.quote(paths["login"])}\n'
                   'export LOGIN_INIT_PROOF=loaded\n'
                   'login_function() { printf function; }\n')
     monkeypatch.setattr(local, '_resolve_shell_init_files', lambda: [str(rc)])
-    monkeypatch.setenv('PATH', '/daemon/bin:/usr/bin:/bin')
-    backend = {} if backend_path is None else {'PATH': backend_path}
+    monkeypatch.setenv('PATH', paths['daemon'])
+    backend = {'PATH': paths['configured']} if backend_override else {}
     with client_env_scope(client):
         terminal = local.LocalEnvironment(cwd=str(tmp_path), env=backend)
         try:
@@ -54,9 +62,10 @@ def test_login_startup_cannot_discard_the_selected_path(tmp_path, monkeypatch, c
                 assert entries[0] == first, result
                 assert loaded == 'loaded' and function == 'function' and marker == ''
                 if client is None:
-                    assert '/daemon/bin' in entries
-                elif client.get('PATH') or backend_path:
-                    assert '/daemon/bin' not in entries
+                    assert str(bins['daemon']) in entries
+                    assert entries.index(str(bins['login'])) < entries.index(str(bins['daemon']))
+                elif client.get('PATH') or backend_override:
+                    assert str(bins['daemon']) not in entries
             assert '_HERMES_LOCAL_LAUNCH_PATH' not in Path(terminal._snapshot_path).read_text()
             # PATH remains normal persistent shell state after startup, not a per-command reset.
             assert terminal.execute('export PATH="/turn/bin:$PATH"')['returncode'] == 0

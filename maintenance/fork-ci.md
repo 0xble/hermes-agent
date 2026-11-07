@@ -49,6 +49,15 @@ still terminate startup. Assertions must verify those outcomes, not merely
 relax an exit-code expectation. Regenerate prompt-surface fixtures through
 `scripts/ci/prompt_surface.py render` after changing tool catalog descriptions.
 
+Login PATH fixtures distinguish inherited launcher entries from an explicit
+backend/client toolchain. Exercise dropped-entry restoration with inherited
+PATH and real directories, since missing absolute directories are deliberately
+excluded. Keep explicit-path precedence, login functions and persistent shell
+edits covered by `tests/tools/test_session_tool_env.py`. The pipeline wrapper
+contract compares parse-error status and trailing-backslash output to native
+eval on each available Bash executable, not one version's constants. Keep exact
+per-segment status assertions and the Bash parser-recovery crash regressions.
+
 Runner fixtures copy `run_tests_launch.py` and `run_tests_fork_child.py` with the
 parallel runner. Upstream split process launch into those siblings, so partial
 copies fail before exercising scratch isolation. Keep gateway preparation
