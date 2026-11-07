@@ -60,7 +60,7 @@ def page(url, **kwargs):
     ([page(B, metadata={"sourceURL": A})], [B, None]),
     ([page(B, metadata={"sourceURL": A}), page(B)], [B, B]),
     ([page(FINAL)], [None, None]),
-    ([page("https://foreign.test/x"), page(B)], [None, B]),
+    ([page("https://foreign.test/x"), page(B)], ["https://foreign.test/x", B]),
 ])
 def test_batch_accounts_for_each_requested_identity(offline, fixed, returned, expected, repeat):
     provider = SimpleNamespace(name="exa", supports_extract=lambda: True, extract=AsyncMock(return_value=copy.deepcopy(returned)))

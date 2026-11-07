@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from tools.tool_backend_helpers import selection_error, selection_exists
 from tools.url_safety import normalize_url_for_request
@@ -73,27 +74,61 @@ def _refuse_all(error: str):
     return None, None, None, json.dumps({"success": False, "error": error})
 
 
+def _extract_identity_key(url: Any) -> Optional[tuple]:
+    """Compare provider canonicalizations without changing fetch targets or cache keys."""
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return (url,)
+    if (parts.scheme, port) in (("http", 80), ("https", 443)):
+        port = None
+    return (parts.scheme.lower(), parts.hostname, port, parts.path.rstrip("/"),
+            parts.query, parts.username, parts.password)
+
+
+def _extract_result_identity(result: dict, requested: set[str], keys: dict) -> Optional[str]:
+    metadata = result.get("metadata")
+    source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+    # sourceURL owns a redirect even when its final URL is another requested URL.
+    for candidate in (source, result.get("url")):
+        if isinstance(candidate, str) and candidate in requested:
+            return candidate
+        identities = keys.get(_extract_identity_key(candidate), set())
+        if identities:
+            return next(iter(identities)) if len(identities) == 1 else None
+    return None
+
+
+def _infer_extract_redirect(result: dict, keys: dict) -> bool:
+    metadata = result.get("metadata")
+    source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+    final = _extract_identity_key(result.get("url"))
+    # A canonical collision is not an unknown redirect, even with one slot left.
+    return bool(final and final not in keys and (not source or _extract_identity_key(source) == final))
+
+
 def _match_extract_results(urls: list[str], results: list[dict]) -> list[dict]:
-    """Match identities, never positions; only a singleton dispatch can infer a redirect."""
+    """Align identities first; infer redirects only for one unambiguous leftover pair."""
     requested = set(urls)
+    keys = {}
+    for url in requested:
+        keys.setdefault(_extract_identity_key(url), set()).add(url)
     matched = {}
     unmatched = []
     for result in results:
-        metadata = result.get("metadata")
-        source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
-        # sourceURL is authoritative when a requested page redirects to another
-        # requested URL. The final URL must not steal that other page's slot.
-        identity = next((url for url in (source, result.get("url")) if url in requested), None)
+        identity = _extract_result_identity(result, requested, keys)
         if identity is None:
             unmatched.append(result)
-        elif identity not in matched:
+        elif identity not in matched or (matched[identity].get("error") and not result.get("error")):
             matched[identity] = result
-    if len(requested) == 1 and not matched and len(unmatched) == 1:
+    remaining = requested - matched.keys()
+    if len(remaining) == 1 and len(unmatched) == 1:
         result = unmatched[0]
-        metadata = result.get("metadata")
-        source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
-        if result.get("url") and (not source or source == result["url"]):
-            matched[urls[0]] = result
+        if _infer_extract_redirect(result, keys):
+            matched[remaining.pop()] = result
     ordered = []
     for url in urls:
         result = dict(matched[url]) if url in matched else _result_entry(url, _NO_RESULT_ERROR)

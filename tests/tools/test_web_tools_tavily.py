@@ -150,7 +150,7 @@ class TestNormalizeTavilyDocuments:
 
 
 class TestWebExtractCacheAttribution:
-    """Only cache content under the URL reported by the extract provider."""
+    """Cache identity-aligned pages under the requested URL, not the redirect target."""
 
     def test_partial_result_caches_under_its_own_requested_url(self):
         from tools import web_tools_extract as wte
@@ -164,7 +164,7 @@ class TestWebExtractCacheAttribution:
                     {"url": urls[1], "raw_content": "second page", "title": "Second"},
                 ]
 
-        urls = ["https://example.com/first", "https://example.com/second"]
+        urls = ["https://example.com/first", "https://example.com/second", "https://example.com/third"]
         with patch("tools.web_result_cache.extract_cache_put") as cache_put:
             asyncio.run(wte._dispatch_extract(_PartialProvider(), urls, None))
 
