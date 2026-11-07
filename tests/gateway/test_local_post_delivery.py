@@ -9,13 +9,14 @@ context alive until restart.
 """
 import pytest
 
+from gateway.session_results import execution_result
 from tests.waiting import async_wait_until
 
 
 async def _owner(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_state import SessionDB
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -49,6 +50,7 @@ async def test_local_turn_runs_its_post_delivery_callbacks_after_settling(tmp_pa
         def after_delivery():  # what TurnRunner / the /goal judge register for the turn
             fired.append((event.text, get_session_admission(db, admission_id=admission)["status"]))
         adapter.register_post_delivery_callback(live.route, after_delivery, generation=1)
+        execution_result.get()['post_delivery'] = (adapter, live.route, 1)
         if event.text == "fails":
             raise RuntimeError("turn failed")
         return "ok"
@@ -63,6 +65,7 @@ async def test_local_turn_runs_its_post_delivery_callbacks_after_settling(tmp_pa
             await async_wait_until(lambda: text in [t for t, _ in fired], timeout=10, what=f"the {text} turn")
         adapter = runner._delivery_adapter_for(live.source)
         assert adapter._post_delivery_callbacks == {}
+        assert adapter._post_delivery_callbacks_by_generation == {}
     finally:
         db.close()
     # Once each, after the turn's outcome committed: the reply was out before they ran.
@@ -80,8 +83,10 @@ async def test_post_delivery_is_taken_by_the_key_the_turn_registered_under(tmp_p
 
     async def turn(event):
         live = authority.sessions[ref.session_id]
-        runner._delivery_adapter_for(live.source).register_post_delivery_callback(
+        adapter = runner._delivery_adapter_for(live.source)
+        adapter.register_post_delivery_callback(
             live.route, lambda: fired.append(event.text), generation=1)
+        execution_result.get()['post_delivery'] = (adapter, live.route, 1)
         live.route = live.route + ":rebound"
         return "ok"
 
@@ -93,6 +98,7 @@ async def test_post_delivery_is_taken_by_the_key_the_turn_registered_under(tmp_p
         await authority.submit(_viewer(), Submission("answers", ref, {"text": "answers"}, "queue"))
         await async_wait_until(lambda: fired == ["answers"], timeout=10, what="the post-delivery callback")
         assert runner._delivery_adapter_for(live.source)._post_delivery_callbacks == {}
+        assert runner._delivery_adapter_for(live.source)._post_delivery_callbacks_by_generation == {}
     finally:
         db.close()
 
@@ -110,7 +116,9 @@ async def test_deleted_local_session_leaves_nothing_on_the_local_adapter(tmp_pat
         kept, deleted = (authority.sessions[ref.session_id] for ref in refs)
         adapter = runner._delivery_adapter_for(kept.source)
         for live in (kept, deleted):
-            adapter.register_post_delivery_callback(live.route, lambda: None, generation=1)
+            for generation in (1, 2):
+                adapter.register_post_delivery_callback(live.route, lambda: None, generation=generation)
+                adapter.claim_post_delivery(live.route, generation)
             with live.event_stream.lock:
                 _interactive(authority, live.source.chat_id)
         result = await mutate_session(authority, _viewer(), refs[1], dict(
@@ -119,7 +127,10 @@ async def test_deleted_local_session_leaves_nothing_on_the_local_adapter(tmp_pat
         assert result.get("deleted_ids") == [refs[1].session_id]
         assert set(adapter.sources) == set(adapter.policies) == set(authority.launch_sources) == {
             refs[0].session_id}
-        assert set(adapter._post_delivery_callbacks) == {kept.route}
+        assert adapter._post_delivery_callbacks == {}
+        expected = {(kept.route, generation) for generation in (1, 2)}
+        assert set(adapter._post_delivery_callbacks_by_generation) == expected
+        assert adapter._post_delivery_claims == expected
         assert adapter.authorize_source(kept.source)
     finally:
         db.close()

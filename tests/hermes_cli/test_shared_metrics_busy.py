@@ -338,7 +338,8 @@ async def _real_runner(monkeypatch):
     from gateway.config import GatewayConfig, PlatformConfig
     from gateway.platforms.base import SendResult
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from plugins.platforms.discord.adapter import DiscordAdapter
 
     monkeypatch.setattr(SessionAuthority, "_schedule", lambda self, ref: None)

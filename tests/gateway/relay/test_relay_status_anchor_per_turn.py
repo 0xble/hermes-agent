@@ -38,7 +38,7 @@ async def _gateway(tmp_path, instance, extra):
     from gateway.relay.adapter import RelayAdapter
     from gateway.relay.descriptor import CapabilityDescriptor
     from gateway.relay.ws_transport import WebSocketRelayTransport
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
     authority = await initialize_session_authority(runner, profile_id='default', instance_id=instance)

@@ -13,7 +13,7 @@ import pytest
 
 from gateway.owner_identity import host_owner_subject, same_owner
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 MEMBERS = [{'member_id': 'one', 'profile': 'default', 'handle': 'one'},
            {'member_id': 'two', 'profile': 'two', 'handle': 'two'}]

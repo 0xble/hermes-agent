@@ -138,6 +138,7 @@ def test_retry_and_undo_after_a_block_resubmit_the_typed_text(provider_url, tmp_
     what the user typed, so the hook re-decides on it (0 model calls, blocked again), never the placeholder."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     import hermes_state_runtime as rt
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     typed = f"look up {SECRET}"
     for name in ("receipt", "rewind"):
@@ -145,7 +146,7 @@ def test_retry_and_undo_after_a_block_resubmit_the_typed_text(provider_url, tmp_
         try:
             _blocked_session(provider_url, db)
             if name == "receipt":
-                epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+                epoch = begin_runtime_epoch(db, instance_id="owner")
                 receipt = rt.mutate_runtime_session(
                     db, epoch=epoch, principal_id="human", session_id="s-block", request_id="r", expected_revision=0,
                     expected_generation=0, operation="rewind", payload={"target_message_id": db.get_messages("s-block")[0]["id"]})

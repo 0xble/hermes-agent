@@ -622,6 +622,7 @@ class RestartRecoveryMixin:
                                           candidates=_NOT_SUPPLIED, allow_resume=True, start_scheduler=None) -> int:
         """Claim eligible interrupted sessions before spawning; record every terminal decision."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from hermes_cli.observability.shared_metrics_busy import note_running_chat_owner
         candidates = self._resume_pending_candidates(platform) if candidates is _NOT_SUPPLIED else candidates
         if candidates is None:
             return 0
@@ -664,6 +665,7 @@ class RestartRecoveryMixin:
             state = self._session_state(entry.session_key)
             state.turn.agent = _AGENT_PENDING_SENTINEL
             state.turn.started_ts = time.time()
+            note_running_chat_owner(self, entry.session_key, source)  # startup runs outside the turn's profile
             self._persist_active_agents()
             resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
             event = self._build_startup_resume_event(source, resume_marker)

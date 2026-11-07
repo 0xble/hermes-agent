@@ -271,6 +271,9 @@ async def fire_post_delivery(authority, admission_id):
     if admission_id in authority.native_waiters:
         _hand_back_post_delivery(authority, admission_id)
         return
+    post_delivery = _registry(authority, 'post_deliveries').pop(admission_id, None)
+    if post_delivery is not None:
+        _fire_post_delivery(post_delivery)
     taken = _registry(authority, 'post_delivery').pop(admission_id, None)
     if taken is None:
         return
@@ -468,14 +471,10 @@ async def execute_admission(authority, ref, row):
             # The waiter was already released (a pause, /stop) and claims nothing now.
             _fire_post_delivery(post_delivery)
         elif post_delivery is not None:
-            # No live adapter handler unwinds this turn, so nothing else fires its post-delivery
-            # cleanup: a recovered or internal turn's progress bubbles would stay forever. A turn
-            # that raised or was cancelled is over too.
-            if row['admission_id'] in authority.pending_deliveries:
-                _registry(authority, 'post_deliveries')[row['admission_id']] = post_delivery
-                _claim(post_delivery)
-            else:
-                _fire_post_delivery(post_delivery)
+            # Even a silent or failed handler still awaits the drain's terminal commit. Keep its
+            # cleanup owned until settlement, rather than firing while the admission is started.
+            _registry(authority, 'post_deliveries')[row['admission_id']] = post_delivery
+            _claim(post_delivery)
         if not handed:
             await _release_turn_marker(authority, event)
         executing_admission.reset(token)
