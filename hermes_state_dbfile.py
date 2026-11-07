@@ -415,6 +415,11 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
         )
         return []
     if worker.error is not None:
+        # Rethrowing adds caller frames to the traceback. Do not keep those
+        # frames rooted by the process-wide cache after this failed scan ends.
+        with _DARWIN_FD_SCAN_LOCK:
+            if _DARWIN_FD_SCAN_WORKER is worker:
+                _DARWIN_FD_SCAN_WORKER = None
         raise worker.error
     return [(pid, target) for pid, target, _identity in tuple(worker.targets)
             if target.casefold() in watched]
