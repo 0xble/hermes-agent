@@ -15,6 +15,10 @@ from typing import Any, Dict
 # window_id) / targeting (element, coordinate, button, modifiers) / drag / scroll /
 # set_value / type-key-wait / focus_app / delivery ladder / return shape.
 _PROPERTIES: dict[str, Any] = {
+    "node": {
+        "type": "string",
+        "description": "Optional configured node name. Omitted uses nodes.default, or the local desktop when unset. No fallback.",
+    },
     "action": {
         "type": "string",
         "enum": [

@@ -41,7 +41,7 @@ no-foreground invariant, click-dispatch internals — see
 
 ## Which machine it drives
 
-`computer_use` acts on the same machine the bot's screen lives on, never on
+With no named-node configuration, `computer_use` acts on the same machine the bot's screen lives on, never on
 the machine running Hermes Desktop. On a gateway with `terminal.backend:
 local` that is the gateway host. With a sandboxed terminal (`docker`, `ssh`,
 or a plugin backend that declares `supports_streams`, such as `singularity`) the
@@ -52,6 +52,124 @@ Daytona and Vercel sandboxes cannot host a display yet, so with those
 backends `computer_use` refuses unless `bot_desktop.placement: gateway` opts
 into driving the host. Details: [Bot Screen → Where the screen
 runs](./bot-screen.md#where-the-screen-runs).
+
+## Named macOS Nodes Over SSH
+
+A controller without a desktop, including a Linux gateway, can drive a prepared
+Mac through its existing SSH alias. The built-in `cua` provider uses CuaDriver's
+[documented stdio MCP transport over SSH](https://cua.ai/docs/cua-driver/guides/vms-and-remote).
+No HTTP bridge, listening port, pairing service, or additional token is needed.
+
+Configure nodes once in the profile's `config.yaml`, outside `computer_use`:
+
+```yaml
+nodes:
+  default: macstudio
+  hosts:
+    macstudio:
+      ssh: macstudio
+      platform: macos
+      computer_use:
+        permission_mode: unrestricted
+    macbook:
+      ssh: macbook
+      platform: macos
+      computer_use:
+        driver: /Applications/CuaDriver.app/Contents/MacOS/cua-driver
+        permission_mode: unrestricted
+computer_use:
+  backend: cua
+```
+
+Names and SSH aliases are arbitrary. `computer_use.driver` inside each node is an
+optional absolute **remote** path, defaulting to the app path shown above. The
+shared `nodes.hosts` registry belongs to the profile. Other adapters can consume
+the same identity, but this slice routes only `computer_use`. It does not change
+where terminal, file, process, or browser tools execute. The earlier proposed
+`computer_use.nodes` shape is not supported. Move it to `nodes.hosts` and use
+`nodes.default`, rather than keeping competing registries.
+
+The Mac needs CuaDriver installed, an unlocked logged-in desktop, a running
+app-owned daemon, and Accessibility and Screen Recording already granted to
+`com.trycua.driver`. The controller needs the existing `computer-use` Python
+feature (MCP SDK) and noninteractive SSH access with its host key trusted.
+The controller does not need a local CuaDriver or `DISPLAY`. Remote driver
+versions are observed, not installed or updated by the controller. This
+adapter targets CuaDriver 0.32.0. Remote setup and login startup
+remain the node owner's responsibility.
+
+The transport runs the equivalent of:
+
+```sh
+ssh -T -o BatchMode=yes macbook /Applications/CuaDriver.app/Contents/MacOS/cua-driver mcp
+```
+
+The SSH child and logical driver session stay alive across capture and input.
+A model call can select a node explicitly:
+
+```json
+{"action": "capture", "node": "macbook", "app": "TextEdit"}
+```
+
+Follow with input on the **same named node**, for example
+`{"action": "click", "node": "macbook", "element": 1}`. An omitted `node` selects
+`nodes.default`, not the last node used. Without a configured default, omission
+retains the existing local behavior. There is no special `node: local` escape:
+a provided name must exist in the registry. Every result identifies its node,
+including approval refusals and errors. Native image content is returned to
+the controller's model, and screenshot spill paths refer to controller storage,
+not inaccessible paths on the Mac. Existing capture-size settings still apply.
+
+Approval prompts and grants identify the node. `/yolo` changes the existing
+controller approval gate, not the node's daemon authorization policy. The node
+owner configures that policy. Each node's `computer_use.permission_mode` is the
+required observed public-daemon mode, defaulting to `standard`, not a request to
+change it. Set it to `unrestricted` for a node whose startup owner has explicitly
+launched that mode. A mode mismatch or unknown mode refuses execution. Hermes
+checks again after opening MCP, before declaring a session or sending desktop
+operations, because CuaDriver can auto-launch a standard daemon if the prepared
+public daemon disappears between preflight and connection. Hermes reports that
+race and closes its transport. It does not approve the replacement, restart the
+daemon, or touch a private Hermes daemon. Coordinate the public-daemon startup
+with its owner before retrying. Controller-side bounded capability manifests are
+refused rather than silently ignored or applied to an unrelated remote daemon.
+All existing actions and background-input delivery modes use the same Cua
+capture and action implementations.
+
+### Per-Node Doctor
+
+```sh
+hermes computer-use doctor --node macstudio --json
+hermes computer-use doctor --node macbook --json
+hermes computer-use doctor --json  # nodes.default, otherwise the existing local doctor
+```
+
+The remote doctor is read-only and does not launch a daemon, grant permissions,
+or wake a Mac. It reports each observation with its source and a value of
+`true`, `false`, or `null` (unknown), plus the observed version string or `null`:
+
+- SSH reachability is separate from an unlocked, GUI-awake desktop.
+- Lock state comes from `IOConsoleLocked` or an explicit console-session lock flag.
+- GUI-awake state comes from IOPMrootDomain's graphics capability bit. It does not
+  claim a physical panel is illuminated or that SSH access implies an awake GUI.
+- The public daemon's running state and immutable authorization mode come from
+  `cua-driver status`, independently of the controller's approval mode.
+- Permission booleans are trusted only with `driver-daemon` attribution. No
+  daemon or another responsible process leaves those grants unknown.
+- A missing probe is unknown, never a guessed denial or a passing check.
+
+Doctor exits nonzero for failed or incomplete checks. Runtime checks refuse a
+known locked or asleep node, denied grants, or unverifiable lock/permission
+state. An unobserved GUI-awake state or driver version also remains unknown
+and refuses execution, rather than claiming the node is ready. SSH/probe/handshake failure has an
+8-second shared request budget, with bounded MCP-child teardown. It never
+falls back to the local desktop, another node, or a controller CLI.
+
+If a transport or logical driver session ends, capture targets and element
+tokens are invalidated. Hermes does not replay input or revive a dead logical
+session inside an action. An interrupted write reports an unknown outcome,
+since it might already have landed. Take a fresh capture on the same node
+before deciding whether to repeat it.
 
 ## Enabling
 

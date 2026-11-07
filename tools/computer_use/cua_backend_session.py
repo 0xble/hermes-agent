@@ -210,10 +210,8 @@ class _CuaDriverSession:
     async def _lifecycle_coro(self) -> None:
         """Owns the stdio MCP contexts: open, signal ready, block on shutdown, clean up — all in one task."""
         import time as _time
-        from mcp import ClientSession, StdioServerParameters
+        from mcp import ClientSession
         from mcp.client.stdio import stdio_client
-        from tools.computer_use import cua_backend as _cb
-        from tools.environments.local import _sanitize_subprocess_env
 
         self._shutdown_event = asyncio.Event()  # built on the loop's own thread
         _t0 = _time.monotonic()
@@ -222,17 +220,8 @@ class _CuaDriverSession:
         # reports HOW FAR it got instead of an opaque "never reached ready".
         self._startup_phase = "binary-check"
         try:
-            driver_cmd = _driver.resolve_cua_driver_cmd()
-            if not driver_cmd and _cb.sandbox_mcp_invocation() is None:
-                raise RuntimeError(_driver.cua_driver_install_hint())
-            self._startup_phase = "manifest-discovery"
-            daemon = self._embedded_daemon
-            (command, args), child_env = (
-                (daemon.proxy_invocation(), daemon.child_env()) if daemon is not None
-                else _cb.sandbox_mcp_invocation() or (_driver._resolve_mcp_invocation(driver_cmd), _cb.cua_driver_child_env()))
+            params = self._connection_parameters()
             _t_manifest = _time.monotonic()
-            # Telemetry policy first (default: disabled), then strip Hermes secrets.
-            params = StdioServerParameters(command=command, args=args, env=_sanitize_subprocess_env(child_env))
             async with stdio_client(params) as (read, write):
                 self._startup_phase = "mcp-initialize"
                 async with ClientSession(read, write) as session:
@@ -262,6 +251,24 @@ class _CuaDriverSession:
     # idempotent no-op (stop() already set it False). A plain bool write is atomic in CPython, so this is
     # safe from the bridge-loop thread without taking self._lock (which stop() may hold while awaiting this
     # coro's future). See #55048 Bug 1.
+    def _connection_parameters(self):
+        from mcp import StdioServerParameters
+        from tools.computer_use import cua_backend as _cb
+        from tools.environments.local import _sanitize_subprocess_env
+
+        driver_cmd = _driver.resolve_cua_driver_cmd()
+        if not driver_cmd and _cb.sandbox_mcp_invocation() is None:
+            raise RuntimeError(_driver.cua_driver_install_hint())
+        self._startup_phase = "manifest-discovery"
+        daemon = self._embedded_daemon
+        (command, args), child_env = (
+            (daemon.proxy_invocation(), daemon.child_env()) if daemon is not None
+            else _cb.sandbox_mcp_invocation() or (_driver._resolve_mcp_invocation(driver_cmd), _cb.cua_driver_child_env()))
+        return StdioServerParameters(command=command, args=args, env=_sanitize_subprocess_env(child_env))
+
+    def _startup_timeout(self) -> float:
+        return 30.0
+
     async def _populate_capabilities(self, session: Any) -> None:
         """Cache per-tool capability sets, input schemas and capability_version from tools/list. Soft
         prerequisite: on failure the map stays empty (capability False)."""
@@ -299,13 +306,14 @@ class _CuaDriverSession:
         if loop is None:
             raise RuntimeError("cua-driver bridge not started")
         self._lifecycle_future = asyncio.run_coroutine_threadsafe(self._lifecycle_coro(), loop)
-        if not self._ready_event.wait(timeout=30.0):
+        timeout = self._startup_timeout()
+        if not self._ready_event.wait(timeout=timeout):
             self._signal_shutdown_locked()
             # Surface which startup phase wedged (issue #57025) — "doctor passes but the wrapper times out"
             # reports are undiagnosable from a bare "never reached ready".
             from hermes_constants import display_hermes_home
             raise RuntimeError(
-                f"cua-driver session never reached ready (timeout 30s; stuck in phase: "
+                f"cua-driver session never reached ready (timeout {timeout:g}s; stuck in phase: "
                 f"{getattr(self, '_startup_phase', 'unknown')}). Run `hermes computer-use doctor` and check "
                 f"{display_hermes_home()}/logs/agent.log for the phase timings.")
         if self._setup_error is not None:

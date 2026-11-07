@@ -74,6 +74,19 @@ def _cu_status(args) -> int:
 
 
 def _cu_doctor(args) -> None:
+    from tools.nodes import resolve_node
+    try:
+        node = resolve_node(getattr(args, "node", None))
+    except Exception as exc:
+        import json
+        print(json.dumps({"ok": False, "node": getattr(args, "node", None), "error": str(exc)}))
+        sys.exit(1)
+    if node is not None:
+        from tools.computer_use.node_doctor import run_node_doctor
+        if getattr(args, "include", None) or getattr(args, "skip", None):
+            print("Node doctor reports its full observed matrix. --include/--skip are local-only")
+            sys.exit(1)
+        sys.exit(run_node_doctor(node, json_output=bool(getattr(args, "json", False))))
     _exit_if_plugin_backend(doctor=True)
     from tools.computer_use.doctor import run_doctor
     sys.exit(run_doctor(
@@ -156,6 +169,7 @@ def build_computer_use_parser(subparsers) -> None:
             "thin so new checks added upstream surface here without code\n"
             "changes. Exits 0 when overall=ok, 1 when degraded/failed, 2\n"
             "when the binary is missing or unreachable.")
+    computer_use_doctor.add_argument("--node", help="Configured node name, otherwise nodes.default or local")
     computer_use_doctor.add_argument(
         "--include", action="append", default=[], metavar="CHECK",
         help="Run only the listed checks. Repeat for multiple "

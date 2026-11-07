@@ -141,6 +141,9 @@ class ComputerUseBackend(ABC):
     @abstractmethod
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult: ...  # e.g. AXPopUpButton selection
 
+    def prepare_for_call(self) -> None:
+        """Optional lazy connection/readiness check, under the dispatch lock, never the global cache lock."""
+
     def wait(self, seconds: float) -> ActionResult:  # default implementation
         time.sleep(max(0.0, min(seconds, 30.0)))
         return ActionResult(ok=True, action="wait", message=f"waited {seconds:.2f}s")

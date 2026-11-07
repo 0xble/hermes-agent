@@ -24,6 +24,7 @@ from hermes_dir_acl import make_user_dir
 
 from agent.image_eviction_policy import image_dimensions_from_bytes
 from tools.computer_use.backend import ActionResult, CaptureResult, ComputerUseBackend, UIElement
+from tools.nodes import Node
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +82,11 @@ def _input_target_mismatch(backend, requested_app: str) -> Optional[str]:
 # Per-Hermes-session cached backends (own cua-driver session, native target, refs, grant namespace).
 _backend_lock = threading.Lock()
 _backend: Optional[ComputerUseBackend] = None  # backward-compatible empty-session injection hook (older tests)
-_backends: dict[str, ComputerUseBackend] = {}
-_backend_call_locks: dict[str, threading.RLock] = {}
-_backend_permission_modes: dict[str, str] = {}
-_backend_displays: dict[str, str] = {}  # DISPLAY the cached backend was spawned against (Bot Desktop rebind)
+_CacheKey = str | tuple[str, str, Node]
+_backends: dict[_CacheKey, ComputerUseBackend] = {}
+_backend_call_locks: dict[_CacheKey, threading.RLock] = {}
+_backend_permission_modes: dict[_CacheKey, str] = {}
+_backend_displays: dict[_CacheKey, str] = {}  # DISPLAY the cached backend was spawned against (Bot Desktop rebind)
 # Approval grants live in the shared store (``tools.approval``: session set + permanent allowlist), keyed by the
 # gate's session key, so a computer_use "always" is one allowlist entry like any terminal pattern. Only the
 # once-per-session escalation warning is tracked here.
@@ -99,10 +101,10 @@ _escalation_warned: set = set()               # sids already warned that a bypas
 # cap: full pixels are re-delivered before compaction (which keeps only the newest image-bearing tool results)
 # could evict the image the note refers to. State is per session; sessionless calls never dedup.
 _screenshot_dedup_lock = threading.Lock()
-_last_screenshot_state: dict[str, dict[str, Any]] = {}  # session_id -> {"digest", "target": (app, window), "streak"}
+_last_screenshot_state: dict[_CacheKey, dict[str, Any]] = {}  # session_id -> {"digest", "target": (app, window), "streak"}
 _SCREENSHOT_DEDUP_MAX_STREAK = 2
 
-def _screenshot_dedup_check(session_id: str, digest: str, target: tuple[str, str]) -> bool:
+def _screenshot_dedup_check(session_id: _CacheKey, digest: str, target: tuple[str, str]) -> bool:
     """True when this capture should be delivered WITHOUT its image: the previous frame for this session had identical
     bytes for the same target and the omission streak is below _SCREENSHOT_DEDUP_MAX_STREAK. Any miss (new pixels,
     new target, streak exhausted, first capture) resets the stored state to this digest so the image goes out."""
@@ -115,7 +117,7 @@ def _screenshot_dedup_check(session_id: str, digest: str, target: tuple[str, str
         _last_screenshot_state[session_id] = {"digest": digest, "target": target, "streak": 0}
         return False
 
-def _reset_screenshot_dedup(session_id: Optional[str] = None) -> None:
+def _reset_screenshot_dedup(session_id: Optional[_CacheKey] = None) -> None:
     """Forget dedup state (all sessions, or one scoped key)."""
     with _screenshot_dedup_lock:
         if session_id is None:
@@ -126,7 +128,12 @@ def _reset_screenshot_dedup(session_id: Optional[str] = None) -> None:
 def reset_screenshot_dedup(session_id: str) -> None:
     """Compaction boundary hook (mirrors ``reset_file_dedup``): the summary may have dropped the frame an
     "unchanged" note would point at, so the next capture of this session must deliver pixels again."""
+    from tools.computer_use.node_routing import owns_remote_key
     _reset_screenshot_dedup(_scoped_sid(session_id))
+    with _screenshot_dedup_lock:
+        for key in list(_last_screenshot_state):
+            if owns_remote_key(key, str(session_id or "")):
+                _last_screenshot_state.pop(key, None)
 
 def _cua_permission_mode(session_id: str) -> str:
     """Map Hermes's approval bypass onto Cua's immutable mode; fails closed. Both identity namespaces are consulted
@@ -160,18 +167,18 @@ def _new_backend(permission_mode: str) -> ComputerUseBackend:
     from plugins.computer_use import get_active_provider
     return get_active_provider().create_backend(permission_mode=permission_mode)
 
-def _install_backend(sid: str, backend: ComputerUseBackend, permission_mode: str) -> ComputerUseBackend:
+def _install_backend(sid: _CacheKey, backend: ComputerUseBackend, permission_mode: str) -> ComputerUseBackend:
     """Record a backend in the session caches (the empty session also mirrors it onto the ``_backend`` hook).
     Caller holds ``_backend_lock``."""
     global _backend
     from tools.computer_use.cua_backend import desktop_identity
     _backends[sid], _backend_permission_modes[sid] = backend, permission_mode
-    _backend_displays[sid] = desktop_identity()
+    _backend_displays[sid] = "" if getattr(backend, "node", None) is not None else desktop_identity()
     _backend_call_locks[sid] = threading.RLock()
     _backend = backend if sid == "" else _backend
     return backend
 
-def _detach_locked(sid: str) -> tuple[Optional[ComputerUseBackend], Optional[threading.RLock]]:
+def _detach_locked(sid: _CacheKey) -> tuple[Optional[ComputerUseBackend], Optional[threading.RLock]]:
     """Remove one session's cache entries, plus the ``_backend`` injection hook when it aliases the empty session
     (older callers/tests may populate only the hook). Caller holds ``_backend_lock``."""
     global _backend
@@ -191,14 +198,16 @@ def _stop_backend(backend: ComputerUseBackend, call_lock: Optional[threading.RLo
     except Exception as e:
         on_error(e)
 
-def _scoped_sid(session_id: str) -> str:
+def _scoped_sid(session_id: str) -> _CacheKey:
     """Cache key for one Hermes session's backend. Outside a served-profile scope it is the bare id
     (legacy keys byte-identical); under a multiplexed turn the routed profile's home key is appended
     so two profiles that share a session id (or a DISPLAY) never share one cua-driver (#110032).
     Every cache path — lookup, install, release — goes through this, so release finds what lookup made."""
     from hermes_constants import get_hermes_home_override, hermes_home_key
     sid = str(session_id or "")
-    return sid if get_hermes_home_override() is None else f"{sid}@{hermes_home_key()}"
+    from tools.computer_use.node_routing import cache_key
+    local_key = sid if get_hermes_home_override() is None else f"{sid}@{hermes_home_key()}"
+    return cache_key(sid, local_key)
 
 def _get_backend(session_id: str = "") -> ComputerUseBackend:
     bare_sid, sid = str(session_id or ""), _scoped_sid(session_id)
@@ -214,10 +223,14 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                 return _install_backend(sid, backend, permission_mode)
             from tools.computer_use.cua_backend import backend_display_stale, desktop_identity
             if (_backend_permission_modes.get(sid, "standard") == permission_mode
-                    and not backend_display_stale(_backend_displays.get(sid, ""), desktop_identity())):
+                    and not getattr(cached, "needs_restart", False)
+                    and (getattr(cached, "node", None) is not None
+                         or not backend_display_stale(_backend_displays.get(sid, ""), desktop_identity()))):
                 return cached
             # Cua's mode and DISPLAY are fixed at daemon startup: a /yolo toggle, or a Bot Desktop that started
             # (or moved) after this backend was cached, replaces only this session's backend.
+            if getattr(cached, "node", None) is not None:
+                _reset_screenshot_dedup(sid)
             _, stale_lock = _detach_locked(sid)  # stopped outside the cache lock; the loop re-reads the mode first
         _stop_backend(cached, stale_lock, lambda e: None)
 
@@ -246,8 +259,14 @@ def _backend_for_call(session_id: str = "") -> Iterator[ComputerUseBackend]:
                 # A queued call can outlive a display/config change even when
                 # no other caller has replaced the cached backend yet.
                 if (_backend_permission_modes.get(sid) != _cua_permission_mode(str(session_id or ""))
-                        or backend_display_stale(_backend_displays.get(sid, ""), desktop_identity())):
+                        or getattr(backend, "needs_restart", False)
+                        or (getattr(backend, "node", None) is None
+                            and backend_display_stale(_backend_displays.get(sid, ""), desktop_identity()))):
                     continue
+            # Remote connection setup must not hold the process-wide cache lock.
+            prepare = getattr(backend, "prepare_for_call", None)
+            if prepare is not None:
+                prepare()
             yield backend
             return
 
@@ -258,13 +277,18 @@ def release_computer_use_session(session_id: str) -> bool:
     grants are not touched here: they live in the shared store and die with ``tools.approval.clear_session``."""
     sid = _scoped_sid(session_id)
     _reset_screenshot_dedup(sid)  # the next capture of a re-created session must deliver pixels
+    from tools.computer_use.node_routing import owns_remote_key
     with _backend_lock:
-        backend, call_lock = _detach_locked(sid)
-    if backend is None:
-        return False
-    _stop_backend(backend, call_lock,
-                  lambda e: logger.debug("computer_use backend release failed for session %s", sid, exc_info=True))
-    return True
+        keys = {sid, *(key for key in _backends if owns_remote_key(key, str(session_id or "")))}
+        retired = [(key, *_detach_locked(key)) for key in keys]
+    released = False
+    for key, backend, call_lock in retired:
+        _reset_screenshot_dedup(key)
+        if backend is not None:
+            released = True
+            _stop_backend(backend, call_lock,
+                          lambda e: logger.debug("computer_use backend release failed for session %s", key, exc_info=True))
+    return released
 
 @atexit.register
 def _shutdown_backend_atexit() -> None:
@@ -316,6 +340,11 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
 def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
+    from tools.computer_use.node_routing import handle_on_node
+    return handle_on_node(args, _handle_computer_use, **kwargs)
+
+
+def _handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
     """Main entry point (tools.registry): a JSON string (text-only) or a dict marked `_multimodal`. Order: hard
     blocks (_reject_unsafe) -> approval scopes (destructive action, then 'bring_to_front' — persistent focus is a
     separate visible side effect with its own scope) -> backend -> dispatch under the session call lock."""
@@ -328,11 +357,14 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
     from tools.bot_desktop.runtime import ensure_started_for_tool as _bd_ensure_started
     def _refused(e: Exception) -> str:
         return json.dumps({"ok": False, "action": action, "code": "human_has_control", "error": str(e)})
+    from tools.computer_use.node_routing import current_node
+    local_desktop = current_node() is None
     try:
-        admitted = _bd_lease.assert_agent_may_act()
+        admitted = _bd_lease.assert_agent_may_act() if local_desktop else None
     except _bd_lease.HumanHasControl as e:
         return _refused(e)
-    _bd_ensure_started()  # headless gateway: bring the profile's screen up before the backend probes DISPLAY
+    if local_desktop:
+        _bd_ensure_started()  # headless gateway: bring the profile's screen up before the backend probes DISPLAY
     if (err := _reject_unsafe(action, args)) is not None:
         return err
     scopes = ([action] if action in _ACTIONS and _ACTIONS[action].destructive else []) + (
@@ -346,6 +378,13 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
     try:
         backend = call.enter_context(_backend_for_call(session_id))
     except Exception as e:
+        from tools.computer_use.node_doctor import NodeUnavailable
+        if isinstance(e, NodeUnavailable):
+            return json.dumps(e.report)
+        if target := current_node():
+            return json.dumps({"ok": False, "error": str(e), "code": "node_backend_failed",
+                               "hint": f"Run `hermes computer-use doctor --node {target.name}`. "
+                                       "No controller or sibling fallback was attempted"})
         from plugins.computer_use import DEFAULT_BACKEND, configured_backend_name
         hint = ({"hint": "If the cua-driver binary is missing, run `hermes computer-use install`. If a Python "
                          "dependency is missing, the error above shows the exact install command."}
@@ -357,7 +396,8 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
             # seconds, and a human may have taken over meanwhile. A result produced after such a flip is
             # discarded too — it may picture what they typed.
             try:
-                _bd_lease.assert_agent_may_act()
+                if local_desktop:
+                    _bd_lease.assert_agent_may_act()
             except _bd_lease.HumanHasControl as e:
                 return _refused(e)
 
@@ -365,7 +405,7 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
                 # Any lease transition since admission voids the frame — including a full take-over /
                 # hand-back cycle that already finished: it still belongs to the human's turn. Capture
                 # paths call this BEFORE the frame is persisted, spilled or sent to auxiliary vision.
-                if _bd_lease.get().epoch != admitted.epoch:
+                if admitted is not None and _bd_lease.get().epoch != admitted.epoch:
                     raise _bd_lease.HumanHasControl(
                         "A human took over this desktop while the action ran; its result was discarded. "
                         "Tell the user what you need and re-capture once they hand back.")
@@ -388,10 +428,13 @@ def _request_approval(action: str, args: dict[str, Any]) -> Optional[str]:
     from tools.approval import _run_approval_gate
 
     mode = "foreground" if args.get("delivery_mode") == "foreground" else "background"
-    description = f"Allow computer_use to perform `{action}`?"
+    from tools.computer_use.node_routing import current_node
+    target = current_node()
+    suffix = f" on node {target.name}" if target else ""
+    description = f"Allow computer_use to perform `{action}`{suffix}?"
     result = _run_approval_gate(
-        pattern_key=f"cua:{action}:{mode}", description=description,
-        display_target=f"computer_use: {_summarize_action(action, args)}", approval_callback=_approval_callback,
+        pattern_key=f"cua:{action}:{mode}" + (f":node:{target.name}" if target else ""), description=description,
+        display_target=f"computer_use{suffix}: {_summarize_action(action, args)}", approval_callback=_approval_callback,
         subject=f"computer_use `{action}` requires approval", noun="desktop actions",
         advice="Find an alternative approach that avoids driving the desktop.",
         autoapprove_log_prefix="computer_use action in non-interactive non-gateway context",
