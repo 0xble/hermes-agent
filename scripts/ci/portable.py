@@ -637,6 +637,28 @@ def provision_rg(env: dict[str, str]) -> None:
         env=rust_environment(env))
 
 
+def prepare_pnpm(env: dict[str, str], *, install: bool) -> Path:
+    """Use PM's pinned pnpm in a checkout-owned store, never the account store."""
+    store = TOOLCHAIN / 'pm'
+    child_env = dict(env, HERMES_HOME=str(STATE / 'pm-home'), HERMES_RUNTIME_DIR=str(store))
+    code = (
+        'import json, sys, pm; from pathlib import Path; '
+        'from pm.build_operations import verified_tools; '
+        'store = Path(sys.argv[1]); target = pm.current_target(); '
+        'pm.prepare_tools(["pnpm"], out=store, target=target) if sys.argv[2] == "install" else None; '
+        'tools = verified_tools(["pnpm"], source_store=store, target=target); '
+        'print(json.dumps(str(tools.entries["pnpm"].binary)))'
+    )
+    executable = ROOT / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    output = subprocess.check_output(
+        [str(executable), '-c', code, str(store), 'install' if install else 'read'],
+        cwd=ROOT, env=child_env, text=True, encoding='utf-8', errors='replace',
+    )
+    binary = Path(json.loads(output.splitlines()[-1]))
+    env['PATH'] = os.pathsep.join(dict.fromkeys([str(binary.parent), *env['PATH'].split(os.pathsep)]))
+    return binary
+
+
 def setup(env: dict[str, str]) -> None:
     ensure_setup_free_space()
     require_checkout_venv_isolation()
@@ -648,7 +670,10 @@ def setup(env: dict[str, str]) -> None:
     provision_rg(env)
     require_tools(('npm', 'rg'), env)
     run(['uv', 'sync', '--locked', '--python', PINS['python'], '--group', 'dev', '--group', 'test', *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)
-    run(['npm', 'ci', '--no-audit', '--no-fund'], env=env)
+    prepare_pnpm(env, install=True)
+    workspaces = ('apps/shared', 'apps/desktop', 'tests-js', 'ui-tui', 'ui-tui/packages/hermes-ink', 'web')
+    run(['node', 'scripts/build/node-deps.mjs', '--source', str(ROOT), '--reuse',
+         *[value for workspace in workspaces for value in ('--workspace', workspace)]], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=ROOT / 'website', env=env)
     run(['uv', 'venv', '--allow-existing', '--python', PINS['python'], str(STATE / 'docs-venv')], env=env)
     run(['uv', 'pip', 'install', '--python', str(docs_python()), 'ascii-guard==2.3.0', 'ruamel.yaml==0.18.16'], env=env)
@@ -965,6 +990,8 @@ def main() -> int:
             setup(env)
             if args.command == 'setup':
                 return 0
+        elif args.lane in (None, 'all', 'node'):
+            prepare_pnpm(env, install=False)
         # Dependency setup is allowed to write ignored state, not tracked source.
         # Assert immediately before checks and again after successful lanes.
         if exact:

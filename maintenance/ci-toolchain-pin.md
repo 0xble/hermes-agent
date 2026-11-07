@@ -28,6 +28,17 @@ strips `GITHUB_ACTIONS` from the isolated lane environment while reading it from
 `os.environ` only to select the hosted resolver branch. Both gate and nightly
 workflows therefore use the same `runuser -u ci -- env HOME="$HOME"` form.
 
+The upstream JS workspaces use `pnpm-lock.yaml`, not a root npm lockfile.
+Portable setup prepares PM's pinned pnpm with `pm.prepare_tools()` in
+`.ci/toolchain/pm` under the isolated `.ci/pm-home`, then verifies that store
+before exposing only pnpm's directory to CI children. This preserves the
+independently pinned CI Node binary. Check-only runs verify the prepared pnpm
+without acquiring tools. Workspace installation uses the existing
+`scripts/build/node-deps.mjs` frozen-install owner with the complete source-check
+workspace selection and dependency-reuse validation. Website remains a separate
+npm project with its own lockfile. Workspace-runner fixtures declare pnpm
+workspaces without dependency installation.
+
 ## Provenance and disposition
 
 Fork patch identity: `ci-toolchain-pin`.
@@ -60,23 +71,16 @@ local behavior without changing toolchain pins.
 
 ## Verification
 
-Regression tests in `scripts/ci/tests/test_portable.py` cover:
+Contract tests: `tests/scripts/ci/test_portable_node_setup.py`.
 
-- nested mise uv layout plus Node `bin` layout winning over an incompatible host PATH;
-- `test_local_environment_accepts_exact_path_tools_without_mise_install`;
-- a fresh setup provisioning pinned npm after initial resolution, then keeping it ahead of mise's bundled npm;
-- a missing pinned uv producing the exact install hint; and
-- GitHub Actions retaining host/workflow tool resolution.
+The setup regression checks the workspace union, reuse mode, frozen-install
+owner and separate website npm path. The PM-boundary regression checks
+checkout-owned tool and profile state while preserving the pinned Node path.
+Run those through `scripts/run_tests.sh` with the existing portable driver
+suite. Run the workspace-runner fixture through Node's test runner and
+`tests-js/node-deps.test.mjs` through its owning Vitest suite, not `node --test`.
 
-Focused command:
-
-```text
-python3 -m unittest scripts.ci.tests.test_portable.PortableGateTests.test_local_environment_resolves_pinned_uv_and_node_from_mise scripts.ci.tests.test_portable.PortableGateTests.test_local_environment_accepts_exact_path_tools_without_mise_install scripts.ci.tests.test_portable.PortableGateTests.test_setup_re_resolves_pinned_npm_after_provisioning scripts.ci.tests.test_portable.PortableGateTests.test_local_environment_fails_with_install_hint_when_pinned_mise_tool_is_missing scripts.ci.tests.test_portable.PortableGateTests.test_github_environment_keeps_host_toolchain_resolution
-```
-
-The focused regression was red before the implementation and green afterward.
-After `./bin/ci setup` provisioned the pinned toolchain/dependencies, the full
-portable unit module passed (`.venv/bin/python -m unittest scripts.ci.tests.test_portable`;
-36 tests, exit 0). A preliminary system-Python run was invalid because it lacked
-`ruamel` and the required SQLite constants; it is not counted as candidate
-verification.
+Existing portable-driver regressions cover exact-version mise resolution,
+missing-install failure, npm provisioning precedence, hosted resolution and
+checkout virtual-environment isolation. These bounded checks do not replace the
+controller-owned exact-head gate or its independent accepted-manifest review.

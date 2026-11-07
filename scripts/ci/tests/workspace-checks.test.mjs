@@ -10,6 +10,7 @@ const runner = resolve(dirname(fileURLToPath(import.meta.url)), '../../run-works
 const fixture = mkdtempSync(join(tmpdir(), 'workspace-checks-'))
 after(() => rmSync(fixture, { recursive: true, force: true }))
 writeFileSync(join(fixture, 'package.json'), JSON.stringify({ private: true, workspaces: ['packages/*'] }))
+writeFileSync(join(fixture, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\nverifyDepsBeforeRun: false\n')
 for (const [name, code] of [['pass', 0], ['fail', 7]]) {
   const dir = join(fixture, 'packages', name)
   mkdirSync(dir, { recursive: true })
@@ -18,11 +19,6 @@ for (const [name, code] of [['pass', 0], ['fail', 7]]) {
   }))
   writeFileSync(join(dir, 'check.mjs'), `console.log('executed-${name}'); process.exitCode = ${code}`)
 }
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-const install = spawnSync(npm, ['install', '--offline', '--ignore-scripts', '--package-lock=false', '--no-audit', '--no-fund'], {
-  cwd: fixture, encoding: 'utf8', shell: process.platform === 'win32',
-})
-assert.equal(install.status, 0, install.stdout + install.stderr)
 function run(...args) {
   return spawnSync(process.execPath, [runner, ...args], { cwd: fixture, encoding: 'utf8' })
 }
@@ -54,6 +50,7 @@ test('defaults to a bounded per-job budget and honors explicit concurrency', () 
   const budgetFixture = mkdtempSync(join(tmpdir(), 'workspace-budget-'))
   try {
     writeFileSync(join(budgetFixture, 'package.json'), JSON.stringify({ private: true, workspaces: ['packages/*'] }))
+    writeFileSync(join(budgetFixture, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\nverifyDepsBeforeRun: false\n')
     for (let index = 0; index < 6; index++) {
       const dir = join(budgetFixture, 'packages', `unit-${index}`)
       mkdirSync(dir, { recursive: true })
@@ -61,10 +58,6 @@ test('defaults to a bounded per-job budget and honors explicit concurrency', () 
         name: `unit-${index}`, version: '1.0.0', scripts: { check: `node -e "console.log('executed-${index}')"` },
       }))
     }
-    const setup = spawnSync(npm, ['install', '--offline', '--ignore-scripts', '--package-lock=false', '--no-audit', '--no-fund'], {
-      cwd: budgetFixture, encoding: 'utf8', shell: process.platform === 'win32',
-    })
-    assert.equal(setup.status, 0, setup.stdout + setup.stderr)
     for (const [workers, args, expected] of [
       [undefined, [], 4], ['2', [], 2], ['1', ['--concurrency', '3'], 3],
     ]) {

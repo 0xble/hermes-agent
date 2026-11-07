@@ -665,6 +665,7 @@ try {
             stack.enter_context(patch.object(ci, 'provision_npm'))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
+            stack.enter_context(patch.object(ci, 'prepare_pnpm'))
             run = stack.enter_context(patch.object(ci, 'run'))
             check = stack.enter_context(patch.object(ci.subprocess, 'check_output'))
             for destination in (target, alias, target.parent / 'missing-venv', local):
@@ -727,6 +728,7 @@ try {
             stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=ci.free_space_floor_bytes() + 1))
             stack.enter_context(patch.object(ci, 'run', side_effect=install))
             stack.enter_context(patch.object(ci, 'provision_rg'))
+            stack.enter_context(patch.object(ci, 'prepare_pnpm'))
             ci.setup(env)
 
             npm = toolchain / 'node_modules' / '.bin' / 'npm'
@@ -1140,6 +1142,7 @@ with ci.checkout_lock():
             stack.enter_context(patch.object(ci, 'provision_npm'))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
+            stack.enter_context(patch.object(ci, 'prepare_pnpm'))
             run = stack.enter_context(patch.object(ci, 'run'))
             ci.setup({})
             self.assertFalse((finished / '.ci').exists())
@@ -1258,6 +1261,7 @@ with patch.dict(reclaim.__globals__, {
             stack.enter_context(patch.object(ci, 'provision_npm'))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
+            stack.enter_context(patch.object(ci, 'prepare_pnpm'))
             run = stack.enter_context(patch.object(ci, 'run'))
             ci.setup({})
             self.assertTrue((finished / '.venv').is_dir())
