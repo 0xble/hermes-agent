@@ -325,6 +325,21 @@ def collect_observation(entrypoint: str, ph: ParityHome, srv: FakeLLMServer,
     )
 
 
+def failure_log_tail(ph: ParityHome, *, max_lines: int = 60) -> str:
+    """Return a bounded, relevant tail from an isolated parity run's Hermes logs."""
+    matched: list[str] = []
+    for name in ("agent.log", "errors.log"):
+        path = ph.hermes_home / "logs" / name
+        if not path.exists():
+            continue
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        relevant = [line for line in lines if re.search(r"plugin|discover|hook", line, re.IGNORECASE)]
+        matched.extend([f"[{name}]"] + relevant[-max_lines:])
+    if len(matched) <= max_lines:
+        return "\n".join(matched)
+    return "\n".join(matched[-max_lines:])
+
+
 def disabled_tool_names() -> set[str]:
     from toolsets import resolve_toolset
 
