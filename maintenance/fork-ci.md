@@ -623,6 +623,13 @@ selects its supplied runtime without provisioning one during the assertion.
 
 ## Verification and retirement
 
+Structural-redaction fixtures isolate `_ENV_POLICY_BY_HOME` and
+`_CONFIG_POLICY_BY_HOME`, the policy maps introduced by upstream
+`e924f7517661d4ac628da50f2c87e066b622c15d`. Routed opt-out fixtures resolve their
+profile policy at setup, not inside redaction. Keep the vault-value and routed
+policy assertions in `tests/agent/test_redact_json.py` unchanged. Retire this
+adaptation when the accepted upstream fixtures use the same recorded-policy API.
+
 The host-installation tripwire also protects the captured account's `.local/bin`
 and `Library/LaunchAgents` from Python writes, removals and link publication.
 Reads remain available for command and service discovery. Script/installer tests

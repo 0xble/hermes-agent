@@ -35,6 +35,11 @@ notices or terminal results that could not be written to the lifecycle row
 - Index-less task notices get collision-safe event ids.
 - Session recovery registers `async_delegation_events`, so a rebuilt
   `state.db` keeps undelivered outbox rows.
+- When a previously offered lifecycle copy is lost, clear its old offer and
+  start the re-offer lease before replay checks the deduplication set. Reversing
+  that order suppresses the replacement until another sweep even though this
+  sweep reports a re-offer. Keep queued-copy, held-copy and lease deduplication
+  covered by `tests/tools/test_async_delegation_orphan_sweep.py`.
 
 ## Why
 

@@ -1034,7 +1034,8 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
             live["_durable_state"] = completion.get("_terminal_state") or status
             # Only an active record is ever force-finalized under its dispatcher's Context; a
             # retained completed one would otherwise pin that turn's agent and history.
-            _records[delegation_id].pop("_context", None)
+            live.pop("_context", None)
+            live.pop("_worker_context_runner", None)
         _prune_completed_locked()
     # A terminal event does not free a submitted slot; only release_slot does.
 

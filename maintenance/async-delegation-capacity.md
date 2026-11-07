@@ -56,6 +56,12 @@ from a new persisted record or a slot-release callback and loops to capacity.
 - Admission persistence, submit-failure finalization, and queued cancellation run
   in the queued unit's captured profile context. A process serving multiple
   profiles must never write another profile's `state.db` or completion manifest.
+- Terminal records release both their copied Context and propagated worker
+  wrapper. The wrapper also captures the dispatching turn, so retaining it in
+  completed history keeps that turn's agent and history alive. Preserve callback
+  propagation while work is queued or running. The weak-reference regression in
+  `tests/tools/test_async_delegation_record_retention.py` proves release after
+  the real worker exits.
 - Duplicate delegation ids are rejected under `_records_lock` before capacity
   bookkeeping or in-memory insertion when the id is already present in memory or
   durably non-terminal. A failed fresh insert removes only the exact record

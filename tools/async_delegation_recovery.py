@@ -364,6 +364,8 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
             orphans.append((delegation_id, payload, completed_at, dispatched_at))
             if copy_lost:
                 lost.append(delegation_id)
+        if lost:
+            _note_reoffers(home, lost, now)
         restored = _replay_pending(conn, orphans, target_queue, now)
         outbox_rows = conn.execute(
             """SELECT e.event_id, e.event_json, e.created_at, e.updated_at,
@@ -388,8 +390,6 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
                 )
                 continue
             outbox_orphans.append((event_id, payload, created_at, updated_at))
-        if lost:
-            _note_reoffers(home, lost, now)
         return held + restored + replay_outbox_pending(conn, outbox_orphans, target_queue, now)
 
 
