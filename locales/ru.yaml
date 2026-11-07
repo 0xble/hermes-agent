@@ -1514,6 +1514,8 @@ platform:
 slash:
   attend:
     description: "Закрепить модель для активной работы бессрочно или на заданное время"
+  rewind:
+    description: "Откатиться к более раннему запросу, чтобы изменить и отправить его заново, или ответвиться оттуда (Esc Esc)"
   approve:
     description: "Одобрить ожидающую опасную команду"
   bg:
@@ -1741,6 +1743,20 @@ slash:
   quit:
     description: "Выйти из CLI (с --delete также удаляется история сеанса)"
 cli:
+  backtrack:
+    title: "↺ Откат — выберите более ранний запрос"
+    keys_hint: "↑/↓ выбор · Enter изменить и отправить заново · f ответвиться отсюда · Esc закрыть"
+    preview_label: "Запрос {number} из {total}:"
+    more_lines: "… (ещё строк: {count})"
+    editing_hint: "↺ Редактирование запроса {number} — Enter откатывает сюда и отправляет · Esc Esc отменяет"
+    edit_cancelled: "↺ Откат отменён; ничего не удалено."
+    rewound: "↺ Откат к запросу {number} (сообщений в архиве: {count}); отправка изменённого запроса."
+    forked: "⑂ Ответвление перед запросом {number}; исходный сеанс {parent} не изменён. Отредактируйте запрос ниже и нажмите Enter для отправки."
+    nothing: "(._.) Нет более ранних запросов для отката."
+    target_changed: "(x_x) Сеанс изменился с момента выбора запроса {number}; ничего не удалено. Ваша правка возвращена в поле ввода."
+    invalid: "(._.) Нет запроса {value} — выберите от 1 до {total}."
+    usage: "Использование: /rewind [N | fork N]"
+    rewind_failed: "(x_x) Не удалось выполнить откат; история не изменена: {error}"
   modern:
     thought_for: "Размышлял {seconds} с"
     thought: "Размышлял"
@@ -4002,3 +4018,8 @@ plan_usage:
   large_notice_limit: "Крупная модель: достигнут {name} ({resets})."
   large_notice_limit_stops: "Крупная модель: достигнут {name} ({resets}), до сброса она не запустится."
   large_notice_percent: "Крупная модель: расходует больше лимита плана на сообщение. Месячный лимит крупных моделей: использовано {percent}."
+shared:
+  # /undo's line naming the files the undone turns changed (tools/checkpoint_undo_hint.py).
+  undo_rollback:
+    list: "↶ Файлы, изменённые в отменённых ходах: {files}. Выполните /rollback, чтобы увидеть контрольные точки и восстановить одну."
+    more: "ещё {count}"

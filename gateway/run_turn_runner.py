@@ -1955,7 +1955,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
         — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
         """
-        from gateway.run import _current_max_iterations
+        from gateway.run import _current_max_iterations, _reload_runtime_env_preserving_config_authority
         ctx = self._ctx
         runner = self._runner
         from gateway.session_policy import policy_for_source
@@ -1983,7 +1983,15 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         combined_ephemeral = self._combined_ephemeral_prompt()
         if policy and policy.skills_prompt:
             combined_ephemeral = "\n\n".join(p for p in (combined_ephemeral, policy.skills_prompt) if p)
-        max_iterations = policy.max_turns if policy else _current_max_iterations()
+        if policy:
+            # Rotated .env keys reach this turn's config reads (side tasks read config.yaml), as on the
+            # messaging path, where _current_max_iterations() does the same reload; the turn budget
+            # stays the session's own. A bypass session never reads the profile.
+            if not policy.ignore_user_config:
+                _reload_runtime_env_preserving_config_authority()
+            max_iterations = policy.max_turns
+        else:
+            max_iterations = _current_max_iterations()
         from gateway.hosted_room_execution_policy import current_room_execution_policy
         room = current_room_execution_policy()
         if room is not None:

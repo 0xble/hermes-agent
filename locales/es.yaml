@@ -1514,6 +1514,8 @@ platform:
 slash:
   attend:
     description: "Fijar el modelo para uso activo permanentemente o por una duración"
+  rewind:
+    description: "Rebobinar a un prompt anterior para editarlo y reenviarlo, o bifurcar desde ahí (Esc Esc)"
   approve:
     description: "Aprobar un comando peligroso pendiente"
   bg:
@@ -1741,6 +1743,20 @@ slash:
   quit:
     description: "Salir de la CLI (usa --delete para eliminar también el historial de la sesión)"
 cli:
+  backtrack:
+    title: "↺ Rebobinar — elige un prompt anterior"
+    keys_hint: "↑/↓ elegir · Enter editar y reenviar · f bifurcar desde aquí · Esc cerrar"
+    preview_label: "Prompt {number} de {total}:"
+    more_lines: "… ({count} líneas más)"
+    editing_hint: "↺ Editando el prompt {number} — Enter rebobina hasta aquí y envía · Esc Esc cancela"
+    edit_cancelled: "↺ Rebobinado cancelado; no se eliminó nada."
+    rewound: "↺ Rebobinado al prompt {number} ({count} mensaje(s) archivado(s)); enviando la edición."
+    forked: "⑂ Bifurcado antes del prompt {number}; la sesión original {parent} no ha cambiado. Edita el prompt abajo y pulsa Enter para enviarlo."
+    nothing: "(._.) No hay prompts anteriores a los que rebobinar."
+    target_changed: "(x_x) La sesión cambió desde que elegiste el prompt {number}; no se eliminó nada. Tu edición ha vuelto al editor."
+    invalid: "(._.) No existe el prompt {value} — elige de 1 a {total}."
+    usage: "Uso: /rewind [N | fork N]"
+    rewind_failed: "(x_x) Falló el rebobinado; el historial no se modificó: {error}"
   modern:
     thought_for: "Pensó durante {seconds}s"
     thought: "Pensó"
@@ -4002,3 +4018,8 @@ plan_usage:
   large_notice_limit: "Modelo grande: alcanzaste tu límite {name} ({resets})."
   large_notice_limit_stops: "Modelo grande: alcanzaste tu límite {name} ({resets}), así que no se ejecutará hasta entonces."
   large_notice_percent: "Modelo grande: usa más del uso de tu plan por mensaje. Límite mensual de modelos grandes: {percent} usado."
+shared:
+  # /undo's line naming the files the undone turns changed (tools/checkpoint_undo_hint.py).
+  undo_rollback:
+    list: "↶ Archivos cambiados en los turnos deshechos: {files}. Ejecuta /rollback para listar los checkpoints y restaurar uno."
+    more: "+{count} más"

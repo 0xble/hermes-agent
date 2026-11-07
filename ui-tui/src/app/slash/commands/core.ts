@@ -30,6 +30,7 @@ import type { Msg, PanelSection } from '../../../types.js'
 import type { StatusBarMode } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
 import { getUiState, patchUiState, sessionCwd } from '../../uiStore.js'
+import { openRewindPicker } from '../canonicalRewindPicker.js'
 import { canonicalRewind, canonicalTitle } from '../canonicalSessionCommands.js'
 import type { SlashCommand, SlashRunCtx } from '../types.js'
 
@@ -924,12 +925,22 @@ export const coreCommands: SlashCommand[] = [
             ctx.transcript.sys(
               t(r.removed === 1 ? 'slashCmd.core.undo.undidOne' : 'slashCmd.core.undo.undidOther', String(r.removed))
             )
+
+            if (r.undo_hint?.text) {
+              ctx.transcript.sys(r.undo_hint.text)
+            }
           } else {
             ctx.transcript.sys(t('slashCmd.core.undo.nothing'))
           }
         })
       )
     }
+  },
+
+  {
+    help: 'rewind to an earlier prompt: edit and resend it, or fork from it (also Esc Esc on an empty composer)',
+    name: 'rewind',
+    run: (_arg, ctx) => openRewindPicker(ctx)
   },
 
   {

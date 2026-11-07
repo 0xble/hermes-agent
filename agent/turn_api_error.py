@@ -377,7 +377,7 @@ def settle_unrecovered_error(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
-            base_url=_base, model=_model, delivered=_delivered,
+            base_url=_base, model=_model, delivered=_delivered, current_turn_user_idx=current_turn_user_idx,
         ))
 
     over_wait_cap = exceeds_retry_wait_cap(agent, api_error)

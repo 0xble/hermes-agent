@@ -1531,6 +1531,8 @@ platform:
 slash:
   attend:
     description: "Az aktív használat modelljének állandó vagy időzített rögzítése"
+  rewind:
+    description: "Visszatekerés egy korábbi prompthoz a szerkesztéshez és újraküldéshez, vagy elágazás onnan (Esc Esc)"
   approve:
     description: "Függőben lévő veszélyes parancs jóváhagyása"
   bg:
@@ -1758,6 +1760,20 @@ slash:
   quit:
     description: "Kilépés a CLI-ből (a --delete a munkamenet előzményeit is törli)"
 cli:
+  backtrack:
+    title: "↺ Visszatekerés — válassz egy korábbi promptot"
+    keys_hint: "↑/↓ választás · Enter szerkesztés és újraküldés · f elágazás innen · Esc bezárás"
+    preview_label: "{number}. prompt / {total}:"
+    more_lines: "… (még {count} sor)"
+    editing_hint: "↺ A(z) {number}. prompt szerkesztése — az Enter idáig teker vissza és elküldi · Esc Esc megszakítja"
+    edit_cancelled: "↺ Visszatekerés megszakítva; semmi sem lett eltávolítva."
+    rewound: "↺ Visszatekerve a(z) {number}. promptig ({count} üzenet archiválva); a szerkesztés elküldése."
+    forked: "⑂ Elágazás a(z) {number}. prompt előtt; az eredeti {parent} munkamenet változatlan. Szerkeszd az alábbi promptot, és nyomj Entert a küldéshez."
+    nothing: "(._.) Nincs korábbi prompt, amelyhez vissza lehetne tekerni."
+    target_changed: "(x_x) A munkamenet megváltozott, mióta a(z) {number}. promptot választottad; semmi sem lett eltávolítva. A szerkesztésed visszakerült a szövegmezőbe."
+    invalid: "(._.) Nincs {value}. prompt — válassz 1 és {total} között."
+    usage: "Használat: /rewind [N | fork N]"
+    rewind_failed: "(x_x) A visszatekerés sikertelen; az előzmények nem változtak: {error}"
   modern:
     thought_for: "{seconds} mp-ig gondolkodott"
     thought: "Gondolkodott"
@@ -4019,3 +4035,8 @@ plan_usage:
   large_notice_limit: "Nagy modell: elérted a(z) {name} korlátot ({resets})."
   large_notice_limit_stops: "Nagy modell: elérted a(z) {name} korlátot ({resets}), így addig nem fut."
   large_notice_percent: "Nagy modell: üzenetenként többet használ a csomagodból. Nagy modellekre vonatkozó havi korlát: {percent} felhasználva."
+shared:
+  # /undo's line naming the files the undone turns changed (tools/checkpoint_undo_hint.py).
+  undo_rollback:
+    list: "↶ A visszavont körökben módosított fájlok: {files}. Futtasd a /rollback parancsot az ellenőrzőpontok listázásához és egy visszaállításához."
+    more: "+{count} további"

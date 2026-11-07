@@ -331,14 +331,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 ## Alias-cache isolation guard scanned nothing from a worktree
 
-- Fork patch identity: `alias-cache-guard-discovery`.
-- The DIRECT_ALIASES in-place-write guard skipped any path whose absolute parts
-  contained `.worktrees`, so from a linked worktree (the fork's standard review
-  and sync checkout) it scanned zero production files and passed vacuously.
-  Discovery now filters repository-relative parts, and a coverage assertion
-  requires the scan to reach the alias-cache owner.
-- Guard: `tests/hermes_cli/test_model_alias_credentials.py`
-  (`test_the_scan_covers_the_alias_cache_owner`).
+- Fork patch identity: `alias-cache-guard-discovery` (retained provenance).
+- The former DIRECT_ALIASES source scanner skipped linked worktrees and passed
+  without inspecting production files. The relative-path discovery repair was
+  superseded by upstream `96c9cc9ac6ffeb43a390d0812fe00572d50213d6`, which removed
+  source-reading tests. Do not restore that scanner.
+- Behavioral isolation remains covered by
+  `tests/hermes_cli/test_model_alias_credentials.py::TestAliasCacheIsProfileScoped`,
+  which switches profile-local definitions and credentials without manually
+  clearing the cache. This is the retained behavior contract.
 
 ## Absurd flood penalty stranded a failed delivery row
 

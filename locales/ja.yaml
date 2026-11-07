@@ -1514,6 +1514,8 @@ platform:
 slash:
   attend:
     description: "操作中のモデルに無期限または指定期間固定"
+  rewind:
+    description: "以前のプロンプトまで巻き戻して編集・再送信、またはそこから分岐 (Esc Esc)"
   approve:
     description: "保留中の危険なコマンドを承認"
   bg:
@@ -1741,6 +1743,20 @@ slash:
   quit:
     description: "CLI を終了（--delete でセッション履歴も削除）"
 cli:
+  backtrack:
+    title: "↺ 巻き戻し — 以前のプロンプトを選択"
+    keys_hint: "↑/↓ 選択 · Enter 編集して再送信 · f ここから分岐 · Esc 閉じる"
+    preview_label: "プロンプト {number} / {total}:"
+    more_lines: "…(さらに {count} 行)"
+    editing_hint: "↺ プロンプト {number} を編集中 — Enter でここまで巻き戻して送信 · Esc Esc でキャンセル"
+    edit_cancelled: "↺ 巻き戻しをキャンセルしました。何も削除されていません。"
+    rewound: "↺ プロンプト {number} まで巻き戻しました({count} 件のメッセージをアーカイブ)。編集内容を送信します。"
+    forked: "⑂ プロンプト {number} の手前で分岐しました。元のセッション {parent} は変更されていません。下のプロンプトを編集し、Enter で送信してください。"
+    nothing: "(._.) 巻き戻せる以前のプロンプトがありません。"
+    target_changed: "(x_x) プロンプト {number} を選択した後にセッションが変更されました。何も削除されていません。編集内容は入力欄に戻されました。"
+    invalid: "(._.) プロンプト {value} はありません — 1 から {total} の間で選択してください。"
+    usage: "使い方: /rewind [N | fork N]"
+    rewind_failed: "(x_x) 巻き戻しに失敗しました。履歴は変更されていません: {error}"
   modern:
     thought_for: "{seconds}秒考えました"
     thought: "考えました"
@@ -4002,3 +4018,8 @@ plan_usage:
   large_notice_limit: "大型モデル：{name}の上限に達しました（{resets}）。"
   large_notice_limit_stops: "大型モデル：{name}の上限に達しました（{resets}）。それまで実行できません。"
   large_notice_percent: "大型モデル：1メッセージあたりプランの利用量を多く消費します。大型モデルの月間上限：{percent} 使用。"
+shared:
+  # /undo's line naming the files the undone turns changed (tools/checkpoint_undo_hint.py).
+  undo_rollback:
+    list: "↶ 取り消したターンで変更されたファイル: {files}。/rollback でチェックポイントを一覧表示し、1 つを復元してください。"
+    more: "ほか {count} 件"

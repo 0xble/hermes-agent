@@ -409,7 +409,9 @@ def _held_pick(frozen, live):
 def present_sections(config):
     """A bare ``gateway:`` key parses as YAML null; like load_config's merge (#58277), treat it as absent so
     ``cfg.get('gateway', {}).get(...)`` reads the default instead of crashing a fresh install's first turn."""
-    config = {key: value for key, value in config.items() if value is not None}
+    from hermes_cli.model_presets import expand_model_presets
+
+    config = expand_model_presets({key: value for key, value in config.items() if value is not None})
     # A scalar ``model: <id>`` (a form every classic loader accepts) is the mapping's ``default``.
     if isinstance(config.get('model'), str):
         config['model'] = {'default': config['model']} if config['model'].strip() else {}
@@ -1141,9 +1143,10 @@ def policy_scope(policy, *, authority=None):
     try:
         from agent.auxiliary_task_config import session_auxiliary_scope
         from gateway.session_local_mcp import editor_mcp_scope
-        # Auxiliary tasks read the session's frozen section, never live config.yaml (a rotated key there).
-        auxiliary = policy.config(authority).get('auxiliary') if authority is not None else None
-        aux_scope = session_auxiliary_scope(auxiliary) if authority is not None else contextlib.nullcontext()
+        # Side tasks follow the profile's config.yaml, as every other side-task reader does; a bypass
+        # session never reads the profile: its side tasks use its own saved section (code defaults only).
+        aux_scope = (session_auxiliary_scope(policy.config(authority, secrets=False).get('auxiliary'))
+                     if policy.ignore_user_config else contextlib.nullcontext())
         with (editor_scope(policy), editor_mcp_scope(authority, policy), aux_scope,
               policy.client_env_scope()):
             yield

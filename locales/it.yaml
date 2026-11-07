@@ -1514,6 +1514,8 @@ platform:
 slash:
   attend:
     description: "Fissa il modello per l’uso attivo permanentemente o per una durata"
+  rewind:
+    description: "Riavvolgi a un prompt precedente per modificarlo e reinviarlo, o dirama da lì (Esc Esc)"
   approve:
     description: "Approva un comando pericoloso in attesa"
   bg:
@@ -1741,6 +1743,20 @@ slash:
   quit:
     description: "Esci dalla CLI (usa --delete per eliminare anche la cronologia della sessione)"
 cli:
+  backtrack:
+    title: "↺ Riavvolgi — scegli un prompt precedente"
+    keys_hint: "↑/↓ scegli · Enter modifica e reinvia · f dirama da qui · Esc chiudi"
+    preview_label: "Prompt {number} di {total}:"
+    more_lines: "… (altre {count} righe)"
+    editing_hint: "↺ Modifica del prompt {number} — Enter riavvolge fin qui e invia · Esc Esc annulla"
+    edit_cancelled: "↺ Riavvolgimento annullato; non è stato rimosso nulla."
+    rewound: "↺ Riavvolto al prompt {number} ({count} messaggio/i archiviato/i); invio della modifica."
+    forked: "⑂ Diramato prima del prompt {number}; la sessione originale {parent} è invariata. Modifica il prompt qui sotto e premi Enter per inviarlo."
+    nothing: "(._.) Nessun prompt precedente a cui riavvolgere."
+    target_changed: "(x_x) La sessione è cambiata da quando hai scelto il prompt {number}; non è stato rimosso nulla. La tua modifica è di nuovo nell'editor."
+    invalid: "(._.) Nessun prompt {value} — scegli da 1 a {total}."
+    usage: "Uso: /rewind [N | fork N]"
+    rewind_failed: "(x_x) Riavvolgimento non riuscito; la cronologia non è stata modificata: {error}"
   modern:
     thought_for: "Ha pensato per {seconds}s"
     thought: "Ha pensato"
@@ -4002,3 +4018,8 @@ plan_usage:
   large_notice_limit: "Modello grande: hai raggiunto il limite {name} ({resets})."
   large_notice_limit_stops: "Modello grande: hai raggiunto il limite {name} ({resets}), quindi non funzionerà fino ad allora."
   large_notice_percent: "Modello grande: usa più utilizzo del tuo piano per messaggio. Limite mensile dei modelli grandi: {percent} usato."
+shared:
+  # /undo's line naming the files the undone turns changed (tools/checkpoint_undo_hint.py).
+  undo_rollback:
+    list: "↶ File modificati nei turni annullati: {files}. Esegui /rollback per elencare i checkpoint e ripristinarne uno."
+    more: "+{count} altri"

@@ -1514,6 +1514,8 @@ platform:
 slash:
   attend:
     description: "Etkin kullanım modelini kalıcı olarak veya belirli bir süre sabitle"
+  rewind:
+    description: "Düzenleyip yeniden göndermek için önceki bir isteme geri sar veya oradan çatalla (Esc Esc)"
   approve:
     description: "Bekleyen tehlikeli bir komutu onayla"
   bg:
@@ -1741,6 +1743,20 @@ slash:
   quit:
     description: "CLI'dan çık (oturum geçmişini de silmek için --delete kullanın)"
 cli:
+  backtrack:
+    title: "↺ Geri sar — önceki bir istemi seç"
+    keys_hint: "↑/↓ seç · Enter düzenle ve yeniden gönder · f buradan çatalla · Esc kapat"
+    preview_label: "İstem {number} / {total}:"
+    more_lines: "… ({count} satır daha)"
+    editing_hint: "↺ İstem {number} düzenleniyor — Enter buraya geri sarar ve gönderir · Esc Esc iptal eder"
+    edit_cancelled: "↺ Geri sarma iptal edildi; hiçbir şey kaldırılmadı."
+    rewound: "↺ İstem {number}'e geri sarıldı ({count} mesaj arşivlendi); düzenleme gönderiliyor."
+    forked: "⑂ İstem {number} öncesinden çatallandı; özgün oturum {parent} değişmedi. Aşağıdaki istemi düzenleyin ve göndermek için Enter'a basın."
+    nothing: "(._.) Geri sarılacak önceki istem yok."
+    target_changed: "(x_x) İstem {number}'i seçtiğinizden beri oturum değişti; hiçbir şey kaldırılmadı. Düzenlemeniz yazma alanına geri kondu."
+    invalid: "(._.) İstem {value} yok — 1 ile {total} arasında seçin."
+    usage: "Kullanım: /rewind [N | fork N]"
+    rewind_failed: "(x_x) Geri sarma başarısız; geçmiş değiştirilmedi: {error}"
   modern:
     thought_for: "{seconds} sn düşündü"
     thought: "Düşündü"
@@ -4002,3 +4018,8 @@ plan_usage:
   large_notice_limit: "Büyük model: {name} limitine ulaşıldı ({resets})."
   large_notice_limit_stops: "Büyük model: {name} limitine ulaşıldı ({resets}), o zamana kadar çalışmaz."
   large_notice_percent: "Büyük model: mesaj başına planından daha fazla kullanım harcar. Aylık büyük model limiti: {percent} kullanıldı."
+shared:
+  # /undo's line naming the files the undone turns changed (tools/checkpoint_undo_hint.py).
+  undo_rollback:
+    list: "↶ Geri alınan turlarda değişen dosyalar: {files}. Kontrol noktalarını listelemek ve birini geri yüklemek için /rollback çalıştırın."
+    more: "+{count} daha"

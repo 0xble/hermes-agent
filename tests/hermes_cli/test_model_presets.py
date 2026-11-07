@@ -669,15 +669,21 @@ def test_literal_at_model_id_does_not_take_the_default_preset_effort():
     assert resolve_reasoning_config(authored, "@coding") == HIGH
 
 
-def test_oneshot_resolves_preset_model_and_effort(tmp_path, monkeypatch):
-    from hermes_cli.oneshot import _configured_model, _resolve_model_and_provider
-    from hermes_constants import resolve_reasoning_config
+@pytest.mark.parametrize("model", ["@coding", {"default": "@coding"}, {"model_preset": "coding"}, {"model": "@coding"}])
+def test_oneshot_gateway_policy_resolves_preset_model_and_effort(tmp_path, monkeypatch, model):
+    from gateway.run import _resolve_gateway_model
+    from gateway.session_local import load_profile_config
+    from gateway.session_policy import build_policy
 
     authored = _preset_high_agent_low()
-    choice = _resolve_model_and_provider(authored, None, None)
-    assert choice.model == "coding-model"
-    assert _configured_model(authored["model"], authored) == "coding-model"
-    assert resolve_reasoning_config(authored, choice.model) == HIGH
+    authored["model"] = model
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(authored), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    policy = build_policy({"source": "oneshot", "cwd": str(tmp_path)}, load_profile_config(tmp_path))
+
+    assert _resolve_gateway_model(policy.config()) == "coding-model"
+    assert policy.provider == "openrouter"
+    assert policy.reasoning_config == HIGH
 
 
 def test_agent_reasoning_effort_survives_a_preset_without_one():

@@ -1514,6 +1514,8 @@ platform:
 slash:
   attend:
     description: "Pionnáil samhail na húsáide gníomhaí go buan nó ar feadh tréimhse"
+  rewind:
+    description: "Athchas go leid níos luaithe chun í a chur in eagar & a athsheoladh, nó gabhlaigh as sin (Esc Esc)"
   approve:
     description: "Ceadaigh ordú contúirteach atá ag fanacht"
   bg:
@@ -1741,6 +1743,20 @@ slash:
   quit:
     description: "Scoir den CLI (úsáid --delete chun stair an tseisiúin a bhaint freisin)"
 cli:
+  backtrack:
+    title: "↺ Athchas — roghnaigh leid níos luaithe"
+    keys_hint: "↑/↓ roghnaigh · Enter cuir in eagar & athsheol · f gabhlaigh ón áit seo · Esc dún"
+    preview_label: "Leid {number} as {total}:"
+    more_lines: "… ({count} líne eile)"
+    editing_hint: "↺ Leid {number} á cur in eagar — athchasann Enter go dtí seo agus seolann · cealaíonn Esc Esc"
+    edit_cancelled: "↺ Athchasadh cealaithe; níor baineadh aon rud."
+    rewound: "↺ Athchasta go leid {number} ({count} teachtaireacht curtha i gcartlann); an t-eagarthóireacht á seoladh."
+    forked: "⑂ Gabhlaithe roimh leid {number}; níor athraíodh an seisiún bunaidh {parent}. Cuir an leid thíos in eagar agus brúigh Enter chun é a sheoladh."
+    nothing: "(._.) Níl aon leideanna níos luaithe le hathchasadh chucu."
+    target_changed: "(x_x) D'athraigh an seisiún ó roghnaigh tú leid {number}; níor baineadh aon rud. Tá d'eagarthóireacht ar ais sa chumadóir."
+    invalid: "(._.) Níl leid {value} ann — roghnaigh 1 go {total}."
+    usage: "Úsáid: /rewind [N | fork N]"
+    rewind_failed: "(x_x) Theip ar an athchasadh; níor athraíodh an stair: {error}"
   modern:
     thought_for: "Smaoinigh ar feadh {seconds}s"
     thought: "Smaoinigh"
@@ -4002,3 +4018,8 @@ plan_usage:
   large_notice_limit: "Samhail mhór: tá do theorainn {name} bainte amach ({resets})."
   large_notice_limit_stops: "Samhail mhór: tá do theorainn {name} bainte amach ({resets}), mar sin ní rithfidh sí go dtí sin."
   large_notice_percent: "Samhail mhór: úsáideann sí níos mó de d’úsáid plean in aghaidh na teachtaireachta. Teorainn mhíosúil na samhlacha móra: {percent} úsáidte."
+shared:
+  # /undo's line naming the files the undone turns changed (tools/checkpoint_undo_hint.py).
+  undo_rollback:
+    list: "↶ Comhaid a athraíodh sna seal a cealaíodh: {files}. Rith /rollback chun seicphointí a liostú agus ceann a athchóiriú."
+    more: "+{count} eile"

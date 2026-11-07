@@ -70,9 +70,12 @@ reconstructing its policy from the old primary.
 
 ## Reader Inventory
 
-Primary readers: CLI config/init/new/main/oneshot, ACP session, TUI server,
-gateway run/config-loaders/inbound/turn, profiles/status/prompt-size/context
-switch guard, and cron jobs/scheduler. Secondary readers: delegation config,
+Primary readers: CLI config/init/new/main, ACP session, TUI server,
+gateway run/config-loaders/inbound/turn/session-policy, profiles/status/prompt-size/context
+switch guard, and cron jobs/scheduler. Top-level one-shot runs use the gateway's
+session policy, not the retired in-process one-shot agent. The policy's shared
+normalizer expands complete preset routes before freezing or following profile
+config, preserving provider, fallbacks and reasoning together. Secondary readers: delegation config,
 auxiliary tasks/fallbacks and supported MoA slots. `hermes_constants` owns shared
 reasoning precedence, including preset effort ahead of global effort.
 
