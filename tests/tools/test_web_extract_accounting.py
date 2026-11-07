@@ -111,7 +111,8 @@ def test_public_batch_keeps_invalid_blocked_and_repeated_slots(offline):
     assert results[1]["fallback_from"] == results[3]["fallback_from"] == "direct_http"
 
 
-def test_provider_exception_is_a_per_url_error_not_a_lost_batch(offline):
+def test_provider_exception_is_a_per_url_error_not_a_lost_batch(offline, caplog):
+    caplog.set_level("INFO", logger="tools.web_tools")
     provider = SimpleNamespace(name="exa", supports_extract=lambda: True,
                                extract=AsyncMock(side_effect=RuntimeError("Provider unavailable")))
     offline.setattr("agent.web_search_registry.get_provider", lambda name: provider)
@@ -119,6 +120,9 @@ def test_provider_exception_is_a_per_url_error_not_a_lost_batch(offline):
     assert [result["url"] for result in results] == [A, B]
     assert all(result["error"] == "Provider unavailable" for result in results)
     assert all(result["fallback_from"] == "direct_http" for result in results)
+    failures = [record for record in caplog.records if "Provider unavailable" in record.getMessage()]
+    assert len(failures) == 1 and failures[0].levelname == "WARNING"
+    assert not failures[0].exc_info  # Routine vendor failure is not a traceback at INFO.
 
 
 @pytest.mark.parametrize("mode", ["success", "redirect", "unrelated", "thin", "error", "rescue"])

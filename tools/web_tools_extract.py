@@ -83,9 +83,13 @@ def _extract_identity_key(url: Any) -> Optional[tuple]:
         port = parts.port
     except ValueError:
         return (url,)
-    if (parts.scheme, port) in (("http", 80), ("https", 443)):
+    scheme = parts.scheme.lower()
+    if (scheme, port) in (("http", 80), ("https", 443)):
         port = None
-    return (parts.scheme.lower(), parts.hostname, port, parts.path.rstrip("/"),
+    # HTTP upgrades identify the same resource, but distinct hosts (including
+    # www), non-default ports, path case and query values are not aliases.
+    transport = "http(s)" if scheme in ("http", "https") else scheme
+    return (transport, parts.hostname, port, parts.path.rstrip("/"),
             parts.query, parts.username, parts.password)
 
 
@@ -111,27 +115,31 @@ def _infer_extract_redirect(result: dict, keys: dict) -> bool:
 
 
 def _match_extract_results(urls: list[str], results: list[dict]) -> list[dict]:
-    """Align identities first; infer redirects only for one unambiguous leftover pair."""
+    """Only successes fill slots; errors remain replaceable by a lone redirect."""
     requested = set(urls)
     keys = {}
     for url in requested:
         keys.setdefault(_extract_identity_key(url), set()).add(url)
-    matched = {}
+    successes, errors = {}, {}
     unmatched = []
     for result in results:
         identity = _extract_result_identity(result, requested, keys)
-        if identity is None:
+        if result.get("error"):
+            if identity is not None:
+                errors.setdefault(identity, result)
+        elif identity is None:
             unmatched.append(result)
-        elif identity not in matched or (matched[identity].get("error") and not result.get("error")):
-            matched[identity] = result
-    remaining = requested - matched.keys()
-    # Deliberate tradeoff: infer this lone pair as a redirect without source
-    # evidence, then cache its content under the requested key for the TTL.
-    # Multiple leftovers remain errors rather than risk positional misattribution.
+        else:
+            successes.setdefault(identity, result)
+    remaining = requested - successes.keys()
+    # Provider placeholders do not consume slots or compete with real content.
+    # Infer only a lone success/request pair without conflicting source evidence;
+    # multiple leftovers remain errors rather than risk positional misattribution.
     if len(remaining) == 1 and len(unmatched) == 1:
         result = unmatched[0]
         if _infer_extract_redirect(result, keys):
-            matched[remaining.pop()] = result
+            successes[remaining.pop()] = result
+    matched = {**errors, **successes}
     ordered = []
     for url in urls:
         result = dict(matched[url]) if url in matched else _result_entry(url, _NO_RESULT_ERROR)
@@ -265,7 +273,8 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
             return failed
         return _match_extract_results(fetch_urls, await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed))
     except Exception as exc:
-        logger.exception("web_extract provider %s failed", provider.name)
+        logger.warning("web_extract provider %s failed: %s", provider.name, exc,
+                       exc_info=logger.isEnabledFor(logging.DEBUG))
         failed = [_result_entry(u, str(exc)) for u in fetch_urls]
         if not _rescue_eligible(provider):
             return failed
