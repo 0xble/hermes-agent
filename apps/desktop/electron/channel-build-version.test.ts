@@ -354,8 +354,8 @@ else:
   }
 })
 
-// Four real manifest/recording pairs cross Node and Python process boundaries.
-test('actual MSIX manifest writer consumes the channel quad across rollover instead of semver patch', (): void => {
+// Four real manifest/recording pairs share module imports and recorder startup.
+test('actual MSIX manifest writer consumes the channel quad across rollover instead of semver patch', async (): Promise<void> => {
   const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'channel-manifest-'))
   const app: string = path.join(root, 'apps/desktop')
   interface ManifestFacts {
@@ -396,11 +396,11 @@ test('actual MSIX manifest writer consumes the channel quad across rollover inst
       fs.copyFileSync(path.join(repo, file), destination)
     }
 
-    // The version parser imports the PM package, and desktop_prepare imports
-    // release helpers that import each other (versioning -> semver). Copy both
-    // complete trees so a new intra-package import cannot break the fixture.
+    // These packages are import-only. Share the checkout's complete trees
+    // (including future intra-package imports) without copying their bytecode
+    // caches into a throwaway packaging fixture under suite-wide I/O load.
     for (const tree of ['pm', 'scripts/releases']) {
-      fs.cpSync(path.join(repo, tree), path.join(root, tree), { recursive: true })
+      fs.symlinkSync(path.join(repo, tree), path.join(root, tree), 'junction')
     }
 
     fs.symlinkSync(path.join(repo, 'node_modules'), path.join(root, 'node_modules'), 'junction')
@@ -416,83 +416,97 @@ test('actual MSIX manifest writer consumes the channel quad across rollover inst
       path.join(app, 'build/agent-payload/manifest.json'),
       JSON.stringify({ launchers: ['hermes-no-registry-needed', 'hermes-no-registry-needed-acp'] })
     )
-    const facts: ManifestFacts[] = []
-
-    for (const sequence of [65535, 65536, 65537, 0xffffffff]) {
-      const build: ChannelBuildRequest = request(sequence)
-
-      const script: string = `
+    const builds: ChannelBuildRequest[] = [65535, 65536, 65537, 0xffffffff].map(sequence => request(sequence))
+    const script: string = `
         const { AppInfo } = require('./node_modules/app-builder-lib/dist/appInfo.js');
         const Msix = require('./node_modules/app-builder-lib/dist/targets/win/MsixTarget.js').default;
-        const config = require('./apps/desktop/electron-builder.config.cjs');
+        const { withChannelBuildRequestBatch } = require('./scripts/msix-shared.mjs');
+        module.exports = async (builds) => {
+        const environments = builds.map(build => ({ ...process.env,
+          _HERMES_CHANNEL_REQUEST_JSON: JSON.stringify(build) }));
+        const configs = withChannelBuildRequestBatch(environments, () => environments.map(env => {
+          process.env._HERMES_CHANNEL_REQUEST_JSON = env._HERMES_CHANNEL_REQUEST_JSON;
+          for (const file of ['./apps/desktop/product-identity.cjs', './apps/desktop/electron-builder.config.cjs']) {
+            delete require.cache[require.resolve(file)];
+          }
+          return require('./apps/desktop/electron-builder.config.cjs');
+        }));
         const pkg = require('./apps/desktop/package.json');
         const fs = require('node:fs');
         const path = require('node:path');
-        const appDir = path.resolve('apps/desktop');
-        (async () => {
-          await config.beforeBuild();
-          const metadata = { ...pkg, ...config.extraMetadata };
-          const appInfo = new AppInfo({ config, metadata }, null, config.win);
-          if (require('semver').valid(appInfo.version) !== appInfo.version) throw Error('Invalid packager semver');
-          const packager = { appInfo, config, metadata, appDir, platformOptions: config.win,
-            getResource: async (file) => path.resolve(appDir, file) };
-          const target = { packager, options: config.msix,
-            getCapabilities: Msix.prototype.getCapabilities, getExtensions: Msix.prototype.getExtensions };
-          const output = path.resolve('manifest.xml');
-          await Msix.prototype.writeManifest.call(target, output, 1, config.msix.publisher, []);
-          console.log(JSON.stringify({version: appInfo.shortVersionWindows, semver: appInfo.version,
-            appId: appInfo.id, xml: fs.readFileSync(output, 'utf8')}));
-        })().catch(e => {console.error(e);process.exitCode=1});
+        const appDir = path.resolve(__dirname, 'apps/desktop');
+          const rows = [];
+          for (const [index, config] of configs.entries()) {
+            await config.beforeBuild();
+            const metadata = { ...pkg, ...config.extraMetadata };
+            const appInfo = new AppInfo({ config, metadata }, null, config.win);
+            if (require('semver').valid(appInfo.version) !== appInfo.version) throw Error('Invalid packager semver');
+            const packager = { appInfo, config, metadata, appDir, platformOptions: config.win,
+              getResource: async (file) => path.resolve(appDir, file) };
+            const target = { packager, options: config.msix,
+              getCapabilities: Msix.prototype.getCapabilities, getExtensions: Msix.prototype.getExtensions };
+            const output = path.resolve(__dirname, builds[index].sequence + '.xml');
+            await Msix.prototype.writeManifest.call(target, output, 1, config.msix.publisher, []);
+            rows.push({version: appInfo.shortVersionWindows, semver: appInfo.version,
+              appId: appInfo.id, xml: fs.readFileSync(output, 'utf8')});
+          }
+          return rows;
+        };
       `
 
-      const output: string = execFileSync(process.execPath, ['-e', script], {
-        cwd: root,
-        encoding: 'utf8',
-        env: { ...process.env, HERMES_DESKTOP_VARIANT: 'bundled', _HERMES_CHANNEL_REQUEST_JSON: JSON.stringify(build) }
-      })
+    const writer: string = path.join(root, 'manifest-writer.cjs')
+    fs.writeFileSync(writer, script)
+    process.env.HERMES_DESKTOP_VARIANT = 'bundled'
+    const render: (builds: ChannelBuildRequest[]) => Promise<ManifestFacts[]> = require(writer)
+    const facts: ManifestFacts[] = await render(builds)
+    assert.equal(facts.length, builds.length)
 
-      const row: ManifestFacts = JSON.parse(output.trim().split('\n').at(-1)!)
+    const recordScript: string = `
+import json, pathlib, sys, zipfile, xml.etree.ElementTree as ET
+sys.path.insert(0, sys.argv[1])
+from scripts.bundles.release_artifacts import record, desktop_application
+root = pathlib.Path(sys.argv[2])
+package = root / 'Recorder-win-x64.msix'
+out = root / 'metadata.json'
+rows = []
+for request in json.loads(sys.argv[3]):
+    xml = (root / f"{request['sequence']}.xml").read_bytes()
+    with zipfile.ZipFile(package, 'w') as archive:
+        archive.writestr('AppxManifest.xml', xml)
+        archive.writestr('app/resources/install-stamp.json', json.dumps({
+            'source': 'channel-build', 'channelBuild': request, 'commit': request['commit'], 'tag': None}))
+    record('windows', 'x64', root, '', request['commit'], out, channel_request=request)
+    manifest = ET.fromstring(xml)
+    desktop = desktop_application(manifest, request)
+    desktop.set('Id', 'WrongDesktop')
+    try:
+        desktop_application(manifest, request)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('Recorder accepted the wrong desktop application ID')
+    rows.append(json.loads(out.read_text(encoding='utf-8')))
+print(json.dumps(rows))
+`
+
+    const recorded: string = execFileSync(
+      process.env.HERMES_PYTHON || 'python3',
+      ['-c', recordScript, repo, root, JSON.stringify(builds)],
+      { encoding: 'utf8' }
+    )
+    const metadataRows: RecordedMetadata[] = JSON.parse(recorded)
+    assert.equal(metadataRows.length, builds.length)
+
+    for (const [index, build] of builds.entries()) {
+      const row: ManifestFacts = facts[index]
       assert.equal(row.version, build.windowsVersion)
       assert.equal(row.semver, build.version)
       assert.match(row.xml, new RegExp(`Version="${build.windowsVersion.replaceAll('.', '\\.')}"`))
       assert.equal((row.xml.match(/Category="windows.appExecutionAlias"/g) || []).length, 2)
       assert.match(row.xml, /HermesChannelab12cd34ef56ab78Cli1/)
-
-      const recordScript: string = `
-import json, pathlib, sys, zipfile, xml.etree.ElementTree as ET
-sys.path.insert(0, sys.argv[1])
-from scripts.bundles.release_artifacts import record, desktop_application
-root = pathlib.Path(sys.argv[2])
-request = json.loads(sys.argv[3])
-package = root / 'Recorder-win-x64.msix'
-with zipfile.ZipFile(package, 'w') as archive:
-    archive.writestr('AppxManifest.xml', (root / 'manifest.xml').read_bytes())
-    archive.writestr('app/resources/install-stamp.json', json.dumps({
-        'source': 'channel-build', 'channelBuild': request, 'commit': request['commit'], 'tag': None}))
-out = root / 'metadata.json'
-record('windows', 'x64', root, '', request['commit'], out, channel_request=request)
-manifest = ET.fromstring((root / 'manifest.xml').read_bytes())
-desktop = desktop_application(manifest, request)
-desktop.set('Id', 'WrongDesktop')
-try:
-    desktop_application(manifest, request)
-except ValueError:
-    pass
-else:
-    raise AssertionError('Recorder accepted the wrong desktop application ID')
-print(out.read_text(encoding='utf-8'))
-`
-
-      const recorded: string = execFileSync(
-        process.env.HERMES_PYTHON || 'python3',
-        ['-c', recordScript, repo, root, JSON.stringify(build)],
-        { encoding: 'utf8' }
-      )
-
-      const metadata: RecordedMetadata = JSON.parse(recorded)
+      const metadata: RecordedMetadata = metadataRows[index]
       assert.equal(metadata.applicationId, build.identity.appNamePascal)
       assert.equal(metadata.version, build.windowsVersion)
-      facts.push(row)
     }
 
     for (let index: number = 1; index < facts.length; index++) {
