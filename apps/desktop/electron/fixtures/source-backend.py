@@ -18,15 +18,22 @@ import zipfile
 
 
 def main() -> None:
+    # -I ignores PYTHONDONTWRITEBYTECODE. Do not write caches through the shared
+    # package links, either here, in PM's worker, or in the launched backend.
+    sys.dont_write_bytecode = True
     repository = Path(__file__).resolve().parents[4]
     temp = Path(sys.argv[1])
     root = Path(os.environ["HERMES_HOME"]) / "hermes-agent"
     root.mkdir(parents=True)
-    for name in (
-        "hermes_cli", "hermes_platform", "pm", "agent", "tools", "gateway", "tui_gateway", "cron", "plugins",
-    ):
+    # PM and CLI resolve their install root from __file__. Keep those packages
+    # and the root modules physical so bootstrap cannot select the host checkout's
+    # dependency generation. The remaining packages are read-only code inputs,
+    # not a second installation to copy (and delete) on every test run.
+    for name in ("pm", "hermes_cli"):
         shutil.copytree(repository / name, root / name,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for name in ("hermes_platform", "agent", "tools", "gateway", "tui_gateway", "cron", "plugins"):
+        (root / name).symlink_to(repository / name, target_is_directory=True)
     for source in repository.glob("*.py"):
         shutil.copy2(source, root / source.name)
     sys.path.insert(0, str(root))
@@ -38,7 +45,7 @@ def main() -> None:
     wheels.mkdir()
     dist = "desktop_backend_deps-1.dist-info"
     entries = {
-        "desktop_backend_deps.pth": "\n".join(sites) + "\n",
+        "desktop_backend_deps.pth": "import sys; sys.dont_write_bytecode = True\n" + "\n".join(sites) + "\n",
         "desktop_backend_proof.py": "VALUE = 'selected by PM'\n",
         f"{dist}/METADATA": "Metadata-Version: 2.1\nName: desktop-backend-deps\nVersion: 1\n",
         f"{dist}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
@@ -69,7 +76,7 @@ def main() -> None:
     worker = root / "pm" / "worker.py"
     worker_python = stage_runtime(Path(uv), Path(sys.executable), temp / "pm-runtime")
     worker_code = (
-        "import runpy, sys; from pathlib import Path; "
+        "import runpy, sys; sys.dont_write_bytecode = True; from pathlib import Path; "
         f"sys.path.insert(0, {str(root)!r}); import pm._uv; "
         f"pm._uv._toolchain = lambda **kwargs: (Path({uv!r}), Path({sys.executable!r})); "
         f"runpy.run_path({str(worker)!r}, run_name='__main__')"
