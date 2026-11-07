@@ -18,4 +18,8 @@ Run `scripts/run_tests.sh tests/plugins/platforms/slack/test_outbound_budget.py 
 
 ## Retirement And Rollback
 
-Retire when upstream supplies equivalent recovery and presentation coverage. Revert the patch commit, its matching tests, index row and register entry to roll back. No stored state, schema or configuration migration.
+Retire when upstream supplies equivalent recovery and presentation coverage.
+
+The outbound budget is not card-specific: `BudgetedAsyncWebClient` replaces `AsyncWebClient` for every adapter client, so it paces all Slack writes even when an explicit `tool_progress: off` keeps cards from starting. Dropping the card-retry half with [Slack ephemeral task cards](slack-ephemeral-task-cards.md) must keep `outbound_budget.py` and its tests.
+
+Revert the patch commit, its matching tests, index row and register entry to roll back. No stored state, schema or configuration migration.

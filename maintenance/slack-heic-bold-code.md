@@ -12,7 +12,8 @@ Load this unit when changing inbound image caching, Slack attachment failure wor
 
 - Patch identity: `slack-heic-bold-code`.
 - Incident: 2026-10-24, Brian's Personal Hermes in Slack (brianle.slack.com). A macOS HEIC screenshot downloaded with HTTP 200 (`image/heic`) was refused by the image cache and reported as "Slack blocked the file download". In the same reply, `**`typing_indicator: false`**` rendered with literal `**`.
-- Upstream: NousResearch/hermes-agent#119593 (open) reports the same image-cache refusal for Telegram HEIC documents. No upstream report of the emphasis-around-code defect was found.
+- Upstream: NousResearch/hermes-agent#119593 (open) reports the same image-cache refusal for Telegram HEIC documents. Open upstream PRs [#105534](https://github.com/NousResearch/hermes-agent/pull/105534) and [#114607](https://github.com/NousResearch/hermes-agent/pull/114607) fix emphasis around inline code; both conflicted with upstream `main` on 2026-10-29.
+- Compared on 2026-10-29, not adopted: upstream [#143830](https://github.com/NousResearch/hermes-agent/pull/143830) (head `e34f912fea4c796581c56595d61951123e627f08`, open) converts only HEIF-brand bytes, to JPEG through `pillow_heif`, so AVIF, TIFF and ICO stay refused and the cached format changes. [#141043](https://github.com/NousResearch/hermes-agent/pull/141043) covers dashboard and TUI uploads, not the gateway image cache.
 - Source surfaces: `gateway/platforms/base.py`, `plugins/platforms/slack/block_kit.py`, `plugins/platforms/slack/attachment_errors.py` (moved from `adapter.py`), `plugins/platforms/slack/adapter.py`.
 - Regression: `scripts/run_tests.sh tests/gateway/test_async_media_cache.py tests/gateway/test_slack_block_kit.py tests/plugins/platforms/slack/test_download_failure_diagnosis.py`.
 
