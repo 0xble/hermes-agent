@@ -42,7 +42,7 @@ async def _stop_retains_wake_for_command_tail():
     runner.pairing_store = MagicMock()
     before_handoff, never = asyncio.Event(), asyncio.Event()
     wake_waiting, wake_release, all_processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    processed, handled_at, tail_snapshot = [], [], []
+    processed, requeue_counts, tail_snapshot = [], [], []
     old_owner = None
     real_stop_typing = adapter._stop_typing_refresh
     real_tail = adapter._drain_pending_after_session_command
@@ -57,7 +57,7 @@ async def _stop_retains_wake_for_command_tail():
 
     async def run_agent(event, source, _quick_key: str, run_generation: int):
         processed.append(event.text)
-        handled_at.append(time.monotonic())
+        requeue_counts.append(adapter._requeue_counts.get(key, 0))
         if len(processed) == 2:
             all_processed.set()
         return "processed: " + event.text
@@ -103,7 +103,7 @@ async def _stop_retains_wake_for_command_tail():
             wake_release.set()
             await asyncio.wait_for(all_processed.wait(), 5)
             assert processed == ["retained internal obligation", "fresh followup"], processed
-            assert all(right - left < 0.1 for left, right in zip(handled_at, handled_at[1:]))
+            assert requeue_counts == [0, 0], "genuine FIFO follow-ups must not enter requeue backoff"
         finally:
             wake_release.set()
             await adapter.cancel_background_tasks()

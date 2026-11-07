@@ -4454,6 +4454,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if task is not None and not task.done():
             logger.debug("[%s] Cancelling active processing for session %s", self.name, session_key)
             self._expected_cancelled_tasks.add(task)
+            if discard_pending:
+                setattr(task, "_hermes_pending_owner", "discard")
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
@@ -4494,6 +4496,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             # Send BEFORE cancelling so cancellation side effects can't drop the "/new"
             # confirmation.
             await self._dispatch_inline_reply(event, log_cmd=cmd)
+            task = self._session_tasks.get(session_key)
+            if task is not None:
+                setattr(task, "_hermes_pending_owner", "command_tail")
             await self.cancel_session_processing(session_key, release_guard=False, discard_pending=False)
         except Exception:
             # On failure restore the original guard so the session isn't left half-reset.
@@ -5296,9 +5301,10 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             return
         if interrupt_event.is_set():
             self._invalidate_deferred_commands(session_key)
-        # Cancellation hands retained FIFO work to the command tail or shutdown spool.
-        # An obsolete owner must not admit an uncancelled successor from its finally.
-        if current_task is not None and current_task.cancelling():
+        # Fence only when the canceller explicitly owns the pending slot (replay,
+        # spool, or discard). Retire-now retains work for this finalizer to drain.
+        if (current_task is not None and current_task.cancelling()
+                and getattr(current_task, "_hermes_pending_owner", None) is not None):
             self._cleanup_finished_session_task(session_key, interrupt_event)
             return
         deferred = None if interrupt_event.is_set() else self._pop_deferred_command(session_key)
@@ -5308,6 +5314,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     self._cleanup_finished_session_task(session_key, interrupt_event)
             return
         pending = self._pending_messages.get(session_key)
+        # Preserve the compression waiter's existing self-requeue cancellation fence.
+        if (current_task is not None and current_task.cancelling()
+                and pending is getattr(current_task, "_hermes_event", None)
+                and getattr(pending, "_gateway_compression_deferred", False)):
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
         # A drain-deferred turn belongs to the shutdown spool, not this adapter's
         # post-turn handoff. Keep the FIFO head in its slot until shutdown flush.
         runner = getattr(self, "gateway_runner", None)
@@ -5650,6 +5662,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 break
             for task in tasks:
                 self._expected_cancelled_tasks.add(task)
+                setattr(task, "_hermes_pending_owner", "shutdown_spool")
                 task.cancel()
             try:
                 await asyncio.wait_for(
