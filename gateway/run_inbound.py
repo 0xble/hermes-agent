@@ -2102,8 +2102,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 return t("gateway.busy.another_turn_running")
             try:
                 if not getattr(event, "_gateway_compression_deferred", False):
-                    await self._run_post_turn_hooks(
+                    await self._defer_post_turn_hooks(
                         agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
+                        session_key=_quick_key, generation=_run_generation,
                     )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
