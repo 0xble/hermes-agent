@@ -18,6 +18,20 @@ const execute: typeof execFile.__promisify__ = promisify(execFile)
 const repository: string = path.resolve(import.meta.dirname, '../../../..')
 const python: string = process.env.HERMES_PYTHON || 'python3'
 
+async function sourceInstallId(root: string, environment: NodeJS.ProcessEnv): Promise<string> {
+  const { stdout }: { stdout: string } = await execute(
+    python,
+    [
+      '-c',
+      'import sys; from pathlib import Path; from hermes_cli.update_channel import install_id; print(install_id(Path(sys.argv[1])))',
+      root
+    ],
+    { cwd: root, env: environment }
+  )
+
+  return stdout.trim()
+}
+
 function buildId(channel: 'stable' | 'canary'): string {
   return (channel === 'stable' ? 'a' : 'b').repeat(32)
 }
@@ -231,12 +245,14 @@ it('carries each install channel from Python publication checks into the source 
     fs.mkdirSync(origin)
     fs.mkdirSync(home)
     git(['init', '-b', 'upstream-build'])
-    const commits: string[] = []
-
-    for (const label of ['old', 'stable', 'canary', 'unpublished']) {
-      git(['commit', '--allow-empty', '-m', label])
-      commits.push(git(['rev-parse', 'HEAD']))
-    }
+    // One real Git import builds the same four-commit history without a
+    // commit/rev-parse process pair for every empty fixture commit.
+    const history: string = ['old', 'stable', 'canary', 'unpublished'].map((label, index) =>
+      `commit refs/heads/upstream-build\nmark :${index + 1}\n` +
+      `committer Fixture <fixture@example.invalid> ${index + 1} +0000\ndata ${label.length}\n${label}\n\n`
+    ).join('') + 'reset refs/tags/v99.0.0\nfrom :4\n\n'
+    execFileSync('git', ['fast-import', '--quiet'], { cwd: origin, input: history, stdio: ['pipe', 'pipe', 'pipe'] })
+    const commits: string[] = git(['rev-list', '--reverse', 'HEAD']).split('\n')
 
     const tags: Record<'stable' | 'canary', string> = { stable: 'v1.2.3', canary: 'v1.2.3+canary.20260911T123456Z' }
 
@@ -272,7 +288,6 @@ it('carries each install channel from Python publication checks into the source 
       draft: false,
       prerelease: false
     })
-    git(['tag', 'v99.0.0'])
     git(['worktree', 'add', '-b', 'feature/gui', root])
     git(['remote', 'add', 'origin', origin])
     fs.writeFileSync(path.join(origin, 'install-stamp.json'), JSON.stringify({ updateMechanism: 'external' }))
@@ -344,17 +359,16 @@ if not getattr(urllib.request, '_hermes_loopback', False):
       HERMES_RUNTIME_DIR: ''
     }
 
-    async function setChannel(channel: 'stable' | 'canary' | 'main', install: string = root): Promise<void> {
-      await execute(
-        python,
-        [
-          '-c',
-          'import sys; from pathlib import Path; from hermes_cli.update_channel import set_install_channel; set_install_channel(sys.argv[1], Path(sys.argv[2]))',
-          channel,
-          install
-        ],
-        { cwd: root, env: environment }
-      )
+    // This fixture selects channels, not the config editor. Ask the production
+    // leaf for the install key once, then stage its JSON-compatible YAML record.
+    // Importing the full config writer in three fresh interpreters otherwise
+    // competes with the suite's real publication probes and backend startups.
+    const installId: string = await sourceInstallId(root, environment)
+
+    function setChannel(channel: 'stable' | 'canary' | 'main'): void {
+      fs.writeFileSync(path.join(home, 'config.yaml'), JSON.stringify({
+        update: { installs: { [installId]: { path: root, channel } } }
+      }))
     }
 
     const checkerPath: string = path.join(root, 'hermes_cli', 'source_check.py')
@@ -438,7 +452,7 @@ if not getattr(urllib.request, '_hermes_loopback', False):
 
     for (const channel of ['stable', 'canary'] as const) {
       replayedSourceUpdate = undefined
-      await setChannel(channel)
+      setChannel(channel)
       const sha: string = commits[channel === 'stable' ? 1 : 2]
       const checked: SourceUpdate = await strategy.check()
       expect(checked, JSON.stringify({ checked, requests })).toMatchObject({
@@ -488,14 +502,18 @@ if not getattr(urllib.request, '_hermes_loopback', False):
     expect(await strategy.apply()).toMatchObject({ ok: false, error: 'release-unavailable' })
     expect(deps.stopBackendsForUpdate).not.toHaveBeenCalled()
     expect(spawned).toHaveLength(0)
-    await setChannel('main')
-    expect(await readSourceUpdate({ python, git: 'git', updateRoot: root, hermesHome: home })).toMatchObject({
+    setChannel('main')
+    const count: number = requests.length
+    const main: SourceUpdate | null = await readSourceUpdate({ python, git: 'git', updateRoot: root, hermesHome: home })
+    expect(main).toMatchObject({
       supported: true,
       branch: 'feature/gui',
       targetSha: commits[3],
       updateAvailable: false
     })
-    const count: number = requests.length
+    // The branch and publication state stay fixed across these UI fallbacks.
+    // Reuse the real probe just as for the release-channel manual fallbacks.
+    replaySourceUpdate(main)
     expect(await strategy.check()).toMatchObject({
       branch: 'feature/gui',
       targetSha: commits[3],
