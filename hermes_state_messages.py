@@ -955,6 +955,24 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             f"UPDATE messages SET content = ? WHERE {_VISIBLE_MESSAGE_SQL} AND id = ? AND session_id = ? AND role = 'user' AND active = 1",
             (self._encode_content(content), row_id, session_id), session_ids=(session_id,))
 
+    def set_failed_turn_boundary_content(self, session_id: str, row_id: int, content: str) -> int:
+        """Rewrite ONE known failed-turn boundary row's copy, only while it is still the newest live
+        conversation row. Used when the gateway owns better copy for the boundary the agent's core
+        closer already wrote for this same turn (the supervisor's normalized status): replacing it
+        in place keeps one Hermes boundary, and a later row (another turn, a real reply) leaves the
+        transcript untouched."""
+        if (not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0
+                or not isinstance(content, str) or not content.strip()):
+            return 0
+        from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
+        return self._write_rowcount(
+            f"UPDATE messages SET content = ? WHERE {_VISIBLE_MESSAGE_SQL} AND id = ? AND session_id = ? "
+            "AND role = 'assistant' AND display_kind = ? AND active = 1 AND NOT EXISTS ("
+            "SELECT 1 FROM messages later WHERE later.session_id = messages.session_id AND later.active = 1 "
+            "AND later.id > messages.id AND later.role NOT IN ('session_meta', 'system'))",
+            (self._encode_content(content), row_id, session_id, FAILED_TURN_DISPLAY_KIND),
+            session_ids=(session_id,))
+
     def deactivate_message(self, session_id: str, row_id: int) -> int:
         """Deactivate ONE known row (id-addressed, idempotent; returns the affected row count). Used by
         the queued-prompt drain: the row written at accept time sits ahead of the in-flight turn's
