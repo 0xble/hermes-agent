@@ -934,22 +934,8 @@ def _pick(updates: dict[str, Any], job: dict[str, Any], key: str) -> Any:
     return updates[key] if key in updates else job.get(key)
 
 
-def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
-    """prompt / name / deliver / skills / model pins; returns an error string or None."""
-    prompt, deliver, skill, skills = a["prompt"], a["deliver"], a["skill"], a["skills"]
-    if prompt is not None:
-        scan_error = _scan_cron_prompt(prompt)
-        if scan_error:
-            return scan_error
-        from cron.prompt_guard import prompt_update_error
-        guard_error = prompt_update_error(job.get("prompt"), prompt, allow_shrink=bool(a["allow_shrink"]))
-        if guard_error:
-            return guard_error
-        updates["prompt"] = prompt
-    if a["name"] is not None and a["name"].strip():
-        # Blank name is a no-op, not a clear: a model re-sending the whole schema with
-        # type-default empties must not wipe untouched fields.
-        updates["name"] = a["name"]
+def _update_delivery_fields(deliver: Any, a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
+    """Validate destination changes before applying their cron-context routing."""
     if deliver is not None:
         bot_chat_error = _validate_bot_chat_deliver(_normalize_deliver_param(deliver))
         if bot_chat_error:
@@ -966,6 +952,28 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
                 return bot_chat_error
             _norm_fd = _resolve_cron_context_deliver(_norm_fd)
         updates["failure_deliver"] = _norm_fd
+    return None
+
+
+def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
+    """prompt / name / deliver / skills / model pins; returns an error string or None."""
+    prompt, deliver, skill, skills = a["prompt"], a["deliver"], a["skill"], a["skills"]
+    if prompt is not None:
+        scan_error = _scan_cron_prompt(prompt)
+        if scan_error:
+            return scan_error
+        from cron.prompt_guard import prompt_update_error
+        guard_error = prompt_update_error(job.get("prompt"), prompt, allow_shrink=bool(a["allow_shrink"]))
+        if guard_error:
+            return guard_error
+        updates["prompt"] = prompt
+    if a["name"] is not None and a["name"].strip():
+        # Blank name is a no-op, not a clear: a model re-sending the whole schema with
+        # type-default empties must not wipe untouched fields.
+        updates["name"] = a["name"]
+    delivery_error = _update_delivery_fields(deliver, a, updates)
+    if delivery_error:
+        return delivery_error
     if a["keep_pinned_lane"] is not None:
         updates["keep_pinned_lane"] = bool(a["keep_pinned_lane"])
     if a["catch_up"] is not None:
