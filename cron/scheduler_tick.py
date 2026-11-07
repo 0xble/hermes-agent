@@ -120,13 +120,9 @@ def _advance_or_drop_recurring(_sched, due_jobs: list) -> list:
 
 
 def _pre_dispatch_housekeeping(_sched, headless: bool) -> None:
-    """Admission reconcile, legacy upgrade drain and dead-owner reap, run under the tick lock
-    before due jobs are read."""
-    from cron.scheduler_authority import reconcile_pending
-    if headless:
-        reconcile_pending(allow_connect=False)
-    else:
-        reconcile_pending()
+    """Schedule admission recovery off-tick, then drain legacy records and reap dead owners."""
+    from cron.scheduler_authority import reconcile_pending_background
+    reconcile_pending_background(allow_connect=not headless)
     # Upgrade drain for the retired CLI lane's records: never let it stop due jobs below.
     try:
         from cron.bot_chat_legacy import drain_legacy_pending
