@@ -383,8 +383,12 @@ class TelegramDailyQuotaMixin:
 
     def progress_edit_interval_for_chat(self, chat_id: Any) -> float:
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
-        return self._daily_quota().progress_edit_interval(
-            str(normalize_telegram_chat_id(chat_id)), self.PROGRESS_EDIT_INTERVAL)
+        try:
+            return self._daily_quota().progress_edit_interval(
+                str(normalize_telegram_chat_id(chat_id)), self.PROGRESS_EDIT_INTERVAL)
+        except Exception:
+            logger.debug("[%s] daily progress interval check failed", self.name, exc_info=True)
+            return self.PROGRESS_EDIT_INTERVAL
 
     def _daily_sheds(self, chat_id: Any, kind: Optional[str]) -> bool:
         """True when the chat's daily volume says this outbound class must not spend a call."""

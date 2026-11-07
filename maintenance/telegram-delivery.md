@@ -252,6 +252,9 @@ and the existing recent-penalty scaling still applies. The progress consumer rec
 between batches, sends the full accumulated text after each wait, and drains immediately at
 turn end. Overflow, reset markers and flood-refused batches retain their buffered text.
 Initial tool bubbles, cleanup, daily shedding and final-reply delivery retain their existing rules.
+Initial sends keep the normal adapter floor even after a failed or outbox-deferred send returns
+no message ID. Retryable edits retain their batch with a 0.3s backoff after any flood deadline.
+If the quota read fails, progress cadence falls back to the adapter floor.
 
 The hourly daily-volume INFO line also includes `edit classes`, counted at the existing request
 metering point. `progress` includes tool-card edits, while `unclassified` has no outbound label.

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
+from gateway.platforms.base import OUTBOUND_PROGRESS, SendResult, outbound_class
 from gateway.run_turn_runner import TurnRunner
 from plugins.platforms.telegram import daily_quota as dq
 from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -77,22 +77,33 @@ class ToolDay:
         target = min(self.t + delay, self.end)
         while self.events and self.events[0][0] <= target:
             _, text = self.events.pop(0)
-            self.runner._progress_emit(text)
+            if isinstance(text, tuple):
+                self.runner._ctx.progress_queue.put(text)
+            else:
+                self.runner._progress_emit(text)
         self.t = target
         if self.t >= self.end:
             raise asyncio.CancelledError
 
 
+def _patch_day(monkeypatch, day, sleep=None):
+    import gateway.run_turn_progress as progress
+    import gateway.run_turn_runner as runner
+
+    clock = SimpleNamespace(monotonic=lambda: day.t)
+    monkeypatch.setattr(progress, "time", clock)
+    monkeypatch.setattr(runner, "time", clock)
+    monkeypatch.setattr(progress, "asyncio", SimpleNamespace(
+        sleep=sleep or day.sleep, CancelledError=asyncio.CancelledError))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("used, interval", [(0, 10), (5000, 30), (8000, 60)])
 async def test_batches_complete_text_and_flushes_at_turn_end(tmp_path, monkeypatch, used, interval):
-    import gateway.run_turn_progress as progress
-
     runner, adapter = _runner(tmp_path, used)
     runner._progress_emit("event0")
     day = ToolDay(runner, 125, [(n, f"event{n}") for n in range(1, 126)])
-    monkeypatch.setattr(progress, "time", SimpleNamespace(monotonic=lambda: day.t))
-    monkeypatch.setattr(progress, "asyncio", SimpleNamespace(sleep=day.sleep, CancelledError=asyncio.CancelledError))
+    _patch_day(monkeypatch, day)
     token = bind_trigger(SimpleNamespace(text="show tool progress"))
     try:
         await runner.send_progress_messages()
@@ -111,8 +122,6 @@ async def test_batches_complete_text_and_flushes_at_turn_end(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_an_isolated_update_is_sent_when_the_batch_expires(tmp_path, monkeypatch):
-    import gateway.run_turn_progress as progress
-
     runner, adapter = _runner(tmp_path, 0)
     runner._progress_emit("first")
     day = ToolDay(runner, 65, [(1, "second")])
@@ -122,8 +131,7 @@ async def test_an_isolated_update_is_sent_when_the_batch_expires(tmp_path, monke
                 adapter._daily_quota().record(CHAT, "sendChatAction")
         await day.sleep(delay)
 
-    monkeypatch.setattr(progress, "time", SimpleNamespace(monotonic=lambda: day.t))
-    monkeypatch.setattr(progress, "asyncio", SimpleNamespace(sleep=pressure_then_sleep, CancelledError=asyncio.CancelledError))
+    _patch_day(monkeypatch, day, pressure_then_sleep)
     token = bind_trigger(SimpleNamespace(text="show tool progress"))
     try:
         await runner.send_progress_messages()
@@ -131,6 +139,106 @@ async def test_an_isolated_update_is_sent_when_the_batch_expires(tmp_path, monke
         reset_trigger(token)
     assert adapter._bot.edit_message_text.await_args_list[0].kwargs["text"] == "first\nsecond"
     assert 58 <= max(day.waits) <= 60
+
+
+@pytest.mark.asyncio
+async def test_flood_batch_retries_transient_failures_with_backoff(tmp_path, monkeypatch):
+    runner, adapter = _runner(tmp_path, 0)
+    runner._progress_emit("first")
+    day = ToolDay(runner, 45, [(1, "second"), (15, "third")])
+    _patch_day(monkeypatch, day)
+    attempts = []
+
+    async def edit(**kwargs):
+        attempts.append((day.t, kwargs["content"]))
+        if len(attempts) == 1:
+            return SendResult(success=False, retryable=True, retry_after=12, error="flood")
+        if len(attempts) <= 4:
+            return SendResult(success=False, retryable=True, error="Not connected")
+        # Bound an unfixed busy loop without relying on a wall-clock timeout.
+        runner._ctx._run_still_current = lambda: False
+        return SendResult(success=True, message_id="1")
+
+    adapter.edit_message = AsyncMock(side_effect=edit)
+    await runner.send_progress_messages()
+    times = [at for at, _ in attempts]
+    assert len(attempts) == 5  # The isolated batch retries through recovery, without new events.
+    assert times[1] >= times[0] + 12
+    assert all(b - a >= 0.29 for a, b in zip(times[1:], times[2:]))
+    assert all(text == "first\nsecond\nthird" for _, text in attempts[1:])
+    assert adapter._bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [
+    SendResult(success=False, retryable=True, error="Not connected"),
+    SendResult(success=True, deferred=True),
+])
+async def test_initial_sends_without_an_anchor_keep_the_normal_floor(tmp_path, monkeypatch, result):
+    runner, adapter = _runner(tmp_path, 8000)
+    runner._progress_emit("event0")
+    day = ToolDay(runner, 35, [(n, f"event{n}") for n in range(1, 36)])
+    _patch_day(monkeypatch, day)
+    attempts = []
+
+    async def send(**kwargs):
+        attempts.append((day.t, kwargs["content"]))
+        return result
+
+    adapter.send = AsyncMock(side_effect=send)
+    await runner.send_progress_messages()
+    assert [at for at, _ in attempts] == [100, 110, 120, 130]
+    assert attempts[1][1].splitlines() == [f"event{n}" for n in range(11)]
+    adapter._bot.edit_message_text.assert_not_awaited()
+
+
+def test_progress_interval_falls_back_when_quota_read_fails(tmp_path, monkeypatch):
+    runner, adapter = _runner(tmp_path, 8000)
+
+    def unavailable():
+        raise OSError("quota unavailable")
+
+    monkeypatch.setattr(adapter, "_daily_quota", unavailable)
+    assert runner._progress_interval_for_chat(adapter) == adapter.PROGRESS_EDIT_INTERVAL
+
+
+@pytest.mark.asyncio
+async def test_overflow_during_a_batch_keeps_the_newest_bubble_editable(tmp_path, monkeypatch):
+    runner, adapter = _runner(tmp_path, 0)
+    monkeypatch.setattr(adapter, "MAX_MESSAGE_LENGTH", 120)
+    adapter._bot.send_message.side_effect = [SimpleNamespace(message_id=1), SimpleNamespace(message_id=2)]
+    lines = [letter * 45 for letter in "abcd"]
+    runner._progress_emit(lines[0])
+    day = ToolDay(runner, 25, [(1, lines[1]), (2, lines[2]), (12, lines[3])])
+    _patch_day(monkeypatch, day)
+    await runner.send_progress_messages()
+    sends = [call.kwargs for call in adapter._bot.send_message.await_args_list]
+    edits = [call.kwargs for call in adapter._bot.edit_message_text.await_args_list]
+    assert [call["text"] for call in sends] == [lines[0], lines[2]]
+    assert edits[0]["message_id"] == 1
+    assert edits[0]["text"] == "\n".join(lines[:2])
+    assert edits[-1]["message_id"] == 2
+    assert edits[-1]["text"] == "\n".join(lines[2:])
+    assert all(len(call["text"]) <= 120 for call in sends + edits)
+
+
+@pytest.mark.asyncio
+async def test_reset_during_a_batch_preserves_lines_on_each_side(tmp_path, monkeypatch):
+    runner, adapter = _runner(tmp_path, 0)
+    adapter._bot.send_message.side_effect = [SimpleNamespace(message_id=1), SimpleNamespace(message_id=2)]
+    runner._progress_emit("before0")
+    day = ToolDay(runner, 25, [
+        (1, "before1"), (2, ("__reset__",)), (3, "after0"), (12, "after1"),
+    ])
+    _patch_day(monkeypatch, day)
+    await runner.send_progress_messages()
+    sends = [call.kwargs["text"] for call in adapter._bot.send_message.await_args_list]
+    edits = [call.kwargs for call in adapter._bot.edit_message_text.await_args_list]
+    assert sends == ["before0", "after0"]
+    assert edits[0]["message_id"] == 1
+    assert edits[0]["text"] == "before0\nbefore1"
+    assert edits[-1]["message_id"] == 2
+    assert edits[-1]["text"] == "after0\nafter1"
 
 
 def test_hourly_summary_attributes_edits_without_debug_or_counting_them_twice(tmp_path, caplog):

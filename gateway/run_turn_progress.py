@@ -572,11 +572,16 @@ class GatewayTurnProgressMixin:
                 self._progress_absorb(st, raw)
 
     async def _wait_for_progress_batch(self, st, last_edit_ts: float) -> None:
-        while st.progress_msg_id is not None:
+        while last_edit_ts or st.defer_until:
             now = time.monotonic()
+            # Initial sends retain the adapter's normal floor even without an anchor
+            # (failed or outbox-deferred sends). Pressure only widens existing-card edits.
+            interval = (self._progress_interval_for_chat(st.adapter) if st.progress_msg_id is not None
+                        else self._progress_edit_interval(st.adapter))
             remaining = max(st.defer_until - now,
-                            self._progress_interval_for_chat(st.adapter) - (now - last_edit_ts))
+                            interval - (now - last_edit_ts))
             if remaining <= 0:
+                st.defer_until = 0.0
                 break
             await asyncio.sleep(remaining)
         if st.can_edit:
@@ -636,6 +641,9 @@ class GatewayTurnProgressMixin:
                     continue
                 if not await self._roll_progress_overflow_if_needed(st):
                     if not await self._progress_send_or_edit(st, st.progress_lines[-1]):
+                        # Keep an isolated failed batch eligible for retry, with a yield
+                        # even after the previous flood deadline has expired.
+                        st.defer_until = time.monotonic() + 0.3
                         continue
                 last_edit_ts = time.monotonic()
                 if not self._progress_deferred(st):
