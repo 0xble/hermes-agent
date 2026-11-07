@@ -124,10 +124,11 @@ async def test_a_secondary_profiles_old_conversation_gets_its_result_after_the_s
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource
     from gateway.session_authorities import SessionAuthorities
-    from gateway.session_authority import LiveSession, initialize_session_authority
+    from gateway.session_authority import LiveSession
     from gateway.session_detached import detach
     from hermes_constants import get_hermes_home
     from hermes_state import SessionDB
+    from tests.fakes.runtime_owner import initialize_session_authority
     root = tmp_path / 'hermes'
     profile = root / 'profiles' / 'fitness'
     profile.mkdir(parents=True)
