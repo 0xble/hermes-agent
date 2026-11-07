@@ -225,9 +225,9 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
             return failed
         return _match_extract_results(fetch_urls, await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed))
     except Exception as exc:
-        if not _rescue_eligible(provider):
-            raise
         failed = [_result_entry(u, str(exc)) for u in fetch_urls]
+        if not _rescue_eligible(provider):
+            return failed
         return _match_extract_results(fetch_urls, await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed))
     if results and all(r.get("error") for r in results) and _rescue_eligible(provider):
         return _match_extract_results(fetch_urls, await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results))

@@ -111,6 +111,16 @@ def test_public_batch_keeps_invalid_blocked_and_repeated_slots(offline):
     assert results[1]["fallback_from"] == results[3]["fallback_from"] == "direct_http"
 
 
+def test_provider_exception_is_a_per_url_error_not_a_lost_batch(offline):
+    provider = SimpleNamespace(name="exa", supports_extract=lambda: True,
+                               extract=AsyncMock(side_effect=RuntimeError("Provider unavailable")))
+    offline.setattr("agent.web_search_registry.get_provider", lambda name: provider)
+    results = json.loads(asyncio.run(wt.web_extract_tool([A, B], char_limit=10000)))["results"]
+    assert [result["url"] for result in results] == [A, B]
+    assert all(result["error"] == "Provider unavailable" for result in results)
+    assert all(result["fallback_from"] == "direct_http" for result in results)
+
+
 @pytest.mark.parametrize("mode", ["success", "redirect", "thin", "error", "rescue"])
 def test_direct_miss_reuses_only_successful_provider_pages_within_ttl(offline, mode):
     now = [100000.0]
