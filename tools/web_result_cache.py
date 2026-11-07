@@ -591,11 +591,17 @@ def extract_cache_get(url: str, format: Optional[str] = None, provider: str = ""
     except Exception:
         return None
     logger.info("web_extract cache hit: %s", url)
-    return {"url": url, "title": entry.get("title", ""), "content": content, "error": None, "cached": True}
+    result = {"url": entry.get("result_url", url), "title": entry.get("title", ""), "content": content, "error": None, "cached": True}
+    if result["url"] != url:
+        result["requested_url"] = url
+    result.update({key: value for key, value in entry.get("provenance", {}).items()
+                   if key in ("fallback_from", "extract_backend", "direct_fetch_error")})
+    return result
 
 
 def extract_cache_put(
-    url: str, content: str, title: str = "", format: Optional[str] = None, provider: str = ""
+    url: str, content: str, title: str = "", format: Optional[str] = None, provider: str = "",
+    *, result_url: Optional[str] = None, provenance: Optional[dict] = None
 ) -> None:
     """Store one successful extraction's full clean text for TTL reuse; pages over the truncate-store
     ceiling are not cached (serving a capped copy back as if whole would silently lose the tail)."""
@@ -613,6 +619,10 @@ def extract_cache_put(
             index[_url_digest(url, format, provider)] = {
                 "url": url, "file": str(file_path), "title": title or "", "fetched_at": time.time(),
             }
+            if provenance:
+                index[_url_digest(url, format, provider)]["provenance"] = provenance
+            if result_url and result_url != url:
+                index[_url_digest(url, format, provider)]["result_url"] = result_url
             _save_index(index)
     except Exception as exc:
         logger.debug("Failed to cache web extract for %s: %s", url, exc)

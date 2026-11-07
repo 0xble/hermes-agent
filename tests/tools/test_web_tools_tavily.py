@@ -191,7 +191,8 @@ class TestWebExtractCacheAttribution:
             asyncio.run(wte._dispatch_extract(_RedirectProvider(), urls, None))
 
         cache_put.assert_called_once_with(
-            "https://example.com/old", "moved page", "Moved", format=None, provider="keenable"
+            "https://example.com/old", "moved page", "Moved", format=None, provider="keenable",
+            result_url="https://www.example.com/moved"
         )
 
 

@@ -158,9 +158,16 @@ def test_partial_canonical_batch_keeps_direct_fallback_attribution(backend_harne
 
     sdk.get_contents.side_effect = contents
     result = _extract([extra_url, "https://site.test/article"])
-    canonical = next(r for r in result if r["url"] == "https://site.test/canonical")
-    assert canonical["fallback_from"] == "direct_http"
-    assert canonical["extract_backend"] == "exa" and canonical["direct_fetch_error"]
+    if extra_url.endswith(".pdf"):
+        canonical = next(r for r in result if r["url"] == "https://site.test/canonical")
+        assert canonical["fallback_from"] == "direct_http"
+        assert canonical["extract_backend"] == "exa" and canonical["direct_fetch_error"]
+    else:
+        # A canonical URL alone cannot identify which of two requested pages
+        # succeeded. Return explicit errors rather than guessing by position.
+        assert [r["url"] for r in result] == [extra_url, "https://site.test/article"]
+        assert all(r.get("error") for r in result)
+        assert all(r["fallback_from"] == "direct_http" for r in result)
     put.assert_not_called()
 
 
