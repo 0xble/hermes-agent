@@ -3725,13 +3725,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 images, text_content = adapter.extract_images(response)
                 text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
-                content = header + text_content
-                if source.platform == Platform.SLACK and not (result or {}).get("error"):
-                    from agent.notice_style import notice_metadata
-                    await adapter.send(chat_id=source.chat_id, content=header,
-                                       metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
-                    content = text_content
-                await adapter.send(chat_id=source.chat_id, content=content, metadata=_thread_metadata)
+                # Keep attribution and body in one send: concurrent completions must not
+                # interleave headers, and a rejected receipt must not leave a bare result.
+                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
             for copy_block in copy_blocks:
                 copy_metadata = dict(_thread_metadata or {})
                 copy_metadata["copy_block"] = True
@@ -5452,6 +5448,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 _sk, _streamed, _previewed, _content_delivered,
             )
             response["already_sent"] = True
+        elif _sc is not None and getattr(_sc, "_abandoned_draft_message_id", None):
+            if not turn_ctx._run_still_current() or response.get("interrupted"):
+                return  # Do not fall through to plugin-transformed reconciliation either.
+            # A dead consumer sealed its owned preview: finish that message, never infer
+            # ownership from thread metadata or post a duplicate beside the orphan.
+            await self._run_agent_edit_streamed_message(
+                _sc, source, response, _final, _sk=_sk,
+                ok=("Reconciled abandoned draft for session %s in message %s.", _sk, _sc.message_id),
+                fail_result="Abandoned-draft edit failed for session %s (%s); sending final normally.",
+                fail_exc="Abandoned-draft edit failed for session %s: %s; sending final normally.",
+            )
         elif not _transformed and _stale_finalized and _sc is not None:
             # Stale finalize: edit the streamed message up to the complete response (on failure the
             # normal send delivers). Not for split delivery — message_id is only the LAST chunk.

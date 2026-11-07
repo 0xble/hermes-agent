@@ -201,6 +201,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._use_draft_streaming = False
         self._draft_id: Optional[int] = None
         self._draft_failures = 0
+        self._abandoned_draft_message_id: Optional[str] = None
         # TERMINAL authorization refusal for THIS RUN (see _send_draft_frame).
         # Per-run state, constructed fresh each turn, so a refusal can never
         # mute a healthy destination on a later turn.
@@ -289,9 +290,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return "\n\n---\n".join(p for p in (self._accumulated, progress) if p)
 
     def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False) -> dict | None:
-        """Per-send metadata.  ``final`` → notify=True (Mattermost treats notify-worthy sends
-        as final when a broken thread root may fall back flat); ``expect_edits`` keeps
-        editable previews on Telegram's legacy send path."""
+        """Per-send metadata. ``final`` carries the native draft's identity and notify=True
+        (Mattermost treats notify-worthy sends as final when a broken thread root may fall
+        back flat). ``expect_edits`` keeps editable previews on Telegram's legacy send path."""
         meta = dict(self.metadata) if self.metadata else {}
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
@@ -299,6 +300,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            if self._draft_id is not None:
+                meta["_draft_id"] = self._draft_id
         return meta or None
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).
@@ -595,7 +598,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             while True:
                 # Session reset (/new, /stop): abandon rather than deliver stale deltas.
                 if not self._run_still_current():
-                    await self._abandon_native_stream()
+                    await self._abandon_native_stream(reconcile=False)
                     return
                 tick = self._drain_queue()
 
@@ -684,7 +687,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
         finally:
-            self._wake_flush_waiters()
+            await self._finish_transports()
 
     # ── run() collaborators ─────────────────────────────────────────────
 
