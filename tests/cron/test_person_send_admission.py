@@ -92,6 +92,8 @@ def test_queued_edits_reroute_before_claim_without_losing_execution(home, monkey
     changed = declared_send(path, now, "changed")
     tail = declared_send(path, now, "tail")
     blocker = due_job(now, no_agent=edit != "agent")
+    blockers = [due_job(now, no_agent=True) for _ in range(3)] if edit != "agent" else []
+    blocker_started_extra = {item["id"]: threading.Event() for item in blockers}
     release_first, release_blocker = threading.Event(), threading.Event()
     first_started, blocker_started, changed_started, tail_done = (threading.Event() for _ in range(4))
     starts = []
@@ -105,6 +107,9 @@ def test_queued_edits_reroute_before_claim_without_losing_execution(home, monkey
         elif item["id"] == blocker["id"]:
             blocker_started.set()
             assert release_blocker.wait(10)
+        elif item["id"] in blocker_started_extra:
+            blocker_started_extra[item["id"]].set()
+            assert release_blocker.wait(30)
         elif item["id"] == changed["id"]:
             changed_started.set()
         elif item["id"] == tail["id"]:
@@ -113,8 +118,9 @@ def test_queued_edits_reroute_before_claim_without_losing_execution(home, monkey
 
     monkeypatch.setattr(scheduler, "run_one_job", run)
     try:
-        assert scheduler.tick(sync=False) == 4
+        assert scheduler.tick(sync=False) == 4 + len(blockers)
         assert first_started.wait(5) and blocker_started.wait(5)
+        assert all(event.wait(5) for event in blocker_started_extra.values())
         receipt = executions.latest_execution(changed["id"])
         if edit == "script":
             (path / "scripts" / "changed.py").write_text("pass\n", encoding="utf-8")
