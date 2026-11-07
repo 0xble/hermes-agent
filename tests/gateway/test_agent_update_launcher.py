@@ -21,6 +21,16 @@ from hermes_cli.gateway import _cmd_update
 from datetime import UTC
 
 
+@pytest.fixture(autouse=True)
+def maintenance_window(monkeypatch):
+    # These transport/lineage tests exercise unattended admission in the allowed window.
+    # Out-of-window card behavior is covered by test_lifecycle_approval.py.
+    from tools import lifecycle_approval
+    real = lifecycle_approval.maintenance_window_open
+    monkeypatch.setattr(lifecycle_approval, "maintenance_window_open",
+                        lambda: real(clock=lambda: 1793880000.0))  # 2026-11-05 04:00 PST
+
+
 def test_agent_update_resolver_error_is_user_facing_without_marker(tmp_path):
     from gateway.update_launcher import make_agent_update_handler
 

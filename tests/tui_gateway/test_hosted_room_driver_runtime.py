@@ -492,6 +492,7 @@ def test_worker_settles_without_any_client_transport(db: Path):
 
 
 def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
+    now = time.time()
     identity = _identity()
     _admit(db, identity)
     prepared = []
@@ -500,11 +501,10 @@ def test_policy_hooks_prepare_and_publish_terminal_idempotently(db: Path):
         db,
         FakeSessionRPC(),
         prepare_room=lambda binding: prepared.append(binding.room_id),
-        publish_terminal=lambda binding, task: published.append((
-            binding.room_id,
-            task["identity"].task_id,
-            task["status"],
-        )),
+        publish_terminal=lambda binding, task: published.append(
+            (binding.room_id, task["identity"].task_id, task["status"])
+        ),
+        clock=lambda: now,
     )
 
     runtime.start()

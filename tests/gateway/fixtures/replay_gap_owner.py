@@ -28,6 +28,7 @@ class Owner:
         from hermes_state import SessionDB
         from tests.fakes.runtime_owner import begin_runtime_epoch
         self.loop, self.events, self.running = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
+        self.writer_paused = threading.Event()
         self.pause, self.gaps, self.turns, self.ref = pause, [], [], SessionRef("owned", "s")
         self.running.set()
         self.db = SessionDB(db_path=db_path)
@@ -41,6 +42,8 @@ class Owner:
         self.conn = AuthorityConnection(self.authority, self, {"user_id": "viewer"})
 
     def write(self, frame):  # the viewer's socket
+        if not self.running.is_set():
+            self.writer_paused.set()
         self.running.wait(30)
         self.loop.call_soon_threadsafe(self.events.put_nowait, frame)
         return True
@@ -74,6 +77,9 @@ class Owner:
                 while not self.live.subscribers and time.monotonic() < deadline:
                     time.sleep(0.01)  # health: allow HX013 -- the owner thread waits for the re-attach
             self.authority.publish_execution("s", row["generation"], "message.delta", {"text": delta})
+            if pause and index == 0:
+                # Keep later deltas pending instead of letting the first drain batch absorb them.
+                assert self.writer_paused.wait(5), "viewer never reached its paused write"
         with self.live.event_stream.lock:
             self.authority.executing.pop("s", None)
         commit_and_publish(self.authority, self.live, self.ref, row, FINAL, "completed", None, {})
