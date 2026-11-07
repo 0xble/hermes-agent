@@ -75,6 +75,10 @@ def _row():
 def test_loaded_sources_survive_disk_replacement_until_real_profile_reload(identity_env, monkeypatch, isolation):
     homes = [identity_env / name for name in ("a", "b")]
     first_dir, first_sources = _plugin(homes[0], isolation=isolation)
+    registered = first_dir / "registered.py"
+    shared_source = identity_env / "registered.py"
+    registered.rename(shared_source)
+    registered.symlink_to(shared_source)
     py_compile.compile(str(first_dir / "helper.py"), doraise=True)
     _, second_sources = _plugin(homes[1], isolation=isolation, value=b"two")
     identities = []

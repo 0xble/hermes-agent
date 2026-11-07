@@ -28,7 +28,7 @@ class PluginSourceLoader(SourceFileLoader):
     def get_code(self, fullname: str) -> types.CodeType:
         source = self.get_data(self.path)
         code = self.source_to_code(source, self.path)
-        relative = Path(self.path).resolve().relative_to(self.capture.root).as_posix()
+        relative = Path(self.path).absolute().relative_to(self.capture.root).as_posix()
         self.capture.sources[relative] = source
         return code
 
@@ -39,7 +39,7 @@ class PluginSourceCapture:
     def __init__(self, module_name: str, root: Path | None = None):
         self.module_name = module_name
         self.directory_plugin = root is not None
-        self.root = root.resolve() if root is not None else None
+        self.root = root.absolute() if root is not None else None
         self.sources: dict[str, bytes] = {}
 
     def find_spec(self, fullname, path=None, target=None):
@@ -48,7 +48,7 @@ class PluginSourceCapture:
         spec = PathFinder.find_spec(fullname, path, target)
         if spec is None or not isinstance(spec.loader, SourceFileLoader) or spec.origin is None:
             return None
-        origin = Path(spec.origin).resolve()
+        origin = Path(spec.origin).absolute()
         if self.root is None:
             self.root = origin.parent
         if not origin.is_relative_to(self.root):
