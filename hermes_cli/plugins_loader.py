@@ -593,7 +593,7 @@ class PluginLoaderMixin:
             if in_host and not self._is_manifest_only_language_pack(manifest):
                 result = self._plugin_host().load(manifest, ctx, module_name=module_name,
                                                 entrypoint=manifest.source not in {"user", "project"})
-                return True, result.get("code_identity")
+                return True, (result or {}).get("code_identity")
             # Reuse a deferred platform's already-imported package so its body doesn't run twice.
             # See #78050.
             module = self._predeclared_modules.pop(plugin_key, None)

@@ -56,6 +56,10 @@ The Hermes manager owns the registration-time source snapshot described in
 Keep capture on the actual compiling loader, including isolated-host imports and deferred
 pre-imports. Never replace this with a status-time disk hash. Preserve the existing discovery,
 status and reload fields when adopting upstream equivalents. No profile data migration is needed.
+Digest framing is SHA-256 over each module's UTF-8 relative POSIX path, NUL, ASCII decimal
+source byte length, NUL, and source bytes, in sorted path order. Renames and file boundaries
+are part of the identity. Status reads use the discovery lock without waiting, returning null
+while discovery owns the lock or when reading rows fails (with `plugins_error` for failures).
 Rollback removes the additive identity fields without changing installed plugin source.
 Retire this patch when upstream supplies equivalent imported-byte snapshots and read-only reporting.
 

@@ -64,7 +64,36 @@ def _plugin(home, *, isolation="in_process", value=b"old"):
 
 
 def _digest(sources):
-    return hashlib.sha256(b"".join(sources[name] for name in sorted(sources))).hexdigest()
+    return hashlib.sha256(b"".join(
+        name.encode("utf-8") + b"\0" + str(len(sources[name])).encode("ascii") + b"\0" + sources[name]
+        for name in sorted(sources))).hexdigest()
+
+
+@pytest.mark.parametrize("other", [
+    {"__init__.py": b"# a\n", "helper.py": b"\n# b\n"},
+    {"__init__.py": b"# a\n\n", "renamed.py": b"# b\n"},
+])
+def test_source_identity_frames_paths_and_file_boundaries(tmp_path, other):
+    from hermes_cli.plugins_identity import PluginSourceCapture
+
+    first = PluginSourceCapture("first", tmp_path / "first")
+    second = PluginSourceCapture("second", tmp_path / "second")
+    first.sources = {"__init__.py": b"# a\n\n", "helper.py": b"# b\n"}
+    second.sources = other
+    assert b"".join(first.sources.values()) == b"".join(second.sources.values())
+    assert first.identity("1")["digest"] != second.identity("1")["digest"]
+
+
+def test_none_host_reply_loads_without_identity(identity_env, monkeypatch):
+    home = identity_env / "host-profile"
+    _plugin(home, isolation="host")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = plugins.get_plugin_manager()
+    monkeypatch.setattr(manager, "_plugin_host", lambda: SimpleNamespace(load=lambda *a, **k: None))
+    plugins.discover_plugins(force=True)
+    row = _row()
+    assert row["enabled"] is True and row["error"] is None
+    assert row["code_identity"] is None
 
 
 def _row():

@@ -1,6 +1,7 @@
 """Registration-time source identity, captured by the loaders that compile plugin code.
 
-The digest is SHA-256 of source bytes concatenated in relative POSIX-path order. Version and
+The digest is SHA-256 of (relative POSIX path, NUL, byte length, NUL, source bytes) per module,
+in sorted path order. Paths are UTF-8 and lengths are ASCII decimal. Version and
 UTC load time are separate metadata. Lazy imports after register() returns are outside the
 snapshot. No disk reads occur when reporting identity. Native, sourceless or already imported
 entry points without captured source cannot claim a source identity.
@@ -68,7 +69,9 @@ class PluginSourceCapture:
             return None
         digest = hashlib.sha256()
         for path in sorted(self.sources):
-            digest.update(self.sources[path])
+            source = self.sources[path]
+            digest.update(path.encode("utf-8") + b"\0" + str(len(source)).encode("ascii") + b"\0")
+            digest.update(source)
         return {"digest": digest.hexdigest(), "version": version,
                 "loaded_at": datetime.now(timezone.utc).isoformat(), "module_count": len(self.sources)}
 

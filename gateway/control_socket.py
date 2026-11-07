@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 from gateway.gateway_slot import SLOT_ACTIVE, effective_gateway_slot, slot_filename
 
 logger = logging.getLogger(__name__)
+_plugins_error_logged = False
 
 CONTROL_PROTOCOL_VERSION = 1
 _SOCKET_FILENAME = "gateway.sock"
@@ -196,15 +197,34 @@ def build_identify_payload() -> dict[str, Any]:
     return payload
 
 
+def _plugin_status_fields() -> dict[str, Any]:
+    """Plugin reporting must not delay or break the gateway's liveness/role signal."""
+    global _plugins_error_logged
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        from hermes_cli.plugins_identity import compact_plugin_rows
+        manager = get_plugin_manager()
+        if not manager._discovery_lock.acquire(blocking=False):
+            return {"plugins": None}
+        try:
+            return {"plugins": compact_plugin_rows(manager)}
+        finally:
+            manager._discovery_lock.release()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        if not _plugins_error_logged:
+            _plugins_error_logged = True
+            logger.warning("Gateway status plugin rows unavailable: %s", error, exc_info=True)
+        return {"plugins": None, "plugins_error": error}
+
+
 def build_status_payload() -> dict[str, Any]:
     """Default ``status`` answer — current runtime status, answered live."""
     from gateway.status import read_runtime_status
     from gateway import zero_cut_standby as zcs
-    from hermes_cli.plugins import get_plugin_manager
-    from hermes_cli.plugins_identity import compact_plugin_rows
     return {**(read_runtime_status() or {}), **zcs.readiness(), "protocol": CONTROL_PROTOCOL_VERSION,
             "answered_at": time.time(), "answering_pid": os.getpid(),
-            "plugins": compact_plugin_rows(get_plugin_manager())}
+            **_plugin_status_fields()}
 
 
 class GatewayControlServer:

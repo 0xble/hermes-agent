@@ -83,7 +83,7 @@ def reload_plugins_verb(runner: Any, loop: asyncio.AbstractEventLoop) -> Callabl
     """Control-socket ``reload-plugins``: force re-discovery under the requested home's scope so a plugin
     installed/enabled by another process (CLI, Desktop, ``plugins.manage``) loads now; the loaded event
     then re-wires that profile's adapters. Only the gateway home and served profile homes are accepted.
-    Answer: ``{"reloaded", "home", "plugins", "activations", "adapters_rewired"}``. Runs on the socket executor thread
+    Answer: ``{"reloaded", "home", "plugins", "plugin_details", "activations", "adapters_rewired"}``. Runs on the socket executor thread
     (discovery is blocking); the count is read on the loop AFTER the re-wire callback (FIFO), so a
     truthful "active now" reaches the caller."""
 
