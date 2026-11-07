@@ -30,11 +30,12 @@ def test_find_permission_diagnostic_is_not_payload(tmp_path, mode, has_match):
         locked.chmod(0o700)
 
     assert all(not path.startswith("find: ") for path in result.files), result.to_dict()
+    assert result.error is None, result.to_dict()
+    assert result.warning and "restricted permissions" in result.warning, result.to_dict()
+    assert result.skipped_paths == [str(locked)]
     if not has_match:
-        assert result.error and "Permission denied" in result.error, result.to_dict()
         assert result.total_count == 0
     else:
-        assert result.error is None, result.to_dict()
         assert result.total_count == 1, result.to_dict()
         if mode == "files_only":
             assert result.files == [str(readable)]

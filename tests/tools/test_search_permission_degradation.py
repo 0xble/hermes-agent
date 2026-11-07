@@ -19,6 +19,7 @@ Contract after the fix:
 """
 
 import os
+import re
 import shutil
 
 import pytest
@@ -112,7 +113,14 @@ class RecordingEnvironment:
         if "--version" in command:
             return {"output": self.rg_version, "returncode": 0}
         if "--files" in command:
-            return {"output": self.rg_output, "returncode": self.rg_code}
+            marker_match = re.search(r"__HERMES_RG_STDERR_[0-9a-f]+__", command)
+            assert marker_match is not None
+            marker = marker_match.group()
+            lines = self.rg_output.splitlines()
+            diagnostics = [line for line in lines if line.startswith(("rg: ", "grep: "))]
+            paths = [line for line in lines if line not in diagnostics]
+            output = "\n".join(paths) + "\n" + marker + "\n".join(diagnostics)
+            return {"output": output, "returncode": self.rg_code}
         if "--line-number" in command:
             # rg content-search invocation (goes through the same canned output).
             return {"output": self.rg_output, "returncode": self.rg_code}
@@ -319,7 +327,7 @@ def test_content_search_hard_error_regex_still_surfaced():
     assert result.error is not None
     assert result.error.startswith("Search failed: rg: regex parse error:")
     assert "unclosed character class" in result.error
-    assert result.warning is None
+    assert result.warning == "Invalid regex; retried once as a fixed-string (literal) search."
 
 
 @pytest.mark.parametrize("code", [126, 2])

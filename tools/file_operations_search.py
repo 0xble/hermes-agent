@@ -345,24 +345,28 @@ def _find_exit_verdict(exit_code: int, raw_files: list[str], diagnostics: list[s
                              "permissions); results are partial.")
 
 
-def _drain_stderr_capped(pipe, chunks: list[bytes], omitted: list[int]) -> None:
+def _drain_stderr_capped(pipe, chunks: list[bytes], omitted: list[int],
+                         retain_bytes: Optional[int] = None) -> None:
     """Read ``pipe`` to EOF (rg must never block on a full stderr pipe) but keep only the
     first ``_STDERR_RETAIN_BYTES``; the first line is always kept so a lone huge diagnostic
     still names the failure. ``omitted[0]`` counts the dropped lines. Past the cap the first
     non-permission line is still kept, so a real failure behind a flood of permission
-    errors is never classified as a permission-only partial success."""
+    errors is never classified as a permission-only partial success. Filename
+    capture selects a smaller prefix and caps individual diagnostic lines too;
+    complete retained lines and the omitted tally remain available for classification."""
     kept = 0
     kept_other = False
+    cap = _STDERR_RETAIN_BYTES if retain_bytes is None else min(_STDERR_RETAIN_BYTES, retain_bytes)
     for raw in pipe or ():
-        if chunks and kept + len(raw) > _STDERR_RETAIN_BYTES:
+        if chunks and kept + len(raw) > cap:
             line = raw.decode("utf-8", "replace").strip()
             if not kept_other and line and not _PERMISSION_DENIED_RE.match(line):
-                chunks.append(raw)
+                chunks.append(raw if retain_bytes is None else raw[:retain_bytes])
                 kept_other = True
                 continue
             omitted[0] += 1
             continue
-        chunks.append(raw)
+        chunks.append(raw if retain_bytes is None else raw[:retain_bytes])
         kept += len(raw)
 
 
@@ -435,7 +439,7 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     # BSD find -exec ... + reports a grep hard error as exit 1, not 2.
     # A normal grep no-match is also 1, but has no diagnostics.
     hard_error = result.exit_code == 2 or (result.exit_code == 1 and bool(diagnostics.strip()))
-    if hard_error and not payload.strip():
+    if hard_error and not payload.strip() and not _is_permission_only_error(diagnostics):
         error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
     skip = _skipped_fields(diagnostics)
@@ -689,28 +693,17 @@ class SearchMixin:
                     bounded.set()
                     break
 
-        diagnostics = bytearray()
-
-        def _drain_stderr() -> None:
-            # Continue draining after the bound so a noisy failure cannot fill
-            # its pipe and deadlock the bounded stdout reader.
-            assert proc.stderr is not None
-            while chunk := proc.stderr.read(4096):
-                diagnostics.extend(chunk[:max(0, 4096 - len(diagnostics))])
-
-        error_drainer = None
-        if capture_stderr and not merge_stderr:
-            error_drainer = threading.Thread(target=_drain_stderr, daemon=True)
-            error_drainer.start()
         drainer = threading.Thread(target=_drain, daemon=True)
         drainer.start()
         err_chunks: list[bytes] = []
         err_omitted = [0]
         err_drainer = None
-        if merge_stderr:
+        if merge_stderr or capture_stderr:
             err_pipe = proc.stderr
             err_drainer = threading.Thread(  # health: allow HX012 -- pipe drainer, reads no profile-scoped state
-                target=_drain_stderr_capped, args=(err_pipe, err_chunks, err_omitted), daemon=True)
+                target=_drain_stderr_capped,
+                args=(err_pipe, err_chunks, err_omitted, 4096 if capture_stderr else None),
+                daemon=True)
             err_drainer.start()
         deadline = time.monotonic() + timeout
         exit_code: Optional[int] = None
@@ -729,11 +722,7 @@ class SearchMixin:
         proc.wait()
         drainer.join()
         proc.stdout.close()
-        if error_drainer:
-            error_drainer.join()
-            assert proc.stderr is not None
-            proc.stderr.close()
-        stderr = diagnostics.decode("utf-8", errors="replace")
+        stderr = ""
         stdout = b"".join(lines).decode("utf-8", errors="replace")
         if err_drainer is not None:
             err_drainer.join()
@@ -742,7 +731,10 @@ class SearchMixin:
             err_text = b"".join(err_chunks).decode("utf-8", errors="replace")
             if err_omitted[0]:
                 err_text = err_text.rstrip("\n") + "\n" + _omitted_diagnostics_line(err_omitted[0]) + "\n"
-            stdout = err_text + stdout
+            if merge_stderr:
+                stdout = err_text + stdout
+            else:
+                stderr = err_text
         if exit_code == 124:
             return ExecuteResult(stdout=stdout + f"\n[Command timed out after {timeout}s]", exit_code=124, stderr=stderr)
         if exit_code == 130:
@@ -1413,13 +1405,13 @@ class SearchMixin:
                                     else posixpath.join(parent, file))
                  for file in stdout.splitlines() if file]
         bounded_sigpipe = result.exit_code == 141 and len(files) >= fetch_limit
-        diagnostic = result.stderr.strip()[:4096]
-        permission_partial = result.exit_code == 2 and bool(files) and _is_permission_only_error(diagnostic)
+        diagnostic = result.stderr.strip()
+        permission_partial = result.exit_code == 2 and _is_permission_only_error(diagnostic)
         if result.exit_code not in {0, 1, 124} and not bounded_sigpipe and not permission_partial:
             operation = "Exact modification-time order" if order == "modified" else "File search"
             return SearchResult(error=(
-                f"{operation} failed while running ripgrep (exit {result.exit_code})."
-                + (f" {diagnostic}" if diagnostic else "")))
+                f"{operation} failed while running ripgrep (exit {result.exit_code}, invocation failure)."
+                + (f" {diagnostic[:4096]}" if diagnostic else "")))
         # find's directory supplement supports basename globs, not path/brace globs.
         if limit_reason != "search_timeout" and has_find:
             basename = pattern.rsplit('/', 1)[-1]
@@ -1436,6 +1428,10 @@ class SearchMixin:
         if time.monotonic() >= deadline:
             limit_reason = "search_timeout"
         skip = _skipped_fields(diagnostic)
+        skip["skipped_paths"] = [
+            path if posixpath.isabs(path) or re.match(r"^[A-Za-z]:/", path)
+            else posixpath.normpath(posixpath.join(parent, path))
+            for path in skip["skipped_paths"]]
         return SearchResult(files=files, total_count=len(files), limit_reason=limit_reason,
                             warning=_prepend_skipped_paths_warning(skip, None), **skip)
 

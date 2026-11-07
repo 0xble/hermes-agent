@@ -52,9 +52,13 @@ exceed its basename syntax. The no-rg `find -name` fallback
 retains its historical basename-only syntax. Content matching is unchanged;
 BSD find-wrapped grep errors now surface diagnostics at exit 1 instead of being
 misreported as empty matches (a diagnostic-free grep exit 1 still means no matches).
-This intentionally includes an unreadable subdirectory with no usable match
-payload: it errors like ripgrep, rather than leaking `find: ... Permission denied`
-as a filename. Partial readable matches remain usable in all output modes.
+Permission-only traversal failures retain readable matches, or return an empty
+result with an actionable skipped-path warning when nothing matched. Other
+diagnostic-only errors still fail, and diagnostics never become filenames.
+Native filename and content search share the line-aware stderr drainer, including
+the omitted-path tally and retention of a real error beyond a permission flood.
+Filename warnings resolve skipped paths against each root job's subprocess cwd.
+Partial readable matches remain usable in all output modes.
 
 ## Timeout provenance
 
