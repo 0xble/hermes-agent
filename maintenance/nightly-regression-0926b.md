@@ -20,6 +20,53 @@ The writable-replacement check adapts the final access revalidation from [upstre
 
 The absent-path guard alone does not cover an absent-then-recreated database between `os.access` and the later existence check. Teknium's upstream [quarantine-lock preflight repair](https://github.com/NousResearch/hermes-agent/commit/8c118f7834d0f66639e4198efb9c8b9bd2c2ccee) and [directory-before-lock repair](https://github.com/NousResearch/hermes-agent/commit/59b70c943a5f3504e03dab0b2ed4ceb3a8b32848) from merged [PR #140511](https://github.com/NousResearch/hermes-agent/pull/140511) arrived with the upstream sync and are not fork code. The fork patch narrows upstream's unlocked branch: only a positively observed SQLite header permits unlocked preflight. Missing, invalid, unreadable or deliberately skipped header probes retain the existing quarantine lock through file/sidecar permission repair, quarantine, connection and schema commit. An unreadable damaged file must not enter the unlocked branch and become eligible for quarantine only after its permissions are repaired. Directory repair stays before lock creation. Retain the fork's absent-path guard and live-connection byte-probe guard. `tests/hermes_state/test_zeroed_db_quarantine_race.py` keeps upstream's mid-quarantine test and adds the fork's absent/recreated interleaving outside HERMES_HOME and the unreadable-file permission-repair interleaving inside it, each with 2 real openers, real filesystem results, retained canonical sessions and forensic backup integrity.
 
+## Shared-writer startup race (session-end CI)
+
+`test_session_end_delegations.py` labels a notification kind `[process]`; it does
+not spawn a process. A dispatch publishes terminal status before its worker has
+finished ledger persistence, and the fixture formerly shut down its executor
+with `wait=False`. A trailing ledger write could therefore observe the next
+test's HERMES_HOME and become the first opener of that test's state.db. Draining
+these finite fake runners before monkeypatch teardown removes that trigger.
+
+The underlying defect is product code, not just fixture cleanup: the async
+ledger precreated an empty state.db and opened it without SessionDB's startup
+lock or live-connection tracking. SessionDB could acquire its lock, see that
+live empty inode as corruption, and quarantine it with its sidecars. Two normal
+application writers can reproduce the same split-generation/disk-I/O failure.
+`hermes_cli.sqlite_util.open_shared_state_db` now owns the existing quarantine
+lock before empty-file creation through schema commit and uses the tracked
+connector. Both async-delegation and delivery ledgers use it. Standalone ledger
+opens refuse an existing invalid header or unavailable lock without moving any
+bytes; SessionDB remains the sole recovery/provenance owner. Its fail-closed
+quarantine behavior and forensic backups are unchanged. Incognito RAM delivery
+continues to bypass on-disk startup.
+
+A failed first ledger open must not strand the newly created zero-byte primary:
+subsequent ledger opens would reject it as a damaged header and SessionDB would
+produce a spurious forensic backup. The shared opener creates the primary with
+`O_EXCL` under the startup lock and retains its device/inode identity. On open,
+initialization or commit failure it removes only that same still-empty primary
+and empty sidecars absent before this attempt, before releasing the lock. Existing,
+replaced or nonempty primaries, pre-existing sidecars and nonempty sidecars remain untouched.
+Retry/preservation regressions cover both ledgers and failures at connection and
+schema initialization. The session-end fixture waits on its recorded futures
+with a 10-second bound instead of an unbounded executor join.
+
+The valid-header ledger fast path remains a follow-up: an existing SQLite header
+alone does not establish that both ledger schemas exist, so this correctness
+repair retains startup locking and schema reconciliation on each connect.
+
+The event-controlled first-opener regression in
+`tests/hermes_state/test_delegation_startup_race.py` is RED before the product
+fix: the real SessionDB quarantines the paused ledger's zero-byte DB and the
+ledger then raises `sqlite3.OperationalError: disk I/O error`. The suite also
+checks both ledgers' live connection registration and invalid-file refusal.
+Run it with the canonical runner, zero file retries, alongside session-end,
+SQLite utility, delegation/fd-leak and delivery-ledger tests. Open fork and
+upstream PR searches for state.db/delegation startup found no equivalent fix;
+upstream quarantine-preflight PRs address SessionDB peers, not this raw writer.
+
 ## Verification and retirement
 
 Run `scripts/run_tests.sh --file-retries 0 tests/hermes_state` for the quarantine/preflight integration, including read-only refusal, directory-before-lock repair, concurrent no-clobber quarantine, forensic backup and integrity. For the remaining repairs, run `scripts/run_tests.sh --file-retries 0` on `tests/e2e/core/providers/test_native_copilot_acp.py` (Linux non-root) and `tests/tools/test_process_heartbeat.py` in a pinned Linux CI container. The forced quarantine preflight race and heartbeat ordering tests are event-synchronized. Run `scripts/check_fork_patches.py --repo . --source-only` with a clean HOME and HERMES_HOME after committing.

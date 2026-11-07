@@ -219,12 +219,12 @@ def _connect() -> sqlite3.Connection:
     if is_incognito():
         from gateway.incognito import ram_connect
         return ram_connect("delivery:" + str(_db_path()), _initialize_schema)
-    from hermes_cli.sqlite_util import open_db
+    from hermes_cli.sqlite_util import open_shared_state_db
 
-    # Shared state.db: SessionDB owns the durable PRAGMA set; this opener keeps the plain-tuple rows
-    # and the 10 s busy timeout it always had.
-    return open_db(_db_path(), db_label="state.db (delivery_ledger)", busy_timeout_ms=10_000,
-                   row_factory=None, initialize=_initialize_schema)
+    # Shared state.db writers must participate in SessionDB startup serialization
+    # and connection tracking, not expose a live empty DB to its quarantine probe.
+    return open_shared_state_db(_db_path(), db_label="state.db (delivery_ledger)",
+                                initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

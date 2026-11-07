@@ -16,33 +16,15 @@ from tools import async_delegation as ad
 
 
 class _TrackingConnection:
-    """Delegates to a real sqlite3.Connection while recording close() calls.
+    """Close instrumentation mixed into the requested real connection factory.
 
-    sqlite3.Connection is a static C type: it has no per-instance __dict__ and
-    its methods can't be monkeypatched, so open/close tracking is done via a
-    delegating wrapper returned in place of the real connection.
+    Keep sqlite_safe_read's tracked factory/close semantics intact; a delegating
+    proxy is not itself a SQLite connection and cannot safely track its lifetime.
     """
 
-    def __init__(self, real, closed_ids):
-        object.__setattr__(self, "_real", real)
-        object.__setattr__(self, "_closed_ids", closed_ids)
-
     def close(self):
-        self._closed_ids.append(id(self._real))
-        self._real.close()
-
-    def __enter__(self):
-        self._real.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return self._real.__exit__(exc_type, exc, tb)
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-    def __setattr__(self, name, value):
-        setattr(self._real, name, value)
+        self._closed_ids.append(id(self))
+        super().close()
 
 
 def _point_ledger(monkeypatch, tmp_path):
@@ -55,9 +37,12 @@ def _track_connections(monkeypatch):
     real_connect = sqlite3.connect
 
     def tracking_connect(*args, **kwargs):
+        factory = kwargs.pop("factory", sqlite3.Connection)
+        kwargs["factory"] = type("ObservedConnection", (_TrackingConnection, factory), {})
         conn = real_connect(*args, **kwargs)
+        conn._closed_ids = closed
         opened.append(id(conn))
-        return _TrackingConnection(conn, closed)
+        return conn
 
     monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
     return opened, closed
@@ -110,22 +95,25 @@ def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
         def execute(self, sql, *args, **kwargs):
             if "CREATE TABLE" in sql:
                 raise sqlite3.OperationalError("simulated schema init failure")
-            return self._real.execute(sql, *args, **kwargs)
+            return super().execute(sql, *args, **kwargs)
 
         def executescript(self, script):
             if "CREATE TABLE" in script:
                 raise sqlite3.OperationalError("simulated schema init failure")
-            return self._real.executescript(script)
+            return super().executescript(script)
 
         def cursor(self, *args, **kwargs):
-            return _FailingSchemaCursor(self._real.cursor(*args, **kwargs))
+            return _FailingSchemaCursor(super().cursor(*args, **kwargs))
 
     def tracking_connect(database, *args, **kwargs):
-        conn = real_connect(database, *args, **kwargs)
         if str(database) == ":memory:":
-            return conn
+            return real_connect(database, *args, **kwargs)
+        factory = kwargs.pop("factory", sqlite3.Connection)
+        kwargs["factory"] = type("FailingObservedConnection", (_FailingSchemaConnection, factory), {})
+        conn = real_connect(database, *args, **kwargs)
+        conn._closed_ids = closed
         opened.append(id(conn))
-        return _FailingSchemaConnection(conn, closed)
+        return conn
 
     monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
 
