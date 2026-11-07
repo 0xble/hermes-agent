@@ -23,9 +23,17 @@ transcript echo, or queued follow-up drain.
 - Under session authority a busy messaging follow-up is committed to the durable FIFO
   (`_hm_authority_admission`) and its turn runs a new event restored from the row. Once that
   row is durably `queued`, the live event's STT starts (the `admitted_queued` hook) and is
-  published under its transport identity; the claimed turn adopts the transcript and echo
+  published under the row's admission id; the claimed turn adopts the transcript and echo
   ledger in `_prepare_inbound_message_text` instead of transcribing again. A refused or
   fenced admission starts no STT. Steer-fallback and interrupt transcripts are adopted too.
+- A redelivery (lost ACK, relay replay) reconciles onto the same row and admission id, so it
+  starts no second STT and no second echo. Only a result with at least one transcript is
+  adopted: a failed or disabled STT is retried by the turn against the committed copy, and
+  failure notes are repointed from the adapter download to that copy. When `/stop`, `/new` or
+  a refusal fences the row before its turn, the in-flight STT is cancelled so no late echo
+  answers a message that will not run. A row whose waiter was only paused keeps its prefetch.
+- Known gap: a gateway restart between admission and the turn loses the in-memory prefetch,
+  so that turn transcribes and echoes the note a second time.
 - Preserve queue admission receipts when integrating the shared FIFO prefetch:
   `_queue_or_replace_pending_event` returns true only for an admitted event and
   false for a missing adapter or a full queue. Refused voice events start no STT;
@@ -47,6 +55,9 @@ transcript echo, or queued follow-up drain.
 ## Verification
 
 Contract tests: `tests/gateway/test_queued_voice_durable_fifo.py::test_voice_queued_behind_running_turn_echoes_before_it_finishes_and_is_transcribed_once`,
+  `tests/gateway/test_queued_voice_durable_fifo.py::test_redelivered_voice_note_is_transcribed_and_echoed_once`,
+  `tests/gateway/test_queued_voice_durable_fifo.py::test_failed_prefetch_is_retried_by_the_turn_against_the_committed_copy`,
+  `tests/gateway/test_queued_voice_durable_fifo.py::test_fenced_queued_voice_never_echoes_late`,
   `tests/gateway/test_telegram_voice_v0_regressions.py::test_queued_voice_transcribes_immediately_and_drain_reuses_it`,
   `tests/gateway/test_telegram_voice_v0_regressions.py::test_fifo_voice_from_queue_command_prefetches_before_drain`
 
