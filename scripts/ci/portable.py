@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import errno
 import hashlib
 import importlib.util
 import json
@@ -11,9 +12,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -238,8 +242,154 @@ def external_temporary_directory(prefix: str, parent: Path | None = None) -> Ite
     for ancestor in (parent, *parent.parents):
         if (ancestor / '.git').exists() or (ancestor / 'node_modules').exists():
             raise RuntimeError(f'Temporary directory parent has Git or Node dependency ancestry: {parent}')
+    if prefix == 'hermes-ci-home-':
+        with owned_ci_home(parent) as home:
+            yield home
+        return
     with tempfile.TemporaryDirectory(prefix=prefix, dir=parent) as temporary:
         yield Path(temporary)
+
+
+@contextmanager
+def temporary_home_lock(path: Path, *, wait: bool) -> Iterator[bool]:
+    """Do not follow a substituted lock file, or mistake lock contention for death."""
+    if path.is_symlink():
+        raise OSError(f'Symlink HOME lock: {path}')
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, 'r+b') as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode) or path.is_symlink():
+            raise OSError(f'Not a regular HOME lock: {path}')
+        if os.name == 'nt':
+            import msvcrt
+            if os.fstat(lock.fileno()).st_size == 0:
+                lock.write(b'0')
+                lock.flush()
+            lock.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    if not wait:
+                        yield False
+                        return
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield False
+                return
+        yield True
+
+
+def ci_owner_identity() -> dict[str, str | int]:
+    """Record OS process creation time, rather than trusting a reusable PID."""
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(kernel.GetCurrentProcess(), ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(system), ctypes.byref(user)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        started = str((created.dwHighDateTime << 32) | created.dwLowDateTime)
+    elif sys.platform.startswith('linux'):
+        # Slim CI containers need no procps package just to record ownership.
+        fields = Path('/proc/self/stat').read_text(encoding='utf-8-sig').rsplit(')', 1)[1].split()
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8-sig').strip()
+        started = f'{boot}:{fields[19]}'
+    else:
+        started = subprocess.check_output(
+            ['ps', '-p', str(os.getpid()), '-o', 'lstart='], text=True, encoding='utf-8',
+            env=dict(os.environ, LC_ALL='C'), timeout=10,
+        ).strip()
+    return {'pid': os.getpid(), 'process_start': started, 'host_id': socket.gethostname()}
+
+
+def ci_home_bytes(home: Path) -> int:
+    """Allocated bytes, without traversing directory links or junctions."""
+    total = 0
+    with os.scandir(home) as entries:
+        for entry in entries:
+            info = entry.stat(follow_symlinks=False)
+            total += getattr(info, 'st_blocks', (info.st_size + 511) // 512) * 512
+            if entry.is_dir(follow_symlinks=False) and not _home_reparse_point(info):
+                total += ci_home_bytes(Path(entry.path))
+    return total
+
+
+def _home_reparse_point(info: os.stat_result) -> bool:
+    return bool(getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0))
+
+
+def sweep_ci_homes(parent: Path) -> None:
+    """Called under the parent lock, including publication of the next owner."""
+    count = reclaimed = 0
+    for home in parent.iterdir():
+        if not home.name.startswith('hermes-ci-home-'):
+            continue
+        try:
+            info = home.lstat()
+            if not stat.S_ISDIR(info.st_mode) or _home_reparse_point(info):
+                continue
+            # Inspect legacy age before opening our lock, which changes directory mtime.
+            newest = max([info.st_mtime, *(entry.lstat().st_mtime for entry in home.iterdir())])
+            marker = home / '.owner.json'
+            marked = stat.S_ISREG(marker.lstat().st_mode) if not marker.is_symlink() and marker.exists() else False
+            if not marked and time.time() - newest < 24 * 60 * 60:
+                continue
+            with temporary_home_lock(home / '.owner.lock', wait=False) as held:
+                if not held:
+                    continue
+                size = ci_home_bytes(home)
+                if os.name != 'nt':
+                    shutil.rmtree(home)
+            if os.name == 'nt':
+                # Windows cannot remove an open lock file. The parent lock
+                # still fences all creators and sweepers after this close.
+                shutil.rmtree(home)
+            count += 1
+            reclaimed += size
+        except FileNotFoundError:
+            continue  # A normally exiting owner can remove its home during enumeration.
+        except OSError as error:
+            print(f'portable CI: skipped {home.name}: {error}', file=sys.stderr)
+    print(f'portable CI: reclaimed {count} home(s), {reclaimed} allocated bytes', flush=True)
+
+
+@contextmanager
+def owned_ci_home(parent: Path) -> Iterator[Path]:
+    # Serialize mkdir/marker/lock publication with sweep, never the CI workload.
+    with ExitStack() as owner:
+        with temporary_home_lock(parent / '.hermes-ci-homes.lock', wait=True) as held:
+            if not held:
+                raise RuntimeError('Could not acquire temporary HOME registry lock')
+            sweep_ci_homes(parent)
+            home = Path(tempfile.mkdtemp(prefix='hermes-ci-home-', dir=parent))
+            try:
+                if not owner.enter_context(temporary_home_lock(home / '.owner.lock', wait=True)):
+                    raise RuntimeError('Could not acquire new temporary HOME lock')
+                (home / '.owner.json').write_text(json.dumps(ci_owner_identity()), encoding='utf-8')
+            except BaseException:
+                owner.close()
+                shutil.rmtree(home)
+                raise
+        try:
+            yield home
+        finally:
+            # Keep sweepers excluded until the owner lock and tree are both gone.
+            with temporary_home_lock(parent / '.hermes-ci-homes.lock', wait=True) as held:
+                if not held:
+                    raise RuntimeError('Could not acquire temporary HOME cleanup lock')
+                owner.close()
+                shutil.rmtree(home)
 
 
 def windows_appdata_environment(home: Path) -> dict[str, str]:
