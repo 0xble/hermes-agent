@@ -56,6 +56,12 @@ inherited through `GatewayTurnMixin`, not before it as a second direct base:
 the reversed ancestor order prevents `GatewayRunner` from importing. Preserve
 the real gateway route and scratch-runner regressions when reconciling this split.
 
+Queued-row cancellation regressions follow upstream's detached-conversation
+contract, not the retired read-only `superseded` flag. Preserve terminal
+cancellation and deletion assertions, and prove the old conversation mounts
+off the chat without changing the chat's current conversation. The existing
+app-turn and handoff regressions protect continued access and delivery isolation.
+
 `run_tests_parallel.py` retains the child return code (and terminating signal),
 runner status and presence/absence of a terminal pytest summary on every failed
 attempt. A timed-out or crashed child with no parsed outcomes is reported as

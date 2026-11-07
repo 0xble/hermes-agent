@@ -1,10 +1,10 @@
-"""Queued messaging rows never outlive the conversation that /new replaced.
+"""Queued messaging rows can be settled after their chat moves on.
 
 A /new that arrived right after a restart, before startup recovery mounted the route's durable
 FIFO, skipped that FIFO's queued rows: the lane moved to a fresh session and the old rows stayed
-``queued`` forever. Once superseded, every write (cancel included) was refused as
-``session_superseded`` and the ledger refused the delete as ``session_busy``. Real GatewayRunner,
-DiscordAdapter and authority over a real SessionDB.
+``queued`` forever. Reset settles them even before recovery. Stranded rows can still be cancelled
+from the detached conversation without repointing the chat, then the conversation can be deleted.
+Real GatewayRunner, DiscordAdapter and authority over a real SessionDB.
 """
 import pytest
 
@@ -79,7 +79,8 @@ async def test_a_superseded_sessions_queued_rows_can_be_cancelled_then_deleted(m
     # The stranded state a pre-fix /new left: the lane moved on, the old rows still queued.
     authority.sessions.pop(owner)
     runner.session_store.reset_session(key)
-    assert runner.session_store.peek_session_id(key) != owner
+    current = runner.session_store.peek_session_id(key)
+    assert current != owner
 
     actor = SessionActor('messaging-control', authority.profile_id,
                       frozenset({'session:submit', 'session:control'}), 'operator')
@@ -87,6 +88,8 @@ async def test_a_superseded_sessions_queued_rows_can_be_cancelled_then_deleted(m
     for admission_id in queued:
         receipt = await authority.cancel_queued(actor, ref, admission_id)
         assert (receipt.status, receipt.outcome) == ('terminal', 'cancelled')
-    assert authority.sessions[owner].superseded, 'the old conversation mounted read-only'
+    assert authority.sessions[owner].detached, 'the old conversation mounted off the chat'
+    assert authority.sessions[owner].route != key
+    assert runner.session_store.peek_session_id(key) == current
     assert _rows(authority, owner) == [('A', 'terminal', 'cancelled'), ('B', 'terminal', 'cancelled')]
     assert authority.db.delete_session(owner, exclude_active_write_guards=True)
