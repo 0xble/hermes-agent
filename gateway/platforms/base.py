@@ -1658,6 +1658,10 @@ class ExecApprovalPrompt:
 _INGRESS_CONSUMER: "_contextvars.ContextVar[Optional[asyncio.Task]]" = _contextvars.ContextVar(
     "gateway_ingress_consumer", default=None)
 
+# Only this invocation's adapter lifecycle promises to fire delivery callbacks.
+post_delivery_owner: _contextvars.ContextVar[Optional[tuple]] = _contextvars.ContextVar(
+    "gateway_post_delivery_owner", default=None)
+
 
 # (obligation id, event, adapter) while send_final_ledgered awaits the send. Task-local, because
 # one adapter serves many sessions at once: the send's finally reads only its own turn's entry if
@@ -5355,7 +5359,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """
         assert self._message_handler is not None
         while True:
-            response = await self._message_handler(event)
+            token = post_delivery_owner.set((self, event))
+            try:
+                response = await self._message_handler(event)
+            finally:
+                post_delivery_owner.reset(token)
             if (response is not None or not getattr(event, "_gateway_compression_deferred", False)
                     or self._pending_messages.get(session_key) is not event):
                 return response
