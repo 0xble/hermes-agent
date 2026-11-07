@@ -1,11 +1,15 @@
 # Session-scoped Fast expiry
 
-Load this unit when changing `agent.fast_expiry_seconds` or the gateway's
+Load this unit when changing `agent.fast_expiry_seconds`,
+`agent.ultrafast_expiry_seconds`, or the gateway's
 session-scoped `/fast fast` / `/fast ultrafast` override lifecycle.
 
 ## Required behavior
 
-- `agent.fast_expiry_seconds` defaults to `0`, which disables expiry.
+- `agent.fast_expiry_seconds` defaults to `1800` (30 minutes) for session `fast`.
+- `agent.ultrafast_expiry_seconds` defaults to `300` (5 minutes) for session
+  `ultrafast`, independently of the Fast setting.
+- An explicit `0` disables expiry for that tier only.
 - Only session-scoped static Fast overrides (`fast` / `ultrafast`) expire. The
   bounded `auto` and `cold` modes, explicit `normal`, and `--global` writes do
   not use this deadline.
@@ -33,13 +37,19 @@ Retire this patch if upstream ships equivalent behavior.
 
 ## Configuration
 
-The parent can enable the eight-hour policy later with:
+The fork defaults are 30 minutes for Fast and 5 minutes for Ultrafast.
+Each setting accepts seconds, including fractional seconds. For example:
 
 ```text
-hermes config set agent.fast_expiry_seconds 28800
+hermes config set agent.fast_expiry_seconds 1800
+hermes config set agent.ultrafast_expiry_seconds 300
 ```
 
-Do not run that command as part of source delivery.
+Set either key to `0` to keep that tier enabled until explicitly changed.
+A missing key uses its own default, so an existing Fast setting does not
+change Ultrafast's 5-minute default. Invalid values warn with the affected key
+and disable expiry for that tier only. Do not run these commands as part of
+source delivery.
 
 ## Verification
 
@@ -51,7 +61,9 @@ matrix below is the acceptance contract for this patch.
 ### Ownership and state transition
 
 `ConversationState.service_tier_override` is authoritative for a session. A
-static session selection stores a wall-clock deadline beside that override;
+static session selection maps its tier to the corresponding expiry config key,
+using the defaults from `hermes_cli.config_defaults.DEFAULT_CONFIG`, and stores
+a wall-clock deadline and the selected duration beside that override;
 `auto`, `cold`, explicit normal, and global config writes have no deadline.
 When `_resolve_session_service_tier` observes `time.time() >= deadline`, it
 sets the session override to `None`, clears the deadline, and calls
@@ -101,7 +113,7 @@ second notice if another path already consumed it.
 ### Non-goals
 
 - No expiry for CLI, TUI, cron, ACP, subagent, or other non-messaging-gateway
-  surfaces.
+  surfaces. No child-side timer or delegation changes.
 - No expiry for `auto`, `cold`, explicit normal, or `--global`.
 - No changes to `_merge_turn_request_overrides`,
   `_set_pending_turn_sidecar_notes`, `_consume_pending_turn_sidecar_notes`, or
@@ -124,11 +136,11 @@ second notice if another path already consumed it.
 | 6 | Expiry notice plus another staged note appears once in order | `test_expiry_notice_and_other_staged_note_are_delivered_once` |
 | 7 | `/fast fast` after deadline replies with notice once, enables Fast with a new deadline, next turn has no notice | `test_fast_selection_after_expiry_replies_once_and_restarts_deadline` |
 | 8 | `/fast status` after deadline shows normal plus notice once | `test_fast_status_after_expiry_shows_normal_and_notice_once` |
-| 9 | `ultrafast` follows the same expiry semantics | `test_fast_reenable_restarts_expiry_clock_and_ultrafast_expires` |
+| 9 | Re-enabling either static tier restarts its own deadline | `test_fast_reenable_restarts_expiry_clock_and_ultrafast_expires` |
 | 10 | `auto`, `cold`, `normal`, and `--global` never expire | `test_non_static_fast_modes_never_get_a_deadline`; `test_fast_global_never_expires` |
-| 11 | Default `0` never expires | `test_fast_expiry_default_zero_never_expires` |
-| 12 | Invalid values warn and count as `0` | `test_invalid_fast_expiry_is_disabled_with_warning` |
-| 13 | Status and picker remaining time use h/m | `test_fast_status_reports_remaining_time_in_hours_and_minutes`; `test_fast_picker_title_includes_human_readable_expiry` |
+| 11 | Fast defaults to 30m, Ultrafast defaults to 5m even with an existing Fast-only config, custom durations are independent, explicit `0` never expires | `test_static_tiers_use_independent_expiry_settings`; `test_explicit_zero_never_expires` |
+| 12 | Invalid values for either tier warn with that key and count as `0` | `test_invalid_fast_expiry_is_disabled_with_warning` |
+| 13 | Status and picker remaining time use the correct tier's duration in h/m | `test_fast_status_reports_remaining_time_in_hours_and_minutes`; `test_fast_picker_title_includes_human_readable_expiry` |
 | 14 | Running-agent transition matches `/fast off` | `test_live_agent_read_time_filter_is_non_mutating_until_resolution` |
 
 Tests use frozen virtual clocks; no sleeps are used. Rows 1, 2, 4, and 5

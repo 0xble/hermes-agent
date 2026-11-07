@@ -180,14 +180,51 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
 
 
-def _set_gateway_fast_config(monkeypatch, tmp_path, *, service_tier="", expiry=0):
+def _set_gateway_fast_config(monkeypatch, tmp_path, *, service_tier="", expiry=0, ultrafast_expiry=0):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
-        lambda: {"agent": {"service_tier": service_tier, "fast_expiry_seconds": expiry}},
+        lambda: {"agent": {"service_tier": service_tier, "fast_expiry_seconds": expiry,
+                           "ultrafast_expiry_seconds": ultrafast_expiry}},
     )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-6-astra")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("word, config, seconds", [
+    ("fast", {}, 1800),
+    ("ultrafast", {}, 300),
+    ("ultrafast", {"fast_expiry_seconds": 1800}, 300),
+    ("fast", {"fast_expiry_seconds": 120, "ultrafast_expiry_seconds": 420}, 120),
+    ("ultrafast", {"fast_expiry_seconds": 120, "ultrafast_expiry_seconds": 420}, 420),
+    ("fast", {"ultrafast_expiry_seconds": 0}, 1800),
+    ("ultrafast", {"fast_expiry_seconds": 0}, 300),
+])
+async def test_static_tiers_use_independent_expiry_settings(monkeypatch, tmp_path, word, config, seconds):
+    runner = _make_runner()
+    load_gateway_config = gateway_run._load_gateway_config
+    _set_gateway_fast_config(monkeypatch, tmp_path)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"agent": config}), encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: load_gateway_config(config_path))
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"provider": "openai-api"})
+    clock = {"now": 100.0}
+    monkeypatch.setattr("gateway.run_config_loaders.time.time", lambda: clock["now"])
+    event = _make_event(f"/fast {word}")
+    key = runner._session_key_for_source(event.source)
+    await runner._handle_fast_command(event)
+    assert runner._session_service_tier_expiry(key) == (100.0 + seconds, seconds)
+    status = await runner._handle_fast_command(_make_event("/fast status"))
+    assert status is not None
+    assert f"Expires in: {seconds // 60}m" in status
+    clock["now"] += seconds - 0.01
+    assert runner._resolve_session_service_tier(session_key=key) == {"fast": "priority", "ultrafast": "ultrafast"}[word]
+    clock["now"] = 100.0 + seconds
+    assert runner._resolve_session_service_tier(session_key=key, report_transition=True) == (
+        None, f"⚡ Fast mode switched off after {seconds // 60}m.",
+    )
+    assert runner._resolve_session_service_tier(session_key=key, report_transition=True) == (None, None)
 
 
 @pytest.mark.asyncio
@@ -215,45 +252,49 @@ async def test_session_fast_override_expires_to_explicit_normal(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
-async def test_fast_expiry_default_zero_never_expires(monkeypatch, tmp_path):
+@pytest.mark.parametrize("word, tier", [("fast", "priority"), ("ultrafast", "ultrafast")])
+async def test_explicit_zero_never_expires(monkeypatch, tmp_path, word, tier):
     runner = _make_runner()
     _set_gateway_fast_config(monkeypatch, tmp_path, expiry=0)
     clock = {"now": 100.0}
     monkeypatch.setattr("gateway.run_config_loaders.time.time", lambda: clock["now"])
-    event = _make_event("/fast fast")
+    event = _make_event(f"/fast {word}")
     session_key = runner._session_key_for_source(event.source)
     await runner._handle_fast_command(event)
     clock["now"] = 10_000.0
-    assert runner._resolve_session_service_tier(session_key=session_key, report_transition=True) == ("priority", None)
+    assert runner._resolve_session_service_tier(session_key=session_key, report_transition=True) == (tier, None)
 
 
 @pytest.mark.asyncio
-async def test_fast_reenable_restarts_expiry_clock_and_ultrafast_expires(monkeypatch, tmp_path):
+@pytest.mark.parametrize("word, tier", [("fast", "priority"), ("ultrafast", "ultrafast")])
+async def test_fast_reenable_restarts_expiry_clock_and_ultrafast_expires(monkeypatch, tmp_path, word, tier):
     runner = _make_runner()
-    _set_gateway_fast_config(monkeypatch, tmp_path, expiry=10)
+    _set_gateway_fast_config(monkeypatch, tmp_path, expiry=10, ultrafast_expiry=10)
     clock = {"now": 100.0}
     monkeypatch.setattr("gateway.run_config_loaders.time.time", lambda: clock["now"])
-    event = _make_event("/fast ultrafast")
+    event = _make_event(f"/fast {word}")
     session_key = runner._session_key_for_source(event.source)
     await runner._handle_fast_command(event)
     clock["now"] = 109.0
     await runner._handle_fast_command(event)
     clock["now"] = 118.0
-    assert runner._resolve_session_service_tier(session_key=session_key) == "ultrafast"
+    assert runner._resolve_session_service_tier(session_key=session_key) == tier
     clock["now"] = 119.0
     assert runner._resolve_session_service_tier(session_key=session_key) is None
 
 
 @pytest.mark.asyncio
-async def test_fast_global_never_expires(monkeypatch, tmp_path):
+@pytest.mark.parametrize("word, tier", [("fast", "priority"), ("ultrafast", "ultrafast")])
+async def test_fast_global_never_expires(monkeypatch, tmp_path, word, tier):
     runner = _make_runner()
-    _set_gateway_fast_config(monkeypatch, tmp_path, service_tier="fast", expiry=10)
+    _set_gateway_fast_config(monkeypatch, tmp_path, service_tier=word, expiry=10, ultrafast_expiry=20)
     clock = {"now": 100.0}
     monkeypatch.setattr("gateway.run_config_loaders.time.time", lambda: clock["now"])
-    session_key = runner._session_key_for_source(_make_event("/fast fast").source)
-    await runner._handle_fast_command(_make_event("/fast fast --global"))
+    event = _make_event(f"/fast {word} --global")
+    session_key = runner._session_key_for_source(event.source)
+    await runner._handle_fast_command(event)
     clock["now"] = 10_000.0
-    assert runner._resolve_session_service_tier(session_key=session_key, report_transition=True) == ("priority", None)
+    assert runner._resolve_session_service_tier(session_key=session_key, report_transition=True) == (tier, None)
 
 
 @pytest.mark.asyncio
@@ -407,14 +448,16 @@ async def test_fast_status_after_expiry_shows_normal_and_notice_once(monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["not-a-number", "", None, -1, "inf", "nan", True, False])
-async def test_invalid_fast_expiry_is_disabled_with_warning(monkeypatch, tmp_path, caplog, invalid):
+@pytest.mark.parametrize("word", ["fast", "ultrafast"])
+async def test_invalid_fast_expiry_is_disabled_with_warning(monkeypatch, tmp_path, caplog, invalid, word):
     runner = _make_runner()
-    _set_gateway_fast_config(monkeypatch, tmp_path, expiry=invalid)
+    _set_gateway_fast_config(monkeypatch, tmp_path, expiry=invalid, ultrafast_expiry=invalid)
     caplog.set_level("WARNING", logger="gateway.run")
-    await runner._handle_fast_command(_make_event("/fast fast"))
-    state = runner._peek_session_state(runner._session_key_for_source(_make_event("/fast fast").source))
+    event = _make_event(f"/fast {word}")
+    await runner._handle_fast_command(event)
+    state = runner._peek_session_state(runner._session_key_for_source(event.source))
     assert state.conversation.service_tier_override_expires_at == 0
-    assert "fast_expiry_seconds" in caplog.text
+    assert f"agent.{word}_expiry_seconds=" in caplog.text
 
 
 @pytest.mark.asyncio
