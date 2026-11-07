@@ -58,4 +58,3 @@ class GoalStatusMixin:
         if s.status == "done":
             return ContextNotice(f"✓ Goal done ({meta}): {s.goal}")
         return f"Goal ({s.status}, {meta}): {s.goal}"
-

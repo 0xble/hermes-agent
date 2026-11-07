@@ -558,4 +558,3 @@ async def test_cancelled_delivery_keeps_admission_claim_until_its_ack_finishes(
             ack_proceed.set()
             store.close_all_db_handles()
             runner.close_all_session_db_handles()
-

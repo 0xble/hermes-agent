@@ -292,6 +292,9 @@ class Platform(Enum):
         value = value.strip().lower()
         if value in cls._value2member_map_:
             return cls._value2member_map_[value]
+        from agent.safe_worker_policy import safe_worker_enabled
+        if safe_worker_enabled():
+            return None
         global _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases
         if _Platform__bundled_plugin_names is None:
             _Platform__bundled_plugin_names, _Platform__bundled_plugin_aliases = cls._scan_bundled_plugin_platforms()

@@ -85,3 +85,19 @@ def test_gateway_reaction_requirements_do_not_leak_to_desktop(monkeypatch):
     assert "react" in {tool["function"]["name"] for tool in tools}
     monkeypatch.setattr(reactions.desktop_ui, "user_enabled", lambda *a, **kw: True)
     assert "reactions" not in (session_disabled_toolsets([], "desktop") or [])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_desktop_reaction_schema_follows_opt_in(monkeypatch, enabled):
+    from model_tools import get_tool_definitions
+    from toolsets import session_disabled_toolsets
+
+    monkeypatch.setattr(reactions.desktop_ui, "user_enabled", lambda *a, **kw: enabled)
+    tools = get_tool_definitions(
+        enabled_toolsets=["desktop_ui"],
+        disabled_toolsets=session_disabled_toolsets([], "desktop"),
+        quiet_mode=True, skip_tool_search_assembly=True,
+    )
+    names = [tool["function"]["name"] for tool in tools]
+    assert names.count("react") == int(enabled)
+    assert "react_to_message" not in names

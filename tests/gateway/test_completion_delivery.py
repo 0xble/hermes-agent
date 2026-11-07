@@ -2033,4 +2033,3 @@ def test_settle_callback_does_not_run_when_no_settle_can_start(monkeypatch):
 
     asyncio.run(_exercise())
     assert calls == []
-

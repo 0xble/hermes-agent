@@ -116,7 +116,8 @@ def test_fast_auto_and_cold_parse_and_slash_command(monkeypatch):
         assert GatewayRunner._load_service_tier() == expected
     assert DEFAULT_CONFIG["agent"]["service_tier"] == ""
     assert DEFAULT_CONFIG["agent"]["fast_auto_seconds"] == 60
-    assert DEFAULT_CONFIG["agent"]["fast_expiry_seconds"] == 0
+    assert DEFAULT_CONFIG["agent"]["fast_expiry_seconds"] == 1800
+    assert DEFAULT_CONFIG["agent"]["ultrafast_expiry_seconds"] == 300
 
     # /fast auto — session-scoped, agent rebuilt, status reports the mode
     fast_cmd = next(c for c in COMMAND_REGISTRY if c.name == "fast")

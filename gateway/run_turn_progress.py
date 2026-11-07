@@ -18,7 +18,9 @@ from agent.replay_cleanup import strip_stale_dangerous_confirmations
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.platforms.typing_state import call_typing_with_metadata, typing_metadata_for_source
+from gateway.platforms.typing_state import (
+    call_typing_with_metadata, typing_metadata_for_source,
+)
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
@@ -384,6 +386,63 @@ class GatewayTurnProgressMixin:
         _progress_len_fn: Any
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
+        # A second failure before the fresh bubble edits successfully means edits are unusable.
+        reanchored: bool = False
+        # Buffer until the monotonic flood deadline, without editing, splitting or sending.
+        defer_until: float = 0.0
+        # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
+        tool_progress_sent: bool = False
+
+    # Match the adapter's per-chat interim-edit floor so fast producers do not park
+    # edits inside the transport lock without delivering any additional updates.
+    _PROGRESS_EDIT_INTERVAL = 3.0
+
+    @classmethod
+    def _progress_edit_interval(cls, adapter) -> float:
+        try:
+            value = float(getattr(adapter, "PROGRESS_EDIT_INTERVAL", None) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        return max(cls._PROGRESS_EDIT_INTERVAL, value)
+
+    @staticmethod
+    def _is_flood_refusal(result) -> bool:
+        error = (getattr(result, "error", "") or "").lower()
+        return getattr(result, "retry_after", None) is not None or any(w in error for w in ("flood", "retry after"))
+
+    @classmethod
+    def _edit_failure_is_deferrable(cls, st, result) -> bool:
+        """Transient and rate-limit edit failures leave the bubble editable for a later tick.
+
+        A flood refusal says "not now", not "never": disabling edits on it turns every later tool
+        line into its own message for the rest of the turn, and sending one now spends the budget
+        the platform just said is exhausted.
+        """
+        if cls._is_flood_refusal(result):
+            wait = max(float(getattr(result, "retry_after", None) or 0.0), cls._progress_edit_interval(st.adapter))
+            st.defer_until = time.monotonic() + wait
+            logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
+            return True
+        if getattr(result, "retryable", False):
+            logger.debug("[%s] Transient progress edit failure, retrying next tick", st.adapter.name)
+            return True
+        return False
+
+    @staticmethod
+    def _progress_deferred(st) -> bool:
+        return time.monotonic() < st.defer_until
+
+    @staticmethod
+    def _abandon_progress_bubble(st) -> bool:
+        """After a permanent edit failure, continue in a fresh bubble (True) unless the previous
+        fresh bubble also failed, which means editing itself is unusable (False, can_edit off)."""
+        if st.reanchored:
+            st.can_edit = False
+            return False
+        logger.info("[%s] Progress bubble no longer editable, starting a fresh one", st.adapter.name)
+        st.reanchored = True
+        st.progress_msg_id = None
+        return True
 
     def _progress_edit_state(self, adapter) -> TurnRunner._ProgressEditState:
         ctx = self._ctx
@@ -416,7 +475,9 @@ class GatewayTurnProgressMixin:
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
             kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
+        with outbound_class(OUTBOUND_PROGRESS):
+            return await st.adapter.edit_message(**kwargs)
 
     @staticmethod
     def _progress_text(lines: list) -> str:
@@ -756,8 +817,9 @@ class GatewayTurnProgressMixin:
         ctx = self._ctx
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
+
     def _status_callback_sync(self, event_type: str, message: str) -> None:
-        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
+        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
         if ctx.mute_notification_reply or not self._status_live():
@@ -771,16 +833,17 @@ class GatewayTurnProgressMixin:
             )
             return
         def present():
+            from agent.notice_style import notice_metadata
             if local_viewer_turn(self):
                 self._publish_execution("status.update", {"kind": _viewer_status_kind(event_type, prepared),
                                                           "text": prepared})
                 return
-            fut = self._schedule(
-                _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+            self._schedule(
+                self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared,
+                    notice_metadata(ctx._status_thread_metadata, platform=ctx.source.platform,
+                                    style=getattr(message, "notice_style", None))),
                 f"status_callback ({event_type}) scheduling error",
             )
-            if fut is not None and ctx._cleanup_progress:
-                fut.add_done_callback(self._track_future_cleanup_id)
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
                             diagnostic=is_warning_status(event_type, message))
 

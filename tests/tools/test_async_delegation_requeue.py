@@ -98,4 +98,3 @@ def test_requeue_leaves_a_row_held_by_another_claim():
 
     assert _column("requeue-foreign", "delivery_claim") == "other-consumer"
     assert offered.empty()
-
