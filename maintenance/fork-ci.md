@@ -655,9 +655,14 @@ baseline reached `/quit after resume` with 294.3 seconds of successful steps
 and then hit the unchanged 300-second file cap before its one-shot/cleanup.
 Deadline failures now include the step, pane and gateway log, and stop further
 input instead of accumulating later timeouts. A missing composer acknowledgement
-never sends Enter. A slash-command completion redraw that leaves the typed
-text on its own line still counts; a suggestion row that only names the
-command does not. With that checked readiness condition, idle steps use a
+never sends Enter. Composer acknowledgement requires a fresh occurrence ending
+at the terminal insertion cursor, not adjacency to `❯` or a bare exact line.
+After interruption the completion redraw can retain rule/answer chrome before
+the typed text (`──/compress` or `As/compress` in hosted failures); neither
+changes the input buffer. Cursor coordinates distinguish that buffer from a
+suggestion row or auto-suggest suffix, even when either shows the full command.
+The existing 10-second deadline and fresh-output requirement remain unchanged.
+With that checked readiness condition, idle steps use a
 0.5-second quiet period instead of a 2-second timing cushion. All output,
 traceback, process and witness assertions remain. Non-TTY output is captured to
 temporary files so inherited
