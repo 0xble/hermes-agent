@@ -11,6 +11,12 @@ MISSING_SUBMIT_GRACE_SECONDS = 600
 MISSING_SUBMIT_READS = 2
 
 
+class CronExecutionDeferred(RuntimeError):
+    """A known update fence refused this fire before any journal or submission existed."""
+
+    reason_code = "update_paused"
+
+
 class CronExecutionUnknown(RuntimeError):
     """The owner may have accepted this fire; retain it until settlement or the missing fence."""
 
@@ -183,6 +189,11 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             raise CronExecutionUnknown(
                 f'Cron execution unverified; {identity}; reconcile {journal} '
                 f'{type(exc).__name__}: {exc}') from exc
+        from hermes_cli.gateway_client import GatewayUnavailableError
+        if (isinstance(exc, GatewayUnavailableError)
+                and exc.state == "draining" and exc.reason_code == "update_paused"
+                and not journal.exists()):
+            raise CronExecutionDeferred("Gateway update paused before cron admission") from exc
         error = f'{type(exc).__name__}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
 

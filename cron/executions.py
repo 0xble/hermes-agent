@@ -592,6 +592,19 @@ _OWNER_WEDGED_REASON = (
 )
 
 
+def discard_unadmitted_execution(execution_id: str) -> bool:
+    """Withdraw our audit preclaim only after a typed refusal proves no admission existed.
+
+    No terminal success/failure is invented for a run that never happened. The scheduler keeps
+    the skip reason on the job and the exact external worker ack carries its deferral receipt.
+    """
+    with _transaction() as conn:
+        return conn.execute(
+            "DELETE FROM executions WHERE id=? AND status='running' AND handoff_pending=0 "
+            "AND process_id=? AND pid=?", (execution_id, _PROCESS_ID, os.getpid()),
+        ).rowcount == 1
+
+
 def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> None:
     """Close the receipt of a run that never started: a ``claimed`` row never resolves. Best-effort
     so a ledger write cannot mask the failure the caller logs or re-raises."""

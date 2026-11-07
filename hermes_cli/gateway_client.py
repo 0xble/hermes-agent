@@ -98,9 +98,10 @@ class GatewayUnavailableError(GatewayClientError):
     """No ready owner to dial: ``state`` is ``ensure_gateway_runtime``'s verdict (``draining`` while an
     update holds the install, ``starting`` past the deadline, ...). Nothing was submitted."""
 
-    def __init__(self, message, state):
+    def __init__(self, message, state, reason_code=None):
         super().__init__(message)
         self.state = state
+        self.reason_code = reason_code
 
 
 class EventQueue(asyncio.Queue):
@@ -330,8 +331,11 @@ async def _connect_gateway(endpoint=None, subject=None, *, client_lease=None, ma
                 # A multi-line startup report (redacted traceback tail + where the full log is).
                 raise GatewayUnavailableError(f"Gateway could not start: {detail}", result.state)
             detail = f" ({detail})" if detail else ""
+            # Only the discovery update fence carries this deferrable reason. A generic
+            # unavailable/draining error (including one after a submit) is not a deferral.
+            reason = "update_paused" if (result.state, result.reason_code) == ("draining", "update_paused") else None
             raise GatewayUnavailableError(f"Gateway {result.state}: {result.reason_code or 'not_ready'}{detail}",
-                                          result.state)
+                                          result.state, reason_code=reason)
         endpoint = result.endpoint
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
