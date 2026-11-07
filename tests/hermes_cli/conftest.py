@@ -146,6 +146,46 @@ def _discharge_host_update_obligation():
 
 
 @pytest.fixture
+def intercept_update_git(monkeypatch):
+    """Inject Git outcomes at the updater's custody seam and standalone readers.
+
+    macOS owner-watched Git and Windows job-bound Git need not call
+    ``subprocess.run``. Delegation retains that production custody behavior,
+    without intercepting its child twice or treating host probes as Git.
+    """
+    from pathlib import Path
+    import subprocess
+    import threading
+
+    from hermes_cli import update_custody
+
+    real_run, real_git = subprocess.run, update_custody.run_git
+    scope = threading.local()
+
+    def install(intercept):
+        def run(command, *args, **kwargs):
+            if (getattr(scope, "custody", False)
+                    or Path(str(command[0])).name.lower() not in {"git", "git.exe"}):
+                return real_run(command, *args, **kwargs)
+            return intercept(command, real_run, *args, **kwargs)
+
+        def run_git(git_cmd, git_args, **kwargs):
+            def delegate(command, **kwargs):
+                scope.custody = True
+                try:
+                    return real_git(command[:len(git_cmd)], command[len(git_cmd):], **kwargs)
+                finally:
+                    scope.custody = False
+
+            return intercept([*git_cmd, *git_args], delegate, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", run)
+        monkeypatch.setattr(update_custody, "run_git", run_git)
+
+    return install
+
+
+@pytest.fixture
 def isolated_source_completion(monkeypatch):
     """Unit-test the completion tail in-process; real transport is tested separately."""
     from hermes_cli import update_cmd, update_completion

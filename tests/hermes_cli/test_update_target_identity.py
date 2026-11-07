@@ -104,7 +104,9 @@ def _publish_stable(monkeypatch, t):
                                 'fork-late', 'fork-late-push-ok', 'fork-late-wrong-branch',
                                 'fork-late-reverted', 'check-main',
                                 'check-explicit', 'check-missing', 'check-upstream'])
-def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkeypatch, case, capsys):
+def test_branch_update_uses_real_refs_and_completion_request(
+    update_tree, intercept_update_git, monkeypatch, case, capsys,
+):
     t = update_tree
     git(t.clone, 'checkout', '-q', 'main')
     t.args.channel = 'main'
@@ -139,7 +141,7 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
                     capture_output=True, text=True, encoding='utf-8')
         return found.stdout.strip() or '<no upstream>'
 
-    def fault(command, *args, **kwargs):
+    def fault(command, run, *args, **kwargs):
         assert Path(command[0]).name.lower() in {'git', 'git.exe'} or command[0] == sys.executable, command
         assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
         # The upstream sync's tree move (`pull upstream main` on older updaters, a local merge of
@@ -166,7 +168,7 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
             pushes.append(result.returncode)
         return result
 
-    monkeypatch.setattr(subprocess, 'run', fault)
+    intercept_update_git(fault)
     fails = case in {'missing', 'check-missing', 'no-move', 'wrong-branch',
                      'fork-upstream-wrong-branch', 'fork-upstream-reverted',
                      'fork-late-wrong-branch', 'fork-late-reverted'}
@@ -211,7 +213,9 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
 
 
 @pytest.mark.parametrize('server', ['sha', 'fetch-refused', 'at-release', 'ahead-release', 'explicit-branch'])
-def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, monkeypatch, server):
+def test_stable_git_uses_remote_identity_without_moving_local_tags(
+    update_tree, intercept_update_git, monkeypatch, server,
+):
     """A stable update is pinned to the channel's exact commit: no tag lookup on
     origin, the stale local ``v1.1.0`` never moves, and an explicit --branch
     bypasses the channel."""
@@ -229,10 +233,9 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
         git(t.origin, 'branch', 'retained-branch', t.newer)
         t.args.branch = 'retained-branch'
         expected = t.newer
-    run = subprocess.run
     calls = []
 
-    def guarded_run(command, *args, **kwargs):
+    def guarded_run(command, run, *args, **kwargs):
         command = list(map(str, command))
         assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
         cwd = Path(kwargs.get('cwd', os.getcwd())).resolve()
@@ -243,7 +246,7 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
             return subprocess.CompletedProcess(command, 128, stdout='', stderr='fixture: raw SHA wants disabled')
         return run(command, *args, **kwargs)
 
-    monkeypatch.setattr(subprocess, 'run', guarded_run)
+    intercept_update_git(guarded_run)
     if server == 'fetch-refused':
         with pytest.raises(SystemExit) as error:
             cli_main.cmd_update(t.args)
@@ -276,7 +279,9 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
 
 @pytest.mark.platforms('windows')
 @pytest.mark.parametrize('transport', ['gitless', 'no-git', 'git-error', 'dirty'])
-def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, monkeypatch, tmp_path, transport):
+def test_stable_zip_consumes_the_same_commit_through_the_real_swap(
+    update_tree, intercept_update_git, monkeypatch, tmp_path, transport,
+):
     t = update_tree
     monkeypatch.setattr(cli_main, '_pause_windows_gateways_for_update',
                         lambda: {"resume_needed": True})
@@ -307,7 +312,7 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     urls, git_calls = [], []
-    real_open, real_run = urllib.request.urlopen, subprocess.run
+    real_open = urllib.request.urlopen
     fetched, failed = False, False
 
     def local_open(request, *args, **kwargs):
@@ -320,11 +325,7 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
             local += '?' + parsed.query
         return real_open(local, *args, **kwargs)
 
-    from hermes_cli import update_custody
-
-    real_custody_run, seam = update_custody.run, threading.local()
-
-    def guard(command, args, kwargs, call):
+    def guard(command, call, *args, **kwargs):
         nonlocal fetched, failed
         command = list(map(str, command))
         assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
@@ -342,31 +343,13 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
             fetched = True
         return result
 
-    def guarded_run(command, *args, **kwargs):
-        if getattr(seam, 'custody', False):  # already guarded at the custody seam below
-            return real_run(command, *args, **kwargs)
-        return guard(command, args, kwargs, real_run)
-
-    def custody_call(command, *args, **kwargs):
-        seam.custody = True
-        try:
-            return real_custody_run(command, *args, **kwargs)
-        finally:
-            seam.custody = False
-
-    def guarded_custody_run(command, *args, **kwargs):
-        # The updater's git goes through update_custody.run: on Windows inside an update that is a
-        # suspended Popen bound to the update's job, not subprocess.run, so faults go in here too.
-        return guard(command, args, kwargs, custody_call)
-
     if transport in {'gitless', 'no-git'}:
         (t.clone / '.git').rename(tmp_path / 'git-state')
     if transport == 'dirty':
         (t.clone / 'content.txt').write_text('local work\n', encoding='utf-8')
     before = (t.clone / 'content.txt').read_bytes()
     monkeypatch.setattr(urllib.request, 'urlopen', local_open)
-    monkeypatch.setattr(subprocess, 'run', guarded_run)
-    monkeypatch.setattr(update_custody, 'run', guarded_custody_run)
+    intercept_update_git(guard)
     try:
         if transport == 'dirty':
             with pytest.raises(SystemExit) as error:

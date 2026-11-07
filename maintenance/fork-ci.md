@@ -60,6 +60,17 @@ contract compares parse-error status and trailing-backslash output to native
 eval on each available Bash executable, not one version's constants. Keep exact
 per-segment status assertions and the Bash parser-recovery crash regressions.
 
+Updater Git fault injection belongs at `update_custody.run_git`, not only
+`subprocess.run` or `update_custody.run`: macOS owner-watched children and
+Windows job-bound children can bypass those lower seams. The shared
+`intercept_update_git` fixture retains native custody when delegating, also
+guards standalone Git readers, and never intercepts a delegated child twice.
+Preserve real local refs, stash/rescue ordering, target identity and failure
+assertions. Recovery fixtures use the generalized `_release_dead_lock` helper
+and inject empty Git output at the same custody seam. Keep fleet-only Git
+simulations at that seam too. Retire these adaptations when the fixtures no
+longer depend on an execution path that differs by host.
+
 Runner fixtures copy `run_tests_launch.py` and `run_tests_fork_child.py` with the
 parallel runner. Upstream split process launch into those siblings, so partial
 copies fail before exercising scratch isolation. Keep gateway preparation

@@ -22,7 +22,7 @@ from hermes_cli import update_cmd
 
 def _git(root: Path, *args: str) -> str:
     result = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
-                            text=True, encoding="utf-8")
+                            text=True, encoding="utf-8", check=False)
     assert result.returncode == 0, f"git {args}: {result.stderr}"
     return result.stdout.strip()
 
@@ -539,7 +539,7 @@ def test_dead_index_lock_scan_retries_an_unknown_holder(tmp_path, monkeypatch):
     scans = iter([None, False])
     monkeypatch.setattr(er, "_held_open", lambda *args, **kwargs: next(scans))
 
-    assert er._release_dead_index_lock(git_dir, tmp_path, any_git=True) is True
+    assert er._release_dead_lock(lock, tmp_path, any_git=True) is True
     assert not lock.exists()
 
 
@@ -603,17 +603,11 @@ def test_an_empty_head_answer_keeps_the_marker(tmp_path, monkeypatch, capsys):
     marker for the next launch instead of reading as "the update finished"."""
     root, pre, target = _broken_release(tmp_path, 5)
     marker = _rollback_marker(root, pre, target)
-    stub = tmp_path / "silent-git"
-    stub.write_text("", encoding="utf-8")
-    monkeypatch.setattr(er, "_git_executable", lambda recorded="": str(stub))
-    real_run = subprocess.run
+    from hermes_cli import update_custody
 
-    def silent(argv, *args, **kwargs):  # every git call "succeeds" with no output
-        if argv and argv[0] == str(stub):
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        return real_run(argv, *args, **kwargs)
-
-    monkeypatch.setattr(subprocess, "run", silent)
+    monkeypatch.setattr(update_custody, "run_git",
+                        lambda git_cmd, args, **kwargs:
+                        subprocess.CompletedProcess([*git_cmd, *args], 0, "", ""))
     assert er.restore_interrupted_pull(root) is False
     assert marker.exists(), "an empty `rev-parse HEAD` deleted the marker over a torn tree"
     assert "Could not read HEAD" in capsys.readouterr().err
