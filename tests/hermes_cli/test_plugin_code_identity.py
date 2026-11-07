@@ -197,6 +197,8 @@ def test_existing_surfaces_report_identity_without_running_plugins_or_writing(id
     monkeypatch.setattr(registry, "dispatch", lambda *a, **k: pytest.fail("read dispatched tool"))
     before = _snapshot(home)
     listed = asyncio.run(list_plugins(authority, actor, {}))
+    from tui_gateway.contracts.registry import METHODS, check_result
+    check_result(METHODS["plugins.list"], listed)
     status = build_status_payload()
     identity = _row()["code_identity"]
     for payload in (listed, status):

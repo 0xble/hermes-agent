@@ -583,6 +583,13 @@ class PluginsListParams(Params):
     pass
 
 
+class PluginCodeIdentity(Result):
+    digest: str
+    version: str
+    loaded_at: str
+    module_count: int
+
+
 class LegacyPluginRow(Result):
     name: str
     version: str
@@ -593,6 +600,7 @@ class LegacyPluginRow(Result):
     hooks: int | None = None
     commands: int | None = None
     error: str | None = None
+    code_identity: PluginCodeIdentity | None = None
 
 
 class PluginToolsetRow(Result):
