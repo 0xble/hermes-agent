@@ -216,8 +216,8 @@ class SlackThreadTitlesMixin:
     async def _title_channel_thread_root(self, source, title: str, current) -> None:
         """Show the generated title on a channel thread's root.
 
-        agents.sessions.rename covers channel threads only when Slack holds an agent session for
-        them (else session_not_found); Hermes never opens one there, so channels do not use it.
+        The visible channel heading stays on the root, independent of native session availability.
+        A session rename alone does not replace that first-line heading.
         """
         try:
             from slack_sdk.errors import SlackApiError

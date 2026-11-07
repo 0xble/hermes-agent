@@ -150,17 +150,28 @@ async def test_late_interim_reassert_cannot_restore_status_after_final(monkeypat
     owner = asyncio.create_task(a._keep_typing("D123", interval=10000, metadata=md))
     await asyncio.wait_for(initial_set.wait(), 2)
     interim = asyncio.create_task(a.send("D123", "working", metadata=md))
+    final_started = asyncio.Event()
+    stop_typing = a.stop_typing
+
+    async def final_clear(*args, **kwargs):
+        final_started.set()
+        await stop_typing(*args, **kwargs)
+
+    a.stop_typing = final_clear
+    final = None
     try:
         await asyncio.wait_for(reassert_started.wait(), 2)
-        # Final delivery owns exactly this surface and has completed all normal typing cleanup.
-        await a._stop_typing_refresh("D123", owner, metadata=md)
-        assert ui_status[0] == ""
-        assert not a._typing_refresh_owners
+        # Completion waits behind the in-flight phrase, then clears both protocols.
+        final = asyncio.create_task(a._stop_typing_refresh("D123", owner, metadata=md))
+        await asyncio.wait_for(final_started.wait(), 2)
         release_reassert.set()
-        assert (await interim).success
+        result, _ = await asyncio.wait_for(asyncio.gather(interim, final), 2)
+        assert result.success
+        assert not a._typing_refresh_owners
         assert ui_status[0] == "", "the interim request restored a stuck idle status"
     finally:
         release_reassert.set()
-        owner.cancel()
-        interim.cancel()
-        await asyncio.gather(owner, interim, return_exceptions=True)
+        tasks = [task for task in (owner, interim, final) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
