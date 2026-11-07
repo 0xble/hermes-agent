@@ -45,16 +45,16 @@ def _build_full_manifest(
         features["assistant_view"] = {
             "assistant_description": "Chat with Hermes in threads and DMs."}
         bot_scopes.append("assistant:write")
-        bot_events.extend(["assistant_thread_context_changed", "assistant_thread_started"])
+        # Assistant threads show native Stop too (upstream subscribes Agent apps only).
+        bot_events.extend([
+            "agent_session_stopped", "assistant_thread_context_changed", "assistant_thread_started"])
     elif messaging_experience == "agent":
         features["agent_view"] = {"agent_description": "Chat with Hermes in Slack Messages."}
         bot_scopes.append("assistant:write")
         # Slack includes current viewing context in Agent DM events only after this subscription
         # is enabled; the adapter uses it to preserve the referred channel across the agent turn.
-        bot_events.extend(["app_context_changed", "app_home_opened"])
-
-    if messaging_experience != "none":
-        bot_events.append("agent_session_stopped")
+        # agent_session_stopped turns on Slack's native Stop button (mapped onto /stop).
+        bot_events.extend(["agent_session_stopped", "app_context_changed", "app_home_opened"])
 
     bot_scopes.sort()
     bot_events.sort()

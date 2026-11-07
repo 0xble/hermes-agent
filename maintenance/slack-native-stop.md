@@ -19,11 +19,22 @@ resume event.
 
 Fork patch identity: `slack-native-stop`.
 
-Adapted from upstream [PR #143850](https://github.com/NousResearch/hermes-agent/pull/143850),
-commit `46e9b2aac7bc34a69a72d499f2c4a8da37973cb7`, open when inspected on
-2026-10-24. The fork additionally preserves thread-aware authorization on its
-older adapter boundary, subscribes Assistant manifests, and tests the running
-turn through the real adapter and gateway. No moving upstream baseline is adopted.
+Carries upstream [PR #143850](https://github.com/NousResearch/hermes-agent/pull/143850)
+in its own shape, head `46e9b2aac7bc34a69a72d499f2c4a8da37973cb7` (open, checked
+2026-10-29). `plugins/platforms/slack/adapter_native_stop.py` and
+`tests/gateway/test_slack_native_stop.py` are byte-identical to that head, and the
+adapter import, listener registration and Agent manifest lines match its hunks, so a
+sync that contains the merged PR resolves them without conflicts. If upstream lands a
+different shape, compare it against this unit instead of keeping both.
+
+Fork-only remainder:
+
+- Assistant manifests also subscribe to `agent_session_stopped`. Upstream subscribes
+  Agent manifests only.
+- `tests/gateway/test_slack_native_stop_gateway.py` covers Assistant and `none`
+  manifests, malformed and gated events, and a real gateway turn interrupted through
+  the adapter. `tests/gateway/test_slack.py` asserts the listener is registered.
+- The Assistant note in the Slack messaging guide.
 
 The [Slack event contract](https://docs.slack.dev/reference/events/agent_session_stopped/)
 specifies that clicking Stop does not stop work automatically. Without a listener
@@ -31,7 +42,7 @@ the gateway remains busy. A missing subscription prevents the event from arrivin
 
 ## Verification
 
-`scripts/run_tests.sh tests/gateway/test_slack.py tests/gateway/test_slack_native_stop.py tests/gateway/test_stop_chat_scope.py tests/gateway/test_stop_pauses_goal_and_holds_wakes.py tests/hermes_cli/test_slack_cli.py`
+`scripts/run_tests.sh tests/gateway/test_slack.py tests/gateway/test_slack_native_stop.py tests/gateway/test_slack_native_stop_gateway.py tests/gateway/test_stop_chat_scope.py tests/gateway/test_stop_pauses_goal_and_holds_wakes.py tests/hermes_cli/test_slack_cli.py`
 
 Verify the live app subscribes to `agent_session_stopped`, start a disposable Slack
 turn, click the native Stop button, and confirm the running agent is interrupted
@@ -40,7 +51,9 @@ usable. Unit tests alone do not prove delivery from Slack.
 
 ## Retirement And Rollback
 
-Retire when the accepted upstream release implements the listener and subscriptions
-and these regressions pass without the fork adaptation. Revert the patch to roll
-back code. The event subscription may remain enabled, but cancellation will no
-longer work until a listener is restored. No data migration is required.
+When a sync brings in #143850 or an equivalent listener and Agent subscription, drop
+the identity from the shared files and keep only the fork-only remainder above, until
+upstream also subscribes Assistant manifests. Retire the remainder then, once the
+regressions above pass without it. Revert the patch to roll back code. The event
+subscription may remain enabled, but cancellation will no longer work until a listener
+is restored. No data migration is required.

@@ -30,8 +30,6 @@ async def handle_agent_session_stopped(adapter: Any, event: dict, body: Optional
     await adapter._handle_slash_command({
         "command": "/stop", "text": "", "user_id": user_id, "channel_id": channel_id,
         "team_id": team_id, "thread_ts": thread_ts})
-    logger.info("[Slack] agent_session_stopped channel=%s thread=%s team=%s outcome=stop_dispatched",
-                channel_id, thread_ts, team_id)
     await adapter.stop_typing(channel_id, {"thread_id": thread_ts, "slack_team_id": team_id})
     # The legacy "" clear is not an Agent Sessions status; "active" is the documented exit.
     client = adapter._get_client(channel_id, team_id=team_id or None)
