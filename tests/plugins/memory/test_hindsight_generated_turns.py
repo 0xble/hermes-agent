@@ -5,7 +5,7 @@ import pytest
 from agent.prompt_builder import format_steer_marker
 from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
 from plugins.memory.hindsight import HindsightMemoryProvider
-from plugins.memory.hindsight.retention import filter_retain_messages
+from agent.memory_retention import filter_retain_messages
 from tools.process_registry_notifications import format_process_notification
 
 

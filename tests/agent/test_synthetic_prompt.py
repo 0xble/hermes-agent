@@ -14,7 +14,7 @@ from agent.memory_manager import MemoryManager
 from agent.synthetic_prompt import auto_recall_query, human_prompt_text
 from agent.turn_context import _memory_turn_start_and_prefetch
 from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
-from plugins.memory.hindsight.retention import filter_retain_messages
+from agent.memory_retention import filter_retain_messages
 from tools.delegation_resume import AUTO_RESUME_NOTICE_OPEN
 from tools.process_registry_notifications import PROCESS_NOTIFICATION_END, format_process_notification
 
@@ -436,11 +436,13 @@ def test_manager_forwards_provenance_only_to_providers_that_accept_it():
     manager = MemoryManager()
     legacy, aware = Legacy(), Aware()
     manager._providers = [legacy, aware]  # type: ignore[list-item]  # duck-typed sync_turn signatures
+    manager.sync_all(HUMAN, "ok", session_id="s-1", display_kind="hidden", platform="slack")
+    # A generated turn reaches neither: the manager drops it before any provider sees it.
     manager.sync_all("notice", "ok", session_id="s-1", display_kind="internal_notification", platform="cron")
     assert manager.flush_pending(timeout=5) is True
 
-    assert legacy.calls == [("notice", "s-1")]
-    assert aware.calls == [("notice", "s-1", "internal_notification", "cron")]
+    assert legacy.calls == [(HUMAN, "s-1")]
+    assert aware.calls == [(HUMAN, "s-1", "hidden", "slack")]
 
 
 def test_hindsight_sync_turn_drops_a_structured_synthetic_turn(monkeypatch):
@@ -565,6 +567,59 @@ def test_generated_turn_never_consumes_the_buffer_even_when_it_is_stale(clock):
     assert _run_turn(agent, _process_notice(), display_kind="internal_notification") == ""
     assert provider.consumed_by == [HUMAN]
     assert provider.buffer == f"recall for: {HUMAN}"  # dropped only when a human turn would use it
+
+
+class _NoDiscardHookProvider(_BufferingProvider):
+    """A catalog plugin's shape: it buffers like Hindsight but keeps the base no-op ``discard_prefetch``."""
+
+    from agent.memory_provider import MemoryProvider as _Base
+
+    discard_prefetch = _Base.discard_prefetch
+
+
+class _LiveRecallProvider(_NoDiscardHookProvider):
+    """Recalls live in ``prefetch`` (mem0-style), so it never needed the discard hook."""
+
+    def prefetch(self, query, *, session_id=""):
+        self.consumed_by.append(query)
+        return f"live recall for: {query}"
+
+
+def _session_with(provider, max_age=1800.0):
+    agent, _ = _session_with_buffering_provider(max_age)
+    agent._memory_manager._providers = [provider]  # type: ignore[list-item]  # duck-typed provider
+    return agent
+
+
+def test_stale_buffer_is_dropped_for_a_provider_without_the_discard_hook(clock):
+    provider = _NoDiscardHookProvider()
+    agent = _session_with(provider)
+
+    _run_turn(agent, HUMAN)
+    clock[0] += 1801
+    later = "And what about the rollback plan?"
+    assert _run_turn(agent, later) == ""
+    clock[0] += 60
+    assert _run_turn(agent, "Who owns it?") == f"recall for: {later}"
+
+
+def test_fresh_buffer_is_kept_for_a_provider_without_the_discard_hook(clock):
+    provider = _NoDiscardHookProvider()
+    agent = _session_with(provider)
+
+    _run_turn(agent, HUMAN)
+    clock[0] += 600
+    assert _run_turn(agent, "And what about the rollback plan?") == f"recall for: {HUMAN}"
+
+
+def test_live_recall_provider_still_answers_the_turn_after_a_stale_gap(clock):
+    provider = _LiveRecallProvider()
+    agent = _session_with(provider)
+
+    _run_turn(agent, HUMAN)
+    clock[0] += 1801
+    later = "And what about the rollback plan?"
+    assert _run_turn(agent, later) == f"live recall for: {later}"
 
 
 def test_zero_prefetch_max_age_disables_the_bound(clock):
