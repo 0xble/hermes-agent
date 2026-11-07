@@ -280,7 +280,7 @@ class GatewayStatusCommandsMixin:
         )
         lines = [t("gateway.status.header"), "",
                  t("gateway.status.session_id", session_id=fields["session_id"])]
-        lines.append(f"Incognito: {'ON' if session_entry.incognito else 'OFF'}")
+        lines.append(t("gateway.status.incognito", state="ON" if session_entry.incognito else "OFF"))
         if fields["title"]:
             lines.append(t("gateway.status.title", title=fields["title"]))
         lines += [t("gateway.status.created", timestamp=fields["created"]),
