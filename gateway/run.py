@@ -10,6 +10,11 @@ except ModuleNotFoundError as exc:  # a partial ``hermes update`` can leave the 
     if exc.name != "hermes_bootstrap":
         raise  # the bootstrap exists but cannot load: skipping it would skip PM activation
 
+if __name__ == "__main__":
+    from hermes_cli.test_artifact_lifetime import arm_test_artifact_lifetime
+
+    arm_test_artifact_lifetime()
+
 import asyncio
 import concurrent.futures
 import dataclasses
