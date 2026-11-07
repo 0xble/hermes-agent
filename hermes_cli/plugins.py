@@ -235,6 +235,7 @@ class LoadedPlugin:
     error: Optional[str] = None
     # Bundled platform recorded as a not-yet-imported loader (see _register_deferred_platform).
     deferred: bool = False
+    code_identity: Optional[dict[str, Any]] = None
 
 
 class PluginContext(PluginCapabilityCtxMixin):
@@ -1496,18 +1497,6 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     def get_telegram_handler_factories(self) -> list[tuple]:
         """Back-compat alias for ``get_platform_handler_factories("telegram")``."""
         return self.get_platform_handler_factories("telegram")
-
-    def list_plugins(self) -> list[dict[str, Any]]:
-        """Return a list of info dicts for all discovered plugins."""
-        return [
-            {
-                "name": p.manifest.name, "key": manifest_key(p.manifest), "kind": p.manifest.kind,
-                "version": p.manifest.version, "description": p.manifest.description,
-                "source": p.manifest.source, "enabled": p.enabled, "tools": len(p.tools_registered),
-                "hooks": len(p.hooks_registered), "middleware": len(p.middleware_registered),
-                "commands": len(p.commands_registered), "error": p.error,
-            } for _key, p in sorted(self._plugins.items())
-        ]
 
     def find_plugin_skill(self, qualified_name: str) -> Optional[Path]:
         """Return the ``Path`` to a plugin skill's SKILL.md, or ``None``."""

@@ -244,6 +244,7 @@ class HostRuntime:
         return {"protocol": PROTOCOL_VERSION, "pid": os.getpid(), "python": sys.version.split()[0]}
 
     def op_load(self, params: dict[str, Any]) -> dict[str, Any]:
+        from hermes_cli.plugins_identity import registration_sources
         plugin_key = str(params["plugin_key"])
         target = _import_plugin(params)
         register = target if callable(target) and not isinstance(target, types.ModuleType) \
@@ -252,8 +253,10 @@ class HostRuntime:
             raise AttributeError(f"Plugin '{params.get('name')}' has no register() function")
         module_name = getattr(target, "__name__", None) or getattr(register, "__module__", None)
         self.modules[plugin_key] = str(module_name or "")
-        self._run(register(RemotePluginContext(self, plugin_key, params)))
-        return {"module": module_name}
+        with registration_sources(target) as capture:
+            self._run(register(RemotePluginContext(self, plugin_key, params)))
+        identity = capture.identity(params["manifest"]["version"]) if capture is not None else None
+        return {"module": module_name, "code_identity": identity}
 
     def op_load_instance(self, params: dict[str, Any]) -> Any:
         """Category plugins (memory provider, context engine, cron scheduler): import the directory,
@@ -476,10 +479,13 @@ async def _on_behalf_of(awaitable: Any, origin: Optional[int]) -> Any:
 
 def _import_plugin(params: dict[str, Any]) -> Any:
     """Import a directory plugin under the module name Hermes assigned, or resolve an entry point."""
+    from hermes_cli.plugins_identity import PluginSourceCapture, PluginSourceLoader
     if params.get("entrypoint"):
         for ep in importlib.metadata.entry_points().select(group=_ENTRY_POINTS_GROUP):
             if ep.name == params.get("name"):
-                return ep.load()
+                prefix = ep.value.partition(":")[0].partition(".")[0]
+                with PluginSourceCapture(prefix):
+                    return ep.load()
         raise ImportError(f"Entry point '{params.get('name')}' not found in group '{_ENTRY_POINTS_GROUP}'")
     plugin_dir = Path(str(params["path"]))
     init_file = plugin_dir / "__init__.py"
@@ -494,7 +500,9 @@ def _import_plugin(params: dict[str, Any]) -> Any:
             ns_pkg.__path__ = []  # type: ignore[attr-defined]
             ns_pkg.__package__ = parent
             sys.modules[parent] = ns_pkg
+    capture = PluginSourceCapture(module_name, plugin_dir)
     spec = importlib.util.spec_from_file_location(module_name, init_file,
+                                                  loader=PluginSourceLoader(module_name, str(init_file), capture),
                                                   submodule_search_locations=[str(plugin_dir)])
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot create module spec for {init_file}")
@@ -503,7 +511,8 @@ def _import_plugin(params: dict[str, Any]) -> Any:
     module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
     sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
+        with capture:
+            spec.loader.exec_module(module)
     except BaseException:
         for name in [m for m in sys.modules if m == module_name or m.startswith(module_name + ".")]:
             sys.modules.pop(name, None)

@@ -312,6 +312,40 @@ documented ABCs instead of internals. The full old-to-new map is the
 [`COMPAT_MANIFEST.md`](https://github.com/NousResearch/hermes-agent/blob/5912ed81ed9/COMPAT_MANIFEST.md)
 from the last commit that shipped the layer.
 
+## Loaded Code Identity
+
+`PluginManager.list_plugins()` includes `code_identity` for Python plugins whose import and
+`register(ctx)` succeeded. It contains `digest`, `version`, `loaded_at` (UTC ISO 8601), and
+`module_count`. The digest is SHA-256 over each module's relative POSIX path (UTF-8), NUL,
+source byte length (ASCII decimal), NUL, and exact source bytes compiled during import and
+registration, in sorted path order. Framing distinguishes renames and different file boundaries
+even when concatenated source bytes are equal. Version is the plugin manifest's
+`version`, stored separately from the digest. Source compilation bypasses cached bytecode so a
+forced reload cannot silently execute an older `.pyc` with a matching size and timestamp.
+Captured modules compile from source without reading or writing a bytecode cache. The measured
+cost was about 0.7 s with all 325 bundled plugins enabled. Only enabled plugins pay this cost.
+
+The snapshot covers the package `__init__.py` and plugin-owned source modules imported through
+registration, including imports made by `register()`. Later lazy imports are outside this snapshot.
+Replacing files on disk does not change a running plugin's identity. Only a successful reload
+records a new snapshot. The same capture runs inside the isolated plugin host when enabled.
+
+The existing gateway control-socket `status` answer includes compact
+`plugins: [{key, name, code_identity}]` rows. Authenticated `plugins.list` discovery includes the
+same field. `reload-plugins` preserves its existing `plugins` name list and adds `plugin_details`
+with compact identity rows. Reading these surfaces does not discover or dispatch plugins.
+Status reads plugin rows under the discovery lock without waiting: a busy lock returns
+`plugins: null`. A row-read exception returns `plugins: null` plus `plugins_error`, with a warning
+logged once per process, preserving status liveness and role fields.
+`plugins.list` no longer waits for in-progress discovery. A call racing a reload can see the
+pre-reload snapshot.
+
+Disabled, deferred, errored, manifest-only, portable and category-owned plugins have
+`code_identity: null` when this manager has not successfully registered captured Python source.
+Native or sourceless entry points, and entry points imported before source capture was installed,
+also cannot provide a source identity. The digest identifies captured source, not dependencies,
+data files, Python runtime state or an authenticity signature.
+
 ## What you're building
 
 A **calculator** plugin with two tools:

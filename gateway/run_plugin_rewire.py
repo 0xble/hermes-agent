@@ -83,7 +83,7 @@ def reload_plugins_verb(runner: Any, loop: asyncio.AbstractEventLoop) -> Callabl
     """Control-socket ``reload-plugins``: force re-discovery under the requested home's scope so a plugin
     installed/enabled by another process (CLI, Desktop, ``plugins.manage``) loads now; the loaded event
     then re-wires that profile's adapters. Only the gateway home and served profile homes are accepted.
-    Answer: ``{"reloaded", "home", "plugins", "activations", "adapters_rewired"}``. Runs on the socket executor thread
+    Answer: ``{"reloaded", "home", "plugins", "plugin_details", "activations", "adapters_rewired"}``. Runs on the socket executor thread
     (discovery is blocking); the count is read on the loop AFTER the re-wire callback (FIFO), so a
     truthful "active now" reaches the caller."""
 
@@ -91,6 +91,7 @@ def reload_plugins_verb(runner: Any, loop: asyncio.AbstractEventLoop) -> Callabl
         from hermes_constants import get_hermes_home, hermes_home_key
         from hermes_cli.plugins import discover_plugins, get_plugin_manager
         from hermes_cli.plugins_activation import activation_summaries, dependency_blocked_summaries
+        from hermes_cli.plugins_identity import compact_plugin_rows
         from gateway.run import _profile_runtime_scope
         params = params or {}
         gateway_home = Path(get_hermes_home())
@@ -112,6 +113,7 @@ def reload_plugins_verb(runner: Any, loop: asyncio.AbstractEventLoop) -> Callabl
             # A plugin that failed on a dependency this gateway booted without rides along, so the
             # enabling caller asks for the restart that loads it.
             names = sorted(manager._plugins)
+            details = compact_plugin_rows(manager)
             activations = activation_summaries(manager) + dependency_blocked_summaries(manager)
         _reconcile_plugin_mcp_servers(runner, requested)
         try:
@@ -119,7 +121,7 @@ def reload_plugins_verb(runner: Any, loop: asyncio.AbstractEventLoop) -> Callabl
         except Exception:
             rewired = None
         return {"reloaded": True, "home": str(requested), "plugins": names, "activations": activations,
-                "adapters_rewired": rewired}
+                "adapters_rewired": rewired, "plugin_details": details}
 
     return _handler
 
