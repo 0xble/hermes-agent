@@ -12,8 +12,12 @@ from __future__ import annotations
 import threading
 import types
 
+import pytest
+
 from tui_gateway import server
 from tui_gateway.user_messages import AGENT_BUILD_ABANDONED
+
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
 
 
 class _InlineThread:

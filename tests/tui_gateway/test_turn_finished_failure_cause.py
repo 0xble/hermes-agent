@@ -30,6 +30,8 @@ import pytest
 
 from tui_gateway import server
 
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
+
 
 class _InlineThread:
     """Run the turn synchronously so tests observe its final state."""

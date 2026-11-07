@@ -5,7 +5,11 @@ anchor can still name the wrong, stale row)."""
 import threading
 import types
 
+import pytest
+
 from tui_gateway import server
+
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
 
 
 def _session(agent=None, **extra):
