@@ -13,6 +13,7 @@ import functools
 import logging
 import time
 from contextlib import nullcontext, suppress
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform
@@ -27,6 +28,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+_post_turn_delivered = ContextVar("gateway_post_turn_delivered", default=False)
 
 
 # Parallels the CLI's "user-interrupted (Ctrl+C)": an explicit pause that user input never revives.
@@ -524,7 +526,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         session_key = None
         with suppress(Exception):
             session_key = self._session_key_for_source(source)
-        if session_key and hasattr(adapter, "register_post_delivery_callback"):
+        if session_key and not _post_turn_delivered.get() and hasattr(adapter, "register_post_delivery_callback"):
             try:
                 active = getattr(adapter, "_active_sessions", {}).get(session_key)
                 generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
@@ -760,6 +762,44 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
+
+    async def _defer_post_turn_hooks(
+        self, *, agent_result, source, is_internal, event, session_key, generation,
+    ) -> None:
+        """Let the durable FIFO settle and the transport answer before auxiliary bookkeeping.
+
+        Use the existing delivery owner so recovered turns, live waiters and
+        silent turns all fire the same once-only callback in their owning profile.
+        """
+        from gateway.session_results import execution_result
+        captured = execution_result.get()
+
+        async def finish():
+            token = execution_result.set(captured)
+            delivered_token = _post_turn_delivered.set(True)
+            try:
+                with self._profile_scope_for_source(source):
+                    await self._run_post_turn_hooks(
+                        agent_result=agent_result, source=source, is_internal=is_internal, event=event)
+            except Exception:
+                logger.debug("Post-delivery goal/loop bookkeeping failed", exc_info=True)
+            finally:
+                _post_turn_delivered.reset(delivered_token)
+                execution_result.reset(token)
+
+        adapter = self._delivery_adapter_for(source)
+        if adapter is None:
+            await finish()
+            return
+        async def after_delivery():
+            # The adapter's 30s cosmetic-cleanup budget must not cancel goal/loop
+            # bookkeeping while its bounded auxiliary request is still running.
+            task = self._retain_background_task(asyncio.create_task(finish()))
+            await asyncio.shield(task)
+
+        adapter.register_post_delivery_callback(session_key, after_delivery, generation=generation)
+        if captured is not None:
+            captured['post_delivery'] = (adapter, session_key, generation)
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
