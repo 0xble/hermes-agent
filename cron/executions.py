@@ -272,24 +272,33 @@ def _delete_prunable(
         " AND COALESCE(julianday(e.finished_at), julianday(e.claimed_at)) < julianday(?)"
         if cutoff is not None else ""
     )
+    # Latest attempts (including one-shot/removed jobs) can be protected forever.
+    # Exclude them with the indexed latest-row lookup BEFORE limiting the page,
+    # so they cannot starve eligible history. Bound the remaining delivery and
+    # journal checks: those obligations may also persist indefinitely.
     ids = []
     with closing(conn.execute(
-        """SELECT e.id, e.job_id FROM executions AS e INDEXED BY idx_executions_terminal_age
+        """SELECT e.id, e.job_id, e.delivery_outcome, e.delivery_status,
+                  e.delivery_status_provisional
+           FROM executions AS e INDEXED BY idx_executions_terminal_age
            WHERE e.status IN ('completed','failed','unknown')
-             AND COALESCE(e.delivery_outcome, '') != 'queued'
-             AND COALESCE(e.delivery_status, '') NOT IN ('pending','delivering')
-             AND e.delivery_status_provisional=0
-             AND e.id != (
-                 SELECT newest.id FROM executions AS newest
-                 WHERE newest.job_id=e.job_id
-                 ORDER BY julianday(newest.claimed_at) DESC, newest.claimed_at DESC,
-                          newest.id DESC LIMIT 1
+             AND NOT EXISTS (
+                 SELECT 1 FROM (
+                     SELECT newest.id FROM executions AS newest
+                     WHERE newest.job_id=e.job_id
+                     ORDER BY julianday(newest.claimed_at) DESC, newest.claimed_at DESC,
+                              newest.id DESC LIMIT 1
+                 ) AS latest WHERE latest.id=e.id
              )""" + age_clause + """
-           ORDER BY COALESCE(julianday(e.finished_at), julianday(e.claimed_at)), e.id""",
-        (cutoff,) if cutoff is not None else (),
+           ORDER BY COALESCE(julianday(e.finished_at), julianday(e.claimed_at)), e.id
+           LIMIT ?""",
+        ((cutoff,) if cutoff is not None else ()) + (limit * 4,),
     )) as rows:
         for row in rows:
-            if row["id"] in keep_ids:
+            if (row["id"] in keep_ids
+                    or row["delivery_outcome"] == "queued"
+                    or row["delivery_status"] in ("pending", "delivering")
+                    or row["delivery_status_provisional"] != 0):
                 continue
             # A terminal worker can still owe canonical admission settlement. Keep
             # its recovery link until the journal's owner removes it, even if old.
@@ -301,28 +310,43 @@ def _delete_prunable(
     return conn.executemany("DELETE FROM executions WHERE id=?", ids).rowcount
 
 
-def _prune_unlocked(conn: sqlite3.Connection, *, keep_ids: Iterable[str] = ()) -> None:
-    """Age out terminal history, with a bounded runaway-write backstop.
-
-    Share one deletion budget between both policies so an upgrade or recovery
-    backlog cannot monopolize the caller's write transaction. Later transitions
-    drain any remaining excess. In-flight attempts never enter either policy.
-    """
-    from hermes_cli.config import load_config_readonly
-
-    value = (load_config_readonly().get("cron") or {}).get(
-        "execution_retention_days", TERMINAL_RETENTION_DAYS)
+def _retention_cutoff() -> Optional[str]:
+    """Retention config is best-effort; it must never undo a terminal write."""
     try:
+        from hermes_cli.config import load_config_readonly
+
+        value = (load_config_readonly().get("cron") or {}).get(
+            "execution_retention_days", TERMINAL_RETENTION_DAYS)
         days = float(value)
         if not math.isfinite(days) or days < 0:
             raise ValueError("expected a non-negative finite duration")
-    except (TypeError, ValueError):
-        logger.warning("Invalid cron.execution_retention_days=%r, using %s", value, TERMINAL_RETENTION_DAYS)
+    except Exception as error:
+        # Unrelated config (e.g. an unknown model preset), malformed mappings,
+        # and conversion errors are all retention failures, not execution failures.
+        logger.warning("Cannot resolve cron.execution_retention_days, using %s: %s",
+                       TERMINAL_RETENTION_DAYS, error, exc_info=True)
         days = TERMINAL_RETENTION_DAYS
+    if days == 0:
+        return None
+    try:
+        return (_hermes_now().astimezone(UTC) - timedelta(days=days)).isoformat()
+    except OverflowError:
+        # A window longer than representable history expires nothing by age.
+        # Keep the independent row backstop active rather than rolling back.
+        return None
+
+
+def _prune_unlocked(conn: sqlite3.Connection, *, keep_ids: Iterable[str] = ()) -> None:
+    """Age out terminal history, with bounded deletion and non-SQL checks.
+
+    Share one deletion budget between both policies so an upgrade or recovery
+    backlog cannot monopolize the caller's write transaction. Later transitions
+    drain eligible excess. In-flight attempts never enter either policy.
+    """
+    cutoff = _retention_cutoff()
     budget = TERMINAL_PRUNE_BATCH_SIZE
     keep_ids = set(keep_ids)
-    if days > 0:
-        cutoff = (_hermes_now().astimezone(UTC) - timedelta(days=days)).isoformat()
+    if cutoff is not None:
         budget -= _delete_prunable(conn, budget, keep_ids=keep_ids, cutoff=cutoff)
     if budget <= 0:
         return
