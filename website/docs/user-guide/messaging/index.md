@@ -567,7 +567,7 @@ display:
 | `all` | Running-output updates **and** the final status message with the output tail |
 | `result` | Only the final status message with the output tail (regardless of exit code) |
 | `error` | Only the final status message with the output tail when the exit code is non-zero |
-| `off` | No process watcher messages at all. Also honored by the CLI, TUI and Desktop: background-process completions and heartbeats no longer wake the agent (subagent results still do) |
+| `off` | No user-visible process receipts, including running/final output, busy-turn status and fallback notices. Explicit gateway `notify_on_complete=true` completions still wake the agent. CLI, TUI and Desktop completion/heartbeat wakes stay suppressed (subagent results still arrive) |
 
 You can also set this via environment variable:
 
@@ -575,7 +575,7 @@ You can also set this via environment variable:
 HERMES_BACKGROUND_NOTIFICATIONS=result
 ```
 
-With `terminal(background=true, notify_on_complete=true)` the finished process starts a new agent turn and the agent reports the result itself, so no separate status line is sent. The effective `off` mode suppresses this completion turn too, even when `notify_on_complete=true`. With notifications enabled, the exception is a process that finishes while the turn that launched it is still running: the completion is queued as the agent's next turn and you get the one-line `concise` status right away (unless the mode is `error` with a zero exit code), instead of silence until that turn ends.
+With `terminal(background=true, notify_on_complete=true)` the finished process starts a new agent turn and the agent reports the result itself, so no separate status line is sent. On the messaging gateway, `off` preserves this explicitly requested completion turn while hiding every separate process receipt; the agent can still report meaningful results. It does not enable automatic notification promotion or watch-pattern wakes. CLI, TUI and Desktop still suppress completion turns under `off`. With notifications enabled, the exception is a process that finishes while the turn that launched it is still running: the completion is queued as the agent's next turn and you get the one-line `concise` status right away (unless the mode is `error` with a zero exit code), instead of silence until that turn ends.
 
 While a chat is mid-turn or started a turn within the last `gateway.completion_notification_batch_window_seconds` (default 300), successful background results (exit 0, completed delegations) are held and handed to the agent together as one turn that lists every result. Failures, non-zero exits, and a result a parked `/goal` is explicitly waiting on are delivered at once, and they bring any held results with them. Results are never dropped: a restart releases held results for delivery on the next start. Set the window to `0` to deliver each result as soon as it lands.
 

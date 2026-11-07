@@ -125,25 +125,78 @@ class TestLoadBackgroundNotificationsMode:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("notify", [False, True])
 @pytest.mark.parametrize("mode", ["off", "'off'", "concise"])
-async def test_off_suppresses_watcher_completion_even_with_notify(monkeypatch, tmp_path, notify, mode):
+@pytest.mark.parametrize("busy", [False, True])
+@pytest.mark.parametrize("exit_code", [0, 1])
+async def test_off_hides_receipts_but_keeps_explicit_completion(monkeypatch, tmp_path, notify, mode, busy, exit_code):
     import tools.process_registry as pr_module
 
-    registry = _FakeRegistry([SimpleNamespace(
-        output_buffer="done\n", exited=True, exit_code=0, command="echo done", started_at=None,
-    )])
+    registry = _FakeRegistry([
+        SimpleNamespace(output_buffer="running\n", exited=False),
+        SimpleNamespace(output_buffer="done\n", exited=True, exit_code=exit_code, command="echo done", started_at=None),
+    ])
     monkeypatch.setattr(pr_module, "process_registry", registry)
     runner = _build_runner(monkeypatch, tmp_path, mode)
     runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
-    runner._launching_turn_active = AsyncMock(return_value=False)
+    runner._launching_turn_active = AsyncMock(return_value=busy)
     adapter = runner.adapters[Platform.TELEGRAM]
 
-    await runner._run_process_watcher({**_watcher_dict(), "notify_on_complete": notify})
+    await runner._run_process_watcher({**_watcher_dict(thread_id="42"), "notify_on_complete": notify})
 
     enabled = mode == "concise"
-    assert runner._enqueue_process_completion_notification.await_count == int(enabled and notify)
-    assert adapter.send.await_count == int(enabled and not notify)
+    assert runner._enqueue_process_completion_notification.await_count == int(notify)
+    assert adapter.send.await_count == int(enabled and (not notify or busy))
     adapter.handle_message.assert_not_awaited()
     assert not registry.is_completion_consumed("proc_test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "'off'"])
+@pytest.mark.parametrize("busy", [False, True])
+async def test_off_refused_explicit_completion_stops_after_eight_without_receipt(monkeypatch, tmp_path, mode, busy):
+    import tools.process_registry as pr_module
+
+    running = SimpleNamespace(output_buffer="running\n", exited=False)
+    finished = SimpleNamespace(output_buffer="done\n", exited=True, exit_code=1, command="build", started_at=None)
+    registry = _FakeRegistry([running] + [finished] * 9)
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    delays = []
+
+    async def tick(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", tick)
+    runner = _build_runner(monkeypatch, tmp_path, mode)
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=False)
+    runner._launching_turn_active = AsyncMock(return_value=busy)
+
+    await runner._run_process_watcher({**_watcher_dict(), "notify_on_complete": True})
+
+    assert runner._enqueue_process_completion_notification.await_count == 8
+    assert delays == [0, 0, 2, 4, 8, 16, 32, 60, 60]
+    runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+    runner.adapters[Platform.TELEGRAM].handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "'off'"])
+@pytest.mark.parametrize("notify", [False, True])
+async def test_off_keeps_local_client_watcher_silent(monkeypatch, tmp_path, mode, notify):
+    import tools.process_registry as pr_module
+
+    registry = _FakeRegistry([
+        SimpleNamespace(output_buffer="running\n", exited=False),
+        SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0, command="build", started_at=None),
+    ])
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    runner = _build_runner(monkeypatch, tmp_path, mode)
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+    runner._send_watcher_message = AsyncMock(return_value=True)
+    runner._launching_turn_active = AsyncMock(return_value=True)
+
+    await runner._run_process_watcher({**_watcher_dict(), "platform": "local", "notify_on_complete": notify})
+
+    runner._enqueue_process_completion_notification.assert_not_awaited()
+    runner._send_watcher_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

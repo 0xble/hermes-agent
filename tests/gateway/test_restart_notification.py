@@ -556,7 +556,7 @@ async def test_survivor_watcher_acknowledges_after_presenting_or_suppressing(tmp
         "session_id": "proc_text", "check_interval": 0.01, "notify_on_complete": notify,
     })
     assert sent == ([] if mode == "off" or notify else ["claimed"])
-    assert runner._enqueue_process_completion_notification.await_count == int(mode != "off" and notify)
+    assert runner._enqueue_process_completion_notification.await_count == int(notify)
     assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
 
 

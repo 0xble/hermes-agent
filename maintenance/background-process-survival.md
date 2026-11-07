@@ -146,9 +146,13 @@ Fork patch identity: `terminal-background-survival`.
   before rename (including the managed-worker handoff). Native bash/zsh login-rc
   tests verify output and status before any parent wait-status fallback.
 - The owning profile's effective `display.background_process_notifications: off`
-  suppresses gateway process completion turns, including explicit
-  `notify_on_complete=true` watchers. A suppressed survivor settles its delivery
-  marker without admission or a public send, so recovery does not replay it.
+  hides all public process receipts: running/final output, busy-turn status and
+  admission-refusal fallback. Explicit `notify_on_complete=true` still admits
+  a completion turn for idle or busy gateway topics; false settles silently.
+  CLI/TUI/Desktop remain silent under `off`; automatic wait-promotion stays
+  disabled on every surface. Wait guidance promises a later turn only when
+  that consumer can receive one. Refused gateway completions retain the
+  eight-attempt cap and #837 backoff, without public fallback under `off`.
   The retained process result remains available to `process(wait/log)`.
 - `gateway_shutdown` (both restart and an operator gateway stop) leaves opted-in
   processes running. Explicit operator stop paths (`process.kill`, `cli.stop`,

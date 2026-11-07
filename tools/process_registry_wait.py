@@ -73,7 +73,9 @@ def wait_plan(
     Anywhere else, ending the turn or not waiting again loses the result, so the
     caller keeps the full window and must collect or kill the process itself.
     """
-    reachable = can_receive_later()
+    from tools.process_registry_wait_policy import _completion_delivery_supported
+
+    reachable = _completion_delivery_supported(explicit_notify=True)
     if notify_on_complete and completion_reaches_session and reachable:
         return (min(NOTIFIABLE_DEFAULT_TIMEOUT, max_timeout),
                 " You will be notified on completion; do not wait again. End the turn or do other work.")
