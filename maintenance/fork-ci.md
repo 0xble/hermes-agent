@@ -104,7 +104,30 @@ clears only after a gateway serves the new commit.
 
 Portable Python execution passes `--file-retries 0`, including E2E and native OS
 qualification. A fail-once test stays failed at the gate entrypoint. Interactive
-runner defaults remain unchanged. The Windows Desktop cwd self-test retains its
+runner defaults remain unchanged.
+
+Per-file timeouts retain their existing hard cap. On POSIX, each fresh pytest
+process registers an all-thread stack-dump signal before importing pytest. The
+runner requests that dump one second before the deadline (a proportional lead
+for tiny explicit caps), then kills the process tree at the original deadline.
+Stacks go to a private attempt file, outside pytest capture, and are attached to
+the failure output before scratch cleanup. A readiness marker prevents sending
+SIGUSR2 to an unregistered child; Windows reports that signal-based diagnostics
+are unavailable and retains its existing kill path. Pytest's own per-test
+faulthandler plugin remains enabled. Collection, an earlier failing test, and
+session-finish hangs must not suppress the file-level diagnostic. The bootstrap
+retains the actual `pytest` module argument in the process command line so the
+live-DB ancestry guard still recognizes children with scrubbed environments.
+Verify with
+`scripts/run_tests.sh tests/scripts/test_run_tests_timeout_dump.py tests/scripts/test_run_tests_parallel.py tests/scripts/test_run_tests_parallel_stdio.py tests/scripts/test_run_tests_parallel_timeout_scaling.py tests/hermes_state/test_live_db_guard_ancestry.py`.
+This instrumentation does not claim a cause for the intermittent turn-hold
+adoption hang: hosted runs 41525743485, 41698107946 and 41703877839, attempt 1,
+collected seven tests but printed no first result before their 300-second kill.
+Local isolated/repeated/shard runs and the unchanged hosted retry completed in
+about six seconds. The missing evidence is the hosted process's active stacks,
+not justification to widen a limit or remove coverage.
+
+The Windows Desktop cwd self-test retains its
 60-second limit; on a timeout it snapshots the PowerShell parent exit state
 and live descendant PIDs/names/statuses, kills the snapshotted process tree,
 then performs a bounded drain to capture partial stdout. If the drain still
