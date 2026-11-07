@@ -132,7 +132,7 @@ def test_blocked_judgment_keeps_a_wake_and_breaches_survive_replacement(home, mo
 
 
 @pytest.mark.parametrize("action", ["pause", "resume", "replace", "clear"])
-def test_model_controls_never_request_approval_or_clear(home, action):
+def test_model_controls_apply_without_approval(home, action):
     manager()
     if action == "resume":
         goals.GoalManager("autonomy").pause()
@@ -141,8 +141,8 @@ def test_model_controls_never_request_approval_or_clear(home, action):
         payload={"goal": "alternate route"} if action == "replace" else None)
     assert result.get("status") != "pending"
     if action == "clear":
-        assert not result["ok"]
-        assert goals.load_goal("autonomy").status == "active"
+        assert result["ok"], result
+        assert goals.load_goal("autonomy").status == "cleared"
     elif action == "resume":
         # The pause above is the user's, which the agent never lifts.
         assert not result["ok"] and result["error_code"] == "user_paused", result
@@ -337,6 +337,21 @@ def test_explicit_pauses_and_approval_entry_respect_autonomy(home):
     assert result.get("status") != "pending"
     assert not result["ok"] and result["error_code"] == "user_paused", result
     assert goals.load_goal("autonomy").status == "paused"
+
+
+def test_autonomy_prompt_explains_reasoned_retirement_and_registry_tracks_it(home):
+    from hermes_cli.goals_autonomy import AUTONOMY_CONTINUATION_TEMPLATE
+    from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
+
+    prompt = manager().next_continuation_prompt()
+    assert prompt is not None
+    assert "Never clear a goal." not in prompt
+    assert "Clear only an obsolete" in prompt
+    assert "verified takeover" in prompt
+    assert "Never clear to escape unmet criteria or failing checks" in prompt
+    assert "Use complete for an achieved goal" in prompt
+    assert any(row["formatter"] == "autonomy" and row["template"] == AUTONOMY_CONTINUATION_TEMPLATE
+               for row in GOAL_PROMPT_REGISTRY)
 
 
 def test_autonomy_reads_the_owning_profile_for_each_activity(home):

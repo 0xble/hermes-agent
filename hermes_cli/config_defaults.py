@@ -1476,7 +1476,7 @@ DEFAULT_CONFIG = {
         # True shows every goal card. False hides automatic lifecycle output, not queries or
         # approvals. "hidden" also hides approval cards and control receipts (hermes_cli/goal_notices.py).
         "notices": True,
-        "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
+        "autonomy": False,  # Inherit the contract; clearing obsolete goals requires a recorded reason.
         # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
         # Minimum seconds between autonomous continuation turns (continuation after continuation,
