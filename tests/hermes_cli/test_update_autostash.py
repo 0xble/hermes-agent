@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli import main as hermes_main, update_cmd
-from tests.hermes_cli.test_update_target_identity import git, update_tree
+from tests.hermes_cli.test_update_target_identity import git, update_tree as update_tree
 from datetime import UTC
 
 
