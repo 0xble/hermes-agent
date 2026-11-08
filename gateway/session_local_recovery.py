@@ -459,7 +459,7 @@ _BOOT_RECEIPTS_SQL = (
     "OR EXISTS (SELECT 1 FROM state_meta c WHERE c.key = ? || substr(m.key, ?)))")
 
 
-def restore_completion_route(runner, session_key):
+async def restore_completion_route(runner, session_key):
     """Background work that outlived its local session reports after a restart: boot left that ended
     session unrestored, so restore it first, as ``authorize`` does on a viewer's first touch, and its
     completion is noted on it as before. Anything else is left to the delivery's own checks."""
@@ -469,7 +469,7 @@ def restore_completion_route(runner, session_key):
     if authority is None or parsed.get('platform') != Platform.LOCAL.value or parsed['chat_id'] in authority.sessions:
         return
     with contextlib.suppress(RuntimeStoreError):
-        restore_local_session(authority, parsed['chat_id'])
+        await restore_local_session_async(authority, parsed['chat_id'])
 
 
 def release_handed_off_receipts(db, *, epoch):

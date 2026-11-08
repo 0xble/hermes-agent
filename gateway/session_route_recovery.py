@@ -23,6 +23,7 @@ from. LOCAL rows (cron, CLI, TUI) restore from their private receipt and API row
 ``_publish_route``: a row that ended for a recoverable reason (``agent_close``, ``ws_orphan_reap``,
 ...) is mounted live too, as the lane's next message would reopen it.
 """
+import asyncio
 import json
 from datetime import datetime
 
@@ -89,7 +90,7 @@ def _row_entry(row, platform, route, profile):
 
 
 def _mount_plan(authority, sid):
-    """``(route, entry, routed)`` for a row a route or a messaging-platform row can stand for, else
+    """``(route, entry, detached)`` for a row a route or a messaging-platform row can stand for, else
     None. Reads only: ``restore_routed_session`` mounts it, the stored picker lists it."""
     row = authority.db.get_session(sid)
     route = row.get('session_key') if row is not None else None
@@ -103,25 +104,35 @@ def _mount_plan(authority, sid):
         return None
     routed = _routed_entry(authority, sid, route)
     entry = routed or _row_entry(row, platform, route, profile)
-    return None if entry is None else (route, entry, routed)
+    return None if entry is None else (
+        route, entry, routed is None and _names_another_conversation(authority, sid, route))
 
 
 def restore_routed_session(authority, sid):
     """Publish *sid* as its lane would after a restart; None when this row is not one a route or a
     messaging-platform row can stand for."""
+    return _publish_routed_session(authority, sid, _mount_plan(authority, sid))
+
+
+async def restore_routed_session_async(authority, sid):
+    """Read the cold route off-loop and publish its live mount on the owner loop."""
+    plan = await asyncio.to_thread(_mount_plan, authority, sid)
+    return _publish_routed_session(authority, sid, plan)
+
+
+def _publish_routed_session(authority, sid, plan):
     from gateway.session_authority import LiveSession
     from gateway.session_contract import SessionRef
-    plan = _mount_plan(authority, sid)
     if plan is None:
         return None
-    route, entry, routed = plan
+    route, entry, detached = plan
     authority._require_admission_open()
     # Re-pin the persisted receiving bot so delivery after a restart goes through it or nowhere,
     # never the default bot by heuristic (gateway/AGENTS.md § Identity survives the process).
     source = authority.runner._restored_source(entry)
     if sid not in authority.sessions:
         live = authority.sessions[sid] = LiveSession(source, route)
-        if routed is None and _names_another_conversation(authority, sid, route):
+        if detached:
             from gateway.session_detached import detach
             detach(authority, live, sid)  # the lane moved past it: its turns stay off the chat
     return SessionRef(authority.profile_id, sid)

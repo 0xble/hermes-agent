@@ -1546,7 +1546,7 @@ class GatewayNotificationsMixin(
         from gateway.session_detached import follow_detached_pin
         from gateway.session_local_recovery import restore_completion_route
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
-        restore_completion_route(self, str(evt.get("session_key") or ""))  # watch notices and heartbeats too
+        await restore_completion_route(self, str(evt.get("session_key") or ""))  # watch notices and heartbeats too
         if self._completion_held_by_stop(evt):
             # Retryable, not refused: the event stays queued until the user's next turn.
             if raise_not_accepted:
