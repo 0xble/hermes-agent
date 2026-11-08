@@ -830,6 +830,23 @@ Rollback reverts this fixture change, with no runtime or stored-state migration.
 
 Contract tests: `tests/hermes_cli/test_host_terminal_viewer_ownership.py`
 
+## Webapp sign-out navigation
+
+The `fork-ci-reliability` identity covers the gated sign-out journey in
+`apps/desktop/e2e/core/webapp-gateway-attach.spec.ts`. After sign-out, the browser
+transport navigates to `/login` when an authenticated request is refused. Observe
+that navigation instead of issuing a competing reload, which can address a
+Chromium target during detachment. Keep the socket-closure, command-summary,
+API-401, login-URL, hidden-composer and successful-re-sign-in assertions.
+
+Nightly run `42450734092`, job `128639191910`, failed at the competing reload
+with `Page.reload: Not attached to an active page`. Its retained trace contains
+only test-runner events, so it cannot establish the browser's navigation timing.
+A Linux Chromium probe of the unchanged journey confirmed script-initiated
+`/login` navigation after sign-out and successful re-sign-in. No renderer change
+is needed. Retire this adaptation when upstream observes the same navigation
+contract. Rollback reverts the test change without altering runtime state.
+
 ## Release-sync scope
 
 A release sync merges thousands of upstream commits. Fork policy checks classify
