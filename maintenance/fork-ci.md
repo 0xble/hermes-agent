@@ -808,6 +808,28 @@ roll back the commit carrying `Fork-Patch: fork-ci-reliability` for this probe.
 
 Contract tests: `tests/tools/test_process_registry_attached_boundary.py`
 
+## Host terminal paste cancellation
+
+The `fork-ci-reliability` identity covers the host terminal's real-PTY cancellation
+observation in `tests/hermes_cli/test_host_terminal_viewer_ownership.py`.
+The wait-for-room hook proves that a paste hit backpressure. It cannot prove
+where cancellation lands: Linux may make the master writable again before the
+tab's close is processed, so the write resumes and cancellation reaches its
+worker-thread await instead. Observe `CancelledError` leaving `bridge.write`,
+while preserving every live-shell, detach, registry and retention assertion.
+Production still delivers already-received input until backpressure after close.
+
+This adopts upstream [PR #145620](https://github.com/NousResearch/hermes-agent/pull/145620),
+commit `bcc5e486cf60a6dad7345d0fb8ed26def261e034`, with contributor authorship
+preserved. The fork's hosted run `42444478246` failed the narrower observation.
+On the unchanged base, Linux CPython 3.14.7 reproduced it in 1/200 runs under
+24 `yes` workers. An event-controlled first-wait drain reproduced it in 200/200
+runs while the outer write was cancelled and the shell stayed alive and detached.
+Retire this adaptation when the maintained release includes the upstream fix.
+Rollback reverts this fixture change, with no runtime or stored-state migration.
+
+Contract tests: `tests/hermes_cli/test_host_terminal_viewer_ownership.py`
+
 ## Release-sync scope
 
 A release sync merges thousands of upstream commits. Fork policy checks classify
