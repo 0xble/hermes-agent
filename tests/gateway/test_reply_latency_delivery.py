@@ -133,7 +133,7 @@ async def test_streamed_final_records_last_confirmed_chunk(monkeypatch, mode):
 
     adapter = Adapter()
     if mode != "fresh":
-        adapter.MAX_MESSAGE_LENGTH = 64
+        adapter.MAX_MESSAGE_LENGTH = 600
     clock = [1800000000.0]
     monkeypatch.setattr("gateway.reply_latency.time", SimpleNamespace(time=lambda: clock[0]))
     confirmations = []
@@ -159,7 +159,7 @@ async def test_streamed_final_records_last_confirmed_chunk(monkeypatch, mode):
     if mode == "fallback":
         consumer._fallback_final_send = True
         consumer._edit_supported = False
-    consumer.finish("The complete answer. " * (100 if mode == "fallback" else 20 if mode == "split" else 1))
+    consumer.finish("The complete answer. " * (1 if mode == "fresh" else 100))
     await consumer.run()
     row, = read_records()
     assert row["final_delivery"] == 1800000000.0 + 11 * len(confirmations) - 1
