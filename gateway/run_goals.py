@@ -674,7 +674,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         self, *, session_entry: Any, source: Any, final_response: str,
         user_initiated: bool = False, external_event: bool = False,
         goal_instance: Optional[float] = None,
-        run_generation: Optional[int] = None,
+        invalidation_epoch: Optional[int] = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
@@ -682,8 +682,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         from gateway.wake import automatic_route_available
 
         def is_current():
-            return run_generation is None or self._is_session_run_current(
-                self._session_key_for_source(source), run_generation)
+            return invalidation_epoch is None or (
+                self._session_state(self._session_key_for_source(source)).persistent.invalidation_epoch
+                == invalidation_epoch)
 
         def _load():
             from hermes_cli.goals import GoalManager
@@ -771,18 +772,23 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
     async def _defer_post_turn_hooks(
-        self, *, agent_result, source, is_internal, event, session_key, generation,
+        self, *, agent_result, source, is_internal, event, session_key, generation, invalidation_epoch=None,
     ) -> None:
         """Let the durable FIFO settle and the transport answer before auxiliary bookkeeping.
 
         Only a delivery owner can promise to fire the callback. Direct callers
-        finish inline, and superseded callbacks cannot judge a replacement turn.
+        finish inline. Invalidation fences superseded work without rejecting FIFO successors.
         """
         from gateway.session_results import execution_result
         captured = execution_result.get()
+        state = self._session_state(session_key).persistent
+        if invalidation_epoch is None:
+            invalidation_epoch = state.invalidation_epoch
+        if state.invalidation_epoch != invalidation_epoch:
+            return
 
         async def finish():
-            if not self._is_session_run_current(session_key, generation):
+            if state.invalidation_epoch != invalidation_epoch:
                 return
             token = execution_result.set(captured)
             delivered_token = _post_turn_delivered.set(True)
@@ -790,7 +796,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 with self._profile_scope_for_source(source):
                     await self._run_post_turn_hooks(
                         agent_result=agent_result, source=source, is_internal=is_internal, event=event,
-                        run_generation=generation)
+                        invalidation_epoch=invalidation_epoch)
             except Exception:
                 logger.debug("Post-delivery goal/loop bookkeeping failed", exc_info=True)
             finally:
@@ -801,24 +807,29 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         from gateway.platforms.base import post_delivery_owner
         owner = post_delivery_owner.get()
         register = getattr(adapter, 'register_post_delivery_callback', None)
-        delivery_owned = captured is not None or (
+        delivery_owned = (captured is not None and captured.get('post_delivery_owned') is True) or (
             owner is not None and owner[0] is adapter and owner[1] is event)
         if not callable(register) or not delivery_owned:
             await finish()
             return
-        async def after_delivery():
-            # The adapter's 30s cosmetic-cleanup budget must not cancel goal/loop
-            # bookkeeping while its bounded auxiliary request is still running.
-            task = self._retain_background_task(asyncio.create_task(finish()))
-            await asyncio.shield(task)
+        delivered = asyncio.Event()
 
-        register(session_key, after_delivery, generation=generation)
+        async def wait_for_delivery():
+            await delivered.wait()
+            await finish()
+
+        # Track before settlement can report idle. Only the signal callback enters
+        # the cosmetic cleanup chain, never the auxiliary judge's lifetime.
+        task = self._retain_background_task(asyncio.create_task(wait_for_delivery()))
+        self._track_task_in(adapter._background_tasks, task)
+        event._post_turn_bookkeeping_task = task
+        register(session_key, delivered.set, generation=generation)
         if captured is not None:
             captured['post_delivery'] = (adapter, session_key, generation)
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
-        run_generation: Optional[int] = None,
+        invalidation_epoch: Optional[int] = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         from gateway.session_authorities import active_authority
@@ -910,10 +921,14 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             instance = identity.get("goal_instance")
             if type(instance) in (int, float):
                 goal_kwargs["goal_instance"] = instance
-            if run_generation is not None:
-                goal_kwargs["run_generation"] = run_generation
+            if invalidation_epoch is not None:
+                goal_kwargs["invalidation_epoch"] = invalidation_epoch
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
+            if invalidation_epoch is not None and (
+                self._session_state(self._session_key_for_source(source)).persistent.invalidation_epoch
+                != invalidation_epoch):
+                return
             try:
                 await hook(
                     session_entry=session_entry, source=source, final_response=final_text if successful else "",

@@ -676,6 +676,7 @@ class GatewayAgentCacheMixin:
         generation-guarded and would otherwise leave ``/moa`` / ``/model --once`` in force."""
         self._restore_pending_one_turn_model_override(session_key)
         generation = self._begin_session_run_generation(session_key)
+        self._session_state(session_key).persistent.invalidation_epoch += 1
         if reason:
             logger.info("Invalidated run generation for %s → %d (%s)", session_key, generation, reason)
         return generation
