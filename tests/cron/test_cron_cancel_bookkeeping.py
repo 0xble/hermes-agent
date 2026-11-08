@@ -132,6 +132,21 @@ def test_removal_before_the_run_starts_books_cancelled_not_claim_loss(store, mon
     assert (row["status"], row["error"]) == ("cancelled", "job removed while running")
 
 
+def test_removal_cause_survives_claim_loss_bookkeeping(store):
+    from cron.cancellation import request_cancel
+
+    job = jobs.create_job(prompt="long", schedule="every 1h", deliver="local")
+    fire = executions.create_execution(job["id"], source="test")["id"]
+    executions.mark_execution_running(fire)
+    jobs.remove_job(job["id"])
+    request_cancel(fire, reason="job removed while running")
+
+    scheduler._record_fire_ownership_lost(job, None, fire)
+
+    row = executions.get_execution(fire)
+    assert (row["status"], row["error"]) == ("cancelled", "job removed while running")
+
+
 def test_overlapping_cancel_requests_keep_the_first_reason(store, monkeypatch):
     """Both callers can pass the existence check before either publishes its marker."""
     from pathlib import Path

@@ -275,6 +275,18 @@ def test_remote_cancel_names_cause_and_preserves_budget(isolated_store, monkeypa
         # A detached worker has no control in the operator's process.
         control = scheduler._running_cancel_events[scheduler._inflight_key(job["id"])]
         control.local = False
+        if action == "remove":
+            from cron import scheduler_control
+            interrupt = scheduler_control.interrupt_job_run
+
+            def settle_before_local_interrupt_returns(job):
+                receipt = interrupt(job)
+                # A remote owner can finish as soon as deletion rejects its heartbeat.
+                # It must already see the durable removal cause, before this local tail ends.
+                assert future.result(timeout=5)
+                return receipt
+
+            monkeypatch.setattr(scheduler_control, "interrupt_job_run", settle_before_local_interrupt_returns)
         if action == "disable":
             updated = jobs.update_job(job["id"], {"enabled": False})
             assert updated is not None and updated["enabled"] is False
