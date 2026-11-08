@@ -278,6 +278,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         tool_progress_sent: bool = False
         skipped_edits: int = 0
         progress_pause_logged: bool = False
+        dirty: bool = False
 
     # Default minimum seconds between progress edits. An adapter may raise it with
     # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
@@ -386,9 +387,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
         st.progress_msg_id, st.progress_lines = None, []
+        st.dirty = False
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
-
-
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx

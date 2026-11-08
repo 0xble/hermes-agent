@@ -471,6 +471,7 @@ class GatewayTurnProgressMixin:
             result = await self._send_progress_text(st, self._progress_text(group))
             if result.success and result.message_id:
                 st.progress_msg_id = result.message_id
+        st.dirty = not result.success
         # The newest continuation is the only mutable bubble: keep just its lines so later
         # edits update it instead of replaying the full transcript into new messages.
         st.progress_lines = groups[-1]
@@ -484,6 +485,7 @@ class GatewayTurnProgressMixin:
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
         st.progress_msg_id, st.progress_lines = None, []
+        st.dirty = False
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
 
     def _progress_absorb(self, st, raw) -> Any:
@@ -493,15 +495,19 @@ class GatewayTurnProgressMixin:
             if not st.progress_lines:
                 return base_msg
             st.progress_lines[-1] = type(base_msg)(_append_progress_repeat_count(base_msg, count + 1))
+            st.dirty = True
             return st.progress_lines[-1]
         st.progress_lines.append(raw)
+        st.dirty = True
         return raw
 
     async def _flush_progress_edit(self, st) -> None:
         # A deferred bubble may still hold an unsplit, over-limit buffer: never send that as one edit.
-        if st.can_edit and st.progress_lines and st.progress_msg_id and not self._progress_deferred(st):
+        if st.dirty and st.can_edit and st.progress_lines and st.progress_msg_id and not self._progress_deferred(st):
             with suppress(Exception):
-                await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                if result.success and not (result.raw_response or {}).get("skipped"):
+                    st.dirty = False
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
@@ -541,6 +547,7 @@ class GatewayTurnProgressMixin:
                 return True
             if result.success:
                 st.reanchored = False
+                st.dirty = False
                 return True
             if self._edit_failure_is_deferrable(st, result):
                 # Flood keeps the throttle cadence (True); a bare transient error retries next tick.
@@ -552,6 +559,8 @@ class GatewayTurnProgressMixin:
         result = await self._send_progress_text(st, self._progress_text(st.progress_lines) if st.can_edit else msg)
         if result.success and result.message_id:
             st.progress_msg_id = result.message_id
+        if result.success:
+            st.dirty = False
         return True
 
     def _progress_interval_for_chat(self, adapter) -> float:

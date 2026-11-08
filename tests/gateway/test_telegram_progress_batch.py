@@ -241,6 +241,43 @@ async def test_reset_during_a_batch_preserves_lines_on_each_side(tmp_path, monke
     assert edits[-1]["text"] == "after0\nafter1"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reset_path", ["consumer", "batch"])
+async def test_reset_does_not_edit_an_already_published_buffer(tmp_path, monkeypatch, reset_path):
+    runner, adapter = _runner(tmp_path, 0)
+    runner._progress_emit("first")
+    day = ToolDay(runner, 15, [(1, ("__reset__",))])
+    _patch_day(monkeypatch, day)
+    if reset_path == "consumer":
+        await runner.send_progress_messages()
+    else:
+        st = runner._progress_edit_state(adapter)
+        runner._progress_absorb(st, runner._ctx.progress_queue.get_nowait())
+        await runner._progress_send_or_edit(st, "first")
+        runner._ctx.progress_queue.put(("__reset__",))
+        await runner._collect_progress_batch(st)
+    adapter._bot.send_message.assert_awaited_once()
+    adapter._bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_flush_is_not_repeated_but_failed_flush_keeps_new_text(tmp_path):
+    runner, adapter = _runner(tmp_path, 0)
+    st = runner._progress_edit_state(adapter)
+    runner._progress_absorb(st, "first")
+    await runner._progress_send_or_edit(st, "first")
+    runner._progress_absorb(st, "second")
+    adapter.edit_message = AsyncMock(side_effect=[
+        SendResult(success=False, retryable=True), SendResult(success=True, message_id="1"),
+    ])
+    await runner._flush_progress_edit(st)
+    await runner._flush_progress_edit(st)
+    await runner._flush_progress_edit(st)
+    assert adapter.edit_message.await_count == 2
+    assert all(call.kwargs["content"] == "first\nsecond"
+               for call in adapter.edit_message.await_args_list)
+
+
 def test_hourly_summary_attributes_edits_without_debug_or_counting_them_twice(tmp_path, caplog):
     before_restart = dq.DailyQuota(profile_dir=tmp_path)
     before_restart.record(CHAT, "editMessageText")
