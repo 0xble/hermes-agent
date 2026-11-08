@@ -291,7 +291,7 @@ class TestVideoDownloadBlock:
 
     def test_media_handler_accepts_video_notes(self, adapter):
         class _Names:  # filter stand-in: | collects names; & and ~ only need to compose
-            def __init__(self, *names):
+            def __init__(self, *names, **kwargs):
                 self.names = set(names)
 
             def __or__(self, other):
@@ -304,9 +304,9 @@ class TestVideoDownloadBlock:
 
         fake_filters = SimpleNamespace(
             **{name: _Names(name) for name in ("TEXT", "COMMAND", "LOCATION", "VENUE", "PHOTO", "VIDEO",
-                                                "VIDEO_NOTE", "AUDIO", "VOICE")},
+                                                "VIDEO_NOTE", "AUDIO", "VOICE", "ALL")},
             Document=SimpleNamespace(ALL=_Names("DOCUMENT")), Sticker=SimpleNamespace(ALL=_Names("STICKER")),
-            StatusUpdate=None)
+            StatusUpdate=None, MessageFilter=_Names)
         registered = {}
         with patch.multiple("plugins.platforms.telegram.adapter", filters=fake_filters,
                             TelegramMessageHandler=lambda flt, callback: registered.setdefault(callback, flt)):
