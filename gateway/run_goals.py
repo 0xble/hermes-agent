@@ -786,10 +786,13 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             invalidation_epoch = state.invalidation_epoch
         if state.invalidation_epoch != invalidation_epoch:
             return
+        started = False
 
         async def finish():
-            if state.invalidation_epoch != invalidation_epoch:
+            nonlocal started
+            if started or state.invalidation_epoch != invalidation_epoch:
                 return
+            started = True
             token = execution_result.set(captured)
             delivered_token = _post_turn_delivered.set(True)
             try:
@@ -807,12 +810,25 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         from gateway.platforms.base import post_delivery_owner
         owner = post_delivery_owner.get()
         register = getattr(adapter, 'register_post_delivery_callback', None)
-        delivery_owned = (captured is not None and captured.get('post_delivery_owned') is True) or (
+        fifo_owned = captured is not None and captured.get('post_delivery_owned') is True
+        delivery_owned = fifo_owned or (
             owner is not None and owner[0] is adapter and owner[1] is event)
-        if not callable(register) or not delivery_owned:
+        # FIFO execution hands off an explicit owner below. Legacy adapter delivery
+        # instead reads the guard's generation, which an early return may never bind.
+        guard = getattr(adapter, '_active_sessions', {}).get(session_key)
+        mismatched_guard = (not fifo_owned and guard is not None
+                            and getattr(guard, '_hermes_run_generation', None) != generation)
+        if not callable(register) or not delivery_owned or mismatched_guard:
             await finish()
             return
         delivered = asyncio.Event()
+        if register(session_key, delivered.set, generation=generation) is not True:
+            await finish()
+            return
+
+        async def finish_inline():
+            delivered.set()
+            await finish()
 
         async def wait_for_delivery():
             await delivered.wait()
@@ -823,9 +839,14 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         task = self._retain_background_task(asyncio.create_task(wait_for_delivery()))
         self._track_task_in(adapter._background_tasks, task)
         event._post_turn_bookkeeping_task = task
-        register(session_key, delivered.set, generation=generation)
+        event._post_turn_bookkeeping_fallback = finish_inline
         if captured is not None:
-            captured['post_delivery'] = (adapter, session_key, generation)
+            from gateway.session_ingress import post_delivery_owners
+            owners = post_delivery_owners(captured.get('post_delivery'))
+            bookkeeping_owner = (adapter, session_key, generation)
+            if bookkeeping_owner not in owners:
+                owners.append(bookkeeping_owner)
+            captured['post_delivery'] = owners
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
