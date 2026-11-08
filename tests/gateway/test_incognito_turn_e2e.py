@@ -232,6 +232,7 @@ async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify
     agent = runner._cached_agent_for(key)
     provider.replies = ["Second OK"]
     second = await turn("Private follow-up", "private-2")
+    assert store.lookup_by_session_key(key).last_prompt_tokens > 0
     # A 429 runs the real private path through the credential pool, whose status is persisted.
     limited = RuntimeError(f"rate limited while reading {canary}")
     limited.status_code = 429
@@ -245,7 +246,7 @@ async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify
     assert summaries and all(summaries)
     # The cache re-baseline keeps the resolver's agent across private turns.
     assert agent is not None and agent.incognito is True and runner._cached_agent_for(key) is agent
-    assert store.lookup_by_session_key(key).last_prompt_tokens > 0
+    assert store.lookup_by_session_key(key).last_prompt_tokens == agent.context_compressor.last_prompt_tokens
     records = [record.getMessage() for record in caplog.records]
     assert not any(canary in text for text in records)
     assert any(text.startswith("Incognito agent turn failed:") for text in records), records
