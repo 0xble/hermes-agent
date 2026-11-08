@@ -141,13 +141,18 @@ def test_classified_nonoverflow_400_persists_a_large_failed_session(reason):
     classified = ClassifiedError(reason=reason, status_code=400, retryable=False)
     agent = _Agent()
     agent._persist_session = Mock()
-    nonretryable_client_error_result(
+    result = nonretryable_client_error_result(
         agent, error, classified, status_code=400, api_kwargs=None, api_messages=[{}] * 81,
         messages=[{"role": "user", "content": "continue"}], conversation_history=[{}] * 60,
         api_call_count=1, approx_tokens=100_000, provider="custom:claude-proxy",
         base_url="http://127.0.0.1:8317/v1", model="claude-opus-5-5",
     )
-    agent._persist_session.assert_called_once()
+    if reason is FailoverReason.content_policy_blocked:
+        agent._persist_session.assert_not_called()
+        assert result["messages"] == [{}] * 60
+        assert result["failure_reason"] == "content_policy_blocked"
+    else:
+        agent._persist_session.assert_called_once()
 
 
 @pytest.mark.parametrize(
