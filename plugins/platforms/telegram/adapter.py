@@ -1983,8 +1983,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         else:
             message_id = getattr(msg, "message_id", None)
         from gateway.reply_latency import transport_confirmed
-        result = transport_confirmed(content, SendResult(
-            success=True, message_id=str(message_id) if message_id is not None else None))
+        result = transport_confirmed(content, SendResult(success=True, message_id=str(message_id) if message_id is not None else None),
+                                     chat_id=chat_id, thread_id=thread_id)
         if message_id is not None:
             await self._record_rich_sent(chat_id, message_id, content)
         return result
@@ -2031,7 +2031,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
             return self._rich_transient_result(exc, "rich editMessageText")
         # Mirror the fresh-send index: a streamed final finalized via edit is otherwise never recorded.
         from gateway.reply_latency import transport_confirmed
-        result = transport_confirmed(content, SendResult(success=True, message_id=message_id))
+        result = transport_confirmed(content, SendResult(success=True, message_id=message_id), chat_id=chat_id, thread_id=self._metadata_thread_id(metadata))
         await self._record_rich_sent(chat_id, message_id, content)
         return result
 
@@ -4930,7 +4930,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                 return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
             msg, used_thread_fallback = outcome
             from gateway.reply_latency import record_transport_reply
-            confirmed_at = record_transport_reply(chunk)
+            confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
             delivered.append(str(msg.message_id))
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
@@ -5304,12 +5304,12 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                 logger.error("[%s] Overflow split: first-chunk edit failed: %s", self.name, _redact_telegram_error_text(e), exc_info=True)
                 return SendResult(success=False, error=_redact_telegram_error_text(e))
         from gateway.reply_latency import record_transport_reply
-        confirmed_at = record_transport_reply(first_chunk)
+        thread_id = self._metadata_thread_id(metadata)
+        confirmed_at = record_transport_reply(first_chunk, chat_id=chat_id, thread_id=thread_id)
         # Continuations call self._bot.send_message directly to skip self.send's pre-chunking.
         continuation_ids: list[str] = []
         delivered_chunks = [first_chunk]
         prev_id = message_id
-        thread_id = self._metadata_thread_id(metadata)
         for chunk in chunks[1:]:
             reply_to_id = int(prev_id) if prev_id else None
             thread_kwargs = self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=reply_to_id)
@@ -5330,7 +5330,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                         "continuation_message_ids": tuple(continuation_ids)},
                     continuation_message_ids=tuple(continuation_ids))
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
-            confirmed_at = record_transport_reply(chunk)
+            confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
             prev_id = new_id

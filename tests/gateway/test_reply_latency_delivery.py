@@ -104,7 +104,7 @@ async def test_telegram_first_chunk_and_last_chunk_are_confirmations_not_return_
     clock = [1800000000.0]
     monkeypatch.setattr("gateway.reply_latency.time", SimpleNamespace(time=lambda: clock[0]))
     adapter = _telegram("never")
-    incoming = event(adapter, "split", "topic")
+    incoming = event(adapter, "split", "77")
     bind_agent_start(incoming)
 
     async def chunk(chat_id, text, **kwargs):
@@ -115,7 +115,7 @@ async def test_telegram_first_chunk_and_last_chunk_are_confirmations_not_return_
         return SimpleNamespace(message_id=str(clock[0]))
 
     monkeypatch.setattr(adapter._bot, 'send_message', chunk)
-    await adapter.send_final_ledgered(incoming, "route", "word " * 1500, {}, reply_to=None)
+    await adapter.send_final_ledgered(incoming, "route", "word " * 1500, {"thread_id": "77"}, reply_to=None)
     first = [r for r in records(caplog) if r["event"] == "first_reply"]
     assert first and first[0]["timestamp"] == 1800000010.0
     from gateway.reply_latency_report import read_records
@@ -134,6 +134,20 @@ async def test_streamed_final_records_last_confirmed_chunk(monkeypatch, mode):
     adapter = Adapter()
     if mode != "fresh":
         adapter.MAX_MESSAGE_LENGTH = 64
+    clock = [1800000000.0]
+    monkeypatch.setattr("gateway.reply_latency.time", SimpleNamespace(time=lambda: clock[0]))
+    confirmations = []
+    original_send = adapter.send
+
+    async def confirmed_send(*args, **kwargs):
+        clock[0] += 10
+        result = await original_send(*args, **kwargs)
+        confirmations.append(clock[0])
+        result.raw_response = {"reply_latency_confirmed_at": clock[0]}
+        clock[0] += 1  # Bookkeeping after confirmation must not move the delivery clock.
+        return result
+
+    monkeypatch.setattr(adapter, "send", confirmed_send)
     incoming = event(adapter, "stream")
     bind_agent_start(incoming)
     consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(
@@ -147,4 +161,6 @@ async def test_streamed_final_records_last_confirmed_chunk(monkeypatch, mode):
     consumer.finish("The complete answer. " * (100 if mode == "fallback" else 20 if mode == "split" else 1))
     await consumer.run()
     row, = read_records()
-    assert row.get("final_delivery") is not None
+    assert row["final_delivery"] == 1800000000.0 + 11 * len(confirmations) - 1
+    assert row["final_delivery"] == confirmations[-1]
+    assert len(confirmations) > (0 if mode == "fresh" else 1)
