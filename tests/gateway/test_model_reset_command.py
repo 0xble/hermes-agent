@@ -45,7 +45,7 @@ async def test_reset_clears_a_persisted_override_after_restart(tmp_path, monkeyp
 
     reply = await runner._handle_model_command(_event("/model reset", source))
 
-    assert "cfg-model" in reply
+    assert reply == "✓ Model override reset."
     assert store.get_model_override(key) is None
     assert runner._session_model_overrides.get(key) is None
     assert runner._pending_one_turn_model_restores.get(key) is None  # an armed --once can't re-plant it
