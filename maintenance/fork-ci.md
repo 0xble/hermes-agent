@@ -928,3 +928,11 @@ Retire these adaptations when upstream supplies equivalent causal pause fixtures
 and a server sized for its downloader's concurrency.
 
 Contract tests: `tests/gateway/test_gateway_slot_isolation.py`, `tests/hermes_cli/test_local_component_jobs.py`, `tests/pm/test_downloader.py`.
+
+Fork-patch classifier fixture repositories disable commit signing locally as
+well as hooks. A developer's global SSH signing setting otherwise resolves its
+public-key path under the fixture's isolated `HOME`, where that key is absent,
+and fails before any classification assertion. The real candidate's signing and trailer policies are
+unchanged. Retire this fixture adaptation when upstream isolates Git signing.
+
+Contract tests: `tests/scripts/test_fork_patch_trailers.py`.
