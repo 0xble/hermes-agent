@@ -686,6 +686,11 @@ class GatewayAgentCacheMixin:
         state = self._peek_session_state(session_key)
         return int(state.persistent.run_generation) if state is not None else 0
 
+    def _session_invalidation_epoch(self, session_key: str) -> int:
+        """Read the boundary fence without creating session state during bookkeeping."""
+        state = self._peek_session_state(session_key)
+        return state.persistent.invalidation_epoch if state is not None else 0
+
     def _is_session_run_current(self, session_key: str, generation: int) -> bool:
         """Return True when ``generation`` is still current for ``session_key``."""
         if not session_key:
