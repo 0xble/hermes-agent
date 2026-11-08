@@ -43,7 +43,7 @@ async def execute_and_book(tmp_path, monkeypatch, *, mode, recovered, schedule):
     home = tmp_path / 'profile'
     owner = owners.cron_owner(home, monkeypatch)
     job = jobs.create_job(prompt='Generate a report', schedule=schedule, deliver='local', repeat=2)
-    job = jobs.claim_job_for_fire(job['id'], manual=True, return_job=True)
+    job = jobs.claim_job_for_fire(job['id'], manual=False, return_job=True)
     if job['schedule']['kind'] == 'once':
         assert jobs.claim_dispatch(job['id'])
     fire = executions.create_execution(job['id'], source='test')['id']

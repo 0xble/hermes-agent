@@ -115,7 +115,7 @@ def test_store_failure_preserves_one_shot_and_wake_gate(
     )
     if not no_agent:
         job = jobs.update_job(job["id"], {"monitor_script": "monitor.py"})
-    claimed = jobs.claim_job_for_fire(job["id"], manual=True, return_job=True)
+    claimed = jobs.claim_job_for_fire(job["id"], manual=False, return_job=True)
     assert scheduler.run_one_job(claimed)
     current = jobs.get_job(job["id"])
     if no_agent:
