@@ -20,6 +20,7 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import atexit
+import errno
 import importlib
 import ipaddress
 import os
@@ -1200,6 +1201,14 @@ def _processes_with_hermes_home_under(roots) -> list[int]:
         try:
             home = proc.environ().get("HERMES_HOME")
         except (psutil.Error, OSError):
+            continue
+        except SystemError as exc:
+            # psutil's Darwin proc_environ can return with a PermissionError still set.
+            if (sys.platform != "darwin"
+                    or str(exc) != "<built-in function proc_environ> returned a result with an exception set"
+                    or not isinstance(exc.__cause__, PermissionError)
+                    or exc.__cause__.errno not in (errno.EACCES, errno.EPERM)):
+                raise
             continue
         if not home:
             continue

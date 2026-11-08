@@ -506,6 +506,28 @@ live-system guard are unchanged. A Linux probe that lets the leader exit before
 group inspection reproduces the old guard refusal. Retire when upstream adopts
 cooperative teardown for this cell.
 
+## Session reaper permission failures
+
+The `fork-ci-reliability` identity covers the session-end process scan in
+`tests/conftest.py` and its regressions in `tests/test_session_daemon_reaper.py`.
+Darwin's psutil `proc_environ` can wrap a permission denial in `SystemError`,
+turning an otherwise passing file into a teardown failure. Skip only that exact
+native error with an `EACCES` or `EPERM` permission cause. Unrelated native errors
+must still propagate. The live regression enumerates only its own 2 children,
+while reading their actual environments and retaining real signal delivery.
+Controlled regressions preserve canonical and symlinked home matching, reject
+symlink escapes and similarly prefixed foreign homes, and retain the self-PID
+exclusion. Do not replace resolved-home matching with a lexical prefilter,
+which would lose legitimate symlink aliases.
+
+Upstream `e075441241b8d626789b4aae0e376f86eabf824d` retains the same unhandled
+error. The POSIX scan from
+https://github.com/NousResearch/hermes-agent/pull/149391 is intentional.
+https://github.com/NousResearch/hermes-agent/pull/150315 addresses a missing
+psutil installation instead and does not cover this failure. No upstream
+publication is claimed. Retire this adaptation when released upstream preserves
+both permission-denial containment and the existing resolved-home boundary.
+
 ## Linked worktree test venv
 
 The `fork-ci-reliability` identity also covers the canonical runner's venv
