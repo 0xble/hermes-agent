@@ -73,8 +73,8 @@ def run_exec(monkeypatch, tmp_path):
     """browser_exec on the local or cloud-provider route; the real harness CLI with the fake transport above."""
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
-    monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
-    monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda: "")
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override_raw", lambda: "")
     monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
     monkeypatch.setattr(bu_cli, "_exec_route_is_sidecar", {}, raising=False)
     monkeypatch.setattr(bu_cli, "_driven_daemons", {})
@@ -85,17 +85,18 @@ def run_exec(monkeypatch, tmp_path):
     monkeypatch.setattr(bu_cli, "_harness_site_dir", lambda: os.pathsep.join([str(fake_dir), site_dir]))
     # tests/tools/conftest.py hides the CLI; this is _find_cli()'s production command
     monkeypatch.setattr(bu_cli, "_find_cli", lambda: [sys.executable, "-m", "browser_harness.run"])
+    monkeypatch.setattr(bu_cli, "_resolve_local_engine_cdp", lambda env, *args, **kwargs: (env.update({"BU_CDP_URL": "ws://127.0.0.1:47000/devtools/browser/fixture"}) or None))
     log = tmp_path / "cdp.jsonl"
 
     def run(activate_works: bool, cloud: bool = False, code: str = "print(capture_screenshot({shot!r}))",
             autospawn_daemon_kind: str = ""):
-        monkeypatch.setattr(bs_cloud, "get_cloud_provider", (lambda: object()) if cloud else (lambda: None))
+        monkeypatch.setattr("tools.browser_tool_cloud._get_cloud_provider", (lambda: object()) if cloud else (lambda: None))
         if autospawn_daemon_kind:  # direct-API Browser Use config: the harness picks its own browser
-            monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: SimpleNamespace(name="browser-use"))
+            monkeypatch.setattr("tools.browser_tool_cloud._get_cloud_provider", lambda: SimpleNamespace(name="browser-use"))
             monkeypatch.setattr(bu_cli, "_use_gateway", lambda cfg: False)
             monkeypatch.setattr(bu_cli, "_browser_use_api_key_set", lambda: True)
         monkeypatch.setenv("FAKE_DAEMON_KIND", autospawn_daemon_kind)
-        monkeypatch.setattr(bs, "get_session_info",
+        monkeypatch.setattr("tools.browser_tool_session._get_session_info",
                             lambda key: {"cdp_url": f"ws://127.0.0.1:47000/devtools/browser/{key}",
                                          "features": {} if cloud else {"local": True}})
         monkeypatch.setenv("FAKE_CDP_LOG", str(log))
