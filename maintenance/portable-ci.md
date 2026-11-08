@@ -89,7 +89,8 @@ There is no host-wide install lock. Fork patch identity: `ci-shared-download-cac
 When Linux makes the normal disk-backed Python scratch path read-only, Python
 fixtures use a unique directory under the runner's original disk-backed HOME,
 outside the isolated child HOME. Temporary parents with Git or Node dependency
-ancestry are rejected. Only invocation-owned directories are cleaned. A kernel lock prevents concurrent setup/check in that checkout and is
+ancestry are rejected. Startup also reclaims abandoned CI homes under that same
+temporary parent, as specified below. A kernel lock prevents concurrent setup/check in that checkout and is
 released automatically on process exit. Checkouts never use another checkout's
 venv or personal pytest plugin. Setup and checks reject a symlinked checkout
 `.venv` before syncing dependencies or selecting its interpreter, including
@@ -101,6 +102,76 @@ variables are absent from the child environment. Installed rustup users share
 only the resolved toolchain executable directory. Cargo configuration/cache is
 checkout-owned. Setup/check detect any edits to pre-existing source files and
 fail without overwriting the contributor's work.
+
+## portable-ci-home-sweep
+
+Fork patch identity: `portable-ci-home-sweep`. The identity exactly matches this
+unit's section title. Source baseline: `d26ea98988f516e2c46d455ea428e8d486ee02af`.
+
+Every `hermes-ci-home-*` wrapper holds `.owner.lock` for its lifetime and records
+PID, OS process creation time, and hostname in `.owner.json`. Creation, owner
+publication, sweeping, and normal teardown share a parent registry lock. A sweep
+only considers direct, real directories with this prefix. It never removes a
+home with a held owner lock, even when its PID marker is incorrect. An unlocked
+marked home is abandoned, including after SIGKILL or PID reuse. The kernel lock,
+rather than a process-list snapshot or hostname comparison, is authoritative.
+Do not replace it with PID-only ownership.
+
+Unmarked homes need at least 24 hours of inactivity by the newest mtime of the
+home and its immediate entries. No recursive `lsof +D` scan is attempted against
+potentially 68-GB trees. This is the conservative age-only legacy fallback, not
+proof that every legacy descendant is closed. Symlinks and Windows reparse
+directories are not traversed. Per-home filesystem errors are logged and left
+for a later run. Reclamation logs home count and allocated bytes. Allocated bytes
+are summed without following links, not a measurement of APFS exclusive extents.
+The registry lock is held during reclamation, so startup can wait behind a large
+deletion. Windows uses the equivalent kernel byte lock and closes it before
+removing its file under the registry lock. Native Windows execution remains
+separate qualification.
+
+Removal restores owner permissions on read-only entries before retrying the
+failed operation, preserving `TemporaryDirectory`'s normal teardown behavior.
+The portable runner keeps this stdlib-only because importing `utils` also loads
+the application's YAML dependency. Payload entries are removed before
+`.owner.json` and `.owner.lock`. A partial payload failure therefore retains
+both ownership files, so the next sweep retries immediately instead of applying
+the 24-hour legacy delay.
+
+### Environment materialization
+
+The wrapper creates an empty HOME, not a copy of the installed runtime. PM's
+`Venv.apply` in `pm/packages.py` makes UUID generations under
+`installs/<checkout-path-hash>/environments`, including a writable dependency
+workspace. `pm/runtime.py::prepare_runtime` separately stages and selects the
+manager runtime. `hermes_cli/boot_bootstrap.py` records per-install boot steps.
+The install ID hashes the checkout path, not the dependency lock. Different
+extras, plugin graphs, source changes and repair operations can create distinct
+generations in the same install. The original prepare-before-select rationale is
+recorded in `92686159d13cf56ee47fc9d0f4854d093b9f859f`.
+
+Sharing these whole trees by lock hash would couple writable selections,
+workspaces, leases, editable paths and repair state. The real cold-runtime test
+`tests/pm/test_cold_runtime_e2e.py` changes the source lock, builds a new app,
+removes a dependency, and repairs it into another environment. The real-build
+contract `tests/pm/test_environment_build.py` changes a plugin dependency and
+checks that failed preparation preserves the selected environment. Those
+operations require isolated, writable state. Materialization is retained.
+This patch adds no shared environment cache and makes no per-run storage
+reduction claim. The existing portable uv download cache already requests APFS
+clones where supported. PM's private engine deliberately strips ambient `UV_*`
+settings and selects its own cache, so that portable optimization does not imply
+all PM generation builds share its cache. Retain that boundary in this scoped
+fix rather than redirecting test dependency state into a shared runtime.
+
+### Regression and retirement
+
+Contract tests: `tests/scripts/ci/test_portable_homes.py`. They exercise dead
+owners, a held lock despite a bad PID, PID reuse, fresh and old legacy homes,
+top-level activity, symlink boundaries, read-only teardown and reclamation,
+retry after partial removal, and SIGKILL followed by a fresh process using the
+real wrapper. All parents are test-owned. Retire this fork patch only
+when the replacement wrapper proves the same crash reclamation and live-owner
+preservation contracts. Reverting the patch restores normal-exit cleanup only.
 
 Docs generators run in a disposable copy of source, including uncommitted
 contributor edits. Parity compares file content and the complete added/deleted
