@@ -418,12 +418,12 @@ def _live_system_guard(request, monkeypatch):
             (".venv/bin/hermes" in low and "update" in low)
         )
 
-    def _is_npm_refresh_fixture(cmd, kwargs) -> bool:
+    def _is_dependency_refresh_fixture(cmd, kwargs) -> bool:
         # Only PM's direct temporary fixture command is a known false positive:
         # its parent path can contain "hermes-ci-home", but it updates a throwaway
-        # package-lock.json. Shell payloads, extra args and executable overrides
+        # package-lock.json or pnpm-lock.yaml. Shell payloads and executable overrides
         # are deliberately not exempt. No real Hermes entrypoint has this shape.
-        if not isinstance(cmd, (list, tuple)) or len(cmd) != 2 or cmd[1] != "update":
+        if not isinstance(cmd, (list, tuple)) or list(cmd[1:]) not in (["update"], ["update", "--recursive", "--lockfile-only", "--no-save"]):
             return False
         if not kwargs or kwargs.get("shell") or kwargs.get("executable") is not None:
             return False
@@ -434,6 +434,8 @@ def _live_system_guard(request, monkeypatch):
         suffix = ("store", "npm-fixture", "npm.cmd") if _os.name == "nt" else (
             "store", "npm-fixture", "bin", "npm"
         )
+        if list(cmd[1:]) != ["update"]:
+            suffix = ("store", "pnpm-fixture", "pnpm.cmd" if _os.name == "nt" else "pnpm")
         if binary.parts[-len(suffix):] != suffix:
             return False
         root = binary.parents[len(suffix) - 1]
@@ -596,7 +598,7 @@ def _live_system_guard(request, monkeypatch):
         # the update-spawn path must mock subprocess.Popen explicitly.
         cmd_str = _cmd_to_string(cmd)
         block_update = _base_is_hermes_update(cmd) or _is_hermes_update(cmd)
-        if block_update and not _is_npm_refresh_fixture(cmd, kwargs):
+        if block_update and not _is_dependency_refresh_fixture(cmd, kwargs):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
                 f"subprocess.{name}({cmd!r}) — this command would run "
