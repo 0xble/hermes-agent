@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +38,13 @@ class ReplyReceipt:
 
 _current: contextvars.ContextVar[ReplyReceipt | None] = contextvars.ContextVar(
     "gateway_reply_receipt", default=None)
-_delivery_kind: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "gateway_reply_delivery_kind", default="text_send")
+_delivery_kind: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "gateway_reply_delivery_kind", default=None)
+
+
+@lru_cache(maxsize=128)
+def _ensure_log_directory(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
 
 
 def _emit(receipt: ReplyReceipt, event: str, timestamp: float, **details: Any) -> None:
@@ -49,7 +55,7 @@ def _emit(receipt: ReplyReceipt, event: str, timestamp: float, **details: Any) -
         logger.info("gateway_reply_latency %s", payload)
         from hermes_constants import get_hermes_home
         directory = receipt.log_dir or Path(get_hermes_home()) / "logs" / "reply-latency"
-        directory.mkdir(parents=True, exist_ok=True)
+        _ensure_log_directory(directory)
         day = datetime.fromtimestamp(timestamp, UTC).date().isoformat()
         # A single O_APPEND write keeps concurrent turns/processes from interleaving JSON lines.
         fd = os.open(directory / f"{day}.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -175,14 +181,19 @@ def record_first_reply(
     return stamp
 
 
-def record_transport_reply(text: str) -> float | None:
+def record_transport_reply(text: str, *, chat_id: str, thread_id: Any = None) -> float | None:
     """Only adapters call this, immediately after an actual API confirmation."""
-    return record_first_reply(current_receipt(), text, kind=_delivery_kind.get())
+    receipt, kind = current_receipt(), _delivery_kind.get()
+    thread = str(thread_id) if thread_id is not None else None
+    if (receipt is None or kind is None or str(chat_id) != receipt.identity["chat_id"]
+            or thread != receipt.identity["thread_id"]):
+        return None
+    return record_first_reply(receipt, text, kind=kind)
 
 
-def transport_confirmed(text: str, result: Any) -> Any:
+def transport_confirmed(text: str, result: Any, *, chat_id: str, thread_id: Any = None) -> Any:
     """Attach the API clock before adapter bookkeeping or an outbox commit can delay return."""
-    stamp = record_transport_reply(text)
+    stamp = record_transport_reply(text, chat_id=chat_id, thread_id=thread_id)
     if stamp is not None:
         result.raw_response = {**(result.raw_response or {}), "reply_latency_confirmed_at": stamp}
     return result
