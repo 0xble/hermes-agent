@@ -683,7 +683,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         def is_current():
             return invalidation_epoch is None or (
-                self._session_state(self._session_key_for_source(source)).persistent.invalidation_epoch
+                self._session_invalidation_epoch(self._session_key_for_source(source))
                 == invalidation_epoch)
 
         def _load():
@@ -781,16 +781,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         """
         from gateway.session_results import execution_result
         captured = execution_result.get()
-        state = self._session_state(session_key).persistent
         if invalidation_epoch is None:
-            invalidation_epoch = state.invalidation_epoch
-        if state.invalidation_epoch != invalidation_epoch:
+            invalidation_epoch = self._session_invalidation_epoch(session_key)
+        if self._session_invalidation_epoch(session_key) != invalidation_epoch:
             return
         started = False
 
-        async def finish():
+        async def finish(*, deferred=False):
             nonlocal started
-            if started or state.invalidation_epoch != invalidation_epoch:
+            if started or self._session_invalidation_epoch(session_key) != invalidation_epoch:
                 return
             started = True
             token = execution_result.set(captured)
@@ -799,7 +798,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 with self._profile_scope_for_source(source):
                     await self._run_post_turn_hooks(
                         agent_result=agent_result, source=source, is_internal=is_internal, event=event,
-                        invalidation_epoch=invalidation_epoch)
+                        invalidation_epoch=invalidation_epoch, existing_session_only=deferred)
             except Exception:
                 logger.debug("Post-delivery goal/loop bookkeeping failed", exc_info=True)
             finally:
@@ -828,11 +827,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         async def finish_inline():
             delivered.set()
-            await finish()
+            await finish(deferred=True)
 
         async def wait_for_delivery():
             await delivered.wait()
-            await finish()
+            await finish(deferred=True)
 
         # Track before settlement can report idle. Only the signal callback enters
         # the cosmetic cleanup chain, never the auxiliary judge's lifetime.
@@ -850,7 +849,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
-        invalidation_epoch: Optional[int] = None,
+        invalidation_epoch: Optional[int] = None, existing_session_only: bool = False,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         from gateway.session_authorities import active_authority
@@ -865,9 +864,17 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not successful:
             final_text = ""
         try:
-            session_entry = await self.async_session_store.get_or_create_session(
-                source, touch_activity=not is_internal,
-            )
+            if existing_session_only:
+                # Settlement can precede a stop that suspends this route. Deferred
+                # auxiliary work must not reopen it by resolving a fresh session.
+                session_entry = await self.async_session_store.lookup_by_session_key(
+                    self._session_key_for_source(source))
+                if session_entry is None:
+                    return
+            else:
+                session_entry = await self.async_session_store.get_or_create_session(
+                    source, touch_activity=not is_internal,
+                )
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
@@ -947,7 +954,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
             if invalidation_epoch is not None and (
-                self._session_state(self._session_key_for_source(source)).persistent.invalidation_epoch
+                self._session_invalidation_epoch(self._session_key_for_source(source))
                 != invalidation_epoch):
                 return
             try:
