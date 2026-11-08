@@ -68,4 +68,9 @@ fork adaptation only when upstream covers remove/pause, tool receipts, and runni
 visibility with the same regressions green. Source landing is not live gateway
 deployment.
 
+Commit `744157e2899967937f4cd8b487e6db5433aadb61` prepared those upstream
+verdict assertions without a trailer. Classify its exact content here without
+rewriting the attached candidate or advancing the trailer floor.
+Fork-Patch-Backfill: 378923d245564f1ac576e95dc7f43c81c33e33f0; cron-inflight-cancellation
+
 The external-worker waiter accepts `cancelled` alongside `completed` and `failed` as a durable terminal verdict. It must not report unknown side effects after the owner has already committed cancellation. `tests/cron/test_cron_cancel_bookkeeping.py::test_the_external_worker_waiter_accepts_a_cancelled_row` exercises the real waiter against that ledger row. Retire this adaptation when the upstream waiter recognizes all scheduler terminal states.
