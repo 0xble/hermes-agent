@@ -19,6 +19,7 @@ import tempfile
 import time
 from typing import TextIO
 
+from pm.worker_budget import UV_STEP_TIMEOUT, VENV_CREATE_TIMEOUT, DEPENDENCY_CHECK_TIMEOUT
 from pm.filesystem import native
 from pm.package import InstallError
 from pm.progress import LiveTail, TextSink, verbose_output
@@ -380,12 +381,12 @@ class PythonEnvironment:
         result = self._run(
             ["venv", "--relocatable", "--no-project", "--no-config",
              "--python", str(self.python), str(self.destination)],
-            cwd=self.destination.parent, timeout=120,
+            cwd=self.destination.parent, timeout=VENV_CREATE_TIMEOUT,
         )
         if result.returncode:
             raise InstallError("venv", f"uv venv failed: {result.stderr[-600:]}")
 
-    def lock(self, source: Path, *, upgrade: bool = False, timeout: int = 1800) -> None:
+    def lock(self, source: Path, *, upgrade: bool = False, timeout: int = UV_STEP_TIMEOUT) -> None:
         command = ["lock", "--python", str(self.python)]
         if upgrade:
             command.append("--upgrade")
@@ -395,12 +396,12 @@ class PythonEnvironment:
 
     def check_lock(self, source: Path) -> None:
         result = self._run(["lock", "--check", "--python", str(self.python)],
-                           cwd=source, timeout=1800)
+                           cwd=source, timeout=UV_STEP_TIMEOUT)
         if result.returncode:
             raise classify_uv_failure("lock", result.returncode, result.stderr or result.stdout)
 
     def sync(self, source: Path, *, extras: Sequence[str] = (), groups: Sequence[str] = (),
-             timeout: int = 1800, frozen: bool = True, all_extras: bool = False,
+             timeout: int = UV_STEP_TIMEOUT, frozen: bool = True, all_extras: bool = False,
              no_install_project: bool = False, locked: bool = False,
              no_default_groups: bool = False) -> None:
         """Install the root and every member; resolve only in a writable workspace.
@@ -448,7 +449,7 @@ class PythonEnvironment:
             raise classify_uv_failure("sync", result.returncode, result.stderr or result.stdout)
 
     def export_requirements(self, source: Path, out: Path, *, extras: Sequence[str] = (),
-                            timeout: int = 1800) -> None:
+                            timeout: int = UV_STEP_TIMEOUT) -> None:
         command = ["export", "--frozen", "--python", str(self.python), "--no-default-groups",
                    "--no-emit-project", "--no-hashes", "--no-annotate", "--no-header",
                    "--format", "requirements-txt", "--output-file", str(out)]
@@ -469,7 +470,7 @@ class PythonEnvironment:
             self._install_requirements_file(requirements_file, wheelhouse=wheelhouse, lock=lock)
 
     def _install_requirements_file(self, requirements: Path, *, wheelhouse: Path | None = None,
-                                   lock: Path | None = None, timeout: int = 1800) -> None:
+                                   lock: Path | None = None, timeout: int = UV_STEP_TIMEOUT) -> None:
         """Install *requirements*; *lock* is the uv.lock they were exported from.
 
         `uv pip install` re-resolves the export, so the lock's manifest overrides
@@ -492,7 +493,7 @@ class PythonEnvironment:
         if result.returncode:
             raise classify_uv_failure("pip", result.returncode, result.stderr or result.stdout)
 
-    def install_wheelhouse(self, source: Path, wheelhouse: Path, *, timeout: int = 1800) -> None:
+    def install_wheelhouse(self, source: Path, wheelhouse: Path, *, timeout: int = UV_STEP_TIMEOUT) -> None:
         """Install rebuilt wheels whose hashes the bundle manifest owns, not uv.lock."""
         requirements = source / "requirements.txt"
         self.export_requirements(source, requirements, timeout=timeout)
@@ -504,7 +505,7 @@ class PythonEnvironment:
         command = ["cache", "prune", "--no-config"]
         if ci:
             command += ["--ci", "--force"]
-        result = self._run(command, cwd=Path.cwd(), timeout=1800)
+        result = self._run(command, cwd=Path.cwd(), timeout=UV_STEP_TIMEOUT)
         if result.returncode:
             raise InstallError("uv", f"cache pruning failed: {result.stderr[-600:]}")
 
@@ -518,7 +519,7 @@ class PythonEnvironment:
         result = replace(self, output=None)._run(
             # Forced colour (FORCE_COLOR/CLICOLOR_FORCE) would wrap the report in ANSI pm.pip_check cannot read.
             ["pip", "check", "--no-config", "--color", "never", "--python", str(self.executable)],
-            cwd=self.destination.parent, timeout=60,
+            cwd=self.destination.parent, timeout=DEPENDENCY_CHECK_TIMEOUT,
         )
         if not result.returncode:
             return

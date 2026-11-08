@@ -487,6 +487,7 @@ class Store:
     def install_lock(self):
         """Serialize writers using the same advisory lock as runtime publication."""
         from pm.filesystem import lock_fd
+        from pm.worker_budget import unbounded
         self.root.mkdir(parents=True, exist_ok=True)
         lock = self.root / ".install.lock"
         fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
@@ -495,7 +496,8 @@ class Store:
             # silent for minutes; say what it is waiting on.
             if not lock_fd(fd, wait=True, timeout=2):
                 print(f"waiting for {lock} (another PM operation holds it)", file=sys.stderr, flush=True)
-                lock_fd(fd, wait=True)
+                with unbounded():
+                    lock_fd(fd, wait=True)
             yield
         finally:
             os.close(fd)

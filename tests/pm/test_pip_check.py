@@ -18,7 +18,14 @@ import pytest
 
 from pm.package import InstallError
 from pm.pip_check import override_requirements, overridden_versions, unexpected_incompatibilities
-from tests.pm._fixtures import _run, _wheel
+from tests.pm._fixtures import (
+    _run,
+    _wheel,
+    build_worker as build_worker,  # noqa: PLC0414 -- pytest fixtures are imported for discovery
+    client as client,  # noqa: PLC0414 -- pytest fixtures are imported for discovery
+    isolated_python as isolated_python,  # noqa: PLC0414 -- pytest fixtures are imported for discovery
+    offline_build_worker as offline_build_worker,  # noqa: PLC0414 -- pytest fixtures are imported for discovery
+)
 
 REPO_LOCK = Path(__file__).resolve().parents[2] / "uv.lock"
 
@@ -113,7 +120,7 @@ def test_stdlib_fallback_reads_the_real_lock_like_tomllib(monkeypatch):
 
 
 @pytest.fixture
-def overridden_project(tmp_path):
+def overridden_project(tmp_path, offline_build_worker):
     """A real project whose dependency pins shared-dep==1.0, overridden to 2.0."""
     return _overridden_project(tmp_path, ["shared_dep"])
 
@@ -208,7 +215,7 @@ def test_requirements_builds_from_an_overridden_lock_apply_its_overrides(overrid
     environment.install_wheelhouse(source, wheels)
 
 
-def test_streamed_check_still_sees_failures_ahead_of_a_long_expected_report(tmp_path):
+def test_streamed_check_still_sees_failures_ahead_of_a_long_expected_report(tmp_path, offline_build_worker):
     """Interactive builds stream uv output and keep only its tail. An unrelated failure
     reported before 2,000+ characters of override-covered lines must still fail the check."""
     from pm import build_environment

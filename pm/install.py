@@ -23,6 +23,7 @@ from pm.package import InstallError, Package, Runner, StatePackage, compose_env
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection, StagedUpdate
 from pm.registry import get_package, walk
 from pm.store import Store, current_target, merge_tree, tree_digest
+from pm.worker_budget import unbounded
 
 LOG = logging.getLogger(__name__)
 _active_install_store: ContextVar[Store | None] = ContextVar("pm_active_install_store", default=None)
@@ -40,6 +41,7 @@ def _using_install_store(store: Store):
         _active_install_store.reset(token)
 
 
+@unbounded()
 def _prepare_artifacts(package, store, scratch, artifacts, version, target, *,
                        progress=None, pause_event=None, download_progress=None):
     def tick(done, total, ranges):

@@ -10,13 +10,17 @@ import argparse
 import hashlib
 import json
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import re
 import shlex
 from pathlib import Path
 
 from hermes_constants import get_default_hermes_root, project_venv_dir
 
+# A worker can account for patient waits without adding worker imports to the
+# pre-import launcher's stdlib closure.
+_patient_lock_wait = ContextVar("pm_patient_lock_wait", default=nullcontext)
 
 def install_state_lock_path(state: Path) -> Path:
     """Stable lock outside the deletable install directory."""
@@ -43,7 +47,9 @@ def install_state_lock(state: Path, *, timeout: float | None = None):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        yield lock_fd(fd, wait=True, timeout=timeout)
+        with _patient_lock_wait.get()() if timeout is None else nullcontext():
+            held = lock_fd(fd, wait=True, timeout=timeout)
+        yield held
     finally:
         os.close(fd)
 

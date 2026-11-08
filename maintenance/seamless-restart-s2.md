@@ -2,6 +2,75 @@
 
 Patch identity: `seamless-restart-s2`.
 
+### PM worker deadlines and offline validation
+
+`pm/client_process.py` bounds the isolated worker's active request time to the
+larger of 3,600 seconds and the sum of its sequential command budgets plus a
+180-second protocol margin. `pm/worker_budget.py` owns the named constants also
+used by the command runners: create 120 seconds, uv step 1,800 seconds, dependency
+check 60 seconds, workspace interpreter probe 60 seconds and repair validation
+60 seconds. Explicit operation timeouts replace the uv step budget, not the
+whole request budget. Existing step deadlines are unchanged.
+
+- `build_environment`: create + optional lock + sync + bytecode retry + check.
+  A resolving build is 120 + 3T + 60 + 180, or 5,760 seconds with default T.
+  A frozen build is 120 + 2T + 60 + 180, or 3,960 seconds.
+- `ensure_environment` and `ensure_python_tool`: the resolving build sum.
+  `ensure_project_environment`: the frozen build sum.
+- `sync_venv` and `ensure(venv)`: resolving build + workspace probe + repair
+  validation + margin, or 5,880 seconds. This conservatively covers both repair
+  and plugin resolution. Plugin eviction reserves up to 2N + 4 complete builds,
+  using the actual kept and due member counts discovered under the install lock.
+  Each extra build adds create + lock + sync + retry + check + workspace probe.
+- `build_requirements_environment`: create + install + check + margin, or 2,160
+  seconds before applying the 3,600-second floor.
+- `lock_project`, `check_project_lock`, `export_requirements` and `prune_cache`:
+  1 uv step + margin, or 1,980 seconds before the floor. Currency probes and
+  tool-only operations retain the protocol floor.
+
+Tool acquisition is not finitely bounded: downloads renew their network retry
+budget on durable progress, and explicit install locks intentionally wait
+patiently. The worker explicitly suspends the active-time clock while acquiring
+its toolchain, downloading/unpacking/staging artifacts, preparing native build
+tools or waiting for a patient lock. It resumes the remaining budget afterwards,
+including nested acquisition. A stdlib ContextVar hook keeps generic install-state
+locking independent of worker modules, so minimal pre-import launchers retain
+their existing import closure. Tool-only requests use the same suspension contract.
+A worker that never sends a complete protocol message still expires. This avoids
+inventing a tool-fetch ceiling that kills valid progressing downloads.
+
+At this base, npm sidecars do **not** run inside `sync_venv`: plugin install and
+transaction callers run `install_node_sidecar` before the PM sync. Each sidecar's
+900-second subprocess budget therefore lies outside this worker's clock, as do
+its prerequisite tool fetches. There is no npm-install count to estimate in the
+sync worker. If sidecar installation moves into this worker, its actual member
+count must add 900 seconds per install to the operation budget.
+
+The worker stays in the caller's process group and session so updater and Desktop
+group cleanup retain custody. Deadline cleanup snapshots descendants with psutil,
+kills children before the worker, then reaps it. Bare recovery without psutil uses
+a stdlib process-table snapshot on POSIX or bounded taskkill on Windows. During
+sync, control-pipe EOF also kills the worker tree. `ensure` retains its resumable
+pause-on-EOF behavior. A complete result is authoritative even if the timer fires
+before cancellation, so expiry cannot replace that result with a timeout.
+
+Contract tests: `tests/pm/test_worker_deadline.py`, `tests/pm/test_worker_lifetime.py`, `tests/pm/test_worker_budgets.py`, `tests/pm/test_pip_check.py`.
+
+The pip-check integration fixture uses the existing real isolated worker with
+local uv and Python on both sides of the process boundary. Its runtime is built
+from the vendored PM wheelhouse. Both caller and worker reject tool acquisition.
+`UV_OFFLINE=1` alone only governed uv's fixture lock command: PM's public build
+facade acquired its own tools before dispatch, and stripped ambient UV settings.
+Linux CPython 3.14.7 stacks on the base revision show that acquisition waiting
+in `Download._probe`'s HTTPS read, without a uv child. The original hosted run
+finished items 1–14, locating its unfinished item at the requirements-build
+test, item 15. The exact hosted stack was not captured.
+
+Retire this adaptation when upstream tests supply their offline toolchain at
+both boundaries and the worker protocol has equivalent bounded failure and
+process cleanup. Revert the focused commit to roll back these changes without
+altering the existing uv runner or override validation.
+
 ## Contract and current gate
 
 Detached cron dispatch freezes both the physical tree and immutable-release module
