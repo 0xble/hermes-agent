@@ -10,7 +10,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 export default function setup(): () => void {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vitest-'))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'vitest-')))
   process.env.TMPDIR = root
   process.env.TEMP = root
   process.env.TMP = root

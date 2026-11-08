@@ -833,6 +833,13 @@ Contract tests: `tests/tools/test_terminal_trailing_amp_auto_background.py`
 
 ## Release-sync scope
 
+Native Electron test scratch roots resolve their physical spelling before being
+published through TMPDIR. On macOS `/var` aliases `/private/var`, so subprocess
+cwd, module entrypoint identity and fixture expectations otherwise disagree.
+Case-sensitive native tests still require a disposable case-sensitive volume.
+Keep that volume outside the checkout's module-resolution ancestry so missing
+dependency fixtures cannot accidentally import the checkout's installed packages.
+
 A release sync merges thousands of upstream commits. Fork policy checks classify
 fork work only, so contributor attribution (`scripts/ci/portable.py`), catalog
 admission (`scripts/ci/check_plugin_admission.py`) and the trailer check
