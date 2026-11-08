@@ -68,3 +68,5 @@ follow-ups through the durable FIFO first, so queued voice waited for its turn a
 Retire when the selected upstream release transcribes queued voice at admission
 with a shared in-flight cache. Roll back by reverting the logical patch. No
 persistent state changes.
+
+The v0.23.0 admission extraction moved the FIFO enqueue into `_hm_admit_to_fifo`. Bind and reset the `admitted_queued` callback there, after busy/preemption checks, and forget only that event's published STT handle when its waiter closes. Keeping the callback in the former wrapper leaves it unused.
