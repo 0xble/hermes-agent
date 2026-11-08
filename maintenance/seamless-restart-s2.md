@@ -2,6 +2,32 @@
 
 Patch identity: `seamless-restart-s2`.
 
+### PM worker deadlines and offline validation
+
+`pm/client_process.py` bounds the isolated worker request to 3,600 seconds, or
+an explicitly longer uv operation budget plus 180 seconds. Existing uv step
+deadlines remain unchanged. A silent worker or incomplete JSON reply expires
+with an operation-specific `InstallError` and tree cleanup, rather than holding
+the client in `readline()` indefinitely. This does not bound the preceding
+in-process tool acquisition, which retains its download deadlines.
+
+Contract tests: `tests/pm/test_worker_deadline.py`, `tests/pm/test_pip_check.py`.
+
+The pip-check integration fixture uses the existing real isolated worker with
+local uv and Python on both sides of the process boundary. Its runtime is built
+from the vendored PM wheelhouse. Both caller and worker reject tool acquisition.
+`UV_OFFLINE=1` alone only governed uv's fixture lock command: PM's public build
+facade acquired its own tools before dispatch, and stripped ambient UV settings.
+Linux CPython 3.14.7 stacks on the base revision show that acquisition waiting
+in `Download._probe`'s HTTPS read, without a uv child. The original hosted run
+finished items 1–14, locating its unfinished item at the requirements-build
+test, item 15. The exact hosted stack was not captured.
+
+Retire this adaptation when upstream tests supply their offline toolchain at
+both boundaries and the worker protocol has equivalent bounded failure and
+process cleanup. Revert the focused commit to roll back these changes without
+altering the existing uv runner or override validation.
+
 ## Contract and current gate
 
 Detached cron dispatch freezes both the physical tree and immutable-release module

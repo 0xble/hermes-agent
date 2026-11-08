@@ -99,6 +99,7 @@ def _raise_worker_error(error: dict):
 
 def _request(operation, arguments, *, callbacks=None, pause_event=None, project_root=None):
     from pm import receipt
+    from pm.client_process import WORKER_TIMEOUT, worker_process
     from pm.registry import package_definitions
 
     request_id = uuid.uuid4().hex
@@ -122,8 +123,8 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     stopped = threading.Event()
     write_lock = threading.Lock()
     monitor = None
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=True, encoding="utf-8", env=environment) as process:
+    timeout = max(WORKER_TIMEOUT, arguments["timeout"] + 180) if "timeout" in arguments else WORKER_TIMEOUT
+    with worker_process(command, env=environment, operation=operation, timeout=timeout) as process:
         assert process.stdin is not None and process.stdout is not None
         writer = process.stdin
 
@@ -182,9 +183,6 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
             stopped.set()
             if monitor is not None:
                 monitor.join()
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=5)
 
 
 def ensure(name, *, base_env=None, explicit=False, verify=True, progress=None, pause_event=None,
