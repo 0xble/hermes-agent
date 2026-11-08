@@ -106,6 +106,7 @@ def test_pre_pull_failure_notice_names_parked_autostash(update_tree, tmp_path, m
     unsafe = tree.clone / "unsafe.py"
     if failure in {"already_current_restore", "branch_restore"}:
         unsafe.write_text("def broken(:\n", encoding="utf-8")
+        git(tree.clone, "add", "unsafe.py")
 
     def broken_upstream(*_a, **_k):
         raise update_cmd.UpstreamTargetBroken(tree.newer, "upstream.py", "invalid syntax")
