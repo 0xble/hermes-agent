@@ -18,7 +18,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.typing_state import call_typing_with_metadata, typing_metadata_for_source
-from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
+from gateway.run_turn_runner_progress import _ToolProgressLine, edit_progress_message, send_progress_text
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -411,13 +411,7 @@ class GatewayTurnProgressMixin:
         )
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
-        ctx = self._ctx
-        kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
-        if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
-            kwargs["finalize"] = True
-        if st._edit_accepts_metadata:
-            kwargs["metadata"] = ctx._progress_metadata
-        return await st.adapter.edit_message(**kwargs)
+        return await edit_progress_message(st, self._ctx, message_id, content)
 
     @staticmethod
     def _progress_text(lines: list) -> str:
@@ -845,7 +839,8 @@ class GatewayTurnProgressMixin:
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
-        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
+        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
+        from gateway.status_delivery import send_scoped_status
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
         if ctx.mute_notification_reply or not self._status_live():
@@ -864,7 +859,8 @@ class GatewayTurnProgressMixin:
                                                           "text": prepared})
                 return
             fut = self._schedule(
-                _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+                send_scoped_status(getattr(ctx, "_reply_latency_receipt", None), ctx._status_adapter,
+                                   ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
                 f"status_callback ({event_type}) scheduling error",
             )
             if fut is not None and ctx._cleanup_progress:

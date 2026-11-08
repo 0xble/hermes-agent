@@ -623,6 +623,30 @@ Outgoing deliveries (`gateway/delivery.py`) handle:
 
 Cron job deliveries are NOT mirrored into gateway session history — they live in their own cron session only. This is a deliberate design choice to avoid message alternation violations.
 
+### Local Reply Latency
+
+`gateway/reply_latency.py` appends timing observations to the active profile's
+`logs/reply-latency/YYYY-MM-DD.jsonl` (UTC dates). The immutable inbound key is
+`platform`, `chat_id`, `thread_id`, and `message_id`. Transport and admission turn IDs
+are diagnostic only. Receipt and admission observations survive FIFO rehydration.
+The reader folds observations into 1 timing record per inbound, retaining receipt,
+durable admission, agent start, earliest confirmed visible delivery and its kind,
+and the last confirmed final chunk. No message content is written.
+
+```bash
+python -m gateway.reply_latency_report --since 7d
+python -m gateway.reply_latency_report --since 2026-11-01 --until 2026-11-08
+```
+
+Reports select inbounds by receipt time in the half-open range, even if delivery
+falls outside it. ISO dates without offsets mean UTC. `--platform` defaults to
+Telegram, and `--log-dir` can select another profile's journal. Each endpoint has
+its own count, missing count, p50 and p90 in seconds, using linear interpolation.
+Empty cohorts have null percentiles. Failed, skipped and deferred sends are not
+delivery confirmations. Legacy text-only first-reply observations cannot establish
+first-visible latency and remain missing. These are local transport confirmations,
+not proof that a person read the reply. Historical progress times cannot be recovered.
+
 ## Hooks
 
 Gateway hooks are Python modules that respond to lifecycle events:

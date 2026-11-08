@@ -32,11 +32,11 @@ class StreamTransportMixin:
 
     _MIN_NEW_MSG_CHARS = 4
 
-    def _record_first_reply(self, text, result=None):
+    def _record_first_reply(self, text, result=None, *, kind="text_send"):
         from gateway.reply_latency import record_first_reply
         if self.cfg.cursor:
             text = text.replace(self.cfg.cursor, "")
-        record_first_reply(getattr(self, "_reply_latency_receipt", None), text, result)
+        record_first_reply(getattr(self, "_reply_latency_receipt", None), text, result, kind=kind)
 
     async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
         """Edit via the adapter, passing routing metadata when supported."""
@@ -51,8 +51,10 @@ class StreamTransportMixin:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        result = await self.adapter.edit_message(**kwargs)
-        self._record_first_reply(content, result)
+        from gateway.reply_latency import delivery_scope
+        with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_edit"):
+            result = await self.adapter.edit_message(**kwargs)
+        self._record_first_reply(content, result, kind="text_edit")
         return result
 
     async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
@@ -303,8 +305,10 @@ class StreamTransportMixin:
         })
         await self._journal_preview(replacement_intent, self._message_id, force=True)
         try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
+            from gateway.reply_latency import delivery_scope
+            with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_send"):
+                result = await self.adapter.send(
+                    chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
         except Exception as e:
             await self._journal_preview(self._last_sent_text, self._message_id, force=True)
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -428,7 +432,7 @@ class StreamTransportMixin:
         # strand final_content_delivered=False and duplicate the send (docs/rca-wecom-
         # stream-final-ack-timeout-duplicate.md).  A definitive failure rolls it back.
         if finalize:
-            self._mark_final_delivered(record=text)  # recorded: stale frame can't suppress
+            self._mark_final_delivered(record=text, confirmed=False)  # stale frame can't suppress
         if await self._try_frame(self._send_frame(text, finalize=finalize),
                                  "send_stream_frame raised, disabling native streaming: %s"):
             # Native-frame success is confirmed delivery, unlike the optimistic finalize above.
@@ -528,9 +532,11 @@ class StreamTransportMixin:
             )
             return False
         await self._journal_preview(text)
-        result = await self.adapter.send(
-            chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
-            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+        from gateway.reply_latency import delivery_scope
+        with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_send"):
+            result = await self.adapter.send(
+                chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
+                metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
         if not result.success:
             await self._journal_preview("")
             self._edit_supported = False

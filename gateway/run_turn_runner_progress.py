@@ -19,10 +19,13 @@ async def send_progress_text(state: Any, ctx: Any, text: str) -> SendResult:
     formatter = getattr(type(state.adapter), "format_progress_text", None)
     if kind == OUTBOUND_TOOL_PROGRESS and formatter is not None:
         text = formatter(state.adapter, ctx.source.chat_id, text)
-    with outbound_class(kind):
+    from gateway.reply_latency import delivery_scope, record_first_reply
+    receipt = getattr(ctx, "_reply_latency_receipt", None)
+    with outbound_class(kind), delivery_scope(receipt, "progress_send"):
         result = await state.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
+    record_first_reply(receipt, text, result, kind="progress_send")
     if kind == OUTBOUND_TOOL_PROGRESS and (result.success or (result.raw_response or {}).get("partial_overflow")):
         state.tool_progress_sent = True
     return result
@@ -34,8 +37,11 @@ async def edit_progress_message(state: Any, ctx: Any, message_id: str, content: 
         kwargs["finalize"] = True
     if state._edit_accepts_metadata:
         kwargs["metadata"] = ctx._progress_metadata
-    with outbound_class(OUTBOUND_PROGRESS):
+    from gateway.reply_latency import delivery_scope, record_first_reply
+    receipt = getattr(ctx, "_reply_latency_receipt", None)
+    with outbound_class(OUTBOUND_PROGRESS), delivery_scope(receipt, "progress_edit"):
         result = await state.adapter.edit_message(**kwargs)
+    record_first_reply(receipt, content, result, kind="progress_edit")
     if result.success and not (result.raw_response or {}).get("skipped"):
         state.retry_wait = 0.0
     if (result.raw_response or {}).get("skipped"):

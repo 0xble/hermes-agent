@@ -24,9 +24,11 @@ class StreamFallbackMixin:
         if not text.strip():
             return reply_to_id
         try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, reply_to=reply_to_id,
-                metadata=self._metadata_for_send(final=final, expect_edits=not final))
+            from gateway.reply_latency import delivery_scope
+            with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_send"):
+                result = await self.adapter.send(
+                    chat_id=self.chat_id, content=text, reply_to=reply_to_id,
+                    metadata=self._metadata_for_send(final=final, expect_edits=not final))
             self._record_first_reply(text, result)
             if not (result.success and result.message_id):
                 self._edit_supported = False
@@ -170,6 +172,8 @@ class StreamFallbackMixin:
         self._already_sent = True
         # Recorder substitutes the unsplit ledger on a split turn.
         self._mark_final_delivered(record=final_text)
+        from gateway.reply_latency import record_final_reply
+        record_final_reply(getattr(self, "_reply_latency_receipt", None), chunks[-1], result)
         self._last_sent_text = chunks[-1]
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -243,7 +247,9 @@ class StreamFallbackMixin:
             kwargs["reply_to"] = reply_to
         result = None
         for attempt in range(2):
-            result = await self.adapter.send(**kwargs)
+            from gateway.reply_latency import delivery_scope
+            with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_send"):
+                result = await self.adapter.send(**kwargs)
             if getattr(result, "success", False):
                 self._record_first_reply(content, result)
                 break

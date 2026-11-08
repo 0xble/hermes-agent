@@ -30,7 +30,7 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.run_task_card_progress import TaskCardProgressMixin
-from gateway.run_turn_runner_progress import _ToolProgressLine, edit_progress_message, send_progress_text
+from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
 from gateway.run_turn_runner_receipts import _persisted_turn
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
@@ -142,6 +142,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
     def __init__(self, runner: GatewayRunner, ctx: TurnContext, *, model_assignment: Optional[dict] = None) -> None:
         self._runner = runner
         self._ctx = ctx
+        from gateway.reply_latency import current_receipt
+        ctx._reply_latency_receipt = current_receipt()
         self._model_assignment = model_assignment
         from gateway.status_delivery import StatusDelivery
         self._status_delivery = StatusDelivery(ctx, lambda: runner._delivery_adapter_for(ctx.source))
@@ -318,9 +320,6 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             # Overflow edits pass metadata (Telegram topic/thread routing) only when edit_message takes it.
             _edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
         )
-
-    async def _edit_progress_message(self, st, message_id: str, content: str):
-        return await edit_progress_message(st, self._ctx, message_id, content)
 
     @staticmethod
     def _progress_text(lines: list) -> str:

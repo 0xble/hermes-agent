@@ -1982,9 +1982,12 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                 message_id = (msg.get("result") or {}).get("message_id")
         else:
             message_id = getattr(msg, "message_id", None)
+        from gateway.reply_latency import transport_confirmed
+        result = transport_confirmed(content, SendResult(success=True, message_id=str(message_id) if message_id is not None else None),
+                                     chat_id=chat_id, thread_id=thread_id)
         if message_id is not None:
             await self._record_rich_sent(chat_id, message_id, content)
-        return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
+        return result
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "rich_message": self._rich_message_payload(content)}
@@ -2027,8 +2030,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                 return self._record_send_flood_cooldown(chat_id, wait)
             return self._rich_transient_result(exc, "rich editMessageText")
         # Mirror the fresh-send index: a streamed final finalized via edit is otherwise never recorded.
+        from gateway.reply_latency import transport_confirmed
+        result = transport_confirmed(content, SendResult(success=True, message_id=message_id), chat_id=chat_id, thread_id=self._metadata_thread_id(metadata))
         await self._record_rich_sent(chat_id, message_id, content)
-        return SendResult(success=True, message_id=message_id)
+        return result
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
@@ -4912,6 +4917,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
         prior = len(delivered)
+        confirmed_at = None
         for chunk in chunks:
             if (delivered and current_outbound_class() == OUTBOUND_TOOL_PROGRESS
                     and self._daily_sheds(chat_id, OUTBOUND_PROGRESS)):
@@ -4923,12 +4929,15 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
                 return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
             msg, used_thread_fallback = outcome
+            from gateway.reply_latency import record_transport_reply
+            confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
             delivered.append(str(msg.message_id))
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
             raw_response={
-                "message_ids": list(delivered), "requested_thread_id": requested_thread_id, "thread_fallback": used_thread_fallback})
+                "message_ids": list(delivered), "requested_thread_id": requested_thread_id, "thread_fallback": used_thread_fallback,
+                **({"reply_latency_confirmed_at": confirmed_at} if confirmed_at is not None else {})})
 
     @staticmethod
     def _with_partial_send(
@@ -4984,7 +4993,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         key = (str(chat_id), str(thread_id) if thread_id is not None else "", str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
-            result = await self.edit_message(chat_id, cached_id, content, finalize=True, metadata=metadata)
+            from gateway.reply_latency import current_receipt, delivery_scope, record_first_reply
+            receipt = current_receipt()
+            with delivery_scope(receipt, "progress_edit"):
+                result = await self.edit_message(chat_id, cached_id, content, finalize=True, metadata=metadata)
+            record_first_reply(receipt, content, result, kind="progress_edit")
             if result.success:
                 # Only write back if nobody evicted/replaced this key during the await.
                 if result.message_id and self._status_message_ids.get(key) == cached_id:
@@ -5290,11 +5303,13 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                     return self._record_send_flood_cooldown(chat_id, wait)
                 logger.error("[%s] Overflow split: first-chunk edit failed: %s", self.name, _redact_telegram_error_text(e), exc_info=True)
                 return SendResult(success=False, error=_redact_telegram_error_text(e))
+        from gateway.reply_latency import record_transport_reply
+        thread_id = self._metadata_thread_id(metadata)
+        confirmed_at = record_transport_reply(first_chunk, chat_id=chat_id, thread_id=thread_id)
         # Continuations call self._bot.send_message directly to skip self.send's pre-chunking.
         continuation_ids: list[str] = []
         delivered_chunks = [first_chunk]
         prev_id = message_id
-        thread_id = self._metadata_thread_id(metadata)
         for chunk in chunks[1:]:
             reply_to_id = int(prev_id) if prev_id else None
             thread_kwargs = self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=reply_to_id)
@@ -5315,12 +5330,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                         "continuation_message_ids": tuple(continuation_ids)},
                     continuation_message_ids=tuple(continuation_ids))
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
+            confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
             prev_id = new_id
         last_id = continuation_ids[-1] if continuation_ids else message_id
         logger.debug("[%s] Overflow split delivered %d chunks; last_id=%s", self.name, 1 + len(continuation_ids), last_id)
-        return SendResult(success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids))
+        return SendResult(success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids),
+                          raw_response={"reply_latency_confirmed_at": confirmed_at} if confirmed_at is not None else None)
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a bot-posted message (Bot API allows it within 48h); failures are non-fatal.

@@ -131,7 +131,7 @@ def _adapter_event(event, **changes):
         receipt = max(stamped, key=lambda candidate: candidate._attended_activity_received_at)
     if receipt is not event and projected is event:
         projected = copy(event)
-    for name in ('_attended_activity_received_at', '_attended_activity_marked'):
+    for name in ('_attended_activity_received_at', '_attended_activity_marked', '_reply_latency_receipt_id'):
         if hasattr(receipt, name):
             setattr(projected, name, getattr(receipt, name))
     if unmarked:
@@ -328,10 +328,12 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                 'event': deepcopy({name: getattr(event, name) for name in _EVENT_FIELDS}),
                 'timestamp': event.timestamp.isoformat()}
     if (received_at := getattr(event, '_attended_activity_received_at', None)) is not None:
-        # Receipt metadata survives the FIFO, including a restart, but is not delivery identity.
+        # Arrival survives FIFO restoration, including a restart.
         envelope['attended_activity'] = {
             'received_at': received_at, 'marked': bool(getattr(event, '_attended_activity_marked', False)),
         }
+    if event.message_id is None and (receipt_id := getattr(event, '_reply_latency_receipt_id', None)):
+        envelope['reply_receipt_id'] = receipt_id
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -420,6 +422,7 @@ def restore_native(payload, runner=None):
     if activity := envelope.get('attended_activity'):
         event._attended_activity_received_at = activity['received_at']
         event._attended_activity_marked = activity['marked']
+    event._reply_latency_receipt_id = envelope.get('reply_receipt_id')
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):

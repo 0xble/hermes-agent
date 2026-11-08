@@ -338,7 +338,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             acked = acked[: -len(self.cfg.cursor)]
         self._mark_final_delivered(record=acked)
 
-    def _mark_final_delivered(self, record: Optional[str] = None) -> None:
+    def _mark_final_delivered(self, record: Optional[str] = None, *, confirmed: bool = True) -> None:
         """Set both turn-final flags; ``record`` also records the delivered payload."""
         self._final_response_sent = True
         # Only claim final delivery if the sealed chunks and final tail actually landed. ``_already_sent``
@@ -350,6 +350,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._final_content_delivered = True
         if record is not None:
             self._record_turn_final_payload(record)
+        from gateway.reply_latency import record_stream_final
+        if confirmed:
+            record_stream_final(getattr(self, "_reply_latency_receipt", None),
+                                self._display_payload(self._accumulated))
 
     def _display_payload(self, text: str) -> str:
         """Normalize like ``_send_or_edit`` output: directive strip + fence close + strip."""
