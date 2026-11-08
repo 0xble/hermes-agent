@@ -17,7 +17,7 @@ from tests.waiting import async_wait_until
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('adapter_lifecycle', [False, True])
+@pytest.mark.parametrize('adapter_lifecycle', ['direct', 'capture_only', 'adapter'])
 async def test_handler_bookkeeping_follows_its_delivery_owner(monkeypatch, tmp_path, adapter_lifecycle):
     from tests.gateway.test_duplicate_user_message import _bootstrap
 
@@ -41,18 +41,23 @@ async def test_handler_bookkeeping_follows_its_delivery_owner(monkeypatch, tmp_p
     monkeypatch.setattr(adapter, 'send_typing', lambda *a, **k: asyncio.sleep(0))
     event = MessageEvent(text='question', source=source, message_id='direct')
 
-    if adapter_lifecycle:
+    if adapter_lifecycle == 'adapter':
         adapter.set_message_handler(runner._handle_message)
         await adapter._process_message_background(event, runner._session_key_for_source(source))
+        await async_wait_until(lambda: not adapter._background_tasks, timeout=10, what='adapter bookkeeping')
     else:
-        assert await runner._handle_message(event) == 'ok'
+        token = execution_result.set({} if adapter_lifecycle == 'capture_only' else None)
+        try:
+            assert await runner._handle_message(event) == 'ok'
+        finally:
+            execution_result.reset(token)
     hooks.assert_awaited_once()
-    assert sends_at_hook == ([['ok']] if adapter_lifecycle else [[]])
+    assert sends_at_hook == ([['ok']] if adapter_lifecycle == 'adapter' else [[]])
     assert not adapter._post_delivery_callbacks_by_generation
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('invalidate_at', ['sweep', 'judge_return'])
+@pytest.mark.parametrize('invalidate_at', ['running_turn', 'sweep', 'judge_return'])
 async def test_superseded_bookkeeping_cannot_judge_or_continue(monkeypatch, invalidate_at):
     adapter, source = _signal(monkeypatch)
     runner = GatewayRunner(GatewayConfig())
@@ -67,7 +72,7 @@ async def test_superseded_bookkeeping_cannot_judge_or_continue(monkeypatch, inva
     async def hooks(**kwargs):
         await runner._post_turn_goal_continuation(
             session_entry=SimpleNamespace(session_id=manager.session_id, session_key=key),
-            source=source, final_response='ok', run_generation=kwargs.get('run_generation'))
+            source=source, final_response='ok', invalidation_epoch=kwargs.get('invalidation_epoch'))
 
     async def evaluate(fn):
         decision = fn()
@@ -80,17 +85,22 @@ async def test_superseded_bookkeeping_cannot_judge_or_continue(monkeypatch, inva
     monkeypatch.setattr(runner, '_enqueue_fifo', enqueue)
     monkeypatch.setattr('gateway.wake.automatic_route_available', AsyncMock(return_value=True))
     adapter.register_post_delivery_callback(key, cleanup, generation=generation)
-    token = execution_result.set({})
+    epoch = runner._session_state(key).persistent.invalidation_epoch
+    if invalidate_at == 'running_turn':
+        runner._invalidate_session_run_generation(key, reason='stop before handler return')
+    token = execution_result.set({'post_delivery_owned': True})
     try:
         await runner._defer_post_turn_hooks(
             agent_result='ok', source=source, is_internal=False,
-            event=MessageEvent(text='question', source=source), session_key=key, generation=generation)
+            event=MessageEvent(text='question', source=source), session_key=key, generation=generation,
+            invalidation_epoch=epoch)
     finally:
         execution_result.reset(token)
     delivery_generation = generation
     if invalidate_at == 'sweep':
         delivery_generation = runner._invalidate_session_run_generation(key, reason='new session')
     await adapter._fire_post_delivery_callback(key, delivery_generation)
+    await async_wait_until(lambda: not adapter._background_tasks, timeout=10, what='bookkeeping to settle')
 
     cleanup.assert_awaited_once()
     assert manager.evaluate_after_turn.call_count == int(invalidate_at == 'judge_return')
@@ -141,3 +151,76 @@ async def test_slow_post_turn_hook_does_not_hold_settlement_or_final_delivery(mo
         release.set()
         await async_wait_until(lambda: not adapter._session_tasks, timeout=15, what='the delivered turn to finish')
         await asyncio.to_thread(authority.db.close)
+
+
+@pytest.mark.asyncio
+async def test_queued_successor_keeps_both_post_turn_hooks(monkeypatch):
+    from tests.gateway.test_busy_burst_serial_reader import _busy_owner
+
+    adapter, source = _signal(monkeypatch)
+    owner = await _busy_owner(monkeypatch, adapter, source, busy_text_mode='queue')
+    hooks, stopping, release = [], asyncio.Event(), asyncio.Event()
+    first = True
+
+    async def stop(*args, **kwargs):
+        nonlocal first
+        if first:
+            first = False
+            stopping.set()
+            await release.wait()
+
+    async def hook(**kwargs):
+        hooks.append(kwargs['event'].text)
+
+    monkeypatch.setattr(adapter, '_stop_typing_refresh', stop)
+    monkeypatch.setattr(owner.runner, '_run_post_turn_hooks', hook)
+    await adapter.handle_message(MessageEvent(text='B', source=source, message_id='B'))
+    try:
+        settled = asyncio.create_task(owner.settle(2))
+        await asyncio.wait_for(stopping.wait(), 10)
+        await async_wait_until(
+            lambda: owner.runner._current_session_run_generation(owner.key) >= 2,
+            timeout=10, what='queued B to claim its generation')
+        release.set()
+        await settled
+        await async_wait_until(lambda: not adapter._background_tasks, timeout=10, what='both delivery owners')
+        assert sorted(hooks) == ['A', 'B']
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_slow_bookkeeping_does_not_delay_cosmetic_callbacks(monkeypatch):
+    from gateway.platforms.base import post_delivery_owner
+
+    adapter, source = _signal(monkeypatch)
+    runner = GatewayRunner(GatewayConfig())
+    runner.adapters = {source.platform: adapter}
+    key = runner._session_key_for_source(source)
+    generation = runner._begin_session_run_generation(key)
+    entered, release = asyncio.Event(), asyncio.Event()
+    cleanup = AsyncMock()
+
+    async def hook(**kwargs):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, '_run_post_turn_hooks', hook)
+    event = MessageEvent(text='question', source=source)
+    token = post_delivery_owner.set((adapter, event))
+    try:
+        await runner._defer_post_turn_hooks(
+            agent_result='ok', source=source, is_internal=False, event=event,
+            session_key=key, generation=generation)
+    finally:
+        post_delivery_owner.reset(token)
+    adapter.register_post_delivery_callback(key, cleanup, generation=generation)
+    firing = asyncio.create_task(adapter._fire_post_delivery_callback(key, generation))
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await async_wait_until(lambda: cleanup.await_count == 1, timeout=2, what='cosmetic callback while judge waits')
+        assert adapter._background_tasks, 'settlement must observe the pending bookkeeping'
+    finally:
+        release.set()
+        await firing
+        await async_wait_until(lambda: not adapter._background_tasks, timeout=10, what='bookkeeping completion')

@@ -395,7 +395,7 @@ async def execute_admission(authority, ref, row):
     from gateway.session_operator import is_viewer_input
     viewer_token = viewer_turn.set(live if is_viewer_input(row) else None)
     api_token = api_execution.set(None)
-    captured = {}
+    captured = {'post_delivery_owned': True}
     result_token = execution_result.set(captured)
     token = executing_admission.set(True)
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
@@ -593,8 +593,12 @@ async def _deliver_settled(authority, admission_id):
 
 async def deliver_response(adapter, event, session_key, response):
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
+    from gateway.response_filters import display_kind_for_event, is_intentional_silence_response, silence_allowed
     text, ttl = adapter._unwrap_ephemeral(response)
     if not text:
+        return
+    if (is_intentional_silence_response(text)
+            and silence_allowed(display_kind_for_event(event), event.reply_expected)):
         return
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))

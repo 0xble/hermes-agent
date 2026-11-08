@@ -650,9 +650,11 @@ not proof that a person read the reply. Historical progress times cannot be reco
 Goal and loop post-turn bookkeeping runs through the existing post-delivery callback
 owner. Durable settlement still precedes the final send, while a slow auxiliary
 judge no longer delays the answer it evaluates. A direct handler caller without
-a delivery owner runs bookkeeping inline. Deferred bookkeeping checks its run
-generation before starting, judging and continuing so a stale callback cannot
-continue a superseded turn. Stale progress cleanup remains independent.
+an explicit delivery owner runs bookkeeping inline. Deferred bookkeeping belongs
+to the adapter's background tasks, outside the cosmetic cleanup timeout.
+Legacy adapter tasks join bookkeeping after their cosmetic cleanup completes.
+An invalidation epoch fences stop/reset/new boundaries without rejecting
+ordinary FIFO succession. Stale progress cleanup remains independent.
 
 ## Hooks
 
