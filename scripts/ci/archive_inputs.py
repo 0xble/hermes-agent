@@ -21,6 +21,7 @@ from pm.downloader import Download, DownloadError, DownloadTransportError, Sourc
 from pm.lock import SCHEMA
 from pm.store import ALL_TARGETS, Store
 from scripts.releases import r2
+from scripts.ci.temporary import temporary_parent
 
 TERMUX_TARGET = "linux-arm64-bionic"
 
@@ -160,7 +161,7 @@ def stage_inputs(pins: list[InputPin], *, archive: Archive, store: Store | None 
 
     def stage_digest(digest: str, references: list[InputPin]) -> None:
         # Each worker owns its downloads and cleanup, including on failure.
-        with tempfile.TemporaryDirectory(prefix="hermes-inputs-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="hermes-inputs-", dir=temporary_parent()) as temporary:
             local = Path(temporary) / "input"
             origin = archive.fetch(references[0], local)
             for pin in references:

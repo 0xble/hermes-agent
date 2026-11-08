@@ -37,6 +37,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from scripts.ci.temporary import temporary_parent
+
 SNAPSHOT = ROOT / "tests" / "fixtures" / "prompt_surface"
 MANIFEST = "surfaces.json"
 # Same rough estimate as agent.model_metadata.CHARS_PER_TOKEN; kept local so ``diff`` needs no deps.
@@ -227,7 +230,7 @@ def _write_snapshot(out: Path, prompts: dict[str, dict[str, str]], tools_by_surf
 def render(out: Path) -> int:
     """Render into *out* from a fresh child process and home, so nothing from the caller's
     environment, config or imported modules reaches the bytes."""
-    with tempfile.TemporaryDirectory(prefix="prompt-surface-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="prompt-surface-", dir=temporary_parent()) as tmp:
         home = Path(tmp) / "home"
         home.mkdir()
         staging = Path(tmp) / "out"
