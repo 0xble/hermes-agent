@@ -312,12 +312,12 @@ class TestMarkerAfterStreamedReply:
         assert consumer.has_durably_delivered_text(ANSWER) is True
 
     @pytest.mark.asyncio
-    async def test_marker_final_still_retracts_the_turn(self):
-        """A turn that stays silent (final is the marker) still retracts its streamed
-        preamble; the gateway's whole-response filter owns what goes out next."""
+    async def test_marker_final_preserves_the_finalized_preamble(self):
+        """A bare final rejects only its segment, keeping the finalized tool preamble."""
         adapter, consumer = await _stream_answer_then_marker("NO_REPLY")
 
-        assert _visible(adapter) == []
+        assert _visible(adapter) == [ANSWER]
+        assert not any("NO_REPLY" in text for text in _sent_and_edited(adapter))
         assert consumer.final_content_delivered is False
 
 
