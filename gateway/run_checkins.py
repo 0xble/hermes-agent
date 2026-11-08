@@ -201,7 +201,7 @@ async def prepare_checkin(runner, event, entry, *, start=False):
 
 
 async def silence_fallback(runner, event, entry, result: dict) -> dict:
-    """A failed turn or second refusal cannot strand a required check-in. Use normal delivery."""
+    """Honor successful deliberate quiet, but deliver factual status for failed/unknown inspections."""
     if descriptor(event) is None or not isinstance(result, dict):
         return result
     if result.get("interrupted"):
@@ -221,15 +221,21 @@ async def silence_fallback(runner, event, entry, result: dict) -> dict:
         manager = _manager(runner, entry)
         work = _observe(manager, entry.session_id)
         manager.reconcile(work)
-        return fallback_status(work, manager.config) if work else ""
+        return (fallback_status(work, manager.config) if work else "",
+                not any(item["kind"] == "unknown" for item in work))
 
     try:
-        status = await runner._run_in_executor_with_context(observe)
+        status, inspected = await runner._run_in_executor_with_context(observe)
     except Exception:
         logger.warning("Supervisor fallback could not refresh its roster", exc_info=True)
+        inspected = False
         status = getattr(event, "_checkin_fallback", "Background work could not be inspected. Supervision will retry.")
     if not failed and response and not runner._is_intentional_silence(result, response):
         return result
+    from gateway.response_filters import is_intentional_silence_response
+    if (inspected and not failed and result.get("completed") is True
+            and not result.get("failure_reason") and is_intentional_silence_response(response)):
+        status = ""
     recovered = {**result, "final_response": status, "delivery_text": status,
                  "_model_final_response": status, "intentional_silence": not bool(status),
                  "already_sent": False}

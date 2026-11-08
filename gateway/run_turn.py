@@ -3476,7 +3476,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
-            # Apply the mandatory status after generic error/empty-reply shaping, so a provider
+            # Normalize supervisor output after generic error/empty-reply shaping, so a provider
             # explainer cannot replace it in either delivery or the captured completion.
             from gateway.run_checkins import silence_fallback
             checkin_result = await silence_fallback(self, event, session_entry, agent_result)

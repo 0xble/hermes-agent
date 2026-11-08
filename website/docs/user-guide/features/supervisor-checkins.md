@@ -1,13 +1,13 @@
 ---
 title: Supervisor Check-ins
-description: Automatic, bounded status updates while a gateway conversation owns background work.
+description: Automatic supervision with useful updates and quiet unchanged waits while background work remains.
 ---
 
 # Supervisor Check-ins
 
 When a gateway conversation finishes a turn but still owns background work, Hermes automatically schedules a supervisor check-in. You do not need to set a loop or heartbeat.
 
-By default, the first check is due **20 minutes after the last visible assistant message**. Subsequent updates are due every **30 minutes**. A visible assistant message or streamed edit resets that timer. A failed or held delivery does not.
+By default, the first check is due **20 minutes after the last visible assistant message**. Subsequent inspections run at most once every **30 minutes** while work remains, even when an inspection stays quiet. A visible assistant message or streamed edit resets that timer. A failed or held delivery does not.
 
 ## What It Tracks
 
@@ -58,7 +58,11 @@ Hermes re-enters the original conversation and topic only when it is idle and it
 
 The generated turn lists the outstanding work, its state, age, and last observed activity when available. Hermes inspects logs and artifacts, distinguishes liveness from progress, and steers or recovers stalled work within its existing authority. A check-in never grants permission to restart work with unreconciled external effects.
 
-While work remains, Hermes must write a **1–2 line status** explaining what finished, what is still running, and when it will check again, unless it delivers the final result. Ordinary loop and goal silence rules do not suppress this bounded status. If the model returns a silence marker, Hermes retries once. If it still produces no written status, the gateway delivers a factual fallback through the normal reply path.
+Hermes reports **material progress, consequential changed risk, actionable stalls or decisions, and verified completion**. Useful status updates stay within **1–2 lines**. An initial reassurance can still be useful while active work is underway.
+
+After a successful inspection, an unchanged, understood future window or dependency wait may stay quiet with `NO_REPLY` or `[SILENT]`. The age of the work or an unresolved peer reference alone does not require another message or next-check promise. Quiet inspections keep supervision armed and preserve pending work. They do not count as visible output, resolve peers, or complete goals. The persisted attempt fence prevents an immediate retry or a hot loop after restart.
+
+An empty, failed, incomplete or unknown inspection does not qualify as deliberate quiet. When needed, the gateway delivers a factual pending or unknown status through its normal reply path. A valid written status or final result is preserved. Successful deliberate silence does not cause a model retry or fallback message.
 
 If the local roster cannot be read, an already-armed supervisor retains its persisted due clock, including after restart. It does not reset or disarm merely because observation failed. At the due time it enters the normal admission and written-status path with an honest **unknown roster** item. An unarmed conversation with an unavailable roster stays silent. Only confirmed visible output resets the normal cadence.
 

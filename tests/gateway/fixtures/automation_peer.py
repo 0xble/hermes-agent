@@ -46,11 +46,8 @@ class Model(BaseHTTPRequestHandler):
                 if hasattr(self.server, 'checkin_release'):
                     self.server.checkin_blocked.set()
                     self.server.checkin_release.wait(60)
-                message['content'] = 'NO_REPLY'
-            # Recovery guidance is API-only system text, not a new human row.
-            elif any('required supervisor status' in str(m.get('content', ''))
-                     for m in messages if m['role'] in ('system', 'developer')):
-                message['content'] = getattr(self.server, 'status_text', 'SUPERVISOR_STATUS: tests are running. Next check in 30 minutes.')
+                message['content'] = ('NO_REPLY' if getattr(self.server, 'checkin_silent', False) else
+                    getattr(self.server, 'status_text', 'SUPERVISOR_STATUS: tests are running.'))
             elif 'REAL_TERMINAL_COMPLETION' in str(last):
                 message['content'] = 'COMPLETION_STATUS: background work finished.'
         if 'SPAWN_AUTOMATION' in str(last) and messages[-1]['role'] != 'tool':
@@ -270,9 +267,6 @@ async def probe(root, base, mode):
                         assert status_frame['action']['chat_id'] == 'automation-chat', status_frame
                         assert str(status_frame['action']['metadata']['thread_id']) == '103', status_frame
                         assert status_frame['platform'] == 'telegram' and status_frame['botId'] == 'fixture-bot', status_frame
-                        retries = [r for r in model.requests if any('required supervisor status' in str(m.get('content', ''))
-                                   for m in r['messages'] if m['role'] in ('system', 'developer'))]
-                        assert len(retries) == (0 if model.checkin_failure else 1), retries
                         if model.checkin_failure:
                             with sqlite3.connect(home / 'state.db') as db:
                                 saved = json.loads(db.execute('SELECT value FROM state_meta WHERE key=?',
@@ -296,14 +290,14 @@ async def probe(root, base, mode):
                                 await goal('clear')
                             await wait_for(lambda: state() is None)
                             print(json.dumps({'peer_only': True, 'unverified_idle_still_pending': True,
-                                'supervisor_turns': model.checkin_turns, 'silence_recovered': True,
+                                'supervisor_turns': model.checkin_turns, 'status_delivered': True,
                                 'explicit_user_clear_disarmed': True, 'topic': '103'}))
                             return
                         model.gate.touch()
                         await wait_for(lambda: 'COMPLETION_STATUS' in json.dumps(outgoing))
                         await wait_for(lambda: state() is None)
                         assert model.checkin_turns == 1
-                        print(json.dumps({'supervisor_turns': model.checkin_turns, 'silence_recovered': True,
+                        print(json.dumps({'supervisor_turns': model.checkin_turns, 'status_delivered': True,
                                           'completion_disarmed': True, 'topic': '103'}))
                         return
                     async with websocket(home, desc) as observer:
