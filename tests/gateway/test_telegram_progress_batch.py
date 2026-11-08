@@ -301,7 +301,7 @@ def test_hourly_summary_attributes_edits_without_debug_or_counting_them_twice(tm
 async def test_transient_edit_attempts_back_off_to_a_cap_and_reset_on_recovery(tmp_path, monkeypatch):
     runner, adapter = _runner(tmp_path, 0)
     runner._progress_emit("first")
-    day = ToolDay(runner, 245, [(1, "second"), (205, "third"), (305, "fourth")])
+    day = ToolDay(runner, 245, [(1, "second"), (105, "third"), (205, "fourth")])
     _patch_day(monkeypatch, day)
     attempts = []
 
@@ -314,7 +314,7 @@ async def test_transient_edit_attempts_back_off_to_a_cap_and_reset_on_recovery(t
     # 10s floor, doubling to a 60s cap. A successful edit resets the next retry to 10s.
     assert [at for at, _ in attempts] == [110, 120, 140, 180, 240, 300, 310, 320, 340]
     assert all(text == "first\nsecond" for _, text in attempts[:4])
-    assert all(text == "first\nsecond\nthird" for _, text in attempts[4:6])
+    assert all(text == "first\nsecond\nthird" for _, text in attempts[4:6]), attempts
     assert all(text == "first\nsecond\nthird\nfourth" for _, text in attempts[6:])
     adapter._bot.send_message.assert_awaited_once()
 

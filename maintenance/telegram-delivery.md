@@ -257,6 +257,8 @@ no message ID. The first event sends immediately, without absorbing pre-queued l
 Pressure only widens existing-card edits, so separate grouping keeps the normal adapter floor.
 Retryable edits retain their batch and back off from at least that floor, doubling to a 60s
 cap (or the floor if larger). A successful edit resets the backoff. Flood deadlines still apply.
+A transient overflow refusal first encountered during cancellation gets 1 paced retry;
+cleanup does not wait out a card that was already deferred or flooded.
 Interrupted batches discard queued events, including resets, without rendering or cancellation flushes.
 If the quota read fails, progress cadence falls back to the adapter floor.
 

@@ -514,6 +514,7 @@ class GatewayTurnProgressMixin:
         if self._agent_interrupted():
             self._drain_progress_queue()
             return
+        deferred_on_entry = self._progress_deferred(st)
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
@@ -526,6 +527,13 @@ class GatewayTurnProgressMixin:
                 else:
                     self._progress_absorb(st, raw)
                     await self._roll_progress_overflow_if_needed(st)
+        # Preserve overflow recovery when its first transient refusal happens during drain.
+        # Retry once at its deadline, without waiting out an already deferred or flooded card.
+        if not deferred_on_entry and st.retry_wait and self._progress_deferred(st):
+            await asyncio.sleep(st.defer_until - time.monotonic())
+            if self._agent_interrupted():
+                self._drain_progress_queue()
+                return
         # Final edit with all remaining tools (only if editing works)
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             await self._roll_progress_overflow_if_needed(st)
