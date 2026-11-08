@@ -5547,11 +5547,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
-            # Legacy callers join this task to observe settlement. Keep the judge
-            # after all cosmetic callbacks and outside their bounded cleanup chain.
-            bookkeeping = getattr(event, "_post_turn_bookkeeping_task", None)
-            if bookkeeping is not None:
-                await asyncio.shield(bookkeeping)
+            from gateway.session_ingress import join_turn_bookkeeping
+            await join_turn_bookkeeping(event)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
