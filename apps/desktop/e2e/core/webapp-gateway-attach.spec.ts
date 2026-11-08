@@ -474,7 +474,7 @@ function python(sandbox: CoreSandbox, code: string, ...args: string[]): string {
 /**
  * Behind the sign-in gate the browser signs in with the dashboard's password, not the browser
  * credential `hermes webapp` hands out; `hermes webapp --sign-out` must still sign it out: the open
- * tab is cut off, a reload lands on the sign-in page, and signing in again works.
+ * tab is cut off, it navigates to the sign-in page, and signing in again works.
  */
 test('signing out of a Webapp behind sign-in signs the browser out', async () => {
   test.skip(process.platform !== 'linux', 'runs with the other Webapp journeys (Linux CI)')
@@ -533,7 +533,8 @@ test('signing out of a Webapp behind sign-in signs the browser out', async () =>
     expect(signedOut.output).toMatch(/closed [1-9]\d* browser connections?\./)
     expect(signedOut.output).toContain('Every browser login behind sign-in has ended')
     expect((await page.request.get(`${origin}/api/sessions`)).status()).toBe(401)
-    await page.reload()
+    // The client navigates to /login when its signed-out requests are refused. Reloading here
+    // races that navigation and can address a Chromium target that is being detached.
     await expect(page).toHaveURL(/\/login/, { timeout: 60_000 })
     await expect(composer(page)).toBeHidden()
 
