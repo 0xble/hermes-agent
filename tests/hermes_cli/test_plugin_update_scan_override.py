@@ -130,18 +130,19 @@ def test_desktop_rows_offer_a_git_update_only_while_the_check_still_matches_the_
     assert cached_git_updates({"tern": {**checked, "pinned": True}}) == {}
 
 
-def _subdir_install(tmp_path, monkeypatch):
+@pytest.fixture
+def subdir_install(admission_env, monkeypatch):
     """A real subdirectory install (``file://repo#my-plugin``): no local ``.git``, so update re-clones."""
     from hermes_cli import plugins_cmd as pc
 
-    repo = tmp_path / "monorepo"
+    root, _home = admission_env
+    repo = root / "monorepo"
     plugin = repo / "my-plugin"
     plugin.mkdir(parents=True)
     (plugin / "plugin.yaml").write_text("name: my-plugin\nmanifest_version: 1\n", encoding="utf-8")
     (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n", encoding="utf-8")
     subprocess.run(["git", "init", "-qb", "main"], cwd=repo, check=True, capture_output=True)
     _commit(repo, "v1")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(pc, "_scan_on_install_enabled", lambda: False)
     target, _manifest, _name = pc._install_plugin_core(f"file://{repo}#my-plugin", force=False)
     assert not (target / ".git").exists()
@@ -149,13 +150,13 @@ def _subdir_install(tmp_path, monkeypatch):
     return repo, plugin, target
 
 
-def test_subdirectory_update_asks_before_a_caution_scan_and_never_accepts_dangerous(tmp_path, monkeypatch):
+def test_subdirectory_update_asks_before_a_caution_scan_and_never_accepts_dangerous(subdir_install):
     """The re-clone path used to accept a caution verdict without asking, because replacing the tree and
     accepting the scan were one ``force``. Now it follows the git-pull rule: caution needs ``force``,
     dangerous is refused even with it, and a refusal leaves the installed tree and record alone."""
     from hermes_cli import plugins_cmd as pc
 
-    repo, plugin, target = _subdir_install(tmp_path, monkeypatch)
+    repo, plugin, target = subdir_install
     (plugin / "helper.py").write_text("eval('1 + 1')\n", encoding="utf-8")
     _commit(repo, "caution")
     before = pc._read_install_metadata()["my-plugin"]

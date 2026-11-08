@@ -52,9 +52,29 @@ async function grant(files: PluginFiles, folder = vault): Promise<string> {
   return (granted as { folder: { id: string } }).folder.id
 }
 
-// Linux volumes are case-sensitive, so they stand in for a case-sensitive
-// macOS volume here: `Vault` and `vault` are two folders.
+// These fixtures need distinct case-only identities on either POSIX host.
+// Probe the actual scratch directory, including when npm runs outside CI.
 describe('case on a case-sensitive macOS volume', () => {
+  beforeEach(() => {
+    if (!posix) {
+      return
+    }
+
+    const probe = path.join(scratch, 'a')
+    fs.writeFileSync(probe, '')
+    const caseInsensitive = fs.existsSync(path.join(scratch, 'A'))
+
+    fs.unlinkSync(probe)
+
+    if (caseInsensitive) {
+      throw new Error(
+        'These security fixtures require distinct case-only paths: run with TMPDIR on a case-sensitive volume. ' +
+          'On macOS, provision one with scripts/ci/case-sensitive-tmpdir.sh from the repository root. ' +
+          'See maintenance/portable-ci.md for usage and cleanup.'
+      )
+    }
+  })
+
   it.runIf(posix)('a link from the granted Vault into a sibling vault is outside the folder', async () => {
     const files = make('darwin')
     const id = await grant(files)

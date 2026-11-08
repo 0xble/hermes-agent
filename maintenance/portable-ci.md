@@ -103,6 +103,50 @@ only the resolved toolchain executable directory. Cargo configuration/cache is
 checkout-owned. Setup/check detect any edits to pre-existing source files and
 fail without overwriting the contributor's work.
 
+Portable temporary-parent selection treats non-empty `TMPDIR` as a required
+parent, even when Python's temporary-directory cache already names another
+volume. Missing paths, non-directories and failed write probes stop setup before
+any lane and name the requested path, without fallback. Unset or empty `TMPDIR`
+keeps the stdlib default. All implicit CI temp parents share this helper, while
+the existing Git/Node ancestry check stays unchanged. This extends
+`fork-ci-reliability`. Retire it when the replacement CI runner enforces the
+same requested-volume contract.
+
+Contract tests: `tests/scripts/ci/test_portable_tmpdir.py`
+
+On macOS, every execution profile additionally probes its invocation-owned
+scratch filesystem before environment setup or any lane starts. Creating `a`
+must not make `A` resolve. A case-insensitive scratch volume fails explicitly
+because the desktop security tests need distinct `Vault`/`vault` and
+`.hermes`/`.HERMES` identities. Linux and Windows retain their existing behavior.
+Direct npm runs of `plugin-files-spellings.test.ts` also probe their actual
+scratch directory before the case-only fixtures, so they cannot pass vacuously.
+This extends `fork-ci-reliability`; native macOS precondition regressions live
+in `tests/scripts/ci/test_portable_case_sensitive.py`.
+
+Provision disposable scratch explicitly, outside the gate:
+
+```bash
+ci_tmp=$(scripts/ci/case-sensitive-tmpdir.sh)
+TMPDIR="$ci_tmp" ./bin/ci gate "$(git rev-parse HEAD)"
+# Or run the desktop file directly with the same TMPDIR:
+TMPDIR="$ci_tmp" npm --prefix apps/desktop run test:desktop:platforms -- electron/plugin-files-spellings.test.ts
+```
+
+The helper creates and attaches a disposable 20-GB sparse case-sensitive APFS
+image with `-nobrowse`, prints only its TMPDIR on stdout, and prints cleanup
+commands on stderr. An optional argument selects a new scratch directory and
+refuses an existing one. It never provisions implicitly inside CI or touches
+an existing image. After all owned CI children exit, detach by the printed
+mount path, remove that image, and remove its empty mount and parent directories:
+
+```bash
+ci_scratch=${ci_tmp%/mnt/tmp}
+hdiutil detach "$ci_scratch/mnt"
+rm "$ci_scratch/scratch.sparseimage"
+rmdir "$ci_scratch/mnt" "$ci_scratch"
+```
+
 ## portable-ci-home-sweep
 
 Fork patch identity: `portable-ci-home-sweep`. The identity exactly matches this
@@ -346,6 +390,12 @@ The explicit checkpoint exception imports upstream Python 3.14 and the native PM
 Release, signing, store publishing and channel promotion workflows remain removed under the fork workflow policy. Tests whose entire owner disappeared are retired with that owner. Generic archive/link, SHA admission, ancestry and receipt security tests remain. Workflow policy coverage remains in `scripts/ci/tests/test_portable.py` and `tests/ci/test_workflow_job_graph.py`. The resumable reconciliation evidence records each removed test owner and partial retirement separately.
 
 ## Native Checkpoint Fixture Boundaries
+
+The plugin subdirectory-update scan fixture depends on the shared `admission_env`
+fixture, which pins local uv/Python and runs the real PM dependency transaction
+in-process. Its callers cannot accidentally bootstrap a downloadable toolchain
+before reaching the caution/dangerous scan assertions. Worker transport remains
+covered by the separate plugin worker fixtures.
 
 Release-publication corruption tests call the actual `scripts.bundles.release_artifacts promote` and builds-table CLI owners. Termux build tests call the native build driver directly. Neither depends on a deleted Actions workflow. Archive fixtures force-add their declared local wheel directory, so a contributor's global Git ignore cannot silently remove the fixture dependency from the archived source. Python payload signing requires both a Darwin host and a Darwin target.
 

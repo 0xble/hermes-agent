@@ -21,6 +21,9 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from scripts.ci.temporary import temporary_parent
+
 STATE = ROOT / '.ci'
 # Checkout-owned npm and ripgrep at the exact pins; host tools only bootstrap them.
 TOOLCHAIN = STATE / 'toolchain'
@@ -238,7 +241,7 @@ def source_unchanged() -> Iterator[None]:
 @contextmanager
 def external_temporary_directory(prefix: str, parent: Path | None = None) -> Iterator[Path]:
     """Own one temporary directory without repository/dependency ancestry."""
-    parent = (parent if parent is not None else Path(tempfile.gettempdir())).resolve()
+    parent = temporary_parent(parent)
     for ancestor in (parent, *parent.parents):
         if (ancestor / '.git').exists() or (ancestor / 'node_modules').exists():
             raise RuntimeError(f'Temporary directory parent has Git or Node dependency ancestry: {parent}')
@@ -1116,6 +1119,22 @@ def checkout_lock() -> Iterator[None]:
         yield
 
 
+def require_case_sensitive_tmpdir(parent: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix='hermes-ci-case-probe-', dir=parent) as directory:
+        probe = Path(directory)
+        (probe / 'a').touch()
+        if (probe / 'A').exists():
+            raise RuntimeError(
+                f'macOS CI scratch is case-insensitive: {parent}. '
+                'Desktop security tests require distinct case-only paths: '
+                'run with TMPDIR on a case-sensitive volume. '
+                'Provision and run: '
+                'TMPDIR="$(scripts/ci/case-sensitive-tmpdir.sh)" '
+                './bin/ci gate "$(git rev-parse HEAD)". '
+                'See maintenance/portable-ci.md for cleanup.'
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native'))
@@ -1152,6 +1171,8 @@ def main() -> int:
         return 0
     STATE.mkdir(exist_ok=True)
     with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
+        if sys.platform == 'darwin':
+            require_case_sensitive_tmpdir(home)
         env = resolve_local_toolchain(environment(home))
         if args.command in ('setup', 'full', 'gate', 'nightly', 'nightly-native'):
             setup(env)

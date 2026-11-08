@@ -770,6 +770,7 @@ try {
     def test_default_invocation_sets_up_and_runs_all_lanes_after_failure(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             stack.enter_context(patch.object(ci, 'STATE', Path(directory)))
+            stack.enter_context(patch.object(ci, 'require_case_sensitive_tmpdir'))
             stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
             stack.enter_context(patch.object(sys, 'argv', ['bin/ci']))
             seen = []
@@ -888,6 +889,7 @@ try {
                 '    attempts.write_text(str(count), encoding="utf-8")\n'
                 '    assert count > 1, "first attempt fails"\n', encoding='utf-8')
             stack.enter_context(patch.object(ci, 'STATE', root / 'state'))
+            stack.enter_context(patch.object(ci, 'require_case_sensitive_tmpdir'))
             stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
             stack.enter_context(patch.object(sys, 'argv', ['bin/ci', 'check', '--lane', 'python', '--workers', '1']))
             # Keep the actual lane, shell harness and pytest subprocesses. Only
