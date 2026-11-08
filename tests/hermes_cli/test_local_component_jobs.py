@@ -60,6 +60,18 @@ def test_component_job_pause_retains_pin_and_stops_sequence(client, monkeypatch,
     monkeypatch.setattr(lm.bootstrap, "get_supervisor", lambda: None)
 
     flowing, release = threading.Event(), threading.Event()
+    from pm.downloader import Download
+
+    read_range = Download._read_range
+
+    def hold_remaining_ranges(self, source, remote, part, start, end, stop, record):
+        # Keep real bytes outstanding until the router has observed and paused the transfer.
+        # The coordinator may otherwise coalesce every range into a final-only tick.
+        if source.url.endswith("/component-1.zip") and start:
+            assert release.wait(15)
+        return read_range(self, source, remote, part, start, end, stop, record)
+
+    monkeypatch.setattr(Download, "_read_range", hold_remaining_ranges)
     real_hook = lm._runtime_progress_hook
 
     def observed_hook(job):
