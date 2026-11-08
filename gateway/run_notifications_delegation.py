@@ -134,7 +134,7 @@ class GatewayNotificationsMixin:
         from gateway.run_notifications import asyncio, claim_siblings_off_loop
         from gateway.run import _format_gateway_process_notification
         from gateway.session_local_recovery import restore_completion_route
-        restore_completion_route(self, str(group[0].get("session_key") or ""))
+        await restore_completion_route(self, str(group[0].get("session_key") or ""))
         if any(self._completion_held_by_stop(evt) for evt in group):
             return False  # requeued whole; no sibling claim is taken while the session is stopped
 

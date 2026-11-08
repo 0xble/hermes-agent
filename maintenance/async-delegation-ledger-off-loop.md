@@ -109,3 +109,14 @@ The completion pre-flight marks a claim settled before awaiting a terminal `drop
 `release`. The delivery `finally` block skips that primary claim, so cancellation while the
 worker-thread settle is blocked cannot issue a competing `release` and strand the completion.
 The regression `test_cancelled_preflight_settle_is_not_released_again` covers both dispositions.
+
+## Local completion route restoration
+
+Process results, watch notices, async-delegation batches and automation wakes restore a closed local route through `restore_local_session_async`. Its validation and session-store lock run off-loop while publication remains on the owner loop. Calling the synchronous restore from these async producers triggers the loop-thread store-lock guard and strands a completed child's note after a finite CLI exits.
+
+Completion routing through `follow_detached_pin` also reads the route, compression owner and row off-loop. Cold messaging mounts use `restore_routed_session_async`, sharing the synchronous mount's preparation and publication owners. Only preparation crosses the thread boundary. A result pinned before the chat moved on still reaches that conversation's detached mount, including after restart.
+
+Contract tests: `tests/tools/test_completed_process_results.py::test_headless_terminal_result_survives_cli_exit`
+  `tests/gateway/test_unviewed_completion_notes.py`
+  `tests/gateway/test_local_process_completion_admission.py`
+  `tests/gateway/test_detached_conversation_results.py::test_cold_completion_routing_keeps_store_reads_off_the_owner_loop`

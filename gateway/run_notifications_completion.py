@@ -333,7 +333,7 @@ class GatewayNotificationsMixin:
             # Transfer responsibility synchronously, before the first await. If cancellation is
             # delivered before this coroutine starts, the batching caller still owns the claims.
             cleanup_state["owner"] = "delivery"
-        restore_completion_route(self, str(evt.get("session_key") or ""))
+        await restore_completion_route(self, str(evt.get("session_key") or ""))
         if self._completion_held_by_stop(evt):
             # Before the primary's durable claim, so holding spends no delivery attempt; refund any
             # sibling the batch already claimed so it is not stranded until its lease expires.

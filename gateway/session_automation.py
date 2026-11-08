@@ -990,7 +990,7 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
     from gateway.session_detached import detached_live, detached_route_of, route_entry
     authority = active_authority(runner)
     key = runner._session_key_for_source(source)
-    restore_completion_route(runner, key)  # a closed local session boot left unrestored has no store entry yet
+    await restore_completion_route(runner, key)  # a closed local session boot left unrestored has no store entry yet
     entry = route_entry(authority, key) if authority is not None else None
     if authority is None or entry is None:
         return False

@@ -163,3 +163,27 @@ async def test_a_secondary_profiles_old_conversation_gets_its_result_after_the_s
         assert await runner._inject_watch_notification('[process proc_1 finished]', evt) is True
     await async_wait_until(lambda: _noted(fitness, a, '[process proc_1 finished]'), timeout=10,
                            what="the result in fitness's A")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('detached_origin', [False, True])
+async def test_cold_completion_routing_keeps_store_reads_off_the_owner_loop(monkeypatch, detached_origin):
+    import threading
+
+    from gateway.session_detached import detached_key, follow_detached_pin
+    from gateway.session_mutations import retire_live_sessions
+    from hermes_loop_guard import set_loop_thread
+
+    runner, _adapter, authority, _source, _sent, _ran, _gates, lane, ref = await _moved_on(monkeypatch)
+    assert await _app_turn(authority, ref, 'reopen the old conversation') == ('terminal', 'completed')
+    route = detached_key(lane, ref.session_id)
+    evt = _chat_started('process', route if detached_origin else lane, ref.session_id)
+    retire_live_sessions(authority, [ref.session_id])
+    set_loop_thread(threading.get_ident())
+    try:
+        routed = await follow_detached_pin(runner, evt)
+    finally:
+        set_loop_thread(None)
+    assert routed['session_key'] == route
+    assert authority.sessions[ref.session_id].detached
+    assert authority.sessions[ref.session_id].route == route
