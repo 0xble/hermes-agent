@@ -68,7 +68,7 @@ async def test_auto_tts_copy_caption_fallbacks_keep_body_visible_but_never_spoke
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["document", "photo", "image-file", "video", "animation", "album"])
 @pytest.mark.parametrize("internal", [False, True])
-async def test_plain_media_captions_render_markers_before_truncating(monkeypatch, tmp_path, operation, internal):
+async def test_plain_media_captions_render_markers_before_truncating(monkeypatch, tmp_path, public_dns, operation, internal):
     import plugins.platforms.telegram.adapter as tg
     import telegram
 
