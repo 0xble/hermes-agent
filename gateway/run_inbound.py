@@ -2063,7 +2063,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             else self._begin_session_run_generation(_quick_key)
         )
         _claim_state = self._session_state(_quick_key)
-        _invalidation_epoch = _claim_state.persistent.invalidation_epoch
+        _invalidation_epoch = self._session_invalidation_epoch(_quick_key)
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL

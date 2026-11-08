@@ -39,6 +39,9 @@ clears the goal once with one short notice, before dispute pause or timed backof
   completion, with one shared start fence preventing duplicate bookkeeping
   if delivery arrives late or the judge is already running. FIFO handoff retains
   both bubble-cleanup and bookkeeping owners when their routes differ.
+  Deferred bookkeeping looks up an existing route instead of creating a session,
+  so a suspended route stays suspended after terminal settlement. Boundary epoch
+  reads use the runner's noncreating state lookup, like generation reads.
   Direct handler callers without a delivery owner, including
   adapters without callback support, finish bookkeeping inline. The admission
   drain explicitly declares delivery ownership in its result context. An
