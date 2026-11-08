@@ -547,6 +547,13 @@ def test_large_script_error_is_bounded_and_full_redacted_output_is_recoverable(
     from agent.redact import redact_sensitive_text
     from cron.scheduler import _build_job_prompt
 
+    # Assert the owner-only policy itself, as tests/cron/test_file_permissions.py does: containerized
+    # CI runners otherwise take the shared policy's container branch, which deliberately skips chmod.
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    for name in ("HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_HOME_MODE", "HERMES_UID", "HERMES_GID"):
+        monkeypatch.delenv(name, raising=False)
+
     secret = "sk-" + "synthetic" * 6
     stderr = "BUILD START " + secret + "\n" + "compiling unit\n" * 70000 + "BUILD FAILED"
     stdout = "OUT START\n" + "build progress\n" * 20000 + secret + "\nOUT END"
