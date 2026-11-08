@@ -20,7 +20,10 @@ def test_chatty_ordinary_job_has_no_on_disk_output(tmp_path, monkeypatch):
     _checkpoint(tmp_path, monkeypatch)
     registry = ProcessRegistry()
     ready = threading.Event()
-    registry.on_output = lambda session, chunk: ready.set() if "READY" in chunk else None
+    # Output chunks follow pipe reads, not lines: a read can end between READY and its
+    # newline. Readiness is the complete line in the buffer, the state asserted below.
+    registry.on_output = lambda session, chunk: (
+        ready.set() if session.output_buffer.endswith("READY\n") else None)
     source = "import sys,time; print('x'*2000000); print('READY',flush=True); time.sleep(30)"
     session = registry.spawn_local(f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}")
     try:
