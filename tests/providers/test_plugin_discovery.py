@@ -32,13 +32,23 @@ def _clear_provider_caches():
             del sys.modules[mod]
 
 
-def test_bundled_plugins_discovered():
-    """Every plugins/model-providers/<name>/ should contain a plugin.yaml + __init__.py."""
+def _bundled_plugin_dirs():
     plugins_dir = REPO_ROOT / "plugins" / "model-providers"
     assert plugins_dir.is_dir(), f"Missing {plugins_dir}"
+    # Git may leave empty directories or bytecode after a bundled provider moves
+    # out of core. Either plugin marker enrolls a directory so a missing partner
+    # still fails the layout contract instead of silently disappearing.
+    return [
+        child for child in plugins_dir.iterdir()
+        if child.is_dir() and not child.name.startswith(("_", "."))
+        and any((child / marker).is_file() for marker in ("__init__.py", "plugin.yaml"))
+    ]
 
-    child_dirs = [c for c in plugins_dir.iterdir() if c.is_dir()]
-    assert child_dirs, f"No provider plugins under {plugins_dir}"
+
+def test_bundled_plugins_discovered():
+    """Every bundled provider has both import code and a manifest."""
+    child_dirs = _bundled_plugin_dirs()
+    assert child_dirs, "No bundled provider plugins"
 
     for child in child_dirs:
         assert (child / "__init__.py").exists(), f"{child.name} missing __init__.py"
@@ -55,8 +65,7 @@ def test_all_profiles_register():
     _clear_provider_caches()
     from providers import list_providers
 
-    plugins_dir = REPO_ROOT / "plugins" / "model-providers"
-    plugin_dir_count = sum(1 for c in plugins_dir.iterdir() if c.is_dir())
+    plugin_dir_count = len(_bundled_plugin_dirs())
 
     profiles = list_providers()
     names = sorted(p.name for p in profiles)
