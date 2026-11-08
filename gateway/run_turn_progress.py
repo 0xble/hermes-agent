@@ -518,6 +518,9 @@ class GatewayTurnProgressMixin:
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
+                if self._agent_interrupted():
+                    self._drain_progress_queue()
+                    return
                 if self._is_reset_marker(raw):
                     # Content-bubble marker during drain: close the current progress bubble
                     # and start a fresh one for tool lines that arrived after.
@@ -585,6 +588,7 @@ class GatewayTurnProgressMixin:
         """Keep refused edits buffered without spending calls on every consumer tick."""
         floor = cls._progress_edit_interval(st.adapter)
         if cls._is_flood_refusal(result):
+            st.retry_wait = 0.0
             wait = max(float(getattr(result, "retry_after", None) or 0.0), floor)
             st.defer_until = time.monotonic() + wait
             logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
