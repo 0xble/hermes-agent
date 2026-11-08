@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway import session_ingress, session_results, session_settlement_recovery as recovery
+from gateway import session_ingress, session_ingress_media as media, session_results, session_settlement_recovery as recovery
 from gateway.session_runtime_workers import mutation_tasks
 from hermes_state_runtime import get_session_admission
 from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
@@ -19,7 +19,7 @@ async def test_delivery_precedes_slow_media_collection(tmp_path, monkeypatch, pa
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     started, allow_cleanup = threading.Event(), threading.Event()
     order, releases = [], []
-    release = recovery._release_media
+    release = media.release_admission_media
 
     def slow_release(owner, admission_id):
         releases.append(admission_id)
@@ -28,7 +28,7 @@ async def test_delivery_precedes_slow_media_collection(tmp_path, monkeypatch, pa
         assert allow_cleanup.wait(10), 'test did not release the cleanup worker'
         release(owner, admission_id)
 
-    monkeypatch.setattr(recovery, '_release_media', slow_release)
+    monkeypatch.setattr(media, 'release_admission_media', slow_release)
 
     async def execute(owner, ref, row):
         owner.pending_results[row['admission_id']] = {'result': {'final_response': 'reply'}, 'usage': {}}
@@ -125,7 +125,7 @@ async def test_resolution_racing_recovery_releases_once(tmp_path, monkeypatch, c
     monkeypatch.setattr(recovery, '_mark_unknown', held_mark)
     monkeypatch.setattr(recovery, '_SETTLE_RETRY_DELAYS_S', ())
     monkeypatch.setattr(session_results, 'finish_result', fail)
-    monkeypatch.setattr(recovery, '_release_media', lambda owner, admission_id: released.append(admission_id))
+    monkeypatch.setattr(media, 'release_admission_media', lambda owner, admission_id: released.append(admission_id))
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
     with db:
         receipt = await _submit(authority, 'photo')
@@ -173,7 +173,7 @@ async def test_resolution_the_drain_owned_is_collected_when_its_recovery_fails(t
     monkeypatch.setattr(recovery, '_mark_unknown', held_mark)
     monkeypatch.setattr(recovery, '_SETTLE_RETRY_DELAYS_S', ())
     monkeypatch.setattr(session_results, 'finish_result', fail)
-    monkeypatch.setattr(recovery, '_release_media', lambda owner, admission_id: released.append(admission_id))
+    monkeypatch.setattr(media, 'release_admission_media', lambda owner, admission_id: released.append(admission_id))
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
     with db:
         receipt = await _submit(authority, 'photo')
@@ -197,7 +197,7 @@ async def test_resolution_of_a_retired_conversation_restores_it(tmp_path, monkey
     db, authority = _authority(tmp_path, monkeypatch)
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     monkeypatch.setattr(recovery, '_SETTLE_RETRY_DELAYS_S', ())
-    monkeypatch.setattr(recovery, '_release_media', lambda owner, admission_id: None)
+    monkeypatch.setattr(media, 'release_admission_media', lambda owner, admission_id: None)
 
     def fail(*args, **kwargs):
         raise OSError('storage unavailable')
@@ -265,7 +265,7 @@ async def test_cancelled_drain_keeps_delivery_and_collection_owned(tmp_path, mon
         sent.append('reply')
 
     monkeypatch.setattr(recovery, 'commit_and_publish', commit)
-    monkeypatch.setattr(recovery, '_release_media', release)
+    monkeypatch.setattr(media, 'release_admission_media', release)
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
     monkeypatch.setattr(session_ingress, 'deliver_response', send)
     with db:
@@ -294,7 +294,7 @@ async def test_cancelled_drain_keeps_delivery_and_collection_owned(tmp_path, mon
 async def test_cancelled_drain_stays_cancelled_when_its_delivery_fails(tmp_path, monkeypatch):
     db, authority = _authority(tmp_path, monkeypatch)
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
-    monkeypatch.setattr(recovery, '_release_media', lambda owner, admission_id: None)
+    monkeypatch.setattr(media, 'release_admission_media', lambda owner, admission_id: None)
     delivering, fail = asyncio.Event(), asyncio.Event()
 
     async def execute(owner, ref, row):
@@ -350,7 +350,7 @@ async def test_media_turns_settling_together_collect_one_at_a_time(tmp_path, mon
     async def send(adapter, event, key, response):
         sent.append(event.message_id)
 
-    monkeypatch.setattr(recovery, '_release_media', slow_release)
+    monkeypatch.setattr(media, 'release_admission_media', slow_release)
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
     monkeypatch.setattr(session_ingress, 'deliver_response', send)
     with db:
@@ -361,7 +361,7 @@ async def test_media_turns_settling_together_collect_one_at_a_time(tmp_path, mon
             assert sent == ids, 'every reply goes out while collection is still held'
             await asyncio.sleep(0)
             assert len(mutation_tasks(authority)) == 1, 'collections for one profile must not stack'
-            assert authority._media_release_queue == ids[1:], 'only admission ids wait, never their payloads'
+            assert authority._media_releases == ids[1:], 'only admission ids wait, never their payloads'
         finally:
             allow_cleanup.set()
             await async_wait_until(lambda: not mutation_tasks(authority), timeout=5, what='queued collection')
