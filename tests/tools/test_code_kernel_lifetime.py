@@ -358,7 +358,8 @@ def test_shutdown_during_socket_setup_cleans_resources_without_spawning(monkeypa
     assert resources["sock"].fileno() == -1
     if resources["path"]:
         assert not Path(resources["path"]).exists()
-    assert kernel.death_pipe_w is None
+    assert kernel.cell_authority is None
+    assert kernel.closed is True
 
 
 def test_remote_events_redact_identity_and_never_probe_host_pid(monkeypatch, caplog):

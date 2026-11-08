@@ -456,7 +456,7 @@ def test_runtime_evaluate_blocked_when_current_page_is_private(monkeypatch):
 
 
     monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
-    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda task_id: PRIVATE_URL)
+    monkeypatch.setattr(browser_cdp_tool, "_current_page_private_url", lambda endpoint, target_id: PRIVATE_URL)
 
     async def fake_call(*args, **kwargs):
         calls.append((args, kwargs))
