@@ -12,6 +12,8 @@ def _run_cli(monkeypatch, argv_tail):
     import hermes_cli.main as main_mod
 
     monkeypatch.setattr(sys, "argv", ["hermes", "sessions", *argv_tail])
+    # Exit codes, not the wall-clock deletion window (tests/hermes_cli/test_sessions_prune_window.py).
+    monkeypatch.setattr("hermes_cli.maintenance_window.deletion_window_open", lambda: True)
     try:
         main_mod.main()
     except SystemExit as exc:

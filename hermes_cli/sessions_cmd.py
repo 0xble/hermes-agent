@@ -692,6 +692,12 @@ def _cmd_delete(db, args):
 _NEVER_ACTIVE_DEFAULT_DAYS = 30.0
 
 
+def _now_param(args):
+    """``session.prune``'s run-now override, sent only when asked: a gateway older than this CLI
+    rejects the unknown key."""
+    return {"now": True} if getattr(args, "now", False) else {}
+
+
 def _prune_never_active_keyed(db, args):
     """`prune --never-active`: drop keyed gateway rows opened and never used (mostly escaped test
     fixtures). Separate from the shared prune/archive selector, which is pinned to `ended_at IS NOT
@@ -733,7 +739,7 @@ def _prune_never_active_keyed(db, args):
         from hermes_cli.gateway_client import GatewayClientError
         from hermes_cli.sessions_owner import owner_prune, report_owner_failure
         try:
-            result = owner_prune(owner, never_active_days=days, now=bool(getattr(args, "now", False)))
+            result = owner_prune(owner, never_active_days=days, **_now_param(args))
         except (GatewayClientError, OSError, TimeoutError) as exc:
             return report_owner_failure(exc)
         deleted, routing_deleted, skipped = result["deleted"], result["routing_deleted"], result["skipped"]
@@ -840,7 +846,7 @@ def _cmd_prune_or_archive(db, args, action):
         from hermes_cli.gateway_client import GatewayClientError
         from hermes_cli.sessions_owner import owner_prune, report_owner_failure
         try:
-            pruned = owner_prune(args.owner_endpoint, filters=filters, now=bool(getattr(args, "now", False)))
+            pruned = owner_prune(args.owner_endpoint, filters=filters, **_now_param(args))
             print(f"Pruned {pruned['deleted']} session(s).")
         except (GatewayClientError, OSError, TimeoutError) as exc:
             return report_owner_failure(exc)

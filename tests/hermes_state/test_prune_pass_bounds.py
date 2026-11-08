@@ -69,3 +69,26 @@ def test_a_window_bound_pass_refuses_to_start_and_stops_when_the_window_closes(t
 
         assert deleted == 25
         assert sum(db.get_session(sid) is None for sid in ids) == 25
+
+
+def test_a_local_reset_conversation_is_pruned_whole_even_one_session_per_transaction(tmp_path, monkeypatch):
+    """Its segments sweep only together, so a shrunken batch must still carry the whole conversation."""
+    from tests.fakes.runtime_owner import begin_runtime_epoch
+    from tests.hermes_state.test_target_advance_fence import _local_session, _mutate
+    real_pacer = hermes_state_maintenance.PrunePacer
+    monkeypatch.setattr(hermes_state_maintenance, "PrunePacer", lambda max_size: real_pacer(max_size=1))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        epoch = begin_runtime_epoch(db, instance_id="owner")
+        owner = _local_session(db, epoch, tmp_path)
+        child = _mutate(db, epoch, owner, "reset")["target_session_id"]
+        db.append_message(child, "user", "turn")
+        db.end_session(child, "done")
+        at = time.time() - 200 * 86400
+        db._execute_write(lambda conn: (
+            conn.execute("UPDATE sessions SET started_at=?, ended_at=?, last_activity_at=? WHERE id IN (?,?)",
+                         (at, at, at, owner, child)),
+            conn.execute("UPDATE messages SET timestamp=? WHERE session_id IN (?,?)", (at, owner, child))))
+
+        assert db.prune_sessions(older_than_days=90) == 2
+        assert db.get_session(owner) is None and db.get_session(child) is None

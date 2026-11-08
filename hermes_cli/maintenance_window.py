@@ -52,9 +52,8 @@ def deletion_window_refusal(override_hint: str) -> Optional[str]:
     (the caller's explicit run-now switch); None while the window is open."""
     if deletion_window_open():
         return None
-    return (f"Session pruning runs only inside maintenance.deletion_window ({deletion_window_spec()} local "
-            f"time), so a large delete cannot stall the live gateway. Preview it with a dry run, wait for "
-            f"the window, or {override_hint} to run it now anyway.")
+    return (f"Prune deletes only in maintenance.deletion_window ({deletion_window_spec()} local). "
+            f"Preview with a dry run, wait, or {override_hint} to run now.")
 
 
 def deletion_window_open(at: Optional[datetime] = None) -> bool:

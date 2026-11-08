@@ -39,9 +39,7 @@ async def prune(connection, ref, params):
                                           or never_active < 0)):
         raise RuntimeStoreError('invalid_params')
     filters = _filters(params['filters']) if 'filters' in params else None
-    now = params.get('now', False)
-    if not isinstance(now, bool):
-        raise RuntimeStoreError('invalid_params')
+    now = params.get('now') is True
     from hermes_cli.maintenance_window import deletion_window_refusal
     if not now and (refusal := deletion_window_refusal('pass --now')):
         raise RuntimeStoreError('outside_deletion_window', detail=refusal)
@@ -51,7 +49,7 @@ async def prune(connection, ref, params):
     return await asyncio.shield(task)
 
 
-async def _apply(authority, filters, never_active, within_window):
+async def _apply(authority, filters, never_active, within_window=False):
     from hermes_state_prune_pacing import DeletionWindowClosedError, PruneInProgressError
     try:
         return await _prune(authority, filters, never_active, within_window)

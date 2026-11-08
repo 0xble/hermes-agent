@@ -43,8 +43,8 @@ class PrunePacer:
     """Adaptive batch size plus a writer-fairness pause after every prune transaction.
 
     A batch that holds the lock longer than ``TARGET_S`` halves the next one (down to a single
-    session); a quick one doubles it back up to ``max_size``. The pause is at least the time
-    the lock was held, so a prune never holds the writer more than about half the time.
+    session); a quick one doubles it back up to ``max_size``. The pause matches the time the
+    lock was held (0.05-2 s), so up to a 2 s hold a prune holds the writer about half the time.
     """
     TARGET_S = 0.5
     MIN_PAUSE_S = 0.05

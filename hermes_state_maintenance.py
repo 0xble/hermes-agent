@@ -338,6 +338,18 @@ class SessionMaintenanceMixin:
             self._auto_archive_lineage(row[0])
         return len(rows)
 
+    def _prune_conversation_groups(self, candidate_ids: list[str]) -> list[list[str]]:
+        """*candidate_ids* in order, each local reset/compression conversation's candidates moved
+        together to its first one: ``retire_prunable`` sweeps such a conversation only when every
+        segment is in the same transaction, so a batch boundary between them would keep it forever
+        once the pacer shrinks batches."""
+        from hermes_state_local import local_conversation_ids
+        groups: dict[str, list[str]] = {}
+        with self._read_ctx() as conn:
+            for sid in candidate_ids:
+                groups.setdefault(local_conversation_ids(conn, sid)[0], []).append(sid)
+        return list(groups.values())
+
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,
                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
                        deleted_ids: Optional[list] = None, within_deletion_window: bool = False,
@@ -387,14 +399,17 @@ class SessionMaintenanceMixin:
         # promptly.  The pause is intentional: without yielding between transactions, a maintenance
         # loop can reacquire the lock often enough to starve a live turn.  The pacer sizes the next
         # batch by this one's measured hold and pauses at least that long.
+        groups = self._prune_conversation_groups(candidate_ids)
         pacer, position, held = PrunePacer(max_size=25), 0, [0.0]
-        while position < len(candidate_ids):
+        while position < len(groups):
             if within_deletion_window and not deletion_window_open():
                 logger.info("session prune stopped: maintenance.deletion_window closed with %d candidate(s) "
-                            "left for the next run", len(candidate_ids) - position)
+                            "left for the next run", sum(map(len, groups[position:])))
                 break
-            requested = candidate_ids[position:position + pacer.size]
-            position += len(requested)
+            requested = []
+            while position < len(groups) and (not requested or len(requested) + len(groups[position]) <= pacer.size):
+                requested += groups[position]
+                position += 1
 
             def _do(conn, requested=requested):
                 started = time.monotonic()
@@ -449,7 +464,7 @@ class SessionMaintenanceMixin:
             finish_pending_deletes(self, required_ids=batch_removed)
             for sid in batch_removed:
                 self._remove_session_files(sessions_dir, sid)
-            if position < len(candidate_ids):
+            if position < len(groups):
                 pacer.pause(held[0])
 
         if removed_count:
@@ -636,7 +651,8 @@ class SessionMaintenanceMixin:
             # freelist ratio passed — it holds an exclusive lock for a full rewrite.
             since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))
             vacuum_due = since_vacuum is None or since_vacuum >= min_vacuum_interval_days * 86400
-            if vacuum and pruned > 0 and vacuum_due:
+            # A pass that ran to the end of the window must not start a full rewrite after it.
+            if vacuum and pruned > 0 and vacuum_due and deletion_window_open():
                 result["freelist_ratio"] = ratio = self._freelist_ratio()
                 # Same admission `hermes sessions optimize` runs: VACUUM plus the TRUNCATE checkpoint
                 # retire the WAL generation a sibling writer (gateway, Desktop, dashboard, cron) still

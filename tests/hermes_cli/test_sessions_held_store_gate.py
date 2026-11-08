@@ -35,6 +35,8 @@ def state_db(monkeypatch, tmp_path):
     # cmd_sessions opens the ACTIVE home's store by explicit path (a served-profile process has
     # no single default store), so the home is the seam, not hermes_state's default resolver.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # The holder gate, not the wall-clock deletion window (tests/hermes_cli/test_sessions_prune_window.py).
+    monkeypatch.setattr("hermes_cli.maintenance_window.deletion_window_open", lambda: True)
     seed = SessionDB(db_path=db_path)
     seed.create_session("seed", "cli")
     seed.append_message("seed", "user", "hello")
