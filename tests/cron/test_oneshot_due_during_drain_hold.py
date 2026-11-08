@@ -1,10 +1,7 @@
-"""A one-shot that comes due while a gateway drain holds cron dispatch fires once afterwards.
+"""Overdue one-shots stay held for an owner decision, including after a dispatch drain.
 
-A restart or ``hermes update`` drain waits on in-flight turns with the ticker's dispatch held
-(``can_dispatch`` false). The one-shot grace (120s) must count from the end of that hold, not
-from the due time: an update that waited three minutes on a Kanban turn retired the reminder
-the user scheduled for that minute as ``missed`` without ever running it. A hold whose gateway
-never came back, or a reminder due hours into an endless external drain, is still retired (#93526).
+Drain continuity records explain the miss but do not authorize a stale send.
+The payload stays disabled and inspectable instead of being silently deleted.
 """
 
 import threading
@@ -53,7 +50,7 @@ def _held_ticker_cycle():
     InProcessCronScheduler().start(stop, interval=1, can_dispatch=draining)
 
 
-def test_oneshot_due_during_a_drain_fires_once_the_next_gateway_ticks(cron_store, monkeypatch):
+def test_oneshot_due_during_a_drain_is_held_after_grace(cron_store, monkeypatch):
     t0 = time.time()
     note_held(now=t0 - 100)  # the drain began holding dispatch 100s ago ...
     _held_ticker_cycle()     # ... and the ticker is still holding it now
@@ -61,7 +58,10 @@ def test_oneshot_due_during_a_drain_fires_once_the_next_gateway_ticks(cron_store
     save_jobs([_oneshot("reminder", start - timedelta(seconds=90))])
 
     # The next gateway's first tick lands 190s after the due time, past the 120s grace.
-    assert _scan_at(monkeypatch, start + timedelta(seconds=100)) == ["reminder"]
+    assert _scan_at(monkeypatch, start + timedelta(seconds=100)) == []
+    assert load_jobs()[0]["state"] == "missed"
+    assert load_jobs()[0]["enabled"] is False
+    assert load_jobs()[0]["prompt"] == "x"
     assert [j["id"] for j in load_jobs()] == ["reminder"]
 
 
@@ -77,4 +77,7 @@ def test_stale_oneshot_is_retired_despite_a_hold(cron_store, monkeypatch, hold_t
     save_jobs([_oneshot("reminder", start - timedelta(seconds=due_ago))])
 
     assert _scan_at(monkeypatch, start) == []
-    assert load_jobs() == []
+    assert len(load_jobs()) == 1
+    assert load_jobs()[0]["state"] == "missed"
+    assert load_jobs()[0]["enabled"] is False
+    assert load_jobs()[0]["prompt"] == "x"
