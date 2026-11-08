@@ -24,6 +24,7 @@ def _repo(tmp_path):
 
     git("init", "-q")
     git("config", "core.hooksPath", "/dev/null")
+    git("config", "commit.gpgsign", "false")
     git("config", "user.name", "Fixture")
     git("config", "user.email", "fixture@example.invalid")
     git("commit", "--allow-empty", "-qm", "baseline")
