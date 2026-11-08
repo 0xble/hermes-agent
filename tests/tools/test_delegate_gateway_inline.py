@@ -153,7 +153,7 @@ def test_dispatch_follows_the_schema_the_session_carries(fast_children, monkeypa
 
     dispatched = []
     monkeypatch.setattr(async_delegation, "dispatch_async_delegation_batch",
-                        lambda **kw: dispatched.append(kw) or {"status": "dispatched", "delegation_id": "d1"})
+                        lambda **kw: dispatched.append(kw) or {"status": "dispatched", "accepted": True, "delegation_id": "d1"})
 
     joined = json.loads(fast_children.delegate_task(
         goal="audit", background=True, parent_agent=_parent(_built(inline=True).tools)))
