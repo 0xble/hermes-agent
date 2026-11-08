@@ -126,7 +126,12 @@ def test_cancelling_a_script_job_kills_it_and_names_the_reason(tmp_path, monkeyp
     # kill, not interpreter selection.
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").symlink_to(sys.executable)
+    # A venv launcher is not a base interpreter on Python 3.14.
+    (venv / "bin" / "python").symlink_to(getattr(sys, "_base_executable"))
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {Path(sys.base_prefix) / 'bin'}\ninclude-system-site-packages = false\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable))
     monkeypatch.setattr("pm.environments.selected_venv", lambda repo: venv)
     # Spawning sanitizes PATH, which resolves the real install's bin dir; the guard refuses that
