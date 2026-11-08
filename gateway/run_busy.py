@@ -20,7 +20,7 @@ from agent.i18n import DEFAULT_LANGUAGE, t
 from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, turn_origin_for_event
 from gateway.response_filters import (
     apply_agent_origin_reply_expectation,
     is_agent_origin_text,
@@ -868,9 +868,21 @@ class GatewayBusySessionMixin:
         if turn.agent is not running_agent:
             return None
         if turn.event is not None and turn.event is not event:
+            apply_agent_origin_reply_expectation(event)
+            human_reply = (event.reply_expected is not False and turn_origin_for_event(event) == "user"
+                           and not is_agent_origin_text(event.text))
             turn.event.absorb_reply_expected(event)
+            # Goal/loop openers retain False when absorbing unknown adapter addressing. A real
+            # human takeover still needs the normal human fallback, including on those turns.
+            if human_reply and turn.event.reply_expected is False:
+                turn.event.reply_expected = event.reply_expected
             if turn.ctx is not None:
                 turn.ctx.reply_expected = turn.event.reply_expected
+                if human_reply:
+                    turn.ctx.terminal_reply_metadata.update({
+                        "queued_terminal_display_kind": None,
+                        "queued_terminal_reply_expected": turn.ctx.reply_expected,
+                    })
             # The agent read reply_expected at turn start; a folded-in human message must reach
             # its final-response recovery too, or a contentless stop resolves to silence.
             if hasattr(running_agent, "_turn_reply_expected"):
