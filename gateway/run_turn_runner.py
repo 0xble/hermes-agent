@@ -560,8 +560,9 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
         from gateway.warning_notifications import is_warning_status, render_notification
+        from gateway.bot_peer_notices import automatic_notices_allowed
         ctx = self._ctx
-        if ctx.mute_notification_reply or not self._status_live():
+        if ctx.mute_notification_reply or not self._status_live() or not automatic_notices_allowed(ctx.source):
             return
         prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
         if prepared is None:
