@@ -200,6 +200,22 @@ removes a dependency, and repairs it into another environment. The real-build
 contract `tests/pm/test_environment_build.py` changes a plugin dependency and
 checks that failed preparation preserves the selected environment. Those
 operations require isolated, writable state. Materialization is retained.
+The cold CLI source fixture derives a first-party import closure from
+`hermes_bootstrap` and `hermes_cli`, treating repository packages as atomic so
+lazy worker imports and package data ship together. It scans deferred imports
+as well as module-load imports, without executing the application. The root
+application manifest and lock remain excluded. This avoids the old hand-copied
+package list drifting when the CLI imports another package, such as
+`gateway.client_lifetime`. The every-host contract in
+`tests/pm/test_cold_snapshot.py` checks resolution independently of the Linux
+cold-runtime E2E toolchain. This extends `fork-ci-reliability`.
+The tiny app recipe also supplies `python-dotenv`, required by the real legacy
+launch's config migration. No production root manifest or lock is copied, and
+the provisioning, plugin discovery, source-update and repair assertions remain
+unchanged.
+
+Contract tests: `tests/pm/test_cold_snapshot.py`, `tests/pm/test_cold_runtime_e2e.py`.
+
 This patch adds no shared environment cache and makes no per-run storage
 reduction claim. The existing portable uv download cache already requests APFS
 clones where supported. PM's private engine deliberately strips ambient `UV_*`
