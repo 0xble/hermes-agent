@@ -4661,6 +4661,7 @@ export interface SessionMutateResult {
 export interface SessionPruneParams {
   filters?: Record<string, unknown> | null
   never_active_days?: number | null
+  now?: boolean | null
 }
 export interface SessionPruneResult {
   deleted: number

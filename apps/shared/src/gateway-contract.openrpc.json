@@ -38320,6 +38320,18 @@
             ],
             "default": null,
             "title": "Never Active Days"
+          },
+          "now": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Now"
           }
         },
         "title": "SessionPruneParams",

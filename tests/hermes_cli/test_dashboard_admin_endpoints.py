@@ -560,7 +560,7 @@ class TestSessionManagementEndpoints:
 
         r = self.client.post(
             "/api/sessions/prune",
-            json={"older_than_days": 1, "source": "skip-test"},
+            json={"older_than_days": 1, "source": "skip-test", "now": True},
         )
         assert r.status_code == 200
         body = r.json()
