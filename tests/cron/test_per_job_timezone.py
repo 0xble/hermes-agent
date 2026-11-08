@@ -104,7 +104,7 @@ class TestJobLifecycle:
 
     def test_update_rejects_a_bad_zone(self, store):
         job = jobs.create_job(prompt="keep", schedule="0 8 * * *")
-        with pytest.raises(ValueError, match="Invalid IANA timezone"):
+        with pytest.raises(ValueError, match="Unknown timezone"):
             jobs.update_job(job["id"], {"timezone": "Mars/Olympus"})
         assert jobs.get_job(job["id"]).get("timezone") is None
 

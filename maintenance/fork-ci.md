@@ -854,3 +854,10 @@ The same sync exposed an upstream desktop build bug: `xcrun` honors an inherited
 `macos-sysroot-native.test.mjs` failed on its stale-SDKROOT rung. The helper
 builds now pass `xcrunEnv()`, which drops `SDKROOT` after the resolver has chosen
 the SDK. Offer this upstream; drop the patch once upstream carries an equivalent.
+
+Fork sync fixtures follow the accepted v0.23.0 owners: browse conflict probes
+live in `gateway.runtime_ownership`, cron model pinning resolves its current
+profile home, invalid update zones use the shared timezone validator's copy,
+and models.dev's bounded fetch runs on a deadline worker. The offline startup
+contract observes blocked DNS directly, independent of the worker's name.
+Preserve real ownership, model pin, invalid-write and schema-readiness assertions.
