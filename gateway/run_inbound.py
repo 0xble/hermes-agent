@@ -1942,7 +1942,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # A failed admit stays the authority's answer (refusal notice or turn error), never a
         # pending legacy turn: that would run unadmitted, outside the FIFO's order.
         note_busy_admitting(event)
-        return True, await admit_message(authority, event)
+        from gateway.session_ingress import admitted_queued
+        if not (busy and self._pending_event_audio_paths(event)):
+            return True, await admit_message(authority, event)
+        token = admitted_queued.set(lambda: self._prefetch_admitted_voice(event))
+        try:
+            return True, await admit_message(authority, event)
+        finally:
+            admitted_queued.reset(token)
+            self._forget_admitted_voice(event)
 
     async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:  # health: allow CC -- this is the single ordered admission boundary for session controls and loop wakes.
         """Handle an incoming message from any platform: auth → command check → running-agent
