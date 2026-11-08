@@ -35,6 +35,11 @@ visible delivery kind and final-delivery confirmations to the existing daily
 `logs/reply-latency/` JSONL files. Progress sends, status cards and edits count only
 after transport success. Deferred outbox acceptance is not delivery. Telegram
 split sends stamp each acknowledged chunk before outbox/bookkeeping waits.
+Adapter confirmations require an explicit delivery scope and matching chat/thread
+identity. An inherited turn receipt alone never authorizes attribution. Deferred
+outbox sweeps clear the scheduling turn's delivery scope, including when an older
+row targets the same chat and thread. Log directory creation is cached per path,
+while each observation remains a small single append write.
 The local logging must stay independent of the shared-telemetry opt-in. Stamp
 arrival before buffering, but emit `received` only after authorization. Diagnostic
 identity or log failures must not interrupt intake. Recursive queued follow-ups
@@ -53,6 +58,9 @@ covers unauthorized DMs and diagnostic failures during admission. The delivery
 tests also cover progress/status sends and edits, admission rehydration, skipped
 and deferred sends, split Telegram confirmations, fresh streamed finals and
 fallback continuation chunks. Run these
+alongside [`test_reply_latency_attribution.py`](../tests/gateway/test_reply_latency_attribution.py),
+which covers copied worker context, unrelated destinations, inherited outbox
+sweeps and matching scoped replies across Telegram send and overflow paths. Run them
 with the existing shared-metrics, stream-consumer and attended-activity tests
 when these lifecycles move. A native-frame or adapter-internal split cannot
 claim delivery before its actual transport acknowledgement.
