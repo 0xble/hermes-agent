@@ -23,6 +23,7 @@ import pm.cli
 
 @pytest.fixture()
 def install_spy(monkeypatch):
+    monkeypatch.setattr("pm.extras.legacy_selection", lambda _root: ["all"])
     calls = {"names": None, "verified": None, "sync_extras": None, "activated": [], "fail": set()}
 
     def fake_install_names(names, target=None, *, verify=True):

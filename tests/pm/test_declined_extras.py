@@ -18,9 +18,15 @@ from pm.package import InstallError
 from pm.paths import repo_root
 
 
+@pytest.fixture(autouse=True)
+def no_payload_selection(monkeypatch):
+    monkeypatch.setattr(extras, "installed_selection", lambda _root: [])
+
+
 @pytest.fixture()
 def synced(monkeypatch):
     calls = []
+    monkeypatch.setattr(pm.cli, "_first_selection", lambda requested: (requested or ["all"], []))
     monkeypatch.setattr(pm.cli, "_install_names", lambda names, target=None, *, verify=True: 0)
     monkeypatch.setattr(importlib.import_module("pm.install"), "activate", lambda **kwargs: [])
     monkeypatch.setattr(importlib.import_module("pm.install"), "sync_venv",
@@ -35,27 +41,27 @@ def _next_selection(recorded, requested=None):
 
 
 def test_without_drops_a_recorded_extra_from_every_later_selection(synced, tmp_path):
-    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False, without=["matrix"])) == 0
+    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False, without=["mistral"])) == 0
 
     # The update's sync carries recorded extras forward; the dropped one stays out, others stay.
-    assert _next_selection(["all", "fal", "matrix"]) == ["all", "fal"]
+    assert _next_selection(["all", "fal", "mistral"]) == ["all", "fal"]
     # A data root without facts re-scans the main-era venv, which is never deleted.
     site = tmp_path / "venv" / "lib" / "python3.11" / "site-packages"
-    for anchor in (*extras._anchors("matrix"), "fal_client"):
+    for anchor in (*extras._anchors("mistral"), "fal_client"):
         (site / anchor).mkdir(parents=True)
-    assert extras.legacy_selection(tmp_path) == ["all", "fal", "matrix"]
-    extras.record_declined_extras(add=["matrix"], project_root=tmp_path)
+    assert extras.legacy_selection(tmp_path) == ["all", "fal", "mistral"]
+    extras.record_declined_extras(add=["mistral"], project_root=tmp_path)
     assert extras.legacy_selection(tmp_path) == ["all", "fal"]
     # A lazy first use refuses instead of silently reinstalling it.
     package = SimpleNamespace(project_root=repo_root)
-    with pytest.raises(InstallError, match="pm install --extra matrix"):
-        install._refuse_declined(package, ["matrix"], explicit=False)
+    with pytest.raises(InstallError, match="pm install --extra mistral"):
+        install._refuse_declined(package, ["mistral"], explicit=False)
 
 
 def test_extra_opts_a_dropped_extra_back_in():
-    extras.record_declined_extras(add=["matrix"])
-    assert _next_selection(["all"], requested=["matrix"]) == ["all", "matrix"]
-    install._refuse_declined(SimpleNamespace(project_root=repo_root), ["matrix"], explicit=True)
+    extras.record_declined_extras(add=["mistral"])
+    assert _next_selection(["all"], requested=["mistral"]) == ["all", "mistral"]
+    install._refuse_declined(SimpleNamespace(project_root=repo_root), ["mistral"], explicit=True)
 
 
 def test_without_refuses_an_extra_the_default_sync_selects_anyway(synced, capsys):
@@ -113,15 +119,15 @@ def _watch_lock(monkeypatch, asked=None):
 
 
 def test_a_sync_queued_behind_an_opt_in_keeps_the_extra(monkeypatch):
-    """`--extra matrix` clears the decline while it still owns the dependency lock, so a bare
-    update sync queued behind it never reads the stale decline and publishes without matrix."""
+    """`--extra mistral` clears the decline while it still owns the dependency lock, so a bare
+    update sync queued behind it never reads the stale decline and publishes without mistral."""
     import threading
 
     monkeypatch.setattr(install, "_feature_policy", lambda extras, *, repair: (None, None))
     package = _BlockingVenv()
     monkeypatch.setattr(install, "get_package", lambda name: package)
     install.sync_venv(["all"], explicit=True)
-    extras.record_declined_extras(add=["matrix"])
+    extras.record_declined_extras(add=["mistral"])
 
     holders, _ = _watch_lock(monkeypatch)
     queued_sync_selected = threading.Event()
@@ -148,21 +154,21 @@ def test_a_sync_queued_behind_an_opt_in_keeps_the_extra(monkeypatch):
             queued_errors.append(exc)
 
     queued = threading.Thread(target=queued_sync)
-    package.hold[("all", "matrix")] = queued.start
+    package.hold[("all", "mistral")] = queued.start
     monkeypatch.setattr(install, "_target_selection", target)
     monkeypatch.setattr(extras, "record_declined_extras", clear_decline)
 
-    install.sync_venv(["matrix"], explicit=True)
+    install.sync_venv(["mistral"], explicit=True)
     queued.join(30)
 
     assert not queued.is_alive() and queued_errors == []
-    assert package.built[-1] == ["all", "matrix"]
-    assert _recorded() == ["all", "matrix"]
+    assert package.built[-1] == ["all", "mistral"]
+    assert _recorded() == ["all", "mistral"]
     assert extras.declined_extras() == frozenset()
 
 
 def test_without_during_an_opt_in_sync_stays_recorded(monkeypatch):
-    """`--without matrix` landing while `--extra matrix` builds waits for it, so the opt-in's
+    """`--without mistral` landing while `--extra mistral` builds waits for it, so the opt-in's
     decline clear cannot erase the newer opt-out."""
     import threading
 
@@ -177,25 +183,25 @@ def test_without_during_an_opt_in_sync_stays_recorded(monkeypatch):
         return result
 
     def mid_build():
-        threading.Thread(target=install.decline_extras, args=(["matrix"],), name="opt-out").start()
+        threading.Thread(target=install.decline_extras, args=(["mistral"],), name="opt-out").start()
         # Set once the opt-out queues on the lock or, unlocked, has written its decline.
         assert settled.wait(30)
 
-    package = _BlockingVenv({("all", "matrix"): mid_build})
+    package = _BlockingVenv({("all", "mistral"): mid_build})
     monkeypatch.setattr(install, "get_package", lambda name: package)
     monkeypatch.setattr(extras, "record_declined_extras", record)
 
-    install.sync_venv(["all", "matrix"], explicit=True)
+    install.sync_venv(["all", "mistral"], explicit=True)
     for thread in threading.enumerate():
         if thread.name == "opt-out":
             thread.join(30)
 
-    assert extras.declined_extras() == frozenset({"matrix"})
+    assert extras.declined_extras() == frozenset({"mistral"})
 
 
 def test_without_after_a_failed_first_migration_keeps_the_other_legacy_extras(monkeypatch):
     """A first PM sync that died before writing facts leaves the main-era venv as the only record of
-    what was installed: `--without matrix` seeds its sync from that scan and drops only matrix."""
+    what was installed: `--without mistral` seeds its sync from that scan and drops only mistral."""
     calls = []
     monkeypatch.setattr(pm.cli, "_install_names", lambda names, target=None, *, verify=True: 0)
     monkeypatch.setattr(install, "activate", lambda **kwargs: [])
@@ -206,20 +212,20 @@ def test_without_after_a_failed_first_migration_keeps_the_other_legacy_extras(mo
     (root / "pyproject.toml").parent.mkdir(parents=True)
     (root / "pyproject.toml").write_bytes((repo_root() / "pyproject.toml").read_bytes())
     site = root / "venv" / "lib" / "python3.11" / "site-packages"
-    for anchor in (*extras._anchors("matrix"), "fal_client"):
+    for anchor in (*extras._anchors("mistral"), "fal_client"):
         (site / anchor).mkdir(parents=True)
     monkeypatch.setattr(importlib.import_module("pm.paths"), "repo_root", lambda: root)
 
-    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False, without=["matrix"])) == 0
+    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False, without=["mistral"])) == 0
 
     assert calls == [["all", "fal"]]
-    assert extras.declined_extras(root) == frozenset({"matrix"})
+    assert extras.declined_extras(root) == frozenset({"mistral"})
 
 
 def test_automatic_repair_never_undoes_a_without_that_landed_after_its_read(monkeypatch):
     """Configured-platform repair reads the declines, then asks PM for the configured extra. A
-    `--without matrix` completing between that read and PM's lock wins: repair's request was
-    Hermes's choice, not the user's, so it neither re-adds matrix nor clears the new decline."""
+    `--without mistral` completing between that read and PM's lock wins: repair's request was
+    Hermes's choice, not the user's, so it neither re-adds mistral nor clears the new decline."""
     import pm.client
     from hermes_cli import main_install_repair
 
@@ -228,7 +234,7 @@ def test_automatic_repair_never_undoes_a_without_that_landed_after_its_read(monk
     monkeypatch.setattr(install, "get_package", lambda name: package)
     monkeypatch.setattr(pm.client, "is_runtime", lambda: True)
     monkeypatch.setattr(main_install_repair, "_configured_features_missing_deps",
-                        lambda: [("Matrix", "Run `hermes setup`.", "matrix")])
+                        lambda: [("Matrix", "Run `hermes setup`.", "mistral")])
     install.sync_venv(["all"], explicit=True)
 
     real_lock, opted_out = install._venv_install_lock, []
@@ -237,7 +243,7 @@ def test_automatic_repair_never_undoes_a_without_that_landed_after_its_read(monk
         if not opted_out:
             # Repair has read the declines and is about to take the lock: the opt-out lands first.
             opted_out.append(True)
-            install.decline_extras(["matrix"])
+            install.decline_extras(["mistral"])
             install.sync_venv(["all"], explicit=True)
         return real_lock(**kwargs)
 
@@ -245,6 +251,6 @@ def test_automatic_repair_never_undoes_a_without_that_landed_after_its_read(monk
     main_install_repair._install_configured_features_missing_deps(repo_root())
 
     assert opted_out
-    assert extras.declined_extras() == frozenset({"matrix"})
+    assert extras.declined_extras() == frozenset({"mistral"})
     assert _recorded() == ["all"]
-    assert all("matrix" not in built for built in package.built)
+    assert all("mistral" not in built for built in package.built)
