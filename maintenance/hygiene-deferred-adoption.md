@@ -75,3 +75,12 @@ prompt count was also stale, so hygiene ran a 93-second compression for a 33-to-
 
 Retire after upstream silences adopted turn-holds and fences lease-less rewrites against a newer summary generation.
 Roll back the patch commits and their regression tests. No persistent-data migration is required.
+
+## Stored-version claims after the v0.23.0 sync
+
+UID deduplication must follow the existing carried-tail version proof, not replace it. A stale held fragment with a UID that cannot claim the current stored row receives its own occurrence identity, so it cannot suppress the concurrent current version. Proven rewrites remain one active occurrence. Superseded physical versions remain compacted display history rather than a second active input or a display rewind. Both watermark and named-coverage archive paths share this preparation. The active-UID suite preserves upstream's newest-position replay rule.
+
+Contract tests: `tests/hermes_state/test_compaction_carried_tail_not_cloned.py`
+  `tests/hermes_state/test_compaction_active_uid.py`
+
+Deterministic tool-result pruning can replace the entire body, provided the held dict proves the current row digest and drops the old API sidecar through the compressor's `_rewritten` helper. The UID overlap fixture uses that real rewrite contract rather than manufacturing a new sidecar without a version proof. Stale-digest and changed-sidecar cases still retain the concurrent current row.

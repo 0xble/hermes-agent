@@ -41,18 +41,6 @@ def _newest_message_uid_rows(rows: Sequence[_MessageRow]) -> list[_MessageRow]:
     return kept[::-1]
 
 
-def _carried_tail_slots(
-    conn: sqlite3.Connection, tail_ids: list[int], messages: list[dict[str, Any]], tail_count: int,
-) -> int:
-    """Tail slots whose originals are ABOVE the watermark, never positional rewinds below it."""
-    if not tail_ids or tail_count <= 0:
-        return 0
-    uids = {row[0] for row in conn.execute(
-        f"SELECT message_uid FROM messages WHERE id IN ({_placeholders(tail_ids)})", tail_ids) if row[0]}
-    return sum(1 for message in messages[-tail_count:]
-               if isinstance(message.get(MESSAGE_UID), str) and message[MESSAGE_UID] in uids)
-
-
 def _unrepresented_tail_rows(
     conn: sqlite3.Connection, tail_ids: list[int], session_id: Optional[str] = None,
 ) -> list[sqlite3.Row]:
