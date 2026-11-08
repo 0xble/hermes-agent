@@ -18,6 +18,10 @@ Contract tests: `tests/gateway/test_gateway_delegation_mode.py`
 
 These tests drive real parent/child inference against a loopback provider and real persisted session metadata. They retain the heartbeat/cache pin, explicit mode, stop propagation, shared endpoint and moved-entry cases.
 
+The control-watcher runner also binds the production stopped-claim route check.
+Its real outbox/injector tests and `test_goal_continuation_identity.py` must reach
+strict session and goal validation rather than failing at a missing mixin method.
+
 ## Retirement and rollback
 
 Retire when upstream runtime acquisition and metadata sync cover the fork contracts directly. Revert the adaptation together with any consumer of the fork lifetime binding, never restore a duplicate of the upstream acquisition method.
