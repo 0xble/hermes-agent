@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+import signal
 import subprocess
 import threading
 
@@ -13,10 +14,24 @@ from pm.package import InstallError
 WORKER_TIMEOUT = 3600
 
 
+def _kill_worker(process):
+    # PM also runs before the application (or hermes_cli helpers) is installed.
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15, check=False)
+        finally:
+            process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX branch, own session only
+        except ProcessLookupError:
+            return
+
+
 @contextmanager
 def worker_process(command, *, env, operation, timeout):
-    from hermes_cli._subprocess_compat import kill_process_tree
-
     expired = threading.Event()
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                text=True, encoding="utf-8", env=env,
@@ -24,7 +39,7 @@ def worker_process(command, *, env, operation, timeout):
 
     def expire():
         expired.set()
-        kill_process_tree(process)
+        _kill_worker(process)
 
     timer = threading.Timer(timeout, expire)
     timer.daemon = True
@@ -35,7 +50,7 @@ def worker_process(command, *, env, operation, timeout):
         timer.cancel()
         timer.join()
         if process.poll() is None:
-            kill_process_tree(process)
+            _kill_worker(process)
         process.wait(timeout=5)
         assert process.stdin is not None and process.stdout is not None
         process.stdin.close()
