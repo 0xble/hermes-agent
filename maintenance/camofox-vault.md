@@ -158,11 +158,13 @@ without changing the native browser or its consent surface.
   writes, including the checkbox click, stay inside the backend's guarded
   `fill_context` after the exact-origin pre-check and metadata snapshot re-check.
 - Fork patch identity: `vault-remember-logins` (local, no upstream submission).
-- Contract test: `tests/tools/test_browser_vault_remember.py` (real Chromium). The shared fill
-  template keeps checkout's final value-blind readback, per-event authority checks,
-  `retain_stamps`, and non-mutating `verify_only` mode. Remember selection applies only to
-  password/code tokens, never checkout or address controls; its click revalidates the
-  credential's origin, inspection stamp, and liveness before input/change events.
+- Contract test: `tests/tools/test_browser_vault_remember.py` (real Chromium).
+
+The shared fill template keeps checkout's final value-blind readback, per-event
+authority checks, `retain_stamps`, and non-mutating `verify_only` mode. Remember
+selection applies only to password/code tokens, never checkout or address controls.
+Its click revalidates the credential's origin, inspection stamp, and liveness
+before input/change events.
 
 ## Provenance and patches
 
