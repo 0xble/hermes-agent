@@ -90,7 +90,7 @@ class ProcessSurvivalMixin:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=outer_stderr,
-                    start_new_session=True,
+                    start_new_session=True,  # detached-spawn: ok — explicit restart survivor has durable exit receipts
                 )
         except Exception:
             self._remove_survivor_run_dir(session)
