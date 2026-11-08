@@ -280,14 +280,24 @@ test('reviewList reports an untracked directory without recursively listing its 
 
 test('reviewList caps the file payload returned to the renderer', async () => {
   const dir = makeRepo()
-
-  for (let i = 0; i < REVIEW_FILE_CAP + 10; i++) {
-    fs.writeFileSync(path.join(dir, `untracked-${String(i).padStart(4, '0')}.txt`), 'generated\n')
+  // Populate real Git rows with one shared blob, rather than thousands of
+  // filesystem writes, line-count reads and deletions just to assert a row cap.
+  const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], {
+    cwd: dir, input: 'generated\n', encoding: 'utf8'
+  }).trim()
+  const entries = Array.from({ length: REVIEW_FILE_CAP - 1 }, (_, i) =>
+    `100644 ${blob}\tstaged-${String(i).padStart(4, '0')}.txt\n`
+  ).join('')
+  execFileSync('git', ['update-index', '--index-info'], { cwd: dir, input: entries })
+  for (let i = 0; i < 11; i++) {
+    fs.writeFileSync(path.join(dir, `a-untracked-${String(i).padStart(2, '0')}.txt`), 'generated\n')
   }
 
   const result = await reviewList(dir, 'uncommitted', null, 'git')
 
   assert.equal(result.files.length, REVIEW_FILE_CAP)
+  assert.deepEqual(result.files[0], { path: 'a-untracked-00.txt', added: 1, removed: 0, status: '?', staged: false })
+  assert.ok(result.files.slice(1).every(file => file.staged && file.added === 1))
 })
 
 const mockExecFile = vi.mocked(await import('node:child_process')).execFile

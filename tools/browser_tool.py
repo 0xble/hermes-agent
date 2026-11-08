@@ -984,21 +984,8 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     """Type ``text`` into the element ``ref`` (fill: clears, then types)."""
     if _is_camofox_mode():
         return _camofox("camofox_type", ref, text, task_id)
-    effective_task_id = _last_session_key(task_id or "default")
-    blocked = _blocked_private_page_action(effective_task_id, "type")
-    if blocked is not None:
-        return blocked
-    ref = _at_ref(ref)
-    result = _session._run_browser_command(effective_task_id, "fill", [ref, text])
-    from agent.display import redact_browser_typed_text_for_display, redact_tool_args_for_display
-    # Typed text goes through the secret-pattern redactor so API keys / tokens don't
-    # leak into tool progress or chat history (the raw value already went to the browser).
-    display_text = (redact_tool_args_for_display("browser_type", {"text": text}) or {})["text"]
-    if result.get("success"):
-        response = {"success": True, "typed": display_text, "element": ref}
-    else:
-        response = _err(result.get("error", f"Failed to type into {ref}"))
-    return _dumps(redact_browser_typed_text_for_display(_lp._copy_fallback_warning(response, result), text))
+    from tools.browser_tool_typing import type_with_agent_browser
+    return type_with_agent_browser(ref, text, task_id)
 
 
 def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:

@@ -301,18 +301,20 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
                         'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
                     raise
                 try:
-                    current = store.scope if store is not None else scope
-                    next_owner = rpc('worker.adopt', **{k: v for k, v in current.items() if k != 'epoch'})
+                    # The callback is shared by child stores: authenticate the execution
+                    # that failed, never the detached root on a child's behalf.
+                    current = {k: params[k] for k in scope if k != 'epoch'}
+                    next_owner = rpc('worker.adopt', **current)
                 except (WorkerPersistenceError, GatewayOwnerRestartError, ConnectionClosed, OSError, TimeoutError) as adoption:
                     if isinstance(adoption, WorkerPersistenceError) and str(adoption) not in (
                             'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
                         raise
                     time.sleep(.1)
                     continue
-                scope['epoch'] = next_owner['owner_epoch']
-                params['epoch'] = scope['epoch']
-                if store is not None:
-                    store.adopt(scope['epoch'])
+                params['epoch'] = next_owner['owner_epoch']
+                if store is not None and params['execution_id'] == store.scope['execution_id']:
+                    scope['epoch'] = params['epoch']
+                    store.adopt(params['epoch'])
 
     outbox = get_hermes_home() / 'cron' / 'worker-receipts' / execution_id
     store = RuntimeSessionStore(reconnect, scope, outbox, adopted=adopted)

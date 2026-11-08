@@ -34,6 +34,15 @@ class Model(BaseHTTPRequestHandler):
         if getattr(self.server, 'checkin', False):
             if '[Supervisor check-in]' in str(last):
                 self.server.checkin_turns += 1
+                if getattr(self.server, 'checkin_failure', False):
+                    payload = json.dumps({'error': {'message': 'Fixture supervisor request rejected',
+                        'type': 'invalid_request_error', 'code': 'invalid_request_error'}}).encode()
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 if hasattr(self.server, 'checkin_release'):
                     self.server.checkin_blocked.set()
                     self.server.checkin_release.wait(60)
@@ -91,9 +100,12 @@ async def probe(root, base, mode):
     model.requests = []
     model.blocked, model.release = threading.Event(), threading.Event()
     model.gate = home / 'release-terminal'
-    model.checkin = mode in ('checkin', 'peer-checkin', 'checkin-race-admission', 'checkin-race-execution')
+    peer_checkin = mode.startswith('peer-checkin')
+    model.checkin = peer_checkin or mode in ('checkin', 'checkin-race-admission', 'checkin-race-execution')
+    model.checkin_failure = mode == 'peer-checkin-failure'
+    status_marker = 'Still outstanding:' if model.checkin_failure else 'SUPERVISOR_STATUS'
     race = mode.startswith('checkin-race-')
-    if mode == 'peer-checkin':
+    if peer_checkin:
         model.status_text = 'SUPERVISOR_STATUS: peer result still awaits parent verification. Next check in 30 minutes.'
     model.checkin_turns = 0
     threading.Thread(target=model.serve_forever, daemon=True).start()
@@ -115,7 +127,7 @@ async def probe(root, base, mode):
             if frame['type'] == 'outbound':
                 if 'AUTOMATION_ACK' in json.dumps(frame):
                     outbound_at['initial'] = time.time()
-                if 'SUPERVISOR_STATUS' in json.dumps(frame):
+                if status_marker in json.dumps(frame):
                     outbound_at['supervisor'] = time.time()
                     await status_ack.wait()
                 await ws.send(json.dumps({'type': 'outbound_result', 'requestId': frame['requestId'],
@@ -170,7 +182,7 @@ async def probe(root, base, mode):
                         await send('timer-config', '/heartbeat every 1m TIMER_AUTOMATION')
                         await wait_for(lambda: 'Heartbeat' in json.dumps(outgoing))
                     sid = rows()[0]['target_session_id']
-                    if mode == 'peer-checkin':
+                    if peer_checkin:
                         async with websocket(home, desc) as parent:
                             await rpc(parent, 'session.resume', session_id=sid)
                             async def goal(call, *args, **kwargs):
@@ -231,7 +243,7 @@ async def probe(root, base, mode):
                                               'human_follower_drained': True, 'successor_drained': True}))
                             return
                         try:
-                            await wait_for(lambda: 'SUPERVISOR_STATUS' in json.dumps(outgoing))
+                            await wait_for(lambda: status_marker in json.dumps(outgoing))
                         except AssertionError as exc:
                             raise AssertionError(json.dumps({
                                 'outgoing': outgoing,
@@ -247,20 +259,32 @@ async def probe(root, base, mode):
                         # until the daemon proves execution did not erase its overdue debt.
                         before_ack = state()
                         assert before_ack is not None and armed is not None
-                        assert before_ack['fired'] and before_ack['due_at'] == armed['due_at'], before_ack
+                        assert before_ack['fired'] and before_ack['due_at'] == armed['due_at'], {
+                            'before_ack': before_ack, 'armed': armed, 'outgoing': outgoing}
                         assert before_ack['last_visible_at'] == armed['last_visible_at'], before_ack
                         assert before_ack['next_attempt_at'] > time.time() + 1700, before_ack
                         status_ack.set()
                         await wait_for(lambda: state()['last_visible_at'] >= outbound_at['supervisor'])
                         assert state()['due_at'] > time.time() + 1700
-                        status_frame = next(f for f in outgoing if 'SUPERVISOR_STATUS' in json.dumps(f))
+                        status_frame = next(f for f in outgoing if status_marker in json.dumps(f))
                         assert status_frame['action']['chat_id'] == 'automation-chat', status_frame
                         assert str(status_frame['action']['metadata']['thread_id']) == '103', status_frame
                         assert status_frame['platform'] == 'telegram' and status_frame['botId'] == 'fixture-bot', status_frame
                         retries = [r for r in model.requests if any('required supervisor status' in str(m.get('content', ''))
                                    for m in r['messages'] if m['role'] in ('system', 'developer'))]
-                        assert len(retries) == 1, retries
-                        if mode == 'peer-checkin':
+                        assert len(retries) == (0 if model.checkin_failure else 1), retries
+                        if model.checkin_failure:
+                            with sqlite3.connect(home / 'state.db') as db:
+                                saved = json.loads(db.execute('SELECT value FROM state_meta WHERE key=?',
+                                    ('gateway.admission.result.v1.' + automatic[0]['admission_id'],)).fetchone()[0])
+                            result = saved['result']
+                            assert result['completed'] is False, result
+                            assert result['failure_reason'], result
+                            for key in ('final_response', 'delivery_text', '_model_final_response'):
+                                assert result[key].startswith('Still outstanding:'), result
+                            assert 'No reply:' not in json.dumps(status_frame), status_frame
+                            assert 'Send it again' not in json.dumps(status_frame), status_frame
+                        if peer_checkin:
                             async with websocket(home, desc) as parent:
                                 await rpc(parent, 'session.resume', session_id=sid)
                                 unchanged = await goal('state')

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -376,11 +377,11 @@ def test_multi_account_handle_round_trips_and_unions_with_raw_item_id(tmp_path, 
     env["HERMES_HOME"] = str(home)
     repo = Path(__file__).resolve().parents[2]
     set_command = [
-        "uv", "run", "python", "hermes", "config", "set",
+        sys.executable, "hermes", "config", "set",
         f"vault.origin_aliases.{handle}", '["https://login.planetfitness.com"]',
     ]
     get_command = [
-        "uv", "run", "python", "hermes", "config", "get",
+        sys.executable, "hermes", "config", "get",
         f"vault.origin_aliases.{handle}", "--json",
     ]
     subprocess.run(set_command, cwd=repo, env=env, capture_output=True, text=True, check=True)
@@ -409,7 +410,7 @@ def test_agent_written_config_set_form_is_honored_without_restart(tmp_path, monk
     env["HERMES_HOME"] = str(home)
     repo = Path(__file__).resolve().parents[2]
     command = [
-        "uv", "run", "python", "hermes", "config", "set",
+        sys.executable, "hermes", "config", "set",
         "vault.origin_aliases.example-item", '["https://signin.example.com"]',
     ]
     monkeypatch.setenv("HERMES_HOME", str(home))

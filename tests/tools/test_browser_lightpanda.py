@@ -13,6 +13,16 @@ from tools import browser_tool_cloud as bt_cloud
 from tools import browser_tool_cdp as bt_cdp
 
 
+@pytest.fixture(autouse=True)
+def _isolated_pm_checkout(tmp_path, monkeypatch):
+    # Package resolution may inspect manifest/install metadata beside its source
+    # checkout; never let a checkout under the real Hermes home select host state.
+    from pm import paths
+    root = tmp_path / "pm-checkout"
+    root.mkdir()
+    monkeypatch.setattr(paths, "repo_root", lambda: root)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -186,6 +196,8 @@ class TestChromeFallback:
              patch("tools.browser_tool_install._find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch("tools.browser_tool_install._chromium_installed", return_value=True), \
              patch("tools.browser_tool_session._needs_chromium_sandbox_bypass", return_value=True), \
+             patch("tools.browser_tool_capture.BrowserOutputCapture"), \
+             patch("tools.browser_tool_session._read_command_output", return_value=("", "")), \
              patch("subprocess.Popen", side_effect=capture_popen):
             result = bt_lightpanda_fallback._run_chrome_fallback_command(
                 "task1", "screenshot", [], timeout=30
@@ -321,8 +333,10 @@ class TestEngineOverride:
             captured_cmds.append(cmd)
             return mock_proc
 
-        # We need to mock the file operations too
-        with patch("subprocess.Popen", side_effect=capture_popen), \
+        # Assert argv construction independently from the shared memory collector.
+        with patch("tools.browser_tool_capture.BrowserOutputCapture"), \
+             patch("tools.browser_tool_session._read_command_output", return_value=('{"success":true,"data":{}}', "")), \
+             patch("subprocess.Popen", side_effect=capture_popen), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \
@@ -370,7 +384,9 @@ class TestEngineOverride:
 
         # Return a substantive snapshot so the LP fallback does NOT trigger.
         mock_stdout = '{"success": true, "data": {"snapshot": "- heading \\"Hello\\" [ref=e1]", "refs": {"e1": {}}}}'
-        with patch("subprocess.Popen", side_effect=capture_popen), \
+        with patch("tools.browser_tool_capture.BrowserOutputCapture"), \
+             patch("tools.browser_tool_session._read_command_output", return_value=(mock_stdout, "")), \
+             patch("subprocess.Popen", side_effect=capture_popen), \
              patch("os.open", return_value=99), \
              patch("os.close"), \
              patch("os.unlink"), \
@@ -429,6 +445,8 @@ class TestEngineOverride:
              patch("tools.browser_tool_cloud._get_cloud_provider", return_value=mock_provider), \
              patch("tools.browser_tool_cdp._get_cdp_override", return_value=""), \
              patch("tools.browser_tool._is_camofox_mode", return_value=False), \
+             patch("tools.browser_tool_capture.BrowserOutputCapture"), \
+             patch("tools.browser_tool_session._read_command_output", return_value=(mock_stdout, "")), \
              patch("subprocess.Popen", side_effect=capture_popen), \
              patch("os.open", return_value=99), \
              patch("os.close"), \

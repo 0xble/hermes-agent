@@ -238,6 +238,52 @@ def test_invalidated_otp_target_does_not_tick_remember(page, mutation):
     assert not _checked(page, "trust")
 
 
+@pytest.mark.parametrize("token,value", [("cc-number", "4111111111111111"), ("given-name", "Fixture")])
+def test_remember_flag_never_ticks_for_checkout_or_address(page, token, value):
+    _open(page, inside=_box("rm", "Remember me"))
+    page.evaluate("document.querySelector('[type=password]').type='text'")
+    controls = json.loads(page.evaluate(build_inspection_js("nonlogin")))
+    target = next(c for c in controls if c["type"] == "text")
+    fills = [{"index": target["index"], "token": token, "value": value}]
+    result = json.loads(page.evaluate(build_fill_js(fills, "https://login.example", "nonlogin", remember=True)))
+    assert result["filled"] == 1 and result["remembered"] is False
+    assert not _checked(page, "rm")
+    assert page.evaluate("window.clicks") == []
+
+
+def test_verify_only_never_reclicks_and_retained_stamps_are_cleaned(page):
+    _open(page, inside=_box("rm", "Remember me"))
+    controls = [LoginControl.from_dict(raw) for raw in json.loads(page.evaluate(build_inspection_js("retain")))]
+    classified = [c for c in (classify_login_control(control) for control in controls) if c]
+    fills = select_password_fill(classified, "pw-value")
+    first = json.loads(page.evaluate(build_fill_js(fills, "https://login.example", "retain",
+                                                 remember=True, retain_stamps=True)))
+    assert first["filled"] == 1 and first["remembered"] is True
+    assert page.locator('[data-hermes-vault-slot]').count() > 0
+    page.evaluate("document.querySelector('#rm').checked=false;window.clicks=[]")
+    verified = json.loads(page.evaluate(build_fill_js(fills, "https://login.example", "retain",
+                                                    remember=True, verify_only=True)))
+    assert verified["filled"] == 1 and verified["remembered"] is False
+    assert verified["fieldResults"] == [{"token": "current-password", "status": "filled"}]
+    assert not _checked(page, "rm") and page.evaluate("window.clicks") == []
+    assert page.locator('[data-hermes-vault-slot], [data-hermes-vault-aria-only]').count() == 0
+
+
+@pytest.mark.parametrize("revoke", ["disabled=true", "readOnly=true", "removeAttribute('data-hermes-vault-slot')"])
+def test_remember_click_revalidates_credential_before_input_events(page, revoke):
+    _open(page, inside=_box("rm", "Remember me"))
+    page.evaluate("""mutation => {
+      window.credentialEvents=[];
+      const password=document.querySelector('[type=password]');
+      for (const name of ['input','change']) password.addEventListener(name,()=>window.credentialEvents.push(name));
+      document.querySelector('#rm').onclick=()=>Function('password','password.'+mutation)(password);
+    }""", revoke)
+    result = _fill(page)
+    assert result["filled"] == 0 and result["remembered"] is True
+    assert result["fieldResults"] == [{"token": "current-password", "status": "missing"}]
+    assert page.evaluate("window.credentialEvents") == []
+
+
 def test_enter_code_ticks_trust_this_device(page):
     from agent.vault_backends import unlock
     from tools import browser_vault_tool

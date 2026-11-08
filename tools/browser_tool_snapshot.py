@@ -112,7 +112,7 @@ def _truncate_snapshot(snapshot_text: str, max_chars: Optional[int] = None) -> s
 
 
 def _redact_browser_output(value: Any, *,
-                           vault_tab: str = "default", vault_origin: str = "", _depth: int = 0) -> Any:
+                           vault_tab: str | None = None, vault_origin: str = "", _depth: int = 0) -> Any:
     """Redact browser data under the active tab/origin rule.
 
     ``_depth`` stops a page-controlled tree from raising RecursionError. The

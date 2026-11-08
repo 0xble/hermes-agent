@@ -85,8 +85,9 @@ def test_owner_restart_retires_in_flight_children_instead_of_recovering_them(led
     # The root is the recoverable unknown; its child died with the worker and is never adoptable.
     assert states == {'worker': 'unknown', child_eid: 'terminal'}
     assert db.get_session(child_sid)['end_reason'] == 'agent_close'
-    with pytest.raises(rt.RuntimeStoreError, match='stale_generation|stale_epoch'):
-        _child_append(db, replacement, {'execution_id': child_eid, 'session_id': child_sid}, 1, 'late')
+    for submitted_epoch in (epoch, replacement):
+        with pytest.raises(rt.RuntimeStoreError, match='^stale_generation$'):
+            _child_append(db, submitted_epoch, {'execution_id': child_eid, 'session_id': child_sid}, 1, 'late')
 
 
 def test_depth_cap_profile_and_an_early_child_finish_settle_the_child_row(ledger):

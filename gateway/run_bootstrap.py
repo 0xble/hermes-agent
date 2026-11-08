@@ -185,6 +185,11 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             from gateway.status import consume_planned_stop_marker_for_self
             return consume_planned_stop_marker_for_self()
 
+        # Planned reload: launchd bootout issued only to re-read the service definition.
+        def _planned_restart() -> bool:
+            from gateway.restart_loop_guard import consume_planned_restart_signal
+            return consume_planned_restart_signal()
+
         # Fast (<10ms) sync snapshot: stdlib + /proc, no subprocesses (`ps aux` here once blocked ~3s).
         def _snapshot():
             from gateway.shutdown_forensics import snapshot_shutdown_context
@@ -199,6 +204,8 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             planned_stop_seen[0] = True
         elif planned_stop_seen[0] and not planned_takeover:
             planned_stop = True
+        planned_restart = not (planned_takeover or planned_stop) and bool(
+            _best_effort(_planned_restart, "Planned restart marker check failed: %s"))
         _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
@@ -206,6 +213,9 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
         elif planned_stop:
             logger.info("Received %s as a planned gateway stop — exiting cleanly", sig_name or "SIGTERM/SIGINT")
+        elif planned_restart:
+            logger.info("Received %s with planned-restart marker — taking the bounded restart path",
+                        sig_name or "SIGTERM")
         else:
             # Mirrored onto the runner so _stop_impl suppresses the gateway_state=stopped persist for
             # unexpected signals; operator stops take the `planned_stop` branch and leave it False (DO persist).
@@ -233,7 +243,11 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             # here, and a sibling-driven --replace takeover is not launchd-timed either, so both
             # keep the configured drain. _stop_impl uses this to cap the drain to the live budget.
             runner._stop_requested_by_signal = True
-        asyncio.create_task(runner.stop())
+        if planned_restart:
+            # Match the SIGUSR1 restart, without its after-turn wait: launchd times this shutdown.
+            asyncio.create_task(runner.stop(restart=True, service_restart=True))
+        else:
+            asyncio.create_task(runner.stop())
     return shutdown_signal_handler
 
 
@@ -315,27 +329,8 @@ async def _start_gateway_start_control_socket(runner):
         # manager) relaunches after the code swap.
         _main_loop = asyncio.get_running_loop()
 
-        def _pause_for_update_handler() -> dict:
-            try:
-                from hermes_cli.gateway import _get_restart_drain_timeout
-                _drain = float(_get_restart_drain_timeout())
-            except Exception:
-                _drain = 30.0
-            accepted_box: list[bool] = []
-            _done = threading.Event()
-
-            def _request() -> None:
-                try:
-                    accepted_box.append(runner.request_restart(detached=False, via_service=True))
-                finally:
-                    _done.set()
-
-            _main_loop.call_soon_threadsafe(_request)
-            _done.wait(timeout=5.0)
-            accepted = bool(accepted_box and accepted_box[0])
-            return {
-                "pausing": accepted, "already_stopping": not accepted,
-                "pid": os.getpid(), "drain_timeout": _drain}
+        from gateway.run_control_pause import make_update_pause_handler
+        _pause_for_update_handler = make_update_pause_handler(runner, _main_loop)
 
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now

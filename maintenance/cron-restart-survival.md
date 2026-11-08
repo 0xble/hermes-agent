@@ -1,6 +1,21 @@
 # Cron restart survival on macOS
 
-Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`, `cron-oneshot-retirement-alert`.
+Patch identities: `cron-macos-detached`, `cron-restart-survival`, `cron-detached-claim-release`, `cron-oneshot-retirement-alert`, `detached-child-terminal-reconnect`.
+
+## Retired delegated children
+
+A gateway restart still retires delegated child executions; preserving them is outside this
+patch. Receipt handling refuses a retired execution with terminal `stale_generation` before
+considering its old epoch (exact same-epoch mutation acknowledgements remain replayable).
+The detached reconnect callback authenticates the execution from the failed request, never
+the root on a child's behalf, and updates the root journal only for a root reconnect. A child
+reports `child execution retired or superseded (stale_generation)` through the ordinary
+failed-delegation result. Closing the parent store cannot poison that verdict as `outbox_closed`.
+
+Contract tests: `tests/cron/test_detached_child_restart.py`, `tests/hermes_state/test_runtime_worker_children.py`.
+The detached-parent regression uses the real child store, receipt ledger, epoch retirement,
+and delegation runner with an in-process transport and a five-second Event deadline; it also
+covers a lost response and a parent store closing during the child's reconnect.
 
 ## One-shot retirement notices
 

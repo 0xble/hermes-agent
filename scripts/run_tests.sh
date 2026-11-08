@@ -336,6 +336,8 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 #     tests/tools/test_docker_backend_real.py); remote-backends.yml points them at
 #     a throwaway sshd container and a small public image. The key is a
 #     per-run throwaway, never a credential.
+#   * VAULT_BROWSER_FIXTURE_MODULES / SOURCE opt into the isolated native
+#     checkout fixture using installed companion modules/source, not user profiles.
 #
 # These are test-infrastructure knobs, not credentials — same class as the
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
@@ -353,7 +355,8 @@ for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
   HERMES_TEST_SCRATCH_ROOT PLAYWRIGHT_BROWSERS_PATH SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
   HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
-  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE; do
+  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE \
+  VAULT_BROWSER_FIXTURE_MODULES VAULT_BROWSER_FIXTURE_SOURCE; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi

@@ -153,3 +153,20 @@ def test_connect_lists_and_resolves_cards(monkeypatch):
     finally:
         reset_secret_scope(scope)
         server.shutdown()
+
+
+def test_onepassword_card_expiry_and_cvc_are_available_to_checkout_planning():
+    from agent.vault_login_classifier import LoginControl, classify_checkout_control
+    from tools.browser_vault_payment import plan
+    fields = [{"id": "ccnum", "value": "4111111111111111"}, {"id": "cvv", "value": "9876"},
+              {"id": "expiry", "value": "202907"}]
+    secret = _card_secret(fields)
+    raw = [{"index": 0, "autocomplete": "cc-number"},
+           {"index": 1, "type": "combobox", "label": "Expiry month"},
+           {"index": 2, "type": "listbox", "label": "Expiry year"},
+           {"index": 3, "label": "###", "groupLabel": "CVC", "groupCandidateCount": 1}]
+    controls = [LoginControl.from_dict(c) for c in raw]
+    classified = [c for control in controls if (c := classify_checkout_control(control))]
+    selected, ambiguous = plan([{"classified": classified, "controls": controls}], secret)
+    assert not ambiguous
+    assert {f["token"] for f in selected[0]["fills"]} == {"cc-number", "cc-exp-month", "cc-exp-year", "cc-csc"}

@@ -27,9 +27,11 @@ Unchanged boundaries:
   given by the user in chat is never a source. Only a value deliberately fetched
   from an authorized store for that service counts. Never ask for or accept a
   secret in chat, or repeat one in a reply.
-- Cards: prefer `browser_vault_fill` first. Direct entry may follow only a real
-  fill or field failure: `no_payment_fields`, a partial fill, missed fields, or a
-  processor frame. Read each native field at entry with
+- Cards: prefer `browser_vault_fill` first. Direct entry may follow in two
+  cases: (1) a real fill or field failure: `no_payment_fields`, a partial fill,
+  missed fields, or a processor frame; or (2) `approval_unavailable` (no prompt
+  surface), only when the user explicitly approved this exact charge in this
+  session's conversation. Read each native field at entry with
   `onepass --account <alias> read 'op://<vault>/<item>/ccnum'` (or `cvv`, `expiry`)
   and type it with `browser_type` or `fill_input` on the verified merchant origin.
   An approved exact charge means the user explicitly approved the merchant,
@@ -38,6 +40,15 @@ Unchanged boundaries:
   `payment_retry_refused`. `approval_unavailable` means no prompt surface, not
   approval: direct entry is allowed only with explicit approval of this exact
   charge in this session's conversation. Otherwise obtain fresh user approval.
+- Separately, card-on-file direct entry requires explicit approval of the merchant
+  or wallet, selected card, and exact card-on-file add/update action in the current
+  session. Use live 1Password fields only after verifying the canonical top-level
+  merchant or wallet origin and, when used, its owned embedded processor frame,
+  with no charge, top-up, fee, plan change, or cadence change.
+  Follow the same vault-first route and technical fallback signals; all three
+  refusal stops above still apply. For card-on-file `approval_unavailable`, the
+  same explicit current-action approval is required. Card-on-file is not a $0
+  charge and implies no standing, default, or fallback-card authorization.
 - Never repeat secrets in replies, files, commits, or shell arguments. The Link
   skill separately owns its approved one-time-card retrieval file and cleanup;
   it must use that Link credential, not substitute a password-manager card.

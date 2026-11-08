@@ -1,7 +1,8 @@
 # Secret-safe provider diagnostics
 
 Load when changing provider HTTP diagnostics, the standalone probe, or its
-credential and logging boundary. Fork patch identity: `io-safe-provider-probe`.
+credential and logging boundary, including source-owned terminal redaction of
+Python diagnostic output. Fork patch identity: `io-safe-provider-probe`.
 
 The Io integrity work needs a selected-endpoint check without putting a
 credential into a shell command or exposing a provider's reflected error body.
@@ -55,6 +56,33 @@ output are suppressed in this dedicated process. The full runtime builder is
 not called: pool loading can write auth state, selection can refresh, and model
 resolution can make auto-detection requests. Read-only config loading retains
 its existing last-known-good bookkeeping, but a fallback config cannot be probed.
+
+## Source-owned terminal diagnostics
+
+`agent/redact.py` reuses its existing Bearer residue sweep on the already
+recognized pytest diagnostic and final Python exception lines. Unkeyed opaque
+Bearer values in bytes/string reprs (including escaped trailing LF) must be
+masked by `redact_terminal_output` itself, not merely by later egress redaction.
+Keep the sweep diagnostic-scoped: ordinary source dumps, traceback source lines,
+short prose and variable references remain unchanged. Preserve the existing
+redaction opt-out and `force=True` override; do not change the shared Bearer
+pattern or apply it globally to source output.
+
+`tests/agent/test_terminal_diagnostic_bearer.py` exercises actual imports in
+credentialless disposable subprocess homes. Its two invariants cover bytes and
+string quotes/escapes, line endings, pytest context, source preservation and the
+import-time disabled default versus forced redaction. Qualification includes
+`scripts/run_tests.sh tests/agent/test_redact.py tests/agent/test_terminal_diagnostic_bearer.py`
+through the normal admission route. Direct stdlib unittest is narrow,
+noncanonical RED/GREEN evidence only, not exact-head qualification.
+
+Contract tests: `tests/agent/test_terminal_diagnostic_bearer.py`
+
+Upstream main `90d6b98fd86d20981ee06ddd5b7d93e4320f26a4` retains the synthetic
+failure. Merged upstream PR #92586 owns this diagnostic/source boundary; open
+#110697 handles keyed suffixes and #94826 handles egress token edges, neither
+replaces this terminal repair. Retire this extension when upstream covers both
+invariants. Rollback reverts its source/test changes without state migration.
 
 ## Verification and retirement
 

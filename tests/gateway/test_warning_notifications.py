@@ -106,6 +106,36 @@ def test_warning_opt_out_preserves_other_delivery(tmp_path, monkeypatch, platfor
     assert all(row[0] == source.chat_id for row in adapter.sent)
 
 
+@pytest.mark.parametrize("platform", [Platform.SLACK, Platform.TELEGRAM, Platform.LOCAL])
+@pytest.mark.parametrize("display_kind", [None, "internal_notification", "supervisor_checkin"])
+def test_supervisor_defers_engine_notices_until_final_delivery(monkeypatch, platform, display_kind):
+    from gateway import run
+
+    adapter = RecordingAdapter()
+    source = SessionSource(platform=platform, chat_id="chat", user_id="user", thread_id="1700.1")
+    gateway = object.__new__(GatewayRunner)
+    gateway._delivery_adapter_for = lambda source: adapter
+    gateway._thread_metadata_for_source = lambda source, reply_to_message_id=None: {"thread_id": source.thread_id}
+    ctx = TurnContext(source=source, user_config={}, _run_still_current=lambda: True,
+                      persist_user_display_kind=display_kind, _status_adapter=adapter,
+                      _status_chat_id=source.chat_id, _status_thread_metadata={"thread_id": source.thread_id})
+    turn = TurnRunner(gateway, ctx)
+    monkeypatch.setattr(run, "safe_schedule_threadsafe", lambda coro, *a, **k: asyncio.run(coro))
+    emitter = Emitter()
+    emitter.status_callback = turn._status_callback_sync
+    emitter.notice_callback = turn._notice_callback_sync
+
+    emitter._emit_warning("The provider is unavailable")
+    emitter._emit_diagnostic_status("The provider rejected the request and retrying won't help")
+    emitter._emit_notice(AgentNotice("Credit access paused", level="error", key="credits.depleted"))
+    turn._status_callback_sync("info", "Still working")
+    assert len(adapter.sent) == (0 if display_kind == "supervisor_checkin" else 4)
+
+    # The gate owns engine chrome only, not the roster-validated final or direct tool responses.
+    asyncio.run(adapter.send(source.chat_id, "Still outstanding: peer validation"))
+    assert adapter.sent[-1][1] == "Still outstanding: peer validation"
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 def test_direct_warning_delivery_keeps_failure_state(tmp_path, monkeypatch, enabled):
     from gateway import run

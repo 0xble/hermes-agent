@@ -665,10 +665,70 @@ async def test_tool_progress_edits_follow_daily_budget_without_restoring_typing(
         assert edited.success
         assert bool((edited.raw_response or {}).get("skipped")) is bool(used)
         adapter._bot.send_message.assert_awaited_once()
+        first_text = adapter._bot.send_message.call_args.kwargs["text"]
+        assert ("Live updates paused" in first_text) is bool(used)
+        if used:
+            assert first_text.endswith(adapter.format_message("Live updates paused (daily Telegram limit)"))
+        assert getattr(state, "skipped_edits", 0) == (1 if used else 0)
         assert adapter._bot.edit_message_text.await_count == (0 if used else 1)
         if used:
             await adapter.send_typing(CHAT)
             adapter._bot.send_chat_action.assert_not_awaited()
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("daily_pressure", [False, True])
+@pytest.mark.parametrize("path", ["edit", "overflow"])
+async def test_progress_skips_preserve_pending_state_and_log_daily_pause_once_per_turn(
+    tmp_path, caplog, daily_pressure, path,
+):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), 10 if daily_pressure else 0)
+    clock = Wall(100)
+    adapter._telegram_chat_outbound_slot_secs = 0.01
+    adapter._telegram_chat_budget = ChatOutboundBudget(clock=clock)
+    if not daily_pressure:
+        # Rich finalize deliberately bypasses the short-term slot. Exercise an interim skip.
+        adapter.REQUIRES_EDIT_FINALIZE = False
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    token = bind_trigger(SimpleNamespace(text="run the checks"))
+    try:
+        for turn in range(2):
+            clock.t += 20  # The next turn starts beyond the previous turn's edit floor.
+            runner, state = _progress_runner(adapter)
+            await runner._progress_send_or_edit(state, _tool_line(runner, state))
+            state.reanchored = True
+            adapter._chat_budget().note_interim(CHAT)
+            assert adapter._chat_budget().interim_blocked(CHAT)
+            if path == "overflow":
+                state._PROGRESS_TEXT_LIMIT = len(state.progress_lines[0])
+            for i in range(3):
+                line = _tool_line(runner, state, f"Checking step {i}")
+                pending = list(state.progress_lines)
+                if path == "overflow":
+                    assert await runner._roll_progress_overflow_if_needed(state)
+                else:
+                    assert await runner._progress_send_or_edit(state, line)
+                pauses = [r for r in caplog.records if r.getMessage() ==
+                          f"progress edits paused for {CHAT}: daily budget"]
+                assert len(pauses) == (turn + 1 if daily_pressure else 0)
+                assert state.progress_lines == pending
+                assert state.reanchored  # A skipped edit did not repair the bubble.
+                assert getattr(state, "skipped_edits", 0) == i + 1
+            await runner._flush_progress_edit(state)
+            assert state.skipped_edits == 4
+            pauses = [r for r in caplog.records if r.getMessage() ==
+                      f"progress edits paused for {CHAT}: daily budget"]
+            assert len(pauses) == (turn + 1 if daily_pressure else 0)
+            assert all(r.levelno == logging.INFO for r in pauses)
+        adapter._bot.send_message.assert_awaited()
+        assert adapter._bot.send_message.await_count == 2
+        adapter._bot.edit_message_text.assert_not_awaited()
     finally:
         reset_trigger(token)
 
@@ -768,6 +828,9 @@ async def test_initial_tool_bubble_does_not_exempt_adapter_split_continuations(t
         assert state.progress_msg_id
         assert (adapter._bot.send_message.await_count == 1) is bool(used)
         assert not used or state.tool_progress_sent
+        if used:
+            first_text = adapter._bot.send_message.call_args_list[0].kwargs["text"]
+            assert first_text.endswith(adapter.format_message("Live updates paused (daily Telegram limit)"))
     finally:
         reset_trigger(token)
 

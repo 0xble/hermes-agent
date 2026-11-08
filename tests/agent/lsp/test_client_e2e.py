@@ -227,6 +227,7 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
     try:
         # Generous deadlines: CI runners under load took >3 s here (PR-blocking flake).
         ready_deadline = asyncio.get_running_loop().time() + 15.0
+        # slow_tree atomically publishes this path after installing SIGTERM ignore.
         while not child_pid_file.exists():
             assert asyncio.get_running_loop().time() < ready_deadline
             await asyncio.sleep(0.01)

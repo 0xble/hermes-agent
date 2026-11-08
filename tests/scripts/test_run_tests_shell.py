@@ -49,7 +49,7 @@ def test_shell_runner_preserves_explicit_power_shell_module_path(tmp_path, modul
     env.pop("__HERMES_ACTIVATED", None)
     result = subprocess.run(
         ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
-        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -71,7 +71,7 @@ def test_shell_runner_preserves_powershell_analysis_cache_path(tmp_path):
     env.pop("__HERMES_ACTIVATED", None)
     result = subprocess.run(
         ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
-        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -101,7 +101,42 @@ def test_explicit_interpreter_keeps_pythonpath_across_clean_environment(tmp_path
     env.pop("__HERMES_ACTIVATED", None)
     result = subprocess.run(
         ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
-        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env, check=False,
     )
     assert "using HERMES_PYTHON" in result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_shell_runner_forwards_only_explicit_vault_fixture_paths(tmp_path, opt_in):
+    """Companion opt-in reaches pytest without opening the environment allowlist."""
+    paths = {
+        "VAULT_BROWSER_FIXTURE_MODULES": str(tmp_path / "native modules"),
+        "VAULT_BROWSER_FIXTURE_SOURCE": str(tmp_path / "companion source"),
+    }
+    expected = paths if opt_in else dict.fromkeys(paths)
+    case = tmp_path / "test_vault_fixture_environment.py"
+    case.write_text(
+        "import os\n"
+        "def test_fixture_environment():\n"
+        f"    expected = {expected!r}\n"
+        "    assert {key: os.environ.get(key) for key in expected} == expected\n"
+        "    assert 'VAULT_BROWSER_FIXTURE_UNRELATED' not in os.environ\n"
+        "    assert 'OPENAI_API_KEY' not in os.environ\n",
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "HERMES_PYTHON": sys.executable,
+           "HERMES_TEST_FILE_RETRIES": "0", "OPENAI_API_KEY": "synthetic-canary",
+           "VAULT_BROWSER_FIXTURE_UNRELATED": "synthetic-canary"}
+    env.pop("__HERMES_ACTIVATED", None)
+    for key in paths:
+        env.pop(key, None)
+    if opt_in:
+        env.update(paths)
+    result = subprocess.run(
+        ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env, check=False,
+    )
     assert result.returncode == 0, result.stdout + result.stderr

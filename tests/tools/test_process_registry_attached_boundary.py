@@ -35,6 +35,29 @@ def test_attached_explicit_high_exit_is_not_a_signal(local_registry, tmp_path, c
     assert not (tmp_path / "process-runs").exists()
 
 
+def _sleep_started(parent):
+    for process in [parent, *parent.children(recursive=True)]:
+        try:
+            if process.name() == "sleep":
+                return True
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            # A login-shell child can be reaped after the snapshot.
+            continue
+    return False
+
+
+@pytest.mark.parametrize("error", [psutil.NoSuchProcess, psutil.ZombieProcess])
+def test_sleep_probe_tolerates_vanished_child(error):
+    parent, vanished, sleeper = (Mock(spec=psutil.Process) for _ in range(3))
+    parent.name.return_value = "shell"
+    vanished.name.side_effect = error(123)
+    sleeper.name.return_value = "sleep"
+    parent.children.return_value = [vanished]
+    assert not _sleep_started(parent)
+    parent.children.return_value = [vanished, sleeper]
+    assert _sleep_started(parent)
+
+
 @pytest.mark.platforms("posix")
 def test_attached_sleep_retains_fast_native_kill(local_registry, tmp_path):
     session = local_registry.spawn_local("sleep 30", cwd=str(tmp_path))
@@ -43,7 +66,7 @@ def test_attached_sleep_retains_fast_native_kill(local_registry, tmp_path):
         # Wait for shell startup, not for completion: kill an actually running sleep.
         parent = psutil.Process(session.pid)
         ready_deadline = time.monotonic() + 5
-        while not any(p.name() == "sleep" for p in [parent, *parent.children(recursive=True)]):
+        while not _sleep_started(parent):
             assert time.monotonic() < ready_deadline
             time.sleep(0.01)
         start = time.monotonic()

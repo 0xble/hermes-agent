@@ -72,7 +72,8 @@ def test_unknown_resolution_atomically_revokes_worker_before_unblocking(tmp_path
         db = SessionDB(db_path=tmp_path / 'state.db')
         with pytest.raises(rt.RuntimeStoreError, match='stale_generation'):
             rt.adopt_worker_execution(db, epoch=epoch, **assignment, adoption_secret='private')
-        with pytest.raises(rt.RuntimeStoreError, match='stale_epoch'):
+        # Revocation is terminal even though the worker still belongs to the old epoch.
+        with pytest.raises(rt.RuntimeStoreError, match='stale_generation'):
             append(db, epoch=epoch, **assignment, sequence=1, content='late')
         assert db.get_messages('s') == []
         assert rt.claim_session_input(db, epoch=epoch, session_id='s')['admission_id'] == follower['admission_id']

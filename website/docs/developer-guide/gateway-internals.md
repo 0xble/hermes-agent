@@ -697,6 +697,9 @@ is only the fallback for processes registered before the gateway serves (checkpo
 while it stops, drained at startup and post-turn. Agent-notify watchers send no user-facing
 receipt (the agent's next turn is the report) unless the launching turn is still running at exit
 — then the injection only queues a follow-up, so the concise receipt goes out immediately.
+Under `off`, explicit `notify_on_complete=true` gateway completions still reach the agent,
+but all public receipts (including busy-turn and refused-admission fallback) remain hidden.
+CLI/TUI/Desktop completion wakes and automatic wait-promotion stay suppressed under `off`.
 
 The idle completion watcher also drains `watch_match` / `watch_disabled`; no user follow-up is
 required. Notify-off drains these without waking. Transport failures are retried; unavailable

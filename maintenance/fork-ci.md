@@ -98,6 +98,31 @@ before running. Keep the checkout's pinned toolchain and every assertion intact,
 then detach and remove only the invocation's disposable image after all owned
 processes have exited.
 
+Electron fixture cost must stay proportional to the assertion under the full
+project's default worker concurrency. The channel-version MSIX test shares the
+checkout's import-only PM and release packages through directory junctions,
+as it already does for Node dependencies, and admits each exact request once
+through the existing synchronous batch validator before loading the real
+packager configs. All four rollover cases still use the real MSIX writer and
+Python artifact recorder, including the wrong-application rejection, but share
+one in-process Node module and one Python recorder instead of eight cold
+process starts. The writer module stays beside its disposable packaging tree
+so its real module resolution and build hooks retain the fixture boundary.
+
+The review payload-cap fixture uses Git's index and one shared blob for most
+of its over-cap rows, plus real untracked files on both sides of the cutoff.
+It still exercises real Git status/diffs, line counting and the renderer cap,
+without creating, reading and deleting thousands of physical files. The
+source-handoff fixture gets the canonical install key from Python once and
+stages channel records directly. One Git fast-import creates its four empty
+commits instead of a commit/rev-parse subprocess pair per commit. The config
+writer has its own Python tests;
+both release-channel forced handoff probes remain real. Main's unchanged
+branch snapshot is reused for the UI fallbacks, with the no-publication-I/O
+assertion starting before its real Python check. Keep existing
+deadlines, worker policy and behavior assertions. Retire these adaptations
+when upstream fixtures provide the same bounded work and coverage.
+
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning
 clears only after a gateway serves the new commit.
@@ -130,6 +155,31 @@ but, on failure, reports per-profile request counts, heartbeat/success age, and
 canary job state (no prompts or keys) so the next missed fire can be attributed
 to enumeration, ticker liveness, claim, or execution instead of an opaque timeout.
 
+The real-process self-reaping-supervisor fixture waits for both the child's
+startup and a parent-ready marker written after its TERM trap is installed.
+A controlled FIFO hold after the fork reproduced the old fixture accepting
+child readiness alone: the actual registry delivered TERM before the handler
+existed and the supervisor exited -15. Holding that same point now keeps the
+readiness predicate false until release. Exit-zero and parent-only TERM
+assertions remain unchanged, as do production parent-first signalling, grace
+windows, worker counts and timeouts.
+
+The process-registry unit fixture isolates PM's PATH store with a temporary
+`HERMES_RUNTIME_DIR` (as in `test_store_path_dirs_cache`) and console-script
+discovery with `_resolve_hermes_bin_dir = lambda: None` (as in
+`test_persist_on_release`). These tests exercise process spawning and teardown,
+not the operator's managed Hermes installation. The payload-aware resolver
+introduced in `3383a1d8b3` probes a sibling `manifest.json`; in a checkout under
+real `HERMES_HOME`, that sibling is correctly outside HomeIOGuard's source-tree
+exemption. The persistence lifecycle fixture owns the same temporary PM store
+and stubs unrelated dependency activation when importing `run_agent` for cleanup
+hooks; it still executes the real lifecycle method, survivor wrapper and registry.
+An exact-main fixture reproduced all eighteen original guard failures before
+this isolation; isolating console-script discovery alone did not fix PM's
+independent store lookup. Leave payload discovery, the home guard and every
+process assertion unchanged. Run both process files alongside the real-home
+tripwire tests; retire this adaptation when upstream isolates those host lookups.
+
 Prompt-surface review keeps full commit ancestry for the merge-base comparison,
 but its checkout uses Git's `blob:none` partial-clone filter. Fetching every
 historical blob exhausted the job's 5-minute budget before review could run,
@@ -138,6 +188,22 @@ Checkout and base `git archive` hydrate the content actually read. A real local
 Git regression leaves an unrelated historical artifact missing while rendering
 the base-to-head prompt diff. The job timeout, staleness test, committed
 snapshots, qualification requirement, and core-approval path are unchanged.
+
+The PM upgrade harness must re-pin its local-origin `main` channel after writing
+fake-provider configuration. Replacing `config.yaml` otherwise erases the
+installer's channel record and makes an official-origin sandbox fall back to
+`stable`, spending live anonymous GitHub API quota. Keep the managed-environment
+`update --check` behind a dead HTTP(S) proxy and assert `Update channel: main`;
+its Git origin is a local path and must remain usable without release HTTP.
+`tests/hermes_cli/test_pm_update_check_harness.py` reproduces a rate-limited
+403 through the real checker before configuring, then verifies that the real
+harness restores `main`, makes no release HTTP request, and leaves HEAD and
+configuration unchanged during `--check`. This ports upstream
+[PR #147904](https://github.com/NousResearch/hermes-agent/pull/147904), with an
+additional deterministic regression. Retire this fork note when the upstream
+fix and equivalent no-network coverage are present through normal integration.
+Do not substitute a GitHub token, retries, skips, or a successful unknown state
+for the fixture's local-origin contract.
 
 The nightly fetches upstream CalVer release tags before its historical upgrade E2E:
 `actions/checkout` sees only fork tags (latest `v2026.8.3`), otherwise the test's
@@ -725,6 +791,22 @@ is related origin, not a fix for callback test isolation. Retire this adaptation
 when released upstream binds these real-process tests to fixture-owned homes.
 
 Contract tests: `tests/tools/test_terminal_trailing_amp_auto_background.py`
+
+## Attached native-kill readiness probe
+
+The `fork-ci-reliability` identity covers the attached-job readiness probe in
+`tests/tools/test_process_registry_attached_boundary.py`. Login-shell startup
+can leave a child in a psutil snapshot that is reaped before its name is read.
+Only `NoSuchProcess` and `ZombieProcess` mean that candidate is gone; continue
+looking for a real `sleep` before timing the native kill. Access and other probe
+errors still fail. The killed-status, sub-0.5-second kill, and no-exit-receipt
+assertions are unchanged. Deterministic vanished-child probes require both a
+negative result without a sleeper and a positive result after a vanished child.
+This is independent of the broader teardown-helper change in fork PR #1120.
+Retire when released upstream carries equivalent race-safe readiness probing;
+roll back the commit carrying `Fork-Patch: fork-ci-reliability` for this probe.
+
+Contract tests: `tests/tools/test_process_registry_attached_boundary.py`
 
 ## Release-sync scope
 

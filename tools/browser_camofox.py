@@ -1180,28 +1180,30 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     """Type text into an element by ref via Camofox."""
+    from tools.browser_tool_typing import register_typed_card_value, typed_result
     session = None
+    task, origin = task_id or "default", ""
     try:
         session, blocked = _require_tab(task_id, "type")
         if blocked:
             return blocked
         clean_ref = ref.lstrip("@")
+        origin = register_typed_card_value(clean_ref, text, task,
+                                          lambda: _snapshot_data(session).get("snapshot", ""))
         _post(_tab_path(session, "type"), {"userId": session["user_id"], "ref": clean_ref, "text": text})
-        from agent.display import redact_browser_typed_text_for_display, redact_tool_args_for_display
+        from agent.display import redact_tool_args_for_display
         # Match browser_tool.browser_type: the raw text is typed into the page, but the
         # returned display value is run through the secret-pattern redactor so API keys /
         # tokens don't leak into tool progress or chat history.
         display_text = (redact_tool_args_for_display("browser_type", {"text": text}) or {})["text"]
         response = {"success": True, "typed": display_text, "element": clean_ref}
-        return json.dumps(redact_browser_typed_text_for_display(response, text))
+        return json.dumps(typed_result(response, text, task, origin))
     except requests.HTTPError as exc:
-        from agent.display import redact_browser_typed_text_for_display
         if session is not None and _clear_stale_tab(session, exc):
             return tool_error(_STALE_TAB_ERROR, success=False)
-        return tool_error(redact_browser_typed_text_for_display(str(exc), text), success=False)
+        return tool_error(typed_result(str(exc), text, task, origin), success=False)
     except Exception as e:
-        from agent.display import redact_browser_typed_text_for_display
-        return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
+        return tool_error(typed_result(str(e), text, task, origin), success=False)
 
 
 def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:

@@ -30,7 +30,7 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typing_after_prompt, typing_metadata_for_source
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.run_task_card_progress import TaskCardProgressMixin
-from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
+from gateway.run_turn_runner_progress import _ToolProgressLine, edit_progress_message, send_progress_text
 from gateway.run_turn_runner_receipts import _persisted_turn
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
@@ -276,6 +276,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         defer_until: float = 0.0
         # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
         tool_progress_sent: bool = False
+        skipped_edits: int = 0
+        progress_pause_logged: bool = False
 
     # Default minimum seconds between progress edits. An adapter may raise it with
     # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
@@ -316,15 +318,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         )
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
-        ctx = self._ctx
-        kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
-        if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
-            kwargs["finalize"] = True
-        if st._edit_accepts_metadata:
-            kwargs["metadata"] = ctx._progress_metadata
-        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
-        with outbound_class(OUTBOUND_PROGRESS):
-            return await st.adapter.edit_message(**kwargs)
+        return await edit_progress_message(st, self._ctx, message_id, content)
 
     @staticmethod
     def _progress_text(lines: list) -> str:
@@ -512,10 +506,6 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         except Exception as e:
             logger.debug("event_callback hook error: %s", e)
 
-    def _status_live(self) -> bool:
-        """Status adapter present and this run is still the current generation."""
-        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
-
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
@@ -570,7 +560,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
     def _setup_stream_consumer(self, platform_key):
         from gateway.stream_recovery import preview_recorder, restore_preview
         ctx = self._ctx
-        if ctx.mute_notification_reply:
+        if ctx.mute_notification_reply or ctx.persist_user_display_kind == "supervisor_checkin":
             return None, None, None, False
         stream_consumer = None
         # The streaming-TTS consumer is created on the outer loop thread before run_sync launches;

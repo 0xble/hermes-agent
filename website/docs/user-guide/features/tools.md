@@ -262,7 +262,9 @@ This applies where a completion can reach the agent: the interactive CLI (includ
 `hermes chat -q`), the TUI and desktop app, and messaging chats. Non-interactive `hermes chat -q`,
 one-shot `hermes -z`, cron jobs, Kanban workers, stateless API requests and delegated subagents keep the
 previous behaviour because they cannot receive a later completion, as does any profile with
-`display.background_process_notifications: off` (completions never start an agent turn there). Checking
+`display.background_process_notifications: off` (automatic wait-promotion stays disabled there).
+An explicitly requested `notify_on_complete=true` still wakes the messaging gateway agent under
+`off`, without a separate chat receipt; CLI, TUI and Desktop keep plain polling under `off`. Checking
 a process whose completion goes to someone else (another session's process, or a subagent's process
 that was not handed off) also stays plain polling. Admin-managed settings and `${VAR}` values count.
 To keep plain polling everywhere, set:

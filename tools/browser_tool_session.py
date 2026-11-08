@@ -85,24 +85,9 @@ def windows_headless_browser_options(browser_env: dict[str, str],
     return {**browser_env, "AGENT_BROWSER_HEADED": "false"}
 
 
-def _read_command_output_files(stdout_path: str, stderr_path: str) -> tuple[str, str]:
-    """Best-effort read of agent-browser stdout/stderr temp files."""
-    out = []
-    for path in (stdout_path, stderr_path):
-        try:
-            with open(path, "r", encoding="utf-8-sig") as f:
-                out.append(f.read().strip())
-        except OSError:
-            out.append("")
-    return out[0], out[1]
-
-
-def _unlink_command_output_files(*paths: str) -> None:
-    for path in paths:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+def _read_command_output(proc: subprocess.Popen) -> tuple[str, str]:
+    from tools.browser_tool_capture import collect
+    return collect(proc)
 
 
 def _format_browser_timeout_error(
@@ -141,8 +126,12 @@ def _shim_safe_args(argv0: str, command: str, args: list[str]) -> tuple[str, lis
     Unexpected end of input``) and multi-line ``fill`` text is truncated the same way. ``eval``
     scripts are sent base64-encoded (``agent-browser eval -b``); any other command whose argv carries
     a newline or ``%`` is wrapped as ``batch`` with the command as a JSON array on stdin — cmd.exe
-    never sees the text (both forms present since the 0.26 floor). Every other spawn gets the raw
-    argv and no stdin."""
+    never sees the text (both forms present since the 0.26 floor). Fills use batch on every
+    platform to keep typed values off argv; other non-shim commands retain their argv."""
+    # Every fill uses the existing batch protocol: typed credentials must never
+    # appear in a process command line, even on POSIX or for single-line input.
+    if command == "fill" and args:
+        return "batch", [], json.dumps([[command, *args]]).encode("utf-8")
     if not args or not argv0.lower().endswith((".cmd", ".bat")):
         return command, args, None
     if command == "eval":
@@ -230,33 +219,22 @@ def _ensure_screen_for_headed_chromium() -> None:
 
 def _popen_agent_browser(argv: list[str], env: dict[str, str], socket_dir: str, tag: str,
                          stdin_payload: Optional[bytes] = None) -> subprocess.Popen:
-    """Spawn agent-browser with stdout/stderr redirected to ``socket_dir/_std{out,err}_<tag>``;
-    ``stdin_payload`` (a ``batch`` JSON body) is served from ``_stdin_<tag>`` the same way.
+    """Spawn with memory-only input/output and daemon-safe bounded collection.
 
-    Temp files, not pipes: the CLI forks a daemon that inherits its fds, so pipes never
-    see EOF until the timeout. Windows: CREATE_NO_WINDOW only (CREATE_NEW_PROCESS_GROUP
-    cancels asyncio's running task on 3.11), STARTF_USESTDHANDLES + close_fds so the child
-    gets ONLY our three handles (leaked console handles kill the Rust daemon grandchild).
+    Keep Windows' explicit stdio handles and hidden-window policy. Capture drains
+    inherited handles without waiting for daemon EOF or persisting raw page output.
     """
-    fds = [os.open(os.path.join(socket_dir, f"_{slot}_{tag}"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-           for slot in ("stdout", "stderr")]
-    stdin: Any = subprocess.DEVNULL
-    if stdin_payload is not None:
-        stdin_path = os.path.join(socket_dir, f"_stdin_{tag}")
-        with open(stdin_path, "wb") as f:
-            f.write(stdin_payload)
-        fds.append(os.open(stdin_path, os.O_RDONLY))
-        stdin = fds[-1]
-    try:
-        _popen_extra: dict = {}
-        if os.name == "nt":
-            _si = subprocess.STARTUPINFO()
-            _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
-            _popen_extra = {"creationflags": windows_hide_flags(), "close_fds": True, "startupinfo": _si}
-        return subprocess.Popen(argv, stdout=fds[0], stderr=fds[1], stdin=stdin, env=env, **_popen_extra)
-    finally:
-        for fd in fds:
-            os.close(fd)
+    from tools.browser_tool_capture import BrowserOutputCapture
+    stdin = subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL
+    _popen_extra: dict = {}
+    if os.name == "nt":
+        _si = subprocess.STARTUPINFO()
+        _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
+        _popen_extra = {"creationflags": windows_hide_flags(), "close_fds": True, "startupinfo": _si}
+    proc = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=env, bufsize=0, **_popen_extra)
+    setattr(proc, "_hermes_browser_capture", BrowserOutputCapture(proc))
+    return proc
 
 
 def _session_record(prefix: str, cdp_url: Optional[str], features: dict[str, Any]) -> dict[str, Any]:
@@ -284,7 +262,7 @@ def _create_local_session(task_id: str, allow_real_profile: bool = True) -> dict
     if allow_real_profile:
         cdp_url, err = _real_profile._real_profile_cdp()
         if err:
-            _bt.logger.warning("real-profile unavailable for task %s, using a fresh browser: %s", task_id, err)
+            _bt.logger.warning("real-profile unavailable for task %s, using a fresh browser", task_id)
             fallback_note = _real_profile.real_profile_fallback_note(err)
         elif cdp_url:
             info = _session_record("rp", _cdp._resolve_cdp_override(cdp_url), {"local": True, "real_profile": True})
@@ -668,13 +646,13 @@ def _interpret_browser_command_output(command: str, stdout: str, stderr: str, re
     non-JSON output is an error except ``screenshot``, whose path is recovered from prose."""
     if stderr and stderr.strip():
         level = logging.WARNING if returncode != 0 else logging.DEBUG
-        _bt.logger.log(level, "browser '%s' stderr: %s", command, stderr.strip()[:500])
+        _bt.logger.log(level, "browser '%s' produced stderr (%d chars)", command, len(stderr))
 
     stdout_text = stdout.strip()
     if not stdout_text:
         if returncode != 0:
             error_msg = stderr.strip() if stderr else f"Command failed with code {returncode}"
-            _bt.logger.warning("browser '%s' failed (rc=%s): %s", command, returncode, error_msg[:300])
+            _bt.logger.warning("browser '%s' failed (rc=%s, %d stderr chars)", command, returncode, len(stderr))
             return {"success": False, "error": error_msg, "returncode": returncode}
         if command not in _bt._EMPTY_OK_COMMANDS:
             _bt.logger.warning("browser '%s' returned empty output (rc=0)", command)
@@ -685,12 +663,12 @@ def _interpret_browser_command_output(command: str, stdout: str, stderr: str, re
         parsed = json.loads(stdout_text)
     except json.JSONDecodeError:
         raw = stdout_text[:2000]
-        _bt.logger.warning("browser '%s' returned non-JSON output (rc=%s): %s", command, returncode, raw[:500])
+        _bt.logger.warning("browser '%s' returned non-JSON output (rc=%s, %d chars)", command, returncode, len(stdout_text))
         if command == "screenshot":
             combined_text = "\n".join(part for part in [stdout_text, (stderr or "").strip()] if part)
             recovered_path = _snapshot._extract_screenshot_path_from_text(combined_text)
             if recovered_path and Path(recovered_path).exists():
-                _bt.logger.info("browser 'screenshot' recovered file from non-JSON output: %s", recovered_path)
+                _bt.logger.info("browser 'screenshot' recovered file from non-JSON output")
                 return {"success": True, "data": {"path": recovered_path, "raw": raw}}
         return {"success": False, "error": f"Non-JSON output from agent-browser for '{command}': {raw}", "returncode": returncode}
 
@@ -818,29 +796,23 @@ def _spawn_and_collect(
         if not session_info.get("cdp_url") and not _cloud._is_headed_mode():
             browser_env = windows_headless_browser_options(browser_env)
 
-    stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
-    stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
     cmd_parts, browser_env = _sandbox_wrap(cmd_parts, browser_env, task_socket_dir)
     proc = _popen_agent_browser(cmd_parts, browser_env, task_socket_dir, command, stdin_payload)
 
     try:
-        proc.wait(timeout=timeout)
+        from tools.browser_tool_capture import wait_for_cli
+        wait_for_cli(proc, timeout, stdin_payload)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
-        _unlink_command_output_files(stdout_path, stderr_path)
+        stdout, stderr = _read_command_output(proc)
         _handle_browser_command_timeout(task_id, session_info, task_socket_dir)
         if stderr and stderr.strip():
-            _bt.logger.warning("browser '%s' stderr after timeout: %s", command, stderr.strip()[:500])
+            _bt.logger.warning("browser '%s' produced stderr after timeout (%d chars)", command, len(stderr))
         _bt.logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                        command, timeout, task_id, task_socket_dir)
         return {"success": False, "error": _format_browser_timeout_error(command, timeout, stdout, stderr)}
-    with open(stdout_path, "r", encoding="utf-8-sig") as f:
-        stdout = f.read()
-    with open(stderr_path, "r", encoding="utf-8-sig") as f:
-        stderr = f.read()
-    _unlink_command_output_files(stdout_path, stderr_path)
+    stdout, stderr = _read_command_output(proc)
     return _interpret_browser_command_output(command, stdout, stderr, proc.returncode)
 
 
@@ -939,7 +911,7 @@ def _dispatch_browser_command(
         result = _unwrap_batch_result(
             _spawn_and_collect(task_id, session_info, cmd_parts, command, engine, timeout, stdin_payload), command)
     except Exception as e:
-        _bt.logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
+        _bt.logger.warning("browser '%s' exception: %s", command, type(e).__name__)
         result = {"success": False, "error": str(e)}
     return engine, result
 
@@ -990,7 +962,7 @@ def _run_browser_command(
     # empty, non-JSON, nonzero rc, parsed).
     fallback_reason = _lp._lightpanda_fallback_reason(engine, command, result)
     if fallback_reason:
-        _bt.logger.info("Lightpanda fallback: retrying '%s' with Chrome (task=%s): %s", command, task_id, fallback_reason)
+        _bt.logger.info("Lightpanda fallback: retrying '%s' with Chrome (task=%s)", command, task_id)
         if command == "screenshot":  # separate Chrome session to the same URL
             fallback_result = _lp._chrome_fallback_screenshot(task_id, args or [], timeout)
         else:

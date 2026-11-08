@@ -19,6 +19,16 @@ from tools import browser_tool_session as bt_session
 from tools import browser_tool_install as bt_install
 
 
+@pytest.fixture(autouse=True)
+def _isolated_pm_checkout(tmp_path, monkeypatch):
+    # Package resolution may inspect manifest/install metadata beside its source
+    # checkout; never let a checkout under the real Hermes home select host state.
+    from pm import paths
+    root = tmp_path / "pm-checkout"
+    root.mkdir()
+    monkeypatch.setattr(paths, "repo_root", lambda: root)
+
+
 def _auth_db(path, value=None):
     """Store/read a marker in a real auth DB so snapshot fixtures exercise SQLite."""
     import sqlite3
@@ -280,6 +290,7 @@ class TestRealProfileCdpLaunch:
                           side_effect=[None, "http://127.0.0.1:41000"]), \
              patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt_session, "_popen_agent_browser", side_effect=fake_agent_browser_spawn), \
+             patch.object(bt_session, "_read_command_output", return_value=("", "")), \
              patch.object(bt, "_socket_safe_tmpdir", return_value=str(tmp_path)), \
              patch.object(bt_cloud, "_is_headed_mode", return_value=False):
             bt_real_profile._real_profile_cdp()

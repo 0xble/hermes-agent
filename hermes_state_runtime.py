@@ -1046,10 +1046,8 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
     digest = admission_fingerprint(canonical_target=session_id,
                                   payload={'operation': operation, 'payload': json.loads(encoded)})
     def write(conn):
-        _epoch(conn, epoch)
         row = worker_receipt_assignment(conn, execution_id, session_id, generation, sequence, digest)
-        if row['owner_epoch'] != epoch:
-            raise RuntimeStoreError('stale_epoch')
+        terminal = row['status'] == 'terminal'
         old = conn.execute('SELECT * FROM worker_receipts WHERE execution_id=? AND sequence=?',
                            (execution_id, sequence)).fetchone()
         if old is not None:
@@ -1058,7 +1056,19 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             from hermes_state_runtime_workers import retired_receipt
             if retired_receipt(old['result_json']):
                 raise RuntimeStoreError('stale_generation')  # a terminal execution's read copy
-            return json.loads(old['result_json'])
+        elif terminal:
+            # Retirement is final, not an invitation to reconnect to a new epoch.
+            raise RuntimeStoreError('stale_generation')
+        try:
+            _epoch(conn, epoch)
+        except RuntimeStoreError:
+            if terminal:
+                raise RuntimeStoreError('stale_generation') from None
+            raise
+        if row['owner_epoch'] != epoch:
+            raise RuntimeStoreError('stale_generation' if terminal else 'stale_epoch')
+        if old is not None:
+            return json.loads(old['result_json'])  # retain exact mutation acknowledgements
         if row['status'] not in ('registered', 'running'):
             raise RuntimeStoreError('stale_generation')
         if sequence != row['last_sequence'] + 1:

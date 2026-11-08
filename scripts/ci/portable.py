@@ -751,8 +751,9 @@ def python_tests(env: dict[str, str], roots: list[str], workers: int,
     require_tools(('rg',), env)
     env = dict(env)
     env['HERMES_PYTHON'] = py
-    browser_test = ROOT / 'tests/tools/test_vault_shadow_dom_live.py'
-    if any(browser_test == ROOT / path or browser_test.is_relative_to(ROOT / path) for path in roots):
+    browser_tests = [ROOT / path for path in ('tests/tools/test_vault_shadow_dom_live.py',
+                                              'tests/tools/test_browser_vault_checkout_live.py')]
+    if any(test == ROOT / path or test.is_relative_to(ROOT / path) for path in roots for test in browser_tests):
         # Every lane that owns the real-browser tests must supply Chromium,
         # including the complete contributor suite as well as a shard.
         env['PLAYWRIGHT_BROWSERS_PATH'] = '0'

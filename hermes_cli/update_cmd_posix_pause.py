@@ -225,6 +225,8 @@ def _respawning_service(pid: int) -> str | None:
 def _discover_bare(service_pids: set[int]) -> tuple[list[dict], list[str]]:
     """``(bare gateways, notices)``: this install's ``gateway run`` processes outside any unit."""
     from gateway.status import get_process_start_time
+    from gateway.control_socket import identify_gateway
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
     from hermes_cli.gateway import _capture_gateway_argv, _get_service_pids, find_gateway_pids
     from hermes_cli.update_cmd_fleet import _scoped_manual_gateway_pids
     from hermes_cli.update_fleet_scope import gateway_pid_home
@@ -235,6 +237,10 @@ def _discover_bare(service_pids: set[int]) -> tuple[list[dict], list[str]]:
         pid = int(pid)
         marker = _supervisor_markers(pid)
         argv, home = _capture_gateway_argv(pid), gateway_pid_home(pid)
+        identity = identify_gateway(Path(home)) if home else None
+        # Finite owners end with the client's lease, never updater stop/replay.
+        if leave_client_owned_gateway(pid, identity, home=home, argv=argv):
+            continue
         if marker or not argv or not home:
             why = f"supervised by {marker}" if marker else "its command line could not be read" if not argv \
                 else "its Hermes home could not be proved"

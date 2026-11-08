@@ -19,6 +19,7 @@ BANNED = re.compile(
     r"(?![^.!?]{0,200}\b(?:look[- ]alike|phishing|origin|domain|frame|chat|shell|arguments?|logs?|files?|"
     r"copied from (?:the |a )?page|from (?:the |a )?page)\b)"
     r"[^.!?]{0,100}\b(?:passwords?|codes?(?! review)|cards?|CVCs?)\b|"
+    r"hand the card[^.]{0,30}entry to the user|"
     r"browser-input redaction|redaction-capable runtime",
     re.IGNORECASE,
 )
@@ -76,6 +77,7 @@ def test_secret_entry_guard_rejects_restored_restrictions():
         "Keep card numbers and CVCs in vault fills.",
         "Card numbers may be entered only through browser_vault_fill.",
         "Never type a password, card number, CVC or code.",
+        "Card inputs cannot be filled by the vault; do not retry, hand the card entry to the user instead.",
         "Direct entry requires browser-input redaction for PAN/CVC-shaped values.",
     ):
         assert BANNED.search(text), text
@@ -114,9 +116,52 @@ def test_card_fallback_never_routes_around_approval_refusal(name, code):
                    if sentence.startswith("Never fall back after "))
     assert code in refusal
     assert "no_payment_fields, a partial fill, missed fields, or a processor frame" in text
-    assert "approval_unavailable" in text
+    # approval_unavailable is its own condition, not gated behind "only after" the fill-failure list.
+    assert "only after no_payment_fields" not in text
+    assert ("in two cases: (1) after no_payment_fields, a partial fill, missed fields, "
+            "or a processor frame; or (2) after approval_unavailable (no prompt surface), "
+            "only when the user explicitly approved this exact charge in this session's "
+            "conversation") in text
+    assert "Approved exact charge means the user explicitly approved the merchant, amount, and selected card" in text
+
+
+def _descriptions():
+    from tools.browser_tool import BROWSER_TOOL_SCHEMAS
+    from tools.browser_use_cli import BROWSER_EXEC_SCHEMA
+    from tools.browser_vault_tool import BROWSER_VAULT_SCHEMA
+
+    browser_type = next(s for s in BROWSER_TOOL_SCHEMAS if s["name"] == "browser_type")
+    defs = [{"type": "function", "function": schema} for schema in
+            (browser_type, BROWSER_EXEC_SCHEMA, BROWSER_VAULT_SCHEMA,
+             {"name": "terminal", "description": "terminal"})]
+    return {d["function"]["name"]: d["function"]["description"]
+            for d in _apply_dynamic_schemas(defs)}
+
+
+@pytest.mark.parametrize("name", ["browser_type", "browser_exec", "browser_vault"])
+@pytest.mark.parametrize("destination", ["merchant", "wallet"])
+def test_card_on_file_requires_current_action_merchant_or_wallet_and_card_approval(name, destination):
+    text = _descriptions()[name]
+    assert "Separately, card-on-file direct entry" in text
+    approval = next(sentence for sentence in text.split(". ")
+                    if sentence.startswith("Separately, card-on-file direct entry"))
+    assert "explicitly approved the merchant or wallet, selected card, and exact card-on-file add/update action in this session's conversation" in approval
+    assert destination in approval
+    assert "Verify the canonical top-level merchant or wallet origin and, when used, its owned embedded processor frame before entry" in text
+    assert "no charge, top-up, fee, plan change, or cadence change" in text
+    assert "same vault-first route and technical fallback signals" in text
+    assert "No standing, default, or fallback-card authorization is implied" in text
+    assert "Card-on-file is not a $0 charge" in text
+
+
+@pytest.mark.parametrize("name", ["browser_type", "browser_exec", "browser_vault"])
+def test_card_on_file_missing_prompt_still_needs_current_action_approval(name):
+    text = _descriptions()[name]
+    assert "For card-on-file approval_unavailable, the same explicit current-session merchant-or-wallet, selected-card, and exact card-on-file-action approval is required" in text
     assert "only when the user explicitly approved this exact charge in this session's conversation" in text
     assert "Approved exact charge means the user explicitly approved the merchant, amount, and selected card" in text
+    assert "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused" in text
+    assert "no_payment_fields, a partial fill, missed fields, or a processor frame" in text
 
 
 def test_link_checkout_keeps_its_approved_one_time_card_source():
