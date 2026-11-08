@@ -73,7 +73,7 @@ def running_turn(monkeypatch):
             {"model": "primary", "runtime": {}}, "telegram", "", 5, {}, {},
         )
         assert selected is agent and not reused
-        ctx.agent_holder[0] = agent
+        ctx.bind_agent_lifetime(agent)
         runner._session_state(key).turn.agent = agent
         started.set()
         assert resume.wait(5), "worker was not resumed"
