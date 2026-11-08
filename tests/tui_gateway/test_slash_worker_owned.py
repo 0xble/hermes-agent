@@ -119,9 +119,9 @@ def test_owner_sigkill_takes_the_worker_group_and_spares_a_live_owners_worker(tm
             owner.communicate(timeout=10)
 
 
-def _group_leader(*shell: str) -> subprocess.Popen:
+def _group_leader(*shell: str, stdin=subprocess.DEVNULL) -> subprocess.Popen:
     """A stand-in worker leading its own group, with a TERM-ignoring child that stays in it."""
-    return subprocess.Popen(["sh", "-c", *shell], stdin=subprocess.DEVNULL,
+    return subprocess.Popen(["sh", "-c", *shell], stdin=stdin,
                             start_new_session=True)  # detached-spawn: ok — test stand-in, killed in finally
 
 
@@ -148,8 +148,11 @@ def test_a_worker_that_already_died_is_never_group_signalled(monkeypatch):
     """A dead leader no longer proves the pgid is ours: leave the group to the supervisor."""
     released, signalled = [], []
     monkeypatch.setattr(process_identity, "release_process_groups", lambda pgids: released.append(list(pgids)))
-    leader = _group_leader("sleep 120 & exit 0")
+    leader = _group_leader("sleep 120 & read ignored", stdin=subprocess.PIPE)
     try:
+        wait_until(lambda: len(_group(leader.pid)) >= 2, what="the child before its leader exits")
+        leader.send_signal(signal.SIGCONT)
+        leader.stdin.close()
         leader.wait(timeout=10)
         survivors = wait_until(lambda: _group(leader.pid), what="the leaderless member")
         real_killpg = os.killpg
