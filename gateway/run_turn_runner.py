@@ -801,50 +801,11 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
             turn_route, platform_key, combined_ephemeral, max_iterations,
             reasoning_config, pr, skip_context_files,
         )
+        self._ctx.bind_agent_lifetime(agent)
         base_overrides = turn_route.get("base_request_overrides")
         if base_overrides is not None:
             agent._gateway_base_request_overrides = dict(base_overrides)
         return agent
-
-    def _resolve_turn_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr):
-        """Reuse this session's cached AIAgent (frozen system prompt + tool schemas → prompt cache
-        hits) or build a fresh one. Returns (agent, reused_cached_agent)."""
-        ctx = self._ctx
-        runner = self._runner
-        skip_context_files = self._skip_context_files(platform_key)
-        sig = runner._agent_config_signature(
-            turn_route["model"], turn_route["runtime"], ctx.enabled_toolsets, combined_ephemeral,
-            cache_keys=runner._extract_cache_busting_config(ctx.user_config),
-            user_id=getattr(ctx.source, "user_id", None),
-            user_id_alt=getattr(ctx.source, "user_id_alt", None),
-            skip_context_files=skip_context_files,
-        )
-        cache_lock = getattr(runner, "_agent_cache_lock", None)
-        cache = getattr(runner, "_agent_cache", None)
-        peek_sid, dead = self._cached_sid_is_dead(cache_lock, cache)
-        msg_count = self._current_message_count()
-        found = self._lookup_cached_agent(sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count)
-        agent = found.agent
-        # Lock released — refresh the reused agent's fallback chain from disk OUTSIDE the cache lock
-        # (disk I/O under the lock stalls the idle-sweep watcher and Discord heartbeats). A chain
-        # configured after caching must reach the next turn; per-session serialization keeps it safe.
-        if found.reused and agent is not None:
-            self._runner._apply_fallback_chain_to_agent(agent, runner._refresh_fallback_model())
-        if found.evicted is not None:
-            self._release_evicted_agent(found.evicted)
-        if agent is None:
-            agent = self._build_fresh_agent(
-                turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr, skip_context_files,
-            )
-            self._ctx.bind_agent_lifetime(agent)
-            if cache_lock and cache is not None:
-                with cache_lock:
-                    # Record the snapshot's session_id with message_count so the cross-process guard
-                    # can skip the meaningless count comparison if the active session_id switches.
-                    cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
-                    runner._enforce_agent_cache_cap()
-            logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
-        return agent, found.reused
 
     # ── per-turn agent wiring ───────────────────────────────────────────────────────────────
 
