@@ -7,6 +7,7 @@ All processes and homes are disposable; the owner is a real Hermes process impor
 import contextlib
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -125,14 +126,17 @@ def test_stop_after_a_router_crash_still_stops_its_surviving_model_child(monkeyp
     sup.proc = subprocess.Popen(  # detached-spawn: ok — test router stand-in; its group is killed below
         [sys.executable, "-c",
          "import subprocess, sys; c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']);"
-         f" open({str(receipt)!r}, 'w').write(str(c.pid))"],
-        stdin=subprocess.DEVNULL, start_new_session=True)
+         f" open({str(receipt)!r}, 'w').write(str(c.pid)); sys.stdin.read(1)"],
+        stdin=subprocess.PIPE, start_new_session=True)
     process_identity.own_process_groups([sup.proc.pid])
     pgid = sup.proc.pid
     try:
-        sup.proc.wait(timeout=30)  # the router "crashed"; the model child is still in its group
         model = psutil.Process(int(wait_until(lambda: receipt.exists() and receipt.read_text(encoding="utf-8"),
                                               what="model child receipt")))
+        # Record the live subtree before deliberately orphaning the model.
+        sup.proc.send_signal(signal.SIGCONT)
+        sup.proc.stdin.close()
+        sup.proc.wait(timeout=30)
         assert os.getpgid(model.pid) == pgid
         sup.stop()
         wait_until(lambda: not model.is_running() or model.status() == psutil.STATUS_ZOMBIE, timeout=10,
