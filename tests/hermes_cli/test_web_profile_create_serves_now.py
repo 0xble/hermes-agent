@@ -22,6 +22,7 @@ def client(monkeypatch, _isolate_hermes_home):
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(profiles, "_get_wrapper_dir", lambda: home / "bin")
     monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: home)
     monkeypatch.setattr(profiles, "_get_profiles_root", lambda: home / "profiles")
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
