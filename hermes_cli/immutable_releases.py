@@ -630,17 +630,15 @@ def _build_candidate_web(staging: Path) -> None:
     from pm import prepare_tools
     from pm.build_operations import verified_tools
     from pm.store import current_target
+    from hermes_cli.source_build import build_source_web, prepare_source_dependencies
+
     target = current_target()
-    store = prepare_tools(["node", "npm"], out=staging.parent / ".build-tools", target=target)
-    tools = verified_tools(["node", "npm"], source_store=store, target=target)
-    npm = str(tools.entries["npm"].binary)
+    store = prepare_tools(["node", "pnpm"], out=staging.parent / ".build-tools", target=target)
+    tools = verified_tools(["node", "pnpm"], source_store=store, target=target)
     env = tools.environment(_release_subprocess_env())
-    workspaces = ["--workspace", "web", "--include-workspace-root"]
-    if (staging / "ui-tui" / "package.json").is_file():
-        workspaces[:0] = ["--workspace", "ui-tui"]
-    subprocess.run([npm, "ci", "--no-audit", "--no-fund", *workspaces],
-                   cwd=staging, env=env, check=True)
-    subprocess.run([npm, "run", "build", "--workspace", "web"], cwd=staging, env=env, check=True)
+    workspaces = ("ui-tui", "web") if (staging / "ui-tui" / "package.json").is_file() else ("web",)
+    prepare_source_dependencies(staging, workspaces, env=env, explicit=True)
+    build_source_web(staging, env=env)
     if not (staging / "hermes_cli" / "web_dist" / "index.html").is_file():
         raise RuntimeError("candidate web build did not produce hermes_cli/web_dist/index.html")
 

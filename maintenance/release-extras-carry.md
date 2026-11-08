@@ -76,3 +76,7 @@ the active install, or when immutable releases are retired. Rollback reverts
 `prepare_venv` union and the early return, together with the tests. No state
 migration is involved. A PM generation the carry committed stays a normal PM
 generation.
+
+Candidate web assets use the archived revision's shared source-build composition: PM prepares a build-owned Node/pnpm closure, `prepare_source_dependencies` installs the explicit locked workspace union, and `build_source_web` renders that revision with its committed default-brand icons. Do not restore npm workspace commands after the upstream pnpm migration. The staged web regression permits only its required PM tool downloads and keeps package caches under its temporary home.
+
+Contract tests: `tests/hermes_cli/test_immutable_candidate_web_real.py::test_real_candidate_web_build_from_staged_revision`
