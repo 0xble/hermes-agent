@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from cron import jobs
+from cron import executions, jobs
 from tests.fakes.cron_owner import admit_fire, cron_owner
 from tools.cronjob_tools import _try_dispatch_background_run
 from tools.process_registry_notifications import format_process_notification
@@ -54,6 +54,7 @@ async def test_notice_carries_the_run_sessions_model_and_api_calls(owner):
 
     def run_one_job(claimed, **kw):
         claimed["execution_id"] = fire  # what the real run_one_job stamps on the claimed snapshot
+        executions.finish_execution(claimed["execution_id"], success=True)
         jobs.mark_job_run(claimed["id"], True)
         return True
 
@@ -68,6 +69,7 @@ def test_notice_omits_fields_no_run_session_recorded(owner):
     job = jobs.create_job(prompt="report", schedule="every 1h", deliver="local")
 
     def run_one_job(claimed, **kw):  # no execution id, no run session (e.g. a refused fire)
+        executions.finish_execution(claimed["execution_id"], success=True)
         jobs.mark_job_run(claimed["id"], True)
         return True
 
@@ -83,6 +85,7 @@ def test_refused_fire_of_a_pinned_job_prints_no_model(owner):
     job = jobs.create_job(prompt="report", schedule="every 1h", deliver="local", model="vendor/pinned-model")
 
     def run_one_job(claimed, **kw):  # refused before any run session existed
+        executions.finish_execution(claimed["execution_id"], success=False, error="refused")
         jobs.mark_job_run(claimed["id"], False, "refused")
         return False
 
