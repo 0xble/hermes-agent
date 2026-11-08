@@ -3065,6 +3065,17 @@ before. A relative `AGENT_BROWSER_PROFILE` was resolved against the working dire
 written as that absolute path (the working directory of the process that migrated the config), with a
 notice, shown the same way, naming the path it pinned so you can check your browser logins are there.
 
+**Remembering logins:** Vault password and verification-code fills tick a safe Remember me or Trust this device checkbox in the same login form or tight container before input events can submit it. The result includes `remembered`. Marketing, consent, privacy, cookie, public/shared-computer, hidden, disabled, and out-of-form options are excluded. A visually hidden native checkbox can still be selected through its visible label.
+
+```yaml
+vault:
+  remember_logins:
+    default: true
+    work: false
+```
+
+`vault.remember_logins.default` is `true` by default. Other keys override it for the matching managed Camofox browser account alias. A bare `vault.remember_logins: false` disables automatic ticking for every account. Each `browser_vault` login fill or code entry also accepts `remember: false` for a task-level override. Neither setting unchecks an already-checked box, so untick it before filling when the task must not remember the login.
+
 ## Timezone
 
 Override the server-local timezone with an IANA timezone string. Affects cron scheduling and the time injected into the system prompt. It does not change log files: every line in `~/.hermes/logs/` is stamped in the machine's local time, which is what `hermes logs --since` compares against.
