@@ -73,4 +73,17 @@ verdict assertions without a trailer. Classify its exact content here without
 rewriting the attached candidate or advancing the trailer floor.
 Fork-Patch-Backfill: 378923d245564f1ac576e95dc7f43c81c33e33f0; cron-inflight-cancellation
 
+The v0.23.0 merge regressed that contract by publishing removal's cancel marker
+after releasing the jobs lock. A remote heartbeat could observe the deletion,
+finish the execution as failed, and leave no live row for the late cancel request.
+Publish the durable marker under the jobs lock, as v0.23.0 does, while keeping
+the fork's process-local hard interrupt outside it. Schedule-loss bookkeeping
+also uses upstream's marker-aware `finish_lost_execution`, so a cancel arriving
+after the initial operator check keeps its specific terminal verdict and cause.
+The remote-removal test forces settlement before the local interrupt tail returns.
+Pause/disable budgeting, self-removal delivery and replacement-owner fences remain
+separate contracts.
+
+Contract tests: `tests/cron/test_inflight_cancellation.py`, `tests/cron/test_cron_cancel_bookkeeping.py`.
+
 The external-worker waiter accepts `cancelled` alongside `completed` and `failed` as a durable terminal verdict. It must not report unknown side effects after the owner has already committed cancellation. `tests/cron/test_cron_cancel_bookkeeping.py::test_the_external_worker_waiter_accepts_a_cancelled_row` exercises the real waiter against that ledger row. Retire this adaptation when the upstream waiter recognizes all scheduler terminal states.

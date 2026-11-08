@@ -2591,12 +2591,13 @@ def remove_job(job_id: str, *, run_result: Optional[dict] = None) -> bool:
         marker = _self_removal_delivery.get()
         if marker is not None and marker.job_id == canonical_id:
             marker.removed = True
+        if not self_removal_delivery_allowed(canonical_id):
+            # Publish the cause before a remote heartbeat can observe the missing schedule.
+            cancel_job_run(canonical_id, reason="job removed while running")
 
     # Interrupt after releasing the jobs lock: cancellation may inspect or update the same store.
     from cron.scheduler_control import interrupt_job_run
     receipt = interrupt_job_run(job)
-    if not self_removal_delivery_allowed(canonical_id):
-        cancel_job_run(canonical_id, reason="job removed while running")
     if run_result is not None:
         run_result.update(receipt)
     if job_output_dir.exists():

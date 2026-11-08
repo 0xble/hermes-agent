@@ -3071,7 +3071,7 @@ def _record_fire_ownership_lost(
     if schedule_cancelled(job_id, fire_owner):
         if fire_owner is not None:
             record_cancelled_run(job_id, fire_owner, _CANCELLED_INTERRUPTED)
-        finish_execution(execution_id, success=False, error=_CANCELLED_INTERRUPTED)
+        finish_lost_execution(execution_id, _CANCELLED_INTERRUPTED)
         return
     if fire_owner is not None and owns_terminal_claim(job_id, fire_owner) and mark_job_run(
         job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
