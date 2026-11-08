@@ -253,7 +253,11 @@ between batches, sends the full accumulated text after each wait, and drains imm
 turn end. Overflow, reset markers and flood-refused batches retain their buffered text.
 Initial tool bubbles, cleanup, daily shedding and final-reply delivery retain their existing rules.
 Initial sends keep the normal adapter floor even after a failed or outbox-deferred send returns
-no message ID. Retryable edits retain their batch with a 0.3s backoff after any flood deadline.
+no message ID. The first event sends immediately, without absorbing pre-queued later events.
+Pressure only widens existing-card edits, so separate grouping keeps the normal adapter floor.
+Retryable edits retain their batch and back off from at least that floor, doubling to a 60s
+cap (or the floor if larger). A successful edit resets the backoff. Flood deadlines still apply.
+Interrupted batches discard queued events, including resets, without rendering or cancellation flushes.
 If the quota read fails, progress cadence falls back to the adapter floor.
 
 The hourly daily-volume INFO line also includes `edit classes`, counted at the existing request
@@ -263,7 +267,9 @@ other writers reported as `unobserved`. They do not change the persistent ledger
 They distinguish outbound classes, not every producer within a class. The 2026-11-06 retained
 logs had no class attribution: the call ledger could split 6,457 edits into 4,707 untagged,
 1,498 goal-triggered and 252 typed-triggered edits, but could not identify a dominant producer.
-Regression: `tests/gateway/test_telegram_progress_batch.py` plus the existing daily-quota suite.
+Regression: `tests/gateway/test_telegram_progress_batch.py`,
+`tests/gateway/test_supervisor_turn_chrome.py::test_intermediate_supervisor_sends_are_suppressed_without_muting_humans`
+(unchanged: suppress supervisor chrome while preserving human sends and edits), plus the existing daily-quota suite.
 
 | Path | Private worst case | Group worst case |
 | --- | --- | --- |
