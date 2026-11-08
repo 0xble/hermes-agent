@@ -132,11 +132,25 @@ def _claim_post_delivery(authority, admission_id, event, waiter):
     waiter.add_done_callback(abandoned)
 
 
+_BOOKKEEPING_JOIN_TIMEOUT_SECONDS = 30.0
+
+
 async def join_turn_bookkeeping(event):
-    """Keep legacy task settlement behind bookkeeping, outside cosmetic timeouts."""
+    """A lost delivery signal must not keep the adapter's session guard forever."""
     task = getattr(event, '_post_turn_bookkeeping_task', None)
     if task is not None:
-        await asyncio.shield(task)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), _BOOKKEEPING_JOIN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning('Post-turn bookkeeping join timed out, finishing inline for message %s', event.message_id)
+            await event._post_turn_bookkeeping_fallback()
+
+
+def post_delivery_owners(post_delivery):
+    """Keep the bubble and bookkeeping owners when their delivery routes differ."""
+    if post_delivery is None:
+        return []
+    return list(post_delivery) if isinstance(post_delivery, list) else [post_delivery]
 
 
 async def fire_turn_post_delivery(event):
@@ -146,10 +160,10 @@ async def fire_turn_post_delivery(event):
     if post_delivery is None:
         return False
     event._turn_post_delivery = None
-    owner, session_key, generation = post_delivery
-    fire = getattr(owner, '_fire_post_delivery_callback', None)
-    if fire is not None:
-        await fire(session_key, generation)
+    for owner, session_key, generation in post_delivery_owners(post_delivery):
+        fire = getattr(owner, '_fire_post_delivery_callback', None)
+        if fire is not None:
+            await fire(session_key, generation)
     return True
 
 
@@ -536,20 +550,20 @@ _post_delivery_tasks = set()
 
 def _claim(post_delivery):
     """The turn's reply is still to be sent: keep a newer generation's sweep off its cleanup."""
-    owner, session_key, generation = post_delivery
-    claim = getattr(owner, 'claim_post_delivery', None)
-    if claim is not None:
-        claim(session_key, generation)
+    for owner, session_key, generation in post_delivery_owners(post_delivery):
+        claim = getattr(owner, 'claim_post_delivery', None)
+        if claim is not None:
+            claim(session_key, generation)
 
 
 def _fire_post_delivery(post_delivery):
     """Detached: bubble deletes can wait out a chat's flood limit, and the FIFO must not."""
-    owner, session_key, generation = post_delivery
-    fire = getattr(owner, '_fire_post_delivery_callback', None)
-    if fire is not None:
-        task = asyncio.create_task(fire(session_key, generation))
-        _post_delivery_tasks.add(task)
-        task.add_done_callback(_post_delivery_tasks.discard)
+    for owner, session_key, generation in post_delivery_owners(post_delivery):
+        fire = getattr(owner, '_fire_post_delivery_callback', None)
+        if fire is not None:
+            task = asyncio.create_task(fire(session_key, generation))
+            _post_delivery_tasks.add(task)
+            task.add_done_callback(_post_delivery_tasks.discard)
 
 
 async def deliver_settled(authority, admission_id):
