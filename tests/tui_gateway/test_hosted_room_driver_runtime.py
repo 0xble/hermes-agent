@@ -416,6 +416,8 @@ def _runtime(
         rooms=[BINDING],
         rpc=rpc,
         turn_lock=locks or RecordingTurnLocks(),
+        # Scheduling latency is not lease expiry. Expiry/recovery tests advance an explicit clock.
+        clock=kwargs.pop("clock", lambda: 100.0),
         lease_ttl_seconds=kwargs.pop("lease_ttl_seconds", 0.4),
         poll_interval_seconds=kwargs.pop("poll_interval_seconds", 0.01),
         **kwargs,
@@ -442,10 +444,6 @@ def test_runtime_uses_unique_process_generation(db: Path):
 def test_room_concurrency_bound_must_be_a_positive_integer(db: Path, value):
     with pytest.raises(ValueError, match="max_concurrent_rooms"):
         _runtime(db, FakeSessionRPC(), max_concurrent_rooms=value)
-
-
-
-
 
 
 def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path):
@@ -671,7 +669,7 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
     )
 
     runtime.start()
-    assert waiting.submitted.wait(1.0)
+    assert waiting.submitted.wait(10.0)
     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
     assert state.get_task(db, identities[0])["status"] == "running"
     assert runtime.stop(timeout=5.0)
@@ -1092,7 +1090,7 @@ def test_retry_ignores_late_receipt_from_prior_execution_generation(db: Path):
     runtime = _runtime(db, rpc, clock=clock)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(10.0)
     time.sleep(0.04)
     assert runtime.stop(timeout=5.0)
 
@@ -1463,7 +1461,7 @@ def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path)
     runtime = _runtime(db, rpc)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(10.0)
     _wait_for(
         lambda: (
             "observation failed after submit"
@@ -1494,7 +1492,7 @@ def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
     )
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(10.0)
     cancelled = runtime.cancel(identity, cancel_id="cancel-user")
     rpc.complete(identity.task_id, content="Too late.")
     runtime.wakeup()
@@ -1519,12 +1517,12 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
         attempts += 1
         if attempts == 1:
             raise RuntimeError("temporary stop transport failure")
-        assert retry_allowed.wait(1.0)
+        assert retry_allowed.wait(10.0)
         return original_interrupt(**kwargs)
 
     rpc.interrupt = flaky_interrupt
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(10.0)
     stopping = runtime.cancel(identity, cancel_id="cancel-retry")
     assert stopping["status"] == "stopping"
     assert state.get_task(db, identity)["status"] == "stopping"
@@ -1670,7 +1668,7 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
     runtime = _runtime(db, rpc)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(10.0)
 
     def finish_only_after_stop_intent():
         if state.get_task(db, identity)["status"] == "stopping":
@@ -1863,7 +1861,7 @@ def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
     )
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(10.0)
     session_id = next(iter(rpc.states))
     with rpc._lock:
         rpc.states[session_id]["pending_approval"] = {
@@ -1888,7 +1886,7 @@ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
     runtime = _runtime(db, rpc)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(10.0)
     session_id = next(iter(rpc.states))
 
     def switch_to_newer_task() -> None:
@@ -1951,7 +1949,7 @@ def test_authority_loss_stops_terminal_commit(db: Path):
     runtime = _runtime(db, rpc, lease_ttl_seconds=30.0)
 
     runtime.start()
-    assert rpc.submitted.wait(1.0)
+    assert rpc.submitted.wait(10.0)
     hosted_rooms.claim_authority(
         db,
         room_id=ROOM_ID,
