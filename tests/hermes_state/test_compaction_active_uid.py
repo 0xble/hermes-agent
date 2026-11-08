@@ -72,7 +72,7 @@ def _assert_unique(db, sid, expected):
 @pytest.mark.parametrize("mode", ["watermark", "coverage", "rotation"])
 def test_carried_handoff_overlaps_concurrent_tail(db, mode):
     """A late adoption carries a row appended after its start watermark."""
-    db.append_message("parent", role="user", content="summarized")
+    db.append_message("parent", role="assistant", content="summarized")
     watermark = db.get_active_message_watermark("parent")
     covered = [watermark]
     if mode != "rotation":
@@ -84,8 +84,11 @@ def test_carried_handoff_overlaps_concurrent_tail(db, mode):
     db.append_messages_batch("parent", tail)
     before = db.get_messages("parent", include_inactive=True)
     # A protected tail included in the handoff ALSO qualifies as concurrent tail.
-    handoff = _summary() + deepcopy(tail)
-    handoff[-2]["content"] = handoff[-2]["api_content"] = "[pruned]"
+    from agent.context_compressor import _rewritten
+    # The real compressor receives the live replay's stored-version digest and
+    # drops stale API sidecars when it rewrites a tool result.
+    handoff = _summary() + db.get_messages_as_conversation("parent", repair_alternation=True)[-len(tail):]
+    handoff[-2] = _rewritten(handoff[-2], "[pruned]")
     sid = _commit(db, mode, handoff, watermark, covered, tail_count=len(tail))
     _assert_unique(db, sid, [m["content"] for m in handoff])
     # Existing payloads, sidecars and ids remain recoverable, not rewritten/deleted.

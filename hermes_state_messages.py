@@ -26,12 +26,12 @@ from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_too
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_identity import (
-    _absorbed_uids_json, _carried_tail_slots, _compaction_messages, _newest_message_uid_rows, _restore_identity_columns,
+    _absorbed_uids_json, _compaction_messages, _newest_message_uid_rows, _restore_identity_columns,
     _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json, _uid_list, display_identity)
 from hermes_state_transactions import execute_transcript_write
 
 from hermes_state_write_metrics import add_write_rows, timed_write_phase, write_phase
-from hermes_state_message_archive import archive_message_rows, archive_named_rows, clone_tail_survivors
+from hermes_state_message_archive import archive_message_rows, archive_named_rows, clone_tail_survivors, prepare_carried_tail
 from hermes_state_display_fold import DisplayFoldMixin, _FoldPlan
 from hermes_state_search_runtime import search_stage
 from hermes_state_deletion import visible_session_sql
@@ -777,13 +777,14 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
             tail_ids, _ = ([], 0) if watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(watermark)))
+            carried, weak = prepare_carried_tail(self, conn, tail_ids, compacted_messages)
             # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
                 conn, session_id, carried_messages or [])
             # A carried tail slot whose original is a concurrent (above-watermark) row is not a
             # positional rewind below the watermark.
-            tail_below = tail_count - _carried_tail_slots(conn, tail_ids, compacted_messages, tail_count)
+            tail_below = tail_count - self._carried_tail_slots(carried, len(compacted_messages), tail_count)
             if tail_below > 0:
                 bound = watermark is not None
                 rewind_ids += [int(row["id"]) for row in conn.execute(
@@ -791,7 +792,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
                     "ORDER BY id DESC LIMIT ?",
                     (session_id, *((int(watermark),) if bound else ()),
                      int(tail_below) + self._uncounted_merged_rows(compacted_messages[-int(tail_count):]))).fetchall()]
-            rewind_ids += tail_ids
+            rewind_ids += [row_id for row_id in tail_ids if row_id not in weak]
             rewind_ids = list(dict.fromkeys(rewind_ids))
         self._seed_display_removals(conn, session_id, affected_fold, rewind_ids)
         archive_message_rows(conn, session_id, rewind_ids, exclude_rewound=True)

@@ -208,6 +208,11 @@ class SessionCoverageMixin:
             return True
         if not self._copy_of_current_row(row, held):
             return False
+        # A deterministic tool-result prune may replace every content byte. The
+        # current row digest proves the input version, and _replays_as above
+        # rejects a stale sidecar while allowing the compressor to drop it.
+        if role == "tool":
+            return True
         stored_text = _text_of(stored)
         return bool(stored_text.strip()) and _holds_as_block(stored_text, _text_of(content))
 

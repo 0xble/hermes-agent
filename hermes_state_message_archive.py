@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from hermes_state_common import _placeholders
-from hermes_state_identity import _carried_tail_slots, _compaction_messages, _unrepresented_tail_rows
+from hermes_state_identity import _compaction_messages, _unrepresented_tail_rows
 from hermes_state_write_metrics import add_write_rows, write_phase
 
 if TYPE_CHECKING:
@@ -13,6 +13,33 @@ if TYPE_CHECKING:
 
 
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
+
+
+def prepare_carried_tail(db, conn, tail_ids: list[int], messages: list[dict[str, Any]]):
+    """Keep UID deduplication from mistaking a stale version for the current tail.
+
+    A rewritten fragment that cannot prove the current stored version is a separate
+    compaction occurrence. Its old UID cannot suppress the concurrent current row.
+    Proven carries retain their UID and consume the existing row exactly once.
+    """
+    from agent.message_metadata import DB_ROW_SNAPSHOT, MESSAGE_UID, stamp_message_uid
+
+    carried, weak = db._carried_tail_ids(conn, tail_ids, messages)
+    unclaimed = [row_id for row_id in tail_ids if row_id not in carried]
+    rows = conn.execute(
+        f"SELECT id, message_uid FROM messages WHERE id IN ({_placeholders(unclaimed)})", unclaimed,
+    ).fetchall() if unclaimed else []
+    uids = {row[1] for row in rows if row[1]}
+    claimed_slots = set(carried.values())
+    claimed_uids = {messages[index].get(MESSAGE_UID) for index in claimed_slots}
+    # A superseded physical version is display history, never a second active occurrence.
+    weak.update(row[0] for row in rows if row[1] in claimed_uids)
+    for index, message in enumerate(messages):
+        if index not in claimed_slots and message.get(MESSAGE_UID) in uids:
+            for key in (MESSAGE_UID, "_row_id", DB_ROW_SNAPSHOT):
+                message.pop(key, None)
+            stamp_message_uid(message)
+    return carried, weak
 
 
 def archive_message_rows(conn, session_id: str, rewind_ids: list[int], *, exclude_rewound: bool = False) -> None:
@@ -64,13 +91,14 @@ def archive_named_rows(
         carried_ids = db._resolve_carried_row_ids(conn, session_id, carried_messages or [])
         covered_set.update(carried_ids)
         unseen = [row_id for row_id in active_ids if row_id not in covered_set]
+        carried, weak = prepare_carried_tail(db, conn, unseen, compacted_messages)
         covered_active = [row_id for row_id in active_ids if row_id in covered_set]
         rewind_ids = list(carried_ids)
         # Tail slots carried from unseen (concurrent) rows never consume a positional rewind below them.
-        tail_below = tail_count - _carried_tail_slots(conn, unseen, compacted_messages, tail_count)
+        tail_below = tail_count - db._carried_tail_slots(carried, len(compacted_messages), tail_count)
         if tail_below > 0:
             rewind_ids += db._tail_originals(covered_active, tail_below, merged_away)
-        rewind_ids += unseen
+        rewind_ids += [row_id for row_id in unseen if row_id not in weak]
         rewind_ids = list(dict.fromkeys(rewind_ids))
     db._seed_display_removals(conn, session_id, fold_plan, rewind_ids)
     archive_message_rows(conn, session_id, rewind_ids)
