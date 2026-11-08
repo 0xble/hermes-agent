@@ -15,13 +15,18 @@ def _git(source: Path, *args: str) -> str:
 
 
 @pytest.mark.platforms("macos")
-def test_real_candidate_web_build_from_staged_revision(tmp_path):
+@pytest.mark.allow_network
+def test_real_candidate_web_build_from_staged_revision(tmp_path, monkeypatch):
     """The production candidate web build must emit the staged revision's bundle.
 
     The staged commit carries a marker the source working tree lacks, and the
     working tree carries a different marker the commit lacks. Only a build of
     the archived revision contains exactly the staged marker.
     """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("npm_config_cache", str(tmp_path / "npm-cache"))
+    monkeypatch.setenv("pnpm_config_store_dir", str(tmp_path / "pnpm-store"))
     repo = Path(__file__).resolve().parents[2]
     source = tmp_path / "source"
     subprocess.run(["git", "clone", "--quiet", "--shared", str(repo), str(source)], check=True)
@@ -38,7 +43,7 @@ def test_real_candidate_web_build_from_staged_revision(tmp_path):
     index.write_text(with_marker(staged_marker), encoding="utf-8")
     _git(source, "add", "web/index.html")
     _git(source, "-c", "user.name=Web", "-c", "user.email=web@example.test",
-         "-c", "core.hooksPath=/dev/null", "commit", "-qm", "test: staged web marker")
+         "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-qm", "test: staged web marker")
     sha = _git(source, "rev-parse", "HEAD")
     # Diverge the checkout from the revision being staged.
     index.write_text(with_marker(source_marker), encoding="utf-8")
