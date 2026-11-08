@@ -1,6 +1,6 @@
 # Cron in-flight cancellation
 
-**Patch identity:** `cron-inflight-cancellation`.
+**Patch identities:** `cron-inflight-cancellation`, `cron-cancel-bookkeeping`.
 
 Removing or pausing a schedule used to leave its in-process agent alive until the
 fire-claim heartbeat noticed the change. The caller could see scheduled/never-run
@@ -60,3 +60,5 @@ Upstream candidates: NousResearch/hermes-agent issue #133057 and PR #133169
 (`hermes cron cancel`); inspect their semantics before adoption. Retire this patch
 only when upstream also covers remove/pause, tool receipts, and running visibility
 with the same regressions green. Source landing is not live gateway deployment.
+
+The external-worker waiter accepts `cancelled` alongside `completed` and `failed` as a durable terminal verdict. It must not report unknown side effects after the owner has already committed cancellation. `tests/cron/test_cron_cancel_bookkeeping.py::test_the_external_worker_waiter_accepts_a_cancelled_row` exercises the real waiter against that ledger row. Retire this adaptation when the upstream waiter recognizes all scheduler terminal states.
