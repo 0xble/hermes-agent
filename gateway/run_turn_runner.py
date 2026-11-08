@@ -274,6 +274,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         reanchored: bool = False
         # Buffer until the monotonic flood deadline, without editing, splitting or sending.
         defer_until: float = 0.0
+        retry_wait: float = 0.0
         # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
         tool_progress_sent: bool = False
         skipped_edits: int = 0
@@ -344,24 +345,6 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
     def _is_flood_refusal(result) -> bool:
         error = (getattr(result, "error", "") or "").lower()
         return getattr(result, "retry_after", None) is not None or any(w in error for w in ("flood", "retry after"))
-
-    @classmethod
-    def _edit_failure_is_deferrable(cls, st, result) -> bool:
-        """Transient and rate-limit edit failures leave the bubble editable for a later tick.
-
-        A flood refusal says "not now", not "never": disabling edits on it turns every later tool
-        line into its own message for the rest of the turn, and sending one now spends the budget
-        the platform just said is exhausted.
-        """
-        if cls._is_flood_refusal(result):
-            wait = max(float(getattr(result, "retry_after", None) or 0.0), cls._progress_edit_interval(st.adapter))
-            st.defer_until = time.monotonic() + wait
-            logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
-            return True
-        if getattr(result, "retryable", False):
-            logger.debug("[%s] Transient progress edit failure, retrying next tick", st.adapter.name)
-            return True
-        return False
 
     @staticmethod
     def _progress_deferred(st) -> bool:

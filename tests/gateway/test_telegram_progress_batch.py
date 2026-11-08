@@ -145,7 +145,7 @@ async def test_an_isolated_update_is_sent_when_the_batch_expires(tmp_path, monke
 async def test_flood_batch_retries_transient_failures_with_backoff(tmp_path, monkeypatch):
     runner, adapter = _runner(tmp_path, 0)
     runner._progress_emit("first")
-    day = ToolDay(runner, 45, [(1, "second"), (15, "third")])
+    day = ToolDay(runner, 105, [(1, "second"), (15, "third")])
     _patch_day(monkeypatch, day)
     attempts = []
 
@@ -164,7 +164,7 @@ async def test_flood_batch_retries_transient_failures_with_backoff(tmp_path, mon
     times = [at for at, _ in attempts]
     assert len(attempts) == 5  # The isolated batch retries through recovery, without new events.
     assert times[1] >= times[0] + 12
-    assert all(b - a >= 0.29 for a, b in zip(times[1:], times[2:]))
+    assert [b - a for a, b in zip(times[1:], times[2:])] == [10, 20, 40]
     assert all(text == "first\nsecond\nthird" for _, text in attempts[1:])
     assert adapter._bot.send_message.await_count == 1
 
@@ -295,3 +295,82 @@ def test_hourly_summary_attributes_edits_without_debug_or_counting_them_twice(tm
     assert '"unobserved":1' in summary
     assert '"editMessageText":3' in summary
     assert "4 calls" in summary
+
+
+@pytest.mark.asyncio
+async def test_transient_edit_attempts_back_off_to_a_cap_and_reset_on_recovery(tmp_path, monkeypatch):
+    runner, adapter = _runner(tmp_path, 0)
+    runner._progress_emit("first")
+    day = ToolDay(runner, 245, [(1, "second"), (205, "third"), (305, "fourth")])
+    _patch_day(monkeypatch, day)
+    attempts = []
+
+    async def edit(**kwargs):
+        attempts.append((day.t, kwargs["content"]))
+        return SendResult(success=len(attempts) == 6, retryable=True, message_id="1")
+
+    adapter.edit_message = AsyncMock(side_effect=edit)
+    await runner.send_progress_messages()
+    # 10s floor, doubling to a 60s cap. A successful edit resets the next retry to 10s.
+    assert [at for at, _ in attempts] == [110, 120, 140, 180, 240, 300, 310, 320, 340]
+    assert all(text == "first\nsecond" for _, text in attempts[:4])
+    assert all(text == "first\nsecond\nthird" for _, text in attempts[4:6])
+    assert all(text == "first\nsecond\nthird\nfourth" for _, text in attempts[6:])
+    adapter._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queued", [["after stop"], [("__reset__",), "after stop"]])
+async def test_interrupted_batch_drops_queued_lines_and_reset_markers(tmp_path, queued):
+    runner, adapter = _runner(tmp_path, 0)
+    st = runner._progress_edit_state(adapter)
+    runner._progress_absorb(st, "first")
+    await runner._progress_send_or_edit(st, "first")
+    runner._progress_absorb(st, "pending")
+    runner._ctx.agent_holder[0] = SimpleNamespace(is_interrupted=True)
+    for raw in queued:
+        runner._ctx.progress_queue.put(raw)
+    await runner._collect_progress_batch(st)
+    assert runner._ctx.progress_queue.empty()
+    assert st.progress_lines == ["first", "pending"]
+    adapter._bot.send_message.assert_awaited_once()
+    adapter._bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_batch_wait_does_not_render_or_flush_on_cancel(tmp_path, monkeypatch):
+    runner, adapter = _runner(tmp_path, 0)
+    agent = SimpleNamespace(is_interrupted=False)
+    runner._ctx.agent_holder[0] = agent
+    runner._progress_emit("first")
+    day = ToolDay(runner, 15, [(1, "second"), (2, "third")])
+
+    async def stop_during_wait(delay):
+        await day.sleep(delay)
+        if day.t >= 110:
+            agent.is_interrupted = True
+
+    _patch_day(monkeypatch, day, stop_during_wait)
+    await runner.send_progress_messages()
+    assert runner._ctx.progress_queue.empty()
+    adapter._bot.send_message.assert_awaited_once()
+    adapter._bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_separate_grouping_keeps_the_normal_floor_under_pressure(tmp_path, monkeypatch):
+    runner, adapter = _runner(tmp_path, 8000)
+    runner._ctx.progress_grouping = "separate"
+    runner._progress_emit("first")
+    day = ToolDay(runner, 35, [(1, "second"), (2, "third"), (3, "fourth")])
+    _patch_day(monkeypatch, day)
+    attempts = []
+
+    async def send(**kwargs):
+        attempts.append((day.t, kwargs["content"]))
+        return SendResult(success=True, message_id=str(len(attempts)))
+
+    adapter.send = AsyncMock(side_effect=send)
+    await runner.send_progress_messages()
+    assert attempts == [(100, "first"), (110, "second"), (120, "third"), (130, "fourth")]
+    adapter._bot.edit_message_text.assert_not_awaited()
