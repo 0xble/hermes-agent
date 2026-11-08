@@ -52,6 +52,18 @@ fork workflow reconciliation, not an upstream defect or an upstream contribution
 Retire this adaptation only when the fork deliberately adopts the upstream
 orchestrator and requalifies its complete workflow graph.
 
+## Orphan upstream workflow tests
+
+Upstream v0.23.0 added `tests/ci/test_install_e2e_macos_arch.py`, which reads
+`install-e2e-macos-run.yml`, and `tests/ci/test_js_tests_vitest_history.py`,
+which reads `js-tests.yml`. Both workflows are children of the upstream `ci.yaml`
+orchestrator that this fork retired in d77a654d8605. The fork never ships either
+file. Its `gate.yml` caches only pinned Linux tool archives, not `node_modules`,
+and its portable qualification never runs the signed macOS install-e2e arm. So
+neither test's subject exists here. Retire both tests with the workflows they read,
+as for `test_combined_check_jobs.py` above. Do not import the workflows to satisfy
+them. Retire this adaptation when the fork adopts the upstream orchestrator.
+
 ## Bounded channel metadata smoke
 
 The complete-request smoke test keeps its 15-second deadline and real CLI
