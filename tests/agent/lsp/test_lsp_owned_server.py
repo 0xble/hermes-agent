@@ -168,7 +168,7 @@ def test_a_live_owner_keeps_its_server_tree(tmp_path):
     """Control: while the owner lives, the supervisor touches nothing."""
     owner, leader, child = _owner(tmp_path, "slow_tree")
     try:
-        supervisor = [p for p in psutil.Process(owner.pid).children() if "process_supervisor.sh" in " ".join(p.cmdline())]
+        supervisor = [p for p in psutil.Process(owner.pid).children() if p.status() != psutil.STATUS_ZOMBIE and "process_supervisor.sh" in " ".join(p.cmdline())]
         assert supervisor, "the owner should have started its owner-death supervisor"
         # Give a wrongly-firing supervisor its full TERM -> 3 s -> KILL window to act.
         with pytest.raises(AssertionError):
