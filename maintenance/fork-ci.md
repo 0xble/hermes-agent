@@ -897,3 +897,17 @@ profile home, invalid update zones use the shared timezone validator's copy,
 and models.dev's bounded fetch runs on a deadline worker. The offline startup
 contract observes blocked DNS directly, independent of the worker's name.
 Preserve real ownership, model pin, invalid-write and schema-readiness assertions.
+
+The slot-isolation bootstrap fixture must replace only `gateway.run.threading`,
+not the process-wide `threading.Thread`. Its inert watcher stand-in otherwise
+also replaces asyncio's executor workers: `pin_launch_store` is queued but never
+executed, leaving startup awaiting an unresolved future. The attempt-9 log tests
+`9eecd39d`, before the prepared repair `41723c35`. Replaying that revision's
+fixture hangs at `test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active`.
+Faulthandler and py-spy show only the idle owner loop and runtime-status writer,
+with no executor worker. All 24 cases complete with the prepared fixture repair.
+This evidence establishes the original fixture regression, not a new hang above
+`6c770e1a`. Retire the stand-in when upstream isolates its watcher creation seam.
+
+
+Contract tests: `tests/gateway/test_gateway_slot_isolation.py`.
