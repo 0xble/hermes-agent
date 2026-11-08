@@ -50,15 +50,11 @@ def test_finite_cli_runs_report_their_own_entrypoint(direct_runtime, tmp_path, m
     ]
 
 
-def test_oneshot_hard_exit_cleanup_records_the_session_summary(direct_runtime, tmp_path, monkeypatch):
-    """`hermes -z` leaves through os._exit, past the atexit hook that closes the metrics session; its
-    pre-exit cleanup must write the run's session.count itself."""
-    from hermes_cli import main as hermes_main
-
+def test_oneshot_metrics_shutdown_records_the_session_summary(direct_runtime, tmp_path, monkeypatch):
+    """Finite CLI metrics retain their summary when the process exporter closes."""
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
-    monkeypatch.setattr(hermes_main, "_oneshot_cleanup_done", False)
     _cli_turn("z-run")
-    hermes_main._cleanup_oneshot_runtime()
+    relay_shared_metrics.shutdown_runtimes()
     _join_export_workers()
 
     sessions = _stored_values(tmp_path, "hermes.session.count")

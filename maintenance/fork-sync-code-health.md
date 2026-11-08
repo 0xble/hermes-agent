@@ -28,7 +28,7 @@ Profile skill-cache and finite-CLI metrics tests move unchanged into topical fil
 Contract tests: `tests/hermes_cli/test_profiles.py::TestCreateProfile::test_clone_config_never_follows_symlinks_out_of_the_provider_dir`
   `tests/hermes_cli/test_profiles_skill_counts.py::test_count_skills_publishes_timestamp_after_the_walk`
   `tests/hermes_cli/test_relay_shared_metrics_runtime_cli.py::test_finite_cli_runs_report_their_own_entrypoint`
-  `tests/hermes_cli/test_relay_shared_metrics_runtime_cli.py::test_oneshot_hard_exit_cleanup_records_the_session_summary`
+  `tests/hermes_cli/test_relay_shared_metrics_runtime_cli.py::test_oneshot_metrics_shutdown_records_the_session_summary`
   `tests/gateway/test_runner_startup_failures.py`
   `tests/gateway/test_pending_steer_drain.py`
   `tests/gateway/test_background_process_notifications.py`
@@ -40,3 +40,5 @@ Contract tests: `tests/hermes_cli/test_profiles.py::TestCreateProfile::test_clon
 Retire when a later frozen upstream baseline includes equivalent decomposition.
 Rollback the commits carrying this identity together; reverting only a sibling
 would break imports. No ratchet configuration or exemptions belong to this unit.
+
+Upstream v0.23.0 removed the unused in-process one-shot runner and its cleanup table. The finite-CLI metrics regression now invokes the retained metrics runtime shutdown owner directly. It still proves the session summary is exported once at shutdown, without restoring a runner that bypasses the gateway.
