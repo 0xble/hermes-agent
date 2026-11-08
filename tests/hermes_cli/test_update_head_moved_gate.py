@@ -76,14 +76,14 @@ def _make_head_pinned_side_effect(sha=PRE_SHA, target_sha=POST_SHA):
 
     return side_effect
 
-def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
+def _patch_update_deps(monkeypatch, tmp_path, run_side_effect, intercept_update_git):
     """Patch the hermes_cli.main helpers ``_cmd_update_impl`` touches.
 
     ``_m()`` in update_cmd.py lazily returns hermes_cli.main, so patching
     attributes on that module is the canonical test surface (matches
     tests/hermes_cli/test_cmd_update.py).
     """
-    monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
+    intercept_update_git(lambda command, real_run, *args, **kwargs: run_side_effect(command, *args, **kwargs))
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate
@@ -123,10 +123,10 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     return handoff
 
 
-def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
+def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys, intercept_update_git):
     """When the pull advances HEAD, the update proceeds normally."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
-    handoff = _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    handoff = _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect(), intercept_update_git)
 
     hermes_main.cmd_update(args)  # completes normally (no SystemExit)
 
@@ -138,11 +138,11 @@ def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     assert request["expected_sha"] == POST_SHA
 
 
-def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
+def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys, intercept_update_git):
     """A detached/pinned HEAD that never moves must fail loudly, not print
     '✓ Code updated!' against the stale tree."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
-    handoff = _patch_update_deps(monkeypatch, tmp_path, _make_head_pinned_side_effect())
+    handoff = _patch_update_deps(monkeypatch, tmp_path, _make_head_pinned_side_effect(), intercept_update_git)
 
     with pytest.raises(SystemExit) as exc_info:
         hermes_main.cmd_update(args)
