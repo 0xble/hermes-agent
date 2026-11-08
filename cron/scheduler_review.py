@@ -203,7 +203,7 @@ def _bounded_review_rerun(job: dict, remaining: float) -> tuple:
             text=True,
             env=env,
             cwd=str(Path(__file__).resolve().parents[1]),
-            start_new_session=True,
+            start_new_session=True,  # detached-spawn: ok — rerun owner terminates and drains the whole script tree
             creationflags=windows_hide_flags(),
         )
         _rerun_children.add(process)

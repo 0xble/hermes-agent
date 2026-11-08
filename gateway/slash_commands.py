@@ -191,10 +191,10 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     # detached-spawn: ok — /update runs `hermes update`, which must outlive the gateway it restarts
     if scoped_env is not None:
         subprocess.Popen(scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True, env=scoped_env)
+                         start_new_session=True, env=scoped_env)  # detached-spawn: ok — updater outlives the gateway it restarts
     else:
         subprocess.Popen(scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+                         start_new_session=True)  # detached-spawn: ok — updater outlives the gateway it restarts
 
 
 def _home_thread_from_source(source) -> Optional[str]:

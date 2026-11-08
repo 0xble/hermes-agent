@@ -48,6 +48,7 @@ def _git(args, cwd, timeout: float = 10, *, tree_timeout: bool = False, **kwargs
         # run(timeout=) kills/reaps only git worktree add, leaving its checkout
         # child holding index.lock. Keep the parent alive until the whole group
         # is killed, then reap it before failed-add ownership checks run.
+        # detached-spawn: ok — finite Git checkout group is killed and reaped on timeout
         group_kw = ({"start_new_session": True} if os.name == "posix" else
                     {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP})
         check = kwargs.pop("check", False)
