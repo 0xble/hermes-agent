@@ -35,7 +35,7 @@ def test_launcher_waiting_on_a_reclaimed_state_lock_excludes_later_launchers(tmp
 
     def observed_open(path, *args, **kwargs):
         fd = real_open(path, *args, **kwargs)
-        if threading.current_thread().name == "launcher-a" and os.fspath(path).endswith(".install.lock"):
+        if threading.current_thread().name == "launcher-a" and Path(path) == pm.environments.install_state_lock_path(state):
             opened.set()
         return fd
 
@@ -87,7 +87,7 @@ def test_lock_file_removal_never_lands_after_a_waiting_launcher_got_the_lock(tmp
 
     def observed_open(path, *args, **kwargs):
         fd = real_open(path, *args, **kwargs)
-        if threading.current_thread().name == "launcher-a" and os.fspath(path).endswith(".install.lock"):
+        if threading.current_thread().name == "launcher-a" and Path(path) == pm.environments.install_state_lock_path(state):
             opened.set()
         return fd
 
@@ -138,7 +138,7 @@ def test_unopenable_lock_path_fails_instead_of_retrying(tmp_path, monkeypatch):
     installs = tmp_path / "installs"
     checkout = tmp_path / "clone"
     monkeypatch.setattr(pm.environments, "installs_root", lambda: installs)
-    lock = installs / install_key(checkout) / ".install.lock"
+    lock = pm.environments.install_state_lock_path(installs / install_key(checkout))
     lock.parent.mkdir(parents=True)
     lock.symlink_to(tmp_path / "gone" / "target")
     outcome: list[BaseException] = []
