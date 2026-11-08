@@ -105,7 +105,7 @@ def _terminal_execution_result(
     wait_for_process_exit: bool,
 ) -> bool:
     current = scheduler.get_execution(execution_id)
-    if not current or current.get("status") not in ("completed", "failed"):
+    if not current or current.get("status") not in ("completed", "failed", "cancelled"):
         return False
     if returncode is not None and returncode < 0 and wait_for_process_exit:
         raise ExternalWorkerExitTimeout(
