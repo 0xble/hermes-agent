@@ -33,7 +33,9 @@ budget on durable progress, and explicit install locks intentionally wait
 patiently. The worker explicitly suspends the active-time clock while acquiring
 its toolchain, downloading/unpacking/staging artifacts, preparing native build
 tools or waiting for a patient lock. It resumes the remaining budget afterwards,
-including nested acquisition. Tool-only requests use the same suspension contract.
+including nested acquisition. A stdlib ContextVar hook keeps generic install-state
+locking independent of worker modules, so minimal pre-import launchers retain
+their existing import closure. Tool-only requests use the same suspension contract.
 A worker that never sends a complete protocol message still expires. This avoids
 inventing a tool-fetch ceiling that kills valid progressing downloads.
 

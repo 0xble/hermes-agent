@@ -38,10 +38,14 @@ def operation_budget(operation, arguments):
 
 @contextmanager
 def reporting(send):
+    from pm.environments import _patient_lock_wait
+
     token = _reporter.set(send)
+    wait_token = _patient_lock_wait.set(unbounded)
     try:
         yield
     finally:
+        _patient_lock_wait.reset(wait_token)
         _reporter.reset(token)
 
 
