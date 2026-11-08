@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, suppress
 import os
+from pathlib import Path
 import signal
 import subprocess
 import threading
@@ -74,6 +75,29 @@ def _kill_tree(pid):
             child.kill()
 
 
+def _proc_parents(root):
+    parents = []
+    for stat in root.glob("[0-9]*/stat"):
+        try:
+            # comm is parenthesized and may itself contain spaces or ')'.
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            parents.append((int(stat.parent.name), int(fields[1])))
+        except (OSError, ValueError, IndexError):
+            continue  # Processes can disappear or become unreadable mid-snapshot.
+    return parents
+
+
+def _bootstrap_parents():
+    try:
+        snapshot = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True,
+                                  text=True, timeout=5, check=True)
+        return [(int(pid), int(ppid)) for pid, ppid in
+                (row.split() for row in snapshot.stdout.splitlines())]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        proc = Path("/proc")
+        return (_proc_parents(proc) or None) if proc.is_dir() else None
+
+
 def _kill_bootstrap_tree(pid):
     """Early recovery has no site-packages, but must retain caller group custody."""
     if os.name == "nt":
@@ -81,9 +105,15 @@ def _kill_bootstrap_tree(pid):
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=15, check=False)
         return
-    snapshot = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True,
-                              text=True, timeout=5, check=True)
-    parents = [tuple(map(int, row.split())) for row in snapshot.stdout.splitlines()]
+    parents = _bootstrap_parents()
+    if parents is None:
+        # Never signal the caller's shared group. A dedicated worker group is
+        # safe to reap when neither process table is available.
+        with suppress(ProcessLookupError):
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, signal.SIGKILL)  # windows-footgun: ok — POSIX branch, worker-owned group
+                return
+        parents = []
     tree = [pid]
     for parent in tree:
         tree.extend(child for child, owner in parents if owner == parent)

@@ -28,12 +28,18 @@ whole request budget. Existing step deadlines are unchanged.
   1 uv step + margin, or 1,980 seconds before the floor. Currency probes and
   tool-only operations retain the protocol floor.
 
-Tool acquisition is not finitely bounded: downloads renew their network retry
+The offline fixture fixes the original `Download._probe` hang by supplying local
+tools at both process boundaries. Worker deadlines cover other failures in the
+bounded command/protocol phases, not that tool-acquisition hang.
+
+Tool acquisition is deliberately not finitely bounded: downloads renew their network retry
 budget on durable progress, and explicit install locks intentionally wait
 patiently. The worker explicitly suspends the active-time clock while acquiring
 its toolchain, downloading/unpacking/staging artifacts, preparing native build
 tools or waiting for a patient lock. It resumes the remaining budget afterwards,
-including nested acquisition. A stdlib ContextVar hook keeps generic install-state
+including nested acquisition. Deadline reports require the request's
+`accepts: ["deadline"]` capability, so clients already loaded before a source
+update continue to receive only callback/result messages. A stdlib ContextVar hook keeps generic install-state
 locking independent of worker modules, so minimal pre-import launchers retain
 their existing import closure. Tool-only requests use the same suspension contract.
 A worker that never sends a complete protocol message still expires. This avoids
@@ -49,12 +55,15 @@ count must add 900 seconds per install to the operation budget.
 The worker stays in the caller's process group and session so updater and Desktop
 group cleanup retain custody. Deadline cleanup snapshots descendants with psutil,
 kills children before the worker, then reaps it. Bare recovery without psutil uses
-a stdlib process-table snapshot on POSIX or bounded taskkill on Windows. During
-sync, control-pipe EOF also kills the worker tree. `ensure` retains its resumable
+a stdlib process-table snapshot on POSIX (`/proc/*/stat` when `ps` fails), or
+bounded taskkill on Windows. If neither POSIX snapshot is available, group cleanup
+is allowed only when the worker owns its group. During sync, control-pipe EOF
+kills the worker tree only before a result is ready. Normal result shutdown exits
+through atexit and releases its runtime lease. `ensure` retains its resumable
 pause-on-EOF behavior. A complete result is authoritative even if the timer fires
 before cancellation, so expiry cannot replace that result with a timeout.
 
-Contract tests: `tests/pm/test_worker_deadline.py`, `tests/pm/test_worker_lifetime.py`, `tests/pm/test_worker_budgets.py`, `tests/pm/test_pip_check.py`.
+Contract tests: `tests/pm/test_worker_deadline.py`, `tests/pm/test_worker_lifetime.py`, `tests/pm/test_worker_budgets.py`, `tests/pm/test_worker_protocol.py`, `tests/pm/test_client_process.py`, `tests/pm/test_pip_check.py`.
 
 The pip-check integration fixture uses the existing real isolated worker with
 local uv and Python on both sides of the process boundary. Its runtime is built

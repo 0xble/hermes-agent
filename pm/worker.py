@@ -9,7 +9,7 @@ import sys
 import threading
 
 
-def _read_controls(messages, pause, fd):
+def _read_controls(messages, pause, fd, result_sent):
     # Raw reads avoid a daemon thread holding sys.stdin's buffered lock at exit.
     pending = b""
     request_id = None
@@ -35,7 +35,7 @@ def _read_controls(messages, pause, fd):
         os.close(fd)
         pause.set()
         messages.put(None)
-        if operation == "sync_venv":
+        if operation == "sync_venv" and not result_sent.is_set():
             # Sync has no pause contract. A dead client must release its install
             # lock and uv children even when only the client PID was killed.
             from pm.client_process import _kill_tree
@@ -61,7 +61,8 @@ def main():
         os.dup2(null.fileno(), 0)
     messages = queue.Queue()
     pause = threading.Event()
-    threading.Thread(target=_read_controls, args=(messages, pause, controls), daemon=True).start()
+    result_sent = threading.Event()
+    threading.Thread(target=_read_controls, args=(messages, pause, controls, result_sent), daemon=True).start()
 
     def receive():
         message = messages.get()
@@ -120,7 +121,8 @@ def main():
                     arguments[name] = lambda *args, name=name: callback(name, *args)
             tools_only = operation in ("stage_only", "prepare_tools", "stage_tools") or (
                 operation == "ensure" and arguments["name"] != "venv")
-            with reporting(send), unbounded() if tools_only else nullcontext():
+            reports = reporting(send) if "deadline" in request.get("accepts", []) else nullcontext()
+            with reports, unbounded() if tools_only else nullcontext():
                 result = implementation(**arguments)
             if request["operation"] == "ensure":
                 result = None  # Runner is reconstructed from the caller's base env.
@@ -133,6 +135,8 @@ def main():
                 error.update(package=exc.package, cause=exc.cause, remedy=exc.remedy)
             response = {"error": error}
         response["receipt"] = receipt.last_completed()
+    # The client may close stdin as soon as the result is flushed.
+    result_sent.set()
     send({"type": "result", **response})
 
 
