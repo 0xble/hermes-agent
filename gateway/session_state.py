@@ -116,6 +116,7 @@ class PersistentState:
     # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
     pending_command_text: Optional[str] = None
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)
+    invalidation_epoch: int = 0  # stop/reset/new boundaries, independent of FIFO succession
     model_override_epoch: int = 0  # monotonic across overrides AND conversation boundaries
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
     # a FRESH AIAgent per run).  Reset on success; process-local, mirrored to the DB by run.py.

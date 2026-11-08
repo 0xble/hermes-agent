@@ -2064,6 +2064,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             else self._begin_session_run_generation(_quick_key)
         )
         _claim_state = self._session_state(_quick_key)
+        _invalidation_epoch = _claim_state.persistent.invalidation_epoch
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
@@ -2105,7 +2106,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 if not getattr(event, "_gateway_compression_deferred", False):
                     await self._defer_post_turn_hooks(
                         agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
-                        session_key=_quick_key, generation=_run_generation,
+                        session_key=_quick_key, generation=_run_generation, invalidation_epoch=_invalidation_epoch,
                     )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
