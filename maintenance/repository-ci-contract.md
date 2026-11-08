@@ -62,7 +62,12 @@ file. Its `gate.yml` caches only pinned Linux tool archives, not `node_modules`,
 and its portable qualification never runs the signed macOS install-e2e arm. So
 neither test's subject exists here. Retire both tests with the workflows they read,
 as for `test_combined_check_jobs.py` above. Do not import the workflows to satisfy
-them. Retire this adaptation when the fork adopts the upstream orchestrator.
+them. `tests/ci/test_timings_report_running_job.py` (upstream after v0.23.0, inside
+the matured sync target) imports `scripts/ci/timings_report.py`, which d77a654d8605
+retired with the same orchestrator, and its assertions read `ci.yaml`'s gate job.
+Retire it on the same basis.
+
+Retire this adaptation when the fork adopts the upstream orchestrator.
 
 ## Bounded channel metadata smoke
 
