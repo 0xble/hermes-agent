@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from pm.environment import PythonEnvironment
 
 from pm import paths
+from pm.worker_budget import WORKSPACE_PROBE_TIMEOUT
 from pm.package import InstallError
 from pm.plugin_declarations import read_python_declaration, manifest_version_error
 
@@ -200,7 +201,7 @@ def _solve_only_for(uv_policy: dict, python: Path) -> None:
     from pm.filesystem import native
 
     probe = subprocess.run([native(python), "-I", "-c", "import platform, sys; print(sys.platform); print(platform.machine())"],
-                           capture_output=True, text=True, encoding="utf-8", check=True, timeout=60)
+                           capture_output=True, text=True, encoding="utf-8", check=True, timeout=WORKSPACE_PROBE_TIMEOUT)
     sys_platform, machine = probe.stdout.split()
     host = f"sys_platform == {sys_platform!r} and platform_machine == {machine!r}"
     uv_policy["environments"] = [f"({entry}) and {host}" for entry in uv_policy.get("environments") or []] or [host]

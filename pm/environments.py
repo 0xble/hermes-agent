@@ -38,12 +38,16 @@ def install_recovery_lock_path(state: Path) -> Path:
 def install_state_lock(state: Path, *, timeout: float | None = None):
     """Hold the shared lock fencing every install-state reader and writer."""
     from pm.filesystem import lock_fd
+    from pm.worker_budget import unbounded
+    from contextlib import nullcontext
 
     lock_path = install_state_lock_path(state)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        yield lock_fd(fd, wait=True, timeout=timeout)
+        with unbounded() if timeout is None else nullcontext():
+            held = lock_fd(fd, wait=True, timeout=timeout)
+        yield held
     finally:
         os.close(fd)
 

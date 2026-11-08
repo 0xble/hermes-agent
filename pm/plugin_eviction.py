@@ -345,6 +345,9 @@ class _EvictingUpdate:
                            if fits(entry[2]) and _is_member_candidate(entry[2])
                            and record.get("tried") != self.fingerprint(entry[2], self.kept)),
                           key=lambda entry: "tried" in recorded[entry])
+        from pm.worker_budget import reserve_eviction_builds
+
+        reserve_eviction_builds(len(self.kept) + len(self.due))
 
     def fingerprint(self, plugin_dir: Path, beside: list[Path]) -> str:
         """What a retry of *plugin_dir* would build: core, the plugin and the enabled plugins."""

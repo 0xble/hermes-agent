@@ -26,6 +26,7 @@ def test_worker_deadline_reaps_the_worker_and_its_child(tmp_path, monkeypatch, p
         + "threading.Event().wait(3600)\n"
     )
     monkeypatch.setattr(processes, "WORKER_TIMEOUT", 2)
+    monkeypatch.setattr("pm.worker_budget.operation_budget", lambda *args: 2)
     monkeypatch.setattr(client, "_worker_command", lambda *args: [sys.executable, "-I", "-c", script])
 
     with pytest.raises(InstallError, match="worker prune_cache timed out after 2s"):

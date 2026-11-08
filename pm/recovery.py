@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from pm.package import InstallError
+from pm.worker_budget import REPAIR_CHECK_TIMEOUT
 
 
 STARTUP_IMPORTS = (
@@ -45,7 +46,8 @@ def validate_environment(python: Path | list[str], *, env: dict, cwd: Path) -> N
     )
     command = [str(python), "-I"] if isinstance(python, (str, Path)) else [*python]
     result = subprocess.run([*command, "-c", script], cwd=cwd, env=env,
-                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            timeout=REPAIR_CHECK_TIMEOUT, check=False)
     if result.returncode:
         raise InstallError("venv", f"startup validation failed: {result.stderr.strip()[-1000:]}")
 
