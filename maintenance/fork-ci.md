@@ -53,6 +53,9 @@ opening another SessionDB on the gateway event loop. Keep the explicit
 `DEFAULT_DB_PATH` test override in the same temporary home as the startup
 reservation, including fatal-exit and takeover cases. Drain fixtures use the
 native `TurnContext` defaults so reply-expected handling remains covered.
+The shared session-control runner binds the real claimed-turn stop fence when
+continuation tests enter session resolution, preserving `/new` isolation rather
+than replacing the fence with an always-false test stub.
 Unmanaged-daemon environment tests intercept both the native launchd adapter
 and the plain-child boundary without touching host services. Preserve the
 exit-code, marker ordering, silence, queued-delivery and environment assertions.

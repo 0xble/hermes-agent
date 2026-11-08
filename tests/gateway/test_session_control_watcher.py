@@ -69,6 +69,7 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
         _sessions_map = GatewayRunner._sessions_map
         _session_state = GatewayRunner._session_state
         _peek_session_state = GatewayRunner._peek_session_state
+        _claimed_turn_route_was_stopped = GatewayRunner._claimed_turn_route_was_stopped
 
         session_store = SimpleNamespace(
             lookup_by_session_id=lambda sid: {"target": target, "requester": requester}.get(sid)
