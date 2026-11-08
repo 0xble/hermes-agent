@@ -1119,6 +1119,22 @@ def checkout_lock() -> Iterator[None]:
         yield
 
 
+def require_case_sensitive_tmpdir(parent: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix='hermes-ci-case-probe-', dir=parent) as directory:
+        probe = Path(directory)
+        (probe / 'a').touch()
+        if (probe / 'A').exists():
+            raise RuntimeError(
+                f'macOS CI scratch is case-insensitive: {parent}. '
+                'Desktop security tests require distinct case-only paths: '
+                'run with TMPDIR on a case-sensitive volume. '
+                'Provision and run: '
+                'TMPDIR="$(scripts/ci/case-sensitive-tmpdir.sh)" '
+                './bin/ci gate "$(git rev-parse HEAD)". '
+                'See maintenance/portable-ci.md for cleanup.'
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native'))
@@ -1155,6 +1171,8 @@ def main() -> int:
         return 0
     STATE.mkdir(exist_ok=True)
     with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
+        if sys.platform == 'darwin':
+            require_case_sensitive_tmpdir(home)
         env = resolve_local_toolchain(environment(home))
         if args.command in ('setup', 'full', 'gate', 'nightly', 'nightly-native'):
             setup(env)

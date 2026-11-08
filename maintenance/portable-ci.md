@@ -114,6 +114,39 @@ same requested-volume contract.
 
 Contract tests: `tests/scripts/ci/test_portable_tmpdir.py`
 
+On macOS, every execution profile additionally probes its invocation-owned
+scratch filesystem before environment setup or any lane starts. Creating `a`
+must not make `A` resolve. A case-insensitive scratch volume fails explicitly
+because the desktop security tests need distinct `Vault`/`vault` and
+`.hermes`/`.HERMES` identities. Linux and Windows retain their existing behavior.
+Direct npm runs of `plugin-files-spellings.test.ts` also probe their actual
+scratch directory before the case-only fixtures, so they cannot pass vacuously.
+This extends `fork-ci-reliability`; native macOS precondition regressions live
+in `tests/scripts/ci/test_portable_case_sensitive.py`.
+
+Provision disposable scratch explicitly, outside the gate:
+
+```bash
+ci_tmp=$(scripts/ci/case-sensitive-tmpdir.sh)
+TMPDIR="$ci_tmp" ./bin/ci gate "$(git rev-parse HEAD)"
+# Or run the desktop file directly with the same TMPDIR:
+TMPDIR="$ci_tmp" npm --prefix apps/desktop run test:desktop:platforms -- electron/plugin-files-spellings.test.ts
+```
+
+The helper creates and attaches a disposable 20-GB sparse case-sensitive APFS
+image with `-nobrowse`, prints only its TMPDIR on stdout, and prints cleanup
+commands on stderr. An optional argument selects a new scratch directory and
+refuses an existing one. It never provisions implicitly inside CI or touches
+an existing image. After all owned CI children exit, detach by the printed
+mount path, remove that image, and remove its empty mount and parent directories:
+
+```bash
+ci_scratch=${ci_tmp%/mnt/tmp}
+hdiutil detach "$ci_scratch/mnt"
+rm "$ci_scratch/scratch.sparseimage"
+rmdir "$ci_scratch/mnt" "$ci_scratch"
+```
+
 ## portable-ci-home-sweep
 
 Fork patch identity: `portable-ci-home-sweep`. The identity exactly matches this

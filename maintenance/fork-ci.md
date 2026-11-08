@@ -96,7 +96,10 @@ job-owned case-sensitive APFS scratch image through `TMPDIR` to the canonical
 `./bin/ci gate <sha>` entrypoint. Prove distinct case-only directory identities
 before running. Keep the checkout's pinned toolchain and every assertion intact,
 then detach and remove only the invocation's disposable image after all owned
-processes have exited.
+processes have exited. Portable CI enforces this precondition before setup or
+lanes on macOS. Direct npm case-spelling tests enforce it at their fixture
+boundary too. Use `scripts/ci/case-sensitive-tmpdir.sh` to provision scratch
+explicitly. [portable-ci.md](portable-ci.md) documents the commands and cleanup.
 
 Electron fixture cost must stay proportional to the assertion under the full
 project's default worker concurrency. The channel-version MSIX test shares the
