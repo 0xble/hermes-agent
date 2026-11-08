@@ -277,6 +277,8 @@ class GatewayTurnPrepareMixin:
             if resolved_entry is None:
                 return
             session_entry = resolved_entry
+        if await asyncio.to_thread(self._claimed_turn_route_was_stopped, event, session_entry.session_id):
+            return
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
@@ -306,6 +308,25 @@ class GatewayTurnPrepareMixin:
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
         return source, session_entry, session_key
+
+    def _claimed_turn_route_was_stopped(self, event, resolved_session_id):
+        """A /new stops the claimed owner, never the fresh session its route now selects."""
+        claimed = getattr(event, "_claimed_owner", None)
+        if not claimed or claimed[0] == resolved_session_id:
+            return False
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        if authority is None:
+            return False
+        if claimed[1] not in (authority.pending_stops.get(claimed[0]), authority.delivered_stops.get(claimed[0])):
+            return False
+        if resolved_session_id in authority.db.get_compression_chain(claimed[0]):
+            return False
+        from gateway.session_results import execution_result
+        result = execution_result.get()
+        if result is not None:
+            result["result"] = {"interrupted": True, "completed": False, "final_response": "", "messages": []}
+        return True
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
         """Follow the (chat_id, thread_id) topic binding — healed to its compression tip — or record
