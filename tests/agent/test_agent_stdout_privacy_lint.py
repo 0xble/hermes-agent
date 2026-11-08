@@ -17,6 +17,9 @@ STREAMS = {"stdout", "stderr", "__stdout__", "__stderr__"}
 # (file, enclosing function) -> (why it cannot carry private turn content, the allowed sites'
 # first-argument source, truncated). Allow a site only when it is CLI-only, startup or content-free.
 ALLOWED = {
+    ('agent/terminal_image.py', 'probe_vscode_images'): ('local TTY startup capability probe, no turn content', frozenset({
+        '_VSCODE_PROBE',
+    })),
     ('agent/agent_init.py', '_emit_compression_summary'): ('startup, non-quiet only: token counts', frozenset({
         "f'📊 Context limit: {_cc.context_length:,} tokens",
     })),
