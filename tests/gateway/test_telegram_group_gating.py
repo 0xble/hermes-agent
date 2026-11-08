@@ -1085,4 +1085,4 @@ async def test_photo_batch_addressed_to_the_bot_keeps_the_silence_notice():
 
     turn_ctx.reply_expected = pending["album"].reply_expected
     await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
-    assert "silence marker" in runner._deliver_queued_first_response.await_args.args[0]
+    assert "No reply was written for this message" in runner._deliver_queued_first_response.await_args.args[0]
