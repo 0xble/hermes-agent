@@ -31,8 +31,16 @@ def _dead_pid() -> int:
 
 def test_restart_watcher_relaunches_from_an_interpreter_without_site_packages(tmp_path, monkeypatch):
     # A python that sees the checkout but no third-party packages, like the bare store Python.
+    shim = tmp_path / "bare_entry.py"
+    shim.write_text(
+        "import sys, types\n"
+        "sys.modules['hermes_cli.gateway_launchd_runtime'] = types.SimpleNamespace(start_gateway_job=lambda *a, **k: None)\n"
+        "assert sys.argv[1] == '-c'\n"
+        "code = sys.argv[2]\n"
+        "sys.argv = ['-c', *sys.argv[3:]]\n"
+        "exec(code, {'__name__': '__main__'})\n", encoding="utf-8")
     bare = tmp_path / "bare-python"
-    bare.write_text(f'#!/bin/sh\nunset PYTHONPATH\nexec "{sys.executable}" -S "$@"\n', encoding="utf-8")
+    bare.write_text(f'#!/bin/sh\nunset PYTHONPATH\nexec "{sys.executable}" -S "{shim}" "$@"\n', encoding="utf-8")
     bare.chmod(0o755)
     probe = subprocess.run([str(bare), "-c", "import ruamel.yaml"], cwd=REPO, capture_output=True, text=True, check=False)
     assert probe.returncode != 0, "premise: the stand-in interpreter must not see site-packages"
