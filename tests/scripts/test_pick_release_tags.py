@@ -6,7 +6,7 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "sandbox" / "pick-rel
 
 
 def _git(cwd, *args):
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    return subprocess.run(["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
 def _pick(repo, *args):
