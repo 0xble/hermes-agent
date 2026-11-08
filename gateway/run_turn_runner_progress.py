@@ -36,6 +36,8 @@ async def edit_progress_message(state: Any, ctx: Any, message_id: str, content: 
         kwargs["metadata"] = ctx._progress_metadata
     with outbound_class(OUTBOUND_PROGRESS):
         result = await state.adapter.edit_message(**kwargs)
+    if result.success and not (result.raw_response or {}).get("skipped"):
+        state.retry_wait = 0.0
     if (result.raw_response or {}).get("skipped"):
         state.skipped_edits += 1
         reason_fn = getattr(type(state.adapter), "progress_edit_pause_reason", None)

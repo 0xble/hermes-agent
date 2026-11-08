@@ -245,6 +245,34 @@ the runner default (`TurnRunner._PROGRESS_EDIT_INTERVAL`, 3.0s). Telegram used 3
 2026-10-06, when the daily call counter showed progress-bubble edits were the largest share of
 typed-turn calls on a chat that hit a daily volume ban; Brian approved slower bubble updates.
 
+Progress cards widen that floor against `DailyQuota.call_pressure`: 10s below 50% of the
+effective daily call ceiling, 30s from 50% to 80%, and 60s from 80% onward. The fractions and
+multipliers live once in `daily_quota.PROGRESS_EDIT_BANDS`; a disabled call budget keeps 10s,
+and the existing recent-penalty scaling still applies. The progress consumer rechecks pressure
+between batches, sends the full accumulated text after each wait, and drains immediately at
+turn end. Overflow, reset markers and flood-refused batches retain their buffered text.
+Initial tool bubbles, cleanup, daily shedding and final-reply delivery retain their existing rules.
+Initial sends keep the normal adapter floor even after a failed or outbox-deferred send returns
+no message ID. The first event sends immediately, without absorbing pre-queued later events.
+Pressure only widens existing-card edits, so separate grouping keeps the normal adapter floor.
+Retryable edits retain their batch and back off from at least that floor, doubling to a 60s
+cap (or the floor if larger). A successful edit resets the backoff. Flood deadlines still apply.
+A transient overflow refusal first encountered during cancellation gets 1 paced retry;
+cleanup does not wait out a card that was already deferred or flooded.
+Interrupted batches discard queued events, including resets, without rendering or cancellation flushes.
+If the quota read fails, progress cadence falls back to the adapter floor.
+
+The hourly daily-volume INFO line also includes `edit classes`, counted at the existing request
+metering point. `progress` includes tool-card edits, while `unclassified` has no outbound label.
+These counters are process-local, with persisted edits from before process startup and edits from
+other writers reported as `unobserved`. They do not change the persistent ledger or its totals.
+They distinguish outbound classes, not every producer within a class. The 2026-11-06 retained
+logs had no class attribution: the call ledger could split 6,457 edits into 4,707 untagged,
+1,498 goal-triggered and 252 typed-triggered edits, but could not identify a dominant producer.
+Regression: `tests/gateway/test_telegram_progress_batch.py`,
+`tests/gateway/test_supervisor_turn_chrome.py::test_intermediate_supervisor_sends_are_suppressed_without_muting_humans`
+(unchanged: suppress supervisor chrome while preserving human sends and edits), plus the existing daily-quota suite.
+
 | Path | Private worst case | Group worst case |
 | --- | --- | --- |
 | All metered calls to one chat (one shared slot) | 45/min (1.33s gap) | 15/min (4.0s gap) |

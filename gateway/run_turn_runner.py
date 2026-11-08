@@ -274,10 +274,12 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         reanchored: bool = False
         # Buffer until the monotonic flood deadline, without editing, splitting or sending.
         defer_until: float = 0.0
+        retry_wait: float = 0.0
         # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
         tool_progress_sent: bool = False
         skipped_edits: int = 0
         progress_pause_logged: bool = False
+        dirty: bool = False
 
     # Default minimum seconds between progress edits. An adapter may raise it with
     # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
@@ -344,24 +346,6 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         error = (getattr(result, "error", "") or "").lower()
         return getattr(result, "retry_after", None) is not None or any(w in error for w in ("flood", "retry after"))
 
-    @classmethod
-    def _edit_failure_is_deferrable(cls, st, result) -> bool:
-        """Transient and rate-limit edit failures leave the bubble editable for a later tick.
-
-        A flood refusal says "not now", not "never": disabling edits on it turns every later tool
-        line into its own message for the rest of the turn, and sending one now spends the budget
-        the platform just said is exhausted.
-        """
-        if cls._is_flood_refusal(result):
-            wait = max(float(getattr(result, "retry_after", None) or 0.0), cls._progress_edit_interval(st.adapter))
-            st.defer_until = time.monotonic() + wait
-            logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
-            return True
-        if getattr(result, "retryable", False):
-            logger.debug("[%s] Transient progress edit failure, retrying next tick", st.adapter.name)
-            return True
-        return False
-
     @staticmethod
     def _progress_deferred(st) -> bool:
         return time.monotonic() < st.defer_until
@@ -386,28 +370,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
         st.progress_msg_id, st.progress_lines = None, []
+        st.dirty = False
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
-
-
-
-    async def _drain_progress_on_cancel(self, st) -> None:
-        ctx = self._ctx
-        with suppress(Exception):
-            while not ctx.progress_queue.empty():
-                raw = ctx.progress_queue.get_nowait()
-                if self._is_reset_marker(raw):
-                    # Content-bubble marker during drain: close the current progress bubble
-                    # and start a fresh one for tool lines that arrived after.
-                    await self._roll_progress_overflow_if_needed(st)
-                    await self._flush_progress_edit(st)
-                    self._reset_progress_bubble(st)
-                else:
-                    self._progress_absorb(st, raw)
-                    await self._roll_progress_overflow_if_needed(st)
-        # Final edit with all remaining tools (only if editing works)
-        if st.can_edit and st.progress_lines and st.progress_msg_id:
-            await self._roll_progress_overflow_if_needed(st)
-        await self._flush_progress_edit(st)
 
     async def _progress_restore_typing(self, st) -> None:
         ctx = self._ctx
