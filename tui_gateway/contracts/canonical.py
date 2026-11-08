@@ -115,6 +115,8 @@ class SessionPruneParams(Params):
 
     filters: dict[str, JsonValue] | None = None
     never_active_days: float | None = None
+    # Delete even outside maintenance.deletion_window (the owner refuses there otherwise).
+    now: bool | None = None
 
 
 class SessionPruneResult(Result):

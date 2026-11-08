@@ -154,13 +154,13 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         "defaults to 90 days; any filter matches all ages)")
     _flag(sessions_prune, "--include-archived",
         help="Also delete archived sessions (excluded by default)")
-    _flag(sessions_prune, "--include-pinned",
-        help="Also delete pinned sessions (excluded by default — pin is a keep flag)")
+    _flag(sessions_prune, "--include-pinned", help="Also delete pinned sessions (excluded by default — pin is a keep flag)")
     _flag(sessions_prune, "--never-active",
         help="Instead of ended sessions, delete keyed gateway rows that were "
             "opened and never used (no messages, tokens, tool calls or title) "
             "and are older than AGE (default 30 days). Ordinary prune can "
             "never reach these — it only ever selects ended sessions")
+    _flag(sessions_prune, "--now", help="Delete now even outside maintenance.deletion_window (prune deletes only inside it by default: a large delete stalls the live gateway's writes)")
     _flag(sessions_prune, "--force",
         help="With no gateway running: run even while another Hermes process (Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped. With the gateway running, prune always goes through it")
 

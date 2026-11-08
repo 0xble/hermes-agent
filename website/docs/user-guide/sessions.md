@@ -619,7 +619,19 @@ hermes sessions prune --newer-than 5h --dry-run
 
 # Skip confirmation
 hermes sessions prune --older-than 30 --yes
+
+# Delete outside maintenance.deletion_window anyway
+hermes sessions prune --older-than 30 --yes --now
 ```
+
+Prune deletes only inside `maintenance.deletion_window` (local time, default
+`02:00-05:00`; an empty value allows any time), because a large delete holds
+the session database's write lock and slows every live chat. Outside the
+window it refuses and names the window. `--dry-run` previews at any time, and
+`--now` runs the delete immediately. A pass that starts in the window stops
+when it closes and leaves the rest for the next run. Only one prune runs on a
+store at a time: while the gateway is still pruning, even after the command
+gave up waiting, a second prune is refused.
 
 Time values (`--older-than`, `--newer-than`, `--before`, `--after`) accept a
 duration (`5h`, `30m`, `2d`, `1w`), a bare number of days, or an ISO

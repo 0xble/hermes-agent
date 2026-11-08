@@ -1381,8 +1381,8 @@ class TestPruneSessions:
         monkeypatch.setattr(hermes_state_maintenance.time, "sleep", pauses.append)
         assert db.prune_sessions(older_than_days=90) == 51
         assert db._read_one("SELECT COUNT(*) FROM sessions WHERE id LIKE 'old-%'")[0] == 0
-        # 51 victims => 25 + 25 + 1, with a release/yield between each transaction.
-        assert pauses == [0.01, 0.01]
+        # 51 quick victims => 25 + 25 + 1, with a writer-fairness pause between each transaction.
+        assert len(pauses) == 2 and all(0.05 <= pause <= 2.0 for pause in pauses)
 
 
     def test_prune_preserves_guarded_compression_lineage_across_batches(self, db, monkeypatch):

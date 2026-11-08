@@ -49,7 +49,7 @@ def test_filtered_backup_covers_protected_sessions_before_retention_prune(store,
     assert exported["archived"]["archived"] == 1
 
     # This fixture is the sole writer; bypass the unrelated host-wide holder inventory.
-    _run(monkeypatch, "prune", "--before", "2000-01-01", "--include-archived", "--include-pinned", "--yes", "--force")
+    _run(monkeypatch, "prune", "--before", "2000-01-01", "--include-archived", "--include-pinned", "--yes", "--force", "--now")
     with SessionDB() as db:
         assert all(db.get_session(session_id) is None for session_id in exported)
 
