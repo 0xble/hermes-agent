@@ -4,6 +4,10 @@ The CLI computes the filters and shows the preview from a read-only view; the de
 this owner's write, through the same ``prune_sessions`` / ``retire_prunable`` path housekeeping
 uses (busy sessions and the logical owner of a retained reset child are skipped). A CLI writing
 the store under a live gateway would be a second writer, so it never does.
+
+Deletes run only inside ``maintenance.deletion_window`` unless the operator passes ``now``, and one
+pass per store at a time: the work is shielded, so a client that times out and asks again would
+otherwise start a second pass beside the first.
 """
 import asyncio
 from pathlib import Path
@@ -35,27 +39,47 @@ async def prune(connection, ref, params):
                                           or never_active < 0)):
         raise RuntimeStoreError('invalid_params')
     filters = _filters(params['filters']) if 'filters' in params else None
+    now = params.get('now', False)
+    if not isinstance(now, bool):
+        raise RuntimeStoreError('invalid_params')
+    from hermes_cli.maintenance_window import deletion_window_refusal
+    if not now and (refusal := deletion_window_refusal('pass --now')):
+        raise RuntimeStoreError('outside_deletion_window', detail=refusal)
     authority._require_admission_open()
     from gateway.session_runtime_workers import track_mutation
-    task = track_mutation(authority, _apply(authority, filters, never_active))
+    task = track_mutation(authority, _apply(authority, filters, never_active, not now))
     return await asyncio.shield(task)
 
 
-async def _apply(authority, filters, never_active):
+async def _apply(authority, filters, never_active, within_window):
+    from hermes_state_prune_pacing import DeletionWindowClosedError, PruneInProgressError
+    try:
+        return await _prune(authority, filters, never_active, within_window)
+    except PruneInProgressError as exc:
+        raise RuntimeStoreError('prune_in_progress', detail=str(exc)) from exc
+    except DeletionWindowClosedError as exc:
+        raise RuntimeStoreError('outside_deletion_window', detail=str(exc)) from exc
+
+
+async def _prune(authority, filters, never_active, within_window):
     from hermes_constants import get_hermes_home
     from gateway.session_mutations import retire_live_sessions
     # Same transcript dir the CLI's local prune unlinks under (dispatch runs in the owner's scope).
     sessions_dir = Path(get_hermes_home()) / 'sessions'
     deleted_ids = []
     if filters is None:
-        deleted, routing, skipped = await asyncio.to_thread(
-            authority.db.prune_never_active_keyed_sessions, older_than_days=float(never_active),
-            sessions_dir=sessions_dir, deleted_ids=deleted_ids)
+        from hermes_state_prune_pacing import prune_pass
+
+        def _never_active():
+            with prune_pass(authority.db.db_path):
+                return authority.db.prune_never_active_keyed_sessions(
+                    older_than_days=float(never_active), sessions_dir=sessions_dir, deleted_ids=deleted_ids)
+        deleted, routing, skipped = await asyncio.to_thread(_never_active)
         result = {'deleted': deleted, 'routing_deleted': routing, 'skipped': skipped}
     else:
         deleted = await asyncio.to_thread(
             authority.db.prune_sessions, sessions_dir=sessions_dir, exclude_active_write_guards=True,
-            deleted_ids=deleted_ids, **filters)
+            deleted_ids=deleted_ids, within_deletion_window=within_window, **filters)
         result = {'deleted': deleted}
     retire_live_sessions(authority, deleted_ids)
     return result

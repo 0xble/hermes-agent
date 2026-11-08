@@ -13,6 +13,7 @@ from hermes_state_common import (
 )
 from hermes_startup_watchdog import report_startup_progress
 from hermes_state_deletion import finish_pending_deletes, stage_delete, visible_session_sql
+from hermes_state_prune_pacing import DeletionWindowClosedError, PrunePacer, prune_pass
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -339,16 +340,30 @@ class SessionMaintenanceMixin:
 
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,
                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
-                       deleted_ids: Optional[list] = None, **filters) -> int:
+                       deleted_ids: Optional[list] = None, within_deletion_window: bool = False,
+                       **filters) -> int:
         """Delete ended sessions inactive for ``older_than_days`` (an explicit ``started_before`` /
         ``last_active_before`` overrides it; None = no implicit bound) matching the filters.
         Children outside the window are orphaned (parent NULLed), not cascade-deleted.  With
         *sessions_dir*, transcript files are removed outside the DB transaction.
         ``exclude_active_write_guards`` (automatic maintenance) skips rows under a live turn lease
         or compression lock while expired/dead holders are reclaimed and fenced.  A compression
-        ancestor is deleted only together with every continuation after it (``whole_lineages``)."""
+        ancestor is deleted only together with every continuation after it (``whole_lineages``).
+        ``within_deletion_window`` refuses to start outside ``maintenance.deletion_window`` and stops
+        between transactions once it closes; the remaining candidates wait for the next run. One
+        pass per store runs at a time in this process (:func:`prune_pass`)."""
         if filters.get("include_open"):
             raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
+        from hermes_cli.maintenance_window import deletion_window_open
+        if within_deletion_window and not deletion_window_open():
+            raise DeletionWindowClosedError("session prune refused: maintenance.deletion_window is closed")
+        with prune_pass(self.db_path):
+            return self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
+                                             deleted_ids, within_deletion_window, filters)
+
+    def _prune_sessions_pass(self, older_than_days, source, sessions_dir, exclude_active_write_guards,
+                             deleted_ids, within_deletion_window, filters) -> int:
+        from hermes_cli.maintenance_window import deletion_window_open
         finish_pending_deletes(self)
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
         removed_ids: list[str] = []
@@ -370,11 +385,25 @@ class SessionMaintenanceMixin:
 
         # Keep each transaction small enough that message/FTS triggers release the WAL write lock
         # promptly.  The pause is intentional: without yielding between transactions, a maintenance
-        # loop can reacquire the lock often enough to starve a live turn.
-        batch_size = 25
-        batches = list(_id_chunks(candidate_ids, size=batch_size))
-        for batch_index, requested in enumerate(batches):
+        # loop can reacquire the lock often enough to starve a live turn.  The pacer sizes the next
+        # batch by this one's measured hold and pauses at least that long.
+        pacer, position, held = PrunePacer(max_size=25), 0, [0.0]
+        while position < len(candidate_ids):
+            if within_deletion_window and not deletion_window_open():
+                logger.info("session prune stopped: maintenance.deletion_window closed with %d candidate(s) "
+                            "left for the next run", len(candidate_ids) - position)
+                break
+            requested = candidate_ids[position:position + pacer.size]
+            position += len(requested)
+
             def _do(conn, requested=requested):
+                started = time.monotonic()
+                try:
+                    return _batch(conn, requested)
+                finally:
+                    held[0] = time.monotonic() - started
+
+            def _batch(conn, requested):
                 ph = _placeholders(requested)
                 rows = conn.execute(
                     f"SELECT s.id FROM sessions s WHERE {where} AND s.id IN ({ph})",
@@ -420,8 +449,8 @@ class SessionMaintenanceMixin:
             finish_pending_deletes(self, required_ids=batch_removed)
             for sid in batch_removed:
                 self._remove_session_files(sessions_dir, sid)
-            if batch_index + 1 < len(batches):
-                time.sleep(0.01)
+            if position < len(candidate_ids):
+                pacer.pause(held[0])
 
         if removed_count:
             while True:
@@ -594,7 +623,8 @@ class SessionMaintenanceMixin:
             # once at entry. No-op when the watchdog is not armed; never raises.
             report_startup_progress(900.0, phase="state_db_auto_prune")
             result["pruned"] = pruned = self.prune_sessions(
-                older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True)
+                older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True,
+                within_deletion_window=True)
             report_startup_progress(900.0, phase="state_db_auto_sweep")
             closed = self.sweep_orphaned_sessions(
                 max_idle_seconds=float(retention_days) * 86400.0,

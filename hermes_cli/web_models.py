@@ -321,6 +321,8 @@ class SessionPrune(BaseModel):
     max_tool_calls: Optional[int] = None
     include_archived: bool = False
     dry_run: bool = False
+    # Delete now even outside maintenance.deletion_window (refused there by default).
+    now: bool = False
 
 class CronJobCreate(BaseModel):
     paused: StrictBool = False

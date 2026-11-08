@@ -157,10 +157,12 @@ def retire_local_receipts(conn, session_ids):
     targets = set(session_ids)
     if not targets:
         return
-    # Prefix scans (GLOB uses the key index), not one LIKE per id: a prune retires thousands.
-    gone = [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
-                                               (POLICY_PREFIX + '*',))
-            if _policy_target(value) in targets]
+    # The receipt routing to a target is its lineage owner's: primary-key lookups, not a scan of
+    # every receipt (each carries its launch request, ~1 GB in all on a cron-heavy store).
+    owners = {POLICY_PREFIX + local_lineage_owner(conn, sid) for sid in targets}
+    gone = [key for key in owners
+            if (saved := conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone())
+            and _policy_target(saved[0]) in targets]
     gone += [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
                                                 (API_DECLARED_PREFIX + '*',)) if value in targets]
     gone += [API_BINDING_PREFIX + sid for sid in targets]

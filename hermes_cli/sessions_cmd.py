@@ -733,7 +733,7 @@ def _prune_never_active_keyed(db, args):
         from hermes_cli.gateway_client import GatewayClientError
         from hermes_cli.sessions_owner import owner_prune, report_owner_failure
         try:
-            result = owner_prune(owner, never_active_days=days)
+            result = owner_prune(owner, never_active_days=days, now=bool(getattr(args, "now", False)))
         except (GatewayClientError, OSError, TimeoutError) as exc:
             return report_owner_failure(exc)
         deleted, routing_deleted, skipped = result["deleted"], result["routing_deleted"], result["skipped"]
@@ -840,11 +840,19 @@ def _cmd_prune_or_archive(db, args, action):
         from hermes_cli.gateway_client import GatewayClientError
         from hermes_cli.sessions_owner import owner_prune, report_owner_failure
         try:
-            print(f"Pruned {owner_prune(args.owner_endpoint, filters=filters)['deleted']} session(s).")
+            pruned = owner_prune(args.owner_endpoint, filters=filters, now=bool(getattr(args, "now", False)))
+            print(f"Pruned {pruned['deleted']} session(s).")
         except (GatewayClientError, OSError, TimeoutError) as exc:
             return report_owner_failure(exc)
     elif prune:
-        print(f"Pruned {db.prune_sessions(sessions_dir=_sessions_dir(), exclude_active_write_guards=True, **filters)} session(s).")
+        from hermes_state_prune_pacing import DeletionWindowClosedError
+        try:
+            pruned = db.prune_sessions(sessions_dir=_sessions_dir(), exclude_active_write_guards=True,
+                                       within_deletion_window=not getattr(args, "now", False), **filters)
+        except DeletionWindowClosedError as exc:
+            print(f"Error: {exc}")
+            return 1
+        print(f"Pruned {pruned} session(s).")
     else:
         print(f"Archived {db.archive_sessions(**filters)} session(s). They're hidden from listings "
               "but fully recoverable (nothing was deleted).")
@@ -1425,6 +1433,11 @@ def cmd_sessions(args, sessions_parser=None):
     )
     observational = action in _OBSERVATIONAL_DB_ACTIONS or (action == "export" and not deleting_export)
     if action == "prune":
+        if not getattr(args, "dry_run", False) and not getattr(args, "now", False):
+            from hermes_cli.maintenance_window import deletion_window_refusal
+            if refusal := deletion_window_refusal("pass --now"):
+                print(f"Refusing to prune now. {refusal}")
+                return 1
         # The always-on gateway owns the store: this process only reads the preview, the owner
         # deletes. No gateway: the local prune below, behind the holder scan, as before.
         from hermes_cli.sessions_owner import live_owner

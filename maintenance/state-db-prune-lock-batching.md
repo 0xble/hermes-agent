@@ -14,6 +14,20 @@ Fork-Patch-Backfill: dd8b51a7f52d926fc084cd7e84bc8b72a651ff0f; state-prune-lock-
 - `_execute_write_marked` emits a warning when one acquired transaction holds the lock for several seconds, including the originating callback, process id, bounded transcript target and input-row count when known. Acquisition time is separate from the lock-hold threshold. Callback wall/thread-CPU time, commit/rollback time and settlement outcome distinguish expensive work from a failed or slow commit without logging transcript payloads or SQL.
 - The same attempt-local `WriteMetrics` context retains archive/mark-inactive, insert (including inline FTS), clone (including inline FTS), display-reconcile, callback-total and commit/rollback timings, with affected message-row counts. Callback-total includes the named callback phases, so those durations must not be summed. Failed transactions report attempted row writes, not committed totals. Fast transactions add no log lines or diagnostic SQL. On macOS, the lock-owner diagnostic says `/proc/locks` is unavailable rather than claiming that a holder released just before the deadline.
 
+## Operator Prune Window and Single Pass
+
+On 2026-11-07 an agent ran `hermes sessions prune --source subagent|cron --older-than 7 --yes` at 11:00 AM PT against the 107 GB default store. The CLI handed the work to the gateway's shielded `session.prune`, gave up after its 600 s client timeout, and its loop started the next source while the first pass kept running in the gateway. Two passes alternated 5-20 s transactions with a 10 ms gap until a restart at 4:26 PM, and foreground writers (Telegram replies, the delegation retry sweep) waited behind them.
+
+- `hermes sessions prune`, the owner's `session.prune` and `POST /api/sessions/prune` refuse to delete outside `maintenance.deletion_window`, naming the configured window. Dry runs still preview. `--now` (CLI), `now: true` (RPC and web body) is the explicit daytime override.
+- A window-bound pass (`prune_sessions(within_deletion_window=True)`: every manual prune without the override and automatic retention) stops between transactions once the window closes and leaves the rest for the next run.
+- One prune pass per store runs at a time in a process (`hermes_state_prune_pacing.prune_pass`). A second request while the first is still running is refused with `prune_in_progress` instead of starting beside it.
+
+## Per-Transaction Cost
+
+The 25-session transactions were slow because of fixed work, not FTS: messages were already deferred to bounded cleanup pages (`rows[none]` in every slow-write warning), and the warnings showed ~6 s of thread CPU per batch. `retire_prunable` and `retire_local_receipts` each re-read and JSON-decoded every local creation receipt (19.6k rows, 1.15 GB, mostly each cron fire's stored launch request) inside every batch, and `retire_routes` decoded all 41.5k routing entries in Python. Cold pages pushed a batch to 9-22 s of wall time.
+
+Both receipt paths now resolve each id's receipt by primary key through its lineage owner (`local_lineage_owner`, the `sessions.chat_id` pointer that `local_conversation_ids` and explicit deletes already use), and routing entries are filtered in SQL. On a synthetic store of the same shape (20k receipts of ~58 KB, 40k routes), a 25-session `retire_prunable` went from 2.5 s to 0.02 s with the same receipts and routes retired. Each pass also sizes its next batch by measured hold time (`PrunePacer`: halve above 0.5 s, down to 1 session) and pauses at least as long as it held the lock (0.05-2 s).
+
 ## Bounded Deletion
 
 Session-count pruning batches alone do not bound a large transcript's FTS-trigger work. Explicit single, bulk/chain and runtime deletes, and retention pruning, now publish the existing durable retirement fence before reclaiming messages. Guard, expected-id and expected-display checks remain inside that retirement transaction. Public session, transcript, timeline and search reads exclude the retired ids, including hidden/archive and LIKE fallback routes. Late transcript appends and child creation reject a retired id or parent.
@@ -64,17 +78,17 @@ GIL, scheduling or index bottleneck, and do not claim a latency improvement.
 
 ## Source surfaces
 
-`gateway/run.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_transactions.py`, `hermes_state_messages.py`, `hermes_state_compression.py`, `hermes_state_message_archive.py`, `hermes_state_write_metrics.py`, `hermes_state_lockowners.py`, and their focused tests.
+`gateway/run.py`, `gateway/session_prune.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_cli/maintenance_window.py`, `hermes_cli/sessions_cmd.py`, `hermes_cli/web_routers/sessions.py`, `hermes_state_prune_pacing.py`, `hermes_state_mutation_retirement.py`, `hermes_state_local.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_transactions.py`, `hermes_state_messages.py`, `hermes_state_compression.py`, `hermes_state_message_archive.py`, `hermes_state_write_metrics.py`, `hermes_state_lockowners.py`, and their focused tests.
 
 ## Focused regression
 
 ```text
-scripts/run_tests.sh tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
+scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
 ```
 
 ## Retirement
 
-Remove this patch when upstream retains the deletion-window gate, bounded automatic prune transactions with guard-safe lineage handling, and cross-platform long-lock diagnostics.
+Remove this patch when upstream retains the deletion-window gate (automatic and operator prune, with an explicit override), single-pass prune per store, receipt retirement without full receipt scans, bounded automatic prune transactions with guard-safe lineage handling, and cross-platform long-lock diagnostics.
 
 ## Rollback
 
