@@ -132,6 +132,13 @@ def _claim_post_delivery(authority, admission_id, event, waiter):
     waiter.add_done_callback(abandoned)
 
 
+async def join_turn_bookkeeping(event):
+    """Keep legacy task settlement behind bookkeeping, outside cosmetic timeouts."""
+    task = getattr(event, '_post_turn_bookkeeping_task', None)
+    if task is not None:
+        await asyncio.shield(task)
+
+
 async def fire_turn_post_delivery(event):
     """Fire, once, the post-delivery cleanup (temporary progress bubbles) of the turn whose reply
     ``event``'s sender just delivered. False when the drain handed this event none."""
