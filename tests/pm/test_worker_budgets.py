@@ -1,5 +1,9 @@
 """The protocol ceiling covers every sequential command, including compile retry."""
 from contextlib import contextmanager
+from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -95,3 +99,23 @@ def test_unbounded_preparation_preserves_remaining_command_budget(monkeypatch):
                 assert len(timers) == 1
     assert timers[-1].seconds == 5900
     assert not deadline.expired.is_set()
+
+
+@pytest.mark.parametrize("timeout", [None, 1])
+def test_bootstrap_locks_need_only_the_preimport_closure(tmp_path, timeout):
+    source = Path(__file__).resolve().parents[2]
+    for relative in ("pm/environments.py", "pm/filesystem.py", "hermes_constants.py"):
+        target = tmp_path / relative
+        target.parent.mkdir(exist_ok=True)
+        shutil.copy2(source / relative, target)
+    (tmp_path / "pm/__init__.py").touch()
+    script = (
+        "import sys; from pathlib import Path\n"
+        f"sys.path.insert(0, {str(tmp_path)!r})\n"
+        "from pm.environments import install_state_lock\n"
+        f"with install_state_lock(Path({str(tmp_path / 'state')!r}), timeout={timeout!r}) as held:\n"
+        "    assert held\n"
+    )
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", script],
+                            capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
