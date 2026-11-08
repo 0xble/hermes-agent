@@ -391,6 +391,12 @@ Release, signing, store publishing and channel promotion workflows remain remove
 
 ## Native Checkpoint Fixture Boundaries
 
+The plugin subdirectory-update scan fixture depends on the shared `admission_env`
+fixture, which pins local uv/Python and runs the real PM dependency transaction
+in-process. Its callers cannot accidentally bootstrap a downloadable toolchain
+before reaching the caution/dangerous scan assertions. Worker transport remains
+covered by the separate plugin worker fixtures.
+
 Release-publication corruption tests call the actual `scripts.bundles.release_artifacts promote` and builds-table CLI owners. Termux build tests call the native build driver directly. Neither depends on a deleted Actions workflow. Archive fixtures force-add their declared local wheel directory, so a contributor's global Git ignore cannot silently remove the fixture dependency from the archived source. Python payload signing requires both a Darwin host and a Darwin target.
 
 Host-specific cases use one native `platforms` marker. Real profile and adapter constructors, explicit selected-payload ownership, an empty completion-parent venv, interpreter-reported base prefixes, and event-controlled probes replace obsolete environment assumptions. Concurrent local transfer fixtures use a threaded HTTP server, preserving the production resolver's IPv4/IPv6 connection behavior. Memory tests exercise actual provider SDK admission and the Hindsight no-install hot-path contract instead of removed dependency bookkeeping. These are fixture adaptations, not waivers of the portable gate or native qualification.
