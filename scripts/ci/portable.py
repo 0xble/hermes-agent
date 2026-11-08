@@ -21,6 +21,9 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from scripts.ci.temporary import temporary_parent
+
 STATE = ROOT / '.ci'
 # Checkout-owned npm and ripgrep at the exact pins; host tools only bootstrap them.
 TOOLCHAIN = STATE / 'toolchain'
@@ -238,7 +241,7 @@ def source_unchanged() -> Iterator[None]:
 @contextmanager
 def external_temporary_directory(prefix: str, parent: Path | None = None) -> Iterator[Path]:
     """Own one temporary directory without repository/dependency ancestry."""
-    parent = (parent if parent is not None else Path(tempfile.gettempdir())).resolve()
+    parent = temporary_parent(parent)
     for ancestor in (parent, *parent.parents):
         if (ancestor / '.git').exists() or (ancestor / 'node_modules').exists():
             raise RuntimeError(f'Temporary directory parent has Git or Node dependency ancestry: {parent}')

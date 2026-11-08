@@ -19,6 +19,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import hermes_yaml as yaml
+from scripts.ci.temporary import temporary_parent as select_temporary_parent
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from validate_plugin_catalog import validate_entry
@@ -135,7 +136,7 @@ def admit(
     errors, _warnings = validate_entry(data)
     if errors:
         raise ValueError("; ".join(errors))
-    with tempfile.TemporaryDirectory(prefix="hermes-plugin-admission-", dir=temporary_parent) as temporary:
+    with tempfile.TemporaryDirectory(prefix="hermes-plugin-admission-", dir=select_temporary_parent(temporary_parent)) as temporary:
         root = Path(temporary)
         clone = root / "source"
         run(["git", "clone", "--filter=blob:none", "--no-checkout", "--depth", "1", "--", data["repo"], str(clone)], cwd=root, timeout=300)

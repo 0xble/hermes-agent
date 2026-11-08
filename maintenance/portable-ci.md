@@ -103,6 +103,17 @@ only the resolved toolchain executable directory. Cargo configuration/cache is
 checkout-owned. Setup/check detect any edits to pre-existing source files and
 fail without overwriting the contributor's work.
 
+Portable temporary-parent selection treats non-empty `TMPDIR` as a required
+parent, even when Python's temporary-directory cache already names another
+volume. Missing paths, non-directories and failed write probes stop setup before
+any lane and name the requested path, without fallback. Unset or empty `TMPDIR`
+keeps the stdlib default. All implicit CI temp parents share this helper, while
+the existing Git/Node ancestry check stays unchanged. This extends
+`fork-ci-reliability`. Retire it when the replacement CI runner enforces the
+same requested-volume contract.
+
+Contract tests: `tests/scripts/ci/test_portable_tmpdir.py`
+
 ## portable-ci-home-sweep
 
 Fork patch identity: `portable-ci-home-sweep`. The identity exactly matches this
