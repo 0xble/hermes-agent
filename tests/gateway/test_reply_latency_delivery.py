@@ -143,6 +143,7 @@ async def test_streamed_final_records_last_confirmed_chunk(monkeypatch, mode):
         clock[0] += 10
         result = await original_send(*args, **kwargs)
         confirmations.append(clock[0])
+        result.message_id = f"chunk-{len(confirmations)}"
         result.raw_response = {"reply_latency_confirmed_at": clock[0]}
         clock[0] += 1  # Bookkeeping after confirmation must not move the delivery clock.
         return result
@@ -151,7 +152,7 @@ async def test_streamed_final_records_last_confirmed_chunk(monkeypatch, mode):
     incoming = event(adapter, "stream")
     bind_agent_start(incoming)
     consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(
-        cursor="", fresh_final_after_seconds=.001))
+        cursor="", fresh_final_after_seconds=.001 if mode == "fresh" else 0))
     consumer._message_id = "preview"
     consumer._message_created_ts = time.monotonic() - 10
     consumer._already_sent = True
