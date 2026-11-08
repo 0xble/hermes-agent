@@ -12,28 +12,36 @@ import re
 import time
 
 logger = logging.getLogger(__name__)
-_IDENTITY = ("platform", "chat_id", "thread_id", "message_id")
+_IDENTITY = ("profile", "platform", "chat_id", "thread_id", "message_id")
 
 
 def read_records(directory: Path | None = None) -> list[dict]:
     """Fold append-only observations into one record per immutable inbound identity.
 
-    The owning profile has its own directory. Transport/authority turn IDs are
-    diagnostic only. Rehydration and duplicate observations never add a sample.
+    The process sink includes routed profiles, so profile is part of the key.
+    Transport/authority turn IDs are diagnostic only. Replays never add a sample.
     """
     if directory is None:
         from hermes_constants import get_hermes_home
         directory = Path(get_hermes_home()) / "logs" / "reply-latency"
     records: dict[tuple, dict] = {}
+    invalid_lines = unreadable_files = 0
     for path in sorted(directory.glob("*.jsonl")):
-        with path.open(encoding="utf-8") as stream:
-            for number, line in enumerate(stream, 1):
-                try:
-                    observation = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning("Ignoring incomplete latency observation at %s:%s", path, number)
-                    continue
-                _fold(records, observation)
+        try:
+            with path.open("rb") as stream:
+                for number, line in enumerate(stream, 1):
+                    try:
+                        observation = json.loads(line.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        invalid_lines += 1
+                        logger.warning("Ignoring invalid latency observation at %s:%s", path, number)
+                        continue
+                    _fold(records, observation)
+        except OSError:
+            unreadable_files += 1
+            logger.warning("Ignoring unreadable latency file %s", path)
+    if invalid_lines or unreadable_files:
+        logger.warning("Skipped %s invalid lines and %s unreadable files", invalid_lines, unreadable_files)
     return list(records.values())
 
 
@@ -48,7 +56,7 @@ def _fold(records: dict, observation: dict) -> None:
     event = observation.get("event")
     if event in {"received", "admitted", "agent_start"}:
         row[event] = min(row.get(event, stamp), stamp)
-    elif event == "first_reply" and observation.get("delivery_kind"):
+    elif event in {"first_visible", "first_reply"} and observation.get("delivery_kind"):
         # Legacy text-only first_reply events did not observe progress. They cannot
         # establish first-visible latency and must remain missing, not bias p90.
         if stamp < row.get("first_visible", float("inf")):

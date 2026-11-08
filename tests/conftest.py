@@ -297,6 +297,7 @@ from tests._fixtures.live_system_guard import (
 from tests._fixtures.model_peer import model_peer  # fixture registers here
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
 from tests._fixtures.repair_capacity import adequate_repair_capacity  # noqa: F401 — registers fixture
+from tests._fixtures.reply_latency import _isolate_reply_latency  # registers fixture
 
 
 @pytest.fixture(autouse=True)

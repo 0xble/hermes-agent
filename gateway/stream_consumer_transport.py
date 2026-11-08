@@ -432,7 +432,7 @@ class StreamTransportMixin:
         # strand final_content_delivered=False and duplicate the send (docs/rca-wecom-
         # stream-final-ack-timeout-duplicate.md).  A definitive failure rolls it back.
         if finalize:
-            self._mark_final_delivered(record=text)  # recorded: stale frame can't suppress
+            self._mark_final_delivered(record=text, confirmed=False)  # stale frame can't suppress
         if await self._try_frame(self._send_frame(text, finalize=finalize),
                                  "send_stream_frame raised, disabling native streaming: %s"):
             # Native-frame success is confirmed delivery, unlike the optimistic finalize above.

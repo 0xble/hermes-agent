@@ -8,7 +8,7 @@ from gateway.reply_latency import bind_agent_start, record_received
 from gateway.platforms.base import SendResult
 from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
-from tests.gateway.test_reply_latency_logs import Adapter, event, records
+from tests.gateway.test_reply_latency_logs import Adapter, event, records, sink_records
 
 
 @pytest.mark.asyncio
@@ -52,15 +52,16 @@ async def test_first_visible_delivery_survives_admission_and_later_chunks(caplog
     }
     adapter.ok = False
     await actions[first]()
-    assert not [r for r in records(caplog) if r["event"] == "first_reply"]
+    assert not [r for r in sink_records() if r["event"] in {"first_visible", "first_reply"}]
     adapter.ok = True
     clock[0] += 2
     await actions[first]()
-    visible = [r for r in records(caplog) if r["event"] == "first_reply"]
+    visible = [r for r in sink_records() if r["event"] == "first_visible"]
     assert len(visible) == 1
     expected_kind = "progress_send" if first == "status" else first
     assert visible[0].get("delivery_kind") == expected_kind
     assert visible[0]["message_id"] == "inbound"
+    assert bool([r for r in records(caplog) if r["event"] == "first_reply"]) == first.startswith("text_")
     clock[0] += 5
     await adapter.send_final_ledgered(restored, "route", "Last chunk", {}, reply_to=None)
     from gateway.reply_latency_report import read_records
@@ -89,10 +90,10 @@ async def test_failed_or_skipped_final_is_not_a_delivery(caplog, monkeypatch, re
                           error_kind="forbidden" if refusal == "failed" else None)
     monkeypatch.setattr(adapter, "send", refused)
     await adapter.send_final_ledgered(incoming, "route", "Answer", {}, reply_to=None)
-    assert not [r for r in records(caplog) if r["event"] in {"first_reply", "final_delivery"}]
+    assert not [r for r in sink_records() if r["event"] in {"first_reply", "first_visible", "final_delivery"}]
     monkeypatch.setattr(adapter, "send", failed_send)
     await adapter.send_final_ledgered(incoming, "route", "Answer", {}, reply_to=None)
-    assert len([r for r in records(caplog) if r["event"] == "final_delivery"]) == 1
+    assert len([r for r in sink_records() if r["event"] == "final_delivery"]) == 1
 
 
 @pytest.mark.asyncio

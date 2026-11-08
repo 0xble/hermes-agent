@@ -9,12 +9,10 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
-import os
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +27,7 @@ class ReplyReceipt:
     identity: dict[str, Any]
     started: bool = False
     replied: bool = False
+    visible: bool = False
     admitted: bool = False
     last_delivery_at: float | None = None
     last_delivery_kind: str | None = None
@@ -42,27 +41,16 @@ _delivery_kind: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "gateway_reply_delivery_kind", default=None)
 
 
-@lru_cache(maxsize=128)
-def _ensure_log_directory(directory: Path) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-
-
 def _emit(receipt: ReplyReceipt, event: str, timestamp: float, **details: Any) -> None:
     try:
-        payload = json.dumps(
-            {**receipt.identity, "event": event, "timestamp": timestamp, **details},
-            separators=(",", ":"), sort_keys=True)
-        logger.info("gateway_reply_latency %s", payload)
-        from hermes_constants import get_hermes_home
-        directory = receipt.log_dir or Path(get_hermes_home()) / "logs" / "reply-latency"
-        _ensure_log_directory(directory)
-        day = datetime.fromtimestamp(timestamp, UTC).date().isoformat()
-        # A single O_APPEND write keeps concurrent turns/processes from interleaving JSON lines.
-        fd = os.open(directory / f"{day}.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, (payload + "\n").encode("utf-8"))
-        finally:
-            os.close(fd)
+        if event in {"received", "agent_start", "first_reply"}:
+            fields = ("profile", "platform", "chat_id", "thread_id", "turn_id", "message_id", "origin")
+            logger.info("gateway_reply_latency %s", json.dumps(
+                {**{key: receipt.identity[key] for key in fields}, "event": event, "timestamp": timestamp},
+                separators=(",", ":"), sort_keys=True))
+        from gateway.reply_latency_sink import emit, log_directory
+        emit(receipt.log_dir or log_directory(),
+             {**receipt.identity, "event": event, "timestamp": timestamp, **details}, time.time())
     except Exception:
         logger.debug("Could not emit reply latency record", exc_info=True)
 
@@ -88,7 +76,7 @@ def record_received(event: Any) -> ReplyReceipt | None:
     stamp = stamp_received(event)
     try:
         from gateway.outbox import transport_id
-        from hermes_constants import get_hermes_home
+        from gateway.reply_latency_sink import log_directory
         from hermes_cli.profiles import current_profile_name
 
         source = getattr(event, "source", None)
@@ -106,9 +94,13 @@ def record_received(event: Any) -> ReplyReceipt | None:
             "profile": str(getattr(source, "profile", None) or current_profile_name("default")),
             "chat_id": str(source.chat_id),
             "thread_id": str(thread_id) if thread_id is not None else None,
-        }, log_dir=Path(get_hermes_home()) / "logs" / "reply-latency")
+            "receipt_id": getattr(event, "_reply_latency_receipt_id", None) or uuid.uuid4().hex,
+        }, log_dir=log_directory())
+        event._reply_latency_receipt_id = receipt.identity["receipt_id"]
         receipt.identity["inbound_key"] = [receipt.identity[name] for name in
                                            ("platform", "chat_id", "thread_id", "message_id")]
+        receipt.identity["inbound_identity"] = [receipt.identity[name] for name in
+            ("profile", "platform", "chat_id", "thread_id", "message_id")]
         event._reply_latency_receipt = receipt
         _emit(receipt, "received", stamp)
         return receipt
@@ -140,6 +132,25 @@ def record_admitted(event: Any) -> None:
 
 def current_receipt() -> ReplyReceipt | None:
     return _current.get()
+
+
+def record_coverage() -> None:
+    """The existing gateway housekeeping tick attests idle instrumentation too."""
+    from gateway.reply_latency_sink import emit, log_directory
+    from hermes_cli.profiles import current_profile_name
+    try:
+        emit(log_directory(), {"event": "coverage", "timestamp": time.time(),
+                              "profile": current_profile_name("default")}, time.time())
+    except Exception:
+        logger.debug("Could not emit reply latency coverage", exc_info=True)
+
+
+def record_no_reply(event: Any) -> None:
+    """Intentional silence ends a human input without inventing assistant text."""
+    receipt = getattr(event, "_terminal_reply_latency_receipt",
+                      getattr(event, "_reply_latency_receipt", None))
+    if receipt is not None and not receipt.replied:
+        _emit(receipt, "no_reply", time.time())
 
 
 def restore_receipt(receipt: ReplyReceipt | None) -> None:
@@ -175,7 +186,10 @@ def record_first_reply(
     stamp = raw.get("reply_latency_confirmed_at", time.time()) if isinstance(raw, dict) else time.time()
     receipt.last_delivery_at, receipt.last_delivery_kind = stamp, kind
     receipt.last_delivery_text = text.strip()
-    if not receipt.replied:
+    if not receipt.visible:
+        receipt.visible = True
+        _emit(receipt, "first_visible", stamp, delivery_kind=kind)
+    if not receipt.replied and kind.startswith("text_"):
         receipt.replied = True
         _emit(receipt, "first_reply", stamp, delivery_kind=kind)
     return stamp

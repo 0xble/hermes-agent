@@ -13,7 +13,7 @@ def test_report_groups_admission_ids_and_reports_coverage_and_linear_quantiles(t
         rows += [dict(base, event="received", timestamp=100),
                  dict(base, event="received", timestamp=100, turn_id="admission"),
                  dict(base, event="agent_start", timestamp=101, turn_id="admission"),
-                 dict(base, event="first_reply", timestamp=100 + seconds, delivery_kind="progress_send"),
+                 dict(base, event="first_visible", timestamp=100 + seconds, delivery_kind="progress_send"),
                  dict(base, event="final_delivery", timestamp=110 + seconds, delivery_kind="text_send")]
     rows += [dict(identity, message_id="missing", event="received", timestamp=100),
              dict(identity, message_id="old", event="received", timestamp=10),
