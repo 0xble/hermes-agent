@@ -261,7 +261,8 @@ checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
 
-Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`, `fork-ci`.
+Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`, `fork-ci`,
+  `Minimal hosted fork CI`.
 The `fork-ci` identity owns the subagent process handoff test synchronization below.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability

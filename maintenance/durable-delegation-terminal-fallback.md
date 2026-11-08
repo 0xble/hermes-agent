@@ -50,7 +50,8 @@ instead of its real result.
 
 ## Provenance
 
-Fork patch identity: `durable-delegation-terminal-fallback`.
+Fork patch identities: `durable-delegation-terminal-fallback`,
+  `Durable delegation terminal-write fallback`.
 
 Upstream-owned code. No upstream issue or PR covered durable outbox delivery
 for child failure notices or terminal-write fallbacks when this patch landed.
