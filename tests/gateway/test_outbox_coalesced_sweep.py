@@ -129,7 +129,13 @@ def _fds() -> int:
 @pytest.mark.asyncio
 async def test_rows_sharing_a_deadline_wake_one_sweep_one_pass(tmp_path, monkeypatch, caplog):
     store = Outbox(tmp_path)
-    rows = [_defer(store, f"reply-{n}", 0.2) for n in range(200)]
+    # A flood penalty supplies one absolute deadline, regardless of how long
+    # writing the deferred rows takes on a loaded runner.
+    wall = time.time()
+    with monkeypatch.context() as seed_clock:
+        seed_clock.setattr(outbox, "time", SimpleNamespace(time=lambda: wall))
+        rows = [_defer(store, f"reply-{n}", 0.2) for n in range(200)]
+    assert len({deadline for _row, deadline in store.scheduled()}) == 1
     held = [_hold(store, f"uncertain-{n}") for n in range(3)]
     adapter = _Adapter()
 
@@ -149,7 +155,9 @@ async def test_rows_sharing_a_deadline_wake_one_sweep_one_pass(tmp_path, monkeyp
         for _ in rows:  # every deferred send used to schedule its own retry task
             await _schedule_retry(store, adapter)
         assert len(outbox._SWEEPS) == 1
-        await _until(lambda: len(adapter.sends) == len(rows))
+        # This cell proves coalescing and durable delivery, not a 5-second
+        # throughput SLA for hundreds of SQLite transactions under the full gate.
+        await _until(lambda: len(adapter.sends) == len(rows), timeout=30)
         await _until(lambda: not outbox._SWEEPS)
         # Connections are closed per operation, not left for GC with their WAL/SHM descriptors.
         assert _fds() - before < 20

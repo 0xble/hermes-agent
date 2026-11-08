@@ -63,6 +63,16 @@ waking the parked sweep, and a sweep surviving a failed pass. On the pre-patch b
 the same 200-row scenario ran 200 passes, logged 634 held lines and leaked 70,563
 descriptors.
 
+The shared-deadline fixture freezes only the outbox wall clock while seeding
+its 200 rows, then restores real time before dispatch. Equal relative delays
+written at different times do not model one flood-penalty deadline. Assert that
+the persisted deadlines are identical, retain the one-pass expectation and
+all descriptor, held-row and delivery checks, and leave production clocks and
+retry timing unchanged. The 200-row completion watchdog is 30s, not a 5s
+throughput assertion. Pacing each send by 30ms reproduces the old timeout while
+the corrected fixture still requires all rows delivered in exactly 1 pass.
+Other retry, backoff and wakeup watchdogs are unchanged.
+
 **Rollback:** Revert the `fix(gateway): coalesce deferred outbox redelivery into one
 sweep` commit. It involves no schema, state or configuration change, and N-1
 releases share the store unchanged.

@@ -528,6 +528,17 @@ psutil installation instead and does not cover this failure. No upstream
 publication is claimed. Retire this adaptation when released upstream preserves
 both permission-denial containment and the existing resolved-home boundary.
 
+## Reset cleanup synchronization
+
+The `fork-ci-reliability` identity covers
+`tests/gateway/test_reset_button_deadlock.py`. Worker admission is not bounded
+by 200 loop sleeps or by heartbeat frequency on a loaded host. Signal actual
+`close()` entry back to the loop, hold its real worker until the loop responds,
+and assert distinct worker identity before releasing it in `finally`.
+A delayed executor must still pass and an inline cleanup must fail. Preserve
+the separate cleanup-error and timeout cases. Production cleanup and its timeout
+are unchanged. Retire when upstream carries equivalent event-driven coverage.
+
 ## Linked worktree test venv
 
 The `fork-ci-reliability` identity also covers the canonical runner's venv
