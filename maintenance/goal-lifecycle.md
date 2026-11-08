@@ -34,6 +34,11 @@ clears the goal once with one short notice, before dispute pause or timed backof
   that callback deliver immediately instead of registering behind a callback
   that already fired. Legacy adapter tasks join bookkeeping after cosmetic cleanup
   so their existing task-settlement barrier still covers loop completion.
+  Refused registrations and mismatched legacy guard generations finish inline.
+  The join waits at most 30 seconds before logging and attempting inline
+  completion, with one shared start fence preventing duplicate bookkeeping
+  if delivery arrives late or the judge is already running. FIFO handoff retains
+  both bubble-cleanup and bookkeeping owners when their routes differ.
   Direct handler callers without a delivery owner, including
   adapters without callback support, finish bookkeeping inline. The admission
   drain explicitly declares delivery ownership in its result context. An
@@ -43,7 +48,8 @@ clears the goal once with one short notice, before dispute pause or timed backof
   Progress cleanup still runs when a newer generation sweeps stale callbacks.
   Native delivery applies the existing intentional-silence policy before sending
   a bare marker, while the captured model result remains available for judging.
-  Regression: `tests/gateway/test_post_turn_delivery_latency.py` and unchanged
+  Regression: `tests/gateway/test_post_turn_bookkeeping_teardown.py`,
+  `tests/gateway/test_post_turn_delivery_latency.py` and unchanged
   `tests/gateway/test_loop_tick_native_settlement.py`.
   Retire when upstream delivers before equivalent nonessential bookkeeping
   under the same durability contract. Rollback reverts this scheduling slice,
