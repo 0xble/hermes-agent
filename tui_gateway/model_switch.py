@@ -323,6 +323,7 @@ def _apply_model_switch(
     """``count_switch=False``: an internal swap (config adoption, MoA one-shot and its restore), not a
     user's /model pick, so it stays out of the shared-metrics switch count."""
     from hermes_cli.model_switch import parse_model_switch_args, switch_model
+    from tui_gateway.methods_config_set import _refuse_managed_model_pick
     if parsed_flags is None:
         parsed_flags = parse_model_switch_args(raw_input)
     if getattr(parsed_flags, "is_reset", False):
