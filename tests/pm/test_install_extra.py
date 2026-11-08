@@ -6,6 +6,11 @@ import pytest
 from pm import install_hint
 
 
+@pytest.fixture(autouse=True)
+def no_legacy_install(monkeypatch):
+    monkeypatch.setattr("pm.extras.legacy_selection", lambda _root: ["all"])
+
+
 def test_hint_names_a_command_the_cli_accepts(monkeypatch):
     from pm import cli, runtime
     from pm import install as install_mod
