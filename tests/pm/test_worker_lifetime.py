@@ -94,7 +94,7 @@ def test_control_eof_stops_sync_but_preserves_ensure_pause(tmp_path, operation):
         "'import threading; threading.Event().wait(3600)'])\n"
         "print(json.dumps([os.getpid(), child.pid]), flush=True)\n"
         "pause = threading.Event()\n"
-        "_read_controls(queue.Queue(), pause, os.dup(0))\n"
+        "_read_controls(queue.Queue(), pause, os.dup(0), threading.Event())\n"
         "assert pause.is_set()\n"
         "child.kill(); child.wait(timeout=5)\n"
     )

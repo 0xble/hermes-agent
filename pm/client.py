@@ -112,6 +112,7 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
         "id": request_id, "operation": operation, "arguments": arguments,
         "update_id": update_id,
         "callbacks": list(callbacks),
+        "accepts": ["deadline"],
         "packages": package_definitions(names),
         "context": {"repo": str(Path(project_root).absolute() if project_root is not None else paths.repo_root()),
                     "lockfile": str(paths.lockfile_path())},
