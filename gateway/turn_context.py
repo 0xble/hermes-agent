@@ -71,6 +71,9 @@ class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
     reply_expected: Optional[bool] = None
+    # Folded human input owns final delivery without changing the persisted opener's provenance.
+    # Uses the same terminal contract keys as queued successors and silence continuations.
+    terminal_reply_metadata: dict = field(default_factory=dict)
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False

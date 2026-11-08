@@ -53,7 +53,12 @@ def harness(monkeypatch, tmp_path):
     agent.save_trajectories = False
     for name in ("_persist_session", "_save_trajectory", "_cleanup_task_resources"):
         monkeypatch.setattr(agent, name, MagicMock())
-    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **kw: "ok")
+    def tool_result(*args, **kwargs):
+        if callable(getattr(h, "tool_hook", None)):
+            h.tool_hook()
+        return "ok"
+
+    monkeypatch.setattr("model_tools.handle_function_call", tool_result)
     adapter = FinalizeCaptureAdapter()
     adapter.deleted = []
 
@@ -126,8 +131,9 @@ def harness(monkeypatch, tmp_path):
         return consumer
 
     monkeypatch.setattr(stream_mod, "GatewayStreamConsumer", capture_consumer)
-    return SimpleNamespace(agent=agent, runner=runner, adapter=adapter, event=event,
-                           state=state, calls=calls, consumers=consumers, preview_ticks=preview_ticks)
+    h = SimpleNamespace(agent=agent, runner=runner, adapter=adapter, event=event,
+                        state=state, calls=calls, consumers=consumers, preview_ticks=preview_ticks)
+    return h
 
 
 async def _run(h, finals, *, typed=True, preamble=False, display_kind=None, first_tool=True,
@@ -182,6 +188,9 @@ async def _run(h, finals, *, typed=True, preamble=False, display_kind=None, firs
     return await h.runner._run_agent(message=h.event.text, context_prompt="", history=[],
         source=h.event.source, session_id="silence-test", session_key=SESSION_KEY,
         run_generation=1, reply_expected=h.event.reply_expected,
+        internal=h.event.internal, event_metadata=h.event.metadata,
+        persist_user_display_metadata={"display_text": h.event.metadata["display_text"]}
+        if "display_text" in h.event.metadata else None,
         persist_user_display_kind=display_kind, event_message_id="relay-1", inbound_message_id="relay-1")
 
 
@@ -242,6 +251,58 @@ async def test_folded_human_gets_one_gateway_retry(harness, marker):
     assert (await _shape(h, result))[:2] == (ANSWER, False)
     assert len(h.consumers) == 2 and h.consumers[0] is not h.consumers[1]
     assert _payloads(h) and all("NO_REPLY" not in payload and "[SILENT]" not in payload for payload in _payloads(h))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["supervisor_checkin", "internal_notification",
+                                 "process_complete", "async_delegation_complete"])
+@pytest.mark.parametrize("mode", ["steer", "redirect"])
+@pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
+@pytest.mark.parametrize("second_marker", [False, True])
+async def test_human_fold_owns_machinery_silence_without_rewriting_opener(
+    harness, kind, mode, marker, second_marker,
+):
+    h = harness
+    h.event.internal = True
+    h.event.text = "Inspect the outstanding dependencies."
+    h.event.metadata = {"display_kind": kind, "display_text": "Background inspection"}
+    incoming = MessageEvent(text=TYPED_TEXT, source=h.event.source, message_id="462")
+    folded = False
+
+    def fold_during_tool():
+        nonlocal folded
+        if folded:
+            return
+        folded = True
+        assert h.runner._human_preempts_autonomous_turn(incoming, h.state)
+        if mode == "redirect":
+            assert h.runner._redirect_active_turn(h.agent, incoming.text, SESSION_KEY, incoming)
+        else:
+            assert h.runner._steer_running_agent(h.agent, incoming.text)
+            assert h.runner._fold_into_running_turn(h.agent, SESSION_KEY, incoming) is h.state.turn
+
+    h.tool_hook = fold_during_tool
+    result = await _run(h, [marker, marker if second_marker else ANSWER], typed=False, display_kind=kind)
+    assert folded
+    assert len(h.calls) == 2
+    assert result["final_response"] == (marker if second_marker else ANSWER)
+    assert (await _shape(h, result))[:2] == (
+        _unexpected_silence_reply() if second_marker else ANSWER, False,
+    )
+    assert h.calls[0].run_generation == h.calls[1].run_generation == 1
+    assert h.calls[0].persist_user_display_kind == kind
+    assert h.event.internal and h.event.metadata["display_kind"] == kind
+    opener = next(row for row in result["messages"] if row.get("content") == h.event.text)
+    assert opener["display_kind"] == kind
+    assert opener["display_metadata"]["display_text"] == "Background inspection"
+    assert any(TYPED_TEXT in str(row.get("content")) for row in h.calls[1].history)
+    if mode == "redirect":
+        assert h.event.ledger_message_id == "462"
+        # Forum topics route by thread metadata, not reply_to. Ledger identity still follows the human.
+        assert h.calls[1].event_message_id is None
+        assert h.calls[1].inbound_message_id == "462"
+        assert result["queued_terminal_inbound_id"] == "462"
+    assert all(marker not in text for text in _payloads(h))
 
 
 @pytest.mark.asyncio
@@ -340,12 +401,25 @@ async def test_second_marker_is_terminal_and_human_fallback_remains(harness):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", [None, "internal_notification"])
-async def test_relay_only_or_machinery_has_no_retry_or_delivery(harness, kind):
+@pytest.mark.parametrize("kind", [None, "internal_notification", "supervisor_checkin"])
+@pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
+@pytest.mark.parametrize("folded", [None, "relay", "unaddressed"])
+async def test_relay_only_or_machinery_has_no_retry_or_delivery(harness, kind, marker, folded):
     h = harness
     if kind:
         h.event.reply_expected = None
-    result = await _run(h, ["NO_REPLY"], typed=False, display_kind=kind)
+        h.event.internal = True
+    if folded:
+        incoming = MessageEvent(
+            text="FYI\n[relay from=agent/cron receipt=r-2]" if folded == "relay" else "A side conversation.",
+            source=h.event.source, message_id="folded-1",
+            reply_expected=None if folded == "relay" else False,
+        )
+        def fold_during_tool():
+            assert h.runner._steer_running_agent(h.agent, incoming.text)
+            assert h.runner._fold_into_running_turn(h.agent, SESSION_KEY, incoming) is h.state.turn
+        h.tool_hook = fold_during_tool
+    result = await _run(h, [marker], typed=False, display_kind=kind)
     assert len(h.calls) == 1
     assert (await _shape(h, result))[1] is True
     assert not _payloads(h)

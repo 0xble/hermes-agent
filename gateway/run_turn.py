@@ -5045,10 +5045,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         if self._is_intentional_silence(_delivery_result, first_response):
             # Runtime provenance describes the continuation row, not the original human's silence
             # contract. A queued successor must not make the retry's second marker silently legal.
-            silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
+            silence_kind = (None if getattr(turn_ctx, "silence_retry", False) else _delivery_result.get(
+                "queued_terminal_display_kind", turn_ctx.persist_user_display_kind))
+            silence_reply_expected = _delivery_result.get("queued_terminal_reply_expected", turn_ctx.reply_expected)
             from gateway.response_filters import reaction_answered
             if ((reaction_answered(_delivery_result) and silence_kind != "supervisor_checkin")
-                    or silence_allowed(silence_kind, turn_ctx.reply_expected)):
+                    or silence_allowed(silence_kind, silence_reply_expected)):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -5836,11 +5838,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             pending_event, pending = defer_review_followup(self, turn_ctx, adapter, pending_event, pending)
+            from gateway.run_turn_silence_recovery import apply_terminal_reply_metadata, silence_recovery_due
+            apply_terminal_reply_metadata(turn_ctx, response, result)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
-            from gateway.run_turn_silence_recovery import silence_recovery_due
             if silence_recovery_due(self, response, turn_ctx, silence_retry=_silence_retry,
                                     scheduled_heartbeat=scheduled_heartbeat):
                 # End-of-turn filtering must finish BEFORE a new consumer can preview the retry.

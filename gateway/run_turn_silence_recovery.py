@@ -20,20 +20,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger("gateway.run_turn")
 
 
+def apply_terminal_reply_metadata(turn_ctx: TurnContext, *results: Any) -> None:
+    """Carry folded ownership to delivery without relabeling the internal opener or its card."""
+    if not turn_ctx.terminal_reply_metadata:
+        return
+    for result in results:
+        if isinstance(result, dict):
+            result.update(turn_ctx.terminal_reply_metadata)
+            result["queued_terminal_inbound_id"] = turn_ctx.inbound_message_id
+
+
 def silence_recovery_due(runner, response: Any, turn_ctx: "TurnContext", *,
                          silence_retry: bool, scheduled_heartbeat: bool) -> bool:
     """Whether a finished execution should get its single recovery re-prompt.
 
-    Never for the recovery itself (bounded to once), heartbeats, interrupted or incomplete runs
+    Never for the recovery itself (bounded to once), untouched heartbeats, interrupted or incomplete runs
     (a partial marker is not a completed silence choice), or turns whose contract permits silence
     (relay-only and machinery turns keep their allowed silence).
     """
     return bool(
-        not (silence_retry or scheduled_heartbeat) and isinstance(response, dict)
+        not (silence_retry or (scheduled_heartbeat and not turn_ctx.terminal_reply_metadata))
+        and isinstance(response, dict)
         and not response.get("interrupted") and response.get("completed") is not False
         and not reaction_answered(response)
         and runner._is_intentional_silence(response, response.get("final_response", ""))
-        and not silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected)
+        and not silence_allowed(
+            response.get("queued_terminal_display_kind", turn_ctx.persist_user_display_kind),
+            response.get("queued_terminal_reply_expected", turn_ctx.reply_expected),
+        )
         and turn_ctx._run_still_current()
     )
 
@@ -77,8 +91,10 @@ async def run_silence_followup(runner, response: dict, turn_ctx: "TurnContext") 
     # been redirected onto a newer human message, so preserve that live terminal identity
     # separately from the original turn's silence contract.
     if isinstance(merged, dict) and "queued_terminal_display_kind" not in merged:
-        merged = {**merged, "queued_terminal_display_kind": turn_ctx.persist_user_display_kind,
-                  "queued_terminal_reply_expected": turn_ctx.reply_expected,
+        merged = {**merged, "queued_terminal_display_kind": response.get(
+                      "queued_terminal_display_kind", turn_ctx.persist_user_display_kind),
+                  "queued_terminal_reply_expected": response.get(
+                      "queued_terminal_reply_expected", turn_ctx.reply_expected),
                   "queued_terminal_inbound_id": (
                       followup.get("_terminal_inbound_id") or turn_ctx.inbound_message_id
                       if isinstance(followup, dict) else turn_ctx.inbound_message_id
