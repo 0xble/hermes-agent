@@ -911,3 +911,20 @@ This evidence establishes the original fixture regression, not a new hang above
 
 
 Contract tests: `tests/gateway/test_gateway_slot_isolation.py`.
+
+Local component pause tests keep all but the first real archive range behind an
+event until the router pauses the transfer. PM deliberately coalesces progress,
+so an uncoordinated loopback transfer can legitimately report only completion.
+Reading the second fixture archive in 1 chunk reproduces the old missing-progress
+assertion for both endpoints without invoking Python toolchain provisioning.
+The resident PM route uses the registered fixture package and its loopback pins,
+so neither `admission_env` nor `build_worker` belongs in this test. Preserve real
+archive I/O, retained pins/partials, absent facts before resume and sequence stops.
+The shared range server admits a full `Download.CONNECTIONS` burst before its
+accept thread runs, instead of the stdlib's smaller listen backlog. Attempt 9
+reported loopback connection resets before the progress wait expired. This removes
+that fixture bottleneck without changing PM retry or deadline behavior.
+Retire these adaptations when upstream supplies equivalent causal pause fixtures
+and a server sized for its downloader's concurrency.
+
+Contract tests: `tests/gateway/test_gateway_slot_isolation.py`, `tests/hermes_cli/test_local_component_jobs.py`, `tests/pm/test_downloader.py`.
