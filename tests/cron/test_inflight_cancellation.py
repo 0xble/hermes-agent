@@ -284,7 +284,13 @@ def test_remote_cancel_names_cause_and_preserves_budget(isolated_store, monkeypa
         assert not control.is_set()
         assert future.result(timeout=5)
     execution = scheduler.get_execution(claimed["execution_id"])
-    assert execution["error"] == scheduler._CANCELLED_INTERRUPTED
+    assert execution is not None
+    if action == "remove":
+        # Removal carries the upstream per-execution cancel marker and its specific reason.
+        assert execution["status"] == "cancelled"
+        assert execution["error"] == "job removed while running"
+    else:
+        assert execution["error"] == scheduler._CANCELLED_INTERRUPTED
     delivery.assert_not_called()
     if action in {"pause", "disable"}:
         current = jobs.get_job(job["id"])

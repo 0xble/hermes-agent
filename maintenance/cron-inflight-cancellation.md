@@ -56,9 +56,16 @@ and scheduler auto-pause of malformed legacy jobs. Auto-pause may deliver the
 blocked-run reason from that exact run-local pause; an operator pause still
 interrupts it, and another owner or heartbeat context receives no exception.
 
-Upstream candidates: NousResearch/hermes-agent issue #133057 and PR #133169
-(`hermes cron cancel`); inspect their semantics before adoption. Retire this patch
-only when upstream also covers remove/pause, tool receipts, and running visibility
-with the same regressions green. Source landing is not live gateway deployment.
+Upstream's execution cancel marker is shipped in commit
+[`ee394bd9213bbc9dae05d2af86e224eab70be4d6`](https://github.com/NousResearch/hermes-agent/commit/ee394bd9213bbc9dae05d2af86e224eab70be4d6),
+https://github.com/NousResearch/hermes-agent/pull/144801 salvages
+https://github.com/NousResearch/hermes-agent/pull/133169.
+Remote removal now records terminal `cancelled` with the exact marker reason
+`job removed while running`, not the generic schedule-interruption error used by
+pause/disable. Keep the removal status/reason assertions distinct while retaining
+all pause/disable budget, delivery, and ownership checks. Retire the remaining
+fork adaptation only when upstream covers remove/pause, tool receipts, and running
+visibility with the same regressions green. Source landing is not live gateway
+deployment.
 
 The external-worker waiter accepts `cancelled` alongside `completed` and `failed` as a durable terminal verdict. It must not report unknown side effects after the owner has already committed cancellation. `tests/cron/test_cron_cancel_bookkeeping.py::test_the_external_worker_waiter_accepts_a_cancelled_row` exercises the real waiter against that ledger row. Retire this adaptation when the upstream waiter recognizes all scheduler terminal states.
