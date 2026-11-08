@@ -441,6 +441,53 @@ def _script_argv(
     return [python_exe, str(path)], env_overlay, None
 
 
+# A failing dependency build can print megabytes. Keep the setup and the final
+# diagnostic in the prompt; retain the full redacted text outside the context.
+_SCRIPT_ERROR_HEAD_CHARS = 1000
+_SCRIPT_ERROR_TAIL_CHARS = 3000
+
+
+def _script_error_excerpt(text: str) -> str:
+    omitted = len(text) - _SCRIPT_ERROR_HEAD_CHARS - _SCRIPT_ERROR_TAIL_CHARS
+    if omitted <= 0:
+        return text
+    return (
+        f"{text[:_SCRIPT_ERROR_HEAD_CHARS]}\n[... {omitted} characters omitted ...]\n"
+        f"{text[-_SCRIPT_ERROR_TAIL_CHARS:]}"
+    )
+
+
+def _script_error_pointer(full: str, cron_job_id: Optional[str]) -> str:
+    """Best-effort latest failure log; never let diagnostic I/O hide the script failure."""
+    try:
+        from cron import jobs
+        from utils import atomic_write_text
+
+        directory = jobs._job_output_dir(str(cron_job_id or ""))
+        jobs.ensure_dirs()
+        _ensure_cron_dir(directory)
+        jobs._secure_dir(directory)
+        path = directory / "script-error.log"
+        atomic_write_text(path, full + "\n", tmp_prefix=".script_error_", mode=0o600)
+        return f"Full output ({len(full)} characters): {path}"
+    except Exception as exc:
+        logger.debug("Could not save full script error output: %s", exc, exc_info=True)
+        return f"Full output ({len(full)} characters) was not saved."
+
+
+def _script_error_output(
+    returncode: int, stdout: str, stderr: str, cron_job_id: Optional[str],
+) -> str:
+    """Format already-redacted streams, saving full output only when a stream is truncated."""
+    header = f"Script exited with code {returncode}"
+    streams = [(name, text) for name, text in (("stderr", stderr), ("stdout", stdout)) if text]
+    full = "\n".join([header] + [f"{name}:\n{text}" for name, text in streams])
+    bounded = "\n".join([header] + [f"{name}:\n{_script_error_excerpt(text)}" for name, text in streams])
+    if bounded != full:
+        bounded += "\n" + _script_error_pointer(full, cron_job_id)
+    return bounded
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
@@ -555,12 +602,7 @@ def _run_job_script(
             stdout = stderr = "[REDACTED - redaction failed]"
 
         if proc.returncode != 0:
-            parts = [f"Script exited with code {proc.returncode}"]
-            if stderr:
-                parts.append(f"stderr:\n{stderr}")
-            if stdout:
-                parts.append(f"stdout:\n{stdout}")
-            return False, "\n".join(parts)
+            return False, _script_error_output(proc.returncode, stdout, stderr, cron_job_id)
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
