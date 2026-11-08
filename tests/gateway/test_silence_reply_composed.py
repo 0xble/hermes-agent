@@ -19,7 +19,7 @@ from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter
 
 real_loop = recovery.real_loop
 ANSWER = "Your meeting is at 3pm."
-WARNING = "The model returned only a silence marker"
+WARNING = "No reply was written for this message"
 
 
 @pytest.mark.asyncio
@@ -39,6 +39,8 @@ async def test_real_loop_silence_delivery(monkeypatch, tmp_path, real_loop, plat
             recovery._call("todo_list", {"todos": []}, "call_todo"),
         ]))
     script.append(recovery._response("NO_REPLY"))
+    if not housekeeping:
+        script.append(recovery._response("NO_REPLY"))
     agent.client = MagicMock()
     agent.client.chat.completions.create.side_effect = lambda **_kw: script.pop(0)
 
