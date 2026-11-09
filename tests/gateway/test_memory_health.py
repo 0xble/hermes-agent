@@ -14,8 +14,8 @@ from plugins.memory import hindsight
 def setup_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / "hindsight").mkdir(parents=True)
-    (home / "config.yaml").write_text("memory: {provider: hindsight}\n")
-    (home / "hindsight/config.json").write_text(json.dumps({"mode": "local_external"}))
+    (home / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
+    (home / "hindsight/config.json").write_text(json.dumps({"mode": "local_external"}), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr("hermes_cli.version_info.get_code_identity", lambda: {"sha": "release-A"})
@@ -71,10 +71,10 @@ async def test_missing_client_after_boot_is_detected_and_unsent_notice_retries(t
     home = setup_home(tmp_path, monkeypatch)
     caplog.set_level(logging.ERROR, logger="gateway.runtime_health")
     gateway = runner()
-    (home / "config.yaml").write_text("memory: {}\n")
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
     await check_memory_health(gateway)
     assert not caplog.records
-    (home / "config.yaml").write_text("memory: {provider: hindsight}\n")
+    (home / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
     gateway._send_home_channel_message.return_value = False
     await check_memory_health(gateway)
     gateway._send_home_channel_message.return_value = True
@@ -133,7 +133,7 @@ async def test_readiness_failure_is_logged_once_and_startup_checks_other_profile
     home = setup_home(tmp_path, monkeypatch)
     other = tmp_path / "other"
     other.mkdir()
-    (other / "config.yaml").write_text("memory: {provider: hindsight}\n")
+    (other / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
     monkeypatch.setattr("gateway.run._handoff_watch_scopes", lambda _: [("broken", home), ("healthy", other)])
     checked = []
 
@@ -239,12 +239,12 @@ async def test_muted_profile_is_log_only_without_a_delivery_marker(tmp_path, mon
     from gateway.runtime_health import _marker, check_memory_health
 
     home = setup_home(tmp_path, monkeypatch)
-    (home / "config.yaml").write_text("memory: {provider: hindsight}\n" + display)
+    (home / "config.yaml").write_text("memory: {provider: hindsight}\n" + display, encoding="utf-8")
     other = tmp_path / "other"
     other.mkdir()
-    (other / "config.yaml").write_text("memory: {provider: hindsight}\n")
+    (other / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
     (other / "hindsight").mkdir()
-    (other / "hindsight/config.json").write_text(json.dumps({"mode": "local_external"}))
+    (other / "hindsight/config.json").write_text(json.dumps({"mode": "local_external"}), encoding="utf-8")
     monkeypatch.setattr("gateway.run._handoff_watch_scopes", lambda _: [(None, home), ("other", other)])
     gateway = runner()
     gateway._served_home_channel_transports = lambda: [
@@ -264,7 +264,7 @@ async def test_muted_profile_is_log_only_without_a_delivery_marker(tmp_path, mon
     assert len(caplog.records) == 2  # one logged diagnostic per profile, not per retry
 
     # A muted presentation is not delivery. Opting back in can still deliver this release's notice.
-    (home / "config.yaml").write_text("memory: {provider: hindsight}\n")
+    (home / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
     await check_memory_health(gateway)
     assert gateway._send_home_channel_message.await_count == 2
     assert gateway._send_home_channel_message.call_args.args[1] == "muted"
@@ -279,7 +279,7 @@ async def test_undeliverable_notice_reuses_logged_readiness_across_restarts(tmp_
     home = setup_home(tmp_path, monkeypatch)
     if delivery == "muted":
         (home / "config.yaml").write_text(
-            "memory: {provider: hindsight}\ndisplay: {suppress_warning_notifications: true}\n")
+            "memory: {provider: hindsight}\ndisplay: {suppress_warning_notifications: true}\n", encoding="utf-8")
     probe = Mock(wraps=runtime_health._readiness_issue)
     monkeypatch.setattr(runtime_health, "_readiness_issue", probe)
     for attempt in range(3):

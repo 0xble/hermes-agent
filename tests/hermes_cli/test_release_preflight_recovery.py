@@ -18,7 +18,7 @@ def provider(root, *, available=False, old_api=False, crash=False, reason="clien
         "class Provider:\n"
         f" def is_available(self): return {available!r}\n"
         f" def unavailable_reason(self): return {reason!r}\n"
-        f"def load_memory_provider({signature}): {body}\n")
+        f"def load_memory_provider({signature}): {body}\n", encoding="utf-8")
 
 
 def pair(tmp_path, monkeypatch):
@@ -28,7 +28,7 @@ def pair(tmp_path, monkeypatch):
     a, b = [release(home, name, {}) for name in ("A", "B")]
     releases.promote(home, a)
     releases.promote(home, b)
-    (home / "config.yaml").write_text("memory: {provider: fixture}\n")
+    (home / "config.yaml").write_text("memory: {provider: fixture}\n", encoding="utf-8")
     return home, a, b
 
 
@@ -62,9 +62,9 @@ def test_forward_identical_degradation_across_three_releases(tmp_path, monkeypat
     c = release(home, "C", {"widget": "widget-client"} if feature == "extra" else {})
     if feature == "extra":
         for root in (a, b):
-            (root / "pyproject.toml").write_text((c / "pyproject.toml").read_text())
+            (root / "pyproject.toml").write_text((c / "pyproject.toml").read_text(encoding="utf-8-sig"), encoding="utf-8")
             selected(root, tmp_path, ["widget"])
-        (home / "config.yaml").write_text("memory: {}\n")
+        (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
     else:
         for root in (a, b, c):
             provider(root, reason="" if feature == "provider-without-reason" else "client unavailable")
@@ -89,7 +89,7 @@ def test_exhausted_recovery_preflight_still_reloads(tmp_path, monkeypatch, caplo
     home, a, b = pair(tmp_path, monkeypatch)
     other = home / "profiles/other"
     other.mkdir(parents=True)
-    (other / "config.yaml").write_text("memory: {provider: fixture}\n")
+    (other / "config.yaml").write_text("memory: {provider: fixture}\n", encoding="utf-8")
     monkeypatch.setattr("pm.plugins_state.dependency_homes", lambda: [other])
     clock = [100.0]
     monkeypatch.setattr(preflight.time, "monotonic", lambda: clock[0])

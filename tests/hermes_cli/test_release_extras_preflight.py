@@ -15,10 +15,10 @@ def release(home, name, extras):
     root = home / "releases" / name
     root.mkdir(parents=True)
     for marker in (".release-ready", ".hermes_build_sha"):
-        (root / marker).write_text(name)
+        (root / marker).write_text(name, encoding="utf-8")
     (root / "pyproject.toml").write_text(
         "[project]\nname='hermes-agent'\nversion='1'\n[project.optional-dependencies]\n" +
-        "\n".join(f"{extra}=['{package}>=1,<2']" for extra, package in extras.items()))
+        "\n".join(f"{extra}=['{package}>=1,<2']" for extra, package in extras.items()), encoding="utf-8")
     venv.EnvBuilder(with_pip=False).create(root / ".venv")
     return root
 
@@ -29,7 +29,7 @@ def selected(root, tmp_path, extras):
     venv.EnvBuilder(with_pip=False).create(env)
     facts = runtime_facts_path(root)
     facts.parent.mkdir(parents=True, exist_ok=True)
-    facts.write_text(json.dumps({"packages": {"venv": {"environment": str(env), "extras": extras}}}))
+    facts.write_text(json.dumps({"packages": {"venv": {"environment": str(env), "extras": extras}}}), encoding="utf-8")
     return env
 
 
@@ -37,9 +37,9 @@ def package(env, name, module):
     site = next((env / "lib").glob("python*/site-packages"))
     info = site / (name.replace('-', '_') + "-1.0.dist-info")
     info.mkdir(exist_ok=True)
-    (info / "METADATA").write_text(f"Name: {name}\nVersion: 1.0\n")
-    (info / "top_level.txt").write_text(module)
-    (site / (module + ".py")).write_text("class Hindsight: pass\n")
+    (info / "METADATA").write_text(f"Name: {name}\nVersion: 1.0\n", encoding="utf-8")
+    (info / "top_level.txt").write_text(module, encoding="utf-8")
+    (site / (module + ".py")).write_text("class Hindsight: pass\n", encoding="utf-8")
 
 
 @pytest.mark.parametrize("extra,distribution,module", [
@@ -63,7 +63,7 @@ def test_activation_outside_candidate_checks_generation_loss_by_operation(tmp_pa
         if damage == "metadata-only":
             payload.unlink()
         else:
-            payload.write_text("raise ModuleNotFoundError('client dependency missing')\n")
+            payload.write_text("raise ModuleNotFoundError('client dependency missing')\n", encoding="utf-8")
     if route == "rollback":
         (home / "previous").symlink_to(b)
     if route == "rollback":
@@ -91,19 +91,19 @@ def test_configured_provider_warns_on_first_activation_without_an_origin(tmp_pat
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     home.mkdir()
-    (home / "config.yaml").write_text("memory:\n  provider: hindsight\n")
+    (home / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
     candidate = release(home, "B", {"hindsight": "hindsight-client"})
     plugin = candidate / "plugins/memory/hindsight"
     plugin.mkdir(parents=True)
-    (plugin / "__init__.py").write_text("")
-    (plugin / "plugin.yaml").write_text("name: hindsight\npip_dependencies: ['hindsight-client>=1,<2']\n")
+    (plugin / "__init__.py").write_text("", encoding="utf-8")
+    (plugin / "plugin.yaml").write_text("name: hindsight\npip_dependencies: ['hindsight-client>=1,<2']\n", encoding="utf-8")
     # The candidate owns its readiness API, even when the caller is older code.
     (candidate / "plugins/memory/__init__.py").write_text(
         "import importlib.util\n"
         "class Provider:\n"
         " def is_available(self): return importlib.util.find_spec('hindsight_client') is not None\n"
         " def unavailable_reason(self): return 'hindsight-client missing'\n"
-        "def load_memory_provider(name, register_skills=False): return Provider()\n")
+        "def load_memory_provider(name, register_skills=False): return Provider()\n", encoding="utf-8")
     releases.promote(home, candidate)
     assert releases.read_pointer(home / "current") == candidate
     assert "hindsight-client" in caplog.text and "availability unknown" in caplog.text
@@ -178,7 +178,7 @@ def test_recovery_never_repairs_target_environment(tmp_path, monkeypatch, operat
         (home / "previous").symlink_to(source)
         monkeypatch.setattr("pm.paths.repo_root", lambda: source)
         (home / "release-layout.json").write_text(json.dumps({
-            "source": str(source), "source_sha": releases.release_sha(source), "plist": None, "state": "done"}))
+            "source": str(source), "source_sha": releases.release_sha(source), "plist": None, "state": "done"}), encoding="utf-8")
         result = releases.rollback(home)
         assert result["current"] == str(source)
         assert not (home / "current").exists()
@@ -199,7 +199,7 @@ def test_activation_spends_one_shared_probe_budget(tmp_path, monkeypatch, caplog
         package(selected(root, tmp_path, ["hindsight"]), "hindsight-client", "hindsight_client")
     releases.promote(home, a)
     releases.promote(home, b)
-    (home / "config.yaml").write_text("memory:\n  provider: hindsight\n")
+    (home / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
     clock = [100.0]
     monkeypatch.setattr(preflight.time, "monotonic", lambda: clock[0])
     real_run, budgets = subprocess.run, []
@@ -233,10 +233,10 @@ def test_distribution_probe_imports_only_primary_module(tmp_path, monkeypatch, d
     site = next((env / "lib").glob("python*/site-packages"))
     if damage != "absent":
         package(env, "widget-client", "widget_client")
-        (site / "widget_client-1.0.dist-info/top_level.txt").write_text("unrelated\nwidget_client\n")
-        (site / "unrelated.py").write_text("raise RuntimeError('must not import unrelated tooling')\n")
+        (site / "widget_client-1.0.dist-info/top_level.txt").write_text("unrelated\nwidget_client\n", encoding="utf-8")
+        (site / "unrelated.py").write_text("raise RuntimeError('must not import unrelated tooling')\n", encoding="utf-8")
     if damage == "broken-primary":
-        (site / "widget_client.py").write_text("raise ImportError('primary client broken')\n")
+        (site / "widget_client.py").write_text("raise ImportError('primary client broken')\n", encoding="utf-8")
     observed = preflight._probe(candidate, preflight._PROBE, ["widget-client"], home)["widget-client"]
     if damage == "absent":
         assert "error" in observed and "version" not in observed
