@@ -18,7 +18,7 @@ def test_repeated_installs_share_only_downloads(tmp_path):
     sandboxes = [I.new_sandbox(tmp_path / name) for name in ("one", "two")]
     with ThreadPoolExecutor(max_workers=2) as pool:
         envs = list(pool.map(lambda sb: cache.environment(sb.env), sandboxes))
-    for key in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "HERMES_RUNTIME_DIR", "npm_config_cache"):
+    for key in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "npm_config_cache"):
         assert envs[0][key] == envs[1][key]
         assert Path(envs[0][key]).is_relative_to(tmp_path / "downloads")
     for sb, env in zip(sandboxes, envs):
@@ -27,6 +27,8 @@ def test_repeated_installs_share_only_downloads(tmp_path):
         assert cache.environment(env) == env  # retry keeps the same cache
         assert not sb.checkout.exists()
         assert not (sb.hermes_home / "installs").exists()
+        assert Path(env["HERMES_RUNTIME_DIR"]) == sb.hermes_home / "tools"
+    assert envs[0]["HERMES_RUNTIME_DIR"] != envs[1]["HERMES_RUNTIME_DIR"]
     (sandboxes[0].hermes_home / "config.yaml").write_text("one\n")
     assert not (sandboxes[1].hermes_home / "config.yaml").exists()
     assert envs[0]["HERMES_HOME"] != envs[1]["HERMES_HOME"]
@@ -44,7 +46,7 @@ def test_explicit_runner_caches_do_not_inherit_installed_or_user_state(tmp_path)
     env = cache.environment(sb.env)
     assert {key: env[key] for key in downloads} == downloads
     assert env["HERMES_HOME"] == str(sb.hermes_home)
-    assert env["HERMES_RUNTIME_DIR"] == str(tmp_path / "fixture" / "runtime")
+    assert env["HERMES_RUNTIME_DIR"] == str(sb.hermes_home / "tools")
     assert "UV_PROJECT_ENVIRONMENT" not in env
     assert not any((tmp_path / name).exists() for name in
                    ("foreign-home", "foreign-runtime", "foreign-venv"))
@@ -102,16 +104,17 @@ def test_upgrade_leg_keeps_two_argument_callers_and_private_downloads(tmp_path, 
     # Match pm/test_configured_features.py's unchanged public helper call exactly.
     legs = [upgrade.make_leg(tmp_path / name, None) for name in ("one", "two")]
     for leg in legs:
-        for key in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "HERMES_RUNTIME_DIR", "npm_config_cache"):
+        for key in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "npm_config_cache"):
             assert Path(leg.env[key]).is_relative_to(leg.root / "downloads")
         assert Path(leg.env["HERMES_HOME"]) == leg.hermes_home
+        assert Path(leg.env["HERMES_RUNTIME_DIR"]) == leg.hermes_home / "tools"
         assert upgrade._git("rev-parse", "HEAD", cwd=leg.install) == base
     assert legs[0].env["UV_CACHE_DIR"] != legs[1].env["UV_CACHE_DIR"]
 
     shared = InstallCache(tmp_path / "explicit-downloads")
     explicit = upgrade.make_leg(tmp_path / "three", None, shared)
     assert explicit.env["UV_CACHE_DIR"] == str(shared.root / "uv")
-    assert explicit.env["HERMES_RUNTIME_DIR"] == str(shared.root / "runtime")
+    assert explicit.env["HERMES_RUNTIME_DIR"] == str(explicit.hermes_home / "tools")
 
 
 def test_upgrade_origin_advertises_only_the_local_subject_branch(tmp_path, monkeypatch):

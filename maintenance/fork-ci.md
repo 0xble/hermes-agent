@@ -5,7 +5,7 @@
 The shallow/partial clone suites retain smart HTTP, complete subject ancestry, historical
 N-1 installer bytes, all clone-shape/transfer assertions and the 900-second nightly file bound.
 Their three simultaneous real installs share only explicit runner content caches (uv, managed
-Python and npm) and a fixture-owned PM runtime download store. Each checkout, PM install identity,
+Python, npm and SHA256-keyed PM archives). Each native store, checkout, PM install identity,
 venv, active selection record and Hermes user home remains distinct. PM's machine uv cache is
 linked to the explicit content cache because PM intentionally does not use `UV_CACHE_DIR`.
 The shell runner must forward only `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, and `npm_config_cache`
@@ -37,6 +37,32 @@ all branches of a developer's partial clone (whose unrelated missing blobs could
 fetches during a local fixture clone). No source clone is redirected to external GitHub. The
 small local-repository regression proves the unrelated branch stays unadvertised; cache
 regressions prove user state and installed environments are not shared.
+
+## Bounded archive acquisition and diagnostics
+
+`InstallCache.artifact` retains only bytes matching a lockfile SHA256. A complete cache hit
+performs no HTTP request. A cold request uses curl's 10-second connection and 30-second total
+bounds, no retries, and atomic publication. Status, URL and checksum failures surface immediately.
+The maintained pinned mirror supplies the same reviewed archive bytes. Each sandbox receives
+private copies of PM's `fetch-<sha256>` entries. PM may delete those copies after publication
+without losing the retained archive. Bootstrap uv is extracted from the exact pinned archive
+into the slot the unmodified historical shell installer already checks.
+
+The previous shared `HERMES_RUNTIME_DIR` was a mutable native store. Its `.install.lock`
+serialized the nominally parallel installs across downloads. It was not an immutable download
+cache, and its archive entries disappeared after successful publication. PM runtime preparation
+and venv selection are separately scoped to each install, so this does not establish a runtime
+preparation deadlock.
+
+The three target files share a per-file fixture deadline of 840 seconds, leaving room for
+process-tree cleanup and pytest diagnostics before the unchanged 900-second file watchdog.
+Installer, update, passive checks, version probes, dependency staging and freeze-point waits
+use the remaining budget. Raw Git helper operations are bounded too. uv and npm HTTP requests
+receive explicit shorter transport limits. No assertion, clone shape, update scenario or outer
+watchdog is relaxed. A slow or failed setup produces an ordinary failure with subprocess output
+instead of losing every result to SIGKILL.
+
+Contract tests: `tests/e2e/core/upgrade/test_install_downloads.py` `tests/e2e/core/upgrade/test_install_cache.py`
 
 ## Fork upgrade release contract
 

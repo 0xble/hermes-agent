@@ -82,7 +82,7 @@ CLI_TIMEOUT = 600
 
 def _git(*args: str, cwd: Path, check: bool = True) -> str:
     cp = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, check=False)
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, check=False, timeout=120)
     if check and cp.returncode != 0:
         raise AssertionError(f"git {args} failed in {cwd}: {cp.stderr}")
     return cp.stdout.strip()
@@ -267,6 +267,7 @@ class Leg:
     env: dict[str, str]
     hermes_home: Path
     wrap_dir: Path
+    cache: InstallCache
     snapshot: dict = field(default_factory=dict)
 
     @property
@@ -287,7 +288,7 @@ class Leg:
     def run(self, *args: str, timeout: float = CLI_TIMEOUT, argv0: str | None = None,
             cwd: Path | None = None) -> subprocess.CompletedProcess:
         return H.run([argv0 or self.hermes, *args], env=self.env, cwd=cwd or self.install,
-                     writable=[self.root], timeout=timeout)
+                     writable=[self.root], timeout=self.cache.remaining(timeout))
 
     def popen(self, *args: str) -> subprocess.Popen:
         log = open(self.root / f"popen-{int(time.monotonic() * 1000)}.log", "w")
@@ -388,7 +389,7 @@ def make_leg(root: Path, template_home: Path | None, cache: InstallCache | None 
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
     cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--managed-python",
                          "--python", base_python], cwd=str(install),
-                        env=uv_env, capture_output=True, text=True, timeout=1800, check=False)
+                        env=uv_env, capture_output=True, text=True, timeout=cache.remaining(300), check=False)
     assert cp.returncode == 0, f"N-1 venv install from its uv.lock failed:\n{cp.stderr[-4000:]}"
     env_probe = H.isolated_env(root)
     hermes_home = Path(env_probe["HERMES_HOME"])
@@ -397,7 +398,8 @@ def make_leg(root: Path, template_home: Path | None, cache: InstallCache | None 
         shutil.copytree(template_home, hermes_home, symlinks=True)
     wrap = _write_wrappers(root, install, hermes_home)
     env = cache.environment(H.isolated_env(root, extra_path=[wrap]))
-    return Leg(root=root, origin=origin, install=install, env=env, hermes_home=hermes_home, wrap_dir=wrap)
+    cache.prepare(env)
+    return Leg(root=root, origin=origin, install=install, env=env, hermes_home=hermes_home, wrap_dir=wrap, cache=cache)
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +598,9 @@ def template_home(tmp_path_factory, provider, install_cache) -> Path:
         with contextlib.closing(sqlite3.connect(db)) as con:
             assert con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
     template = seed.root / "template-home"
-    shutil.copytree(seed.hermes_home, template, symlinks=True)
+    # Native archives and tools belong to each leg, not to the user's state snapshot.
+    shutil.copytree(seed.hermes_home, template, symlinks=True,
+                    ignore=lambda directory, _names: ["tools"] if Path(directory) == seed.hermes_home else [])
     return template
 
 
@@ -614,6 +618,7 @@ def _publish_head(leg: Leg) -> None:
 
 
 def _update(leg: Leg) -> subprocess.CompletedProcess:
+    leg.cache.prepare(leg.env)
     return leg.run(*_RETRY_PREFIX[1:], leg.hermes, "update", "--yes", "--branch", "main",
                    argv0=_RETRY_PREFIX[0], timeout=UPDATE_TIMEOUT)
 
@@ -622,7 +627,7 @@ def _freeze_update_at(leg: Leg, marker: str) -> None:
     proc = leg.popen("update", "--yes", "--branch", "main")
     try:
         H.wait_for(lambda: (leg.root / marker).exists() or proc.poll() is not None,
-                   timeout=UPDATE_TIMEOUT, interval=0.5, what=marker)
+                   timeout=leg.cache.remaining(UPDATE_TIMEOUT), interval=0.5, what=marker)
         assert (leg.root / marker).exists(), (
             f"update finished (rc={proc.returncode}) without reaching the {marker} point")
     finally:
