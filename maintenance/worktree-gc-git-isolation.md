@@ -90,6 +90,16 @@ its index is installed snapshots an empty staged index (Git's actual state), not
 HEAD; otherwise the post-snapshot index comparison falsely reports a concurrent
 edit and refuses every reclamation. The archive still holds all partial files.
 
+After the real smudge checkout has been killed, reaped and positively observed
+idle, the sweep age scenario owns its subsequent holder verdicts. An unknown
+verdict must preserve the aged tree. A known-idle verdict still requires both
+tree and lock age before the real sweep archives all partial files and removes
+the tree, admin entry and branch. A repeated macOS host-wide scan can otherwise
+become unknowable between planning and execution as unrelated git processes
+exit, legitimately keeping the tree. This fixture isolation does not cache or
+relax any production holder recheck. Retire it when upstream supplies an
+equivalent fixture-owned process inventory for these age scenarios.
+
 ## Failed-add ownership and process paths
 
 Each add attempt atomically creates its empty worktree directory before invoking

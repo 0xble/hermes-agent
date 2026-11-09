@@ -120,7 +120,8 @@ class TestCleanupFailedWorktreeAdd:
         assert result.returncode == 0, f"retry failed: {result.stderr}"
 
     @pytest.mark.platforms("posix")
-    def test_abandoned_initializing_add_is_swept_only_when_idle_and_old(self, repo):
+    def test_abandoned_initializing_add_is_swept_only_when_idle_and_old(self, repo, monkeypatch):
+        from hermes_cli import _early_recovery as recovery
         from hermes_cli.worktree_sweep import execute_plan, plan_sweep
 
         settings = {"archive_dirty": True, "archive_max_file_mb": 50,
@@ -136,6 +137,14 @@ class TestCleanupFailedWorktreeAdd:
             execute_plan(str(repo), plan_sweep(str(repo), settings=settings), settings)
             assert wt.exists(), "even an aged initializing tree with live git must survive"
             assert (admin / "locked").read_text().strip() == "initializing"
+
+        # The real checkout is drained. Own the subsequent holder inventory so
+        # unrelated host git processes cannot turn an idle proof into unknown.
+        monkeypatch.setattr(recovery, "_held_open", lambda *args, **kwargs: None)
+        age(wt, admin)
+        execute_plan(str(repo), plan_sweep(str(repo), settings=settings), settings)
+        assert wt.exists(), "an unknowable holder must preserve even an aged initializing tree"
+        monkeypatch.setattr(recovery, "_held_open", lambda *args, **kwargs: False)
 
         # The process is dead, but the ordinary young-tree gate still applies.
         wt.touch()
