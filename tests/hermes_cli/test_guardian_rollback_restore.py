@@ -3,12 +3,28 @@ import json
 import os
 import plistlib
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 import hermes_cli.gateway  # noqa: F401  (load the facade before patching gateway_launchd)
 from hermes_cli import gateway_guardian as guardian
 from tests.hermes_cli.test_gateway_guardian import layout
+
+
+@pytest.fixture(autouse=True)
+def rollback_clock(monkeypatch):
+    """Filesystem work spends no startup budget; only polling advances time."""
+    from hermes_cli import immutable_releases as releases
+
+    now = [100.0]
+
+    def advance(seconds):
+        now[0] += seconds
+
+    clock = SimpleNamespace(monotonic=lambda: now[0], sleep=advance)
+    monkeypatch.setattr(guardian, "time", clock)
+    monkeypatch.setattr(releases, "time", clock)
 
 
 def _op_on(tmp_path):
