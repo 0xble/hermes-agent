@@ -19,7 +19,7 @@ def uv_pin(runner_os: str, runner_arch: str, version: str) -> dict[str, str]:
     architecture = {'X64': 'x86_64', 'ARM64': 'aarch64'}[runner_arch]
     extension = 'zip' if runner_os == 'Windows' else 'tar.gz'
     filename = f'uv-{architecture}-{target}.{extension}'
-    pins = json.loads((ROOT / 'ci/uv-artifacts.json').read_text())
+    pins = json.loads((ROOT / 'ci/uv-artifacts.json').read_text(encoding='utf-8-sig'))
     if version != pins['version']:
         raise ValueError(f'No pinned uv checksums for {version}')
     return {'url': f'https://github.com/astral-sh/uv/releases/download/{version}/{filename}',
