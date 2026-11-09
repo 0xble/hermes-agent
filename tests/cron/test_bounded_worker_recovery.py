@@ -302,7 +302,6 @@ time.sleep(60)
         assert process.wait(timeout=15) == 124
         execution_id = idfile.read_text()
         grandchild_pid = int(pidfile.read_text())
-        import psutil
         assert not process_alive(grandchild_pid)
         token = _home(home)
         try:

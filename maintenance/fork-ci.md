@@ -864,8 +864,11 @@ four-file upstream proposal [#146926](https://github.com/NousResearch/hermes-age
 LSP cancellation wait. Runtime liveness checks under `gateway/` and `tools/`
 already catch these exceptions; no product behavior is changed.
 
-The deterministic regression holds pid_exists true and raises both reap errors
-from Process.status. Retire this adaptation once an accepted upstream release
+The deterministic regression exercises both reap errors from Process.status()
+after is_running() returns true. process_alive never calls pid_exists. The fresh
+serve subreaper inlines its psutil probes to avoid importing tests, which exports
+HERMES_TEST_ISOLATION, and checks that the serve child does not inherit that marker.
+Retire this adaptation once an accepted upstream release
 provides equivalent race-safe helpers and all converted probes. Roll back the
 commits carrying `Fork-Patch: fork-ci-reliability` for this change together.
 

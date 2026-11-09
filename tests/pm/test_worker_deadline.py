@@ -4,10 +4,10 @@ from __future__ import annotations
 import json
 import sys
 
-import psutil
 import pytest
 
 from pm.package import InstallError
+from tests.waiting import process_alive
 
 
 @pytest.mark.parametrize("partial_reply", [False, True])
@@ -33,4 +33,4 @@ def test_worker_deadline_reaps_the_worker_and_its_child(tmp_path, monkeypatch, p
         client._request("prune_cache", {"cache": str(tmp_path)})
 
     for pid in json.loads(pids.read_text()):
-        assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(pid)

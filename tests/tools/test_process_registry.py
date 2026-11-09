@@ -2954,7 +2954,6 @@ class TestSigkillEscalation:
         and left survivors un-killed (flaky — sometimes the parent lived,
         sometimes a child). The escalation now re-probes every target directly.
         """
-        import psutil
         # 2.0s grace (not 1.0): with three interpreters mid-startup on a
         # loaded runner, a 1s SIGTERM->partition window races child spawn and
         # is how a child PID escaped the live-system guard in CI.
@@ -2984,21 +2983,8 @@ class TestSigkillEscalation:
         try:
             ProcessRegistry._terminate_host_pid(parent.pid)
 
-            def _pid_dead(p: int) -> bool:
-                # A pid is "dead" for our purposes if it no longer exists OR
-                # exists only as an unreaped zombie (already terminated, just
-                # not reaped by its reparented parent yet). psutil can also
-                # raise mid-probe if the pid vanishes between the existence
-                # check and the status read — treat any such race as dead.
-                try:
-                    if not psutil.pid_exists(p):
-                        return True
-                    return not ProcessRegistry._proc_alive(psutil.Process(p))
-                except Exception:
-                    return True
-
             def _all_dead():
-                return all(_pid_dead(p) for p in all_pids)
+                return all(not process_alive(p) for p in all_pids)
 
             # _terminate_host_pid SIGKILLs synchronously before returning, so
             # the kill signals are already delivered here. The only remaining
