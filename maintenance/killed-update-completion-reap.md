@@ -15,6 +15,13 @@ and leave the gateway the update had paused draining. A parent-death watch
 kills the child's session when the updater dies. A normal exit dismisses the
 watch and does not kill a child the parent is already reaping.
 
+The hostile checkout-lock cells deliberately stop both the completion child
+and its death watcher before killing the updater. This preserves their
+surviving-tree premise without undoing production reaping: a surviving child
+must still exclude another home's update and remain visible to update readers.
+Freezing only the child lets the watcher kill it and invalidates that premise,
+even with no network available. Both frozen processes must be killed in teardown.
+
 Upgrade e2e sandboxes keep a private `HERMES_GATEWAY_LOCK_DIR` under the
 sandbox root. The host-gateway record is cross-profile, not keyed by
 `HERMES_HOME`; its fallback is `$XDG_STATE_HOME` or `$HOME/.local/state`.
@@ -29,7 +36,8 @@ isolation, not a product change.
 ## Verification and retirement
 
 Contract tests: `tests/hermes_cli/test_update_completion_death_watch.py`
-and `tests/e2e/core/upgrade/test_sandbox_isolation.py`.
+  `tests/e2e/core/upgrade/test_sandbox_isolation.py`
+  `tests/e2e/core/upgrade/git/test_hostile_lock.py`.
 
 Retire the reap when POSIX completion children die with a killed updater the
 way the Windows job already does. Retire the lock-dir pin when upgrade e2e no

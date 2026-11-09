@@ -11,6 +11,10 @@ Cells (contract C1 + C1.7):
 (c) a v2 marker whose pid was reused (creation time mismatch): reclaimed, the update proceeds.
 (d) the update owner is SIGKILLed while a process of its tree still holds the checkout lock:
     a new update cannot start until that process exits.
+
+The surviving-tree cells stop the POSIX death watcher as well as the completion child. Normal
+owner death reaps that child, covered separately by ``test_update_completion_death_watch``;
+these cells deliberately hold the tree alive to exercise checkout-lock inheritance and readers.
 """
 
 from __future__ import annotations
@@ -40,6 +44,8 @@ REFUSAL = "Another Hermes update is already running"
 _DRIVER = r'''
 import json, os, signal, subprocess, sys, time
 from pathlib import Path
+from hermes_cli.update_completion import _OWNER_DEATH_WATCH
+from tests.waiting import wait_until
 
 root, checkout, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 envs = json.loads((root / "envs.json").read_text(encoding="utf-8"))
@@ -87,6 +93,25 @@ def completion_child(home):
     return None
 
 
+def completion_watch(owner):
+    command = [os.fsencode(a) for a in (sys.executable, "-I", "-S", "-c", _OWNER_DEATH_WATCH)]
+    children = Path(f"/proc/{owner}/task/{owner}/children").read_text().split()
+    for pid in children:
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+        except OSError:
+            continue
+        if argv == command:
+            return int(pid)
+    return None
+
+
+def stop(pid):
+    os.kill(pid, signal.SIGSTOP)
+    wait_until(lambda: Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "T",
+               what="update process to stop with its file descriptors intact")
+
+
 result = {}
 if mode == "owner":
     age, offset = float(sys.argv[4]), float(sys.argv[5])
@@ -102,17 +127,19 @@ if mode == "owner":
 elif mode in ("kill-mid-completion", "orphan-reader"):
     first = subprocess.Popen(ARGV, env=envs["home-a"], cwd=checkout, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    child = None
+    child, watcher = None, None
     deadline = time.time() + 240
     while child is None and time.time() < deadline and first.poll() is None:
         child = completion_child(envs["home-a"]["HERMES_HOME"])
         time.sleep(0.05)
     result["child_seen"] = child is not None
     try:
-        # Freeze the child (it keeps its fds) so it cannot finish its real work and free the lock
-        # before the probe below reaches it: on a fast runner it otherwise exits first.
+        # Hold the adversarial premise: neither normal completion nor the owner-death fence
+        # may release the child's inherited lock before the cross-home probes run.
         if child is not None:
-            os.kill(child, signal.SIGSTOP)
+            stop(child)
+            watcher = wait_until(lambda: completion_watch(first.pid), what="completion death watcher")
+            stop(watcher)
         os.kill(first.pid, signal.SIGKILL)
         first.wait()
         result["child_alive_before"] = child is not None and alive(child)
@@ -128,8 +155,13 @@ elif mode in ("kill-mid-completion", "orphan-reader"):
         result["child_alive_after"] = child is not None and alive(child)
     finally:
         # A stopped child never exits on its own: a failed probe must not leave it holding the lock.
+        if first.poll() is None:
+            first.kill()
+            first.wait()
         if child is not None and alive(child):
             os.kill(child, signal.SIGKILL)
+        if watcher is not None and alive(watcher):
+            os.kill(watcher, signal.SIGKILL)
 result["out"] = result.get("out", "")[-4000:]
 print(json.dumps(result))
 '''
