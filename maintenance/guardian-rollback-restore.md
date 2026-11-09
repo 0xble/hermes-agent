@@ -49,6 +49,15 @@ Guard: `scripts/run_tests.sh tests/hermes_cli/test_guardian_rollback_restore.py
 tests/hermes_cli/test_gateway_guardian.py`. One test uses the real `rollback()` and
 `activate_release`, with only the gateway acknowledgement observed through a stub.
 
+The rollback/restore fixture shares a simulated monotonic clock between the
+guardian and immutable-release acknowledgement loop. Only polling advances it,
+so real filesystem transactions and host descheduling cannot consume a 1- or
+2-second scenario budget before the mocked reload starts. Real polling still
+expires the failed target's deadline and gives restoration its own budget.
+Keep real transaction, receipt, pointer and subsequent operator-rollback
+assertions. Production deadlines and the separate deadline-contract tests stay
+unchanged. Retire the fixture clock when these scenarios own equivalent timing.
+
 To roll back, revert this slice. Existing `restore` transactions in `release-last-txn.json`
 then read as unsupported only while one is pending. Settle or archive a pending `restore`
 before downgrading.
