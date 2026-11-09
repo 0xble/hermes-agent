@@ -16,6 +16,8 @@ def corpus(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("history", source="cli", model="test")
     # Common identifier tokens and sparse matches force more than one progress interval.
+    # The writer is autocommit; corpus setup needs one durable commit, not 4000.
+    db._conn.execute("BEGIN")
     db._conn.executemany(
         "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
         [("history", "tool", f"proc common recovery_context fixture {i}", i) for i in range(4000)],
