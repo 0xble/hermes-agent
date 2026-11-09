@@ -50,8 +50,11 @@ The maintained pinned mirror supplies the same reviewed archive bytes. Each sand
 private copies of PM's `fetch-<sha256>` entries. PM may delete those copies after publication
 without losing the retained archive. Retained archives are stored beside the explicit uv cache
 (in `<uv-cache-name>-pm-archives`), outside uv-owned buckets, so `uv cache prune` cannot
-discard them. Bootstrap uv is extracted from the exact pinned archive
-into the slot the unmodified historical shell installer already checks.
+discard them. Only shell-installer worlds extract bootstrap uv from the exact pinned archive
+into the slot the unmodified historical shell installer already checks. Legacy handoff legs seed
+archives without pre-extracting that slot: the staged-uv bootstrap assumes the launching Python
+is suitable, while N-1 may run Python 3.13 and HEAD requires 3.14. PM must acquire its complete
+pinned toolchain on that path before preparing the new runtime.
 
 The previous shared `HERMES_RUNTIME_DIR` was a mutable native store. Its `.install.lock`
 serialized the nominally parallel installs across downloads. It was not an immutable download

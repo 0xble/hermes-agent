@@ -291,7 +291,7 @@ def world(root: Path, *, base: str, installer_ref: str | None = None,
         if cache is not None:
             sb.deadline = cache.deadline
             sb.env = cache.environment(sb.env, managed_uv=I.real_uv())
-            cache.prepare(sb.env, installer_ref)
+            cache.prepare(sb.env, installer_ref, bootstrap_uv=True)
             cache.prepare(sb.env)
         url = srv.url(REPO)
         (sb.home / ".gitconfig").write_text(

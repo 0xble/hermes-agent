@@ -68,7 +68,7 @@ class InstallCache:
                 staged.unlink(missing_ok=True)
         return target
 
-    def prepare(self, env: dict[str, str], ref: str | None = None) -> None:
+    def prepare(self, env: dict[str, str], ref: str | None = None, *, bootstrap_uv: bool = False) -> None:
         """Seed private PM stores with lock-pinned bytes, never installed selections or venvs."""
         from pm.artifact_mirror import mirror_url
         from pm.registry import all_packages, get_package, source_install_packages, walk
@@ -105,7 +105,7 @@ class InstallCache:
                 shutil.copy2(archive, destination)
                 # The unmodified shell bootstrap checks this exact pinned uv slot before
                 # PM can consume its fetch cache. Do its normal archive extraction here.
-                if package.name == "uv":
+                if package.name == "uv" and bootstrap_uv:
                     uv_entry = store / f"uv-{pin['version']}-{target}"
                     if not uv_entry.exists():
                         extract(destination, uv_entry)

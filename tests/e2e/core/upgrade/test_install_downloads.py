@@ -2,6 +2,8 @@
 from contextlib import contextmanager
 import hashlib
 import json
+import io
+import tarfile
 import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -96,3 +98,32 @@ def test_cold_download_failure_is_bounded_and_names_the_artifact(tmp_path, path)
         assert time.monotonic() - started < 5
         assert requests == ["/" + path]
         assert not list((cache.root / "artifacts").glob("[a-f0-9]" * 64))
+
+
+def test_archive_seeding_does_not_publish_a_shell_bootstrap_tool_until_requested(tmp_path, monkeypatch):
+    from pm.store import current_target
+    import pm.artifact_mirror
+
+    source = tmp_path / "source"
+    (source / "pm").mkdir(parents=True)
+    archive = tmp_path / "uv.tar.gz"
+    with tarfile.open(archive, "w:gz") as stream:
+        member = tarfile.TarInfo("uv-fixture/uv")
+        payload = b"fixture binary"
+        member.size = len(payload)
+        member.mode = 0o755
+        stream.addfile(member, io.BytesIO(payload))
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    pin = {"version": "fixture", "artifacts": {current_target(): {
+        "url": archive.as_uri(), "sha256": digest}}}
+    (source / "pm" / "lock.json").write_text(json.dumps({"packages": {"uv": pin}}))
+    monkeypatch.setattr(H, "WORKTREE", source)
+    monkeypatch.setattr(pm.artifact_mirror, "mirror_url", lambda _digest: archive.as_uri())
+    cache = InstallCache(tmp_path / "downloads")
+    env = cache.environment(H.isolated_env(tmp_path / "install"))
+    slot = Path(env["HERMES_RUNTIME_DIR"]) / f"uv-fixture-{current_target()}"
+    cache.prepare(env)
+    assert not slot.exists(), "legacy handoff must let PM install its pinned toolchain"
+    assert len(list((slot.parent / f"fetch-{digest}").iterdir())) == 1
+    cache.prepare(env, bootstrap_uv=True)
+    assert (slot / "uv").read_bytes() == payload
