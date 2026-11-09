@@ -34,6 +34,29 @@ def case_processes(root: Path) -> list[psutil.Process]:
     return owned
 
 
+def _signal_case_process(proc: psutil.Process, root: Path, signal: str) -> bool:
+    """Return whether the handle still needs waiting, without signalling an unproved owner."""
+    try:
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return False
+        home = proc.environ().get("HERMES_HOME")
+        assert home and Path(home).resolve().is_relative_to(root), (
+            f"refusing PID {proc.pid} outside case {root}: HERMES_HOME={home!r}")
+        getattr(proc, signal)()
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
+        # Linux may release mm before publishing the zombie state. Recheck liveness,
+        # but never reuse an earlier environment read as authority to signal.
+        try:
+            return proc.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied:
+            return True
+    return True
+
+
 def stop_case_processes(root: Path) -> None:
     """Stop only explicit case-home owners, including startup before PID publication.
 
@@ -48,27 +71,10 @@ def stop_case_processes(root: Path) -> None:
         processes = case_processes(root)
         if not processes:
             return
-        for proc in processes:
-            try:
-                if proc.status() == psutil.STATUS_ZOMBIE:
-                    continue
-                home = proc.environ().get("HERMES_HOME")
-                assert home and Path(home).resolve().is_relative_to(canonical_root), (
-                    f"refusing PID {proc.pid} outside case {root}: HERMES_HOME={home!r}")
-                proc.terminate()
-            except psutil.NoSuchProcess:
-                pass
+        processes = [proc for proc in processes
+                     if _signal_case_process(proc, canonical_root, "terminate")]
         _gone, alive = psutil.wait_procs(processes, timeout=10)
-        for proc in alive:
-            try:
-                if proc.status() == psutil.STATUS_ZOMBIE:
-                    continue
-                home = proc.environ().get("HERMES_HOME")
-                assert home and Path(home).resolve().is_relative_to(canonical_root), (
-                    f"refusing PID {proc.pid} outside case {root}: HERMES_HOME={home!r}")
-                proc.kill()
-            except psutil.NoSuchProcess:
-                pass
+        alive = [proc for proc in alive if _signal_case_process(proc, canonical_root, "kill")]
         psutil.wait_procs(alive, timeout=5)
     wait_until(lambda: not case_processes(root), timeout=15,
                what=f"all processes with HERMES_HOME under {root} to stop")
