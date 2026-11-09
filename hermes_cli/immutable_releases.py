@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import shutil
@@ -26,6 +27,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, Any
+
+logger = logging.getLogger(__name__)
 
 # Freeze the package's physical code tree before `current` can change. This is
 # the installation owning the process, not any individual cron profile home.
@@ -989,15 +992,37 @@ def wait_for_release_acknowledgement(home: Path, *, timeout_seconds: float = 180
     return True
 
 
+def _preflight_transaction(paths: ReleasePaths, record: dict[str, Any], target: Path, *,
+                           deadline: float | None) -> None:
+    from hermes_cli.immutable_release_preflight import ReleaseActivationRefused, activation_preflight
+    origin = record.get("current_original") or record.get("source")
+    try:
+        activation_preflight(target, origin, paths.home, operation=record["operation"], deadline=deadline)
+    except ReleaseActivationRefused as exc:
+        unapplied = (not record.get("reload_issued") and
+                     _pointer_value(paths.current) == record["current_original"] and
+                     _pointer_value(paths.previous) == record["previous_original"])
+        if not unapplied:
+            logger.warning("RELEASE %s: transaction intent already applied. Preflight is advisory, "
+                           "completing recorded switch despite regression: %s", record["operation"], exc)
+            return
+        # Nothing has been switched or reloaded. A refused intent must not be
+        # replayed by rollback or the next update. Keep the last completed txn.
+        _txn_path(paths).unlink()
+        _sync_dir(paths.home)
+        if record.get("plist"):
+            Path(record["plist"]["backup"]).unlink(missing_ok=True)
+            _sync_dir(paths.home)
+        raise
+
+
 def _prepare_transaction_candidate(paths: ReleasePaths, record: dict[str, Any], *,
                                    deadline: float | None, preflight_done: bool) -> Path:
-    from hermes_cli.immutable_release_preflight import activation_preflight
     candidate = Path(record["candidate"])
     if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
         raise RuntimeError(f"transaction candidate no longer ready: {candidate}")
     if not preflight_done:
-        origin = record.get("current_original") or record.get("source")
-        activation_preflight(candidate, origin, paths.home, operation=record["operation"], deadline=deadline)
+        _preflight_transaction(paths, record, candidate, deadline=deadline)
     return candidate
 
 
@@ -1175,8 +1200,10 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
     from hermes_cli.immutable_release_preflight import activation_preflight
     # A rejected candidate must never become replayable transaction intent.
     origin = old or (pending.get("source") if pending else source)
-    activation_preflight(candidate, origin, paths.home,
-                         operation=pending["operation"] if pending else operation, deadline=deadline)
+    if pending is not None:
+        _preflight_transaction(paths, pending, candidate, deadline=deadline)
+    else:
+        activation_preflight(candidate, origin, paths.home, operation=operation, deadline=deadline)
     if pending is None:
         if source is not None and old is None:
             pending = _migration_record(paths, source, plist_path, candidate=candidate,

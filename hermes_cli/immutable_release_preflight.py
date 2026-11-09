@@ -13,6 +13,10 @@ _ROLLBACK_OPERATIONS = {"rollback", "restore", "first-migration-rollback"}
 _RELOAD_RESERVE_SECONDS = 15.0
 
 
+class ReleaseActivationRefused(RuntimeError):
+    """A definite forward regression, distinct from an inconclusive probe."""
+
+
 # Run under the interpreter PM will actually boot. No Hermes import is needed
 # for the extras probe, so old and new releases can be compared precisely.
 _PROBE = '''
@@ -149,11 +153,10 @@ def activation_preflight(candidate: Path, previous: Path | str | None, home: Pat
         logger.warning(_probe_failure_message(operation, candidate, exc), exc_info=True)
         return
     if errors and not recovery:
-        raise RuntimeError(
+        raise ReleaseActivationRefused(
             f"release activation refused: {'; '.join(errors)}. "
             f"Please re-run the update so candidate-owned carry rebuilds the candidate environment at {candidate} "
-            "with the full applicable extra set. If that keeps failing, repair the candidate environment explicitly. "
-            "The current release was not changed.")
+            "with the full applicable extra set. If that keeps failing, repair the candidate environment explicitly.")
 
 
 def _check_activation(candidate: Path, previous: Path | str | None, home: Path,

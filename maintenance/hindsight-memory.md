@@ -276,7 +276,15 @@ Every transaction probes the selected candidate PM interpreter before
 changing `current`, including source-layout rollback. Fresh forward activation
 preflights before writing transaction intent, so a refusal leaves no WAL to replay
 and cannot block rollback or a later healthy promotion. Recovered transactions
-recheck readiness before replaying their intent. Forward activation refuses
+recheck readiness before replaying their intent. A replay may refuse only while
+both pointers still equal their recorded originals and no reload has been issued.
+A refusal at that point removes the unapplied WAL and its plist backup. Once
+either pointer changes or reload is issued, a definite regression is logged
+loudly and replay completes the recorded intent, still requiring observed reload
+acknowledgement. This also covers completion of a pending first migration and
+the updater's pending-transaction finish. Guardian abandonment verifies and
+archives the applied WAL without re-running forward preflight before rollback.
+Forward activation refuses
 only regressions from the origin: a previously importable extra still declared
 by the candidate loses a direct requirement, or an available configured memory
 provider becomes unavailable. Identical existing degradation warns and proceeds.
@@ -317,6 +325,7 @@ The existing `hermes memory status` red readiness contract remains #845's owner.
 Proof: `tests/hermes_cli/test_release_extras_preflight.py`,
 `tests/hermes_cli/test_release_preflight_recovery.py`,
 `tests/hermes_cli/test_refused_release_activation.py`,
+`tests/hermes_cli/test_release_transaction_preflight.py`,
 `tests/gateway/test_memory_health.py`, and the existing immutable-release and
 memory-status suites. Release integration and promotion remain with Maintenance.
 

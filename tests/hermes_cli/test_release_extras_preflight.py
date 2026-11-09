@@ -85,7 +85,7 @@ def test_activation_outside_candidate_checks_generation_loss_by_operation(tmp_pa
     # A corrected committed environment permits the same transition.
     from pm.environments import project_python
     package(Path(project_python(b)).parent.parent, distribution, module)
-    releases.recover_pending_transaction(home) if route == "recover" else releases.promote(home, b)
+    releases.promote(home, b)
     assert releases.read_pointer(home / "current") == b
 
 
