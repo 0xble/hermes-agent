@@ -63,10 +63,10 @@ def test_carry_keeps_payload_only_extra_in_first_committed_generation(tmp_path, 
     assert Facts(runtime_facts_path(previous)).get("venv")["extras"] == sorted([extra, "slack"])
 
     subprocess.run([uv, "venv", "--python", sys.executable, str(candidate / ".venv")],
-                   check=True, capture_output=True, timeout=60)
+                   cwd=candidate, check=True, capture_output=True, timeout=60)
     payload_python = project_python(candidate)
     subprocess.run([uv, "pip", "install", "--no-deps", "--python", str(payload_python), str(client_wheel)],
-                   check=True, capture_output=True, timeout=60)
+                   cwd=candidate, check=True, capture_output=True, timeout=60)
     monkeypatch.setattr(paths, "repo_root", lambda: candidate)
     assert committed_venv(candidate) is None
     assert selected_venv(candidate) == candidate / ".venv"
