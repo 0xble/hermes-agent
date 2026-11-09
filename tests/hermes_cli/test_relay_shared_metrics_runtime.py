@@ -1692,28 +1692,6 @@ def test_subagent_agent_boundary_closes_its_own_scope(
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_terminal_model_error_retains_the_failed_route(direct_runtime):
     base = {
         "session_id": "s1",
@@ -2534,17 +2512,23 @@ def parked_flush(direct_runtime, monkeypatch):
         "hermes_cli.observability.shared_metrics._utc_now",
         lambda: datetime(2026, 7, 28, 9, tzinfo=UTC),
     )
-    state = SimpleNamespace(attempts=0, entered=threading.Event(), release=threading.Event())
+    state = SimpleNamespace(
+        attempts=0, entered=threading.Event(), release=threading.Event(), timed_out=False,
+    )
 
     def parked() -> None:
         state.attempts += 1
         state.entered.set()
-        state.release.wait(3)
+        released = state.release.wait(60)
+        state.timed_out |= not released
+        assert released, "parked flush was not released within 60 seconds"
 
     direct_runtime.subscribers.flush = parked
     yield state
     state.release.set()
     _join_export_workers()
+    # The runtime logs flush exceptions, so also fail on the fixture's main thread.
+    assert not state.timed_out, "parked flush was not released within 60 seconds"
 
 
 def test_task_ends_do_not_wait_on_the_process_wide_flush_barrier(parked_flush, tmp_path):
