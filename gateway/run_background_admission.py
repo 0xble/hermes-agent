@@ -170,6 +170,10 @@ class GatewayBackgroundAdmissionMixin:
             setattr(event, BACKGROUND_RESERVATION_ATTR, token)
         return token
 
+    def _background_admission_pending(self, session_key: str) -> bool:
+        scheduler = self.__dict__.get("_replay_scheduler")
+        return scheduler is not None and scheduler.gate.admission_pending(session_key)
+
     def _background_turn_room(self) -> bool:
         """Whether a background turn could start now (a cheap pre-check before scan work)."""
         gate = self._get_replay_scheduler().gate
