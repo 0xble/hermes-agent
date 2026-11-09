@@ -20,7 +20,7 @@ jobs:
         shell: bash
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y ca-certificates git
+          apt-get install --no-install-recommends -y ca-certificates git python3
       - name: Configure Git safe directory
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -43,12 +43,14 @@ jobs:
           git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
             'refs/tags/v20*:refs/tags/v20*'
           git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1
+      - name: Cache pinned Linux tool archives
+        uses: ./.github/actions/cache-linux-tools
       - name: Install pinned Linux toolchain and platform libraries
         shell: bash
         run: |
           apt-get update
           apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libx11-dev libxi-dev libxdo-dev libssl-dev libffi-dev patchelf
-          python3 ci/install-linux-tools.py amd64
+          python3 ci/install-linux-tools.py amd64 .ci/linux-tool-archives
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
           uv python install 3.14.7
           npm install --global npm@12.0.0
@@ -78,7 +80,7 @@ jobs:
         shell: bash
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y ca-certificates git
+          apt-get install --no-install-recommends -y ca-certificates git python3
       - name: Configure Git safe directory
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -90,12 +92,14 @@ jobs:
       - name: Assert scheduled or dispatched SHA
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
+      - name: Cache pinned Linux tool archives
+        uses: ./.github/actions/cache-linux-tools
       - name: Install pinned Linux toolchain and platform libraries
         shell: bash
         run: |
           apt-get update
           apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev tmux unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
-          python3 ci/install-linux-tools.py amd64
+          python3 ci/install-linux-tools.py amd64 .ci/linux-tool-archives
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
           uv python install 3.14.7
           npm install --global npm@12.0.0
@@ -141,6 +145,12 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26.8.2'
+      - name: Cache pinned uv archive
+        uses: ./.github/actions/cache-pinned-tool
+        with:
+          source: uv
+          tool: uv
+          version: '0.12.13'
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: '0.12.13'

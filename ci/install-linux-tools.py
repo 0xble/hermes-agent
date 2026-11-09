@@ -120,29 +120,56 @@ def download(url: str, archive: Path) -> None:
             time.sleep(delay)
 
 
-def main(architecture: str, cache_directory: Path | None = None) -> None:
+def verified_archive(artifact: dict, scratch: Path, cache_directory: Path | None) -> Path:
+    cached = cache_directory / artifact['sha256'] if cache_directory is not None else None
+    cache_hit = cached is not None and cached.is_file()
+    archive = cached if cache_hit else scratch / 'download'
+    if not cache_hit:
+        download(artifact['url'], archive)
+    actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if actual != artifact['sha256']:
+        raise RuntimeError(f"Checksum mismatch: {artifact['url']}")
+    # Restored archives are untrusted: verification above is unconditional.
+    if cached is not None and not cache_hit:
+        cache_directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=cache_directory, delete=False) as staged:
+            staged_path = Path(staged.name)
+        try:
+            shutil.copyfile(archive, staged_path)
+            staged_path.replace(cached)
+        finally:
+            staged_path.unlink(missing_ok=True)
+    return archive
+
+
+def artifact_name(artifact: dict) -> str:
+    if artifact['kind'] == 'rust':
+        filename = Path(artifact['url']).name
+        return 'rust-std' if filename.startswith('rust-std-') else filename.split('-', 1)[0]
+    return artifact['kind']
+
+
+def cache_info(architecture: str, tool: str, cache_directory: Path) -> dict[str, str]:
     artifacts = json.loads((HERE / 'linux-artifacts.json').read_text(encoding='utf-8'))[architecture]
+    artifact, = [item for item in artifacts if artifact_name(item) == tool]
+    pins = json.loads((HERE.parent / 'scripts/ci/toolchain.json').read_text(encoding='utf-8'))
+    version = pins['rustc' if artifact['kind'] == 'rust' else artifact['kind']]
+    return {'version': version, 'checksum': artifact['sha256'],
+            'path': str(cache_directory / artifact['sha256'])}
+
+
+def main(architecture: str, cache_directory: Path | None = None, *,
+         tool: str | None = None, download_only: bool = False) -> None:
+    artifacts = json.loads((HERE / 'linux-artifacts.json').read_text(encoding='utf-8'))[architecture]
+    if tool is not None:
+        artifact, = [item for item in artifacts if artifact_name(item) == tool]
+        artifacts = [artifact]
     for artifact in artifacts:
         with tempfile.TemporaryDirectory(prefix='hermes-ci-tool-') as directory:
             scratch = Path(directory)
-            cached = cache_directory / artifact['sha256'] if cache_directory is not None else None
-            cache_hit = cached is not None and cached.is_file()
-            archive = cached if cache_hit else scratch / 'download'
-            if not cache_hit:
-                download(artifact['url'], archive)
-            actual = hashlib.sha256(archive.read_bytes()).hexdigest()
-            if actual != artifact['sha256']:
-                raise RuntimeError(f"Checksum mismatch: {artifact['url']}")
-            # Restored archives are untrusted: verification above is unconditional.
-            if cached is not None and not cache_hit:
-                cache_directory.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(dir=cache_directory, delete=False) as staged:
-                    staged_path = Path(staged.name)
-                try:
-                    shutil.copyfile(archive, staged_path)
-                    staged_path.replace(cached)
-                finally:
-                    staged_path.unlink(missing_ok=True)
+            archive = verified_archive(artifact, scratch, cache_directory)
+            if download_only:
+                continue
             kind = artifact['kind']
             if kind == 'hadolint':
                 target = Path('/usr/local/bin/hadolint')

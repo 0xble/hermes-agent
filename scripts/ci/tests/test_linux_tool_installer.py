@@ -200,5 +200,20 @@ class LinuxToolDownloadTests(unittest.TestCase):
                         self.assertTrue(2 ** attempt <= delay <= 2 ** attempt + 1)
 
 
+class PinnedToolCacheTests(unittest.TestCase):
+    def test_prefetch_verifies_hits_and_misses_without_installing(self):
+        with download_fixture() as (root, data, artifact, _, installed):
+            cache = root / 'cache'
+            with patch.object(installer.urllib.request, 'urlopen', return_value=io.BytesIO(data)) as opener:
+                installer.main('amd64', cache, tool='uv', download_only=True)
+                self.assertEqual(opener.call_count, 1)
+            # An unavailable origin cannot affect a valid restored archive.
+            with patch.object(installer.urllib.request, 'urlopen', side_effect=AssertionError('network on hit')):
+                installer.main('amd64', cache, tool='uv', download_only=True)
+                (cache / artifact['sha256']).write_bytes(b'corrupt cache')
+                with self.assertRaisesRegex(RuntimeError, 'Checksum mismatch'):
+                    installer.main('amd64', cache, tool='uv', download_only=True)
+            self.assertEqual(installed, [])
+
 if __name__ == '__main__':
     unittest.main()
