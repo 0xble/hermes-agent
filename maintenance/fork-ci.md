@@ -1175,6 +1175,18 @@ It fails with the original immediate assertion and passes with the shared
 screen wait. No runtime behavior changes. Retire this synchronization only
 when the renderer supplies an atomic command-output completion boundary.
 
+The platform-command capture helper joins the adapter's admitted session task
+before returning its send mock. The inherited 40-poll window could return with
+no send while an executor-backed `/stop` handler was still running. Both upstream
+v0.23.0 and fork main retain that window, and their unheld command suites pass.
+An event-held `/stop` with accelerated polling reproduces the same missing-send
+assertion on Telegram, Discord and Slack. Joining the task preserves the real
+command dispatch, response assertions and cleanup without a larger timeout.
+Retire this `fork-ci-reliability` adaptation when upstream captures command
+completion through an equivalent causal boundary.
+
+Contract tests: `tests/e2e/test_platform_commands.py::TestSlashCommands::test_leading_space_stop_waits_for_dispatch`.
+
 ## Pinned tool archive caches
 
 `.github/actions/cache-pinned-tool` restores exact SHA-pinned `actions/cache`
