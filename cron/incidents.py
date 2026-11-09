@@ -144,6 +144,17 @@ def _redact_error(error: str) -> str:
 
 def _error_signature(job_id: str, error: str) -> str:
     """Dedup key: stable for same job + cause. Durations and scheduled instants vary per occurrence."""
+    # Agent-declared failures lose their [CRON_FAILURE] control line before reaching here.
+    # An explicit durable-blocker field identifies the cause across model paraphrases. Sign
+    # the entire path, even beyond the normal prose-prefix bound, plus a machine reason when
+    # the report names one. Keep the original error for display and classification.
+    blocker = re.search(r"(?im)^[ \t]*durable blocker:[ \t]*`?((?:/|~/)[^`\r\n]+?)`?[ \t]*$", str(error or ""))
+    if blocker:
+        reason = re.search(r"\bescalated for `([a-z][a-z0-9_]*)`", str(error), re.IGNORECASE)
+        evidence = "durable blocker:" + _normalize_error(blocker.group(1))
+        if reason:
+            evidence += "\nreason:" + reason.group(1).lower()
+        return hashlib.sha256(job_id.encode() + evidence.encode()).hexdigest()[:12]
     normalized = _DURATION_RE.sub("#s", _normalize_error(error))
     normalized = re.sub(
         r"\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})\b",

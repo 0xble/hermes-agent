@@ -134,6 +134,43 @@ def test_same_signature_dedups_same_incident(monkeypatch, tmp_path):
     assert inc.get_incident(id1)["state"] == "detected"
 
 
+def test_durable_blocker_dedups_model_wording_and_keeps_full_error(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    blocker = "/tmp/fork-sync/escalation-invocation.json"
+    ids = []
+    for words in ("no bounded request", "no work request", "no recovery request"):
+        response = ("[CRON_FAILURE]\nSource sync remains escalated for `red_k1_no_progress_48h`. "
+                    f"This tick returned failed=true with {words}.\n\nDurable blocker: `{blocker}`")
+        # The scheduler strips the control marker before incident bookkeeping.
+        error = sched._cron_failure_marker_error(response)
+        iid, is_new = inc.upsert_incident("job-1", error)
+        ids.append(iid)
+        assert is_new is (len(ids) == 1)
+        assert inc.get_incident(iid)["error"] == error
+    assert len(set(ids)) == 1
+    assert inc.count_incidents() == 1
+
+
+def test_durable_blocker_signature_preserves_distinct_causes(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    def error(path, reason):
+        return f"Source sync remains escalated for `{reason}`.\nDurable blocker: `{path}`"
+    original, _ = inc.upsert_incident("job-1", error("/tmp/a.json", "red_k1_no_progress_48h"))
+    other_path, _ = inc.upsert_incident("job-1", error("/tmp/b.json", "red_k1_no_progress_48h"))
+    other_reason, _ = inc.upsert_incident("job-1", error("/tmp/a.json", "two_failed_stages"))
+    other_job, _ = inc.upsert_incident("job-2", error("/tmp/a.json", "red_k1_no_progress_48h"))
+    assert len({original, other_path, other_reason, other_job}) == 4
+    # Paths beyond the prose-prefix bound still identify different blockers.
+    prefix = "/tmp/" + "a" * 220
+    a, _ = inc.upsert_incident("job-1", error(prefix + "/a.json", "reason"))
+    b, _ = inc.upsert_incident("job-1", error(prefix + "/b.json", "reason"))
+    assert a != b
+    # A prose mention of the label is not a durable blocker field.
+    a, _ = inc.upsert_incident("job-1", "No durable blocker: /tmp/a.json, provider 401")
+    b, _ = inc.upsert_incident("job-1", "No durable blocker: /tmp/a.json, provider 503")
+    assert a != b
+
+
 def test_error_change_mints_new_incident(monkeypatch, tmp_path):
     inc = _point_db(monkeypatch, tmp_path)
 
