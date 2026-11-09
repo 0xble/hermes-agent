@@ -273,7 +273,10 @@ Build-time carry and candidate-owned carry remain the repair paths. They are not
 activation gates: an older updater, direct promotion, rollback, or recovered
 transaction can reach the pointer flip without importing candidate-owned PM.
 Every transaction probes the selected candidate PM interpreter before
-changing `current`, including source-layout rollback. Forward activation refuses
+changing `current`, including source-layout rollback. Fresh forward activation
+preflights before writing transaction intent, so a refusal leaves no WAL to replay
+and cannot block rollback or a later healthy promotion. Recovered transactions
+recheck readiness before replaying their intent. Forward activation refuses
 only regressions from the origin: a previously importable extra still declared
 by the candidate loses a direct requirement, or an available configured memory
 provider becomes unavailable. Identical existing degradation warns and proceeds.
@@ -295,21 +298,25 @@ reads back the selected environment rather than trusting PM's return value or
 the payload venv.
 Configured-provider checks use each release's `is_available` and
 `unavailable_reason`, not client construction or network requests. False availability
-is compared even without a reason. Refusals direct the operator to install the
-extra or provider client into the CURRENT release with
-`hermes pm install --extra <x>`, then re-run the update.
+is compared even without a reason. Refusals name the candidate path and direct
+the operator to re-run the update so candidate-owned carry rebuilds that
+environment with the full applicable extra set. If that keeps failing, repair
+the candidate environment explicitly.
 
 At gateway startup and each 60-second housekeeping tick, configured providers use
 those same readiness APIs. Client degradation emits an ERROR with client package
 names and PM repair guidance, and an operator home-channel notice. Per-profile,
 per-release markers suppress repeat errors and delivered notices across ticks and
-restarts. A saved `.logged` issue is reused without re-probing even when muted or
-without a home transport. Saved notices accept a UTF-8 BOM from Windows editors,
+restarts. A saved `.logged` issue is reused without re-probing while muted or
+without a home transport. Before attempting delivery, a saved issue gets 1 fresh
+readiness check. A recovered provider drops the notice and records `.resolved`
+instead of delivering stale advice. Saved notices accept a UTF-8 BOM from Windows editors,
 while newly written notices remain BOM-free. Unsent notices remain eligible for retry. No provider readiness, PM
 selection, or status-command implementation is duplicated or changed by this gate.
 The existing `hermes memory status` red readiness contract remains #845's owner.
 Proof: `tests/hermes_cli/test_release_extras_preflight.py`,
 `tests/hermes_cli/test_release_preflight_recovery.py`,
+`tests/hermes_cli/test_refused_release_activation.py`,
 `tests/gateway/test_memory_health.py`, and the existing immutable-release and
 memory-status suites. Release integration and promotion remain with Maintenance.
 

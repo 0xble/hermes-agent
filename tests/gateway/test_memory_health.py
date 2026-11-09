@@ -297,3 +297,37 @@ async def test_undeliverable_notice_reuses_logged_readiness_across_restarts(tmp_
     monkeypatch.setattr("hermes_cli.version_info.get_code_identity", lambda: {"sha": "release-C"})
     await runtime_health.check_memory_health(gateway)
     assert probe.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["muted", "no-transport"])
+async def test_saved_notice_is_resolved_if_readiness_recovers_before_delivery(tmp_path, monkeypatch, delivery):
+    from gateway import runtime_health
+
+    home = setup_home(tmp_path, monkeypatch)
+    probe = Mock(return_value="client unavailable")
+    monkeypatch.setattr(runtime_health, "_readiness_issue", probe)
+    gateway = runner()
+    if delivery == "muted":
+        (home / "config.yaml").write_text(
+            "memory: {provider: hindsight}\ndisplay: {suppress_warning_notifications: true}\n", encoding="utf-8")
+    else:
+        gateway._served_home_channel_transports = lambda: []
+    await runtime_health.check_memory_health(gateway)
+    marker = runtime_health._marker(home)
+    assert marker.with_suffix(".logged").exists()
+    gateway._send_home_channel_message.assert_not_awaited()
+    assert probe.call_count == 1
+
+    # Delivery becomes possible after an in-place client repair, in a fresh runner.
+    probe.return_value = ""
+    (home / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
+    restarted = runner()
+    await runtime_health.check_memory_health(restarted)
+    restarted._send_home_channel_message.assert_not_awaited()
+    assert probe.call_count == 2
+    assert marker.with_suffix(".resolved").exists()
+    assert not marker.with_suffix(".logged").exists()
+    assert not marker.with_suffix(".notified").exists()
+    await runtime_health.check_memory_health(runner())
+    assert probe.call_count == 2

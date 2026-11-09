@@ -151,8 +151,9 @@ def activation_preflight(candidate: Path, previous: Path | str | None, home: Pat
     if errors and not recovery:
         raise RuntimeError(
             f"release activation refused: {'; '.join(errors)}. "
-            "Install the extra or provider client into the CURRENT release "
-            "(hermes pm install --extra <x>), then re-run the update. The current release was not changed.")
+            f"Please re-run the update so candidate-owned carry rebuilds the candidate environment at {candidate} "
+            "with the full applicable extra set. If that keeps failing, repair the candidate environment explicitly. "
+            "The current release was not changed.")
 
 
 def _check_activation(candidate: Path, previous: Path | str | None, home: Path,

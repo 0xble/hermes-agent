@@ -68,12 +68,12 @@ async def check_memory_health(runner) -> None:
 
 def _pending_notice(home: Path) -> tuple[Path, str, bool]:
     marker = _marker(home)
-    if marker.with_suffix(".notified").exists():
+    if marker.with_suffix(".notified").exists() or marker.with_suffix(".resolved").exists():
         return marker, "", False
     logged = marker.with_suffix(".logged")
     if logged.exists():
-        # Delivery may become possible later. Retry the saved notice without
-        # reloading providers on every housekeeping tick (or gateway restart).
+        # Defer the fresh readiness check until delivery is possible, so muted
+        # profiles do not reload providers on each tick or gateway restart.
         return marker, logged.read_text(encoding="utf-8-sig"), False
     issue = _readiness_issue()
     if not issue:
@@ -96,17 +96,28 @@ async def _check_profile_health(runner, profile, home: Path) -> None:
         return
     if first:
         logger.error("%s [profile=%s]", issue, home)
+    checked = first
     for owner, platform, _config, channel, transport in runner._served_home_channel_transports():
         if owner != profile:
             continue
         sent = False
 
         async def send() -> None:
-            nonlocal sent
+            nonlocal sent, issue, checked
+            if not checked:
+                issue = await asyncio.to_thread(_readiness_issue)
+                checked = True
+                if not issue:
+                    await asyncio.to_thread(marker.with_suffix(".resolved").touch)
+                    await asyncio.to_thread(marker.with_suffix(".logged").unlink, missing_ok=True)
+            if not issue:
+                return
             sent = await runner._send_home_channel_message(
                 platform, channel, transport, issue, "Memory health notice failed for %s:%s: %s")
 
         await present_notification(send, platform=platform)
+        if not issue:
+            break
         # Muted diagnostics remain log-only, not delivered. Keep the notice eligible
         # if the owning profile later enables warning notifications for this release.
         if sent:

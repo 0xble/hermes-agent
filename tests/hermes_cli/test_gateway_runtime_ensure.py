@@ -566,3 +566,41 @@ def test_dead_unmanaged_start_is_a_prompt_terminal_verdict(tmp_path, monkeypatch
     assert "RuntimeError: boot failed with key" in result.detail, result.detail
     assert secret not in result.detail and "OLD_RUN_TRACEBACK" not in result.detail
     assert "gateway-stdio.log" in result.detail
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_own_child_exit_reports_profile_parked_when_host_refuses_profile(tmp_path, monkeypatch):
+    from gateway.runtime_ownership import ProfileOwnership
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_service as service, gateway_runtime_start as start
+
+    root = tmp_path / ".hermes"
+    home = root / "profiles" / "alpha"
+    home.mkdir(parents=True, mode=0o700)
+    owner = ProfileOwnership()
+    children = []
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **k: runtime.GatewayDiscovery("absent"))
+    monkeypatch.setattr(service, "discover_existing_gateway_service", lambda *a, **k: None)
+
+    def lose_start(target, **kwargs):
+        assert target == root
+        owner.reserve([root])
+        (root / "gateway_state.json").write_text(json.dumps({
+            "gateway_state": "running", "pid": os.getpid(), "served_profiles": [],
+            "multiplex_standalone_reason": _REASON}), encoding="utf-8")
+        child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(1)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        children.append(child)
+        child.wait(timeout=10)
+        return child
+
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lose_start)
+    try:
+        result = runtime.ensure_gateway_runtime(home, timeout=2)
+    finally:
+        owner.close()
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+    assert len(children) == 1
+    assert (result.state, result.reason_code, result.detail) == ("inaccessible", "profile_parked", _REASON)

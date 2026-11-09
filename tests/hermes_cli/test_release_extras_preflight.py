@@ -74,6 +74,8 @@ def test_activation_outside_candidate_checks_generation_loss_by_operation(tmp_pa
         if route == "recover":
             with monkeypatch.context() as m:
                 m.setattr(releases, "_run_transaction", lambda *args, **kwargs: {})
+                # Model a crash after an accepted preflight and durable intent.
+                m.setattr("hermes_cli.immutable_release_preflight.activation_preflight", lambda *args, **kwargs: None)
                 releases.promote(home, b)
             # Resuming an update still enforces the forward regression rule.
             releases.recover_pending_transaction(home)

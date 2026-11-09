@@ -989,9 +989,21 @@ def wait_for_release_acknowledgement(home: Path, *, timeout_seconds: float = 180
     return True
 
 
+def _prepare_transaction_candidate(paths: ReleasePaths, record: dict[str, Any], *,
+                                   deadline: float | None, preflight_done: bool) -> Path:
+    from hermes_cli.immutable_release_preflight import activation_preflight
+    candidate = Path(record["candidate"])
+    if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
+        raise RuntimeError(f"transaction candidate no longer ready: {candidate}")
+    if not preflight_done:
+        origin = record.get("current_original") or record.get("source")
+        activation_preflight(candidate, origin, paths.home, operation=record["operation"], deadline=deadline)
+    return candidate
+
+
 def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
                      reload_callback: Callable[[], Any] | None = None, *,
-                     deadline: float | None = None) -> dict[str, str | None]:
+                     deadline: float | None = None, preflight_done: bool = False) -> dict[str, str | None]:
     operation = record["operation"]
     if (record.get("requires_reload") and reload_callback is None
             and not record.get("reload_done") and not record.get("reload_issued")
@@ -1047,10 +1059,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         result = {"current": record["source"], "previous": record["current_original"],
                   "source_sha": record["source_sha"]}
     else:
-        candidate = Path(record["candidate"])
-        if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
-            raise RuntimeError(f"transaction candidate no longer ready: {candidate}")
-        activation_preflight(candidate, origin, paths.home, operation=operation, deadline=deadline)
+        candidate = _prepare_transaction_candidate(paths, record, deadline=deadline, preflight_done=preflight_done)
         if record.get("journal_intended") is not None:
             _atomic_json(paths.home / "release-layout.json", record["journal_intended"])
         _set_pointer(paths.previous, record["previous_intended"])
@@ -1155,7 +1164,6 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
             if pending.get("plist") and plist_body is not None:
                 pending["plist"]["intended_body"] = base64.b64encode(plist_body).decode("ascii")
                 pending["plist"]["intended_sha256"] = hashlib.sha256(plist_body).hexdigest()
-            _write_txn(paths, pending)
         else:
             result = recover_pending_transaction(paths.home, reload_callback, deadline=deadline)
             if result and result.get("current") == str(candidate):
@@ -1164,6 +1172,11 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
     old = _pointer_value(paths.current)
     if old == str(candidate) and not force_reload:
         return {"current": old, "previous": _pointer_value(paths.previous)}
+    from hermes_cli.immutable_release_preflight import activation_preflight
+    # A rejected candidate must never become replayable transaction intent.
+    origin = old or (pending.get("source") if pending else source)
+    activation_preflight(candidate, origin, paths.home,
+                         operation=pending["operation"] if pending else operation, deadline=deadline)
     if pending is None:
         if source is not None and old is None:
             pending = _migration_record(paths, source, plist_path, candidate=candidate,
@@ -1177,12 +1190,12 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
                        "candidate": str(candidate), "previous_intended": previous if old == str(candidate) else old or previous,
                        "journal_original": None, "journal_intended": None,
                        "requires_reload": reload_callback is not None, "plist": plist}
-        _write_txn(paths, pending)
+    _write_txn(paths, pending)
     if before_flip is not None:
         # Compatibility hook: call after previous is recorded but before current.
         _set_pointer(paths.previous, pending["previous_intended"])
         before_flip()
-    return _run_transaction(paths, pending, reload_callback, deadline=deadline)
+    return _run_transaction(paths, pending, reload_callback, deadline=deadline, preflight_done=True)
 
 
 def promote(home: Path, candidate: Path, *, before_flip=None) -> dict[str, str | None]:

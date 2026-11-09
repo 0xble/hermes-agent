@@ -79,8 +79,10 @@ def test_forward_identical_degradation_across_three_releases(tmp_path, monkeypat
     else:
         provider(b, available=True)
     releases.activate_release(home, b, operation="restore")
-    with pytest.raises(RuntimeError, match="CURRENT release.*hermes pm install --extra"):
+    with pytest.raises(RuntimeError, match="re-run the update.*candidate") as refusal:
         releases.promote(home, c)
+    assert str(c) in str(refusal.value)
+    assert "repair the candidate environment explicitly" in str(refusal.value)
     assert releases.read_pointer(home / "current") == b
 
 
