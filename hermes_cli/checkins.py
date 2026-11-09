@@ -32,6 +32,9 @@ class CheckinConfig:
     def load(cls):
         from hermes_cli.config import FailedConfigRead, load_config
         config = load_config()
+        if isinstance(config, FailedConfigRead) and isinstance(config.read_error, OSError):
+            # Unavailable settings pause observation; they are not an authored disarm.
+            raise config.read_error
         raw = config.get("checkins", {})
         if isinstance(config, FailedConfigRead) or not isinstance(raw, dict):
             return cls(enabled=False)

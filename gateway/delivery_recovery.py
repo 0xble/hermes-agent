@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
 from collections.abc import Awaitable
 from typing import Optional, TypeVar
@@ -55,6 +56,26 @@ class RuntimeDeliverySettlement:
                 if task.cancelled():
                     raise
                 self.cancelled = True
+
+
+async def _recover_obligation_policy(runner, row, chat_key, blocked_chats):
+    """Retain unreadable policy for retry, retire only a proven disarm."""
+    from gateway.checkin_delivery import DISARMED, permits_metadata, recovery_metadata
+    try:
+        policy = await recovery_metadata(runner, row["session_key"], row.get("resume_turn_id"))
+        permitted = await permits_metadata(runner, policy, retry_on_read_error=True)
+    except (OSError, sqlite3.Error):
+        logger.warning("Delivery policy unreadable for %s; retaining owed reply", row["session_key"], exc_info=True)
+        blocked_chats[chat_key] = row.get("last_error") or "send_path_degraded"
+        await runner._release_runtime_claim_quiet(
+            row["obligation_id"], "failed to release unreadable-policy obligation %s",
+            error=blocked_chats[chat_key])
+        return None
+    if not permitted:
+        from gateway.delivery_ledger import abandon_obligation
+        await asyncio.to_thread(abandon_obligation, row["obligation_id"], DISARMED)
+        return None
+    return policy
 
 
 class RuntimeDeliveryRecoveryMixin:
@@ -143,11 +164,8 @@ class RuntimeDeliveryRecoveryMixin:
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
-            from gateway.checkin_delivery import permits_metadata, recovery_metadata
-            policy = await recovery_metadata(self, row["session_key"], row.get("resume_turn_id"))
-            if not await permits_metadata(self, policy):
-                from gateway.delivery_ledger import abandon_obligation
-                await asyncio.to_thread(abandon_obligation, row["obligation_id"], "supervisor_checkin_disarmed")
+            policy = await _recover_obligation_policy(self, row, chat_key, blocked_chats)
+            if policy is None:
                 continue
             note_event = await self._redelivery_restart_note_event(row)
             from gateway.copy_blocks import split_copy_blocks_for
@@ -204,7 +222,6 @@ class RuntimeDeliveryRecoveryMixin:
                 await self._arm_flood_timers_for_waiting_rows()
         return redelivered
 
-
     async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
         """Settle every marked turn whose final reply was persisted and clear its marker, so
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
@@ -219,13 +236,17 @@ class RuntimeDeliveryRecoveryMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
-            text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                          started, origin)
-            if text is None or (text and not ledger_on):
-                continue  # no final reply to deliver: the turn resumes
             from gateway.checkin_delivery import permits_recovery
-            if text and not await permits_recovery(self, key, token):
-                text = ""
+            try:
+                text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
+                                              started, origin)
+                if text is None or (text and not ledger_on):
+                    continue  # no final reply to deliver: the turn resumes
+                if text and not await permits_recovery(self, key, token):
+                    text = ""
+            except (OSError, sqlite3.Error):
+                logger.warning("Crash-left delivery policy unreadable for %s; retaining turn marker", key, exc_info=True)
+                continue
             if text:
                 for ref, content in await asyncio.to_thread(
                         self._crash_left_parts, key, token, text, started, origin):

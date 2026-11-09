@@ -65,6 +65,8 @@ def pending_root(runner, route, token):
     if not callable(getattr(store, "_db_for_key", None)):
         return None
     db = store._db_for_key(route)
+    if db is None:
+        raise OSError("Supervisor provenance store is unavailable")
     entry = store.lookup_by_session_key(route)
     lineage = db.get_compression_lineage(entry.session_id) if entry is not None else []
     placeholders = ",".join("?" for _ in lineage) or "NULL"
@@ -95,14 +97,19 @@ async def permits_delivery(runner, root, source):
         return config.permits(root)
 
 
-async def permits_metadata(runner, metadata):
+async def permits_metadata(runner, metadata, *, retry_on_read_error=False):
     policy = (metadata or {}).get("_checkin_scope")
     if policy is None:
         return True
     if policy["source"] is None:
         return False
     from gateway.session import SessionSource
-    return await permits_delivery(runner, policy["root"], SessionSource.from_dict(policy["source"]))
+    try:
+        return await permits_delivery(runner, policy["root"], SessionSource.from_dict(policy["source"]))
+    except OSError:
+        if retry_on_read_error:
+            raise
+        return False
 
 
 async def recovery_metadata(runner, route, token):
@@ -117,7 +124,7 @@ async def recovery_metadata(runner, route, token):
 
 
 async def permits_recovery(runner, route, token):
-    return await permits_metadata(runner, await recovery_metadata(runner, route, token))
+    return await permits_metadata(runner, await recovery_metadata(runner, route, token), retry_on_read_error=True)
 
 
 def suppress_result(result):
@@ -135,7 +142,11 @@ async def fence_local_settlement(authority, live, row, response, captured):
     result = (captured or {}).get("result", {})
     if descriptor.get("display_kind") != DISPLAY_KIND or "checkin_pending_root" not in result:
         return response
-    if await permits_delivery(authority.runner, result["checkin_pending_root"], live.source):
+    try:
+        permitted = await permits_delivery(authority.runner, result["checkin_pending_root"], live.source)
+    except OSError:
+        permitted = False
+    if permitted:
         return response
     suppress_result(result)
     return ""

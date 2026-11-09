@@ -21,9 +21,9 @@ from hermes_cli.checkins import (
 logger = logging.getLogger(__name__)
 
 
-def _manager(runner, entry):
+def _manager(runner, entry, config=None):
     return CheckinManager(runner.session_store._db_for_key(entry.session_key), entry.session_id,
-                          CheckinConfig.load())
+                          CheckinConfig.load() if config is None else config)
 
 
 def _observe(manager, session_id):
@@ -41,14 +41,14 @@ def _observe(manager, session_id):
                  "status": "unknown, inspect the local roster before claiming completion"}]
 
 
-def _reconcile(runner, entry):
-    manager = _manager(runner, entry)
+def _reconcile(runner, entry, config=None):
+    manager = _manager(runner, entry, config)
     work = _observe(manager, entry.session_id)
     visible = getattr(runner, "_checkin_visible", {}).get((entry.session_key, manager.root))
     return manager.reconcile(work, last_visible_at=visible)
 
 
-async def reconcile_turn(runner, source, session_key):
+async def reconcile_turn(runner, source, session_key, *, config=None):
     """Retain the candidate on an observation error, so the next cheap scan retries it."""
     entry = await runner._run_in_executor_with_context(
         runner.session_store.lookup_by_session_key, session_key)
@@ -59,7 +59,7 @@ async def reconcile_turn(runner, source, session_key):
         watches = runner._checkin_watch = {}
     watches[session_key] = (source, entry.session_id)
     try:
-        state = await runner._run_in_executor_with_context(lambda: _reconcile(runner, entry))
+        state = await runner._run_in_executor_with_context(lambda: _reconcile(runner, entry, config))
         if state is None:
             watches.pop(session_key, None)
     except Exception:
@@ -73,9 +73,7 @@ def _queued(adapter, route):
 
 
 async def poll_checkins(runner):
-    from gateway.session_authorities import active_authority
-    from gateway.platforms.event import MessageEvent
-    from hermes_state_runtime import list_session_admissions
+    from gateway.run_turn import GatewayTurnMixin
 
     if getattr(runner, "_startup_restore_in_progress", False):
         return  # Registries and queued human input have not finished recovering yet.
@@ -85,75 +83,92 @@ async def poll_checkins(runner):
     seen = getattr(runner, "_checkin_seen", None)
     if not isinstance(seen, dict):
         seen = runner._checkin_seen = {}
+    scope_key = functools.partial(GatewayTurnMixin._profile_scope_key_for_source, runner)
+    by_scope = {}
     for entry in await runner._run_in_executor_with_context(runner.session_store.list_sessions):
-        identity = (entry.session_key, entry.session_id)
         if entry.suspended or not entry.origin:
             continue
         source = runner._restored_source(entry)
         if source is None:
             continue
+        key = scope_key(source)
+        by_scope.setdefault(key, (source, []))[1].append((entry, source))
+    for source, _ in getattr(runner, "_checkin_watch", {}).values():
+        key = scope_key(source)
+        by_scope.setdefault(key, (source, []))
+    for key, (source, entries) in by_scope.items():
         scope = runner._async_profile_scope_for_source(source)
         if scope is None:
             continue
         async with scope:
-            config = await runner._run_in_executor_with_context(CheckinConfig.load)
-            if seen.get(identity) == config:
+            try:
+                config = await runner._run_in_executor_with_context(CheckinConfig.load)
+            except OSError:
+                logger.warning("Supervisor config unreadable for %s; retaining armed clocks", key, exc_info=True)
                 continue
-            seen[identity] = config
-            await reconcile_turn(runner, source, entry.session_key)
+            for entry, entry_source in entries:
+                identity = (entry.session_key, entry.session_id)
+                if seen.get(identity) != config:
+                    seen[identity] = config
+                    await reconcile_turn(runner, entry_source, entry.session_key, config=config)
+            await _poll_profile_watches(runner, key, config, scope_key)
 
+
+async def _poll_profile_watches(runner, profile_key, config, scope_key):
+    """Observe this profile's armed roster under its poll's single scope/config snapshot."""
+    from gateway.session_authorities import active_authority
+    from gateway.platforms.event import MessageEvent
+    from hermes_state_runtime import list_session_admissions
     for route, (source, expected) in list(getattr(runner, "_checkin_watch", {}).items()):
+        if scope_key(source) != profile_key:
+            continue
         try:
-            scope = runner._async_profile_scope_for_source(source)
-            if scope is None:
+            from agent import estop
+            if (getattr(runner, "_draining", False) or estop.paused_reply() is not None
+                    or getattr(runner, "_user_stop_latched", lambda *_: False)(route)):
                 continue
-            async with scope:
-                from agent import estop
-                if (getattr(runner, "_draining", False) or estop.paused_reply() is not None
-                        or getattr(runner, "_user_stop_latched", lambda *_: False)(route)):
-                    continue
-                entry = await runner._run_in_executor_with_context(
-                    runner.session_store.lookup_by_session_key, route)
-                if entry is None or entry.suspended:
-                    runner._checkin_watch.pop(route, None)
-                    continue
-                manager = await runner._run_in_executor_with_context(lambda: _manager(runner, entry))
-                if expected not in manager.lineage:
-                    runner._checkin_watch.pop(route, None)  # reset/fork, not compression
-                    continue
-                state = await runner._run_in_executor_with_context(lambda: _reconcile(runner, entry))
-                if state is None:
-                    runner._checkin_watch.pop(route, None)
-                    continue
-                if max(state.due_at, state.next_attempt_at) > time.time() or runner._is_session_running(route):
-                    continue
-                adapter = runner._delivery_adapter_for(source)
-                if adapter is None or route in getattr(adapter, "_active_sessions", {}) or _queued(adapter, route):
-                    continue
-                authority = active_authority(runner)
-                # Never fall back around a missing/failed canonical owner. The next poll retries.
-                if authority is None:
-                    continue
-                pending = await runner._run_in_executor_with_context(lambda: list_session_admissions(
-                    authority.db, session_id=authority.logical_owner(entry.session_id)))
-                if pending:
-                    continue
-                descriptor = [manager.root, state.due_at]
-                # The logical due identity is fenced by start(). A refused or pre-execution
-                # cancelled admission must not tombstone it forever in the durable FIFO.
-                identity = json.dumps(["supervisor-checkin", manager.root, state.due_at, uuid.uuid4().hex],
-                                      separators=(",", ":"))
-                event = MessageEvent(text="[Supervisor check-in]", source=source, internal=True,
-                                     message_id=identity, metadata={"gateway_session_key": route,
-                                     "gateway_session_id": entry.session_id, "checkin": descriptor,
-                                     "display_kind": DISPLAY_KIND, "display_text": "Supervisor check-in"})
-                from gateway.config import Platform
-                # LOCAL sources are in-process capabilities. Cloning one invalidates
-                # the registered owner's identity, unlike a native transport route.
-                if source.platform != Platform.LOCAL:
-                    event.source = copy.copy(source)
-                    event.source.message_id = None
-                await authority.admit_automation(adapter, event, identity)
+            entry = await runner._run_in_executor_with_context(
+                runner.session_store.lookup_by_session_key, route)
+            if entry is None or entry.suspended:
+                runner._checkin_watch.pop(route, None)
+                continue
+            manager = await runner._run_in_executor_with_context(lambda: _manager(runner, entry, config))
+            if expected not in manager.lineage:
+                runner._checkin_watch.pop(route, None)  # reset/fork, not compression
+                continue
+            state = await runner._run_in_executor_with_context(lambda: _reconcile(runner, entry, config))
+            if state is None:
+                runner._checkin_watch.pop(route, None)
+                continue
+            if max(state.due_at, state.next_attempt_at) > time.time() or runner._is_session_running(route):
+                continue
+            adapter = runner._delivery_adapter_for(source)
+            if adapter is None or route in getattr(adapter, "_active_sessions", {}) or _queued(adapter, route):
+                continue
+            authority = active_authority(runner)
+            # Never fall back around a missing/failed canonical owner. The next poll retries.
+            if authority is None:
+                continue
+            pending = await runner._run_in_executor_with_context(lambda: list_session_admissions(
+                authority.db, session_id=authority.logical_owner(entry.session_id)))
+            if pending:
+                continue
+            descriptor = [manager.root, state.due_at]
+            # The logical due identity is fenced by start(). A refused or pre-execution
+            # cancelled admission must not tombstone it forever in the durable FIFO.
+            identity = json.dumps(["supervisor-checkin", manager.root, state.due_at, uuid.uuid4().hex],
+                                  separators=(",", ":"))
+            event = MessageEvent(text="[Supervisor check-in]", source=source, internal=True,
+                                 message_id=identity, metadata={"gateway_session_key": route,
+                                 "gateway_session_id": entry.session_id, "checkin": descriptor,
+                                 "display_kind": DISPLAY_KIND, "display_text": "Supervisor check-in"})
+            from gateway.config import Platform
+            # LOCAL sources are in-process capabilities. Cloning one invalidates
+            # the registered owner's identity, unlike a native transport route.
+            if source.platform != Platform.LOCAL:
+                event.source = copy.copy(source)
+                event.source.message_id = None
+            await authority.admit_automation(adapter, event, identity)
         except Exception:
             logger.warning("Supervisor check-in deferred for %s", route, exc_info=True)
 
@@ -197,7 +212,11 @@ async def prepare_checkin(runner, event, entry, *, start=False):
             return None
         return checkin_prompt(work, manager.config), fallback_status(work, manager.config)
 
-    observation = await runner._run_in_executor_with_context(observe)
+    try:
+        observation = await runner._run_in_executor_with_context(observe)
+    except OSError:
+        logger.warning("Supervisor config unavailable before execution; retaining clock", exc_info=True)
+        return False
     if observation is None:
         return False
     event.text, event._checkin_fallback = observation
@@ -211,7 +230,14 @@ async def silence_fallback(runner, event, entry, result: dict) -> dict:
     if tick is None or not isinstance(result, dict):
         return result
     from gateway.checkin_delivery import retain_policy
-    manager = await runner._run_in_executor_with_context(lambda: _manager(runner, entry))
+    # Identity and terminal ownership do not require readable scheduling settings.
+    def delivery_manager():
+        try:
+            config = CheckinConfig.load()
+        except OSError:
+            return _manager(runner, entry, CheckinConfig(enabled=False)), False
+        return _manager(runner, entry, config), True
+    manager, config_readable = await runner._run_in_executor_with_context(delivery_manager)
     if result.get("queued_terminal_display_kind", DISPLAY_KIND) != DISPLAY_KIND:
         await runner._run_in_executor_with_context(lambda: retain_policy(manager, event, None))
         result["checkin_pending_root"] = None
@@ -226,10 +252,10 @@ async def silence_fallback(runner, event, entry, result: dict) -> dict:
                   or (result.get("completed") is not True
                       and (result.get("failure_reason") or exit_failure)))))
     def observe():
-        manager = _manager(runner, entry)
         # Disarm is a delivery policy, not evidence that the last dependency completed.
         work = outstanding_work(manager.db, entry.session_id)
-        manager.reconcile(work)
+        if config_readable:
+            manager.reconcile(work)
         return (fallback_status(work, manager.config) if work else "",
                 not any(item["kind"] == "unknown" for item in work), bool(work))
 

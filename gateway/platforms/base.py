@@ -4224,7 +4224,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
         fallback can fix it (a structured auth/target refusal, or a non-final send a platform's
         volume budget shed on purpose)."""
-        return getattr(result, "error", None) == SEND_SHED_BY_BUDGET
+        from gateway.checkin_delivery import DISARMED
+        return getattr(result, "error", None) in {SEND_SHED_BY_BUDGET, DISARMED}
 
     @staticmethod
     def _is_partial_delivery(result: SendResult) -> bool:
