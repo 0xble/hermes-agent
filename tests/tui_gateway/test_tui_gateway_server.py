@@ -17582,8 +17582,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     so session.activate needs an explicit in-flight payload sourced from the
     backend stream callback.
     """
-    started = threading.Event()
-    release = threading.Event()
+    activations = []
     done = threading.Event()
 
     class _Agent:
@@ -17594,8 +17593,13 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             assert conversation_history == []
             stream_callback("partial ")
             stream_callback("answer")
-            started.set()
-            assert release.wait(2), "test timed out waiting to finish fake model turn"
+            # This checkpoint is after both deltas and before the model can return.
+            # Thread.start()/the streaming receipt do not promise model readiness.
+            activation = server.handle_request({
+                "id": "activate", "method": "session.activate",
+                "params": {"session_id": "sid-live"},
+            })
+            activations.append((activation, session["inflight_turn"]["started_at"]))
             return {
                 "final_response": "partial answer complete",
                 "messages": [
@@ -17604,11 +17608,11 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
                 ],
             }
 
-    server._sessions["sid-live"] = _session(agent=_Agent())
+    server._sessions["sid-live"] = session = _session(agent=_Agent())
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -17625,15 +17629,10 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             }
         )
         assert submit["result"]["status"] == "streaming"
-        assert started.wait(2), "fake model did not stream before activation"
-
-        resp = server.handle_request(
-            {
-                "id": "activate",
-                "method": "session.activate",
-                "params": {"session_id": "sid-live"},
-            }
-        )
+        _join_turn_thread(session)
+        assert done.is_set(), "fake model turn did not complete"
+        assert len(activations) == 1, "fake model never reached its streaming checkpoint"
+        resp, live_started_at = activations[0]
 
         inflight = resp["result"].get("inflight")
         assert inflight == {
@@ -17642,12 +17641,10 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             "user": "write a long answer",
         }
         turn_started_at = resp["result"]["turn_started_at"]
-        assert turn_started_at == server._sessions["sid-live"]["inflight_turn"]["started_at"]
+        assert turn_started_at == live_started_at
         assert turn_started_at > 0
         assert resp["result"]["messages"] == []
 
-        release.set()
-        assert done.wait(2), "fake model turn did not complete"
         completed = server.handle_request(
             {
                 "id": "activate-done",
@@ -17662,9 +17659,10 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             {"role": "assistant", "text": "partial answer complete"},
         ]
     finally:
-        release.set()
-        done.wait(2)
-        server._sessions.pop("sid-live", None)
+        try:
+            _join_turn_thread(session)
+        finally:
+            server._sessions.pop("sid-live", None)
 
 
 def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):

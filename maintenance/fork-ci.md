@@ -936,3 +936,20 @@ and fails before any classification assertion. The real candidate's signing and 
 unchanged. Retire this fixture adaptation when upstream isolates Git signing.
 
 Contract tests: `tests/scripts/test_fork_patch_trailers.py`.
+
+The TUI in-flight activation fixture captures `session.activate` inside its fake
+model, after both partial chunks and before `run_conversation` returns. The
+`prompt.submit` streaming receipt precedes a dispatch-thread handoff to a second
+turn worker, whose profile/config/callback preparation has no 2-second latency
+contract. An event-gated 3-second hold at `_prepare_turn_input` reproduces the
+old readiness assertion without changing the model or the payload. The captured
+snapshot retains the partial text, streaming flag, user text, live timestamp and
+empty committed history checks. The existing thread-join helper observes actual
+completion before final-history assertions and fixture removal, so a worker that
+never reaches the checkpoint fails directly. The session-info stand-in accepts
+the production optional session argument so cleanup cannot raise after completion.
+No production scheduling, timeout, retry or skip policy changes.
+Retire this `fork-ci-reliability` adaptation when upstream uses an equivalent
+causal streaming checkpoint rather than a startup scheduling deadline.
+
+Contract tests: `tests/tui_gateway/test_tui_gateway_server.py::test_session_activate_returns_inflight_stream_before_completion`.
