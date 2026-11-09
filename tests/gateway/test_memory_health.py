@@ -184,6 +184,9 @@ async def test_health_notice_setup_failure_does_not_abort_startup(tmp_path, monk
     gateway = runner()
     prepare_startup(gateway, monkeypatch)
     if failed_step == "cron":
+        # A failure in cron wiring must not suppress the independent boot alarm.
+        probe = AsyncMock()
+        monkeypatch.setattr("gateway.runtime_health.check_memory_health", probe)
         monkeypatch.setattr("gateway.cron_store_notices.install_cron_store_notices",
                             Mock(side_effect=RuntimeError("cron notice setup failed")))
     else:
@@ -197,6 +200,51 @@ async def test_health_notice_setup_failure_does_not_abort_startup(tmp_path, monk
     assert len(caplog.records) == 1
     assert caplog.records[0].levelno == logging.ERROR
     assert isinstance(caplog.records[0].exc_info[1], RuntimeError)
+    if failed_step == "cron":
+        probe.assert_awaited_once_with(gateway)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved", [b"", b"\xef\xbb\xbf", b" \n"])
+async def test_empty_logged_marker_does_not_suppress_memory_alarm(tmp_path, monkeypatch, saved):
+    from gateway import runtime_health
+
+    home = setup_home(tmp_path, monkeypatch)
+    logged = runtime_health._marker(home).with_suffix(".logged")
+    logged.parent.mkdir(parents=True)
+    logged.write_bytes(saved)
+    gateway = runner()
+
+    await runtime_health.check_memory_health(gateway)
+    await runtime_health.check_memory_health(runner())
+
+    gateway._send_home_channel_message.assert_awaited_once()
+    assert "Hindsight client is missing" in logged.read_text(encoding="utf-8")
+    assert logged.with_suffix(".notified").exists()
+
+
+def test_interrupted_notice_write_does_not_publish_an_empty_marker(tmp_path, monkeypatch):
+    from gateway import runtime_health
+    import utils
+
+    home = setup_home(tmp_path, monkeypatch)
+    logged = runtime_health._marker(home).with_suffix(".logged")
+
+    def interrupted_replace(source, destination):
+        assert Path(destination) == logged
+        assert "Hindsight client is missing" in Path(source).read_text(encoding="utf-8")
+        assert not logged.exists()
+        raise OSError("interrupted before rename")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(utils, "atomic_replace", interrupted_replace)
+        with pytest.raises(OSError, match="interrupted before rename"):
+            runtime_health._pending_notice(home)
+
+    assert not logged.exists()
+    _marker, issue, first = runtime_health._pending_notice(home)
+    assert first and "Hindsight client is missing" in issue
+    assert logged.read_text(encoding="utf-8") == issue
 
 
 @pytest.mark.asyncio

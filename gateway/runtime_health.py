@@ -67,6 +67,8 @@ async def check_memory_health(runner) -> None:
 
 
 def _pending_notice(home: Path) -> tuple[Path, str, bool]:
+    from utils import atomic_write_text
+
     marker = _marker(home)
     if marker.with_suffix(".notified").exists() or marker.with_suffix(".resolved").exists():
         return marker, "", False
@@ -74,17 +76,13 @@ def _pending_notice(home: Path) -> tuple[Path, str, bool]:
     if logged.exists():
         # Defer the fresh readiness check until delivery is possible, so muted
         # profiles do not reload providers on each tick or gateway restart.
-        return marker, logged.read_text(encoding="utf-8-sig"), False
+        saved = logged.read_text(encoding="utf-8-sig")
+        if saved.strip():
+            return marker, saved, False
     issue = _readiness_issue()
     if not issue:
         return marker, "", False
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with logged.open("x", encoding="utf-8") as stream:
-            stream.write(issue)
-    except FileExistsError:
-        logger.debug("Memory readiness error already logged for this release: %s", home)
-        return marker, issue, False
+    atomic_write_text(logged, issue)
     return marker, issue, True
 
 
@@ -148,9 +146,12 @@ async def install_health_notices(runner) -> None:
     try:
         from gateway.cron_store_notices import install_cron_store_notices
         install_cron_store_notices(runner, asyncio.get_running_loop())
+    except Exception:
+        logger.error("Cron store health notice setup failed", exc_info=True)
+    try:
         await check_memory_health(runner)
     except Exception:
-        logger.error("Health notice setup failed", exc_info=True)
+        logger.error("Boot memory health check failed", exc_info=True)
 
 
 def health_notice_chores(runner, loop) -> list:

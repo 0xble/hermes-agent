@@ -319,7 +319,10 @@ restarts. A saved `.logged` issue is reused without re-probing while muted or
 without a home transport. Before attempting delivery, a saved issue gets 1 fresh
 readiness check. A recovered provider drops the notice and records `.resolved`
 instead of delivering stale advice. Saved notices accept a UTF-8 BOM from Windows editors,
-while newly written notices remain BOM-free. Unsent notices remain eligible for retry. No provider readiness, PM
+while newly written notices remain BOM-free. Logged issues are written by atomic
+temp-file replacement, and empty markers are treated as absent so an interrupted
+write cannot suppress an alarm. Cron store notice setup and the boot memory check
+fail independently. Unsent notices remain eligible for retry. No provider readiness, PM
 selection, or status-command implementation is duplicated or changed by this gate.
 The existing `hermes memory status` red readiness contract remains #845's owner.
 Proof: `tests/hermes_cli/test_release_extras_preflight.py`,
