@@ -2,6 +2,9 @@
 
 **Patch identity:** `hindsight-retain-visibility`, `evict-memory-shutdown`, and `hindsight-client-selection`.
 
+**Release-readiness patch identity:** `hindsight-memory` owns advisory recovery
+preflight, origin-relative forward checks, and release-scoped readiness notices.
+
 Shutdown must skip whole-transcript egress redaction when every provider inherits
 `MemoryProvider.on_session_end` unchanged. The 58s shutdown watchdog dump at
 2026-11-01 07:36Z showed `hk_1` spending shutdown in that unnecessary scrub; it
