@@ -292,9 +292,19 @@ Raw stdout/stderr and malformed/timeout diagnostics are not logged.
 
 - Candidates accepted by this owner include compact `MMYY` or `MMYYYY` (four or
   six ASCII digits with a valid month) and slash-separated `MM/YY` or `MM/YYYY`.
-  Compact entries register their raw spelling plus month/year components before
-  injection, so later browser-normalized `MM / YYYY` and shortened `MM / YY`
-  values are masked without a global short-number filter. Labels such as `Expiration date`,
+  Entries register their raw spelling plus month/year components before injection.
+  The shared `agent/redact.py` owner derives equivalent matches from each validated
+  `expiry` composite at egress, rather than registering generated strings that would
+  consume the bounded registry and evict unrelated entries. Accepted composites use
+  ASCII digits, a month from 1 through 12, and a 2- or 4-digit year, separated
+  by a slash with optional whitespace or compact with a padded month. Matching
+  covers padded/unpadded months, slash spacing and compact forms, retaining the
+  original year or its 2-digit suffix without inferring a century. Numeric leaves
+  use the existing integer/float normalization, including lost leading zeros.
+  Whole-token composite matches precede component masks so a month/year cannot
+  partially consume the expiry first. Invalid composites retain literal masking
+  without inferred equivalents. Profile, task, origin and cleanup filtering remain
+  unchanged, as does literal backend input. Labels such as `Expiration date`,
   `Expiration (MM/YY)`, and `MM/YY` already share the checkout classifier; issue
   dates, search fields and order numbers still do not register card metadata.
 

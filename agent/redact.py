@@ -155,6 +155,21 @@ def _date_parts(tab: str | None, origin: str = "") -> tuple:
         return tuple(merged)
 
 
+def _expiry_pattern(value: str) -> str | None:
+    """Derive equivalents without spending bounded registry slots or inventing a century."""
+    if not value.isascii():
+        return None
+    match = (re.fullmatch(r"(0?[1-9]|1[0-2])\s*/\s*([0-9]{4}|[0-9]{2})", value)
+             or re.fullmatch(r"(0[1-9]|1[0-2])([0-9]{4}|[0-9]{2})", value))
+    if match is None:
+        return None
+    month, year = match.groups()
+    month = str(int(month))
+    month_pattern = f"0?{month}" if len(month) == 1 else month
+    year_pattern = f"(?:{year}|{year[-2:]})" if len(year) == 4 else year
+    return rf"{month_pattern}(?:\s*/\s*)?{year_pattern}"
+
+
 def redact_registered_vault_number(value: Any, *,
                                    tab: str | None = None, origin: str = "") -> Any:
     """Scrub registered global secrets and scoped components returned as numbers."""
@@ -163,7 +178,11 @@ def redact_registered_vault_number(value: Any, *,
     text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
     with _VAULT_REDACTION_LOCK:
         registered = text in _VAULT_REDACTION_VALUES.get(_vault_scope(), ())
-    if registered or any(text == part for _, part in _date_parts(tab, origin)):
+    parts = _date_parts(tab, origin)
+    if registered or any(text == part for _, part in parts):
+        return "«redacted-vault-secret»"
+    if any(field == "expiry" and (pattern := _expiry_pattern(part)) is not None
+           and re.fullmatch(pattern, text) for field, part in parts):
         return "«redacted-vault-secret»"
     return value
 
@@ -195,7 +214,12 @@ def redact_registered_vault_values(text: str, *,
             text = re.sub(pattern, "«redacted-vault-secret»", text)
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
-    for _, value in parts:
+    # Full expiries must be consumed before month/year components can split them.
+    for field, value in parts:
+        if field == "expiry" and (pattern := _expiry_pattern(value)) is not None:
+            text = re.sub(rf"(?<![A-Za-z0-9_]){pattern}(?![A-Za-z0-9_])",
+                          "«redacted-vault-secret»", text)
+    for _, value in sorted(parts, key=lambda part: len(part[1]), reverse=True):
         text = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])",
                       "«redacted-vault-secret»", text)
     return text
@@ -1059,6 +1083,10 @@ def redact_sensitive_json(value, **kwargs):
     if isinstance(value, (list, tuple)):
         return [redact_sensitive_json(leaf, **kwargs) for leaf in value]
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        scrubbed = redact_registered_vault_number(
+            value, tab=kwargs.get("vault_tab"), origin=kwargs.get("vault_origin", ""))
+        if isinstance(scrubbed, str):
+            return scrubbed
         # Serialized dumps scrubbed registered numeric values too; keep that boundary structurally.
         text = str(value)
         scrubbed = redact_registered_vault_values(

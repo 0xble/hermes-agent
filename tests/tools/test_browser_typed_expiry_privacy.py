@@ -13,9 +13,13 @@ ORIGIN = "https://checkout.example"
 @pytest.mark.parametrize("backend", ["camofox", "agent-browser"])
 @pytest.mark.parametrize("failure", [False, True])
 @pytest.mark.parametrize("label", ["Expiration date", "Expiration (MM/YY)", "MM/YY"])
-@pytest.mark.parametrize("value", ["1229", "12 /29", "12/2029", "0129", "122029", "012029"])
-@pytest.mark.parametrize("surface", ["type", "snapshot"])
-def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path, backend, failure, label, value, surface):
+@pytest.mark.parametrize("value,month,year", [
+    ("1229", 12, "29"), ("12 /29", 12, "29"), ("12/2029", 12, "2029"),
+    ("0129", 1, "29"), ("122029", 12, "2029"), ("012029", 1, "2029"),
+    ("12/29", 12, "29"), ("01/29", 1, "29"), ("1/29", 1, "29"),
+    ("01/2029", 1, "2029"), ("1/2029", 1, "2029"), ("1 / 2029", 1, "2029"),
+])
+def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path, backend, failure, label, value, month, year):
     from tools import browser_vault_tool
     from agent.browser_output_egress import scrub_browser_result
 
@@ -28,17 +32,20 @@ def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path
     monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: ORIGIN)
     monkeypatch.setattr(cf, "_require_tab", lambda *a: ({"task_id": "expiry", "tab_id": "fixture", "user_id": "fixture"}, None))
     typed = []
-    month = "01" if value.startswith("01") else "12"
-    year = "2029" if "2029" in value else "29"
-    formatted = f"{month} / {year}"
-    shortened = f"{month} / {year[-2:]}"
+    representations = sorted({value} | {
+        f"{m}{separator}{y}"
+        for m in (str(month), f"{month:02d}")
+        for y in (year, year[-2:])
+        for separator in ("", "/", " /", "/ ", " / ")
+    })
+    echoes = " ".join(f"echo={representation};" for representation in representations)
     def tree():
-        return f'- textbox "{label}" [e1]' + (f': {formatted}\n- paragraph "echo {value}, shortened {shortened}"' if typed else '')
+        return f'- textbox "{label}" [e1]' + (f': {value}\n- paragraph "{echoes}"' if typed else '')
     monkeypatch.setattr(cf, "_snapshot_data", lambda *a: {"snapshot": tree(), "refsCount": 1})
     def post(path, body, **kw):
         typed.append(body["text"])
         if failure:
-            raise RuntimeError(f'page rejected {body["text"]}')
+            raise RuntimeError(f'page rejected {body["text"]}: {echoes}')
         return {"ok": True}
     monkeypatch.setattr(cf, "_post", post)
     def run(task, command, args=None, **kw):
@@ -46,7 +53,8 @@ def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path
             return {"success": True, "data": {"snapshot": tree(), "refs": {"e1": {}}}}
         assert command == "fill"
         typed.append(args[1])
-        return {"success": not failure, "error": f'page rejected {args[1]}', "fallback_warning": f'echo {args[1]}'}
+        return {"success": not failure, "error": f'page rejected {args[1]}: {echoes}',
+                "fallback_warning": echoes}
     monkeypatch.setattr(session, "_run_browser_command", run)
     def call(name, args):
         return handle_function_call(name, args, task_id="expiry", skip_pre_tool_call_hook=True,
@@ -55,27 +63,31 @@ def test_typed_expiry_masks_raw_and_formatted_owned_output(monkeypatch, tmp_path
         output = call("browser_type", {"ref": "@e1", "text": value})
         assert typed == [value]  # never change the literal backend input
         assert json.loads(output)["success"] is not failure
-        if surface == "type":
+        assert value not in output
+        assert all(f"echo={v};" not in output for v in representations)
+        for full in (True, False):
+            output = call("browser_snapshot", {"full": full})
             assert value not in output
-        output = call("browser_snapshot", {"full": True})
-        if surface == "snapshot":
-            assert value not in output and formatted not in output and shortened not in output
-        assert "[e1]" in json.loads(output)["snapshot"]
+            assert all(f"echo={v};" not in output for v in representations)
+            assert "[e1]" in json.loads(output)["snapshot"]
         # Exercise the real automatic truncated-snapshot cache before disk writes.
         monkeypatch.setattr(bt, "get_browser_snapshot_threshold", lambda: 10)
-        call("browser_snapshot", {"full": False})
+        compact = call("browser_snapshot", {"full": False})
+        assert all(f"echo={v};" not in compact for v in representations)
         files = list((tmp_path / "home/cache/web").glob("browser-snapshot-*.txt"))
         assert files
         for path in files:
             saved = path.read_text()
-            assert value not in saved and formatted not in saved and shortened not in saved
-        ordinary = json.dumps({"snapshot": f'- textbox "Order" [e1]: {value}, {formatted}, {shortened}'})
+            assert value not in saved
+            assert all(f"echo={v};" not in saved for v in representations)
+            assert "[e1]" in saved and "echo=" in saved
+        ordinary = json.dumps({"snapshot": f'- textbox "Order" [e1]: {echoes}'})
         assert scrub_browser_result("browser_snapshot", ordinary, "other-tab") == ordinary
         monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: "https://other.example")
         assert scrub_browser_result("browser_snapshot", ordinary, "expiry") == ordinary
         monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: ORIGIN)
         owned = scrub_browser_result("browser_snapshot", ordinary, "expiry")
-        assert all(v not in owned for v in (value, formatted, shortened))
+        assert all(f"echo={v};" not in owned for v in representations)
         monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: "")
         assert value not in scrub_browser_result("browser_snapshot", ordinary, "expiry")
         monkeypatch.setattr(browser_vault_tool, "_current_page_origin", lambda task: ORIGIN)
