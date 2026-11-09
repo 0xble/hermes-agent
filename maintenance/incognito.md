@@ -59,6 +59,20 @@ not only the command reply.
   Private input and plugin injections must stay on the in-process RAM lane, and
   delayed admission, worker, local-mutation and compression writers must carry
   every affected session identity into SQLite admission.
+- Runtime receipts project ownership from their closed operation schema and the
+  owner's actual lineage. A public message, title, tool output or result mentioning
+  a private session ID remains public content. Privacy refusal is `privacy_denied`,
+  never a successful empty receipt, and consumes no sequence or revision.
+- Worker outboxes check producer scope, revoked copied work and typed ownership
+  before their first save, replay or adoption save. Public writes still journal
+  before send. A definite first-send owner privacy refusal releases its uncommitted
+  sequence. Reopened entries and ambiguous lost ACKs retain the exact pending
+  operation for replay, since a later refusal cannot disprove an earlier commit.
+- Entering incognito also waits for registered, running or unknown durable work
+  anywhere in the conversation's logical/physical lineage. It does not cancel
+  workers. The store takes its lock, the owning DB writer lock, then exclusive
+  privacy admission before sidecar/model/registry publication. New assignments
+  refuse private targets. An unavailable or closed DB cannot acknowledge entry.
 - Relay instrumentation, cached public Relay leases and shared metrics must not
   observe a private turn. Refuse instrumentation before discovering or creating
   a host, not after the subscriber has queued its payload.

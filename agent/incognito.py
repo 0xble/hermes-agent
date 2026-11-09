@@ -93,6 +93,11 @@ def persistence_admission():
     return _gate.shared()
 
 
+def privacy_transition():
+    """Boundary owners acquire their store/DB locks BEFORE this exclusive gate."""
+    return _gate.exclusive()
+
+
 def is_incognito(session_id: str | None = None) -> bool:
     if _scope.get():
         return True

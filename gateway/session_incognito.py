@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 import json
 import logging
 from pathlib import Path
@@ -74,60 +75,71 @@ class SessionIncognitoMixin:
 
     def set_incognito(self, session_key: str, enabled: bool, *, active_override=None):
         """Persist the privacy decision before admitting content. No history is serialized."""
-        from gateway.session import SessionEntry, sanitize_model_override
         entry = self.lookup_by_session_key(session_key)
         if entry is None:
             raise ValueError("No session for incognito boundary")
         if bool(entry.incognito) == bool(enabled):
             return entry
-        # Read the saved prefix before registering the private identity. Reads stay available
-        # afterward too, but the normal replay path may repair malformed role alternation.
-        history = self.load_transcript(entry.session_id) if enabled else None
+        # Resolve the owning handle before taking the store lock. No DB opener or
+        # store lookup may run under the writer lock/exclusive privacy gate.
+        db = self._db_for_key(session_key) if enabled else None
+        from gateway.session_incognito_boundary import idle_privacy_boundary, require_open_database, saved_prefix
         if enabled:
-            self._flush_public_token_counts()
+            require_open_database(db)
+            self._flush_public_token_counts(db)
         with self._lock:
-            records = deepcopy(getattr(self, "_incognito_records", {}))
-            if enabled:
-                record = {
-                    "session_id": entry.session_id,
-                    "model_override": sanitize_model_override(entry.model_override),
-                    "model_override_scope": entry.model_override_scope,
-                    "model_role": entry.model_role,
-                }
-                if active_override is not None:
-                    record["active_override"] = sanitize_model_override(active_override)
-                records[session_key] = record
-            else:
-                records.pop(session_key, None)
-            atomic_json_write(self._incognito_path(), records)
-            self._incognito_records = records
-            # The rewritten record matches this topic's route again.
-            self._incognito_stale = getattr(self, "_incognito_stale", frozenset()) - {session_key}
-            if enabled:
-                entry._incognito_persisted = entry.to_dict()
-                self._lazy("_incognito_histories", dict)[entry.session_id] = deepcopy(history)
-                entry.incognito = True
-                if active_override is not None:
-                    entry.model_override = sanitize_model_override(active_override)
-                    entry.model_override_scope = "session"
-                    entry.model_role = None
-                register_session(entry.session_id, True)
-                register_session(session_key, True)
-            else:
-                saved = SessionEntry.from_dict(entry._incognito_persisted)
-                entry.__dict__.clear()
-                entry.__dict__.update(saved.__dict__)
-                self._lazy("_incognito_histories", dict).pop(entry.session_id, None)
-                register_session(entry.session_id, False)
-                register_session(session_key, False)
-                from gateway.incognito import discard_private_topic
-                discard_private_topic(session_key)
+            if self._entries.get(session_key) is not entry:
+                raise ValueError("Session changed before incognito boundary")
+            if bool(entry.incognito) == bool(enabled):
+                return entry
+            with idle_privacy_boundary(db, entry.session_id) if enabled else nullcontext() as conn:
+                history = saved_prefix(db, conn, entry.session_id) if enabled else None
+                return self._publish_incognito_locked(entry, enabled, history, active_override)
+
+    def _publish_incognito_locked(self, entry, enabled, history, active_override):
+        from gateway.session import SessionEntry, sanitize_model_override
+        session_key = entry.session_key
+        records = deepcopy(getattr(self, "_incognito_records", {}))
+        if enabled:
+            record = {
+                "session_id": entry.session_id,
+                "model_override": sanitize_model_override(entry.model_override),
+                "model_override_scope": entry.model_override_scope,
+                "model_role": entry.model_role,
+            }
+            if active_override is not None:
+                record["active_override"] = sanitize_model_override(active_override)
+            records[session_key] = record
+        else:
+            records.pop(session_key, None)
+        atomic_json_write(self._incognito_path(), records)
+        self._incognito_records = records
+        # The rewritten record matches this topic's route again.
+        self._incognito_stale = getattr(self, "_incognito_stale", frozenset()) - {session_key}
+        if enabled:
+            entry._incognito_persisted = entry.to_dict()
+            self._lazy("_incognito_histories", dict)[entry.session_id] = deepcopy(history)
+            entry.incognito = True
+            if active_override is not None:
+                entry.model_override = sanitize_model_override(active_override)
+                entry.model_override_scope = "session"
+                entry.model_role = None
+            register_session(entry.session_id, True)
+            register_session(session_key, True)
+        else:
+            saved = SessionEntry.from_dict(entry._incognito_persisted)
+            entry.__dict__.clear()
+            entry.__dict__.update(saved.__dict__)
+            self._lazy("_incognito_histories", dict).pop(entry.session_id, None)
+            register_session(entry.session_id, False)
+            register_session(session_key, False)
+            from gateway.incognito import discard_private_topic
+            discard_private_topic(session_key)
         return entry
 
-    def _flush_public_token_counts(self) -> None:
+    def _flush_public_token_counts(self, db) -> None:
         """Apply usage deltas queued while public before the session becomes private."""
         try:
-            db = self._db
             flush = getattr(db, "flush_token_counts", None)
             if callable(flush):
                 from agent.incognito import shared_worker_context
