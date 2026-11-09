@@ -285,6 +285,50 @@ def row_turn_author(policy, row):
     return forward_author(policy)
 
 
+async def _handle_compression_deferred_admission(authority, ref, row, event, captured):
+    """Keep an unexecuted native claim started, ahead of the durable FIFO.
+
+    A handler can defer at entry OR after its own hygiene turn-hold expires.
+    Re-enter that same handler only after compression publishes, so it reloads
+    current history. Never re-submit or enqueue the restored event in adapter RAM.
+    """
+    runner = authority.runner
+    live = authority.sessions[ref.session_id]
+    original_text = event.text
+    while True:
+        # Preparation can enrich event.text (auto skills). Replaying an unexecuted
+        # attempt must not stack that enrichment or suppress the eventual hooks.
+        event.text = original_text
+        event._gateway_compression_deferred = False
+        response = await runner._handle_message(event)
+        session_key = captured.pop('compression_deferred', None)
+        if session_key is None:
+            return response
+        while True:
+            held = await runner._session_has_compression_in_flight(session_key)
+            if not held:
+                from gateway.session_results import validate_unexecuted_claim
+                await asyncio.to_thread(validate_unexecuted_claim, authority.db, authority.epoch, row)
+            # Both the lock read and ownership validation yield: a Stop or drain
+            # accepted during either await must win before handler re-entry.
+            stopped = authority.pending_stops.get(ref.session_id) == row['generation']
+            draining = runner._draining or authority.retiring
+            replaced = authority.sessions.get(ref.session_id) is not live or live.superseded
+            if stopped or draining or replaced:
+                result = {'final_response': '', 'messages': [], 'interrupted': True, 'api_calls': 0}
+                if draining and not stopped:
+                    # Existing shutdown settlement requeues a zero-model native
+                    # claim, preserving its admission id for restart recovery.
+                    result['interrupt_message'] = runner._shutdown_interrupt_reason()
+                captured['result'] = result
+                return None
+            if not held:
+                break
+            # Lock lookup runs off-loop. Controls remain live while this claim
+            # holds the FIFO; the lease also bounds waits on a lost compressor.
+            await asyncio.sleep(0.1)
+
+
 async def execute_admission(authority, ref, row):
     # An admission explicitly claimed by the restore executor owns the corresponding queued
     # inbound event. Remove it before dispatch so replay cannot run it a second time.
@@ -369,7 +413,7 @@ async def execute_admission(authority, ref, row):
                     event.text = '\n'.join(part['text'] for part in prepared['content'] if part.get('type') == 'text')
                 event.allow_gateway_control = False
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
-            response = await authority.runner._handle_message(event)
+            response = await _handle_compression_deferred_admission(authority, ref, row, event, captured)
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:
                 # No TurnRunner result means the handler answered without executing the turn.

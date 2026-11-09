@@ -406,6 +406,11 @@ class GatewayBusySessionMixin:
         """
         if not await self._session_has_compression_in_flight(session_key):
             return False
+        from gateway.session_results import record_compression_deferral
+        if record_compression_deferral(session_key):
+            # Restored native events retain their durable claim, never a RAM slot.
+            event._gateway_compression_deferred = True
+            return True
         # A retry bounce of an input already held for this episode is older than
         # anything queued since. Keep it at the head instead of requeueing it last.
         prepend = prepend or bool(getattr(event, "_gateway_compression_deferred", False))

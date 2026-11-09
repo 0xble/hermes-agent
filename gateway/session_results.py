@@ -7,6 +7,31 @@ execution_result: ContextVar[dict | None] = ContextVar("execution_result", defau
 from hermes_state_terminal import RESULT_PREFIX as _RESULT_PREFIX, load_result
 
 
+def record_compression_deferral(session_key):
+    """Record an unexecuted outcome for the current durable native claim.
+
+    The executor waits and re-enters the handler, rather than manufacturing an
+    empty completed result or transferring ownership to an adapter RAM queue.
+    False leaves genuinely non-authority inputs with their adapter retry path.
+    """
+    from gateway.session_ingress import executing_admission
+    captured = execution_result.get()
+    if not executing_admission.get() or captured is None:
+        return False
+    captured['compression_deferred'] = session_key
+    return True
+
+
+def validate_unexecuted_claim(db, epoch, row):
+    """A compression wait may outlive this runtime's lease; never resume a fenced claim."""
+    with db._read_ctx() as conn:
+        _epoch(conn, epoch)
+        current = _admission(conn, row['admission_id'])
+        if (current['status'] != 'started' or current['owner_epoch'] != epoch
+                or current['generation'] != row['generation']):
+            raise RuntimeStoreError('stale_generation')
+
+
 def record_unexecuted_failure(reply, reason=None, error=None):
     """The admitted turn never ran because it failed (agent initialization raised, history
     unreadable): commit a failed result for the executing admission, so no surface settles it
