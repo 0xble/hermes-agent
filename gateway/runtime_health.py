@@ -74,7 +74,7 @@ def _pending_notice(home: Path) -> tuple[Path, str, bool]:
     if logged.exists():
         # Delivery may become possible later. Retry the saved notice without
         # reloading providers on every housekeeping tick (or gateway restart).
-        return marker, logged.read_text(encoding="utf-8"), False
+        return marker, logged.read_text(encoding="utf-8-sig"), False
     issue = _readiness_issue()
     if not issue:
         return marker, "", False

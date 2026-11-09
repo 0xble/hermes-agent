@@ -282,13 +282,17 @@ async def test_undeliverable_notice_reuses_logged_readiness_across_restarts(tmp_
             "memory: {provider: hindsight}\ndisplay: {suppress_warning_notifications: true}\n")
     probe = Mock(wraps=runtime_health._readiness_issue)
     monkeypatch.setattr(runtime_health, "_readiness_issue", probe)
-    for _ in range(3):
+    for attempt in range(3):
         gateway = runner()
         if delivery == "no-transport":
             gateway._served_home_channel_transports = lambda: []
         await runtime_health.check_memory_health(gateway)
         gateway._send_home_channel_message.assert_not_awaited()
+        if attempt == 0:
+            logged = runtime_health._marker(home).with_suffix(".logged")
+            logged.write_bytes(b"\xef\xbb\xbf" + logged.read_bytes())
     assert probe.call_count == 1
+    assert not runtime_health._pending_notice(home)[1].startswith("\ufeff")
     assert runtime_health._marker(home).with_suffix(".logged").exists()
     monkeypatch.setattr("hermes_cli.version_info.get_code_identity", lambda: {"sha": "release-C"})
     await runtime_health.check_memory_health(gateway)

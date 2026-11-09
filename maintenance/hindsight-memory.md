@@ -304,7 +304,8 @@ those same readiness APIs. Client degradation emits an ERROR with client package
 names and PM repair guidance, and an operator home-channel notice. Per-profile,
 per-release markers suppress repeat errors and delivered notices across ticks and
 restarts. A saved `.logged` issue is reused without re-probing even when muted or
-without a home transport. Unsent notices remain eligible for retry. No provider readiness, PM
+without a home transport. Saved notices accept a UTF-8 BOM from Windows editors,
+while newly written notices remain BOM-free. Unsent notices remain eligible for retry. No provider readiness, PM
 selection, or status-command implementation is duplicated or changed by this gate.
 The existing `hermes memory status` red readiness contract remains #845's owner.
 Proof: `tests/hermes_cli/test_release_extras_preflight.py`,
