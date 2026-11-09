@@ -953,3 +953,24 @@ Retire this `fork-ci-reliability` adaptation when upstream uses an equivalent
 causal streaming checkpoint rather than a startup scheduling deadline.
 
 Contract tests: `tests/tui_gateway/test_tui_gateway_server.py::test_session_activate_returns_inflight_stream_before_completion`.
+
+## Native Vault Keychain Isolation
+
+The `fork-ci-reliability` identity covers the native vault fixture's host-store
+isolation. macOS creates and unlocks a disposable keychain with a throwaway
+password, deletes it at teardown, and disables interactive Security API access
+for the test process. The process's interaction setting is restored afterwards.
+The user's default keychain and search list are never changed. keyring 25.7.0
+ignores its keychain property, so the fixture supplies `kSecUseKeychain` on writes
+and `kSecMatchSearchList` on reads/deletes to the real native queries. The real
+keyring backend, vault operations and store/read/delete assertions still run.
+An absent native backend fails instead of skipping these host-qualified tests.
+
+A locked disposable-keychain diagnostic blocks inside keyring's native
+`SecItemAdd` when interaction is enabled, as captured by faulthandler. The original
+fixture issues unscoped queries, so its random account names do not isolate it
+from the operator's keychain or its authentication prompts. Retire this fixture
+adaptation when upstream provides equivalent disposable, noninteractive native
+storage isolation. No production keychain policy, test bound or retry changes.
+
+Contract tests: `tests/agent/test_vault_keychain_native.py`.
