@@ -1,5 +1,6 @@
 """Activation must protect the selected PM environment even outside candidate code."""
 import json
+import subprocess
 import sys
 import venv
 from pathlib import Path
@@ -68,7 +69,7 @@ def test_activation_outside_candidate_refuses_selected_generation_loss(tmp_path,
     with pytest.raises(RuntimeError, match=extra):
         if route == "recover":
             with monkeypatch.context() as m:
-                m.setattr(releases, "_run_transaction", lambda *args: {})
+                m.setattr(releases, "_run_transaction", lambda *args, **kwargs: {})
                 releases.promote(home, b)
             releases.recover_pending_transaction(home)
         elif route == "rollback":
@@ -128,3 +129,123 @@ def test_candidate_owned_carry_repairs_before_the_transaction_gate(tmp_path, mon
     releases.promote(home, candidate)
     assert calls == [["hindsight"]]
     assert releases.read_pointer(home / "current") == candidate
+
+
+@pytest.mark.parametrize("operation", ["rollback", "restore", "promote"])
+def test_transition_across_differing_extras_warns_and_checks_retained_extra(tmp_path, monkeypatch, caplog, operation):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pm.paths.repo_root", lambda: tmp_path / "frozen-source")
+    a = release(home, "A", {"hindsight": "hindsight-client"})
+    b = release(home, "B", {"hindsight": "hindsight-client", "newthing": "newthing-client"})
+    package(selected(a, tmp_path, ["hindsight"]), "hindsight-client", "hindsight_client")
+    generation = selected(b, tmp_path, ["hindsight", "newthing"])
+    package(generation, "hindsight-client", "hindsight_client")
+    package(generation, "newthing-client", "newthing_client")
+    releases.promote(home, a)
+    releases.promote(home, b)
+    if operation == "rollback":
+        releases.rollback(home)
+    else:
+        releases.activate_release(home, a, operation=operation)
+    assert releases.read_pointer(home / "current") == a
+    assert "newthing" in caplog.text and "no longer declares" in caplog.text
+    assert "operator" in caplog.text.lower()
+
+
+@pytest.mark.parametrize("operation", ["rollback", "restore", "first-migration-rollback"])
+def test_recovery_never_repairs_target_environment(tmp_path, monkeypatch, operation):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    a = release(home, "A", {"hindsight": "hindsight-client"})
+    b = release(home, "B", {"hindsight": "hindsight-client"})
+    releases.promote(home, a)
+    package(selected(a, tmp_path, ["hindsight"]), "hindsight-client", "hindsight_client")
+    package(selected(b, tmp_path, ["hindsight"]), "hindsight-client", "hindsight_client")
+    releases.promote(home, b)
+    monkeypatch.setattr("pm.paths.repo_root", lambda: a)
+    monkeypatch.setattr(releases, "carry_active_extras", lambda *args: pytest.fail("recovery attempted PM repair"))
+    if operation == "first-migration-rollback":
+        # A real source-layout journal exercises the transaction's separate arm.
+        source = tmp_path / "source"
+        a.rename(source)
+        package(selected(source, tmp_path, ["hindsight"]), "hindsight-client", "hindsight_client")
+        subprocess.run(["git", "init", "-q", str(source)], check=True)
+        subprocess.run(["git", "-C", str(source), "add", "pyproject.toml"], check=True)
+        subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                        "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "source"], check=True)
+        (home / "previous").unlink()
+        (home / "previous").symlink_to(source)
+        monkeypatch.setattr("pm.paths.repo_root", lambda: source)
+        (home / "release-layout.json").write_text(json.dumps({
+            "source": str(source), "source_sha": releases.release_sha(source), "plist": None, "state": "done"}))
+        result = releases.rollback(home)
+        assert result["current"] == str(source)
+        assert not (home / "current").exists()
+    else:
+        releases.activate_release(home, a, operation=operation)
+        assert releases.read_pointer(home / "current") == a
+
+
+@pytest.mark.parametrize("operation", ["promote", "rollback", "restore"])
+@pytest.mark.parametrize("expires_in_probe", [False, True])
+def test_activation_spends_one_shared_probe_budget(tmp_path, monkeypatch, caplog, operation, expires_in_probe):
+    from hermes_cli import immutable_release_preflight as preflight
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    a = release(home, "A", {"hindsight": "hindsight-client"})
+    b = release(home, "B", {"hindsight": "hindsight-client"})
+    for root in (a, b):
+        package(selected(root, tmp_path, ["hindsight"]), "hindsight-client", "hindsight_client")
+    releases.promote(home, a)
+    releases.promote(home, b)
+    (home / "config.yaml").write_text("memory:\n  provider: hindsight\n")
+    clock = [100.0]
+    monkeypatch.setattr(preflight.time, "monotonic", lambda: clock[0])
+    real_run, budgets = subprocess.run, []
+
+    def spend(command, **kwargs):
+        if "-c" in command:
+            budgets.append(kwargs["timeout"])
+            if expires_in_probe and len(budgets) == 3:
+                clock[0] += kwargs["timeout"]
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            result = real_run(command, **kwargs)
+            clock[0] += 0.25
+            return result
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spend)
+    monkeypatch.setattr(releases, "carry_active_extras", lambda *args: pytest.fail("budgeted activation attempted repair"))
+    if operation == "promote":
+        with pytest.raises(RuntimeError, match="budget exhausted"):
+            releases.activate_release(home, a, deadline=100.75)
+        assert releases.read_pointer(home / "current") == b
+    else:
+        releases.activate_release(home, a, operation=operation, deadline=100.75)
+        assert releases.read_pointer(home / "current") == a
+        assert "budget exhausted" in caplog.text
+    assert budgets == [0.75, 0.5, 0.25]
+
+
+@pytest.mark.parametrize("damage", ["unrelated-module", "absent", "broken-primary"])
+def test_distribution_probe_imports_only_primary_module(tmp_path, monkeypatch, damage):
+    from hermes_cli import immutable_release_preflight as preflight
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    candidate = release(home, "A", {})
+    env = candidate / ".venv"
+    site = next((env / "lib").glob("python*/site-packages"))
+    if damage != "absent":
+        package(env, "widget-client", "widget_client")
+        (site / "widget_client-1.0.dist-info/top_level.txt").write_text("unrelated\nwidget_client\n")
+        (site / "unrelated.py").write_text("raise RuntimeError('must not import unrelated tooling')\n")
+    if damage == "broken-primary":
+        (site / "widget_client.py").write_text("raise ImportError('primary client broken')\n")
+    observed = preflight._probe(candidate, preflight._PROBE, ["widget-client"], home)["widget-client"]
+    if damage == "absent":
+        assert "error" in observed and "version" not in observed
+    elif damage == "broken-primary":
+        assert observed["missing"] and "primary client broken" in observed["missing"][0]
+    else:
+        assert observed == {"version": "1.0", "missing": []}

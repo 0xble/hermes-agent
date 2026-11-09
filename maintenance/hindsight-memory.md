@@ -270,11 +270,20 @@ Build-time carry and candidate-owned carry remain the repair paths. They are not
 activation gates: an older updater, direct promotion, rollback, or recovered
 transaction can reach the pointer flip without importing candidate-owned PM.
 Every transaction now verifies the selected candidate PM interpreter before
-changing `current`, including source-layout rollback. A recorded active extra
-that the candidate no longer declares, a missing or unimportable direct
-requirement, or a configured provider's failed passive readiness check refuses
-activation. The gate retries existing candidate-owned carry, then reads back the
-environment rather than trusting either PM's return value or the payload venv.
+changing `current`, including source-layout rollback. Missing or unimportable
+direct requirements of retained declared extras, or a configured provider's
+failed passive readiness check, refuse activation. An extra the target no longer
+declares emits a loud warning naming the extra and the operator's choice to
+proceed without it or select a release/plugin that supplies it. Rollback, restore,
+and source-layout rollback only read back dependencies and never carry or repair.
+Forward activation without a caller deadline retries candidate-owned carry.
+Budgeted activation requires prior preparation instead of entering unbounded PM
+sync. Metadata and primary-module import probes share one remaining deadline,
+including the guardian's rollback deadline. Probe budget exhaustion refuses
+forward activation but warns and permits recovery. Each distribution's primary
+module is imported, without importing unrelated top-level tooling. The gate
+reads back the selected environment rather than trusting PM's return value or
+the payload venv.
 Configured-provider checks use the candidate's `is_available` and
 `unavailable_reason`, not client construction or network requests. Empty reasons
 (such as absent credentials) do not become dependency errors.

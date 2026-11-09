@@ -287,7 +287,7 @@ def _leaf_requirements(project: Path) -> dict[str, set[str]]:
     return declared
 
 
-def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
+def _active_locked_extras(source_python: Path, project: Path, *, deadline: float | None = None) -> list[str]:
     """Infer selected leaf extras from installed direct requirements.
 
     Wheel metadata lists *available*, not selected, extras. A uniquely named
@@ -297,7 +297,7 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
     declared = _leaf_requirements(project)
     if not declared:
         return []
-    installed = set(_active_distributions(source_python))
+    installed = set(_active_distributions(source_python, deadline=deadline))
     unique = {name for extra, names in declared.items() for name in names
               if sum(name in other for other in declared.values()) == 1}
     selected = {extra for extra, names in declared.items()
@@ -311,8 +311,10 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
                        "for text in [d.read_text('direct_url.json') or ''] "
                        "for group in re.findall(r'hermes-agent\\[([^]]+)\\]', text) "
                        "for x in group.split(',')))))")
+    from hermes_cli.immutable_release_preflight import probe_timeout
     metadata_result = subprocess.run([str(source_python), "-c", metadata_script], check=True,
-                                     capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env())
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env(),
+                                     timeout=probe_timeout(deadline))
     selected.update(extra for extra in json.loads(metadata_result.stdout) if extra in declared)
 
     # Old transitive packages are not evidence of an enabled feature. In particular,
@@ -339,12 +341,14 @@ def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = (),
         raise RuntimeError(f"candidate dependency build failed: {detail}")
 
 
-def _active_distributions(python: Path) -> dict[str, str]:
+def _active_distributions(python: Path, *, deadline: float | None = None) -> dict[str, str]:
+    from hermes_cli.immutable_release_preflight import probe_timeout
     script = ("import importlib.metadata as m,json; "
               "import re; print(json.dumps({re.sub(r'[-_.]+','-',d.metadata['Name']).lower(): d.version "
               "for d in m.distributions() if d.metadata.get('Name')}))")
     result = subprocess.run([str(python), "-c", script], check=True,
-                            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env())
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env(),
+                            timeout=probe_timeout(deadline))
     return json.loads(result.stdout)
 
 
@@ -426,7 +430,7 @@ def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
     return release / ".venv", "built"
 
 
-def _committed_extras(release: Path | None, project: Path) -> set[str]:
+def _committed_extras(release: Path | None, project: Path, *, deadline: float | None = None) -> set[str]:
     """Extras `project` declares that `release`'s committed PM environment carries.
 
     The source interpreter is frozen at first migration. Extras added since
@@ -437,7 +441,7 @@ def _committed_extras(release: Path | None, project: Path) -> set[str]:
         return set()
     from pm.environments import project_python
     python = project_python(release)
-    inferred = set(_active_locked_extras(python, project)) if python.is_file() else set()
+    inferred = set(_active_locked_extras(python, project, deadline=deadline)) if python.is_file() else set()
     return (_recorded_extras(release) & set(_optional_dependencies(project))) | inferred
 
 
@@ -986,7 +990,8 @@ def wait_for_release_acknowledgement(home: Path, *, timeout_seconds: float = 180
 
 
 def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
-                     reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
+                     reload_callback: Callable[[], Any] | None = None, *,
+                     deadline: float | None = None) -> dict[str, str | None]:
     operation = record["operation"]
     if (record.get("requires_reload") and reload_callback is None
             and not record.get("reload_done") and not record.get("reload_issued")
@@ -1032,7 +1037,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         source = Path(record["source"])
         if not source.is_dir() or release_sha(source) != record["source_sha"]:
             raise RuntimeError("source checkout changed since migration; refusing unsafe rollback")
-        activation_preflight(source, origin, paths.home)
+        activation_preflight(source, origin, paths.home, operation=operation, deadline=deadline)
         _set_pointer(paths.current, None)
         _set_pointer(paths.previous, None)
         if record.get("journal_intended") is not None:
@@ -1045,7 +1050,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         candidate = Path(record["candidate"])
         if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
             raise RuntimeError(f"transaction candidate no longer ready: {candidate}")
-        activation_preflight(candidate, origin, paths.home)
+        activation_preflight(candidate, origin, paths.home, operation=operation, deadline=deadline)
         if record.get("journal_intended") is not None:
             _atomic_json(paths.home / "release-layout.json", record["journal_intended"])
         _set_pointer(paths.previous, record["previous_intended"])
@@ -1082,7 +1087,8 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
     return result
 
 
-def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] | None = None
+def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] | None = None, *,
+                                deadline: float | None = None
                                 ) -> dict[str, str | None] | None:
     """Converge the recorded intent, never infer an inverse from partial pointers."""
     paths = ReleasePaths.for_home(home)
@@ -1101,8 +1107,8 @@ def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] |
             return _transaction_result(record)
         if reload_callback is None and not record.get("reload_issued"):
             raise RuntimeError("release reload pending: restart-authorized update required")
-        return _run_transaction(paths, record, reload_callback)
-    return _run_transaction(paths, record, reload_callback)
+        return _run_transaction(paths, record, reload_callback, deadline=deadline)
+    return _run_transaction(paths, record, reload_callback, deadline=deadline)
 
 
 def _transaction_result(record: dict[str, Any]) -> dict[str, str | None]:
@@ -1120,7 +1126,8 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
                      plist_path: Path | None = None, plist_body: bytes | None = None,
                      reload_callback: Callable[[], Any] | None = None,
                      before_flip: Callable[[], Any] | None = None,
-                     operation: str = "promote", force_reload: bool = False) -> dict[str, str | None]:
+                     operation: str = "promote", force_reload: bool = False,
+                     deadline: float | None = None) -> dict[str, str | None]:
     """Persist the exact pointers, layout and plist bytes before any live mutation.
 
     plist_body is the fully rendered *target* definition. The core writes those
@@ -1150,7 +1157,7 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
                 pending["plist"]["intended_sha256"] = hashlib.sha256(plist_body).hexdigest()
             _write_txn(paths, pending)
         else:
-            result = recover_pending_transaction(paths.home, reload_callback)
+            result = recover_pending_transaction(paths.home, reload_callback, deadline=deadline)
             if result and result.get("current") == str(candidate):
                 return result
             pending = None
@@ -1175,7 +1182,7 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
         # Compatibility hook: call after previous is recorded but before current.
         _set_pointer(paths.previous, pending["previous_intended"])
         before_flip()
-    return _run_transaction(paths, pending, reload_callback)
+    return _run_transaction(paths, pending, reload_callback, deadline=deadline)
 
 
 def promote(home: Path, candidate: Path, *, before_flip=None) -> dict[str, str | None]:
@@ -1349,14 +1356,15 @@ def _migration_record(paths: ReleasePaths, source: Path, plist_path: Path | None
 
 
 def restore_source_layout(home: Path, *, plist_path: Path | None = None,
-                          reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
+                          reload_callback: Callable[[], Any] | None = None,
+                          deadline: float | None = None) -> dict[str, str | None]:
     """Finish a first-migration rollback, including after interrupted unlinks."""
     paths = ReleasePaths.for_home(home)
     pending = _read_txn(paths)
     if pending is not None:
         if pending["operation"] == "first-migration-rollback":
-            return _run_transaction(paths, pending, reload_callback)
-        recover_pending_transaction(paths.home, reload_callback)
+            return _run_transaction(paths, pending, reload_callback, deadline=deadline)
+        recover_pending_transaction(paths.home, reload_callback, deadline=deadline)
     journal = paths.home / "release-layout.json"
     data = json.loads(journal.read_text(encoding="utf-8-sig"))
     source = Path(data["source"]).resolve(strict=True)
@@ -1385,7 +1393,7 @@ def restore_source_layout(home: Path, *, plist_path: Path | None = None,
               "journal_original": data, "journal_intended": intended, "plist": plist,
               "requires_reload": reload_callback is not None}
     _write_txn(paths, record)
-    return _run_transaction(paths, record, reload_callback)
+    return _run_transaction(paths, record, reload_callback, deadline=deadline)
 
 
 def migration_plist(home: Path) -> tuple[Path, bytes] | None:
@@ -1425,12 +1433,13 @@ def abandon_failed_switch(home: Path, *, candidate: Path, previous: Path) -> Non
 
 
 def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | None = None,
-             reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
+             reload_callback: Callable[[], Any] | None = None,
+             deadline: float | None = None) -> dict[str, str | None]:
     paths = ReleasePaths.for_home(home)
     pending = _read_txn(paths)
     if pending is not None:
         operation = pending["operation"]
-        result = recover_pending_transaction(paths.home, reload_callback)
+        result = recover_pending_transaction(paths.home, reload_callback, deadline=deadline)
         if operation in {"rollback", "first-migration-rollback"}:
             assert result is not None
             return result
@@ -1454,9 +1463,9 @@ def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | 
     if previous is None:
         raise RuntimeError("no previous release is available")
     if previous.parent != paths.releases.resolve():
-        return restore_source_layout(home, plist_path=plist_path, reload_callback=reload_callback)
+        return restore_source_layout(home, plist_path=plist_path, reload_callback=reload_callback, deadline=deadline)
     return activate_release(paths.home, previous, plist_path=plist_path, plist_body=plist_body,
-                            reload_callback=reload_callback, operation="rollback")
+                            reload_callback=reload_callback, operation="rollback", deadline=deadline)
 
 
 def resolved_release(home: Path) -> Path | None:

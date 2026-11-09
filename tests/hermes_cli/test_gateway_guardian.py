@@ -354,8 +354,11 @@ def test_rollback_bootstrap_gets_exact_remaining_budget_not_a_whole_second(tmp_p
                         lambda *args, timeout: bootstrap_timeouts.append(timeout))
     monkeypatch.setattr(guardian.subprocess, "run",
                         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
-    monkeypatch.setattr(guardian, "rollback", lambda *args, **kwargs:
-                        kwargs["reload_callback"]() and {"reload_pending": False})
+    def rollback(*args, **kwargs):
+        assert kwargs["deadline"] == 100.4
+        return kwargs["reload_callback"]() and {"reload_pending": False}
+
+    monkeypatch.setattr(guardian, "rollback", rollback)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     guardian.rollback_switch(home, plist, label, a, domain=f"gui/{os.getuid()}", deadline=100.4)
     assert bootstrap_timeouts == [pytest.approx(0.4)]
