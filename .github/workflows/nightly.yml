@@ -157,6 +157,14 @@ jobs:
         run: |
           rustup toolchain install 1.96.1 --profile minimal
           rustup default 1.96.1
+      - name: Provision case-sensitive macOS scratch
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CI_SCRATCH: ${{ runner.temp }}/hermes-ci-case-sensitive
+        run: |
+          ci_tmp=$(scripts/ci/case-sensitive-tmpdir.sh "$CI_SCRATCH")
+          echo "TMPDIR=$ci_tmp" >> "$GITHUB_ENV"
       - name: Qualify native OS at exact SHA
         shell: bash
         run: |
@@ -165,6 +173,22 @@ jobs:
           # serially so a stalled launcher is not mistaken for a pipe leak or
           # a UI timeout; preserve the existing macOS file concurrency.
           ./bin/ci nightly-native '${{ github.sha }}' --workers ${{ matrix.os == 'windows-2025-vs2026' && '1' || '4' }}
+      - name: Clean up case-sensitive macOS scratch
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        env:
+          CI_SCRATCH: ${{ runner.temp }}/hermes-ci-case-sensitive
+        run: |
+          if mount | grep -F " on $CI_SCRATCH/mnt (" > /dev/null; then
+            hdiutil detach "$CI_SCRATCH/mnt"
+          fi
+          rm -f "$CI_SCRATCH/scratch.sparseimage"
+          if [ -d "$CI_SCRATCH/mnt" ]; then
+            rmdir "$CI_SCRATCH/mnt"
+          fi
+          if [ -d "$CI_SCRATCH" ]; then
+            rmdir "$CI_SCRATCH"
+          fi
   desktop-core:
     # The deterministic Desktop core E2E suite (transcript integrity, backend
     # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.
