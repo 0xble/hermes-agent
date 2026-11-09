@@ -83,14 +83,15 @@ def test_cleanup_only_signals_live_processes(monkeypatch, state, method):
     process = Mock(spec=psutil.Process)
     process.is_running.return_value = state != "gone"
     process.status.return_value = psutil.STATUS_ZOMBIE if state == "zombie" else psutil.STATUS_SLEEPING
-    if state == "reaped":
-        process.status.side_effect = psutil.NoSuchProcess(123)
-    elif state == "kill_race":
-        getattr(process, method).side_effect = psutil.NoSuchProcess(123)
-    elif state == "denied":
-        process.status.side_effect = psutil.AccessDenied(123)
-    elif state == "guard":
-        getattr(process, method).side_effect = RuntimeError("outside the test process subtree")
+    failures = {
+        "reaped": ("status", psutil.NoSuchProcess(123)),
+        "kill_race": (method, psutil.NoSuchProcess(123)),
+        "denied": ("status", psutil.AccessDenied(123)),
+        "guard": (method, RuntimeError("outside the test process subtree")),
+    }
+    if state in failures:
+        action, error = failures[state]
+        getattr(process, action).side_effect = error
     monkeypatch.setattr(psutil, "Process", Mock(return_value=process))
     cleanup = (lambda: waiting.kill_if_alive(123)) if method == "kill" else (lambda: waiting.terminate_if_alive(process))
     if state in {"denied", "guard"}:
