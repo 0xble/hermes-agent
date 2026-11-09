@@ -954,6 +954,18 @@ causal streaming checkpoint rather than a startup scheduling deadline.
 
 Contract tests: `tests/tui_gateway/test_tui_gateway_server.py::test_session_activate_returns_inflight_stream_before_completion`.
 
+The platform-command capture helper joins the adapter's admitted session task
+before returning its send mock. The inherited 40-poll window could return with
+no send while an executor-backed `/stop` handler was still running. Both upstream
+v0.23.0 and fork main retain that window, and their unheld command suites pass.
+An event-held `/stop` with accelerated polling reproduces the same missing-send
+assertion on Telegram, Discord and Slack. Joining the task preserves the real
+command dispatch, response assertions and cleanup without a larger timeout.
+Retire this `fork-ci-reliability` adaptation when upstream captures command
+completion through an equivalent causal boundary.
+
+Contract tests: `tests/e2e/test_platform_commands.py::TestSlashCommands::test_leading_space_stop_waits_for_dispatch`.
+
 ## Native Vault Keychain Isolation
 
 The `fork-ci-reliability` identity covers the native vault fixture's host-store
