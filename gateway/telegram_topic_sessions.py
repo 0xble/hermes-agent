@@ -24,7 +24,7 @@ logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.
 
 
 class TopicRequestError(ValueError):
-    """A request the caller can correct: bad name, icon, model, reasoning or target."""
+    """An actionable request failure, including platform availability and invalid input."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -504,7 +504,9 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
 
     thread_id = await adapter._create_dm_topic(int(source.chat_id), name=name, icon_custom_emoji_id=icon_id)
     if not thread_id:
-        raise TopicRequestError("Telegram did not create the topic; the gateway log has the reason.")
+        explain = getattr(adapter, "topic_creation_error_message", None)
+        raise TopicRequestError(explain() if callable(explain) else
+                                "Telegram could not create the topic. Continue in the current topic.")
     dest = replace_source(root, thread_id=str(thread_id))
     settings = {
         "warnings": [], "model_status": "unchanged", "reasoning_status": "unchanged",

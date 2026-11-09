@@ -218,6 +218,7 @@ from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, 
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
+from plugins.platforms.telegram.topic_creation import TopicCreationFailure
 from utils import env_float, env_int, is_truthy_value
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -968,6 +969,10 @@ class _PollingStallError(RuntimeError):
 class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramReconnectMixin,
                       TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
+
+    # Immutable defaults also support connectors assembled without __init__ in tests.
+    _last_topic_creation_failure: TopicCreationFailure | None = None
+    _topic_creation_cooldown_until: float = 0.0
 
     # Bound for the per-(chat_id, thread_id, status_key) status-message cache; FIFO half-trim on overflow.
     _STATUS_MESSAGE_IDS_MAX = 2000
@@ -3090,36 +3095,12 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
     async def _create_dm_topic(
         self, chat_id: int, name: str, icon_color: Optional[int] = None, icon_custom_emoji_id: Optional[str] = None) -> Optional[int]:
         """Create a forum topic in a private (DM) chat (Bot API 9.4+); message_thread_id or None."""
-        if not self._bot:
-            return None
-        try:
-            kwargs: dict[str, Any] = {"chat_id": chat_id, "name": name}
-            if icon_color is not None:
-                kwargs["icon_color"] = icon_color
-            if icon_custom_emoji_id:
-                kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
-            topic = await self._bot.create_forum_topic(**kwargs)
-            thread_id = topic.message_thread_id
-            logger.info("[%s] Created DM topic '%s' in chat %s -> thread_id=%s", self.name, name, chat_id, thread_id)
-            return thread_id
-        except Exception as e:
-            error_text = str(e).lower()
-            # Telegram has no "list topics" API: an existing topic is mapped from incoming messages.
-            if "topic_name_duplicate" in error_text or "already" in error_text:
-                logger.info(
-                    "[%s] DM topic '%s' already exists in chat %s (will be mapped from incoming messages)", self.name, name, chat_id)
-            elif "not a forum" in error_text or "forums_disabled" in error_text:
-                logger.warning(
-                    "[%s] Cannot create DM topic '%s' in chat %s: Threaded Mode is not enabled. "
-                    "The bot owner must open the BotFather Mini App (search 'botfather' in "
-                    "Telegram, tap Open on the search result) -> My bots -> this bot -> Bot "
-                    "Settings -> Threads Settings -> enable Threaded Mode. This cannot be enabled "
-                    "from the DM chat, nor from the BotFather /mybots text menu.",
-                    self.name, name, chat_id)
-            else:
-                logger.warning(
-                    "[%s] Failed to create DM topic '%s' in chat %s: %s", self.name, name, chat_id, _redact_telegram_error_text(e))
-            return None
+        from .topic_creation import create_dm_topic
+        return await create_dm_topic(self, chat_id, name, icon_color, icon_custom_emoji_id)
+
+    def topic_creation_error_message(self) -> str:
+        from .topic_creation import topic_creation_error_message
+        return topic_creation_error_message(self)
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a forum topic for a session handoff; ``message_thread_id`` as str, or None."""
