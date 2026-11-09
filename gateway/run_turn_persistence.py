@@ -545,8 +545,8 @@ class GatewayTurnPersistenceMixin:
     ):
         """``_hmwa_deliver_turn_response``, then, for a usage-window refusal, the limit offer: the limit
         sentence is the reply, and the button follows it once it lands."""
-        from gateway.checkin_delivery import permits_metadata, suppress_result
-        if not await permits_metadata(self, self._event_thread_metadata(event, source)):
+        from gateway.checkin_delivery import delivery_metadata, permits_metadata, suppress_result
+        if not await permits_metadata(self, delivery_metadata(event, {})):
             suppress_result(agent_result)
             return ""
         delivered = await self._hmwa_deliver_turn_response(
