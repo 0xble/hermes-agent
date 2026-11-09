@@ -378,18 +378,17 @@ class TuiGateway:
         return self.wait(lambda m: self.event("message.complete", sid)(m) or self.event("error", sid)(m), timeout)
 
     def close(self) -> None:
+        # EOF lets the leader exit and orphan unregistered helpers. Signal our
+        # whole session while its live leader still proves their origin.
         try:
+            _kill_group(self.proc)
+            self.proc.wait(timeout=10)
+        finally:
             if self.proc.stdin:
                 self.proc.stdin.close()
-            self.proc.wait(timeout=30)
-        except (subprocess.TimeoutExpired, OSError, ValueError):
-            pass
-        _kill_group(self.proc)
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        self._stderr.close()
+            if self.proc.stdout:
+                self.proc.stdout.close()
+            self._stderr.close()
 
 
 def always(resp_factory: Callable[[], Any]) -> Callable[[dict[str, Any]], Any]:
