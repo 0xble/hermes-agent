@@ -46,7 +46,7 @@ def package(env, name, module):
     ("hindsight", "hindsight-client", "hindsight_client"), ("widget", "widget-client", "widget_client")])
 @pytest.mark.parametrize("damage", ["absent", "metadata-only", "broken-import"])
 @pytest.mark.parametrize("route", ["promote", "rollback", "recover"])
-def test_activation_outside_candidate_refuses_selected_generation_loss(tmp_path, monkeypatch, extra, distribution, module, route, damage):
+def test_activation_outside_candidate_checks_generation_loss_by_operation(tmp_path, monkeypatch, extra, distribution, module, route, damage):
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr("pm.paths.repo_root", lambda: tmp_path / "frozen-source")
@@ -66,14 +66,17 @@ def test_activation_outside_candidate_refuses_selected_generation_loss(tmp_path,
             payload.write_text("raise ModuleNotFoundError('client dependency missing')\n")
     if route == "rollback":
         (home / "previous").symlink_to(b)
+    if route == "rollback":
+        releases.rollback(home)
+        assert releases.read_pointer(home / "current") == b
+        return
     with pytest.raises(RuntimeError, match=extra):
         if route == "recover":
             with monkeypatch.context() as m:
                 m.setattr(releases, "_run_transaction", lambda *args, **kwargs: {})
                 releases.promote(home, b)
+            # Resuming an update still enforces the forward regression rule.
             releases.recover_pending_transaction(home)
-        elif route == "rollback":
-            releases.rollback(home)
         else:
             releases.promote(home, b)
     assert releases.read_pointer(home / "current") == a
@@ -84,7 +87,7 @@ def test_activation_outside_candidate_refuses_selected_generation_loss(tmp_path,
     assert releases.read_pointer(home / "current") == b
 
 
-def test_configured_provider_blocks_first_activation_without_an_active_extra(tmp_path, monkeypatch):
+def test_configured_provider_warns_on_first_activation_without_an_origin(tmp_path, monkeypatch, caplog):
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
     home.mkdir()
@@ -101,12 +104,9 @@ def test_configured_provider_blocks_first_activation_without_an_active_extra(tmp
         " def is_available(self): return importlib.util.find_spec('hindsight_client') is not None\n"
         " def unavailable_reason(self): return 'hindsight-client missing'\n"
         "def load_memory_provider(name, register_skills=False): return Provider()\n")
-    with pytest.raises(RuntimeError, match="hindsight-client"):
-        releases.promote(home, candidate)
-    assert not (home / "current").exists()
-    package(candidate / ".venv", "hindsight-client", "hindsight_client")
     releases.promote(home, candidate)
     assert releases.read_pointer(home / "current") == candidate
+    assert "hindsight-client" in caplog.text and "availability unknown" in caplog.text
 
 
 def test_candidate_owned_carry_repairs_before_the_transaction_gate(tmp_path, monkeypatch):
@@ -217,14 +217,9 @@ def test_activation_spends_one_shared_probe_budget(tmp_path, monkeypatch, caplog
 
     monkeypatch.setattr(subprocess, "run", spend)
     monkeypatch.setattr(releases, "carry_active_extras", lambda *args: pytest.fail("budgeted activation attempted repair"))
-    if operation == "promote":
-        with pytest.raises(RuntimeError, match="budget exhausted"):
-            releases.activate_release(home, a, deadline=100.75)
-        assert releases.read_pointer(home / "current") == b
-    else:
-        releases.activate_release(home, a, operation=operation, deadline=100.75)
-        assert releases.read_pointer(home / "current") == a
-        assert "budget exhausted" in caplog.text
+    releases.activate_release(home, a, operation=operation, deadline=115.75)
+    assert releases.read_pointer(home / "current") == a
+    assert "budget exhausted" in caplog.text
     assert budgets == [0.75, 0.5, 0.25]
 
 

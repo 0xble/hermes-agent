@@ -270,3 +270,26 @@ async def test_muted_profile_is_log_only_without_a_delivery_marker(tmp_path, mon
     assert gateway._send_home_channel_message.call_args.args[1] == "muted"
     assert _marker(home).with_suffix(".notified").exists()
     assert len(caplog.records) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["muted", "no-transport"])
+async def test_undeliverable_notice_reuses_logged_readiness_across_restarts(tmp_path, monkeypatch, delivery):
+    from gateway import runtime_health
+    home = setup_home(tmp_path, monkeypatch)
+    if delivery == "muted":
+        (home / "config.yaml").write_text(
+            "memory: {provider: hindsight}\ndisplay: {suppress_warning_notifications: true}\n")
+    probe = Mock(wraps=runtime_health._readiness_issue)
+    monkeypatch.setattr(runtime_health, "_readiness_issue", probe)
+    for _ in range(3):
+        gateway = runner()
+        if delivery == "no-transport":
+            gateway._served_home_channel_transports = lambda: []
+        await runtime_health.check_memory_health(gateway)
+        gateway._send_home_channel_message.assert_not_awaited()
+    assert probe.call_count == 1
+    assert runtime_health._marker(home).with_suffix(".logged").exists()
+    monkeypatch.setattr("hermes_cli.version_info.get_code_identity", lambda: {"sha": "release-C"})
+    await runtime_health.check_memory_health(gateway)
+    assert probe.call_count == 2

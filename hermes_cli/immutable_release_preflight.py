@@ -1,4 +1,4 @@
-"""The dependency gate for every immutable pointer transition, including recovery."""
+"""Refuse dependency regressions on update, keep every recovery probe advisory."""
 from __future__ import annotations
 
 import json
@@ -7,12 +7,14 @@ import subprocess
 import time
 from pathlib import Path
 
-_LOG = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 _ROLLBACK_OPERATIONS = {"rollback", "restore", "first-migration-rollback"}
+# Bootout and reload share the caller's overall deadline, never the probe's.
+_RELOAD_RESERVE_SECONDS = 15.0
 
 
 # Run under the interpreter PM will actually boot. No Hermes import is needed
-# for the extras probe, so an old candidate can still be rejected precisely.
+# for the extras probe, so old and new releases can be compared precisely.
 _PROBE = '''
 import importlib, importlib.metadata as m, json, sys
 out = {}
@@ -48,8 +50,7 @@ for name in json.loads(sys.argv[1]):
         errors.append(name + ': configured memory provider could not be loaded')
     elif not provider.is_available():
         reason = getattr(provider, 'unavailable_reason', lambda: '')()
-        if reason:
-            errors.append(name + ': ' + reason)
+        errors.append(name + ': ' + (reason or 'provider is unavailable'))
 print(json.dumps(errors))
 '''
 
@@ -78,31 +79,31 @@ def _probe(candidate: Path, script: str, values: list[str], home: Path,
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         detail = getattr(exc, "stderr", None) or str(exc)
         raise RuntimeError(
-            f"release activation refused: candidate dependency probe failed for {', '.join(values)} "
-            f"using {project_python(candidate)}: {detail}. Repair the candidate PM environment and retry.") from exc
+            f"dependency probe failed for {', '.join(values)} "
+            f"using {project_python(candidate)}: {detail}") from exc
 
 
 def _verify_extras(candidate: Path, previous: Path | None, *, operation: str,
                    deadline: float, carry_deadline: float | None) -> list[str]:
     from hermes_cli import immutable_releases as releases
-    from packaging.requirements import Requirement
-    from packaging.utils import canonicalize_name
     declared = releases._optional_dependencies(candidate)
     active = releases._recorded_extras(previous) if previous is not None else set()
+    active.update(releases._committed_extras(previous, previous, deadline=deadline) if previous else ())
     removed = active - set(declared)
     if removed:
-        _LOG.warning(
+        logger.warning(
             "RELEASE %s: target %s no longer declares active PM extras: %s. "
             "These extras will not be carried. Operator choice: proceed without these features, "
             "or select a release/plugin that provides them.", operation, candidate, ', '.join(sorted(removed)))
     active.intersection_update(declared)
-    active.update(releases._committed_extras(previous, candidate, deadline=deadline))
-    # From a frozen updater this deliberately does nothing. Readback must refuse
-    # activation rather than trusting the skipped sync or the payload's .venv.
     # PM sync has no caller-deadline contract. Budgeted activations must use
     # an already-prepared environment, never leave a repair running after expiry.
     if operation not in _ROLLBACK_OPERATIONS and carry_deadline is None:
-        releases.carry_active_extras(candidate, previous)
+        try:
+            releases.carry_active_extras(candidate, previous)
+        except Exception:
+            logger.warning("RELEASE %s: candidate carry failed for %s. Comparing selected environments anyway",
+                           operation, candidate, exc_info=True)
     probe_timeout(deadline)
     leaves = releases._leaf_requirements(candidate)
     names = sorted({name for extra in active for name in leaves.get(extra, ())})
@@ -111,48 +112,91 @@ def _verify_extras(candidate: Path, previous: Path | None, *, operation: str,
     observed = _probe(candidate, _PROBE, names, candidate.parent.parent, deadline)
     if not isinstance(observed, dict):
         raise RuntimeError("candidate dependency probe did not return distribution metadata")
-    requirements = [Requirement(raw) for extra in active for raw in declared[extra]]
+    origin_leaves = releases._leaf_requirements(previous) if previous else {}
+    origin_names = sorted({name for extra in active for name in origin_leaves.get(extra, ())})
+    origin = (_probe(previous, _PROBE, origin_names, candidate.parent.parent, deadline)
+              if origin_names and operation not in _ROLLBACK_OPERATIONS else {})
     errors = []
-    for name in names:
-        item = observed.get(name, {})
-        if not item.get("version") or item.get("missing"):
-            errors.append(f"{name} missing or not importable")
-        elif any(req.specifier and item["version"] not in req.specifier
-                 for req in requirements if canonicalize_name(req.name) == name
-                 and (req.marker is None or req.marker.evaluate())):
-            errors.append(f"{name} {item['version']} does not satisfy candidate requirements")
-    return [f"active PM extras {', '.join(sorted(active))}: {'; '.join(errors)}"] if errors else []
+    for extra in sorted(active):
+        missing = [name for name in sorted(leaves.get(extra, ())) if not _importable(observed, name)]
+        if not missing:
+            continue
+        issue = f"active PM extra {extra}: {', '.join(missing)} missing or not importable"
+        if operation not in _ROLLBACK_OPERATIONS and origin_leaves.get(extra) and all(
+                _importable(origin, name) for name in origin_leaves[extra]):
+            errors.append(issue)
+        else:
+            logger.warning("RELEASE %s: %s. %s", operation, issue,
+                           "Proceeding with recovery" if operation in _ROLLBACK_OPERATIONS
+                           else "Origin already degraded or availability unknown. Proceeding with update")
+    return errors
+
+
+def _importable(observed: dict, name: str) -> bool:
+    item = observed.get(name, {})
+    return bool(item.get("version")) and not item.get("missing") and not item.get("error")
 
 
 def activation_preflight(candidate: Path, previous: Path | str | None, home: Path, *,
                          operation: str = "promote", deadline: float | None = None) -> None:
     recovery = operation in _ROLLBACK_OPERATIONS
     carry_deadline = deadline
-    deadline = deadline if deadline is not None else time.monotonic() + 60.0
+    now = time.monotonic()
+    deadline = min(now + 60.0, deadline - _RELOAD_RESERVE_SECONDS) if deadline is not None else now + 60.0
     try:
-        _check_activation(candidate, previous, home, operation, deadline, carry_deadline)
-        probe_timeout(deadline)
-    except (TimeoutError, subprocess.TimeoutExpired):
-        if not recovery:
-            raise RuntimeError("release activation refused: preflight budget exhausted; prepare the candidate and retry")
-        _LOG.warning("RELEASE %s: preflight budget exhausted for %s. Proceeding with recovery "
-                     "without complete dependency readback; operator must verify restored features.", operation, candidate)
+        errors = _check_activation(candidate, previous, home, operation, deadline, carry_deadline)
+    except Exception as exc:
+        logger.warning(_probe_failure_message(operation, candidate, exc), exc_info=True)
+        return
+    if errors and not recovery:
+        raise RuntimeError(
+            f"release activation refused: {'; '.join(errors)}. "
+            "Install the extra or provider client into the CURRENT release "
+            "(hermes pm install --extra <x>), then re-run the update. The current release was not changed.")
 
 
 def _check_activation(candidate: Path, previous: Path | str | None, home: Path,
-                      operation: str, deadline: float, carry_deadline: float | None) -> None:
+                      operation: str, deadline: float, carry_deadline: float | None) -> list[str]:
     from pm.plugins_state import dependency_homes, read_home_selection
-    errors = _verify_extras(candidate, Path(previous) if previous else None, operation=operation,
-                            deadline=deadline, carry_deadline=carry_deadline)
-    for profile in dict.fromkeys([home, *dependency_homes()]):
-        if errors:
-            break
-        config = read_home_selection(profile) or {}
-        provider = (config.get("memory") or {}).get("provider")
-        if provider and provider.strip():
-            errors.extend(_probe(candidate, _PROVIDER_PROBE, [provider.strip()], profile, deadline))
+    recovery = operation in _ROLLBACK_OPERATIONS
+    previous = Path(previous) if previous else None
+    errors = []
+    try:
+        probe_timeout(deadline)
+        errors.extend(_verify_extras(candidate, previous, operation=operation,
+                                     deadline=deadline, carry_deadline=carry_deadline))
+    except Exception as exc:
+        logger.warning(_probe_failure_message(operation, candidate, exc), exc_info=True)
     if errors:
-        raise RuntimeError(
-            f"release activation refused: {'; '.join(errors)}. "
-            "Prepare the candidate with its own PM (hermes pm install --extra <extra>), "
-            "then retry activation. The current release was not changed.")
+        return errors
+    for profile in dict.fromkeys([home, *dependency_homes()]):
+        try:
+            # No more probes once the preflight slice ends, even during recovery.
+            probe_timeout(deadline)
+        except TimeoutError as exc:
+            logger.warning(_probe_failure_message(operation, candidate, exc), exc_info=True)
+            break
+        try:
+            config = read_home_selection(profile) or {}
+            provider = (config.get("memory") or {}).get("provider")
+            if provider and provider.strip():
+                issues = _probe(candidate, _PROVIDER_PROBE, [provider.strip()], profile, deadline)
+                if not issues:
+                    continue
+                if not recovery and previous is not None and not _probe(
+                        previous, _PROVIDER_PROBE, [provider.strip()], profile, deadline):
+                    errors.extend(issues)
+                else:
+                    logger.warning("RELEASE %s [profile=%s]: %s. %s", operation, profile, '; '.join(issues),
+                                   "Proceeding with recovery" if recovery else
+                                   "Origin already degraded or availability unknown. Proceeding with update")
+        except Exception as exc:
+            logger.warning(_probe_failure_message(operation, candidate, exc), exc_info=True)
+    return errors
+
+
+def _probe_failure_message(operation: str, candidate: Path, exc: Exception) -> str:
+    detail = "preflight budget exhausted" if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)) else str(exc)
+    disposition = ("Proceeding with recovery" if operation in _ROLLBACK_OPERATIONS else
+                   "Availability comparison incomplete. Proceeding with update")
+    return f"RELEASE {operation}: preflight probe failed for {candidate}: {detail}. {disposition}"

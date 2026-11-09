@@ -269,33 +269,43 @@ exercises this transition with real offline wheels, PM sync, and import probes.
 Build-time carry and candidate-owned carry remain the repair paths. They are not
 activation gates: an older updater, direct promotion, rollback, or recovered
 transaction can reach the pointer flip without importing candidate-owned PM.
-Every transaction now verifies the selected candidate PM interpreter before
-changing `current`, including source-layout rollback. Missing or unimportable
-direct requirements of retained declared extras, or a configured provider's
-failed passive readiness check, refuse activation. An extra the target no longer
+Every transaction probes the selected candidate PM interpreter before
+changing `current`, including source-layout rollback. Forward activation refuses
+only regressions from the origin: a previously importable extra still declared
+by the candidate loses a direct requirement, or an available configured memory
+provider becomes unavailable. Identical existing degradation warns and proceeds.
+An extra the target no longer
 declares emits a loud warning naming the extra and the operator's choice to
 proceed without it or select a release/plugin that supplies it. Rollback, restore,
 and source-layout rollback only read back dependencies and never carry or repair.
+Every recovery preflight outcome is advisory, including missing extras, unavailable
+providers, old provider API signatures, probe crashes and timeouts. Each failure
+is logged loudly and recovery continues.
 Forward activation without a caller deadline retries candidate-owned carry.
 Budgeted activation requires prior preparation instead of entering unbounded PM
 sync. Metadata and primary-module import probes share one remaining deadline,
-including the guardian's rollback deadline. Probe budget exhaustion refuses
-forward activation but warns and permits recovery. Each distribution's primary
+ending 15 seconds before the caller's deadline to reserve bootout and reload time.
+An exhausted preflight skips remaining probes before switching pointers. Unknown
+availability cannot establish a regression and warns without refusing. Each distribution's primary
 module is imported, without importing unrelated top-level tooling. The gate
 reads back the selected environment rather than trusting PM's return value or
 the payload venv.
-Configured-provider checks use the candidate's `is_available` and
-`unavailable_reason`, not client construction or network requests. Empty reasons
-(such as absent credentials) do not become dependency errors.
+Configured-provider checks use each release's `is_available` and
+`unavailable_reason`, not client construction or network requests. False availability
+is compared even without a reason. Refusals direct the operator to install the
+extra or provider client into the CURRENT release with
+`hermes pm install --extra <x>`, then re-run the update.
 
 At gateway startup and each 60-second housekeeping tick, configured providers use
 those same readiness APIs. Client degradation emits an ERROR with client package
 names and PM repair guidance, and an operator home-channel notice. Per-profile,
 per-release markers suppress repeat errors and delivered notices across ticks and
-restarts. Unsent notices remain eligible for retry. No provider readiness, PM
+restarts. A saved `.logged` issue is reused without re-probing even when muted or
+without a home transport. Unsent notices remain eligible for retry. No provider readiness, PM
 selection, or status-command implementation is duplicated or changed by this gate.
 The existing `hermes memory status` red readiness contract remains #845's owner.
 Proof: `tests/hermes_cli/test_release_extras_preflight.py`,
+`tests/hermes_cli/test_release_preflight_recovery.py`,
 `tests/gateway/test_memory_health.py`, and the existing immutable-release and
 memory-status suites. Release integration and promotion remain with Maintenance.
 

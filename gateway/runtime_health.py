@@ -70,12 +70,17 @@ def _pending_notice(home: Path) -> tuple[Path, str, bool]:
     marker = _marker(home)
     if marker.with_suffix(".notified").exists():
         return marker, "", False
+    logged = marker.with_suffix(".logged")
+    if logged.exists():
+        # Delivery may become possible later. Retry the saved notice without
+        # reloading providers on every housekeeping tick (or gateway restart).
+        return marker, logged.read_text(encoding="utf-8"), False
     issue = _readiness_issue()
     if not issue:
         return marker, "", False
     marker.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with marker.with_suffix(".logged").open("x", encoding="utf-8") as stream:
+        with logged.open("x", encoding="utf-8") as stream:
             stream.write(issue)
     except FileExistsError:
         logger.debug("Memory readiness error already logged for this release: %s", home)
