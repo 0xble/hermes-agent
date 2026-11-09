@@ -1736,7 +1736,7 @@ async def test_ledger_redelivery_reconciles_note_left_by_failed_resumed_delete(t
     startup.adapters = {Platform.TELEGRAM: adapter}
     startup._arm_flood_timers_for_waiting_rows = AsyncMock()
     adapter.gateway_runner = startup
-    monkeypatch.setattr("gateway.delivery_ledger.mark_delivered", lambda _obligation_id: None)
+    monkeypatch.setattr("gateway.delivery_ledger.mark_delivered", lambda _obligation_id, _result=None: None)
 
     row = {
         "obligation_id": "obligation-ledger",

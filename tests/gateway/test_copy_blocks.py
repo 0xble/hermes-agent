@@ -353,7 +353,7 @@ async def test_queued_copy_blocks_keep_distinct_ledger_rows_and_never_resend_del
     monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
     monkeypatch.setattr(ledger, "record_obligation", lambda **kwargs: rows.append(kwargs))
     monkeypatch.setattr(ledger, "mark_attempting", lambda _oid: None)
-    monkeypatch.setattr(ledger, "mark_delivered", lambda _oid: None)
+    monkeypatch.setattr(ledger, "mark_delivered", lambda _oid, _result=None: None)
     monkeypatch.setattr(ledger, "mark_failed", lambda _oid, _error: None)
 
     async def send_with_retry(*, chat_id, content, reply_to, metadata):
@@ -427,7 +427,7 @@ async def test_failed_copy_block_holds_later_blocks_in_order(monkeypatch) -> Non
     monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
     monkeypatch.setattr(ledger, "record_obligation", lambda **kwargs: rows.append(kwargs))
     monkeypatch.setattr(ledger, "mark_attempting", lambda _oid: None)
-    monkeypatch.setattr(ledger, "mark_delivered", lambda _oid: None)
+    monkeypatch.setattr(ledger, "mark_delivered", lambda _oid, _result=None: None)
     monkeypatch.setattr(ledger, "mark_failed", lambda oid, _error: failed.append(oid))
 
     async def send_with_retry(*, chat_id, content, reply_to, metadata):

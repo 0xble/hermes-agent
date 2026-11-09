@@ -4037,7 +4037,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         pending = _PENDING_LEDGER_SETTLEMENT.get()
         if pending is not None and task is not None and task.cancelling():
             if getattr(result, "success", False):
-                self._settle_delivered_obligation_sync(pending[0])
+                self._settle_delivered_obligation_sync(pending[0], result)
         return result
 
     async def _send_with_retry_body(
@@ -4870,7 +4870,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             logger.debug("delivery ledger record failed", exc_info=True)
             return None
 
-    def _settle_delivered_obligation_sync(self, obligation_id: str) -> None:
+    def _settle_delivered_obligation_sync(self, obligation_id: str, result: Any = None) -> None:
         """Mark delivered a send that already landed when this task was cancelled.
 
         Another await would itself raise CancelledError and skip the write, which is how a
@@ -4881,7 +4881,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """
         try:
             from gateway.delivery_ledger import mark_delivered
-            mark_delivered(obligation_id)
+            mark_delivered(obligation_id, result)
         except Exception:
             logger.debug("delivery ledger update failed", exc_info=True)
 
@@ -4896,7 +4896,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
             if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id)
+                await asyncio.to_thread(mark_delivered, obligation_id, result)
                 return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error)
