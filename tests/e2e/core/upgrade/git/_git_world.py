@@ -4,9 +4,9 @@
 git wrapper that reports the official remote URL) whose ``~/.gitconfig`` rewrites the official
 GitHub URL to a loopback ``git http-backend`` origin (``_smart_http``). The install itself comes
 from a real ``scripts/install.sh``: the previous fork promotion's own copy for N-1, HEAD's for
-HEAD. ``preclone`` seeds a checkout the installer then adopts. ``seed_clone_shape`` restores
+HEAD. ``seed_clone_shape`` restores
 retained user Git state after bootstrap, so its shallow/treeless healing cannot mask the
-updater's behavior. Both use real clones over the same complete smart-HTTP origin.
+updater's behavior using real clones over the same complete smart-HTTP origin.
 
 Everything a cell asserts is user-visible: the exit code and transcript of ``hermes update``, the
 checkout's HEAD / branch / working tree / refs, the update receipt, and whether ``hermes
@@ -193,8 +193,13 @@ class World:
         )
         assert cp.returncode == 0, f"retained clone {args} failed: {cp.stderr}"
         assert I.git("rev-parse", "HEAD", cwd=seed, env=self.git_env()) == self.head()
+        branch, upstream = self.branch(), self.git("rev-parse", "--abbrev-ref", "@{upstream}")
+        status = self.status()
         shutil.rmtree(self.checkout / ".git")
         (seed / ".git").rename(self.checkout / ".git")
+        assert self.branch() == branch == "main"
+        assert self.git("rev-parse", "--abbrev-ref", "@{upstream}") == upstream
+        assert self.status() == status, "retained clone changed installed working-tree status"
         self.install_bytes = self.bytes_since(mark)
         self.install_shape = self.shape()
 
@@ -272,16 +277,9 @@ class World:
         return "\n".join(out)
 
 
-def _preclone(sb: I.Sandbox, args: list[str], env: dict[str, str]) -> None:
-    sb.hermes_home.mkdir(parents=True, exist_ok=True)
-    cp = subprocess.run(["git", "clone", "-q", *args, "--branch", "main", I.OFFICIAL_HTTPS, str(sb.checkout)],
-                        capture_output=True, text=True, env=env, timeout=120, check=False)
-    assert cp.returncode == 0, f"pre-clone {args} failed: {cp.stderr[-2000:]}"
-
-
 @contextlib.contextmanager
 def world(root: Path, *, base: str, installer_ref: str | None = None,
-          preclone: list[str] | None = None, cache: InstallCache | None = None) -> Iterator[World]:
+          cache: InstallCache | None = None) -> Iterator[World]:
     """Serve origin ``main`` at ``base`` over smart HTTP and install from it with the installer
     of ``installer_ref`` (None: HEAD's). Yields the live ``World``; the server stops on exit."""
     root.mkdir(parents=True, exist_ok=True)
@@ -300,8 +298,6 @@ def world(root: Path, *, base: str, installer_ref: str | None = None,
             f'[url "{url}"]\n  insteadOf = {I.OFFICIAL_HTTPS}\n  insteadOf = {I.OFFICIAL_SSH}\n'
             '[user]\n  name = user\n  email = user@example.invalid\n', encoding="utf-8")
         w = World(root=root, srv=srv, bare=bare, sb=sb, cache=cache)
-        if preclone is not None:
-            _preclone(sb, preclone, w.git_env())
         script = sb.root / "install.sh"
         script.write_text(installer_script(installer_ref), encoding="utf-8")
         # The served repo publishes commits on main and no release tags: install main (N-1's

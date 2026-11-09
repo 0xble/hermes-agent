@@ -18,8 +18,11 @@ when `HOME` names a sandbox. Failure to resolve that account also drops these in
 N-1 receives a private copy of the runner's actual uv, avoiding repeated Astral bootstrap.
 The Git worlds pass the existing `--skip-browser` option to both real installer versions.
 Their contract is clone shape, transfer, hydration and update behavior, not optional browser
-provisioning. Process snapshots from the 900-second Linux reproduction found their installers
-inside `npx playwright install --with-deps chromium` (a separate 600-second optional step).
+provisioning. In the local Linux reproduction on failing commit `80718d41`, partial/shallow
+installers spent time in `npx playwright install --with-deps chromium` (a separate 600-second
+optional step), then completed in 566/586 seconds. Only `test_upgrade_path.py` reproduced the
+900-second kill, during its sixth scenario. These observations do not establish the exact
+subprocess responsible for either historical partial/shallow kill.
 Skipping that unrelated step does not replace the installer or bypass Git/dependency assertions.
 Cold real installer download coverage remains in
 `test_install_fresh.py::test_fresh_install_serves_head_and_runs_a_turn`: its `installed` fixture
@@ -29,7 +32,7 @@ separate cold path; all three git worlds retain the download-sharing optimizatio
 
 `make_leg(root, template_home)` remains supported for other upgrade suites. Omitting the optional
 cache creates download storage under that leg's own root; only explicit fixture-cache callers share
-content. Keep caller audits and a two-argument regression when extending shared test helpers.
+content and opt into the shared fixture deadline and PM archive preparation. Keep caller audits and a two-argument regression when extending shared test helpers.
 
 `test_upgrade_path` uses the same download-only fixture for its repeated N-1/update legs. Its
 bare origin advertises only the subject branch, like `_install_helpers.make_origin`, rather than
@@ -45,7 +48,9 @@ performs no HTTP request. A cold request uses curl's 10-second connection and 30
 bounds, no retries, and atomic publication. Status, URL and checksum failures surface immediately.
 The maintained pinned mirror supplies the same reviewed archive bytes. Each sandbox receives
 private copies of PM's `fetch-<sha256>` entries. PM may delete those copies after publication
-without losing the retained archive. Bootstrap uv is extracted from the exact pinned archive
+without losing the retained archive. Retained archives are stored beside the explicit uv cache
+(in `<uv-cache-name>-pm-archives`), outside uv-owned buckets, so `uv cache prune` cannot
+discard them. Bootstrap uv is extracted from the exact pinned archive
 into the slot the unmodified historical shell installer already checks.
 
 The previous shared `HERMES_RUNTIME_DIR` was a mutable native store. Its `.install.lock`

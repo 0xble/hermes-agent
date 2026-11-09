@@ -109,6 +109,10 @@ def test_upgrade_leg_keeps_two_argument_callers_and_private_downloads(tmp_path, 
         assert Path(leg.env["HERMES_HOME"]) == leg.hermes_home
         assert Path(leg.env["HERMES_RUNTIME_DIR"]) == leg.hermes_home / "tools"
         assert upgrade._git("rev-parse", "HEAD", cwd=leg.install) == base
+        # A two-argument caller has not opted into a whole-file fixture deadline.
+        if leg.cache is not None:
+            leg.cache.deadline = 0
+        assert leg.run(argv0=str(uv), timeout=5).returncode == 0
     assert legs[0].env["UV_CACHE_DIR"] != legs[1].env["UV_CACHE_DIR"]
 
     shared = InstallCache(tmp_path / "explicit-downloads")

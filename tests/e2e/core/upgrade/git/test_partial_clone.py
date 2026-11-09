@@ -17,6 +17,7 @@ a treeless checkout re-downloads whole directory snapshots on every checkout. Co
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -35,20 +36,25 @@ SHAPES = {
 
 def _scenario(root, shape: str, cache: InstallCache) -> dict:
     cm, w = G.start_world(root / shape, base=G.n1_base(), installer_ref=G.n1_tag(), cache=cache)
-    w.seed_clone_shape(SHAPES[shape])
-    run = {"cm": cm, "w": w, "shape0": w.install_shape}
-    w.set_main(I.head_sha())
-    run["cp1"], run["head1"], run["shape1"] = w.update(), w.head(), w.shape()
-    run["target2"] = w.publish(f"release: e2e partial {shape}", {f"e2e-partial-{shape}.txt": "release\n"})
-    run["cp2"], run["head2"], run["shape2"] = w.update(), w.head(), w.shape()
-    run["version"] = w.version()
-    return run
+    try:
+        w.seed_clone_shape(SHAPES[shape])
+        run = {"cm": cm, "w": w, "shape0": w.install_shape}
+        w.set_main(I.head_sha())
+        run["cp1"], run["head1"], run["shape1"] = w.update(), w.head(), w.shape()
+        run["target2"] = w.publish(f"release: e2e partial {shape}", {f"e2e-partial-{shape}.txt": "release\n"})
+        run["cp2"], run["head2"], run["shape2"] = w.update(), w.head(), w.shape()
+        run["version"] = w.version()
+        return run
+    except BaseException:
+        cm.__exit__(*sys.exc_info())
+        raise
 
 
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("git-partial")
     cache = InstallCache(root / "downloads", os.environ)
+    G.n1_tag()  # resolve once before concurrent callers enter the cached selector
     results = G.in_parallel({shape: (lambda s=shape: _scenario(root, s, cache)) for shape in SHAPES})
     yield results
     for res in results.values():

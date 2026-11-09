@@ -22,6 +22,7 @@ Three installs run concurrently over smart HTTP (release selection is owned by `
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -37,52 +38,67 @@ ORPHAN = "orphan divergence"
 
 def _depth1(root, cache: InstallCache) -> dict:
     cm, w = G.start_world(root / "depth1", base=G.n1_base(), installer_ref=G.n1_tag(), cache=cache)
-    w.seed_clone_shape(["--depth=1", "--single-branch"])
-    run = {"cm": cm, "w": w, "shape0": w.install_shape}
-    w.set_main(I.head_sha())
-    run["mark1"] = w.srv.mark()
-    run["cp1"], run["head1"] = w.update(), w.head()
-    run["fetches1"] = [r for r in w.srv.since(run["mark1"]) if r.command == "fetch"]
-    run["target2"] = w.publish("release: e2e shallow next", {"e2e-shallow-next.txt": "release\n"})
-    run["mark2"] = w.srv.mark()
-    run["cp2"], run["head2"] = w.update(), w.head()
-    run["version"] = w.version()
-    return run
+    try:
+        w.seed_clone_shape(["--depth=1", "--single-branch"])
+        run = {"cm": cm, "w": w, "shape0": w.install_shape}
+        w.set_main(I.head_sha())
+        run["mark1"] = w.srv.mark()
+        run["cp1"], run["head1"] = w.update(), w.head()
+        run["fetches1"] = [r for r in w.srv.since(run["mark1"]) if r.command == "fetch"]
+        run["target2"] = w.publish("release: e2e shallow next", {"e2e-shallow-next.txt": "release\n"})
+        run["mark2"] = w.srv.mark()
+        run["cp2"], run["head2"] = w.update(), w.head()
+        run["version"] = w.version()
+        return run
+    except BaseException:
+        cm.__exit__(*sys.exc_info())
+        raise
 
 
 def _checked(root, cache: InstallCache) -> dict:
     cm, w = G.start_world(root / "checked", base=G.n1_base(), installer_ref=G.n1_tag(), cache=cache)
-    w.seed_clone_shape(["--depth=1", "--single-branch"])
-    run = {"cm": cm, "w": w, "shape0": w.install_shape, "checks": []}
-    between = I.git("rev-list", "--first-parent", f"{G.n1_base()}..{I.head_sha()}", cwd=I.H.WORKTREE).split()
-    for k in (len(between) * 3 // 4, len(between) // 2, len(between) // 4):
-        w.set_main(between[k])
-        run["checks"].append(w.sb.cli("update", "--check", timeout=600))
-    shallow = w.checkout / ".git" / "shallow"
-    run["grafts"] = len(shallow.read_text(encoding="utf-8-sig").split()) if shallow.is_file() else 0
-    w.set_main(I.head_sha())
-    run["cp1"], run["head1"] = w.update(), w.head()
-    return run
+    try:
+        w.seed_clone_shape(["--depth=1", "--single-branch"])
+        run = {"cm": cm, "w": w, "shape0": w.install_shape, "checks": []}
+        between = I.git("rev-list", "--first-parent", f"{G.n1_base()}..{I.head_sha()}", cwd=I.H.WORKTREE).split()
+        checkpoints = (len(between) * 3 // 4, len(between) // 2, len(between) // 4)
+        assert len(set(checkpoints)) == 3, f"need 3 distinct passive-check releases, got {len(between)} commits"
+        for k in checkpoints:
+            w.set_main(between[k])
+            run["checks"].append(w.sb.cli("update", "--check", timeout=600))
+        shallow = w.checkout / ".git" / "shallow"
+        run["grafts"] = len(shallow.read_text(encoding="utf-8-sig").split()) if shallow.is_file() else 0
+        w.set_main(I.head_sha())
+        run["cp1"], run["head1"] = w.update(), w.head()
+        return run
+    except BaseException:
+        cm.__exit__(*sys.exc_info())
+        raise
 
 
 def _prefetched(root, cache: InstallCache) -> dict:
     cm, w = G.start_world(root / "prefetched", base=I.head_sha(), cache=cache)
-    run = {"cm": cm, "w": w}
-    (w.checkout / "e2e-local-before-prefetch.txt").write_text("my local commit\n", encoding="utf-8")
-    w.git("add", "-A")
-    w.git("commit", "-q", "-m", "my local patch")
-    run["local"] = w.head()
-    run["target"] = w.publish("release: e2e shallow prefetch", {"e2e-shallow-prefetch.txt": "release\n"})
-    w.git("fetch", "-q", "--depth", "1", "origin", "main")
-    run["prefetch_shape"] = w.shape()
-    run["cp1"], run["head1"] = w.update(), w.head()
-    return run
+    try:
+        run = {"cm": cm, "w": w}
+        (w.checkout / "e2e-local-before-prefetch.txt").write_text("my local commit\n", encoding="utf-8")
+        w.git("add", "-A")
+        w.git("commit", "-q", "-m", "my local patch")
+        run["local"] = w.head()
+        run["target"] = w.publish("release: e2e shallow prefetch", {"e2e-shallow-prefetch.txt": "release\n"})
+        w.git("fetch", "-q", "--depth", "1", "origin", "main")
+        run["prefetch_shape"] = w.shape()
+        run["cp1"], run["head1"] = w.update(), w.head()
+        return run
+    except BaseException:
+        cm.__exit__(*sys.exc_info())
+        raise
 
 
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("git-shallow")
     cache = InstallCache(root / "downloads", os.environ)
+    G.n1_tag()  # resolve once before concurrent callers enter the cached selector
     results = G.in_parallel({"depth1": lambda: _depth1(root, cache), "checked": lambda: _checked(root, cache),
                              "prefetched": lambda: _prefetched(root, cache)})
     yield results
@@ -147,7 +163,7 @@ def test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(runs)
 def test_current_updater_heals_shallow_history_before_its_bounded_fetch(runs):
     """Independent of which fork promotion supplies N-1: this cell starts at HEAD."""
     run = _run(runs, "prefetched")
-    transcript = G.output(run["cp1"])
+    transcript = run["cp1"].stdout
     healed = transcript.find("Fetched the commit history this shallow checkout was missing")
     bounded = transcript.find("Fetching updates...")
     assert 0 <= healed < bounded, (

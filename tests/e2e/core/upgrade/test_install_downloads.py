@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
+import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Thread
@@ -47,11 +48,16 @@ def artifact_server():
 
 
 def test_verified_archive_survives_a_later_504_without_another_request(tmp_path, monkeypatch):
-    cache = InstallCache(tmp_path / "downloads")
+    uv_cache = tmp_path / "runner" / "uv"
+    uv_cache.mkdir(parents=True)
+    cache = InstallCache(tmp_path / "downloads", {"UV_CACHE_DIR": str(uv_cache)})
     with artifact_server() as (url, payload, requests):
         digest = hashlib.sha256(payload).hexdigest()
         first = cache.artifact(url + "/release", digest)
         assert first.read_bytes() == payload
+        assert cache.artifact(url + "/504", digest) == first
+        # uv owns and may prune its entire cache. PM archives must survive that lifecycle.
+        shutil.rmtree(uv_cache)
         assert cache.artifact(url + "/504", digest) == first
         from pm.store import Store, current_target
         import pm.artifact_mirror

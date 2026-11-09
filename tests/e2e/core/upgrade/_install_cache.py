@@ -35,7 +35,8 @@ class InstallCache:
         """One bounded request, atomic publication, and no network on a verified cache hit."""
         from pm.filesystem import lock_fd
 
-        root = self.downloads.get("UV_CACHE_DIR", self.root) / "artifacts"
+        uv_cache = self.downloads.get("UV_CACHE_DIR")
+        root = uv_cache.with_name(uv_cache.name + "-pm-archives") if uv_cache else self.root / "artifacts"
         root.mkdir(parents=True, exist_ok=True)
         target = root / digest
         with (root / f"{digest}.lock").open("a+b") as lock:
@@ -97,6 +98,9 @@ class InstallCache:
                 entry = store / f"fetch-{digest}"
                 entry.mkdir(parents=True, exist_ok=True)
                 destination = entry / url.rsplit("/", 1)[-1]
+                for previous in entry.iterdir():
+                    if previous != destination:
+                        previous.unlink()
                 shutil.copy2(archive, destination)
                 # The unmodified shell bootstrap checks this exact pinned uv slot before
                 # PM can consume its fetch cache. Do its normal archive extraction here.
