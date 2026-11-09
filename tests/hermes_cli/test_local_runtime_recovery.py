@@ -12,6 +12,8 @@ import time
 import psutil
 import pytest
 
+from tests.waiting import kill_if_alive
+
 
 def _wait_for(predicate, timeout=10):
     deadline = time.monotonic() + timeout
@@ -137,8 +139,7 @@ def test_startup_preserves_trees_and_explicit_stop_checks_owner(tmp_path, monkey
         assert json.loads(supervisor.state_path().read_text()) == state
     finally:
         for proc in processes:
-            if proc.is_running():
-                proc.kill()
+            kill_if_alive(proc)
             try:
                 proc.wait(timeout=5)
             except psutil.NoSuchProcess:

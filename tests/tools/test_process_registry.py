@@ -11,9 +11,11 @@ import sys
 import tempfile
 import threading
 import time
-import psutil
-import pytest
 from unittest.mock import ANY, MagicMock, patch
+
+import pytest
+
+from tests.waiting import process_alive
 
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
@@ -578,10 +580,8 @@ def test_kill_all_real_login_shell_groups_die_with_default_grace(registry):
         time.sleep(0.2)  # brief post-sweep reap/poll allowance
         survivors = []
         for root_pid in root_pids:
-            if root_pid and psutil.pid_exists(root_pid):
-                process = psutil.Process(root_pid)
-                if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
-                    survivors.append(root_pid)
+            if root_pid and process_alive(root_pid):
+                survivors.append(root_pid)
         assert not survivors
     finally:
         registry.kill_all("restart-sweep", source="test-cleanup", consume_output=True)
@@ -811,7 +811,7 @@ def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
         assert _wait_until(lambda: os.path.exists(pidfile))
         child_pid = int(open(pidfile, encoding="utf-8-sig").read())
         assert registry.kill_all("descendant-test", deadline=time.monotonic() + 3.0) == 1
-        assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(child_pid)
     finally:
         registry.kill_all("descendant-test", source="test-cleanup")
         with contextlib.suppress(FileNotFoundError):
@@ -860,7 +860,7 @@ def test_kill_terminates_descendant_that_escaped_process_group(registry, mode):
             result = registry.kill_process(session.id, source="gateway_shutdown")
             assert result["status"] == "killed", result
         time.sleep(0.2)
-        assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(child_pid)
     finally:
         registry.kill_all(session.task_id, source="test-cleanup", consume_output=True)
         with contextlib.suppress(FileNotFoundError):

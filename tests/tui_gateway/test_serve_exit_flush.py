@@ -21,6 +21,8 @@ import time
 
 import pytest
 
+from tests.waiting import kill_if_alive, process_children, process_cmdline, process_name
+
 from tui_gateway import server
 
 class _FlushAgent:
@@ -205,8 +207,8 @@ def test_shutdown_mid_tool_kills_the_command_and_keeps_its_result(monkeypatch):
     deadline = time.monotonic() + 20.0
     sleeper = None
     while sleeper is None and time.monotonic() < deadline:
-        sleeper = next((p for p in psutil.Process().children(recursive=True)
-                        if p.name() == "sleep" and "3518" in " ".join(p.cmdline())), None)
+        sleeper = next((p for p in process_children(os.getpid())
+                        if process_name(p) == "sleep" and "3518" in " ".join(process_cmdline(p) or [])), None)
         time.sleep(0.05)
     assert sleeper is not None, "test setup: foreground sleep never started"
 
@@ -229,8 +231,7 @@ def test_shutdown_mid_tool_kills_the_command_and_keeps_its_result(monkeypatch):
     finally:
         with server._sessions_lock:
             server._sessions.pop("sess-mid-tool", None)
-        if sleeper.is_running():
-            sleeper.kill()
+        kill_if_alive(sleeper)
         set_interrupt(False, thread_id=run_thread.ident)
         env.cleanup()
 
@@ -254,8 +255,8 @@ def test_sigterm_grace_hard_exit_kills_a_sigterm_ignoring_command(monkeypatch):
     deadline = time.monotonic() + 20.0
     sleeper = None
     while sleeper is None and time.monotonic() < deadline:
-        sleeper = next((p for p in psutil.Process().children(recursive=True)
-                        if p.name() == "sleep" and "3522" in " ".join(p.cmdline())), None)
+        sleeper = next((p for p in process_children(os.getpid())
+                        if process_name(p) == "sleep" and "3522" in " ".join(process_cmdline(p) or [])), None)
         time.sleep(0.05)
     assert sleeper is not None, "test setup: foreground sleep never started"
     exits: list = []
@@ -268,8 +269,7 @@ def test_sigterm_grace_hard_exit_kills_a_sigterm_ignoring_command(monkeypatch):
         assert not alive, "SIGTERM-ignoring foreground command survived the hard exit"
         assert exits == [0] and elapsed < 0.9, f"hard exit waited {elapsed:.2f}s (a TERM grace) first"
     finally:
-        if sleeper.is_running():
-            sleeper.kill()
+        kill_if_alive(sleeper)
         run_thread.join(5.0)
         env.cleanup()
 

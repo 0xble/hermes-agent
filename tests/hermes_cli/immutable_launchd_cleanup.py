@@ -10,6 +10,8 @@ from pathlib import Path
 
 import psutil
 
+from tests.waiting import process_alive
+
 _PREFIXES = ("ai.hermes.s2spike.", "ai.hermes.s2migration.", "ai.hermes.s2crash.")
 _REGISTRY = "immutable-launchd-labels.jsonl"
 
@@ -100,8 +102,7 @@ def sweep_prior_sessions(request) -> None:
             entries = [json.loads(line) for line in registry.read_text().splitlines()]
         except (OSError, ValueError):
             continue
-        if entries and all(not psutil.pid_exists(item["pid"]) or
-                           psutil.Process(item["pid"]).create_time() != item["created"]
+        if entries and all(not process_alive(item["pid"], created=item["created"])
                            for item in entries):
             _sweep(registry)
             registry.unlink(missing_ok=True)
