@@ -37,6 +37,7 @@ from plugins.platforms.telegram.private_ingress import (
 )
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
+from plugins.platforms.telegram.thread_fallback import record_root_fallback, reports_thread_fallback
 from plugins.platforms.telegram.telegram_reconnect import TelegramReconnectMixin
 from plugins.platforms.telegram.progress import TelegramProgressMixin
 from plugins.platforms.telegram.telegram_media_download import fetch_telegram_file as _fetch_telegram_file
@@ -1651,9 +1652,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
             except Exception as send_err:
                 if not self._should_retry_without_dm_topic_reply_anchor(send_err, metadata, reply_to_message_id):
                     raise
-                logger.warning(
-                    "[%s] Reply target deleted for Telegram %s, retrying without reply/topic anchor: %s",
-                    self.name, media_label, _redact_telegram_error_text(send_err))
                 if reset_media is not None:
                     reset_media()
                 retry_kwargs = dict(send_kwargs)
@@ -1666,8 +1664,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                         "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing %s upload without an API call",
                         self.name, retry_kwargs.get("chat_id"), cooldown, media_label)
                     raise _MediaFloodRefusal(cooldown)
-                return await _await_with_thread_deadline(
+                message = await _await_with_thread_deadline(
                     send_fn(**retry_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
+                record_root_fallback(send_kwargs.get("message_thread_id") or send_kwargs.get("direct_messages_topic_id"))
+                return message
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -4527,6 +4527,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                     chunk, send_kwargs, plain=bool(metadata and metadata.get("copy_block")))
                 if isinstance(message, SendResult):
                     return message
+                record_root_fallback(thread_id, used_thread_fallback)
                 return message, used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
@@ -4537,10 +4538,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                         # One-off "thread not found" flakes recover on immediate retry: same thread_id once.
                         if not retried_thread_not_found:
                             retried_thread_not_found = True
-                            logger.warning("[%s] Thread %s not found, retrying once with same thread_id", self.name, effective_thread_id)
+                            logger.info("[%s] Thread %s not found, retrying once with same thread_id", self.name, effective_thread_id)
                             continue
                         # Thread is genuinely gone: retry without it and prune the stale binding.
-                        logger.warning("[%s] Thread %s not found, retrying without message_thread_id", self.name, effective_thread_id)
                         await asyncio.to_thread(self._prune_stale_dm_topic_binding, chat_id, effective_thread_id, metadata=metadata)
                         used_thread_fallback = True
                         effective_thread_id = None
@@ -4551,10 +4551,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                         if private_dm_topic_send:
                             return SendResult(success=False, error=safe_send_error, retryable=False)
                         # Reply target deleted; private-topic fallback sends drop anchor + topic id together.
-                        logger.warning("[%s] Reply target deleted, retrying without reply_to: %s", self.name, safe_send_error)
+                        logger.info("[%s] Reply target deleted, retrying without reply_to", self.name)
                         reply_to_id = None
                         if self._dm_topic_fallback(metadata):
                             thread_kwargs = {}
+                            used_thread_fallback = True
                         else:
                             thread_kwargs = self._thread_kwargs_for_send(
                                 chat_id, thread_id, metadata, reply_to_message_id=reply_to_id, reply_to_mode=self._reply_to_mode)
@@ -4759,6 +4760,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         _track(loop.create_task(_quiet()), tasks)
 
     @durable_egress("send")
+    @reports_thread_fallback
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
@@ -5450,14 +5452,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                 self._bot.send_message(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
         except Exception as send_err:
             if (message_thread_id is not None and self._is_bad_request_error(send_err) and self._is_thread_not_found_error(send_err)):
-                logger.warning(
-                    "[%s] Thread %s not found for control message, retrying without message_thread_id", self.name, message_thread_id)
                 # Same prune as the streaming send path; control sends carry no gateway metadata.
                 await asyncio.to_thread(self._prune_stale_dm_topic_binding, kwargs.get("chat_id"), message_thread_id)
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
-                return await call_with_flood_guard(self, kwargs.get("chat_id"), lambda: _await_with_thread_deadline(
+                message = await call_with_flood_guard(self, kwargs.get("chat_id"), lambda: _await_with_thread_deadline(
                     self._bot.send_message(**retry_kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
+                record_root_fallback(message_thread_id)
+                return message
             raise
 
     @durable_control
@@ -5475,6 +5477,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
             chat_id, thread_id, metadata, reply_to_message_id=reply_to_id, reply_to_mode=reply_to_mode))
         return await self._send_message_with_thread_fallback(**kwargs)
 
+    @reports_thread_fallback
     async def _send_prompt(self, what: str, chat_id: str, metadata: Optional[dict[str, Any]], build, *,
                            parse_mode: Any = None, thread_id: Any = None, reply_to_mode: Any = None) -> SendResult:
         """Shared control-prompt shell: not-connected guard, ``build()`` → ``(text, keyboard, on_sent)`` (or a
@@ -6621,6 +6624,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         raise _last_parse_error or RuntimeError("Telegram send_voice failed for all caption variants")
 
     @durable_egress("send_voice")
+    @reports_thread_fallback
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -6671,6 +6675,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                     os.unlink(_transcoded_voice_path)
 
     @durable_egress("send_multiple_images")
+    @reports_thread_fallback
     async def send_multiple_images(
         self, chat_id: str, images: list[tuple], metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send images as Telegram albums (``send_media_group``, 10 per chunk). Animated GIFs can't join a
@@ -6786,6 +6791,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     @durable_egress("send_image_file")
+    @reports_thread_fallback
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -6856,6 +6862,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         return await fallback
 
     @durable_egress("send_document")
+    @reports_thread_fallback
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -6869,6 +6876,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                 ).send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
 
     @durable_egress("send_video")
+    @reports_thread_fallback
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -6904,6 +6912,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                     os.remove(thumb_path)
 
     @durable_egress("send_image")
+    @reports_thread_fallback
     async def send_image(
         self, chat_id: str, image_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -6943,6 +6952,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
                 return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
     @durable_egress("send_animation")
+    @reports_thread_fallback
     async def send_animation(
         self, chat_id: str, animation_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> SendResult:

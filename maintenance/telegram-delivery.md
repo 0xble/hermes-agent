@@ -22,6 +22,17 @@ are owned by [Telegram rendering](telegram-rendering.md).
 - Synthetic gateway event IDs may identify notifications but never become Telegram reply
   anchors. Numeric Telegram message IDs still anchor ordinary DM-topic replies.
 
+## Root fallback is not topic recovery
+
+Fork patch identity: `telegram-delivery`.
+Contract tests: `tests/gateway/test_telegram_thread_fallback.py`.
+
+The 2026-11-09 investigation of https://github.com/NousResearch/hermes-agent/issues/152148 found that this fork's text retry ladder already returned `raw_response.thread_fallback`, and `cron/scheduler_delivery.py` already read it. The delivery-obligation finalizer, cancellation settlement, and recovered-obligation replay discarded it: `mark_delivered` unconditionally cleared `last_error`. Media anchor retries and control sends also removed routing without carrying the distinction into their results. This branch has no `telegram_dm_topic_send.py`; the corresponding routing helpers live in `plugins/platforms/telegram/adapter.py`.
+
+Successful root fallbacks retain `success=True` and report `thread_fallback=True` with `requested_thread_id`. Delivery obligations retain `state=delivered`, their requested `thread_id`, and their existing attempt count, with `last_error=thread_fallback_root`. This records receipt without claiming topic recovery or scheduling duplicate delivery. Anchored and newly created topic text sends retain their existing fail-closed contract. Each fallback logs a content-free WARNING naming the requested thread. Per-send context keeps media albums and control results honest without leaking a fallback into a later or concurrent send.
+
+The regression uses the fake Telegram transport and an explicitly selected temporary ledger database. It covers normal, cancellation, and recovered-obligation settlement, successful in-topic sends, native media, albums, and controls. No live Telegram call or live state database is needed. Retire when upstream carries equivalent result propagation and settlement. Roll back this logical change without a schema or data migration.
+
 ## Copy Block Delivery
 
 Canonical FIFO replies (`gateway/session_ingress.py::deliver_response`) send extracted

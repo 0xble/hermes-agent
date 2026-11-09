@@ -14,6 +14,24 @@ logger = logging.getLogger("gateway.run")
 _T = TypeVar("_T")
 
 
+async def send_obligation_payloads(adapter, chat_id: str, payloads: list, obligation_id: str):
+    """Preserve any root fallback across copy parts, but return a later refusal verbatim."""
+    result = None
+    fallback_result = None
+    for payload, metadata in payloads:
+        try:
+            result = await adapter.send(chat_id=chat_id, content=payload, metadata=metadata)
+        except Exception as send_err:
+            logger.warning("obligation %s: redelivery send raised: %s", obligation_id, send_err, exc_info=True)
+            return None
+        if result is None or not getattr(result, "success", False):
+            return result
+        raw = getattr(result, "raw_response", None)
+        if isinstance(raw, dict) and raw.get("thread_fallback"):
+            fallback_result = result
+    return fallback_result or result
+
+
 class RuntimeDeliverySettlement:
     """Defer teardown cancellation until the same claim/send/refund operation settles.
 

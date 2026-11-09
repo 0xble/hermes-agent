@@ -693,18 +693,11 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                     error=row.get("last_error") or "send_path_degraded",
                 )
                 continue
-            result = None
-            for payload, payload_metadata in payloads:
-                try:
-                    result = await adapter.send(chat_id=row["chat_id"], content=payload, metadata=payload_metadata)
-                except Exception as send_err:
-                    logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
-                    result = None
-                if result is None or not getattr(result, "success", False):
-                    break
+            from gateway.delivery_recovery import send_obligation_payloads
+            result = await send_obligation_payloads(adapter, row["chat_id"], payloads, row["obligation_id"])
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    await asyncio.to_thread(mark_delivered, row["obligation_id"], result)
                     if note_event is not None:
                         reconcile = getattr(adapter, "_reconcile_restart_note_after_delivery", None)
                         if callable(reconcile):
