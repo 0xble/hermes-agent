@@ -231,6 +231,9 @@ async def test_compression_wait_honors_control_before_any_model_call(monkeypatch
             runner._draining = True
             await async_wait_until(lambda: all(r['status'] == 'queued' for r in _rows(owner, ref)), timeout=10)
             await asyncio.wait_for(owner.sessions[sid].task, 10)
+            # A real restart tears down the old adapter tasks before reconnecting.
+            # Drain their pause replies before reusing this fixture adapter.
+            await asyncio.wait_for(asyncio.gather(*list(adapter._session_tasks.values())), 10)
             assert executions == []
             # B's admission waiter may report the existing runtime-draining pause;
             # A itself is silently requeued, with no compression retry response.
