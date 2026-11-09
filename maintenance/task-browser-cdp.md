@@ -1,5 +1,8 @@
 # Task-scoped external browser attachment
 
+Patch identity: `task-browser-cdp`.
+Contract tests: `tests/tools/test_browser_task_cdp.py`.
+
 Trusted **in-process** plugins can temporarily route a task's ordinary
 `browser_*` calls to an externally owned CDP browser without selecting a global
 browser provider or changing `BROWSER_CDP_URL`, `CAMOFOX_URL`, or profile config.
