@@ -26,6 +26,14 @@ def clean_git_env():
 
 
 class PortableGateTests(unittest.TestCase):
+    def test_every_nightly_selector_discovers_executable_coverage(self):
+        from scripts.run_tests_parallel import _discover_files
+
+        for relative in ci.NIGHTLY_ONLY_TESTS:
+            with self.subTest(selector=relative):
+                self.assertTrue(_discover_files([ci.ROOT / relative]),
+                                f'nightly selector has no executable tests: {relative}')
+
     def test_fork_history_email_scan_stays_on_first_parent(self):
         with patch.object(ci, 'git', return_value='fork@example.invalid\n') as git:
             self.assertEqual(ci.fork_commit_emails('base', 'release'), ['fork@example.invalid'])
