@@ -974,3 +974,23 @@ adaptation when upstream provides equivalent disposable, noninteractive native
 storage isolation. No production keychain policy, test bound or retry changes.
 
 Contract tests: `tests/agent/test_vault_keychain_native.py`.
+
+## Routing Harness Session Cleanup
+
+The `fork-ci-reliability` identity also covers the tenancy routing harness.
+`TuiGateway.close` stops its own session before closing stdin or waiting for its
+leader. Previously EOF and the wait could reap that leader before the group
+signal. A surviving helper was then reparented to PID 1, outside the test's live
+ancestry, without an earlier signal snapshot. The live-system guard correctly
+refused that unproven group. This is fixture lifecycle ordering, not production
+signalling of a foreign group or a PM worker group-kill.
+
+The regression uses a real session leader and a helper held on a pipe owned by
+the test. It reproduces the blocked group signal deterministically on the old
+cleanup order and verifies both processes stop on the repaired order. EOF also
+retires the helper on a red run, so failure cannot leak an orphan. Keep the
+live-system guard unchanged, including rejection of genuinely unowned groups.
+Retire this adaptation when upstream stops the owned routing session before
+losing its leader and provides equivalent native process coverage.
+
+Contract tests: `tests/e2e/core/tenancy/test_routing_harness_cleanup.py`, `tests/e2e/core/tenancy/test_routing_truth_table.py`.
