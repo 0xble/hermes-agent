@@ -47,7 +47,7 @@ def test_rollback_that_does_not_come_up_restores_the_running_release(tmp_path, m
     home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     running_body = plist.read_bytes()
 
-    def rollback(home_, *, plist_path, plist_body, reload_callback):
+    def rollback(home_, *, plist_path, plist_body, reload_callback, deadline):
         plist_path.write_bytes(plist_body)
         (home / "current").unlink()
         (home / "current").symlink_to(a)
@@ -76,6 +76,7 @@ def test_rollback_that_does_not_come_up_restores_the_running_release(tmp_path, m
 
     [(candidate, kwargs)] = activations
     assert candidate == b and kwargs["operation"] == "restore"
+    assert kwargs["deadline"] >= deadline
     assert kwargs["plist_body"] == running_body  # the definition it last started with
     assert plist.read_bytes() == running_body and (home / "current").resolve() == b
     assert calls.count("bootstrap") == 2
@@ -129,7 +130,7 @@ def test_failure_before_the_gateway_stops_still_fails_closed(tmp_path, monkeypat
 
 
 def _failing_rollback(home, a, *, raise_after_bootout=False):
-    def rollback(home_, *, plist_path, plist_body, reload_callback):
+    def rollback(home_, *, plist_path, plist_body, reload_callback, deadline):
         plist_path.write_bytes(plist_body)
         (home / "current").unlink()
         (home / "current").symlink_to(a)

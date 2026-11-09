@@ -316,7 +316,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         _launchctl_bootstrap(domain, plist, label, timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         return True
     try:
-        result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
+        result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target, deadline=deadline)
         if result.get("reload_pending"):
             # The S2 acknowledgement may arrive after this one-shot invocation; live
             # process identity below is the independent health proof for this action.
@@ -401,7 +401,7 @@ def _restore_running(home: Path, plist: Path, label: str, running: Path, running
             # reload the release that just failed to start.
             pending.rename(home / f"release-abandoned-{uuid.uuid4().hex}.json")
         result = activate_release(home, running, plist_path=plist, plist_body=running_body,
-                                  reload_callback=reload_target, operation="restore", force_reload=True)
+                                  reload_callback=reload_target, operation="restore", force_reload=True, deadline=budget[0])
         if result.get("reload_pending"):
             wait_for_release_acknowledgement(home, timeout_seconds=_bounded_timeout(5, budget[0]))
         ok = _await_healthy(home, label, running, budget[0])
