@@ -58,7 +58,7 @@ def test_n1_follows_the_newest_promoted_strict_ancestor_not_upstream_tags(releas
 
 
 def test_unfetchable_newer_promotion_does_not_hide_an_available_ancestor(release_repo, monkeypatch):
-    G, source, remote, commits = release_repo
+    G, _source, remote, commits = release_repo
     _git(remote, "update-ref", "refs/heads/deploy/nightly-20261102", commits[3])
     real_run = subprocess.run
     missing = "e" * 40
@@ -83,3 +83,35 @@ def test_unavailable_promotions_use_the_floor_or_fail_loudly(release_repo, monke
     monkeypatch.setattr(G, "FORK_RELEASE_FLOOR", "f" * 40)
     with pytest.raises(RuntimeError, match="fork.*N-1|N-1.*fork"):
         G.n1_tag()
+
+
+def test_passive_checks_have_three_distinct_releases_after_a_recent_promotion(release_repo, monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from tests.e2e.core.upgrade.git import test_shallow_install as shallow
+
+    G, source, remote, commits = release_repo
+    _git(remote, "update-ref", "refs/heads/deploy/nightly-20261102", commits[-2])
+    checks = []
+
+    def cli(*_args, **_kwargs):
+        checks.append(_git(remote, "rev-parse", "main"))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    sb = SimpleNamespace(checkout=source, home=source, cli=cli)
+    world = G.World(root=source.parent, srv=None, bare=remote, sb=sb)
+    monkeypatch.setattr(world, "seed_clone_shape", lambda _args: None)
+    monkeypatch.setattr(world, "git_env", lambda: None)
+    monkeypatch.setattr(G.I, "head_sha", lambda: commits[-1])
+    monkeypatch.setattr(G, "start_world", lambda *_args, **_kwargs: (nullcontext(), world))
+
+    def update():
+        _git(source, "fetch", "-q", "origin", "main")
+        _git(source, "reset", "-q", "--hard", "origin/main")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(world, "update", update)
+    run = shallow._checked(source.parent, None)
+    assert len(checks) == len(set(checks)) == 3
+    assert run["head1"] == run["target"] == checks[-1]
+    assert _git(source, "merge-base", "--is-ancestor", commits[-1], run["target"]) == ""

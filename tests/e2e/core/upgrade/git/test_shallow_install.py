@@ -60,15 +60,12 @@ def _checked(root, cache: InstallCache) -> dict:
     try:
         w.seed_clone_shape(["--depth=1", "--single-branch"])
         run = {"cm": cm, "w": w, "shape0": w.install_shape, "checks": []}
-        between = I.git("rev-list", "--first-parent", f"{G.n1_base()}..{I.head_sha()}", cwd=I.H.WORKTREE).split()
-        checkpoints = (len(between) * 3 // 4, len(between) // 2, len(between) // 4)
-        assert len(set(checkpoints)) == 3, f"need 3 distinct passive-check releases, got {len(between)} commits"
-        for k in checkpoints:
-            w.set_main(between[k])
+        w.set_main(I.head_sha())
+        for i in range(3):
+            run["target"] = w.publish(f"release: e2e passive check {i}", {f"e2e-check-{i}.txt": "release\n"})
             run["checks"].append(w.sb.cli("update", "--check", timeout=600))
         shallow = w.checkout / ".git" / "shallow"
         run["grafts"] = len(shallow.read_text(encoding="utf-8-sig").split()) if shallow.is_file() else 0
-        w.set_main(I.head_sha())
         run["cp1"], run["head1"] = w.update(), w.head()
         return run
     except BaseException:
@@ -149,7 +146,7 @@ def test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(runs)
     cp1 = run["cp1"]
     for cp in run["checks"]:
         assert cp.returncode == 0 and G.TRACEBACK not in G.output(cp), f"`hermes update --check` failed:\n{w.diag(cp)}"
-    assert cp1.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp1)}"
+    assert cp1.returncode == 0 and run["head1"] == run["target"], f"N-1 -> HEAD update failed:\n{w.diag(cp1)}"
     with known_failure(r"claims orphan divergence",
                        "#124645: each depth-1 `--check` appends a graft the fetch reflog pins, and N-1's "
                        "update resets as orphan divergence. HEAD's prune expires those reflogs and HEAD "

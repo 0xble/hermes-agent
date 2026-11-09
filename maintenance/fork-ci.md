@@ -89,7 +89,9 @@ the sandbox checkout's `.git`; never its source or installed dependencies. Recor
 shape and transfer baseline. Use this shared `World.seed_clone_shape` for partial cells too,
 asserting exact tree:0/blob:none/full input shapes so bootstrap cannot silently erase updater
 coverage. Keep the original shape, transfer, ancestry and two-update
-assertions. Current shallow-healer real-Git regressions remain independent of release selection;
+assertions. Passive checks advance through 3 synthetic releases on the real origin after HEAD,
+so a recent promotion cannot collapse their 3 distinct shallow grafts. Current shallow-healer
+real-Git regressions remain independent of release selection;
 never truncate history, patch the historical updater or raise either timeout to make this pass.
 
 Local prerequisite: run historical upstream-tag suites from a tag-pinned object store rather than

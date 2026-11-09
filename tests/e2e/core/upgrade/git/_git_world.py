@@ -4,9 +4,9 @@
 git wrapper that reports the official remote URL) whose ``~/.gitconfig`` rewrites the official
 GitHub URL to a loopback ``git http-backend`` origin (``_smart_http``). The install itself comes
 from a real ``scripts/install.sh``: the previous fork promotion's own copy for N-1, HEAD's for
-HEAD. ``seed_clone_shape`` restores
-retained user Git state after bootstrap, so its shallow/treeless healing cannot mask the
-updater's behavior using real clones over the same complete smart-HTTP origin.
+HEAD. ``seed_clone_shape`` uses real clones over the same complete smart-HTTP origin to restore
+retained user Git state after bootstrap, so install-time shallow/treeless healing cannot mask
+the updater's behavior.
 
 Everything a cell asserts is user-visible: the exit code and transcript of ``hermes update``, the
 checkout's HEAD / branch / working tree / refs, the update receipt, and whether ``hermes

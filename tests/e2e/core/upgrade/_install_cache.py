@@ -1,6 +1,7 @@
 """Download caches for the expensive historical-install scenarios.
 
-Only content-addressed downloads are shared. Each scenario still creates its own checkout,
+Only verified archives, package caches and versioned managed interpreters are shared.
+Each scenario still creates its own checkout,
 install identity, environment, selection records and user data through the real installer.
 """
 from __future__ import annotations
