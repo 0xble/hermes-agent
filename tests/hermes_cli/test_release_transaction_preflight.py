@@ -29,7 +29,8 @@ def source_checkout(root):
     import subprocess
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "add", "pyproject.toml"], check=True)
-    subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+    subprocess.run(["git", "-C", str(root), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"], check=True)
 
 
 @pytest.mark.parametrize("fault", ["verify", "reload"])
