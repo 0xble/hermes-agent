@@ -22,12 +22,19 @@ class CheckinConfig:
     enabled: bool = True
     first_after_seconds: float = 1200
     interval_seconds: float = 1800
+    only_roots: tuple[str, ...] | None = ()
+
+    def permits(self, root: str) -> bool:
+        """An invalid scope fails closed, while an omitted/empty list preserves all roots."""
+        return self.enabled and self.only_roots is not None and (not self.only_roots or root in self.only_roots)
 
     @classmethod
     def load(cls):
-        from hermes_cli.config import load_config
-        raw = load_config().get("checkins", {})
-        raw = raw if isinstance(raw, dict) else {}
+        from hermes_cli.config import FailedConfigRead, load_config
+        config = load_config()
+        raw = config.get("checkins", {})
+        if isinstance(config, FailedConfigRead) or not isinstance(raw, dict):
+            return cls(enabled=False)
 
         def duration(key, default):
             try:
@@ -36,8 +43,12 @@ class CheckinConfig:
             except (TypeError, ValueError):
                 return default
 
+        roots = raw.get("only_roots", [])
+        valid = isinstance(roots, list) and all(isinstance(root, str) and root and root == root.strip()
+                                               for root in roots)
         return cls(raw.get("enabled", True) is not False,
-                   duration("first_after_seconds", 1200), duration("interval_seconds", 1800))
+                   duration("first_after_seconds", 1200), duration("interval_seconds", 1800),
+                   tuple(roots) if valid else None)
 
 
 @dataclass
@@ -77,12 +88,12 @@ class CheckinManager:
     def reconcile(self, work, *, now=None, last_visible_at=None):
         now = time.time() if now is None else now
         current = self.state
-        if current is not None and self.config.enabled and work:
+        if current is not None and self.config.permits(self.root) and work:
             return current
-        if current is None and (not self.config.enabled or not work):
+        if current is None and (not self.config.permits(self.root) or not work):
             return None
         def mutate(state):
-            if not self.config.enabled or not work:
+            if not self.config.permits(self.root) or not work:
                 return None, None
             if state is None:
                 anchor = now if last_visible_at is None else last_visible_at
@@ -111,7 +122,7 @@ class CheckinManager:
         """
         now = time.time() if now is None else now
         def mutate(state):
-            if not self.config.enabled or not work:
+            if not self.config.permits(self.root) or not work:
                 return None, False
             if (state is None or state.due_at != due_at
                     or now < max(state.due_at, state.next_attempt_at)):

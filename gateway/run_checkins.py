@@ -27,7 +27,7 @@ def _manager(runner, entry):
 
 
 def _observe(manager, session_id):
-    if not manager.config.enabled:
+    if not manager.config.permits(manager.root):
         return []
     try:
         return outstanding_work(manager.db, session_id)
@@ -79,14 +79,15 @@ async def poll_checkins(runner):
 
     if getattr(runner, "_startup_restore_in_progress", False):
         return  # Registries and queued human input have not finished recovering yet.
-    # New session identities are inspected once, including restored sessions after a restart.
-    # Only armed/error candidates are observed on subsequent ticks, not the whole transcript DB.
+    # Reconsider idle sessions when their source-profile configuration changes. load() already
+    # owns file-signature invalidation, so do not add a second config cache or stat policy.
+    # Only armed/error candidates are observed on unchanged ticks, not the whole transcript DB.
     seen = getattr(runner, "_checkin_seen", None)
-    if seen is None:
-        seen = runner._checkin_seen = set()
+    if not isinstance(seen, dict):
+        seen = runner._checkin_seen = {}
     for entry in await runner._run_in_executor_with_context(runner.session_store.list_sessions):
         identity = (entry.session_key, entry.session_id)
-        if identity in seen or entry.suspended or not entry.origin:
+        if entry.suspended or not entry.origin:
             continue
         source = runner._restored_source(entry)
         if source is None:
@@ -95,7 +96,10 @@ async def poll_checkins(runner):
         if scope is None:
             continue
         async with scope:
-            seen.add(identity)
+            config = await runner._run_in_executor_with_context(CheckinConfig.load)
+            if seen.get(identity) == config:
+                continue
+            seen[identity] = config
             await reconcile_turn(runner, source, entry.session_key)
 
     for route, (source, expected) in list(getattr(runner, "_checkin_watch", {}).items()):
@@ -197,16 +201,20 @@ async def prepare_checkin(runner, event, entry, *, start=False):
     if observation is None:
         return False
     event.text, event._checkin_fallback = observation
+    event._checkin_pending_root = tick[0]
     return True
 
 
 async def silence_fallback(runner, event, entry, result: dict) -> dict:
     """Honor successful deliberate quiet, but deliver factual status for failed/unknown inspections."""
-    if descriptor(event) is None or not isinstance(result, dict):
+    tick = descriptor(event)
+    if tick is None or not isinstance(result, dict):
         return result
-    if result.get("interrupted"):
-        return result
+    from gateway.checkin_delivery import retain_policy
+    manager = await runner._run_in_executor_with_context(lambda: _manager(runner, entry))
     if result.get("queued_terminal_display_kind", DISPLAY_KIND) != DISPLAY_KIND:
+        await runner._run_in_executor_with_context(lambda: retain_policy(manager, event, None))
+        result["checkin_pending_root"] = None
         return result
     response = str(result.get("final_response") or "").strip()
     from agent.turn_failure_copy import exit_reason_failure, is_max_iteration_handoff
@@ -219,22 +227,32 @@ async def silence_fallback(runner, event, entry, result: dict) -> dict:
                       and (result.get("failure_reason") or exit_failure)))))
     def observe():
         manager = _manager(runner, entry)
-        work = _observe(manager, entry.session_id)
+        # Disarm is a delivery policy, not evidence that the last dependency completed.
+        work = outstanding_work(manager.db, entry.session_id)
         manager.reconcile(work)
         return (fallback_status(work, manager.config) if work else "",
-                not any(item["kind"] == "unknown" for item in work))
+                not any(item["kind"] == "unknown" for item in work), bool(work))
 
     try:
-        status, inspected = await runner._run_in_executor_with_context(observe)
+        status, inspected, pending = await runner._run_in_executor_with_context(observe)
     except Exception:
         logger.warning("Supervisor fallback could not refresh its roster", exc_info=True)
-        inspected = False
+        inspected, pending = False, True
         status = getattr(event, "_checkin_fallback", "Background work could not be inspected. Supervision will retry.")
-    if not failed and response and not runner._is_intentional_silence(result, response):
+    pending = (pending or not inspected or failed or result.get("completed") is not True
+               or result.get("interrupted") or manager.root != tick[0])
+    root = tick[0] if pending else None
+    await runner._run_in_executor_with_context(lambda: retain_policy(manager, event, root))
+    result["checkin_pending_root"] = root
+    disarmed = pending and not manager.config.permits(tick[0])
+    if not disarmed and (result.get("interrupted") or (not failed and
+            response and not runner._is_intentional_silence(result, response))):
         return result
     from gateway.response_filters import is_intentional_silence_response
     if (inspected and not failed and result.get("completed") is True
             and not result.get("failure_reason") and is_intentional_silence_response(response)):
+        status = ""
+    if disarmed:
         status = ""
     recovered = {**result, "final_response": status, "delivery_text": status,
                  "_model_final_response": status, "intentional_silence": not bool(status),
@@ -269,6 +287,11 @@ def install_visible_observer(runner, adapter):
         def wrap(method, signature, name):
             @functools.wraps(method)
             async def observed(*args, **kwargs):
+                from gateway.checkin_delivery import DISARMED, permits_metadata
+                bound = signature.bind_partial(*args, **kwargs).arguments
+                if not await permits_metadata(runner, bound.get("metadata")):
+                    from gateway.platforms.base import SendResult
+                    return SendResult(success=False, pre_send=True, error=DISARMED)
                 result = await method(*args, **kwargs)
                 try:
                     if (getattr(result, "success", False) is True and not getattr(result, "deferred", False)

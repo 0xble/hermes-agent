@@ -1488,9 +1488,9 @@ DEFAULT_CONFIG = {
         # Fork patch: committed agent goal_set receipts surface as notices; /goal replies don't.
         "auto_notices": True,
     },
-    # Supervisor check-ins, automatic reassurance while gateway-owned work remains.
     "checkins": {
         "enabled": True,
+        "only_roots": [],  # Exact compression-root session ids. Empty preserves profile-wide supervision.
         "first_after_seconds": 1200,  # Both durations have a 300-second floor.
         "interval_seconds": 1800,
     },

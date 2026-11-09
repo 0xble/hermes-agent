@@ -491,6 +491,9 @@ class GatewayVoiceMixin:
 
     async def _deliver_voice_reply(self, event: MessageEvent, audio_paths: list[str]) -> None:
         """Play the files in the connected voice channel, else send them as voice messages."""
+        from gateway.checkin_delivery import permits_metadata
+        if not await permits_metadata(self, self._event_thread_metadata(event, event.source)):
+            return
         adapter = self._delivery_adapter_for(event.source)
         guild_id = self._get_guild_id(event)
         play = getattr(adapter, "play_in_voice_channel", None)
@@ -504,7 +507,7 @@ class GatewayVoiceMixin:
         reply_anchor = self._reply_anchor_for_event(event)
         # notify=True mirrors the final-text path in platforms/base.py so notification-gating
         # adapters (Telegram "important" mode) deliver it. Clone: shared w/ typing-indicator state.
-        thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
+        thread_meta = dict(self._event_thread_metadata(event, event.source) or {})
         thread_meta["notify"] = True
         for path in audio_paths:
             await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,

@@ -160,7 +160,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 def _thread_metadata_for_event(event) -> dict | None:
     """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+    from gateway.checkin_delivery import delivery_metadata
+    return delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -4895,6 +4896,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         try:
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
+            from gateway.checkin_delivery import DISARMED
+            if getattr(result, "error", None) == DISARMED:
+                from gateway.delivery_ledger import abandon_obligation
+                await asyncio.to_thread(abandon_obligation, obligation_id, DISARMED)
+                return
             if getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, obligation_id, result)
                 return

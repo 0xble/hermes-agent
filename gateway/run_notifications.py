@@ -492,7 +492,7 @@ class GatewayNotificationsMixin(
             _thread_meta = (
                 dict(thread_metadata)
                 if thread_metadata is not None
-                else self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+                else self._event_thread_metadata(event, event.source)
             )
             chat_id = event.source.chat_id
             # Images go out as one batch (e.g. Signal's multi-attachment RPC) unless [[as_document]].
