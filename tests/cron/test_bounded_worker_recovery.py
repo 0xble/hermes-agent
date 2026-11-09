@@ -230,7 +230,7 @@ class AbandonedAgent:
         pass
 
 run_agent.AIAgent = AbandonedAgent
-scheduler._prepare_job_prompt = lambda *args: (None, 'test prompt')
+scheduler._prepare_job_prompt = lambda *args: (None, 'test prompt', None)
 scheduler._load_cron_job_config = lambda *args: SimpleNamespace(cfg={}, model='test')
 scheduler._resolve_cron_agent_setup = lambda *args: scheduler._CronAgentSetup(model='test')
 scheduler._open_cron_session_db = lambda *args: SimpleNamespace()

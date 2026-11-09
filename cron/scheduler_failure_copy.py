@@ -121,7 +121,7 @@ def generic_failure_notice(job_name: str, job_id: str, cleaned_error: str) -> st
 
 def script_timeout_notice(job_name: str, job_id: str) -> str:
     return (
-        f"⚠️ Cron '{job_name}' failed: its script timed out. No model was invoked. "
+        f"⚠️ Cron '{job_name}' failed: its script timed out. "
         f"Check the script's output under {cron_output_dir_display(job_id)} or `hermes cron runs {job_id}`, "
         f"then run it again with `hermes cron run {job_id}`."
     )

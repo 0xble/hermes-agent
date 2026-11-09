@@ -443,6 +443,86 @@ def _block_and_pause_job(
     return False, doc, alert, reason
 
 
+def _prepare_job_prompt(
+    job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
+) -> tuple[Optional[_sched._RunResult], Optional[str], Optional[str]]:
+    """Run every pre-agent gate of an agent job and build the prompt. Returns
+    ``(early_result, prompt, script_error)``: an early result short-circuits ``run_job``
+    (monitor gate, wake gate, injection block, empty prompt); otherwise ``prompt`` is set.
+    Script errors survive a normal agent reply."""
+    # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
+    # user never chose. no_agent jobs never reach here. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
+    from hermes_cli.config import InvalidUserConfigError, require_parseable_user_config
+
+    try:
+        require_parseable_user_config()
+    except InvalidUserConfigError as exc:
+        logger.error("Job '%s': refusing to run — %s", job_id, exc)
+        return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None, None
+
+    _early, extra_prompt, monitor_context = _sched._apply_monitor_gate(job, job_id, job_name, extra_prompt)
+    if _early is not None:
+        return _early, None, None
+
+    # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
+    # _build_job_prompt so the script runs only once.
+    # run_job acquires its session store before entering this gate so acknowledgements
+    # cannot be consumed by a run that cannot persist its session.
+    prerun_script = None
+    script_error = None
+    script_path = job.get("script")
+    if script_path:
+        prerun_script = _sched._run_job_script_with_claim_heartbeat(
+            job,
+            script_path,
+            workdir=_sched._resolve_job_workdir(job, job_id),
+            cancel_event=cancel_event,
+        )
+        _ran_ok, _script_output = prerun_script
+        if not _ran_ok:
+            script_error = _script_output or "Pre-run script failed without error output."
+        if _ran_ok and not _sched._parse_wake_gate(_script_output):
+            logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
+            _sched.note_cron_skipped(job)
+            silent_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_sched._hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "Script gate returned `wakeAgent=false` — agent skipped.\n"
+            )
+            return (True, silent_doc, _sched.SILENT_MARKER, None), None, None
+
+    try:
+        prompt = _sched._build_job_prompt(
+            job, prerun_script=prerun_script, extra_prompt=extra_prompt,
+            runtime_data_prompt=monitor_context,
+        )
+    except _sched.CronPromptInjectionBlocked as block_exc:
+        # Injection scanner tripped: refuse this tick and tell the operator WHY.
+        logger.warning(
+            "Job '%s' (ID: %s): blocked by prompt-injection scanner — %s", job_name, job_id, block_exc,
+        )
+        blocked_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_sched._hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** BLOCKED\n\n"
+            "The assembled prompt (user prompt + loaded skill content) tripped "
+            "the cron injection scanner and the agent was NOT run.\n\n"
+            f"**Scanner result:** {block_exc}\n\n"
+            "Audit the skill(s) attached to this job for prompt-injection "
+            "payloads or invisible-unicode markers. If the skill is legitimate "
+            "and the match is a false positive, rephrase the content to avoid "
+            "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
+        )
+        return (False, blocked_doc, "", str(block_exc)), None, script_error
+    if prompt is None:
+        logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
+        _sched.note_cron_skipped(job)
+        return (True, "", _sched.SILENT_MARKER, None), None, script_error
+    return None, prompt, script_error
+
+
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
 from cron import scheduler as _sched

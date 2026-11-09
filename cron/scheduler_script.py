@@ -475,6 +475,17 @@ def _script_error_pointer(full: str, cron_job_id: Optional[str]) -> str:
         return f"Full output ({len(full)} characters) was not saved."
 
 
+def _merge_script_failure(
+    result: tuple[bool, str, str, Optional[str]], script_error: Optional[str],
+) -> tuple[bool, str, str, Optional[str]]:
+    """An agent's reply or later failure cannot erase the pre-run script's failure."""
+    if script_error is None:
+        return result
+    _, output, response, error = result
+    combined = "\n".join(text for text in (script_error, error) if text)
+    return False, output, response, combined
+
+
 def _script_error_output(
     returncode: int, stdout: str, stderr: str, cron_job_id: Optional[str],
 ) -> str:
@@ -570,7 +581,8 @@ def _run_job_script(
                 _terminate_cron_script_tree(proc)
                 _sweep_detached_script_orphans()
                 _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
+                return False, ("Script cancelled because cron fire ownership was lost "
+                               f"(exit code {proc.returncode})")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_tree(proc)
@@ -582,7 +594,8 @@ def _run_job_script(
                 # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
                 # signalling, so own-session grandchildren are reached too — the unified deadline layer's
                 # tree-kill (#85147, d6a5cb9725).
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                return False, (f"Script timed out after {script_timeout}s: {path} "
+                               f"(exit code {proc.returncode})")
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
