@@ -733,6 +733,10 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     _bt._maybe_stop_recording(task_id)  # saves the file before close
 
     protected = has_vault_date_components(task_id)
+    if session_info.get("external_task_browser"):
+        if not protected:
+            _release_session_resources(task_id, session_info)
+        return  # Borrowed browser: never send close, even on task/shutdown cleanup.
     # Skipped/failed close does not prove the filled page is gone.
     if protected and ((session_info.get("features") or {}).get("lightpanda") or _session_has_expired(session_info)):
         _bt.logger.warning("Keeping protected browser session %s: close cannot be confirmed", task_id)
