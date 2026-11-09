@@ -866,3 +866,23 @@ The same sync exposed an upstream desktop build bug: `xcrun` honors an inherited
 `macos-sysroot-native.test.mjs` failed on its stale-SDKROOT rung. The helper
 builds now pass `xcrunEnv()`, which drops `SDKROOT` after the resolver has chosen
 the SDK. Offer this upstream; drop the patch once upstream carries an equivalent.
+
+## Tenancy teardown environment race
+
+The `fork-ci-reliability` identity covers permission races in the routing case
+teardown helper. Hosted run
+https://github.com/0xble/hermes-agent/actions/runs/42655586734, shard 8/10, failed in
+`fallback_named_after_401` when the environment recheck before termination raised
+`psutil.AccessDenied`. Both termination and kill now share the ownership check.
+After a permission failure, a fresh status read treats a vanished process or
+zombie as stopped. A still-live or unreadable process stays in the bounded wait
+without receiving a signal whose ownership cannot be proved. The discovery scan
+still skips inaccessible environments. The containment assertion and final
+case-owned survivor verification remain mandatory.
+
+Contract tests: `tests/e2e/core/tenancy/test_routing_process_races.py`, `tests/e2e/core/tenancy/test_routing_process_cleanup.py`.
+
+This extends the fork-local `routing-test-process-cleanup` harness, with no product
+runtime change. Retire when the accepted upstream case teardown handles the same
+race without weakening ownership or survivor checks. Rollback reverts this helper
+and its regression, with no runtime or stored-state migration.
