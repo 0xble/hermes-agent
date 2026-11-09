@@ -384,6 +384,16 @@ from this run. Fresh-receipt identity suppression remains independently GREEN.
 Head again leaves **zero** live children; base leaves **27**, all exact recorded
 fixture children cleaned afterward. Final-output-to-exit medians are 0.127/0.404 s.
 
+A named-profile ensure must also observe the root multiplexer reservation before
+reporting its own startup child's exit as a terminal failure. Desktop cron fires
+profiles concurrently, and a losing launch can exit before the winning root
+publishes that profile's control-channel roster. While the root remains reserved,
+the client waits within its existing deadline, then returns ready or pending,
+without spawning another child. An exited child with neither a profile owner nor
+a root reservation still fails promptly. The behavior contract in
+`tests/hermes_cli/test_gateway_runtime_ensure.py` uses a real root reservation and
+an exited child to cover both ready and pending outcomes.
+
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.
 Rollback by reverting commits carrying the patch identity; no persistent config

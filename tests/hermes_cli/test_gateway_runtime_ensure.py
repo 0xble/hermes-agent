@@ -26,6 +26,7 @@ def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypat
     def spawn(command, **kwargs):
         captured.update(kwargs)
         return child
+    monkeypatch.setattr(start, 'start_gateway_job', lambda *a, **k: None)
     monkeypatch.setattr(start.subprocess, 'Popen', spawn)
     assert start.spawn_unmanaged_gateway(tmp_path, deadline=time.monotonic() + 5) is child
     assert all(key not in captured['env'] for key in flags)
@@ -492,6 +493,48 @@ def test_a_reserved_root_without_a_live_refusal_is_still_awaited(tmp_path, monke
 
     assert (result.state, result.reason_code) == ("starting", "deadline")
     assert spawned == []
+
+
+@pytest.mark.platforms("linux", "macos")
+@pytest.mark.parametrize("ready", [True, False], ids=["ready", "pending"])
+def test_losing_named_profile_start_awaits_reserved_multiplexer(tmp_path, monkeypatch, ready):
+    """A losing child is not a failed launch while another process owns the root reservation."""
+    from gateway.runtime_ownership import ProfileOwnership
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_service as service, gateway_runtime_start as start
+
+    root = tmp_path / ".hermes"
+    home = root / "profiles" / "beta"
+    home.mkdir(parents=True, mode=0o700)
+    (root / "config.yaml").write_text("gateway: {multiplex_profiles: true}\n", encoding="utf-8")
+    owner = ProfileOwnership()
+    children, pending_reads = [], []
+
+    def discover(*args, **kwargs):
+        if children:
+            pending_reads.append(True)
+            if ready and len(pending_reads) >= 2:
+                return runtime.GatewayDiscovery("ready")
+        return runtime.GatewayDiscovery("absent")
+
+    def lose_start(target, **kwargs):
+        assert target == root
+        # The winner claims only the root before its profile roster is published.
+        owner.reserve([root])
+        child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(1)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child.wait(timeout=10)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", discover)
+    monkeypatch.setattr(service, "discover_existing_gateway_service", lambda *a, **k: None)
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lose_start)
+    try:
+        result = runtime.ensure_gateway_runtime(home, timeout=2)
+    finally:
+        owner.close()
+    assert len(children) == 1
+    assert (result.state, result.reason_code) == (("ready", None) if ready else ("starting", "deadline"))
 
 
 @pytest.mark.platforms("linux", "macos")

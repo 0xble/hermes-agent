@@ -470,9 +470,12 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                 continue
             if observed.state not in {"absent", "starting"}:
                 return observed
-            if status is not None and observed.state == "absent":
+            reserved = _starting_multiplexer_root(home) if observed.state == "absent" else None
+            if status is not None and observed.state == "absent" and reserved is None:
                 # The one start this invocation requested died without leaving an owner: waiting
                 # out the deadline cannot change that, and this call never launches a second one.
+                # A root reservation is also an owner: a losing named-profile launch may exit
+                # before the winner publishes that profile in its control-channel roster.
                 # Its own (redacted) output is the answer the user needs, not a pointer to a file.
                 from hermes_cli.gateway_runtime_start import startup_failure_report
                 return GatewayDiscovery("inaccessible", reason_code="runtime_exited",
@@ -482,7 +485,6 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             if observed.state == "absent":
                 retiring = False
                 finite_owner = None
-            reserved = _starting_multiplexer_root(home) if observed.state == "absent" and not requested else None
             if reserved is not None and (reason := _standalone_multiplexer_reason(reserved)):
                 return GatewayDiscovery("inaccessible", reason_code="profile_parked", detail=reason)
             # A default multiplexer that is still starting will serve this named profile; never
