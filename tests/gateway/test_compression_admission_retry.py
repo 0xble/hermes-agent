@@ -234,6 +234,9 @@ async def test_compression_wait_honors_control_before_any_model_call(monkeypatch
             # A real restart tears down the old adapter tasks before reconnecting.
             # Drain their pause replies before reusing this fixture adapter.
             await asyncio.wait_for(asyncio.gather(*list(adapter._session_tasks.values())), 10)
+            # Busy-admission delivery observers are tracked separately from the
+            # active transport task, and must unwind before adapter reuse too.
+            await asyncio.wait_for(asyncio.gather(*list(adapter._background_tasks)), 10)
             assert executions == []
             # B's admission waiter may report the existing runtime-draining pause;
             # A itself is silently requeued, with no compression retry response.
