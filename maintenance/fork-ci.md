@@ -907,3 +907,41 @@ This extends the fork-local `routing-test-process-cleanup` harness, with no prod
 runtime change. Retire when the accepted upstream case teardown handles the same
 race without weakening ownership or survivor checks. Rollback reverts this helper
 and its regression, with no runtime or stored-state migration.
+
+## Pinned tool archive caches
+
+`.github/actions/cache-pinned-tool` restores exact SHA-pinned `actions/cache`
+entries, runs the installer's unconditional SHA-256 verifier, and saves verified
+archives immediately. A later failing check does not discard a successful
+download. No restore prefixes permit a different pin to satisfy the key.
+Keys include source, runner OS and architecture, archive architecture, tool,
+pinned version, and the full expected SHA-256. Cold or evicted caches still
+require the origin. Warm caches remove release-origin requests for these inputs.
+
+`.github/actions/cache-linux-tools` applies that mechanism to all 7 components
+in `ci/linux-artifacts.json` for both Linux jobs in `gate.yml` and `nightly.yml`.
+The installer verifies restored bytes again before extraction or execution.
+Retries, extraction validation, checks and qualification semantics are unchanged.
+The image-build caller in `ci/Dockerfile` retains its existing layer cache.
+
+The independent `setup-uv` callers in native nightly, Desktop core E2E, and live
+providers use the same archive transport. After verification,
+`scripts/ci/pinned_tools.py` seeds the exact `@actions/tool-cache` layout.
+The unchanged `setup-uv` action finds that tool locally and keeps its normal
+outputs, PATH, and dependency-cache behavior. `ci/uv-artifacts.json` pins the
+[uv 0.12.13 release asset digests](https://api.github.com/repos/astral-sh/uv/releases/tags/0.12.13).
+The pinned setup-uv revision's built-in table has no 0.12.13 checksums, so this
+adds explicit verification. PM tools retain their existing SHA-verified archive
+store and tree-digest checks through `setup-pm`. Runtime installers (`rustup`,
+`uv python`, setup-node/setup-python) and npm/Cargo registry downloads retain
+their own verification and cache policies.
+
+Installer tests cover misses, offline hits, corrupt bytes, retries and checksum
+failure before installation. uv seeding tests cover tar/zip, refreshing installed
+bytes from verified archives, and refusing corruption. The first PR workflow run
+exercises the new namespace's miss/save path. Rerun the same head for hosted
+restore/hit qualification. PR caches are scoped to the PR merge ref and cannot
+warm main's nightly. The first main nightly seeds its own entries.
+
+Rollback by reverting this cache change. Retire it when the owning CI bootstrap
+provides equivalent pinned, verified, outage-independent warm archive inputs.
