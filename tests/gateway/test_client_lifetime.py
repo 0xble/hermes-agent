@@ -79,7 +79,6 @@ threading.Event().wait(30)
         # 74 distinguishes forced lifetime teardown from a graceful client exit.
         assert child.wait(timeout=6) == 74
         if with_tool:
-            import psutil
             tool_pid = int(ready.with_suffix('.tool').read_text())
             assert wait_until(lambda: not process_alive(tool_pid), timeout=3)
     finally:
