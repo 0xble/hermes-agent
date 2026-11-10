@@ -134,9 +134,12 @@ def _redact_for_provider(*values: Any) -> Any:
     changed containers as shallow copies. One value in → one value out; several → a tuple.
     """
     from agent.authentication_material import authentication_values, exclude_authentication_material
+    from agent.source_origin import NativeOrigin
     learned: set = set()
 
     def walk(value: Any, fix) -> Any:
+        if isinstance(value, NativeOrigin):
+            return None  # The receipt holds original text and belongs only to the native origin gate.
         if isinstance(value, str):
             return value if not value or value.startswith("data:") else fix(value)
         if isinstance(value, dict):

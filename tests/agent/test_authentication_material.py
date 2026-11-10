@@ -24,6 +24,13 @@ def test_authentication_values_are_removed_on_token_boundaries():
     assert safe[1] == "[redacted] and x482913y."
     assert "482913" not in safe[0]
     assert "AbCdEfGhJkLmNpQrStUvWxYz" not in safe[2] + safe[3]
+    text = "Recovery code: 482913. Keep notices off."
+    receipt = NativeOrigin.person(text, platform="fictional", principal="person", event="event")
+    messages = [{"role": "user", "content": text, "display_metadata": {"_hermes_source_origin": receipt}}]
+    safe_messages = _redact_for_provider(messages)
+    assert "482913" not in json.dumps(safe_messages)
+    assert "Keep notices off." in safe_messages[0]["content"]
+    assert messages[0]["display_metadata"]["_hermes_source_origin"] is receipt
 
 
 def test_native_origin_cannot_silently_serialize_as_empty_metadata():
