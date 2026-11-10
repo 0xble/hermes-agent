@@ -29,12 +29,11 @@ while True:
             last = size
             print('RESIZE', size.lines, flush=True)
         print('WINCH', flush=True)
-    print('TICK', flush=True)
 """
 _NODE_SIZE_WATCHER = (
     "process.stdout.on('resize', () => process.stdout.write('RESIZE ' + process.stdout.rows + '\\n'));"
     "process.on('SIGWINCH', () => process.stdout.write('WINCH\\n'));"
-    "process.stdout.write('READY\\n'); setInterval(() => process.stdout.write('TICK\\n'), 200)"
+    "process.stdout.write('READY\\n'); setInterval(() => {}, 200)"
 )
 
 
@@ -101,9 +100,9 @@ async def test_a_resize_back_waits_until_the_program_answered_the_step(tmp_path,
         # The redraw's two frames, arriving together as they leave the browser.
         tab.send("\x1b[RESIZE:80;23]", "\x1b[RESIZE:80;24]")
         pump = asyncio.create_task(_pump_input(tab, SimpleNamespace(remove=remove), "terminal", session, owner))
-        # The program prints TICK five times a second: give it three seconds.
-        await async_wait_until(
-            lambda: b"RESIZE 24" in tab.output[start:] or tab.output[start:].count(b"TICK") >= 15, timeout=10)
+        # Only resize responses belong on stdout: an unrelated heartbeat can
+        # release the output-based fence before the program observes the step.
+        await async_wait_until(lambda: b"RESIZE 24" in tab.output[start:], timeout=10)
         seen = tab.output[start:]
         tab.close_tab()
         await asyncio.wait_for(pump, 5)
