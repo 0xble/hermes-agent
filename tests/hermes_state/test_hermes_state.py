@@ -2366,14 +2366,12 @@ class TestReconcileColumnsErrorHandling:
     def _db_missing_column(self, tmp_path):
         """A store whose sessions table lacks last_read_at."""
         db_path = tmp_path / "state.db"
-        seed = SessionDB(db_path=db_path)
-        seed.close()
-        conn = sqlite3.connect(str(db_path))
-        try:
+        SessionDB(db_path=db_path).close()
+        with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+            # A pre-column store also predates triggers that reference it.
+            conn.execute("DROP TRIGGER sessions_projection_update")
             conn.execute("ALTER TABLE sessions DROP COLUMN last_read_at")
             conn.commit()
-        finally:
-            conn.close()
         return db_path
 
     def test_locked_alter_propagates(self, tmp_path):
