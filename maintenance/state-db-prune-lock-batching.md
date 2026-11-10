@@ -47,13 +47,18 @@ Contract tests: `tests/hermes_state/test_compaction_prepare_snapshot.py`, `tests
 
 The existing slow-write warning retains `compaction_prepare`. For
 `SessionDB.archive_and_compact`, held-summary checks, held-row CAS and coverage
-proof run in an independent read-only snapshot before `BEGIN IMMEDIATE`.
+proof run in an independent read-only snapshot before `BEGIN IMMEDIATE` when
+held messages/CAS are supplied or more than 8 unresolved dicts need coverage.
+The cheap lease path retains its original transactional preparation and SQL
+content matching. Only the plain content-match branch above that width builds
+the role/content index. Retired-row and merged-run resolution are unchanged.
 The freshness token is captured in that same snapshot and covers only the target
-session: its transcript/runtime revisions and generation, active row count and
-highest id, and raw CAS-owned row values plus role, timestamp and durable identity.
-Comparing raw values avoids decoding and hashing payloads inside the writer lock,
-while fencing edits to fields the transcript revision trigger does not cover,
-including summary markers. Unrelated session writes cannot invalidate the proof.
+session: its transcript/runtime revisions and generation, plus a streamed digest
+of active row ids, timestamps, durable identities and CAS-owned columns not
+covered by the transcript revision trigger. The large content/tool/reasoning
+bodies are fenced by that revision instead of copied or hashed in the writer
+transaction. No full payload copy survives preparation. Summary markers and
+untriggered sidecars remain fenced. Unrelated session writes cannot invalidate the proof.
 A changed token rolls back the attempt and repeats preparation outside the writer
 lock. After 2 optimistic attempts, the final attempt prepares inside the writer
 transaction, preserving the original compaction's progress under contention.
@@ -116,7 +121,7 @@ GIL, scheduling or index bottleneck, and do not claim a latency improvement.
 ## Focused regression
 
 ```text
-scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_compaction_prepare_snapshot.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
+scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_compaction_prepare_snapshot.py tests/hermes_state/test_compaction_prepare_fallback.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
 ```
 
 ## Retirement
