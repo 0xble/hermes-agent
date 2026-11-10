@@ -209,6 +209,7 @@ def retention_user_text(text, messages):
 
     Serialized/imported dictionaries do not become native evidence by being passed to a provider.
     Historical acquisition and recovery instead use classify_origin inside the guarded snapshot.
+    Compare the scaffold-stripped native instruction before egress redaction changes span offsets.
     """
     from agent.synthetic_prompt import is_runtime_prompt
     for message in reversed(messages or ()):

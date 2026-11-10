@@ -613,12 +613,14 @@ class MemoryManager:
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content or not self._owner_allows("sync_turn"):
             return
-        clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
-            clean_user_content, assistant_content, messages)
+        from agent.source_origin import retention_user_text
+        # Select against native text before redaction changes span offsets. The selected
+        # text must share the complete exchange's learned secret set at the egress boundary.
+        origin_user = retention_user_text(clean_user_content, messages)
+        clean_user_content, origin_user, assistant_content, redacted_messages = _redact_for_provider(
+            clean_user_content, origin_user, assistant_content, messages)
         optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author,
                            "display_kind": display_kind, "platform": platform}
-        from agent.source_origin import retention_user_text
-        origin_user = retention_user_text(user_content, messages)
 
         def _sync(provider: MemoryProvider) -> None:
             requires_origin = getattr(provider, "requires_verified_origin", False) is True
@@ -627,7 +629,6 @@ class MemoryManager:
                 if requires_origin:
                     logger.debug("Skipping automatic retention for %s: no verified origin", provider.name)
                 return
-            retained_user = _redact_for_provider(retained_user)
             kwargs: dict[str, Any] = {"session_id": session_id}
             for keyword, value in optional_kwargs.items():
                 # A full transcript could reintroduce generated or unknown spans withheld above.

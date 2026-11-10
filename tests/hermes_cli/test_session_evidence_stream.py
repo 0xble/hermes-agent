@@ -237,10 +237,10 @@ _AUDIT_CHANGES = {
     "invalid-utf8": ("UPDATE messages SET content = CAST(x'80' AS TEXT) WHERE id = 3", ()),
 }
 _AUDIT_ERRORS = {
-    "prefix": "exact session ID", "alias": "exact session ID", "title": "exact session ID",
-    "absent": "exact session ID", "oversize-content": "source bytes", "blob-content": "unsupported",
-    "oversize-metadata": "source bytes", "huge-blob": "exceeds 262144 source bytes",
-    "huge-text": "exceeds 262144 source bytes", "invalid-utf8": "UnicodeDecodeError",
+    "prefix": "control component or unresolved session; acquisition held",
+    "alias": "control component or unresolved session; acquisition held",
+    "title": "control component or unresolved session; acquisition held",
+    "absent": "control component or unresolved session; acquisition held",
     "record-budget": "encoded bytes", "interrupt": "stream interrupted",
 }
 
@@ -400,9 +400,11 @@ def test_transcript_holds_unknown_bodies_without_losing_occurrence_identity(audi
         code, sink, error, peak = _capture(capsys, monkeypatch, "transcript", sid=sid, callback=callback,
                                           measure=scenario == "large")
     assert reads and not writes and ("messages", "content") not in reads
-    if scenario in {"prefix", "alias", "title", "absent", "record-budget", "interrupt"}:
+    assert "x" * 1000 not in json.dumps(sink.rows)
+    assert max(sizes) < 262144
+    if scenario in _AUDIT_ERRORS:
         assert code == (130 if scenario == "interrupt" else 1)
-        assert error and sink.footer is None
+        assert _AUDIT_ERRORS[scenario] in error and sink.footer is None
         assert (tmp_path / "state.db").read_bytes() == before_bytes
         return
     assert code == 0 and not error
