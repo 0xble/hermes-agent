@@ -374,7 +374,7 @@ def _repeat_alert_withheld(incident: dict) -> bool:
 
 
 def _upsert_incident_for_failure(
-    job: dict, error: str, *, output_file: Optional[Any] = None
+    job: dict, error: str, *, output_file: Optional[Any] = None, agent_declared: bool = False
 ) -> tuple[bool, Optional[str]]:
     """Record a durable failure incident (grouped by job + error signature). Returns
     ``(withheld, incident_id)``; withheld=True when the signature's incident is already ``closed``
@@ -386,7 +386,8 @@ def _upsert_incident_for_failure(
 
         incident_id, _is_new = upsert_incident(
             job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file,
-            failure_type="script" if job.get("_script_failed") else None)
+            failure_type=("script" if job.get("_script_failed") else
+                          scheduler_failure_copy.agent_failure_type(error) if agent_declared else None))
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
@@ -553,7 +554,7 @@ from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
-from cron import store_health
+from cron import scheduler_failure_copy, store_health
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
@@ -565,23 +566,6 @@ from cron.scheduler_worker_failure import finish_interrupted_run
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
-
-# Agent-declared failure marker for cron runs. Unlike SILENT, it is deliberately strict so a
-# report that merely quotes the token cannot turn a healthy run into a failed one.
-CRON_FAILURE_MARKER = "[CRON_FAILURE]"
-
-
-def _cron_failure_marker_error(text: str) -> Optional[str]:
-    """Return failure evidence when an agent response declares a cron failure.
-
-    Only the exact, standalone first line is control text. The caller keeps the complete response
-    in the saved run output while routing this evidence through normal failure bookkeeping.
-    """
-    lines = (text or "").splitlines()
-    if not lines or lines[0].rstrip() != CRON_FAILURE_MARKER:
-        return None
-    evidence = "\n".join(lines[1:]).strip()
-    return evidence or "Cron agent reported failure."
 
 
 def _is_cron_silence_response(text: str) -> bool:
@@ -2633,7 +2617,7 @@ def run_job(
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
-                and _cron_failure_marker_error(final_response) is None):
+                and scheduler_failure_copy.cron_failure_marker_error(final_response) is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
             # agent-declared failure marker keep their first-line/whole-response contract.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
@@ -3045,7 +3029,7 @@ def _compose_run_delivery(
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
         # Best-effort: a ledger failure never breaks delivery.
         incident_acked, failure_incident_id = _upsert_incident_for_failure(
-            job, error or "", output_file=output_file
+            job, error or "", output_file=output_file, agent_declared=agent_declared
         )
         if incident_acked:
             deliver_content = ""
@@ -3483,7 +3467,7 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     Returns ``(success, error, agent_declared)``.
     """
     if success and not job.get("no_agent"):
-        marker_error = _cron_failure_marker_error(final_response)
+        marker_error = scheduler_failure_copy.cron_failure_marker_error(final_response)
         if marker_error is not None:
             return False, marker_error, True
     return success, error, False

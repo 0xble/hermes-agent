@@ -14,6 +14,45 @@ from typing import Any, Optional
 from hermes_constants import display_hermes_home
 
 
+CRON_FAILURE_MARKER = "[CRON_FAILURE]"
+
+
+def cron_failure_marker_error(text: str) -> Optional[str]:
+    """Unwrap presentation fences without broadening the strict first-line marker contract.
+
+    The saved run output retains the original response. Bookkeeping and incident summaries start
+    with evidence instead of a Markdown opener; the remaining diagnostic prose stays available.
+    """
+    lines = (text or "").splitlines()
+    if not lines or lines[0].rstrip() != CRON_FAILURE_MARKER:
+        return None
+    body = lines[1:]
+    while body:
+        if not body[0].strip():
+            body.pop(0)
+            continue
+        opening = re.fullmatch(r"(`{3,}|~{3,})[^\n]*", body[0].strip())
+        if opening is None:
+            break
+        fence = opening.group(1)
+        body.pop(0)
+        closing = re.compile(re.escape(fence[0]) + "{" + str(len(fence)) + ",}")
+        for index, line in enumerate(body):
+            if closing.fullmatch(line.strip()):
+                del body[index]
+                break
+    return "\n".join(body).strip() or "Cron agent reported failure."
+
+
+def agent_failure_type(error: str) -> str:
+    """Classify the declared summary, not incidental signals in the rest of the report."""
+    from cron.incidents import _classify_failure_type
+
+    summary = next((line.strip() for line in error.splitlines() if line.strip()), "")
+    kind = _classify_failure_type(summary)
+    return "agent" if kind == "unknown" else kind
+
+
 def cron_output_dir_display(job_id: str) -> str:
     """User-facing path of a job's saved run output (profile-aware)."""
     return f"{display_hermes_home()}/cron/output/{job_id}/"
