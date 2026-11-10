@@ -17,16 +17,24 @@ only split the time budget without diagnosing the stall.
 
 ## Historical git-install download isolation
 
+The dispatcher-restart E2E also covers the gateway submitter's spawn/publication gap. The
+submitter adopts its PID on the live run before contacting the owner, using the same registration
+as the former CLI worker. A killed dispatcher therefore leaves a live handle for TTL extension,
+and a reclaimed submitter exits before admission. Native CLI PTY coverage keeps its private tmux
+server alive across empty-session gaps and destroys it in teardown, avoiding last-session shutdown
+racing the next client launch.
+
 The shallow/partial clone suites retain smart HTTP, complete subject ancestry, historical
 N-1 installer bytes, all clone-shape/transfer assertions and the 900-second nightly file bound.
 Their three simultaneous real installs share only explicit runner content caches (uv, managed
 Python, npm and SHA256-keyed PM archives). Each native store, checkout, PM install identity,
 venv, active selection record and Hermes user home remains distinct. PM's machine uv cache is
 linked to the explicit content cache because PM intentionally does not use `UV_CACHE_DIR`.
-The shell runner must forward only `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, and `npm_config_cache`
-across its `env -i` boundary: otherwise the portable lane's already-primed downloads silently
-vanish before the file worker starts. The runner regression also proves installed/runtime/user
-state and credentials remain scrubbed; do not widen this to a generic environment passthrough.
+The shell runner carries explicit `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, and `npm_config_cache`
+inputs across its `env -i` boundary under private names. The file runner restores them only for
+files inside `tests/e2e/core/upgrade` and removes the private names from every worker. Ordinary
+tests and their subprocesses receive none of these caches, even in a mixed invocation. The runner
+regression also proves installed/runtime/user state and credentials remain scrubbed.
 Only absolute explicit cache paths are eligible. Resolve symlinks and refuse descendants of
 `.hermes`, `.cache/uv`, `.npm` and `.local/share/uv` under the OS password-database home, even
 when `HOME` names a sandbox. Failure to resolve that account also drops these inputs.
@@ -61,7 +69,9 @@ regressions prove user state and installed environments are not shared.
 `InstallCache.artifact` retains only bytes matching a lockfile SHA256. A complete cache hit
 performs no HTTP request. A cold request uses curl's 10-second connection and 30-second total
 bounds, no retries, and atomic publication. Status, URL and checksum failures surface immediately.
-The maintained pinned mirror supplies the same reviewed archive bytes. Each sandbox receives
+Preparation tries each lock URL first, then the maintained pinned mirror on download or checksum
+failure, checking the same SHA256 for either source. If both fail, diagnostics name both URLs.
+Each sandbox receives
 private copies of PM's `fetch-<sha256>` entries. PM may delete those copies after publication
 without losing the retained archive. Retained archives are stored beside the explicit uv cache
 (in `<uv-cache-name>-pm-archives`), outside uv-owned buckets, so `uv cache prune` cannot

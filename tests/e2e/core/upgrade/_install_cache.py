@@ -95,7 +95,16 @@ class InstallCache:
             for artifact in plan if isinstance(plan, list) else [plan]:
                 url, digest = artifact["url"], artifact["sha256"]
                 print(f"Preparing pinned {package.name} archive: {url}", flush=True)
-                archive = self.artifact(mirror_url(digest), digest)
+                try:
+                    archive = self.artifact(url, digest)
+                except AssertionError as primary:
+                    fallback = mirror_url(digest)
+                    if fallback == url:
+                        raise
+                    try:
+                        archive = self.artifact(fallback, digest)
+                    except AssertionError as secondary:
+                        raise AssertionError(f"{primary}\nMirror fallback failed: {secondary}") from secondary
                 entry = store / f"fetch-{digest}"
                 entry.mkdir(parents=True, exist_ok=True)
                 destination = entry / url.rsplit("/", 1)[-1]

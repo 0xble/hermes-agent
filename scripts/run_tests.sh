@@ -349,7 +349,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # credential can leak" property stays auditable at a glance.
 # Admission state is deliberately scrubbed: the helper recognizes held ancestors
 # after env -i, while tests must still exercise terminal promotion as unheld.
-# Download-only caches are explicit runner inputs, not installed/user state. Historical
+# Download-only caches are explicit upgrade inputs, not installed/user state. Historical
 # installer fixtures need the portable lane's primed downloads; dropping these at env -i
 # silently makes every independent N-1 install redownload the same artifacts.
 # Resolve symlinks against the OS account home, never the sandbox HOME. Refuse live
@@ -370,7 +370,8 @@ except (ImportError, KeyError, OSError, RuntimeError, ValueError):
     safe = False
 raise SystemExit(0 if safe else 1)
 ' "${!_cache_var}"; then
-    TEST_ENV+=("$_cache_var=${!_cache_var}")
+    # The file runner exposes these only to upgrade files, never ordinary test children.
+    TEST_ENV+=("_HERMES_UPGRADE_$_cache_var=${!_cache_var}")
   fi
 done
 for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \

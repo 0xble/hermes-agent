@@ -30,9 +30,9 @@ def artifact_server():
             if self.path == "/stall":
                 release.wait(10)
                 return
-            self.send_response(504 if self.path == "/504" else 200)
+            self.send_response(504 if self.path.startswith("/504") else 200)
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(b"corrupt" if self.path == "/corrupt" else payload)
 
         def log_message(self, *_args):
             pass
@@ -98,6 +98,36 @@ def test_cold_download_failure_is_bounded_and_names_the_artifact(tmp_path, path)
         assert time.monotonic() - started < 5
         assert requests == ["/" + path]
         assert not list((cache.root / "artifacts").glob("[a-f0-9]" * 64))
+
+
+@pytest.mark.parametrize("primary,mirror", [("release", "release"), ("504", "release"),
+                                           ("corrupt", "release"), ("504", "504/mirror")])
+def test_prepare_tries_lock_url_before_verified_mirror(tmp_path, monkeypatch, primary, mirror):
+    from pm.store import current_target
+    import pm.artifact_mirror
+
+    with artifact_server() as (url, payload, requests):
+        digest = hashlib.sha256(payload).hexdigest()
+        source = tmp_path / "source"
+        (source / "pm").mkdir(parents=True)
+        pin = {"url": url + "/" + primary, "sha256": digest}
+        (source / "pm/lock.json").write_text(json.dumps({"packages": {
+            "ffmpeg": {"version": "fixture", "artifacts": {current_target(): pin}},
+        }}))
+        monkeypatch.setattr(H, "WORKTREE", source)
+        monkeypatch.setattr(pm.artifact_mirror, "mirror_url", lambda _digest: url + "/" + mirror)
+        cache = InstallCache(tmp_path / "downloads")
+        env = cache.environment(H.isolated_env(tmp_path / "install"))
+        if mirror.startswith("504"):
+            with pytest.raises(AssertionError) as error:
+                cache.prepare(env)
+            assert pin["url"] in str(error.value) and url + "/" + mirror in str(error.value)
+            assert not list(Path(env["HERMES_RUNTIME_DIR"]).glob("fetch-*"))
+        else:
+            cache.prepare(env)
+            archive, = (Path(env["HERMES_RUNTIME_DIR"]) / f"fetch-{digest}").iterdir()
+            assert archive.read_bytes() == payload
+        assert requests == (["/release"] if primary == "release" else ["/" + primary, "/" + mirror])
 
 
 def test_archive_seeding_does_not_publish_a_shell_bootstrap_tool_until_requested(tmp_path, monkeypatch):
