@@ -14,7 +14,11 @@ This is a row ceiling, not a strict byte quota: output sizes can change.
 
 `cron.execution_retention_days` sets the elapsed-day window in `config.yaml`
 (default `8`, `0` disables age expiration while retaining the row backstop).
-Read it in the owning profile at each terminal transition. The virtual-clock
+Read it in the owning profile at each terminal transition. Retention is best-effort:
+any configuration-resolution failure falls back to the default window and must
+not roll back the execution's terminal state. A duration that overflows the
+UTC cutoff disables only age pruning for that call; the row backstop still runs.
+The virtual-clock
 DST soak configures a window longer than its full simulated span: it proves
 every fire and delivery across that span, while dedicated retention tests prove
 expiration. Its final all-runs ledger assertions remain unchanged.
@@ -32,11 +36,22 @@ are eligible. Incidents retain their own error and output-file evidence in
 
 Keep cleanup in the shared terminal-transition path. Each call deletes at most
 500 rows across age expiration and ceiling trimming combined, oldest first.
-An existing backlog converges over later terminal writes instead of requiring
-one large write transaction. The partial numeric-time index serves expiration,
-ordering, and bounded counting. A numeric per-job claim index serves the latest
-attempt exclusion without repeatedly sorting each job's history. Eligibility
-also checks delivery state and journal presence. Compute the cutoff in UTC before subtracting the duration,
+SQL excludes each job's latest attempt before applying the candidate limit.
+Latest attempts of one-shot or removed jobs may remain protected forever, but
+cannot fill the candidate page and prevent cleanup of other jobs' history.
+The partial numeric-time index serves expiration, ordering, and bounded counting;
+the numeric per-job claim index serves latest-attempt exclusion without repeatedly
+sorting each job's history. Finding candidates may scan past any number of latest
+attempts; the limit bounds the remaining eligibility checks, not all SQLite work.
+
+Each policy checks at most four times its deletion budget for delivery state,
+current-transition IDs, and journal presence (2,000 candidates per pass, at most
+4,000 per terminal transition). These protections consume that bounded page and
+have no guaranteed expiry: failed delivery/recovery may leave them indefinitely.
+An entirely protected oldest page can therefore defer cleanup of eligible newer
+rows indefinitely. This intentionally bounds non-SQL work rather than promising
+unconditional ceiling convergence. Once the scanned page contains eligible rows,
+later terminal writes drain the backlog in bounded batches. Compute the cutoff in UTC before subtracting the duration,
 and compare parsed instants so offset changes and DST do not move the window.
 The index is additive, preserving named-column reads/writes by older releases.
 
@@ -70,9 +85,27 @@ comparison, with a separate unbounded-by-count unknown population. Neither
 satisfies this contract. These were inspected as prior art, not adopted patches.
 The fork implementation deliberately uses one time policy and one ceiling for
 all terminal states, with a profile-local age-window setting and no new scheduler owner.
-Upstream state was checked on 2026-10-29. No upstream write is part of this unit.
+Upstream state was rechecked on 2026-11-05: both PRs remain open. Related
+[PR #79082](https://github.com/NousResearch/hermes-agent/pull/79082) also guards
+configuration resolution, but keeps the count-only policy; it is prior art,
+not an adopted patch. Upstream main at
+`8283794aa41779e55293934a910943a4b129cc78` still uses count-only pruning and does
+not satisfy this unit. The config-failure isolation and scan-bound repair remain
+part of fork patch `cron-execution-history`; no upstream write or runtime
+installation is part of this delivery.
 
 ## Verification and Retirement
+
+Contract tests: `tests/cron/test_execution_retention.py`,
+  `tests/cron/test_execution_prune_safety.py`,
+  `tests/cron/test_missed_execution_retention.py`.
+
+`tests/cron/test_execution_prune_safety.py` covers terminal durability under
+oversized retention, unknown model presets, and non-mapping cron config through
+all six terminal writers. Its protected-backlog cases bound SQLite VM work for
+delivery/journal pages and prove convergence after those protections release.
+Permanent singleton/latest backlogs cannot starve age or ceiling cleanup,
+including when the ceiling excess is only one row.
 
 `tests/cron/test_execution_retention.py` owns the time-window and bounded-cleanup
 invariants, including mixed offsets, DST, the cutoff boundary, missing finish
