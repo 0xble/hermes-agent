@@ -679,7 +679,7 @@ def _set_config_path_value(data: dict[str, Any], dotted: tuple[str, ...], value:
 
 
 def _count_cron_jobs(path: Path) -> Optional[int]:
-    """Return the number of cron jobs stored in ``path``.
+    """Return the number of identifiable cron jobs stored in ``path``.
 
     The canonical on-disk shape is ``{"jobs": [...]}`` (see ``cron/jobs.py``).
     A legacy bare-list shape (``[...]``) is also honoured.
@@ -701,9 +701,8 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    if isinstance(data, dict):
-        jobs = data.get("jobs", [])
-        return len(jobs) if isinstance(jobs, list) else None
-    if isinstance(data, list):
-        return len(data)
-    return None
+    jobs = data.get("jobs", []) if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        return None
+    # Junk entries cannot account for a snapshot job, even when the raw lengths match.
+    return sum(isinstance(job, dict) and bool(job.get("id")) for job in jobs)

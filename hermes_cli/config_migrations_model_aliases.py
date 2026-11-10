@@ -184,7 +184,7 @@ def migrate_to_54(results: dict, quiet: bool) -> None:
 def main(argv=None) -> int:
     from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
     from hermes_cli.config import atomic_config_replace
-    import hermes_yaml as yaml
+    from hermes_cli.config_backend import read_config_doc
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path(get_hermes_home()))
     parser.add_argument("--dry-run", action="store_true")
@@ -194,7 +194,7 @@ def main(argv=None) -> int:
     token = set_hermes_home_override(str(args.home.resolve()))
     try:
         path = args.home / "config.yaml"
-        before = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+        before = read_config_doc(path) or {}
         after, changes = migrate_document(before)
         if args.codex_auth_source:
             import time
