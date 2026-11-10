@@ -20,6 +20,12 @@ T = TypeVar("T")
 _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
 
 
+def execute_prune_write(db, fn, patience_s, **kwargs):
+    from hermes_state_prune_budget import run_prune_write
+    return run_prune_write(lambda: db._execute_write_marked(fn, patience_s, **kwargs),
+                           label=getattr(fn, "__qualname__", "maintenance"), skip_result=kwargs.get("skip_result"))
+
+
 def execute_transcript_write(
     db: Any, fn: Callable[[sqlite3.Connection], T], messages: list[dict[str, Any]], *,
     session_id: str, patience_s: float | None = None, session_ids: Any = (),

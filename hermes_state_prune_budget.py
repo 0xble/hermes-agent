@@ -12,12 +12,16 @@ import sqlite3
 import time
 
 _CURRENT = ContextVar("session_prune_budget", default=None)
-_PAGE_SECONDS = ContextVar("session_prune_page_seconds", default=None)
+_UNIT_SECONDS = ContextVar("session_prune_unit_seconds", default=None)
 logger = logging.getLogger(__name__)
 
 
 class PruneBudgetExpired(RuntimeError):
     """The pass deadline or a single transaction's writer budget was exhausted."""
+
+
+class PruneWriteContended(RuntimeError):
+    """No writer lock was acquired. Yield before retrying the same work."""
 
 
 def validate_max_seconds(value):
@@ -77,47 +81,60 @@ def current_budget():
     return _CURRENT.get()
 
 
-@contextmanager
-def prune_page_budget(session_id, single_row_bytes, expired_attempts=0):
-    """Scale only an indivisible row's writer hold, with the same foreground yield."""
-    from hermes_state_deletion import DELETE_BYTES
+def run_prune_write(attempt, *, shrink=None, minimum_seconds=None, defer=None, label="maintenance", skip_result=None):
+    """One recovery path for batches, pages and indivisible housekeeping writes.
+
+    Callbacks run only after the previous transaction rolled back and released its
+    lock. A shrink callback changes the next attempt's unit and returns True, or
+    returns False at its indivisible minimum (including atomic local lineages).
+    """
     budget = current_budget()
-    if budget is None:
-        yield
-        return
-    seconds = min(budget.MIN_UNIT_CEILING_SECONDS,
-                  budget.TRANSACTION_SECONDS * max(1, single_row_bytes / DELETE_BYTES))
-    # Bytes are only an estimate of trigger cost. A minimum unit that already
-    # expired must get a ceiling attempt even when its payload is small.
-    if single_row_bytes and expired_attempts:
-        seconds = budget.MIN_UNIT_CEILING_SECONDS
-    ceiling = seconds == budget.MIN_UNIT_CEILING_SECONDS
-    if ceiling:
-        logger.warning("Session cleanup %r uses the %.2fs indivisible-row writer ceiling (%d bytes)",
-                       session_id, seconds, single_row_bytes)
-    token = _PAGE_SECONDS.set(seconds)
-    try:
-        yield
-    except PruneBudgetExpired:
+    if budget is None or _UNIT_SECONDS.get() is not None:
+        return attempt()
+    from hermes_state_prune_pacing import PrunePacer
+    pacer = PrunePacer(max_size=1)
+    seconds = budget.TRANSACTION_SECONDS
+    while True:
         budget.check()
-        if ceiling:
+        # A byte estimate is useful only for a minimum page. Work cost learned
+        # from a rollback supplies the ceiling attempt when bytes underestimate.
+        if minimum_seconds is not None:
+            seconds = max(seconds, min(budget.MIN_UNIT_CEILING_SECONDS, minimum_seconds()))
+        unit_label = label() if callable(label) else label
+        if seconds > budget.TRANSACTION_SECONDS:
+            logger.warning("Session cleanup %r uses the %.2fs minimum-unit writer ceiling", unit_label, seconds)
+        started = time.monotonic()
+        token = _UNIT_SECONDS.set(seconds)
+        try:
+            return attempt()
+        except PruneWriteContended:
+            pacer.pause(0)
+            continue
+        except PruneBudgetExpired:
+            budget.check()
+        finally:
+            _UNIT_SECONDS.reset(token)
+        held_s = time.monotonic() - started
+        pacer.pause(held_s)
+        if shrink is not None and shrink():
+            seconds = budget.TRANSACTION_SECONDS
+        elif seconds == budget.TRANSACTION_SECONDS:
+            seconds = min(budget.MIN_UNIT_CEILING_SECONDS, max(seconds * 2, held_s * 2))
+        else:
             logger.error("Session cleanup %r could not complete within the %.2fs writer ceiling; cleanup deferred",
-                         session_id, seconds)
-        raise
-    finally:
-        _PAGE_SECONDS.reset(token)
+                         unit_label, seconds)
+            return defer() if defer is not None else skip_result
 
 
 def transaction_seconds(budget):
-    return _PAGE_SECONDS.get() or budget.TRANSACTION_SECONDS
+    return _UNIT_SECONDS.get() or budget.TRANSACTION_SECONDS
 
 
 def write_patience(patience_s, deadline):
     budget = current_budget()
     if budget is not None:
         budget.check()
-        patience_s = min(patience_s, 0.1, max(0, budget.deadline - time.monotonic()))
-        deadline = min(deadline, time.monotonic() + patience_s)
+        deadline = budget.deadline
     return patience_s, deadline
 
 
@@ -151,7 +168,7 @@ def prune_sql(conn, *, write=False):
     except sqlite3.OperationalError as exc:
         from hermes_state_errors import is_sqlite_lock_error
         if is_sqlite_lock_error(exc):
-            raise PruneBudgetExpired("session prune yielded to a foreground SQLite writer") from exc
+            raise PruneWriteContended("session prune yielded to a foreground SQLite writer") from exc
         if time.monotonic() >= deadline or "interrupted" in str(exc).lower():
             raise PruneBudgetExpired("session prune SQL interrupted at its budget") from exc
         raise

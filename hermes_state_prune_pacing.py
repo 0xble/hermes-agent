@@ -53,6 +53,11 @@ class PrunePacer:
     def __init__(self, max_size=25):
         self.max_size = self.size = max_size
 
+    def shrink(self, selected_size=None):
+        previous = self.size
+        self.size = max(1, min(self.size, selected_size if selected_size is not None else self.size) // 2)
+        return self.size < previous
+
     def pause(self, held_s):
         if held_s > self.TARGET_S:
             self.size = max(1, self.size // 2)

@@ -234,6 +234,17 @@ def _derived_api_sessions(conn, session_ids):
         (json.dumps(list(session_ids)),))}
 
 
+def prunable_ids(conn, session_ids):
+    """Select whole idle conversations and their permanently fenced derived ids."""
+    swept, (conversations, derived) = set(session_ids), _local_conversations(conn, session_ids)
+
+    def removable(sid):
+        whole = conversations.get(sid, (sid,))
+        return swept.issuperset(whole) and not any(conn.execute(_LIVE_LEDGER_SQL, (x, x)).fetchone() for x in whole)
+    quiet = [sid for sid in session_ids if removable(sid)]
+    return quiet, derived | _derived_api_sessions(conn, quiet)
+
+
 def retire_prunable(conn, session_ids, *, defer_messages=False):
     """Sweep variant of :func:`retire_sessions`: fence the idle sessions and return only those ids.
     A session with live or unknown work is skipped, so one busy row cannot abort a whole
@@ -248,13 +259,7 @@ def retire_prunable(conn, session_ids, *, defer_messages=False):
     first unfenced id, so an aged-out marker would send the next turn back to the swept generation.
     A Bot Chat's mailbox receipts also outlive the horizon. A caller-named API id is not derived:
     its marker ages out, so the caller can use that id again, as for any other swept session."""
-    swept, (conversations, derived) = set(session_ids), _local_conversations(conn, session_ids)
-
-    def removable(sid):
-        whole = conversations.get(sid, (sid,))
-        return swept.issuperset(whole) and not any(conn.execute(_LIVE_LEDGER_SQL, (x, x)).fetchone() for x in whole)
-    quiet = [sid for sid in session_ids if removable(sid)]
-    derived |= _derived_api_sessions(conn, quiet)
+    quiet, derived = prunable_ids(conn, session_ids)
     retire_sessions(conn, quiet, expiring=[sid for sid in quiet if sid not in derived], defer_messages=defer_messages)
     return quiet
 

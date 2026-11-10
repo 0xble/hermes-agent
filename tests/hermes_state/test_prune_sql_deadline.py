@@ -145,27 +145,52 @@ def test_invalid_runtime_cap_rejected_without_selection(tmp_path, value):
 def test_prune_yields_to_foreground_writer_instead_of_waiting_for_it(tmp_path, local):
     with closing(SessionDB(tmp_path / "state.db")) as db:
         _old_ended(db, "old")
-        held, release = threading.Event(), threading.Event()
+        held, release, yielded = threading.Event(), threading.Event(), threading.Event()
+        result, errors = [], []
         def foreground():
             if local:
                 with db._lock:
                     held.set()
                     release.wait(5)
+                    db._conn.execute("INSERT INTO state_meta(key,value) VALUES('foreground', 'ok')")
             else:
                 conn = sqlite3.connect(db.db_path)
                 conn.execute("BEGIN IMMEDIATE")
                 held.set()
                 release.wait(5)
-                conn.rollback()
+                conn.execute("INSERT INTO state_meta(key,value) VALUES('foreground', 'ok')")
+                conn.commit()
                 conn.close()
         thread = threading.Thread(target=foreground)
         thread.start()
         assert held.wait(2)
-        try:
-            started = time.monotonic()
-            assert db.prune_sessions(older_than_days=90, max_seconds=0.2) == 0
-            assert time.monotonic() - started < 1
-        finally:
-            release.set()
-            thread.join()
-        assert db.get_session("old") is not None
+        from hermes_state_prune_budget import PruneBudget
+        real_pause = PruneBudget.pause
+        def pause(budget, seconds):
+            yielded.set()
+            return real_pause(budget, seconds)
+        def prune():
+            try:
+                result.append(db.prune_sessions(older_than_days=90, max_seconds=5))
+            except BaseException as exc:
+                errors.append(exc)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(PruneBudget, "pause", pause)
+            runner = threading.Thread(target=prune)
+            runner.start()
+            try:
+                # The pruner must yield while the foreground still owns the lock.
+                yielded_before_release = yielded.wait(2)
+            finally:
+                started = time.monotonic()
+                release.set()
+                thread.join(2)
+                assert not thread.is_alive()
+                assert time.monotonic() - started < 2
+                runner.join(5)
+        assert not runner.is_alive()
+        assert not errors
+        assert result == [1]
+        assert yielded_before_release
+        assert db.get_session("old") is None
+        assert db.get_meta("foreground") == "ok"

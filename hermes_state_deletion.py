@@ -108,19 +108,47 @@ def remove_session_files(sessions_dir, session_id):
 
 
 def _finish_delete(db, sid, key, value):
-    from hermes_state_prune_budget import PruneBudgetExpired, check_prune_budget, current_budget, prune_page_budget
+    from hermes_state_prune_budget import PruneBudget, check_prune_budget, current_budget, run_prune_write
     cleanup = json.loads(value)["cleanup"]
+    if cleanup.get("retirement_pending"):
+        def retire(conn):
+            from hermes_state_mutation_retirement import retire_sessions
+            if conn.execute("SELECT 1 FROM state_meta WHERE key=? AND value=?", (key, value)).fetchone() is None:
+                return False
+            retire_sessions(conn, [sid], expiring=[sid] if json.loads(value).get("expires") else [], defer_messages=True)
+            conn.execute("UPDATE state_meta SET value=json_remove(value, '$.cleanup.retirement_pending') "
+                         "WHERE key=? AND value=?", (key, value))
+            return conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0]
+        updated = run_prune_write(lambda: db._execute_write(retire), label=sid,
+                                 minimum_seconds=lambda: PruneBudget.MIN_UNIT_CEILING_SECONDS,
+                                 defer=lambda: _defer_expired_delete(db, sid, key, value))
+        if not updated:
+            return
+        value = updated
+        cleanup = json.loads(value)["cleanup"]
+    from hermes_state_prune_pacing import PrunePacer
+    pacer = PrunePacer(max_size=1 if cleanup.get("attempts") else DELETE_ROWS)
     while True:
         check_prune_budget()
-        selected, size = _page_ids(db, sid, max_rows=1 if cleanup.get("attempts") else DELETE_ROWS)
+        page = [None, 0]
+        def attempt():
+            page[:] = _page_ids(db, sid, max_rows=pacer.size)
+            return db._execute_write(lambda conn: _delete_page(conn, sid, page[0], key, value),
+                                     session_id=sid, input_rows=len(page[0]))
+        def shrink():
+            return pacer.shrink(len(page[0])) if len(page[0]) > 1 else False
+        def seconds():
+            selected, size = _page_ids(db, sid, max_rows=pacer.size)
+            if len(selected) != 1:
+                return 0
+            if cleanup.get("attempts"):
+                return PruneBudget.MIN_UNIT_CEILING_SECONDS
+            return PruneBudget.TRANSACTION_SECONDS * max(1, size / DELETE_BYTES)
         started = time.monotonic()
-        try:
-            with prune_page_budget(sid, size if len(selected) == 1 else 0, cleanup.get("attempts", 0)):
-                progress = db._execute_write(lambda conn: _delete_page(conn, sid, selected, key, value),
-                                             session_id=sid, input_rows=len(selected))
-        except PruneBudgetExpired:
-            current_budget().pause(min(2.0, max(0.05, time.monotonic() - started)))
-            raise
+        progress = run_prune_write(attempt, shrink=shrink, minimum_seconds=seconds, label=sid,
+                                   defer=lambda: _defer_expired_delete(db, sid, key, value))
+        if (budget := current_budget()) is not None and sid in budget.deferred_ids:
+            return
         if not progress:
             break
         pause = min(2.0, max(0.05, time.monotonic() - started))
@@ -143,11 +171,39 @@ def _defer_expired_delete(db, sid, key, value):
     # A pass/window deadline still ends the pass. A page cap only defers this marker.
     budget.check()
     budget.deferred_ids.add(sid)
-    db._execute_write(lambda conn: conn.execute(
+    db._execute_write(lambda conn: _record_expiry(conn, key, value))
+    logger.warning("Session cleanup deferred for %r after writer budget expiry; retirement fence retained", sid)
+
+
+def _record_expiry(conn, key, value):
+    conn.execute(
         "UPDATE state_meta SET value=json_set(value, '$.cleanup.attempts', "
         "COALESCE(json_extract(value, '$.cleanup.attempts'),0)+1, '$.cleanup.last_expired_at', ?) "
-        "WHERE key=? AND value=?", (time.time(), key, value)))
-    logger.warning("Session cleanup deferred for %r after writer budget expiry; retirement fence retained", sid)
+        "WHERE key=? AND value=?", (time.time(), key, value))
+
+
+def defer_retirement(db, select, sessions_dir):
+    """Fence an eligible minimum group while leaving expensive receipt work resumable.
+
+    Recheck eligibility and guards in the same transaction as the fence. No new
+    admission can then race the deferred receipt retirement on the next pass.
+    """
+    from hermes_state_mutation_retirement import RETIRED_PREFIX, _mark_retired, prunable_ids
+    from hermes_state_prune_budget import current_budget
+    def stage(conn):
+        ids, derived = prunable_ids(conn, select(conn))
+        for sid in ids:
+            _mark_retired(conn, RETIRED_PREFIX + sid, expires=sid not in derived, own=True)
+        stage_delete(conn, ids, sessions_dir)
+        for sid in ids:
+            key = RETIRED_PREFIX + sid
+            conn.execute("UPDATE state_meta SET value=json_set(value, '$.cleanup.retirement_pending', json('true')) "
+                         "WHERE key=?", (key,))
+            _record_expiry(conn, key, conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0])
+        return ids
+    ids = db._execute_write(stage, skip_result=[]) or []
+    current_budget().deferred_ids.update(ids)
+    return ids
 
 
 def finish_pending_deletes(db, *, required_ids=()):
@@ -158,7 +214,7 @@ def finish_pending_deletes(db, *, required_ids=()):
     deletes. Errors for the caller's required ids still propagate after the pass.
     """
     from hermes_state_mutation_retirement import RETIRED_PREFIX
-    from hermes_state_prune_budget import PruneBudgetExpired, check_prune_budget, current_budget
+    from hermes_state_prune_budget import check_prune_budget, current_budget
     check_prune_budget()
     required = set(required_ids)
     first_error = None
@@ -174,8 +230,6 @@ def finish_pending_deletes(db, *, required_ids=()):
             continue
         try:
             _finish_delete(db, sid, key, value)
-        except PruneBudgetExpired:
-            _defer_expired_delete(db, sid, key, value)
         except sqlite3.IntegrityError as exc:
             # Keep the guard and durable cleanup marker. A legacy late writer or
             # one row's failing trigger must not block every later delete/prune.

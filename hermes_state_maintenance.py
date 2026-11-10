@@ -414,24 +414,34 @@ class SessionMaintenanceMixin:
         # batch by this one's measured hold and pauses at least that long.
         groups = self._prune_conversation_groups(candidate_ids)
         pacer, position, held = PrunePacer(max_size=25), 0, [0.0]
+        from hermes_state_prune_budget import run_prune_write
         while position < len(groups):
             if within_deletion_window and not deletion_window_open():
                 logger.info("session prune stopped: maintenance.deletion_window closed with %d candidate(s) "
                             "left for the next run", sum(map(len, groups[position:])))
                 break
+            batch_start = position
             requested = []
-            while position < len(groups) and (not requested or len(requested) + len(groups[position]) <= pacer.size):
-                requested += groups[position]
-                position += 1
 
-            def _do(conn, requested=requested):
+            def attempt():
+                nonlocal requested, position
+                position, requested = batch_start, []
+                while position < len(groups) and (not requested or len(requested) + len(groups[position]) <= pacer.size):
+                    requested += groups[position]
+                    position += 1
+                return self._execute_write(_do, skip_result=[]) or []
+
+            def shrink():
+                return pacer.shrink(len(requested)) if position - batch_start > 1 else False
+
+            def _do(conn):
                 started = time.monotonic()
                 try:
                     return _batch(conn, requested)
                 finally:
                     held[0] = time.monotonic() - started
 
-            def _batch(conn, requested):
+            def _select(conn, requested):
                 ph = _placeholders(requested)
                 rows = conn.execute(
                     f"SELECT s.id FROM sessions s WHERE {where} AND s.id IN ({ph})",
@@ -461,23 +471,30 @@ class SessionMaintenanceMixin:
                         str(row["root"]) for row in lineage_rows if str(row["id"]) in guarded
                     }
                     session_ids = [sid for sid in session_ids if sid not in guarded_roots]
-                from hermes_state_mutation_retirement import prune_retired_tombstones, retire_prunable
+                return session_ids
+
+            def _batch(conn, requested):
+                from hermes_state_mutation_retirement import retire_prunable
+                session_ids = _select(conn, requested)
                 session_ids = retire_prunable(conn, sorted(session_ids), defer_messages=True)
-                prune_retired_tombstones(conn)
                 if not session_ids:
                     return []
                 stage_delete(conn, session_ids, sessions_dir)
                 return session_ids
 
-            batch_removed = self._execute_write(_do, skip_result=0) or []
+            def defer():
+                from hermes_state_deletion import defer_retirement
+                return defer_retirement(self, lambda conn: _select(conn, requested), sessions_dir)
+
+            batch_removed = run_prune_write(attempt, shrink=shrink, defer=defer,
+                                             label=lambda: requested or groups[batch_start]) or []
             removed_count += len(batch_removed)
             deleted_ids.extend(batch_removed)
             if batch_removed:
                 emit_session_deleted(self, batch_removed, reason="prune", sessions_dir=sessions_dir)
+            pacer.pause(held[0])
             finish_pending_deletes(self, required_ids=batch_removed)
             # finish_pending_deletes removes transcript files before clearing its marker.
-            if position < len(groups):
-                pacer.pause(held[0])
 
         if removed_count:
             while True:

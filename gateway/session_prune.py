@@ -52,10 +52,12 @@ async def prune(connection, ref, params):
         raise RuntimeStoreError('outside_deletion_window', detail=refusal)
     authority._require_admission_open()
     from gateway.session_runtime_workers import track_mutation
+    from hermes_cli.sessions_owner import PRUNE_RPC_TIMEOUT
     # The owner remains bounded even when its client disappears; its worker owns the
     # deadline, not an asyncio timeout (which cannot stop a running SQLite thread).
+    # Reserve 10% of the client's timeout for settlement and returning the result.
     task = track_mutation(authority, _apply(authority, filters, never_active, not now,
-                                          max_seconds if max_seconds is not None else 540.0))
+                                          max_seconds if max_seconds is not None else PRUNE_RPC_TIMEOUT * 0.9))
     return await asyncio.shield(task)
 
 

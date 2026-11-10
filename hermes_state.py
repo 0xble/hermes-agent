@@ -84,7 +84,7 @@ from hermes_state_maintenance import SessionMaintenanceMixin
 from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
-from hermes_state_transactions import finish_write_maintenance, settle_write_transaction
+from hermes_state_transactions import execute_prune_write, finish_write_maintenance, settle_write_transaction
 from hermes_state_write_stalls import observe_write, write_attempt
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
@@ -1088,8 +1088,8 @@ class SessionDB(
     ) -> T:
         """Run *fn(conn)* in a write transaction; see :meth:`_execute_write_marked`."""
         with observe_write(self.db_path, fn), _storage_write_in_progress(), measure_write():
-            return self._execute_write_marked(
-                fn, patience_s, session_ids=session_ids, skip_result=skip_result, session_id=session_id, input_rows=input_rows)
+            return execute_prune_write(self, fn, patience_s,
+                session_ids=session_ids, skip_result=skip_result, session_id=session_id, input_rows=input_rows)
 
     def _execute_write_marked(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,

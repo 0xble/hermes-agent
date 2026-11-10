@@ -106,11 +106,13 @@ def state_lock(lock, *, db_path, deadline: float | None = None):
     must not turn a queued transcript append into a failed write. Never interrupt
     an acquired transaction.
     """
-    from hermes_state_prune_budget import current_budget, PruneBudgetExpired
+    from hermes_state_prune_budget import current_budget
     if budget := current_budget():
         budget.check()
-        if not lock.acquire(timeout=min(0.1, max(0, budget.deadline - time.monotonic()))):
-            raise PruneBudgetExpired("session prune yielded to the local foreground writer")
+        from hermes_state_prune_pacing import PrunePacer
+        pacer = PrunePacer(max_size=1)
+        while not lock.acquire(blocking=False):
+            pacer.pause(0)
         try:
             budget.check()
             yield
