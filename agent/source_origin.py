@@ -71,7 +71,9 @@ class _StoredRecord(dict):
 
 def stored_origin_metadata(metadata, row=None, *, session_id=None):
     """Called only on metadata acquired from a stored row, never client/import input."""
-    result = dict(metadata or {})
+    if metadata is None:
+        return None
+    result = dict(metadata)
     record = result.get(ORIGIN_KEY)
     if isinstance(record, dict):
         binding = None
