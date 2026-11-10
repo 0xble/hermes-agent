@@ -255,3 +255,13 @@ def test_search_hits_carry_exa_preview_images(backend_harness):
     first, second = _search("compact brushless drill kit")["data"]["web"]
     assert first["image"] == "https://cdn.shop.test/drill.jpg"
     assert "image" not in second
+
+
+def test_execute_code_web_search_stub_uses_paused_schema_wording():
+    """The sandbox stub must not tell agents that stakes=\"standard\" selects Lite."""
+    from tools.code_execution_tool import _TOOL_STUBS
+
+    paused = wt.WEB_SEARCH_SCHEMA["parameters"]["properties"]["stakes"]["description"]
+    doc = _TOOL_STUBS["web_search"][1]
+    assert paused in doc
+    assert 'stakes="standard" marks low-stakes searches for Lite' not in doc
