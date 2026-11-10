@@ -1395,6 +1395,17 @@ print(json.dumps({"wakeAgent": True, "context": {"new_issues": latest - prev}}))
 
 When `wakeAgent` is omitted, the default is `true` (wake the agent as usual).
 
+A nonzero exit, timeout, or termination of the pre-run script marks the run as
+failed, even if the agent replies normally or stays silent. The agent still
+receives the script error so it can explain the failure. The script's exit code
+and reason are retained in the run error and the job's `last_error`. Failure
+delivery names the script and exit code, followed by the agent's reply when it
+is non-empty and not a silence marker. An unavailable exit code is reported as
+unknown. Script failures are classified as script incidents, even when stderr
+contains provider-like errors such as HTTP 429 or 401. Script-only jobs also
+state that no model was invoked. `wakeAgent=false` only skips the agent when the
+script succeeds.
+
 #### Recipes: cheap pre-run gates
 
 The `wakeAgent` gate gives you a $0 way to decide whether a scheduled job should spend any LLM tokens at all. Three patterns cover most use cases.

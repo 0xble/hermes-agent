@@ -277,23 +277,23 @@ def _should_yield_tick_to_fresh_gateway() -> tuple[str, str] | None:
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """One-line failure notice for chat delivery (full details stay in the run output).
 
-    Deterministic scheduler/script shapes are matched first (their text can contain "timed out"
-    and would otherwise be blamed on the model service); everything else goes through the shared
-    ``classify_api_error`` verdict and the copy table in ``scheduler_failure_copy``."""
+    Structured script failures bypass provider classification; legacy timeout and scheduler
+    shapes are also matched before the shared ``classify_api_error`` verdict."""
     from cron.scheduler_failure_copy import (
         classify_cron_failure_reason, generic_failure_notice, inactivity_notice,
-        provider_failure_notice, script_timeout_notice)
+        provider_failure_notice, script_failure_notice, script_timeout_notice)
 
     job_name = job.get("name") or job.get("id") or "cron job"
     job_id = job.get("id") or job_name
     text = (error or "unknown error").strip()
     lower = text.lower()
 
-    # Script runner contract ("Script timed out after {n}s: {path}") — also for agent jobs with a
-    # context script. Must precede provider classification so it never claims a model failure.
-    # See #78503, #82460.
+    if job.get("_script_failed"):
+        return script_failure_notice(job_name, job_id, str(job.get("script") or "unknown script"),
+                                     text, no_agent=bool(job.get("no_agent")))
+    # Legacy callers without a run-side verdict still recognize the runner's timeout contract.
     if lower.startswith("script timed out"):
-        return script_timeout_notice(job_name, job_id)
+        return script_timeout_notice(job_name, job_id, no_agent=bool(job.get("no_agent")))
 
     # Scheduler inactivity watchdog ("idle for {n}s (limit {m}s)"): the job's OWN tool call went
     # quiet, no model service involved. Its text may still contain "timed out", so it must be
@@ -385,7 +385,8 @@ def _upsert_incident_for_failure(
         from cron.incidents import get_incident, upsert_incident
 
         incident_id, _is_new = upsert_incident(
-            job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
+            job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file,
+            failure_type="script" if job.get("_script_failed") else None)
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
@@ -1654,7 +1655,8 @@ def _run_no_agent_job(
             f"{output}\n\n"
             f"Time: {now_iso}"
         )
-        return False, f"{header}**Status:** script failed\n\n{output}\n", alert, output
+        return _merge_script_failure(
+            (False, f"{header}**Status:** script failed\n\n{output}\n", alert, None), output, job=job)
 
     # wakeAgent=false is a silent signal, same as empty stdout.
     if not _parse_wake_gate(output):
@@ -2319,82 +2321,6 @@ def _run_doc_header(job: dict, title: str, job_id: str, prompt: str, *, prompt_s
 _RunResult = tuple[bool, str, str, Optional[str]]
 
 
-def _prepare_job_prompt(
-    job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
-) -> tuple[Optional[_RunResult], Optional[str]]:
-    """Run every pre-agent gate of an agent job and build the prompt. Returns
-    ``(early_result, prompt)``: an early result short-circuits ``run_job`` (monitor gate, wake
-    gate, injection block, empty prompt); otherwise ``prompt`` is set."""
-    # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
-    # user never chose. no_agent jobs never reach here. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
-    from hermes_cli.config import InvalidUserConfigError, require_parseable_user_config
-
-    try:
-        require_parseable_user_config()
-    except InvalidUserConfigError as exc:
-        logger.error("Job '%s': refusing to run — %s", job_id, exc)
-        return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
-
-    _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
-    if _early is not None:
-        return _early, None
-
-    # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
-    # _build_job_prompt so the script runs only once.
-    # run_job acquires its session store before entering this gate so acknowledgements
-    # cannot be consumed by a run that cannot persist its session.
-    prerun_script = None
-    script_path = job.get("script")
-    if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(
-            job,
-            script_path,
-            workdir=_resolve_job_workdir(job, job_id),
-            cancel_event=cancel_event,
-        )
-        _ran_ok, _script_output = prerun_script
-        if _ran_ok and not _parse_wake_gate(_script_output):
-            logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
-            note_cron_skipped(job)
-            silent_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                "Script gate returned `wakeAgent=false` — agent skipped.\n"
-            )
-            return (True, silent_doc, SILENT_MARKER, None), None
-
-    try:
-        prompt = _build_job_prompt(
-            job, prerun_script=prerun_script, extra_prompt=extra_prompt,
-            runtime_data_prompt=monitor_context,
-        )
-    except CronPromptInjectionBlocked as block_exc:
-        # Injection scanner tripped: refuse this tick and tell the operator WHY.
-        logger.warning(
-            "Job '%s' (ID: %s): blocked by prompt-injection scanner — %s", job_name, job_id, block_exc,
-        )
-        blocked_doc = (
-            f"# Cron Job: {job_name}\n\n"
-            f"**Job ID:** {job_id}\n"
-            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"**Status:** BLOCKED\n\n"
-            "The assembled prompt (user prompt + loaded skill content) tripped "
-            "the cron injection scanner and the agent was NOT run.\n\n"
-            f"**Scanner result:** {block_exc}\n\n"
-            "Audit the skill(s) attached to this job for prompt-injection "
-            "payloads or invisible-unicode markers. If the skill is legitimate "
-            "and the match is a false positive, rephrase the content to avoid "
-            "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
-        )
-        return (False, blocked_doc, "", str(block_exc)), None
-    if prompt is None:
-        logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
-        note_cron_skipped(job)
-        return (True, "", SILENT_MARKER, None), None
-    return None, prompt
-
-
 _CRON_DELIVERY_VARS = (
     "HERMES_CRON_AUTO_DELIVER_PLATFORM",
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
@@ -2643,7 +2569,7 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
-
+    job.pop("_script_failed", None)
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
         return _run_no_agent_job(job, job_id, job_name, cancel_event)
@@ -2663,6 +2589,7 @@ def run_job(
                                  execution_id=execution_id)
     job.pop("_session_store_unavailable", None)
     prompt = str(job.get("prompt") or "")
+    script_error = None
 
     _cron_session_id = (owner_execution[1] if owner_execution is not None else
                         f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}")
@@ -2679,9 +2606,9 @@ def run_job(
         # Gate scripts and monitors can acknowledge work. Acquire first so a store outage
         # cannot consume their state, with every early return covered by this finally.
         _session_db = _open_cron_session_db(job)
-        early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+        early, prompt, script_error = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
         if early is not None:
-            return early
+            return _merge_script_failure(early, script_error, job=job)
         from run_agent import AIAgent
         logger.info("Prompt: %s", prompt[:100])
         if scope.workdir:
@@ -2693,7 +2620,7 @@ def run_job(
         model = jc.model
         setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
         if setup.blocked is not None:
-            return setup.blocked
+            return _merge_script_failure(setup.blocked, script_error, job=job)
         model = setup.model
 
         agent = _construct_cron_agent(
@@ -2721,14 +2648,16 @@ def run_job(
                             prompt_stamp=f"{_PROMPT_FRAME}{len(framed_prompt)}\n")
             + f"{_RESPONSE_FRAME}{len(logged_response)}\n{_RESPONSE_HEADING}{logged_response}{_RESPONSE_TERMINATOR}"
         )
-        logger.info("Job '%s' completed successfully", job_name)
-        _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
-        return True, output, final_response, None
+        outcome = _merge_script_failure((True, output, final_response, None), script_error, job=job)
+        logger.info("Job '%s' completed (success=%s)", job_name, outcome[0])
+        _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), outcome[3])
+        return outcome
 
     except Exception as e:
         if isinstance(e, CronSessionStoreUnavailable):
             job["_session_store_unavailable"] = True
-        error_msg = f"{type(e).__name__}: {e!s}"
+        error_msg = _merge_script_failure(
+            (False, "", "", f"{type(e).__name__}: {e!s}"), script_error, job=job)[3]
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
@@ -3099,8 +3028,8 @@ def _compose_run_delivery(
     agent's own ``[CRON_FAILURE]`` evidence, delivered verbatim."""
     err = str(error) if error else ""
     # Failed jobs always deliver, except blocked-config runs, which alert exactly ONCE.
-    blocked_config_silent = BLOCKED_CONFIG_SILENT_MARKER in err
-    blocked_config = blocked_config_silent or BLOCKED_CONFIG_MARKER in err
+    blocked_config_silent = not job.get("_script_failed") and BLOCKED_CONFIG_SILENT_MARKER in err
+    blocked_config = not job.get("_script_failed") and (blocked_config_silent or BLOCKED_CONFIG_MARKER in err)
     incident_acked = False
     failure_incident_id = None
     if blocked_config and not success:
@@ -3120,6 +3049,10 @@ def _compose_run_delivery(
         )
         if incident_acked:
             deliver_content = ""
+        elif job.get("_script_failed"):
+            deliver_content = _summarize_cron_failure_for_delivery(job, error) + _failure_streak_nudge(job)
+            if not job.get("no_agent") and final_response.strip() and not _is_cron_silence_response(final_response):
+                deliver_content += "\n\n" + final_response
         elif agent_declared:
             # The agent already diagnosed the failure in prose; the summarizer's substring
             # heuristics would re-diagnose it ("timed out" -> blame the model service, "401" ->
@@ -4938,12 +4871,12 @@ from cron.scheduler_delivery import (
     _resolve_delivery_targets,
 )
 from cron.scheduler_script import (
-    _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
+    _get_session_db_timeout, _merge_script_failure, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
 )
 from cron.scheduler_prompt import (
     _PROMPT_FRAME, _PROMPT_HEADING, _PROMPT_SEPARATOR, _RESPONSE_FRAME, _RESPONSE_HEADING,
     _RESPONSE_TERMINATOR, _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil,
-    _parse_wake_gate,
+    _parse_wake_gate, _prepare_job_prompt,
 )
 from cron.scheduler_preflight import (
     BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,
