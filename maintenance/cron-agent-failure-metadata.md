@@ -10,6 +10,12 @@ refactors, including ordinary completion and canonical receipt recovery. Read
 [Cron incident classification](cron-incidents.md) before changing type selection;
 explicit script attribution still wins.
 
+The persisted summary is the first meaningful non-fence line of the declared
+failure evidence. This is a presentation rule, not a judgment of summary quality.
+An agent-derived `script` classification falls back to `agent`; only the script
+runner's `_script_failed` signal selects script attribution and its signature
+namespace.
+
 Upstream strict-marker work (#112431/#113155) supplies the declaration contract,
 but persists leading Markdown fences as incident evidence. Related open
 upstream delegation/blocked-tool proposals do not replace this metadata fix.
@@ -18,6 +24,13 @@ No upstream contribution is opened by this draft-only fork delivery.
 Do not rewrite stored incidents. This patch changes new producer records only;
 the exact original response remains in the saved output rather than being
 reconstructed from the normalized summary.
+
+Unwrapping a leading fence changes the stored error text used by
+`_error_signature`. An agent-declared failure whose evidence previously began
+with a fence therefore gets a new signature after the upgrade. If the old
+incident was already acknowledged, the next matching failure can re-alert once
+under the new signature. There is no migration of historical incidents or
+acknowledgments.
 
 ## Proof and retirement
 

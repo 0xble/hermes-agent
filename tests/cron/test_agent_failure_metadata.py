@@ -20,6 +20,7 @@ _AUDIT_RESPONSE = (Path(__file__).parent / "fixtures" / "agent_failure_audit.md"
     ("[CRON_FAILURE]\n\n~~~text\nHTTP 401 Unauthorized\n~~~", "HTTP 401 Unauthorized", "auth"),
     ("[CRON_FAILURE]\n\n```text\n```", "Cron agent reported failure.", "agent"),
     ("[CRON_FAILURE]\nChild failed.\nAuthentication failed in unrelated history.", "Child failed.", "agent"),
+    ("[CRON_FAILURE]\nThe backup script exited 1", "The backup script exited 1", "agent"),
 ])
 def test_declared_failure_persists_meaningful_summary_and_type(tmp_path, monkeypatch, response, summary, failure_type):
     with jobs.use_cron_store(tmp_path / "cron"):
@@ -35,6 +36,10 @@ def test_declared_failure_persists_meaningful_summary_and_type(tmp_path, monkeyp
         assert saved["last_error"].splitlines()[0] == summary
         assert incident["error"].splitlines()[0] == summary
         assert incident["failure_type"] == failure_type
+        assert incident["error_sig"] == incidents._error_signature(job["id"], incident["error"])
+        assert incident["error_sig"] != incidents._error_signature(
+            job["id"], incident["error"], failure_type="script",
+        )
         assert response in Path(incident["output_file"]).read_text()
 
 

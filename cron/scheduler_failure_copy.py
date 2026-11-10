@@ -50,7 +50,8 @@ def agent_failure_type(error: str) -> str:
 
     summary = next((line.strip() for line in error.splitlines() if line.strip()), "")
     kind = _classify_failure_type(summary)
-    return "agent" if kind == "unknown" else kind
+    # Script attribution is reserved for the script runner's _script_failed signal.
+    return "agent" if kind in {"unknown", "script"} else kind
 
 
 def cron_output_dir_display(job_id: str) -> str:
