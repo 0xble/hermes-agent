@@ -107,11 +107,12 @@ def bootstrap(start: bool, recover: bool = False) -> dict:
 def typed_input_pipe():
     """The native composer's private child pipe, never an RPC or metadata import."""
     from pm.environments import activate_dependencies
-    activate_dependencies(python_root())
+    with contextlib.redirect_stdout(sys.stderr):
+        activate_dependencies(python_root())
     from agent.source_origin import typed_input_message
     from agent.source_origin_ingress import publish_input
     from hermes_constants import get_hermes_home
-    record = json.loads(sys.stdin.readline(1_000_001))
+    record = json.loads(sys.stdin.readline())
     if (not isinstance(record, dict) or set(record) != {"session", "request", "text"}
             or not all(isinstance(value, str) and value for value in record.values())):
         raise ValueError("invalid native input")

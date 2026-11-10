@@ -7,12 +7,15 @@ import sys
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from agent.source_origin_ingress import acquire_input, admission_input
 
 
-def test_native_helper_receipt_lives_only_until_the_input_pipe_closes(tmp_path):
+@pytest.mark.parametrize("large", [False, True])
+def test_native_helper_receipt_lives_only_until_the_input_pipe_closes(tmp_path, large):
     root = Path(__file__).resolve().parents[2]
-    text = "Keep notices off."
+    text = "Keep notices off." if not large else "fictional text " * 100_000
     params = {"submission_id": "fictional-input", "text": text}
     request = SimpleNamespace(ref=SimpleNamespace(session_id="fixture"), request_id="fictional-input")
     connection = SimpleNamespace(native_owner=True, authority=SimpleNamespace(

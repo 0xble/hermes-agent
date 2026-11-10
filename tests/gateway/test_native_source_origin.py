@@ -123,3 +123,65 @@ async def test_native_typed_admission_can_be_claimed_without_losing_queued_contr
         origin = restore_input(claimed['payload'].get('source_origin_v1'), text, receipt.admission_id)
         assert retention_user_text(text, [{'role': 'user', 'content': text,
             'display_metadata': origin_metadata(origin) if origin is not None else {}}]) == (text if native else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('native', [True, False])
+async def test_real_native_bootstrap_connection_is_the_only_local_receipt_consumer(tmp_path, monkeypatch, native):
+    from gateway.session_controls import AuthorityConnection
+    from gateway.session_identity import authenticated_subject
+    from tests.gateway.test_session_local_mcp_refreeze import _local_authority
+    from tests.gateway.test_session_authority_cancel_settlement import REF
+    from agent.source_origin import typed_input_message
+    from agent.source_origin_ingress import publish_input
+    from hermes_state_runtime import get_session_admission
+    db, authority = _local_authority(tmp_path, monkeypatch)
+    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
+    identity = {'user_id': 'human', 'provider': 'local' if native else 'remote', 'profile_id': authority.profile_id,
+                'instance_id': authority.instance_id, 'capabilities': ['session:submit', 'session:control'],
+                **({'native_bootstrap': True} if native else {})}
+    authority.sessions['s'].source.user_id = authenticated_subject(identity)
+    connection = AuthorityConnection(authority, object(), identity)
+    connection.subscriptions["s"] = "fictional-attached-viewer"
+    monkeypatch.setattr(connection, '_typed_voice_stop', _false_voice_stop)
+    text = 'Keep notices off.'
+    with db:
+        with publish_input(tmp_path, 's', 'typed', typed_input_message(text, 'tui'), text):
+            response = await connection.dispatch({'id': 1, 'method': 'prompt.submit',
+                'params': {'session_id': 's', 'submission_id': 'typed', 'text': text}})
+        assert 'result' in response, response
+        row = get_session_admission(db, admission_id=response['result']['admission_id'])
+        assert bool(row['payload'].get('source_origin_v1')) is native
+
+
+async def _false_voice_stop(*args):
+    return False
+
+
+@pytest.mark.parametrize('user', ['USLACKBOT', 'USLACK'])
+def test_slack_system_users_cannot_be_verified_even_with_is_bot_false(user):
+    from gateway.platforms.event import MessageEvent
+    event = stamp_slack_person(MessageEvent(text='Keep notices off.', message_id='event'),
+                               {'user': user}, 'Keep notices off.', verified_person=True)
+    assert not source_origin_metadata(event, event.text)
+
+
+@pytest.mark.asyncio
+async def test_failed_slack_identity_lookups_are_bounded_and_retry_after_the_hold(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+    from plugins.platforms.slack.adapter import SlackAdapter
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token='fictional'))
+    adapter._app = MagicMock()
+    adapter._app.client.users_info = AsyncMock(return_value={'ok': False})
+    clock = [100.0]
+    monkeypatch.setattr('plugins.platforms.slack.adapter.time.monotonic', lambda: clock[0])
+    await adapter._resolve_user_is_bot('U_PERSON', team_id='T_TEAM')
+    await adapter._resolve_user_name('U_PERSON', team_id='T_TEAM')
+    await adapter._resolve_user_is_bot('U_PERSON', team_id='T_TEAM')
+    assert adapter._app.client.users_info.await_count == 1
+    assert adapter._user_is_bot_cache[('T_TEAM', 'U_PERSON')] is None
+    clock[0] += 61
+    adapter._app.client.users_info.return_value = {'ok': True, 'user': {'is_bot': False}}
+    await adapter._resolve_user_is_bot('U_PERSON', team_id='T_TEAM')
+    assert adapter._app.client.users_info.await_count == 2
+    assert adapter._user_is_bot_cache[('T_TEAM', 'U_PERSON')] is False

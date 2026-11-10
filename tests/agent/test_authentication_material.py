@@ -63,7 +63,8 @@ def test_every_held_value_is_learned_across_payloads(text, repeat, secret):
 
 
 @pytest.mark.parametrize("text", ["My password is wrong.", "The API key is required for login.",
-                                   "My password is correct.", "The API key is configured."])
+                                   "My password is correct.", "The API key is configured.",
+                                   "My password is wrong!", "The API key is required!"])
 def test_authentication_labels_without_values_pass_unchanged(text):
     assert _redact_for_provider(text) == text
     assert _redact_for_provider({"content": text}, text) == ({"content": text}, text)
@@ -89,3 +90,10 @@ def test_missing_origin_retention_skip_is_info_logged_by_surface(monkeypatch, ca
         manager.sync_all("Keep notices off.", "Acknowledged.", messages=[], platform="tui")
     assert "missing verified origin surface=slack count=2" in caplog.text
     assert "missing verified origin surface=tui count=1" in caplog.text
+
+
+@pytest.mark.parametrize('text', ['\nLine one.\nLine two.\n\n', 'Para one!\n\nPara two?',
+    'My password is the same as before.', 'My password is not working.', 'Password:\nI forgot it',
+    'OTP is in my inbox'])
+def test_prose_and_paragraph_boundaries_survive_authentication_scrubbing(text):
+    assert _redact_for_provider(text, 'Other things in the inbox.') == (text, 'Other things in the inbox.')

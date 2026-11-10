@@ -135,10 +135,14 @@ def typed_input_message(text, platform):
     """Called only where an interactive surface accepts typed text, never by turn builders."""
     import getpass
     from uuid import uuid4
+    try:
+        principal = getpass.getuser()
+    except (KeyError, OSError):
+        return {"role": "user", "content": text}
     event = "typed:" + uuid4().hex
     return {"role": "user", "content": text, "platform_message_id": event,
             "display_metadata": origin_metadata(NativeOrigin.person(
-                text, platform=platform, principal=getpass.getuser(), event=event, authored=authored_text_spans(text)))}
+                text, platform=platform, principal=principal, event=event, authored=authored_text_spans(text)))}
 
 
 def authored_text_spans(text):

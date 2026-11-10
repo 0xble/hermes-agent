@@ -92,3 +92,19 @@ def test_imported_ink_pending_journal_cannot_mint_an_origin(tmp_path):
     path.write_text(json.dumps(record))
     with acquire_input(connection, request.ref, {**params, "display_metadata": record}):
         assert admission_input(request) == {}
+
+
+def test_private_witness_io_failure_does_not_block_input(tmp_path, monkeypatch, caplog):
+    from utils import atomic_json_write
+    text = 'Keep notices off.'
+    message = typed_input_message(text, 'cli')
+    def unavailable(*args, **kwargs):
+        raise OSError('fictional storage failure')
+    monkeypatch.setattr('utils.atomic_json_write', unavailable)
+    with publish_input(tmp_path, 'fixture', 'request', message, text):
+        delivered = True
+    assert delivered and 'Native input origin unavailable' in caplog.text
+    monkeypatch.setattr('utils.atomic_json_write', atomic_json_write)
+    monkeypatch.setattr('getpass.getuser', lambda: (_ for _ in ()).throw(KeyError('no identity')))
+    message = typed_input_message(text, 'cli')
+    assert retention_user_text(text, [message]) is None

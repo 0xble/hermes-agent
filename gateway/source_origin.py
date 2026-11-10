@@ -2,6 +2,8 @@
 
 from agent.source_origin import NativeOrigin, origin_metadata
 
+SLACK_SYSTEM_USERS = frozenset({"USLACKBOT", "USLACK"})
+
 
 def stamp_telegram_person(event, message):
     from gateway.platforms.event import turn_origin_for_event
@@ -35,11 +37,12 @@ def insert_event_context(event, text, offset, addition):
 def stamp_slack_person(event, native, authored_text, *, verified_person=False):
     """Only the adapter's native message event can witness the flat authored body."""
     user = native.get("user")
-    if (verified_person is not True or not isinstance(user, str) or not user or native.get("bot_id") or native.get("bot_profile")
+    if (verified_person is not True or not isinstance(user, str) or not user or user in SLACK_SYSTEM_USERS or native.get("bot_id") or native.get("bot_profile")
             or (native.get("app_id") and not native.get("client_msg_id"))
             or native.get("subtype") not in (None, "file_share", "thread_broadcast")
             or native.get("_hermes_force_process") or event.internal
-            or (native.get("user_profile") or {}).get("is_bot")
+            or native.get("is_app_user") or (native.get("user_profile") or {}).get("is_bot")
+            or (native.get("user_profile") or {}).get("is_app_user")
             or not event.message_id or not authored_text or not event.text.startswith(authored_text)):
         return event
     from agent.source_origin import authored_text_spans

@@ -6,13 +6,15 @@ import re
 _LABEL = (r"(?:(?:recovery|backup|verification|authentication|one[ -]time|login|sign[ -]in|2fa)\s+"
           r"(?:code|token|password)s?|otp|password|passphrase|api[ _-]?key|secret[ _-]?key)")
 _VALUE = re.compile(
-    r"(?P<label>\b" + _LABEL + r"(?:\s*(?:is|are)\s+|\s*[:=]\s*|\s+(?=[`'\"]?\d{4,})))"
+    r"(?P<label>\b" + _LABEL + r"(?:[ \t]*(?:is|are)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+(?=[`'\"]?\d{4,})))"
     r"(?P<value>`[^`\n]+`|\"[^\"\n]+\"|'[^'\n]+'|\S+(?:(?<=[,;])\s+\d{4,}[.,;]?)*)", re.IGNORECASE)
 _SENTENCE = re.compile(r".+?(?:[.!?](?=\s|$)|\n|$)")
 _STATUS_WORDS = frozenset({"wrong", "required", "none", "missing", "needed", "unset", "unavailable",
                            "incorrect", "invalid", "expired", "enabled", "disabled", "optional",
                            "correct", "set", "stored", "configured", "available", "secure", "insecure",
-                           "safe", "unsafe", "strong", "weak", "long", "short"})
+                           "safe", "unsafe", "strong", "weak", "long", "short",
+                           "a", "an", "the", "not", "in", "on", "to", "i", "we", "you", "it",
+                           "my", "your", "this", "that", "same", "still", "there"})
 
 
 def _values(text):
@@ -22,7 +24,7 @@ def _values(text):
         items = re.split(r"[,;]\s*", raw) if re.fullmatch(r"\d{4,}(?:[,;]\s*\d{4,})+", raw) else [raw]
         for item in items:
             value = item.strip().strip("`'\"")
-            if value and (raw[:1] in "`'\"" or value.lower() not in _STATUS_WORDS):
+            if value and (raw[:1] in "`'\"" or value.lower().rstrip(".!?") not in _STATUS_WORDS):
                 yield match, value
 
 
@@ -57,4 +59,4 @@ def exclude_authentication_material(text):
             for index in range(*match.span("value")):
                 if boundaries[index] in ".!?":
                     boundaries[index] = "\0"
-    return "".join(hold(text[match.start():match.end()]) for match in _SENTENCE.finditer("".join(boundaries)))
+    return _SENTENCE.sub(lambda match: hold(text[match.start():match.end()]), "".join(boundaries))

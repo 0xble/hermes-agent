@@ -112,6 +112,7 @@ def _make_adapter():
     adapter._app = MagicMock()
     adapter._user_name_cache = {}
     adapter._user_is_bot_cache = {}
+    adapter._user_info_retry_after = {}
     adapter._channel_name_cache = {}
     adapter._channel_team = {}
     adapter._USER_NAME_CACHE_MAX = 5000

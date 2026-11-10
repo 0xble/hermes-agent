@@ -1070,6 +1070,7 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         self._user_name_cache: dict[tuple[str, str], str] = {}
         self._channel_name_cache: dict[tuple[str, str], str] = {}
         self._user_is_bot_cache: dict[tuple[str, str], bool | None] = {}
+        self._user_info_retry_after: dict[tuple[str, str], float] = {}
         # channel_id → owning team_id (bounded; re-learned on the next event, _get_client falls
         # back to primary). Kept only while exactly one workspace claims the id — _channel_teams
         # holds all claimants; an ambiguous id is dropped, not last-writer-wins.
@@ -3470,16 +3471,32 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
 
     async def _users_info_payload(self, user_id: str, chat_id: str, team_id: str) -> dict:
         """``users.info`` payload for ``user_id`` via the channel's (or default) client."""
-        client = self._get_client(chat_id, team_id=team_id or None) if chat_id else self._app.client
-        return _slack_response_payload(await client.users_info(user=user_id))
+        team_id = str(team_id or self._channel_team.get(chat_id, ""))
+        key, now = (team_id, str(user_id)), time.monotonic()
+        if now < self._user_info_retry_after.get(key, 0):
+            return {}
+        payload = {}
+        try:
+            client = self._get_client(chat_id, team_id=team_id or None) if chat_id else self._app.client
+            payload = _slack_response_payload(await client.users_info(user=user_id))
+            return payload
+        finally:
+            if payload.get("user") and payload.get("ok") is not False:
+                self._user_info_retry_after.pop(key, None)
+            else:
+                self._user_info_retry_after[key] = now + 60
+                self._trim_oldest_dict_entries(self._user_info_retry_after, self._USER_NAME_CACHE_MAX)
 
     @staticmethod
     def _parse_users_info(payload: dict, user_id: str) -> tuple[str, bool]:
         """``(display name, is_bot)`` from a users.info payload; name prefers display → real → id."""
         user = payload.get("user", {})
         profile = user.get("profile", {}) if isinstance(user, dict) else {}
+        from gateway.source_origin import SLACK_SYSTEM_USERS
         is_bot = bool(
-            user.get("is_bot")
+            user_id in SLACK_SYSTEM_USERS
+            or user.get("is_app_user")
+            or user.get("is_bot")
             or user.get("is_workflow_bot")
             or (isinstance(profile, dict) and profile.get("bot_id")))
         name = (
@@ -4689,6 +4706,7 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         if is_command_text:
             text = command_probe_text
         msg_type = MessageType.COMMAND if is_command_text else self._media_message_type(media_types)
+        team_id = str(team_id or self._channel_team.get(channel_id, ""))
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
         # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.

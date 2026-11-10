@@ -9,10 +9,13 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from agent.source_origin import native_origin
 from agent.source_origin_worker import pack_origin, unpack_origin
+
+logger = logging.getLogger(__name__)
 
 _input = ContextVar("native_input_origin", default=None)
 
@@ -31,13 +34,19 @@ def publish_input(home, session, request, message, text):
         from hermes_dir_acl import make_user_dir
         from utils import atomic_json_write
         path = _path(home, session, request)
-        make_user_dir(path.parent, mode=0o700, parents=True, exist_ok=True)
-        atomic_json_write(path, {"session": session, "request": request, "origin": pack_origin(receipt)}, mode=0o600)
+        try:
+            make_user_dir(path.parent, mode=0o700, parents=True, exist_ok=True)
+            atomic_json_write(path, {"session": session, "request": request, "origin": pack_origin(receipt)}, mode=0o600)
+        except OSError as exc:
+            logger.warning("Native input origin unavailable: %s", type(exc).__name__)
     try:
         yield
     finally:
         if path is not None:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Native input origin cleanup unavailable: %s", type(exc).__name__)
 
 
 @contextmanager
@@ -49,7 +58,7 @@ def acquire_input(connection, ref, params):
         path = _path(home, ref.session_id, request)
         try:
             record = json.loads(path.read_bytes())
-        except (FileNotFoundError, ValueError):
+        except (OSError, ValueError):
             record = {}
         if isinstance(record, dict) and record.get("session") == ref.session_id and record.get("request") == request:
             candidate = unpack_origin(record.get("origin"))

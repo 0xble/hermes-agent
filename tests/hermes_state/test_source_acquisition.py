@@ -94,3 +94,16 @@ def test_control_closure_and_origin_preflight_precede_all_body_queries(tmp_path)
         with pytest.raises(EvidenceUnavailable):
             list(acquire_rows(conn, "allowed", policy))
         assert body_reads == []
+
+
+@pytest.mark.parametrize('roots', ['missing', None])
+def test_absent_control_roots_are_not_an_explicit_empty_inventory(tmp_path, roots):
+    import json
+    from hermes_cli.session_evidence import _load_policy
+    data = {'version': 1, 'owner': 'fictional', 'coverage_complete': True, 'inventory_sha256': 'fictional'}
+    if roots != 'missing':
+        data['roots'] = roots
+    manifest = tmp_path / 'roots.json'
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(EvidenceUnavailable, match='invalid owner control coverage'):
+        _load_policy(manifest)

@@ -43,19 +43,24 @@ export async function withNativeTypedInput<T>(input: TypedInput, send: () => Pro
   const closed = new Promise<void>(done => child.once('close', () => done()))
 
   try {
-    await new Promise<void>((ready, reject) => {
-      let output = ''
-      const timer = setTimeout(() => reject(new Error('Native input receipt timed out')), 15_000)
-      child.once('error', error => { clearTimeout(timer); reject(error) })
-      child.stdin.once('error', error => { clearTimeout(timer); reject(error) })
-      child.once('exit', () => { clearTimeout(timer); reject(new Error('Native input receipt unavailable')) })
-      child.stdout.on('data', (chunk: Buffer) => {
-        output += chunk.toString()
+    try {
+      await new Promise<void>((ready, reject) => {
+        let output = ''
+        const timer = setTimeout(() => reject(new Error('Native input receipt timed out')), 2000)
+        child.once('error', error => { clearTimeout(timer); reject(error) })
+        child.stdin.once('error', error => { clearTimeout(timer); reject(error) })
+        child.once('exit', () => { clearTimeout(timer); reject(new Error('Native input receipt unavailable')) })
+        child.stdout.on('data', (chunk: Buffer) => {
+          output += chunk.toString()
 
-        if (/^ready\r?\n/.test(output)) { clearTimeout(timer); ready() }
+          if (/(?:^|\n)ready\r?\n/.test(output)) { clearTimeout(timer); ready() }
+        })
+        child.stdin.write(JSON.stringify({ session: input.session, request: input.request, text: input.text }) + '\n')
       })
-      child.stdin.write(JSON.stringify({ session: input.session, request: input.request, text: input.text }) + '\n')
-    })
+    } catch (error) {
+      child.stdin.end()
+      console.error('Native input origin unavailable:', error instanceof Error ? error.message : String(error))
+    }
 
     return await send()
   } finally {

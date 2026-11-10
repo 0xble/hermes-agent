@@ -13,10 +13,15 @@ def make_agent(request):
 
 
 @pytest.mark.parametrize("typed", [True, False])
-def test_shared_cli_origin_is_private_and_only_typed_input_can_publish(make_agent, tmp_path, monkeypatch, typed):
+@pytest.mark.parametrize("io_failure", [False, True])
+def test_shared_cli_origin_is_private_and_only_typed_input_can_publish(make_agent, tmp_path, monkeypatch, typed, io_failure):
     from agent.source_origin import ORIGIN_KEY, typed_input_message
     from agent.source_origin_ingress import acquire_input, admission_input
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if io_failure:
+        def unavailable(*args, **kwargs):
+            raise OSError("fictional storage failure")
+        monkeypatch.setattr("utils.atomic_json_write", unavailable)
     text = "Keep notices off."
     agent, client = make_agent([frame("message.complete", {"text": "Acknowledged.", "outcome": "completed"})],
                                result={"final_response": "Acknowledged.", "completed": True})
@@ -38,5 +43,5 @@ def test_shared_cli_origin_is_private_and_only_typed_input_can_publish(make_agen
     client.rpc = rpc
     result = agent.run_conversation(text)
     assert result["final_response"] == "Acknowledged."
-    assert bool(received[0]) is typed
+    assert bool(received[0]) is (typed and not io_failure)
     assert list((tmp_path / "cache" / "native-input").glob("*.json")) == []
