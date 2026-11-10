@@ -205,6 +205,8 @@ class SessionCoverageMixin:
         proved = [int(row_id) for row_id in covered_ids if isinstance(row_id, int) and row_id > 0]
         merged_away: set[int] = set()
         content_index = None
+        from hermes_state_compaction_prepare import UNRESOLVED_SNAPSHOT_THRESHOLD
+        index_content = len(unresolved_held or ()) > UNRESOLVED_SNAPSHOT_THRESHOLD
         for message in unresolved_held or ():
             if not isinstance(message, dict):
                 continue
@@ -228,7 +230,7 @@ class SessionCoverageMixin:
             run = self._merged_user_run(conn, session_id, message, watermark)
             if message.get(MERGED_DURABLE_ROWS) and not run:
                 return None
-            if not run and content_index is None:
+            if not run and index_content and content_index is None:
                 content_index = {}
                 for row in conn.execute(
                     "SELECT id, role, content FROM messages WHERE session_id = ? AND active = 1",

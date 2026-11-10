@@ -10,6 +10,7 @@ import pytest
 
 from hermes_state import SessionDB
 from hermes_state_publication import publication_metrics
+from agent.transcript_repair import _OWNED_COLUMNS
 
 
 def test_large_compaction_excludes_preparation_from_write_hold(tmp_path, monkeypatch):
@@ -137,3 +138,23 @@ def test_compaction_reprepares_or_refuses_changed_snapshot(tmp_path, monkeypatch
             assert [m['content'] for m in db.get_messages('topic')] == ['summary', 'concurrent 1']
     finally:
         db.close()
+
+
+@pytest.mark.parametrize('column', list(dict.fromkeys(
+    (*_OWNED_COLUMNS, 'role', 'timestamp', 'message_uid', 'tool_call_uid', 'active'))))
+def test_snapshot_fences_every_proof_column_without_retaining_payload(tmp_path, column):
+    from hermes_state_compaction_prepare import CompactionSnapshotChanged, snapshot_compaction
+
+    with closing(SessionDB(tmp_path / 'state.db')) as db:
+        db.create_session('topic', source='test')
+        db.append_message('topic', 'user', 'body ' * 5000)
+        held = db.get_messages_as_conversation('topic', include_row_ids=True)
+        prepared = snapshot_compaction(db, 'topic', dict(covered_ids=[held[0]['_row_id']],
+            unresolved_held=[], watermark=None, held_messages=held, held_for_cas=held))
+        assert len(repr(prepared.freshness)) < 200
+        value = {'role': 'assistant', 'active': 0, 'timestamp': 123.0, 'token_count': 123,
+                 'observed': 1, '_compressed_summary': 1}.get(column, '[]')
+        with closing(sqlite3.connect(db.db_path)) as writer, writer:
+            writer.execute(f'UPDATE messages SET {column} = ? WHERE session_id = ?', (value, 'topic'))
+        with pytest.raises(CompactionSnapshotChanged):
+            prepared.validate(db._conn)

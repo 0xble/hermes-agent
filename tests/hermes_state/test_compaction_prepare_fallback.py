@@ -6,6 +6,7 @@ import threading
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_compaction_prepare import UNRESOLVED_SNAPSHOT_THRESHOLD
 
 
 @pytest.fixture
@@ -123,3 +124,23 @@ def test_coverage_null_role_matches_sql_semantics(compaction_db):
         unresolved = {'role': None, 'content': 'legacy'}
         assert db._matching_active_ids(conn, 'topic', unresolved) == []
         assert db._proved_coverage(conn, 'topic', [], [unresolved]) == ([], set())
+
+
+@pytest.mark.parametrize('unresolved_count', [
+    0, 1, UNRESOLVED_SNAPSHOT_THRESHOLD, UNRESOLVED_SNAPSHOT_THRESHOLD + 1])
+def test_lease_preparation_only_snapshots_expensive_coverage(compaction_db, monkeypatch, unresolved_count):
+    db = compaction_db
+    assert db.try_acquire_compression_lock('topic', 'holder')
+    original = db._proved_coverage
+    preparations = []
+
+    def prepare(*args):
+        preparations.append(db._conn.in_transaction)
+        return original(*args)
+
+    monkeypatch.setattr(db, '_proved_coverage', prepare)
+    assert db.archive_and_compact('topic', [{'role': 'user', 'content': 'summary'}],
+        lock_holder='holder', covered_ids=[], unresolved_held=[
+            {'role': 'user', 'content': 'never persisted'} for _ in range(unresolved_count)]) == 3
+    assert preparations == [unresolved_count <= UNRESOLVED_SNAPSHOT_THRESHOLD]
+    assert [m['content'] for m in db.get_messages('topic')] == ['summary', 'question', 'answer']
