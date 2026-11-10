@@ -773,17 +773,23 @@ def _note_pinned_skipped(db, filters, action):
           f"(pin is a keep flag). {optin}")
 
 
+def _prune_runtime_refusal(args):
+    from hermes_state_prune_budget import validate_max_seconds
+    value = getattr(args, "max_seconds", None)
+    try:
+        validate_max_seconds(value)
+    except ValueError as exc:
+        return str(exc)
+    if value is not None and getattr(args, "never_active", False):
+        return "--max-seconds applies to retention prune, not --never-active"
+    return None
+
+
 def _cmd_prune_or_archive(db, args, action):
     prune = action == "prune"
-    if prune and getattr(args, "max_seconds", None) is not None:
-        from hermes_state_prune_budget import validate_max_seconds
-        try:
-            validate_max_seconds(args.max_seconds)
-            if getattr(args, "never_active", False):
-                raise ValueError("--max-seconds applies to retention prune, not --never-active")
-        except ValueError as exc:
-            print(f"Error: {exc}")
-            return 1
+    if prune and (refusal := _prune_runtime_refusal(args)):
+        print(f"Error: {refusal}")
+        return 1
     if prune and getattr(args, "never_active", False):
         return _prune_never_active_keyed(db, args)
     from hermes_cli.session_filters import build_prune_filters, describe_filters, format_epoch
