@@ -277,23 +277,23 @@ def _should_yield_tick_to_fresh_gateway() -> tuple[str, str] | None:
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """One-line failure notice for chat delivery (full details stay in the run output).
 
-    Deterministic scheduler/script shapes are matched first (their text can contain "timed out"
-    and would otherwise be blamed on the model service); everything else goes through the shared
-    ``classify_api_error`` verdict and the copy table in ``scheduler_failure_copy``."""
+    Structured script failures bypass provider classification; legacy timeout and scheduler
+    shapes are also matched before the shared ``classify_api_error`` verdict."""
     from cron.scheduler_failure_copy import (
         classify_cron_failure_reason, generic_failure_notice, inactivity_notice,
-        provider_failure_notice, script_timeout_notice)
+        provider_failure_notice, script_failure_notice, script_timeout_notice)
 
     job_name = job.get("name") or job.get("id") or "cron job"
     job_id = job.get("id") or job_name
     text = (error or "unknown error").strip()
     lower = text.lower()
 
-    # Script runner contract ("Script timed out after {n}s: {path}") — also for agent jobs with a
-    # context script. Must precede provider classification so it never claims a model failure.
-    # See #78503, #82460.
+    if job.get("_script_failed"):
+        return script_failure_notice(job_name, job_id, str(job.get("script") or "unknown script"),
+                                     text, no_agent=bool(job.get("no_agent")))
+    # Legacy callers without a run-side verdict still recognize the runner's timeout contract.
     if lower.startswith("script timed out"):
-        return script_timeout_notice(job_name, job_id)
+        return script_timeout_notice(job_name, job_id, no_agent=bool(job.get("no_agent")))
 
     # Scheduler inactivity watchdog ("idle for {n}s (limit {m}s)"): the job's OWN tool call went
     # quiet, no model service involved. Its text may still contain "timed out", so it must be
@@ -385,7 +385,8 @@ def _upsert_incident_for_failure(
         from cron.incidents import get_incident, upsert_incident
 
         incident_id, _is_new = upsert_incident(
-            job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
+            job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file,
+            failure_type="script" if job.get("_script_failed") else None)
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
@@ -1654,7 +1655,8 @@ def _run_no_agent_job(
             f"{output}\n\n"
             f"Time: {now_iso}"
         )
-        return False, f"{header}**Status:** script failed\n\n{output}\n", alert, output
+        return _merge_script_failure(
+            (False, f"{header}**Status:** script failed\n\n{output}\n", alert, None), output, job=job)
 
     # wakeAgent=false is a silent signal, same as empty stdout.
     if not _parse_wake_gate(output):
@@ -2567,7 +2569,7 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
-
+    job.pop("_script_failed", None)
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
         return _run_no_agent_job(job, job_id, job_name, cancel_event)
@@ -2606,7 +2608,7 @@ def run_job(
         _session_db = _open_cron_session_db(job)
         early, prompt, script_error = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
         if early is not None:
-            return _merge_script_failure(early, script_error)
+            return _merge_script_failure(early, script_error, job=job)
         from run_agent import AIAgent
         logger.info("Prompt: %s", prompt[:100])
         if scope.workdir:
@@ -2618,7 +2620,7 @@ def run_job(
         model = jc.model
         setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
         if setup.blocked is not None:
-            return _merge_script_failure(setup.blocked, script_error)
+            return _merge_script_failure(setup.blocked, script_error, job=job)
         model = setup.model
 
         agent = _construct_cron_agent(
@@ -2646,7 +2648,7 @@ def run_job(
                             prompt_stamp=f"{_PROMPT_FRAME}{len(framed_prompt)}\n")
             + f"{_RESPONSE_FRAME}{len(logged_response)}\n{_RESPONSE_HEADING}{logged_response}{_RESPONSE_TERMINATOR}"
         )
-        outcome = _merge_script_failure((True, output, final_response, None), script_error)
+        outcome = _merge_script_failure((True, output, final_response, None), script_error, job=job)
         logger.info("Job '%s' completed (success=%s)", job_name, outcome[0])
         _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), outcome[3])
         return outcome
@@ -2655,7 +2657,7 @@ def run_job(
         if isinstance(e, CronSessionStoreUnavailable):
             job["_session_store_unavailable"] = True
         error_msg = _merge_script_failure(
-            (False, "", "", f"{type(e).__name__}: {e!s}"), script_error)[3]
+            (False, "", "", f"{type(e).__name__}: {e!s}"), script_error, job=job)[3]
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
@@ -3026,8 +3028,8 @@ def _compose_run_delivery(
     agent's own ``[CRON_FAILURE]`` evidence, delivered verbatim."""
     err = str(error) if error else ""
     # Failed jobs always deliver, except blocked-config runs, which alert exactly ONCE.
-    blocked_config_silent = BLOCKED_CONFIG_SILENT_MARKER in err
-    blocked_config = blocked_config_silent or BLOCKED_CONFIG_MARKER in err
+    blocked_config_silent = not job.get("_script_failed") and BLOCKED_CONFIG_SILENT_MARKER in err
+    blocked_config = not job.get("_script_failed") and (blocked_config_silent or BLOCKED_CONFIG_MARKER in err)
     incident_acked = False
     failure_incident_id = None
     if blocked_config and not success:
@@ -3047,6 +3049,10 @@ def _compose_run_delivery(
         )
         if incident_acked:
             deliver_content = ""
+        elif job.get("_script_failed"):
+            deliver_content = _summarize_cron_failure_for_delivery(job, error) + _failure_streak_nudge(job)
+            if not job.get("no_agent") and final_response.strip() and not _is_cron_silence_response(final_response):
+                deliver_content += "\n\n" + final_response
         elif agent_declared:
             # The agent already diagnosed the failure in prose; the summarizer's substring
             # heuristics would re-diagnose it ("timed out" -> blame the model service, "401" ->
