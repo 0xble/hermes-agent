@@ -15,7 +15,7 @@
         "type": "string"
       },
       "stakes": {
-        "description": "Optional. standard: low-stakes lookups where some error is cheap (docs, APIs, product specs, how-tos, recipes, navigation, background); may use a cheaper search tier. Omit or pass high for legal, financial, tax, medical, compliance, official sources, news, prices, safety, time-sensitive or costly-if-wrong work. When unsure, omit.",
+        "description": "Optional quality hint. Exa Lite is paused by default: all Exa searches use full Auto regardless of this hint. If Lite is explicitly re-enabled, standard permits low-stakes lookups; high or omission retains Auto. Use high or omit for protected, time-sensitive or costly-if-wrong research.",
         "enum": [
           "standard",
           "high"
