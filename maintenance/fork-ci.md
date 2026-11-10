@@ -72,6 +72,23 @@ instead of losing every result to SIGKILL.
 
 Contract tests: `tests/e2e/core/upgrade/test_install_downloads.py` `tests/e2e/core/upgrade/test_install_cache.py`
 
+## Worker deadline exit observation
+
+The deadline probe keeps its 2-second request bound and immediate worker-reaped
+assertion. A killed non-child can close its inherited stdout pipe before the
+kernel marks it a zombie. The caller has already read EOF, so the sleeper cannot
+still retain that pipe, but an immediate liveness probe can still see it exiting.
+Observe descendant exit within the existing 5-second cleanup bound, matching the
+sibling worker lifetime tests, and kill any owned survivor on failure. Keep the
+no-survivor assertion and production cleanup unchanged. Hosted run
+https://github.com/0xble/hermes-agent/actions/runs/42753302737 recorded this race in
+`test_worker_deadline_reaps_the_worker_and_its_child[True]`.
+
+Contract tests: `tests/pm/test_worker_deadline.py`, `tests/pm/test_worker_lifetime.py`.
+
+Retire this fixture correction when upstream observes asynchronous descendant exit
+without assuming zero signal-delivery latency. Rollback changes no product state.
+
 ## Upgrade scenario scheduling
 
 The historical N-1 migration file previously ran 7 cases serially. On failing
