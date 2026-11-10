@@ -4,6 +4,9 @@ from agent.source_origin import NativeOrigin, ORIGIN_KEY
 
 
 def stamp_telegram_person(event, message):
+    from gateway.platforms.event import turn_origin_for_event
+    if turn_origin_for_event(event) in {"relay", "process", "goal_loop", "cron"}:
+        return event
     user = getattr(message, "from_user", None)
     # A forwarded message, channel post, or bot-mediated payload is not this person's authored span.
     if (user is not None and getattr(user, "is_bot", None) is False
@@ -49,14 +52,15 @@ def _telegram_authored_spans(text, entities):
 def source_origin_metadata(event, text):
     if not isinstance(text, str):
         return {}
-    metadata = event.metadata or {}
+    from gateway.platforms.event import turn_origin_for_event
+    producer = turn_origin_for_event(event)
     origin = getattr(event, "_native_origin", None)
     if (isinstance(origin, NativeOrigin) and origin.decision(text).status == "verified_human"
             and origin.spans != ((0, len(text)),)):
         return {ORIGIN_KEY: origin}
-    if event.internal or any(metadata.get(key) for key in ("goal_continuation", "loop_wake", "process_notice",
-                                                          "delegation_id", "relay_origin")):
-        origin = NativeOrigin.generated(text, producer="gateway_runtime", event=str(event.message_id or "wake"))
+    if event.internal or producer in {"relay", "process", "goal_loop", "cron"}:
+        origin = NativeOrigin.generated(text, producer=producer if producer != "unknown" else "gateway_runtime",
+                                       event=str(event.message_id or "wake"))
     else:
         origin = getattr(event, "_native_origin", None)
     return {ORIGIN_KEY: origin} if isinstance(origin, NativeOrigin) and origin.decision(text).status != "unknown" else {}

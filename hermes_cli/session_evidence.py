@@ -76,7 +76,7 @@ def _write(data: bytes) -> None:
 def _capture(stream: _Stream, *, home, profile: str, session_id: str | None, policy=None) -> None:
     transcript = session_id is not None
     with evidence_snapshot(home / "state.db") as conn:
-        from hermes_state_acquisition import acquire_rows, acquisition_preflight
+        from hermes_state_acquisition import ACQUISITION_COLUMNS, acquire_rows, acquisition_preflight
         validate_projection(conn)
         if transcript:
             acquisition_preflight(conn, session_id, policy)
@@ -93,8 +93,7 @@ def _capture(stream: _Stream, *, home, profile: str, session_id: str | None, pol
         }
         if transcript:
             header.update(session=origin, human_origin="per_event_preflight", version=2,
-                          projection=["id", "session_id", "message_uid", "role", "timestamp", "origin",
-                                      "disposition", "content", "authored_spans", "principal", "platform", "event"])
+                          projection=list(ACQUISITION_COLUMNS))
         stream.emit(header)
         rows = acquire_rows(conn, session_id, policy) if transcript else inventory_rows(conn)
         if not transcript:

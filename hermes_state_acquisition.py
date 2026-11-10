@@ -11,6 +11,10 @@ from hermes_state_evidence import EvidenceUnavailable, MAX_SOURCE_ROW_BYTES, _bo
 
 # Native session creation records these producer identities, independently of display titles.
 CONTROL_ORIGINS = frozenset({"audit_control", "recovery_control"})
+ORIGIN_COLUMNS = ("id", "session_id", "message_uid", "role", "timestamp", "platform_message_id", "display_kind",
+                  "active", "compacted", "_compressed_summary", "absorbed_message_uids")
+ACQUISITION_COLUMNS = ORIGIN_COLUMNS + ("origin", "disposition", "content", "principal", "platform", "event",
+                                      "authored_spans", "authored_references", "correction_evidence")
 
 
 @dataclass(frozen=True)
@@ -89,11 +93,9 @@ def acquisition_preflight(conn, session_id, policy):
 def _origin_rows(conn, session_id):
     # Only this reserved namespace is inspected, and only after structural admission.
     # Do not materialize unrelated display metadata or any content column for origin guessing.
-    columns = ("id", "session_id", "message_uid", "role", "timestamp", "platform_message_id", "display_kind",
-               "active", "compacted", "_compressed_summary", "absorbed_message_uids")
     origin = """, CASE WHEN octet_length(display_metadata) <= ? AND json_valid(display_metadata)
         THEN json_extract(display_metadata, '$._hermes_source_origin') END AS source_origin FROM """
-    sql = _bounded_projection("messages", columns).replace(" FROM ", origin, 1)
+    sql = _bounded_projection("messages", ORIGIN_COLUMNS).replace(" FROM ", origin, 1)
     sql += " WHERE session_id = ? COLLATE BINARY AND role IN ('user', 'assistant') ORDER BY id"
     for row in conn.execute(sql, (MAX_ORIGIN_BYTES, session_id)):
         result = dict(row)

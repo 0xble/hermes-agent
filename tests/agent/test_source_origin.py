@@ -37,6 +37,11 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
     forwarded = stamp_telegram_person(MessageEvent(text=directive, message_id="forward-1"),
         SimpleNamespace(from_user=native.from_user, forward_origin="quoted", via_bot=None, sender_chat=None))
     assert not source_origin_metadata(forwarded, directive)
+    relay_text = directive + "\n[relay from=fictional receipt=fixture-1]"
+    relay = stamp_telegram_person(MessageEvent(text=relay_text, message_id="relay-1"),
+        SimpleNamespace(**{**native.__dict__, "text": relay_text}))
+    assert relay._native_origin is None
+    assert source_origin_metadata(relay, relay_text)["_hermes_source_origin"].decision(relay_text).status == "generated"
     control = MessageEvent(text=generated + "\n" + directive, message_id="wake-1")
     control.absorb_reply_expected(event)
     assert human_spans(control.text, control._native_origin.decision(control.text)) == directive
