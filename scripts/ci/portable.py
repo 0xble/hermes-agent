@@ -932,6 +932,7 @@ def history_policy() -> None:
 def static(env: dict[str, str]) -> None:
     require_tools(('uv',), env)
     py = python(env)
+    base = git('merge-base', 'origin/main', 'HEAD').strip()
     commands = [
         [py, '-m', 'unittest', 'discover', '-s', 'scripts/ci/tests', '-p', 'test_*.py'],
         # ``ruff.toml`` is the contributor/pre-commit ratchet and intentionally retains a
@@ -939,7 +940,7 @@ def static(env: dict[str, str]) -> None:
         # pyproject.toml carries the maintained rules, while evals/ is research code outside
         # the shipped package and has its own probes.
         [py, '-m', 'ruff', '--config', 'pyproject.toml', 'check', '.', '--exclude', 'evals'],
-        [py, '-m', 'scripts.code_health', '--base', git('merge-base', 'origin/main', 'HEAD').strip(),
+        [py, '-m', 'scripts.code_health', '--base', base,
          '--head', 'HEAD'],
         [py, 'scripts/check-windows-footguns.py', '--all'],
         [py, 'scripts/check_no_tmp_literals.py'],
@@ -947,7 +948,7 @@ def static(env: dict[str, str]) -> None:
         [py, 'scripts/check-case-collisions.py'],
         [py, 'scripts/ci/check_profile_archive_boundary.py'],
         [py, 'scripts/ci/check_lazy_deps_imports.py'],
-        [py, 'scripts/ci/check_blob_size.py', '--base', git('merge-base', 'origin/main', 'HEAD').strip(), '--head', 'HEAD'],
+        [py, 'scripts/ci/check_blob_size.py', '--base', base, '--head', 'HEAD'],
         [py, 'scripts/ci/check_dependency_bounds.py', '--repo', '.'],
         [py, 'scripts/check_fork_patches.py', '--repo', '.', '--source-only'],
         [py, 'scripts/validate_plugin_catalog.py', 'plugin-catalog/'],
