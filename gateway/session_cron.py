@@ -156,7 +156,7 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
 # (cron/quota_hold.py parks past a closed usage window; cron/unreachable_retry.py re-runs a
 # never-reached model; a store-unavailable refusal preserves repeat budget). They cross the
 # authority boundary inside the cron result.
-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_session_store_unavailable')
+RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_session_store_unavailable', '_script_failed')
 
 
 async def operation(authority, name, params, actor=None):

@@ -119,9 +119,21 @@ def generic_failure_notice(job_name: str, job_id: str, cleaned_error: str) -> st
     )
 
 
-def script_timeout_notice(job_name: str, job_id: str) -> str:
+def script_failure_notice(
+    job_name: str, job_id: str, script: str, error: str, *, no_agent: bool,
+) -> str:
+    """The script runner's redacted evidence, never interpreted as a provider failure."""
+    # The runner's first line carries the exit code, after the path on timeouts.
+    # Keep it intact so long paths cannot truncate that evidence away.
+    cleaned = error.splitlines()[0].strip().rstrip(".")
+    mode = " No model was invoked." if no_agent else ""
+    return generic_failure_notice(job_name, job_id, f"script `{script}` failed: {cleaned}") + mode
+
+
+def script_timeout_notice(job_name: str, job_id: str, *, no_agent: bool = False) -> str:
+    mode = " No model was invoked." if no_agent else ""
     return (
-        f"⚠️ Cron '{job_name}' failed: its script timed out. No model was invoked. "
+        f"⚠️ Cron '{job_name}' failed: its script timed out.{mode} "
         f"Check the script's output under {cron_output_dir_display(job_id)} or `hermes cron runs {job_id}`, "
         f"then run it again with `hermes cron run {job_id}`."
     )

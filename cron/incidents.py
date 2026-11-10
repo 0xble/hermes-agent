@@ -142,14 +142,15 @@ def _redact_error(error: str) -> str:
     return text[:MAX_ERROR_CHARS]
 
 
-def _error_signature(job_id: str, error: str) -> str:
+def _error_signature(job_id: str, error: str, *, failure_type: Optional[str] = None) -> str:
     """Dedup key: stable for same job + cause. Durations and scheduled instants vary per occurrence."""
     normalized = _DURATION_RE.sub("#s", _normalize_error(error))
     normalized = re.sub(
         r"\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})\b",
         "<scheduled>", normalized,
     )[:_MAX_SIGNATURE_ERROR_CHARS]
-    return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
+    namespace = b"script\0" if failure_type == "script" else b""
+    return hashlib.sha256(namespace + job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 
 def _incident_id(job_id: str, error_sig: str) -> str:
@@ -177,7 +178,7 @@ def upsert_incident(
     closed, while a ``resolved`` one (job recovered, then broke the same way again) re-opens as
     ``detected`` so the operator is alerted once more. A changed error text mints a new incident."""
     job_id = str(job_id or "")
-    sig = _error_signature(job_id, error)
+    sig = _error_signature(job_id, error, failure_type=failure_type)
     stored_error = _redact_error(error)
     incident_id = _incident_id(job_id, sig)
     now = _hermes_now().isoformat()
