@@ -26,7 +26,7 @@ def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
 
 def _url_blocked(_bt, url: str) -> bool:
     """True when ``url`` hits the always-blocked cloud-metadata floor or fails the SSRF guard."""
-    return _bt._is_always_blocked_url(url) or not _bt._is_safe_url(url)
+    return url != "about:blank" and (_bt._is_always_blocked_url(url) or not _bt._is_safe_url(url))
 
 
 # URL-shaped literals embedded in a JS expression (http/https only). fetch/XHR/navigate

@@ -696,6 +696,9 @@ def _url_policy_error(url: str, *, auto_local: bool = False, task_id: Optional[s
     magic links, OAuth callbacks and signed CDN assets are how the agent signs in and browses, and
     a cloud browser already sees every cookie and typed password of the session — refusing the
     URL protects nothing. Hermes' own secrets leaking into a URL are caught by ``_secret_url_error``."""
+    # The exact empty document is non-network, not a general about:/file:/data: exemption.
+    if url == "about:blank":
+        return None
     local = not _task_cdp.task_browser_url(task_id) and _cloud._is_local_backend()
     # Always-blocked floor: cloud metadata / IMDS endpoints are denied regardless of backend, hybrid
     # routing, or allow_private_urls. There's no legitimate agent use case for navigating to 169.254.169.254
@@ -742,7 +745,7 @@ def _post_redirect_block(nav_session_key: str, url: str, final_url: str, auto_lo
     first so later snapshots can't read the internal content. The metadata floor fires for
     every backend; the private-address check is skipped for local, the sidecar, and
     ``browser.allow_private_urls``."""
-    if not final_url or final_url == url:
+    if not final_url or final_url == url or final_url == "about:blank":
         return None
     if _is_always_blocked_url(final_url):
         what = "a cloud metadata endpoint"

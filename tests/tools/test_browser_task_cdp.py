@@ -153,6 +153,24 @@ def test_quarantined_attachment_cannot_be_silently_detached(boundary, monkeypatc
     assert task_browser_url("external") == ENDPOINT
 
 
+def test_inactivity_reaper_preserves_attachment_and_dispatch_route(boundary, monkeypatch):
+    from tools.browser_task_cdp import attach_task_browser, detach_task_browser, task_browser_url
+    argv, camofox, _ = boundary
+    monkeypatch.setattr(bt, "BROWSER_SESSION_INACTIVITY_TIMEOUT", 0.01)
+    attach_task_browser("external", ENDPOINT)
+    bt._session_last_activity["external"] -= 1
+    # The same janitor pass must still retire an ordinary idle task.
+    bt._session_last_activity["ordinary"] = bt._session_last_activity["external"]
+    bt._lifecycle._cleanup_inactive_browser_sessions()
+    assert "ordinary" not in bt._session_last_activity
+    assert task_browser_url("external") == ENDPOINT
+    assert dispatch("browser_click", {"ref": "@e1"}, "external")["success"]
+    assert argv[-1][1]["cdp_url"] == ENDPOINT
+    camofox.assert_not_called()
+    assert detach_task_browser("external")
+    assert dispatch("browser_click", {"ref": "@e1"}, "external")["backend"] == "camofox"
+
+
 def test_timeout_replacement_keeps_external_routing(boundary, tmp_path):
     from tools.browser_task_cdp import attach_task_browser, task_browser_url
     attach_task_browser("external", ENDPOINT)
@@ -192,6 +210,47 @@ def test_external_navigation_and_eval_keep_nonlocal_url_guards(boundary, monkeyp
     assert not result["success"]
     assert not argv
     camofox.assert_not_called()
+
+
+def test_external_blank_navigation_snapshot_and_eval_keep_other_schemes_blocked(boundary, monkeypatch):
+    from tools.browser_task_cdp import attach_task_browser
+    argv, camofox, _ = boundary
+    monkeypatch.setattr(bt._cloud, "_allow_private_urls", lambda: False)
+    attach_task_browser("external", ENDPOINT)
+    assert dispatch("browser_navigate", {"url": "about:blank"}, "external")["success"]
+    assert any("open" in cmd and "about:blank" in cmd for _, _, cmd in argv)
+    spawn = session._spawn_and_collect
+
+    def on_blank(task_id, info, cmd_parts, *rest):
+        result = spawn(task_id, info, cmd_parts, *rest)
+        if "window.location.href" in cmd_parts:
+            result["data"]["result"] = "about:blank"
+        return result
+
+    monkeypatch.setattr(session, "_spawn_and_collect", on_blank)
+    assert dispatch("browser_snapshot", {}, "external")["success"]
+    assert dispatch("browser_console", {"expression": "document.title"}, "external")["success"]
+    argv.clear()
+    for url in ("about:config", "about:blank#fragment", "file:///etc/hosts", "data:text/html,fixture", "javascript:alert(1)"):
+        assert not dispatch("browser_navigate", {"url": url}, "external")["success"]
+    assert not argv
+    camofox.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["list", "unlock", "fill", "save_login", "enter_code"])
+def test_vault_fails_closed_before_any_parked_browser_or_vault_access(boundary, monkeypatch, action):
+    from tools import browser_vault_tool as vault
+    from tools.browser_task_cdp import attach_task_browser
+    access = Mock(side_effect=AssertionError("attached tasks must not access the vault or parked browser"))
+    for name in ("browser_vault_list", "browser_vault_unlock", "_fenced_page_op"):
+        monkeypatch.setattr(vault, name, access)
+    attach_task_browser("external", ENDPOINT)
+    result = dispatch("browser_vault", {"action": action, "handle": "fixture"}, "external")
+    assert result.get("success") is False
+    assert result["error_type"] == "unsupported_backend"
+    assert "attached" in result["error"]
+    access.assert_not_called()
+    boundary[1].assert_not_called()
 
 
 def test_broken_endpoint_does_not_fall_back_or_close(boundary, monkeypatch):

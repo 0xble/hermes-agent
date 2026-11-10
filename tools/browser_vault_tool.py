@@ -1273,7 +1273,14 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
 
 
 def _handle_vault(args: dict[str, Any], **kwargs) -> str:
+    from tools.browser_task_cdp import task_browser_url
     tid = kwargs.get("task_id")
+    if task_browser_url(tid):
+        return json.dumps({
+            "success": False, "error_type": "unsupported_backend",
+            "error": "browser_vault is unsupported for an attached external task browser; "
+                     "detach it to use the managed browser. No parked Camofox tab was accessed.",
+        })
     action = str(args.get("action") or "")
     handle, label = str(args.get("handle") or ""), str(args.get("label") or "")
     if action == "list":

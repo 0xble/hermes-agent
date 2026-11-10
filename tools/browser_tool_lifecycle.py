@@ -157,7 +157,10 @@ def _cleanup_inactive_browser_sessions():
 
     with _bt._cleanup_lock:
         sessions_to_cleanup = [task_id for task_id, last_time in list(_bt._session_last_activity.items())
-                               if current_time - last_time > _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT]
+                               if current_time - last_time > _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT
+                               # Borrowed attachments belong to the plugin/task lifecycle. Dropping
+                               # one here would silently route the next call to parked Camofox.
+                               and not (_bt._active_sessions.get(task_id) or {}).get("external_task_browser")]
 
     for task_id in sessions_to_cleanup:
         with _session_owner_scope(task_id):
