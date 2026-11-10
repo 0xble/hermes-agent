@@ -58,7 +58,10 @@ of active row ids, timestamps, durable identities and CAS-owned columns not
 covered by the transcript revision trigger. The large content/tool/reasoning
 bodies are fenced by that revision instead of copied or hashed in the writer
 transaction. No full payload copy survives preparation. Summary markers and
-untriggered sidecars remain fenced. Unrelated session writes cannot invalidate the proof.
+untriggered sidecars remain fenced. The revision covers UPDATEs. Inserts/deletes
+are fenced by the id set, and supported writers never delete/reinsert or REPLACE
+an existing id with changed bodies and identical identities. Arbitrary SQL that
+does so is outside this fence. Unrelated session writes cannot invalidate the proof.
 A changed token rolls back the attempt and repeats preparation outside the writer
 lock. After 2 optimistic attempts, the final attempt prepares inside the writer
 transaction, preserving the original compaction's progress under contention.
