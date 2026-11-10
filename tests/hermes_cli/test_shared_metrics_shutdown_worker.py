@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from hermes_cli.observability import relay_shared_metrics
 from hermes_cli.observability.shared_metrics_process import EXIT_FLUSH_TIMEOUT_S
 from tests.hermes_cli.test_relay_shared_metrics_runtime import direct_runtime
 
+pytestmark = pytest.mark.usefixtures("direct_runtime")
 
-def test_shutdown_joins_the_inflight_export_before_its_final_export(direct_runtime, monkeypatch):
+
+def test_shutdown_joins_the_inflight_export_before_its_final_export(monkeypatch):
     runtime = relay_shared_metrics._get_runtime()
     assert runtime is not None
     entered, release, observed = (threading.Event() for _ in range(3))
@@ -56,7 +60,7 @@ def test_shutdown_joins_the_inflight_export_before_its_final_export(direct_runti
     assert not runtime._registered
 
 
-def test_shutdown_join_timeout_leaves_the_final_flush_with_its_worker(direct_runtime, monkeypatch):
+def test_shutdown_join_timeout_leaves_the_final_flush_with_its_worker(monkeypatch):
     runtime = relay_shared_metrics._get_runtime()
     assert runtime is not None
     entered, release = threading.Event(), threading.Event()
