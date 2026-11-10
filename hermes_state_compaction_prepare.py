@@ -28,8 +28,9 @@ def _session_freshness(conn: sqlite3.Connection, session_id: str) -> tuple:
     session = conn.execute(
         'SELECT transcript_revision, runtime_revision, runtime_generation FROM sessions WHERE id = ?',
         (session_id,)).fetchone()
-    # messages_transcript_revision_update fences the large transcript bodies, including writes
-    # by old builds. Fence only the remaining CAS/identity columns here. Stream their digest:
+    # messages_transcript_revision_update fences UPDATEs to the large transcript bodies, including
+    # old builds. Inserts/deletes change the id set: supported writers never replace an existing id.
+    # Fence only the remaining CAS/identity columns here. Stream their digest:
     # sidecars can be large too, and no payload copy may ride across the commit.
     revision_columns = {'role', 'content', 'api_content', 'tool_calls', 'tool_call_id',
                         'tool_name', 'reasoning', 'reasoning_content', 'reasoning_details'}
