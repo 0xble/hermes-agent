@@ -1830,7 +1830,9 @@ These dedicated JSONL streams are separate from the bounded `session_state` tool
 
 `role=user`, API author labels, shared-chat sender IDs, skill bodies and synthetic recovery labels do not prove who typed a turn. These stores do not provide a universal per-turn human principal, so every message and transcript header explicitly reports `human_origin: "unknown"`. This stream does not synthesize, certify or backfill provenance.
 
-Each stream contains 1 `header`, then `session` or `message` records, then 1 terminal `footer`. The header identifies scope, ordering, source projection, byte ceilings and redaction/hash semantics. Values pass through the existing forced secret redactor. If a source identity would be changed by redaction, the operation refuses rather than silently rewriting IDs. No raw-secret hash is emitted.
+Streaming requires an existing WAL journal mode. Other journal modes are refused before output to prevent a stalled consumer from blocking writers. The command never changes journal mode.
+
+Each stream contains 1 `header`, then `session` or `message` records, then 1 terminal `footer`. The header identifies scope, ordering, source projection, byte ceilings and redaction/hash semantics. Values pass through the existing forced secret redactor. If a source identity would be changed by redaction, the operation refuses rather than silently rewriting IDs, including routing identities `user_id`, `chat_id` and `session_key`. No raw-secret hash is emitted.
 
 The footer's `count` counts data records, not the header or footer. `sha256` covers the **exact emitted UTF-8 bytes of the header and every data record, including each LF**, excluding the footer itself. `hashed_bytes` is the byte length of that same prefix. This deterministic fingerprint detects changes to projected, redacted content, flags, origin metadata or graph edges, even when counts do not change. It is not a hash of excluded fields or of the original unredacted source. Independent invocations have independent snapshots, so compare fingerprints before reusing a capture.
 

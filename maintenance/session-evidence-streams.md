@@ -16,6 +16,10 @@ The narrow snapshot bypasses the general `SessionDB` constructor's FTS `SELECT *
 
 ## Update And Verification
 
+Contract tests: `tests/hermes_cli/test_session_evidence_stream.py`.
+
+Streaming requires an existing WAL journal mode. Non-WAL stores are refused before output because a stalled consumer could otherwise block writers. The read-only command never changes journal mode. Routing identities (`user_id`, `chat_id`, `session_key`) that need redaction are refused rather than rewritten. Closed output pipes exit unsuccessfully without shutdown flush noise.
+
 For upstream adoption, inspect physical row ordering, origin/display columns, compaction and rewind flags, native index identity and read-only opening semantics. An upstream export or search command is not equivalent merely because it can print conversation text. Keep missing provenance explicitly unknown until a verified source-owned per-turn principal exists, never infer one from role, title, synthetic identity, API label or shared-chat metadata.
 
 `tests/hermes_cli/test_session_evidence_stream.py` owns the fixture contract, real entry-point profile checks, SQLite authorizer projection proof, concurrent WAL snapshot evidence, pre-acquisition huge-field refusal, streaming memory bound and emitted-byte digest checks. Run it alongside `tests/hermes_cli/test_sessions_inspect.py` and `tests/hermes_cli/test_sessions_export_read_only.py` through `scripts/run_tests.sh` with an isolated test scratch root and the worktree interpreter. Only fictional source-owned fixture stores are required. Neither maintenance verification nor publication authorizes querying an operational store, loading real transcripts or writing to a memory system.

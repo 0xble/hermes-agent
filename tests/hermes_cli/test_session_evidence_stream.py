@@ -27,6 +27,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_SESSION_PROFILE", "wrong-inherited-profile")
     conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA_SQL)
     conn.execute("CREATE VIRTUAL TABLE messages_fts USING fts5(content)")
     conn.execute("INSERT INTO messages_fts (content) VALUES (?)", ("forbidden FTS body",))
@@ -318,8 +319,10 @@ def _selected_entrypoint(store, tmp_path, explicit_profile):
     selected.mkdir(parents=True)
     with sqlite3.connect(selected / "state.db") as target:
         store.backup(target)
+        target.execute("PRAGMA journal_mode=WAL")
     with sqlite3.connect(root / "state.db") as target:
         store.backup(target)
+        target.execute("PRAGMA journal_mode=WAL")
         target.execute("UPDATE messages SET content = 'wrong default home' WHERE role = 'user'")
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "user"),
            "HERMES_HOME": str(root if explicit_profile else selected),
@@ -434,3 +437,36 @@ def test_transcript_is_exact_bounded_audit_evidence_or_fails_closed(audit_case, 
         assert (tmp_path / "state.db").read_bytes() == before_bytes
     if scenario == "large":
         assert peak is not None and peak < 5 * 1024 * 1024
+
+
+@pytest.mark.parametrize("operation", ["inventory", "transcript"])
+@pytest.mark.parametrize("journal", ["delete", "truncate", "persist"])
+def test_stream_refuses_non_wal_before_output(store, operation, journal, capsys, monkeypatch):
+    store.execute(f"PRAGMA journal_mode={journal}")
+    code, sink, error, _ = _capture(capsys, monkeypatch, operation)
+    assert code == 1 and "WAL" in error
+    assert sink.header is None and sink.footer is None
+    assert store.execute("PRAGMA journal_mode").fetchone()[0] == journal
+
+
+@pytest.mark.parametrize("field", ["user_id", "chat_id", "session_key"])
+@pytest.mark.parametrize("operation", ["inventory", "transcript"])
+def test_routing_identity_is_refused_rather_than_masked(store, field, operation, capsys, monkeypatch):
+    store.execute(f"UPDATE sessions SET {field} = ? WHERE id = 'root'", ("+12025550198",))
+    store.commit()
+    code, sink, error, _ = _capture(capsys, monkeypatch, operation)
+    assert code == 1 and "source identity requires redaction" in error
+    assert sink.footer is None
+
+
+def test_closed_output_pipe_has_no_shutdown_flush_noise(store, tmp_path):
+    command, env, _ = _selected_entrypoint(store, tmp_path, False)
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        result = subprocess.run(command, env=env, cwd=Path(__file__).resolve().parents[2],
+                                stdout=write_fd, stderr=subprocess.PIPE, timeout=60, check=False)
+    finally:
+        os.close(write_fd)
+    assert result.returncode == 1
+    assert result.stderr == b""

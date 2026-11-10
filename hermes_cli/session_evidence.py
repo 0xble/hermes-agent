@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 
@@ -15,7 +16,8 @@ from hermes_state_evidence import (
 
 # JSON escaping can expand a source byte sixfold. Keep a separate hard output ceiling too.
 MAX_RECORD_BYTES = 2 * 1024 * 1024
-_IDENTITY_FIELDS = frozenset({"id", "session_id", "parent_session_id", "message_uid", "absorbed_message_uids"})
+_IDENTITY_FIELDS = frozenset({"id", "session_id", "parent_session_id", "message_uid", "absorbed_message_uids",
+                                  "user_id", "chat_id", "session_key"})
 
 
 def _redact_row(row: dict) -> dict:
@@ -110,6 +112,11 @@ def cmd_session_evidence(args) -> int:
         _capture(stream, home=home, profile=profile, session_id=session_id)
         stream.finish()
         return 0
+    except BrokenPipeError:
+        # Discard buffered output so interpreter shutdown cannot flush into the closed pipe.
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        return 1
     except KeyboardInterrupt:
         print('{"type":"error","error":"stream interrupted, no complete evidence"}', file=sys.stderr)
         return 130
