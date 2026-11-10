@@ -29,7 +29,7 @@ def owner_prune(endpoint, **params) -> dict:
     async def _run():
         async with connect_gateway(endpoint) as client:
             return await client.rpc("session.prune",
-                _timeout=max(PRUNE_RPC_TIMEOUT, params.get("max_seconds", 0) + 10), **params)
+                _timeout=max(PRUNE_RPC_TIMEOUT, (params.get("max_seconds") or 0) + 10), **params)
     return asyncio.run(_run())
 
 

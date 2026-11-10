@@ -104,6 +104,7 @@ def referenced_spillover_names(spill_dir) -> set | None:
     ``set()`` when no database exists (no sessions → nothing references anything), ``None``
     when the reference set is UNKNOWN (unreadable / truncated query) so callers fail closed
     and keep the files; a plain read-only connection is enough, the write path owns the locks."""
+    from hermes_state_prune_budget import check_prune_budget, prune_sql
     db_path = spill_dir.parent.parent / "state.db"
     if not db_path.exists():
         return set()
@@ -111,9 +112,10 @@ def referenced_spillover_names(spill_dir) -> set | None:
         # as_uri(): a plain f"file:{path}" breaks on Windows drive letters
         conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True, timeout=5.0)
         try:
-            rows = conn.execute(
-                f"SELECT content, api_content FROM messages WHERE {SPILLOVER_SQL_FILTER} LIMIT 20001"
-            ).fetchall()
+            with prune_sql(conn):
+                rows = conn.execute(
+                    f"SELECT content, api_content FROM messages WHERE {SPILLOVER_SQL_FILTER} LIMIT 20001"
+                ).fetchall()
         finally:
             conn.close()
     except (sqlite3.Error, OSError):
@@ -122,6 +124,7 @@ def referenced_spillover_names(spill_dir) -> set | None:
         return None
     names: set = set()
     for content, api_content in rows:
+        check_prune_budget()
         names |= spillover_names_in_text(content, api_content)
     return names
 

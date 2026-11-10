@@ -485,13 +485,8 @@ class SessionMaintenanceMixin:
                     lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100), skip_result=0)
                 if not deleted_prompts or deleted_prompts < 100:
                     break
-        # Media candidates are durable. Keep the unbounded filesystem reference scan out
-        # of a window/deadline-bound pass; explicit delete/collection can reclaim them later.
-        from hermes_state_prune_budget import current_budget
-        budget = current_budget()
-        if removed_count and budget is not None and budget.deadline == float("inf"):
-            from hermes_state_media import collect_retired_media
-            collect_retired_media(self)
+        from hermes_state_media import collect_retired_media_bounded
+        collect_retired_media_bounded(self)
         return removed_count
 
     def maybe_auto_archive(
