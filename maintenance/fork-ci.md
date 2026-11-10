@@ -948,3 +948,19 @@ warm main's nightly. The first main nightly seeds its own entries.
 
 Rollback by reverting this cache change. Retire it when the owning CI bootstrap
 provides equivalent pinned, verified, outage-independent warm archive inputs.
+
+## Native Keychain
+
+The `fork-ci-reliability` identity covers the native vault Keychain fixture.
+macOS Security.framework uses the account's home to locate its default Keychain.
+The portable runner's empty synthetic `HOME` can make `SecItemAdd` require
+interactive Keychain access. Resolve that native home through `pwd`, while
+vault files remain isolated by `HERMES_HOME`. Disable Keychain interaction only
+in the test process, restore its previous setting at teardown, and fail if the
+real backend or dummy-entry cleanup fails. Keep every store/read/delete and
+vault migration assertion. Windows retains its real Credential Manager path.
+
+Verify with `scripts/run_tests.sh --file-retries 0 tests/agent/test_vault_keychain_native.py`
+under a synthetic `HOME`. Retire this fixture adaptation when the native test
+owner provisions an equivalent noninteractive account Keychain. Roll back by
+reverting this fixture change, with no runtime or credential migration.
