@@ -652,6 +652,9 @@ def _rt_value(value: Any) -> Any:
     from ruamel.yaml.comments import CommentedMap, CommentedSeq
     from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
+    if isinstance(value, (CommentedMap, CommentedSeq)):
+        from copy import deepcopy
+        return deepcopy(value)
     if isinstance(value, dict):
         node = CommentedMap()
         for k, v in value.items():
@@ -701,6 +704,9 @@ def atomic_roundtrip_yaml_save(path: str | Path, new_state: dict, *,
             else:
                 dst.append(_rt_value(value))
         del dst[len(src):]
+        if isinstance(src, CommentedSeq) and src.ca.items:
+            from copy import deepcopy
+            dst.ca.items.update(deepcopy(src.ca.items))
 
     def _merge_item(dst, key, value) -> None:
         current = dst[key]
@@ -720,6 +726,9 @@ def atomic_roundtrip_yaml_save(path: str | Path, new_state: dict, *,
                 dst[key] = _rt_value(value)
         for key in [k for k in dst if k not in src]:
             _roundtrip_delete_key(dst, key)
+        if isinstance(src, CommentedMap) and src.ca.items:
+            from copy import deepcopy
+            dst.ca.items.update(deepcopy(src.ca.items))
 
     _merge(existing, new_state)
     _roundtrip_dump(path, yaml_rt, existing, extra_content=extra_content_on_create if creating else None)

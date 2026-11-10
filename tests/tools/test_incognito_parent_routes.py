@@ -25,8 +25,9 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
     config_file, tmp_path, monkeypatch, private_parent, caller_identity, plugin_launch, route,
 ):
     raw: dict[str, Any] = _authored()
-    if route != "inherit":
-        raw["delegation"].pop("inherit_parent_aliases")
+    if route == "inherit":
+        raw["delegation"] = {"max_spawn_depth": 3}
+    else:
         raw["delegation"].update(model="worker-model", provider="custom:worker", reasoning_effort="low")
     raw["context_file_max_chars"] = 256
     config_file(raw)

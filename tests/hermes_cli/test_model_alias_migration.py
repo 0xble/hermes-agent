@@ -29,11 +29,16 @@ def test_config_retirement_keeps_aliases_and_plugin_policy_without_mutating_inpu
     assert "by_parent" not in after["delegation"]
     assert "model_preset" not in after["delegation"]
     route = after["delegation"]["backends"]["model_map"]
-    assert route["default"] == "delegation-sol"
-    assert route["options"][0]["model"] == "delegation-sol"
-    assert route["options"][0]["reasoning_effort"] == "high"
-    assert route["options"][0]["fallback_providers"] == []
-    assert after["delegation"]["inherit_parent_aliases"] == ["uncensored"]
+    assert route["default"] == "worker"
+    assert [(o["name"], o["model"], o["reasoning_effort"]) for o in route["options"]] == [
+        ("worker", "gpt-6-luna", "low"), ("explorer", "gpt-6.1-terra", "medium"),
+        ("coder", "gpt-6.1-sol", "high"),
+    ]
+    assert all(o["provider"] == "custom:openai-proxy" and o["service_tier"] == "normal" for o in route["options"])
+    assert all("service_tier" not in o["fallback_providers"][0] for o in route["options"])
+    assert route["options"][2]["fallback_providers"][0]["provider"] == "xai-oauth"
+    assert "inherit_parent_aliases" not in after["delegation"]
+    assert "advanced-delegation" in after["plugins"]["enabled"]
     assert after["model_aliases"]["attended"]["model"] == "opus"
     assert changes
     again, changes = migrate_document(after)
@@ -82,5 +87,21 @@ def test_subscription_migration_removes_paid_proxy_credentials_and_fallbacks():
     assert 'api_key' not in after['model'] and 'base_url' not in after['model']
     assert after['fallback_providers'] == []
     route = after['delegation']['backends']['model_map']['options'][0]
-    assert route['provider'] == after['model_aliases']['delegation-sol']['provider'] == 'openai-codex'
-    assert route['fallback_providers'] == []
+    assert after['model_aliases']['delegation-sol']['provider'] == 'openai-codex'
+    assert route['provider'] == 'custom:openai-proxy'
+    assert route['fallback_providers'][0]['model'] == 'gpt-6.1-terra'
+
+
+def test_migration_persists_disabled_routes_as_comments_through_config_writer(tmp_path, monkeypatch):
+    import hermes_yaml as yaml
+    from hermes_cli.config import atomic_config_replace
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(_config()))
+    after, _ = migrate_document(_config())
+    atomic_config_replace(path, after)
+    text = path.read_text()
+    assert "# - name: critical" in text and "# - name: writer" in text
+    saved = yaml.safe_load(text)
+    assert len(saved["delegation"]["backends"]["model_map"]["options"]) == 3
+    assert migrate_document(saved)[0] == saved

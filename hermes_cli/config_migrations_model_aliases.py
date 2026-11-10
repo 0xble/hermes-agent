@@ -30,22 +30,27 @@ def subscription_routes(value: Any, changes: list[str], path: str = "") -> None:
                 value.pop(key, None)
             changes.append(f"{path}: Codex subscription OAuth, API-key proxy removed")
         for key, item in value.items():
-            subscription_routes(item, changes, f"{path}.{key}" if path else key)
+            if key != "backends":
+                subscription_routes(item, changes, f"{path}.{key}" if path else key)
 
 
 def rewrite_references(value: Any, aliases: dict, changes: list[str], path: str = "") -> Any:
     """Rewrite exact old route references, leaving prompts and unrelated text alone."""
     if isinstance(value, list):
-        return [rewrite_references(v, aliases, changes, f"{path}[{i}]") for i, v in enumerate(value)]
+        result = copy.deepcopy(value)
+        for i, item in enumerate(value):
+            result[i] = rewrite_references(item, aliases, changes, f"{path}[{i}]")
+        return result
     if not isinstance(value, dict):
         return value
-    result = {}
+    result = copy.deepcopy(value)
     for key, item in value.items():
         here = f"{path}.{key}" if path else key
         if key == "model_preset":
             name = str(item).strip().lower()
             if name not in aliases:
                 raise ValueError(f"{here}: unknown model alias {name!r}")
+            result.pop(key)
             result["model"] = name
             changes.append(f"{here} -> model: {name}")
         elif key in {"model", "default", "model_role"} and isinstance(item, str) and (m := _REFERENCE.fullmatch(item)):
@@ -92,51 +97,37 @@ def _migrate_aliases(cfg: dict, changes: list[str]) -> dict:
     return aliases
 
 
-def _migrate_delegation(delegation: dict, aliases: dict, changes: list[str]) -> None:
-    parent_map = delegation.pop("by_parent", {}) or {}
-    for selector, route in parent_map.items():
-        match = _REFERENCE.fullmatch(str(selector))
-        if route != "inherit" or match is None or match[1].lower() not in aliases:
-            raise ValueError(f"Cannot retire parent route {selector!r}: only an alias -> inherit exception is supported")
-        names = delegation.setdefault("inherit_parent_aliases", [])
-        if match[1].lower() not in names:
-            names.append(match[1].lower())
-        changes.append(f"delegation.by_parent.{selector} -> plain inherit via inherit_parent_aliases")
+def _migrate_delegation(delegation: dict, changes: list[str]) -> bool:
+    retired = False
+    for key in ("by_parent", "inherit_parent_aliases"):
+        if key in delegation:
+            delegation.pop(key)
+            changes.append(f"delegation.{key}: removed without replacement")
+            retired = True
     if delegation.get("subagents"):
         raise ValueError("Named custom subagents need explicit model_map descriptions before migration")
     delegation.pop("subagents", None)
-    default = delegation.pop("model_preset", None)
-    if default:
-        default = str(default).strip().lower()
-        if default not in aliases:
-            raise ValueError(f"Unknown default delegation alias {default!r}")
-        source = aliases[default]
-        delegation["backend"] = "model_map"
-        settings = delegation.setdefault("backends", {}).setdefault("model_map", {})
-        option = {"name": default, "description": "Ordinary software work on the subscription worker route.",
-                  "model": default, "provider": source["provider"], "fallback_providers": []}
-        for key in ("reasoning_effort", "service_tier"):
-            if key in source:
-                option[key] = source[key]
-        options = settings.setdefault("options", [])
-        if not any(item.get("name") == default for item in options):
-            options.append(option)
-        settings["default"] = default
-        delegation["fallback_providers"] = []
-        changes.append(f"delegation.model_preset -> model_map default {default}, provider fallback disabled")
+    if delegation.pop("model_preset", None):
+        retired = True
+    return retired
 
 
 def migrate_document(config: dict) -> tuple[dict, list[str]]:
     cfg = copy.deepcopy(config)
     changes: list[str] = []
+    retiring_presets = "model_presets" in cfg
     aliases = _migrate_aliases(cfg, changes)
-    subscription_routes(cfg, changes)
+    if retiring_presets:
+        subscription_routes(cfg, changes)
     delegation = cfg.get("delegation") or {}
     if not isinstance(delegation, dict):
         raise ValueError("delegation must be a mapping")
-    _migrate_delegation(delegation, aliases, changes)
-    if delegation:
+    retired = _migrate_delegation(delegation, changes)
+    if delegation or retired:
         cfg["delegation"] = delegation
+    if retired:
+        from hermes_cli.config_migrations_delegation_roles import install_role_routes
+        install_role_routes(cfg, aliases, changes)
     settings = delegation.get("backends", {}).get("model_map", {})
     for option in settings.get("options", []):
         alias = aliases.get(option.get("model"))
@@ -192,7 +183,7 @@ def migrate_to_54(results: dict, quiet: bool) -> None:
 
 def main(argv=None) -> int:
     from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
-    from utils import atomic_roundtrip_yaml_save
+    from hermes_cli.config import atomic_config_replace
     import hermes_yaml as yaml
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path(get_hermes_home()))
@@ -220,7 +211,7 @@ def main(argv=None) -> int:
             changes.append("Imported cached Codex subscription grant into selected home, no refresh or source write")
         changes += migrate_stores(args.home, after.get("model_aliases", {}), dry_run=args.dry_run)
         if not args.dry_run and before != after:
-            atomic_roundtrip_yaml_save(path, after)
+            atomic_config_replace(path, after)
         print("DRY RUN" if args.dry_run else "APPLIED")
         print("\n".join(changes) if changes else "No changes.")
         return 0

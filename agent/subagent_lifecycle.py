@@ -293,15 +293,11 @@ class SubagentLifecycleService:
             _build_child_preserving_parent_tools, _credential_overrides, _load_config, _resolve_delegation_credentials,
             DEFAULT_MAX_ITERATIONS,
         )
-        # Explicit launch routes win. Otherwise share delegate_task's live-parent selection.
+        # Explicit lifecycle routes win over the configured default route.
         routing_cfg = (
             {"provider": request.provider, "model": request.model or ""}
             if request.provider is not None else _load_config()
         )
-        if request.provider is None:
-            from tools.delegate_tool_routes import inherits_parent_alias
-            if inherits_parent_alias(routing_cfg, parent):
-                routing_cfg = {}
         try:
             creds = _resolve_delegation_credentials(routing_cfg, parent)
         except ValueError as exc:

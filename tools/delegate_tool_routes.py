@@ -258,24 +258,6 @@ def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> Ta
     return TaskRoute(creds, route, route.get("reasoning_effort") if backend != "default" else None, None, None, backend)
 
 
-def inherits_parent_alias(config: Mapping[str, Any], parent_agent: Any) -> bool:
-    """The one legacy exception the plugin cannot infer from its JSON task input."""
-    names = config.get("inherit_parent_aliases") or []
-    if not isinstance(names, list):
-        raise DelegationRouteError("delegation.inherit_parent_aliases must list model alias names")
-    if not names:
-        return False
-    from hermes_cli.config import load_config_readonly
-    from hermes_cli.model_alias_runtime import resolve_model_alias
-    current = load_config_readonly() or {}
-    for name in names:
-        alias = resolve_model_alias(name, current, required=True)
-        if (alias.model == getattr(parent_agent, "model", None)
-                and alias.provider == getattr(parent_agent, "provider", None)):
-            return True
-    return False
-
-
 def _route_to_task_route(route: dict[str, Any], parent_agent: Any, cache: dict[str, TaskRoute],
                          config: Optional[Mapping[str, Any]] = None, backend: str = "default") -> TaskRoute:
     label = route.get("label") if isinstance(route.get("label"), str) else None
@@ -365,8 +347,6 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
                 if default and default not in options:
                     raise DelegationRouteError(f"Unknown default model_map route {default!r}; no child started.")
             route = _route_one(provider, declared, i, task, config)
-            if not any(task.get(name) is not None for name in declared) and inherits_parent_alias(config, parent_agent):
-                route = {"label": "inherit"}
             _check_backend_effort(i, route, config)
             resolved = _route_to_task_route(route, parent_agent, cache, config, provider.name)
             routes.append(replace(resolved, reasoning_cfg=dict(resolved.routing_cfg)))

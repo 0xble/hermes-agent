@@ -1,0 +1,114 @@
+"""The fork's decided role policy, expressed through the official plugin's config."""
+from __future__ import annotations
+
+from hermes_yaml import roundtrip_yaml
+
+# Disabled routes are comments, so they cannot become model-facing choices.
+ROLE_SETTINGS = """\
+default: worker
+options:
+  - name: worker
+    description: "Perform mechanically specified edits, extraction/classification from supplied inputs, existing-tool runs and routine summaries with objective checks. Not discovering or reconciling source facts (explorer), novel code (coder), or recommendations/critique (planner); urgency, importance and volume alone do not escalate."
+    provider: custom:openai-proxy
+    model: gpt-6-luna
+    reasoning_effort: low
+    service_tier: normal
+    fallback_providers:
+      - provider: custom:openai-proxy
+        model: gpt-6.1-terra
+        reasoning_effort: low
+  - name: explorer
+    description: "Locate, verify and extract facts from files, official sources, pages, photos or screenshots, returning source locations and gaps. Not recommendations or non-code critique (planner), creating pictures (visual), or interface design (designer)."
+    provider: custom:openai-proxy
+    model: gpt-6.1-terra
+    reasoning_effort: medium
+    service_tier: normal
+    fallback_providers:
+      - provider: custom:openai-proxy
+        model: gpt-6.1-sol
+        reasoning_effort: medium
+  - name: coder
+    description: "Implement and debug substantive code with tests, including routine multi-file changes, specified UI and standard charts where the design is already settled. Not interface design judgment (designer), demonstrated hard failures or unresolved irreversible execution risk (critical), or code review (AutoReview)."
+    provider: custom:openai-proxy
+    model: gpt-6.1-sol
+    reasoning_effort: high
+    service_tier: normal
+    fallback_providers:
+      - provider: xai-oauth
+        model: grok-4.7
+        reasoning_effort: high
+  # Claude routes remain disabled until the proxy protects Brian's 25% reserve.
+  # - name: critical
+  #   description: "Solve unusually hard engineering problems or implement high-consequence changes with unresolved risk to money, production data or security; a prior capable failure is evidence, not a prerequisite. Not routine implementation (coder), read-only synthesis or plan critique (planner), routine summaries (worker), or urgency alone."
+  #   provider: custom:claude-proxy
+  #   model: claude-fable-5-2
+  #   reasoning_effort: high
+  #   service_tier: normal
+  #   fallback_providers:
+  #     - provider: custom:openai-proxy
+  #       model: gpt-6.1-sol
+  #       reasoning_effort: high
+  # - name: planner
+  #   description: "Synthesize evidence, compare options, recommend decisions, define technical architecture or acceptance contracts, and create or critique non-code plans and non-code audits. Not implementation (coder/critical), source-only fact finding (explorer), drawing decided architecture (visual), voice polishing (writer), or code review (AutoReview)."
+  #   provider: custom:claude-proxy
+  #   model: claude-opus-5-5
+  #   reasoning_effort: high
+  #   service_tier: normal
+  #   fallback_providers:
+  #     - provider: custom:openai-proxy
+  #       model: gpt-6.1-sol
+  #       reasoning_effort: high
+  # - name: designer
+  #   description: "Design or repair interfaces people use: screen hierarchy, app flows, responsive layouts, interaction, visual polish and screenshot-driven UI fidelity, including dashboards with charts. Not implementing an already-specified UI or standard chart (coder), inspecting a page for facts (explorer), or standalone pictures and diagrams (visual)."
+  #   provider: custom:claude-proxy
+  #   model: claude-opus-5-5
+  #   reasoning_effort: high
+  #   service_tier: normal
+  #   fallback_providers:
+  #     - provider: custom:openai-proxy
+  #       model: gpt-6.1-sol
+  #       reasoning_effort: high
+  # - name: visual
+  #   description: "Create or repair pictures rather than interfaces: 3D scenes and geometry, illustrations, and designed standalone diagrams or explanatory data visualizations, including diagrams of an already-decided architecture. Not app/dashboard interfaces (designer), standard chart implementation (coder), architecture decisions (planner), or extracting image facts (explorer)."
+  #   provider: custom:claude-proxy
+  #   model: claude-fable-5-2
+  #   reasoning_effort: high
+  #   service_tier: normal
+  #   fallback_providers:
+  #     - provider: custom:openai-proxy
+  #       model: gpt-6.1-sol
+  #       reasoning_effort: high
+  # - name: writer
+  #   description: "Draft substantial voice-sensitive prose or make substantial editorial revisions from established facts and supplied voice examples. Not routine summaries or replies (worker), research extraction (explorer), or analytical reports whose main work is reaching a recommendation (planner)."
+  #   provider: custom:claude-proxy
+  #   model: claude-opus-5-5
+  #   reasoning_effort: medium
+  #   service_tier: normal
+  #   fallback_providers:
+  #     - provider: custom:openai-proxy
+  #       model: gpt-6.1-sol
+  #       reasoning_effort: medium
+"""
+
+
+def role_settings():
+    return roundtrip_yaml().load(ROLE_SETTINGS)
+
+
+def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None:
+    settings = role_settings()
+    config["delegation"].setdefault("backends", {})["model_map"] = settings
+    config["delegation"]["backend"] = "model_map"
+    config["delegation"]["fallback_providers"] = []
+    for option in settings["options"]:
+        name = option["model"]
+        # An alias can start with the exact wire ID and still be edited later.
+        aliases.setdefault(name, {"provider": option["provider"], "model": name})
+    plugins = config.setdefault("plugins", {})
+    enabled = plugins.setdefault("enabled", [])
+    if "advanced-delegation" not in enabled:
+        enabled.append("advanced-delegation")
+    disabled = plugins.get("disabled", [])
+    if "advanced-delegation" in disabled:
+        disabled.remove("advanced-delegation")
+    changes.append("delegation: official model_map worker default, explorer and coder enabled; 5 Claude routes commented pending reserve protection")

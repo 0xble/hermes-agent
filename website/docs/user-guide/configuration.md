@@ -3406,12 +3406,6 @@ The plugin declares a per-task `option` enum. Unknown options are refused before
 any child starts. Per-route effort and tier reach the child and its result.
 For full profile isolation, use the plugin's `profile_routes` backend.
 
-A narrow fork compatibility setting, `delegation.inherit_parent_aliases`,
-accepts a list of upstream alias names. A plain delegation from a parent using
-one of those aliases inherits its live route and effort. Explicit plugin options
-still win. This preserves the configured uncensored-parent exception that the
-plugin's parent-free routing API cannot express.
-
 **Subagent reasoning and Fast mode:** `delegation.reasoning_effort` sets the children's default thinking level (empty = the parent's level). An explicit session pick on the parent (`/reasoning <level>`, `--reasoning`, `/model … --reasoning`) wins over it, so raising the effort for a hard task also raises it for the subagents that task spawns; a `--global` save is a configured default, not a pick. The level is clamped to what each child's route supports. With `delegation.inherit_service_tier: true`, children also inherit the parent's `/fast` mode (`fast`, `auto` or `cold`), including under a pinned `delegation.provider`: the Fast request field is derived for the child's own route, and a route without a fast mode receives none. An explicit `service_tier`/`speed` in `delegation.request_overrides` wins.
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.

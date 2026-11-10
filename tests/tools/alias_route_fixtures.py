@@ -37,7 +37,6 @@ def _authored():
             "fallback_providers": PINNED_CHAIN,
             "request_overrides": {"temperature": 0.2},
             "max_spawn_depth": 3,
-            "inherit_parent_aliases": ["uncensored"],
         },
     }
 
