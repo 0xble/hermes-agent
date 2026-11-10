@@ -205,7 +205,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         elif not isinstance(display_metadata, dict):
             logger.warning("Ignoring unexpected display metadata type on write: %s", type(display_metadata).__name__)
             return None
-        return json.dumps(display_metadata)
+        from agent.source_origin import reserve_metadata
+        return json.dumps(reserve_metadata(display_metadata))
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[dict[str, Any]]:
@@ -305,7 +306,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         if msg.get(DATA_USE) and isinstance(display_metadata, (dict, type(None))):
             # Writers that copy a fixed field list (/branch) carry the key, not display_metadata.
             display_metadata = {**(display_metadata or {}), DATA_USE: list(msg[DATA_USE])}
-        display_metadata = self._encode_display_metadata(display_metadata)
+        from agent.source_origin import persistence_metadata
+        display_metadata = self._encode_display_metadata(persistence_metadata(display_metadata, msg, session_id))
         identity_row = {
             "role": role, "content": encoded_content, "timestamp": message_timestamp,
             "tool_call_id": msg.get("tool_call_id"), "tool_calls": encoded_tool_calls,

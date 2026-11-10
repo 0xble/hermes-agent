@@ -873,6 +873,16 @@ CREATE INDEX IF NOT EXISTS idx_messages_display_backfill
 CREATE INDEX IF NOT EXISTS idx_messages_display_identity
     ON messages(session_id, display_identity, display_order)
     WHERE display_identity IS NOT NULL AND (active = 1 OR compacted = 1);
+CREATE TRIGGER IF NOT EXISTS messages_source_origin_update
+AFTER UPDATE OF content, role, session_id, message_uid, platform_message_id ON messages
+WHEN (new.content IS NOT old.content OR new.role IS NOT old.role OR new.session_id IS NOT old.session_id
+      OR new.message_uid IS NOT old.message_uid OR new.platform_message_id IS NOT old.platform_message_id)
+  AND json_valid(new.display_metadata)
+  AND json_type(new.display_metadata, '$._hermes_source_origin') IS NOT NULL
+BEGIN
+    -- A receipt certifies the original occurrence, never an in-place edit, including an older writer's.
+    UPDATE messages SET display_metadata = json_remove(display_metadata, '$._hermes_source_origin') WHERE id = new.id;
+END;
 DROP TRIGGER IF EXISTS messages_message_uid_insert;
 CREATE TRIGGER IF NOT EXISTS messages_message_uid_insert
 AFTER INSERT ON messages WHEN new.message_uid IS NULL

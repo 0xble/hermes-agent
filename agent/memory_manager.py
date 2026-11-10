@@ -133,6 +133,7 @@ def _redact_for_provider(*values: Any) -> Any:
     model repeats it bare in prose. Never mutates the caller's objects: unchanged values come back as-is,
     changed containers as shallow copies. One value in → one value out; several → a tuple.
     """
+    from agent.authentication_material import authentication_values, exclude_authentication_material
     learned: set = set()
 
     def walk(value: Any, fix) -> Any:
@@ -149,7 +150,8 @@ def _redact_for_provider(*values: Any) -> Any:
         return value
 
     def scrub(text: str) -> str:
-        out = _scrub(text)
+        learned.update(authentication_values(text))
+        out = _scrub(exclude_authentication_material(text))
         if out != text:
             learned.update(set(_TOKEN_RE.findall(text)) - set(_TOKEN_RE.findall(out)))
         return out
@@ -611,14 +613,21 @@ class MemoryManager:
             clean_user_content, assistant_content, messages)
         optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author,
                            "display_kind": display_kind, "platform": platform}
+        from agent.source_origin import retention_user_text
+        origin_user = retention_user_text(user_content, messages)
 
         def _sync(provider: MemoryProvider) -> None:
+            retained_user = (origin_user
+                             if getattr(provider, "requires_verified_origin", False) is True else clean_user_content)
+            if not retained_user:
+                return
+            retained_user = _redact_for_provider(retained_user)
             kwargs: dict[str, Any] = {"session_id": session_id}
             for keyword, value in optional_kwargs.items():
                 if value is not None and self._provider_sync_accepts(provider, keyword):
                     kwargs[keyword] = value
             self._call_unless_stalled(
-                provider, lambda: provider.sync_turn(clean_user_content, assistant_content, **kwargs))
+                provider, lambda: provider.sync_turn(retained_user, assistant_content, **kwargs))
 
         self._submit_background(
             lambda: self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
