@@ -17,9 +17,10 @@ from hermes_state_keys import prefix_range
 logger = logging.getLogger(__name__)
 
 # A page bounds trigger work by rows AND serialized input. An oversized message
-# must make progress alone. SQLite cannot preempt one trigger or an fsync.
-DELETE_ROWS = 64
-DELETE_BYTES = 256 * 1024
+# must make progress alone. Window-bound retention interrupts SQLite VM work
+# (including one trigger); SQLite cannot preempt an OS fsync.
+DELETE_ROWS = 16
+DELETE_BYTES = 64 * 1024
 DELETE_SECONDS = 0.1
 
 
@@ -77,7 +78,7 @@ def _delete_page(conn, sid, selected, key, marker):
         return False
     started = time.monotonic()
     # Small SQL steps let the time target shorten a page on a contended host.
-    for chunk in _id_chunks(selected, size=8):
+    for chunk in _id_chunks(selected, size=1):
         retire_spillover(conn, [sid], message_ids=chunk)
         conn.execute(f"DELETE FROM messages WHERE session_id=? AND id IN ({_placeholders(chunk)})", (sid, *chunk))
         if time.monotonic() - started >= DELETE_SECONDS:
@@ -93,6 +94,8 @@ def finish_pending_deletes(db, *, required_ids=()):
     deletes. Errors for the caller's required ids still propagate after the pass.
     """
     from hermes_state_mutation_retirement import RETIRED_PREFIX
+    from hermes_state_prune_budget import check_prune_budget
+    check_prune_budget()
     required = set(required_ids)
     first_error = None
     rows = db._read_all(
@@ -103,14 +106,22 @@ def finish_pending_deletes(db, *, required_ids=()):
         sid = key[len(RETIRED_PREFIX):]
         try:
             while True:
+                check_prune_budget()
                 selected = _page_ids(db, sid)
+                started = time.monotonic()
                 progress = db._execute_write(lambda conn: _delete_page(conn, sid, selected, key, value),
                                              session_id=sid, input_rows=len(selected))
                 if not progress:
                     break
-                time.sleep(0.01)  # same writer-fairness yield as retention pruning
+                from hermes_state_prune_budget import current_budget
+                pause = min(2.0, max(0.05, time.monotonic() - started))
+                if budget := current_budget():
+                    budget.pause(pause)
+                else:
+                    time.sleep(pause)
             if progress is None:
                 continue
+            check_prune_budget()
             directory = json.loads(value)["cleanup"]["sessions_dir"]
             db._remove_session_files(Path(directory) if directory is not None else None, sid)
             db._execute_write(lambda conn: conn.execute(

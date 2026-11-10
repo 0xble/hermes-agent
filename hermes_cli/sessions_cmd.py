@@ -695,7 +695,10 @@ _NEVER_ACTIVE_DEFAULT_DAYS = 30.0
 def _now_param(args):
     """``session.prune``'s run-now override, sent only when asked: a gateway older than this CLI
     rejects the unknown key."""
-    return {"now": True} if getattr(args, "now", False) else {}
+    params = {"now": True} if getattr(args, "now", False) else {}
+    if (seconds := getattr(args, "max_seconds", None)) is not None:
+        params["max_seconds"] = seconds
+    return params
 
 
 def _prune_never_active_keyed(db, args):
@@ -772,6 +775,15 @@ def _note_pinned_skipped(db, filters, action):
 
 def _cmd_prune_or_archive(db, args, action):
     prune = action == "prune"
+    if prune and getattr(args, "max_seconds", None) is not None:
+        from hermes_state_prune_budget import validate_max_seconds
+        try:
+            validate_max_seconds(args.max_seconds)
+            if getattr(args, "never_active", False):
+                raise ValueError("--max-seconds applies to retention prune, not --never-active")
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
     if prune and getattr(args, "never_active", False):
         return _prune_never_active_keyed(db, args)
     from hermes_cli.session_filters import build_prune_filters, describe_filters, format_epoch
@@ -854,7 +866,8 @@ def _cmd_prune_or_archive(db, args, action):
         from hermes_state_prune_pacing import DeletionWindowClosedError
         try:
             pruned = db.prune_sessions(sessions_dir=_sessions_dir(), exclude_active_write_guards=True,
-                                       within_deletion_window=not getattr(args, "now", False), **filters)
+                                       within_deletion_window=not getattr(args, "now", False),
+                                       max_seconds=getattr(args, "max_seconds", None), **filters)
         except DeletionWindowClosedError as exc:
             print(f"Error: {exc}")
             return 1

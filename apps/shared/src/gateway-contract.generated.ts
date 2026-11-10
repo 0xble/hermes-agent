@@ -4662,6 +4662,7 @@ export interface SessionPruneParams {
   filters?: Record<string, unknown> | null
   never_active_days?: number | null
   now?: boolean | null
+  max_seconds?: number | null
 }
 export interface SessionPruneResult {
   deleted: number

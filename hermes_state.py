@@ -1107,6 +1107,9 @@ class SessionDB(
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        from hermes_state_prune_budget import current_budget, prune_sql, write_patience
+        budget = current_budget()
+        patience_s, deadline = write_patience(patience_s, deadline)
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -1147,16 +1150,17 @@ class SessionDB(
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     conn = cast(sqlite3.Connection, self._conn)  # reopen succeeded under the writer guard
-                    conn.execute("BEGIN IMMEDIATE")
-                    fn_started = True
-                    result = settle_write_transaction(conn, fn, clock=time, logger=logger,
-                        warn_s=self._WRITE_LOCK_WARN_S, acquire_s=time.monotonic() - acquisition_started,
-                        session_id=session_id, input_rows=input_rows)
+                    with prune_sql(conn, write=True):
+                        conn.execute("BEGIN IMMEDIATE")
+                        fn_started = True
+                        result = settle_write_transaction(conn, fn, clock=time, logger=logger,
+                            warn_s=self._WRITE_LOCK_WARN_S, acquire_s=time.monotonic() - acquisition_started,
+                            session_id=session_id, input_rows=input_rows)
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                if budget is None and self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
                     self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                if budget is None and self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError as exc:
@@ -1267,7 +1271,8 @@ class SessionDB(
             try:
                 with self._read_ctx() as conn:
                     from hermes_state_search_runtime import search_stage
-                    with search_stage(self, "sql_ms"):
+                    from hermes_state_prune_budget import prune_sql
+                    with search_stage(self, "sql_ms"), prune_sql(conn):
                         return fn(conn)
             except sqlite3.OperationalError as exc:
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():

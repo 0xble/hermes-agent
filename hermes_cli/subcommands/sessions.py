@@ -152,6 +152,8 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         sessions_prune, "Delete sessions older than AGE — days if bare number, or a duration "
         "like '5h'/'2d'/'1w', or an ISO timestamp (bare prune with no filters "
         "defaults to 90 days; any filter matches all ages)")
+    sessions_prune.add_argument("--max-seconds", type=float,
+        help="Stop retention pruning after this many seconds (also bounded by deletion_window); unfinished cleanup resumes next run")
     _flag(sessions_prune, "--include-archived",
         help="Also delete archived sessions (excluded by default)")
     _flag(sessions_prune, "--include-pinned", help="Also delete pinned sessions (excluded by default — pin is a keep flag)")

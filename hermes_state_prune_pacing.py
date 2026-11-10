@@ -58,4 +58,9 @@ class PrunePacer:
             self.size = max(1, self.size // 2)
         elif held_s < self.TARGET_S / 4:
             self.size = min(self.max_size, self.size * 2)
-        time.sleep(min(max(held_s, self.MIN_PAUSE_S), self.MAX_PAUSE_S))
+        from hermes_state_prune_budget import current_budget
+        seconds = min(max(held_s, self.MIN_PAUSE_S), self.MAX_PAUSE_S)
+        if budget := current_budget():
+            budget.pause(seconds)
+        else:
+            time.sleep(seconds)

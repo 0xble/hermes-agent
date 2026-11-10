@@ -80,7 +80,9 @@ def settle_write_transaction(
     try:
         observe_safely(observation.phase, "callback")
         try:
+            from hermes_state_prune_budget import check_prune_transaction
             result = fn(conn)
+            check_prune_transaction(clock.monotonic() - started)
         finally:
             callback_s = clock.monotonic() - started
             callback_cpu_s = clock.thread_time() - cpu_started

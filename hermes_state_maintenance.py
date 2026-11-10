@@ -344,15 +344,18 @@ class SessionMaintenanceMixin:
         segment is in the same transaction, so a batch boundary between them would keep it forever
         once the pacer shrinks batches."""
         from hermes_state_local import local_conversation_ids
+        from hermes_state_prune_budget import prune_sql, check_prune_budget
         groups: dict[str, list[str]] = {}
-        with self._read_ctx() as conn:
+        with self._read_ctx() as conn, prune_sql(conn):
             for sid in candidate_ids:
+                check_prune_budget()
                 groups.setdefault(local_conversation_ids(conn, sid)[0], []).append(sid)
         return list(groups.values())
 
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,
                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
                        deleted_ids: Optional[list] = None, within_deletion_window: bool = False,
+                       max_seconds: Optional[float] = None,
                        **filters) -> int:
         """Delete ended sessions inactive for ``older_than_days`` (an explicit ``started_before`` /
         ``last_active_before`` overrides it; None = no implicit bound) matching the filters.
@@ -362,23 +365,33 @@ class SessionMaintenanceMixin:
         or compression lock while expired/dead holders are reclaimed and fenced.  A compression
         ancestor is deleted only together with every continuation after it (``whole_lineages``).
         ``within_deletion_window`` refuses to start outside ``maintenance.deletion_window`` and stops
-        between transactions once it closes; the remaining candidates wait for the next run. One
+        inside SQLite VM work and between transactions once it closes. ``max_seconds`` adds a
+        runtime cap; a deadline-interrupted page rolls back and resumes next run. One
         pass per store runs at a time in this process (:func:`prune_pass`)."""
         if filters.get("include_open"):
             raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
         from hermes_cli.maintenance_window import deletion_window_open
         if within_deletion_window and not deletion_window_open():
             raise DeletionWindowClosedError("session prune refused: maintenance.deletion_window is closed")
-        with prune_pass(self.db_path):
-            return self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
-                                             deleted_ids, within_deletion_window, filters)
+        from hermes_state_prune_budget import PruneBudget, PruneBudgetExpired, prune_budget
+        removed_ids = []
+        budget = PruneBudget(within_deletion_window, max_seconds)
+        try:
+            with prune_pass(self.db_path), prune_budget(budget):
+                return self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
+                                                 removed_ids, within_deletion_window, filters)
+        except PruneBudgetExpired as exc:
+            logger.info("%s", exc)
+            return len(removed_ids)
+        finally:
+            if deleted_ids is not None:
+                deleted_ids.extend(removed_ids)
 
     def _prune_sessions_pass(self, older_than_days, source, sessions_dir, exclude_active_write_guards,
                              deleted_ids, within_deletion_window, filters) -> int:
         from hermes_cli.maintenance_window import deletion_window_open
         finish_pending_deletes(self)
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
-        removed_ids: list[str] = []
         # Select outside the write transaction.  The old implementation selected and deleted every
         # victim inside one BEGIN IMMEDIATE, so a large FTS cascade could hold every foreground writer
         # out for minutes.  Each short transaction rechecks the full predicate and the active guards;
@@ -454,16 +467,15 @@ class SessionMaintenanceMixin:
                 if not session_ids:
                     return []
                 stage_delete(conn, session_ids, sessions_dir)
-                removed_ids.extend(session_ids)
                 return session_ids
 
             batch_removed = self._execute_write(_do, skip_result=0) or []
             removed_count += len(batch_removed)
+            deleted_ids.extend(batch_removed)
             if batch_removed:
                 emit_session_deleted(self, batch_removed, reason="prune", sessions_dir=sessions_dir)
             finish_pending_deletes(self, required_ids=batch_removed)
-            for sid in batch_removed:
-                self._remove_session_files(sessions_dir, sid)
+            # finish_pending_deletes removes transcript files before clearing its marker.
             if position < len(groups):
                 pacer.pause(held[0])
 
@@ -473,11 +485,13 @@ class SessionMaintenanceMixin:
                     lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100), skip_result=0)
                 if not deleted_prompts or deleted_prompts < 100:
                     break
-        if removed_count:
+        # Media candidates are durable. Keep the unbounded filesystem reference scan out
+        # of a window/deadline-bound pass; explicit delete/collection can reclaim them later.
+        from hermes_state_prune_budget import current_budget
+        budget = current_budget()
+        if removed_count and budget is not None and budget.deadline == float("inf"):
             from hermes_state_media import collect_retired_media
             collect_retired_media(self)
-        if deleted_ids is not None:
-            deleted_ids.extend(removed_ids)
         return removed_count
 
     def maybe_auto_archive(
@@ -640,6 +654,9 @@ class SessionMaintenanceMixin:
             result["pruned"] = pruned = self.prune_sessions(
                 older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True,
                 within_deletion_window=True)
+            if not deletion_window_open():
+                result["deadline_reached"] = True
+                return result
             report_startup_progress(900.0, phase="state_db_auto_sweep")
             closed = self.sweep_orphaned_sessions(
                 max_idle_seconds=float(retention_days) * 86400.0,
