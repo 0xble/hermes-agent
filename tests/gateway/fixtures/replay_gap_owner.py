@@ -3,7 +3,6 @@ for one session ``s`` and one viewer whose socket stops reading while paused (Ct
 cap to 16384 and kept the overflow path; ``frame_cap`` pins the old 256, as its own overflow probe does."""
 import asyncio
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +27,7 @@ class Owner:
         from hermes_state import SessionDB
         from tests.fakes.runtime_owner import begin_runtime_epoch
         self.loop, self.events, self.running = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
+        self.blocked, self.reattached = threading.Event(), threading.Event()
         self.pause, self.gaps, self.turns, self.ref = pause, [], [], SessionRef("owned", "s")
         self.running.set()
         self.db = SessionDB(db_path=db_path)
@@ -41,6 +41,8 @@ class Owner:
         self.conn = AuthorityConnection(self.authority, self, {"user_id": "viewer"})
 
     def write(self, frame):  # the viewer's socket
+        if not self.running.is_set():
+            self.blocked.set()
         self.running.wait(30)
         self.loop.call_soon_threadsafe(self.events.put_nowait, frame)
         return True
@@ -60,19 +62,24 @@ class Owner:
             self.turns[-1].start()
             return {"admission_id": row["admission_id"], "status": "queued"}
         verb = {"session.resume": "resume", "prompt.receipt": "receipt", "session.detach": "detach"}.get(method)
-        return await getattr(self.conn, verb)(self.ref, {} if verb == "resume" else params) if verb else {}
+        result = await getattr(self.conn, verb)(self.ref, {} if verb == "resume" else params) if verb else {}
+        if verb == "resume" and self.gaps:
+            self.reattached.set()
+        return result
 
     def _turn(self, row, pause):
         from gateway.session_settlement_recovery import commit_and_publish
-        self.authority._stamp_claim(self.ref, self.live, row)
         if pause:
             self.running.clear()  # Ctrl-Z mid-turn
+        self.authority._stamp_claim(self.ref, self.live, row)
+        if pause:
+            # A drain can capture a whole batch before blocking. Park its writer first so the
+            # following 400 deltas fill the pending mailbox, rather than an in-flight batch.
+            assert self.blocked.wait(5), "viewer writer did not pause"
         for index, delta in enumerate(DELTAS):
             if pause == "live" and index == 400:
                 self.running.set()  # fg mid-turn
-                deadline = time.monotonic() + 5
-                while not self.live.subscribers and time.monotonic() < deadline:
-                    time.sleep(0.01)  # health: allow HX013 -- the owner thread waits for the re-attach
+                assert self.reattached.wait(5), "viewer did not re-attach after the gap"
             self.authority.publish_execution("s", row["generation"], "message.delta", {"text": delta})
         with self.live.event_stream.lock:
             self.authority.executing.pop("s", None)
