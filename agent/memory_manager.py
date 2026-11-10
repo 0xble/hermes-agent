@@ -617,13 +617,16 @@ class MemoryManager:
         origin_user = retention_user_text(user_content, messages)
 
         def _sync(provider: MemoryProvider) -> None:
-            retained_user = (origin_user
-                             if getattr(provider, "requires_verified_origin", False) is True else clean_user_content)
+            requires_origin = getattr(provider, "requires_verified_origin", False) is True
+            retained_user = origin_user if requires_origin else clean_user_content
             if not retained_user:
                 return
             retained_user = _redact_for_provider(retained_user)
             kwargs: dict[str, Any] = {"session_id": session_id}
             for keyword, value in optional_kwargs.items():
+                # A full transcript could reintroduce generated or unknown spans withheld above.
+                if requires_origin and keyword == "messages":
+                    continue
                 if value is not None and self._provider_sync_accepts(provider, keyword):
                     kwargs[keyword] = value
             self._call_unless_stalled(

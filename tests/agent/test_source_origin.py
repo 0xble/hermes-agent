@@ -102,6 +102,8 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
         assert "3 projects" in clean[0]["content"]
         assert "Help recover my password." in clean[0]["content"]
         assert "482913" not in json.dumps(_redact_for_provider("Recovery code: 482913", "482913"))
+        status_exchange = _redact_for_provider("My password is wrong.", "The routing was wrong. Keep notices off.")
+        assert status_exchange[1] == "The routing was wrong. Keep notices off."
         for material in ("Recovery code: `alpha beta`.", "Recovery codes: 482913, 573024.",
                          'Password is "fictional phrase".'):
             safe = _redact_for_provider(material + " Keep notices off. Limit is 12.")
@@ -113,6 +115,7 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
             name = "fictional"
             requires_verified_origin = True
             def sync_turn(self, user, assistant, **kwargs):
+                assert "messages" not in kwargs
                 retained.append((user, assistant))
         manager = MemoryManager()
         manager._providers = [FictionalArchive()]

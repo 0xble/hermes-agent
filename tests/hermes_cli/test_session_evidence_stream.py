@@ -465,3 +465,43 @@ def test_closed_output_pipe_has_no_shutdown_flush_noise(store, tmp_path):
         os.close(write_fd)
     assert result.returncode == 1
     assert result.stderr == b""
+
+
+def test_native_person_turn_reaches_cli_with_bounded_authored_content(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from agent.turn_context import _stage_turn_user_message
+    from agent.session_persistence import _db_flush_row
+    from gateway.platforms.event import MessageEvent
+    from gateway.response_filters import display_metadata_for_event
+    from gateway.source_origin import stamp_telegram_person
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("dangling", source="audit_control")
+    directive = "Keep project progress notices off."
+    try:
+        for sid, text in (("allowed", directive), ("oversize", "x" * (300 * 1024))):
+            db.create_session(sid, source="telegram")
+            raw = SimpleNamespace(from_user=SimpleNamespace(id=1, is_bot=False), text=text,
+                                  forward_origin=None, via_bot=None, sender_chat=None)
+            event = stamp_telegram_person(MessageEvent(text=text, message_id=sid), raw)
+            agent = SimpleNamespace(platform="telegram")
+            message, _ = _stage_turn_user_message(agent, text, None, 1.0, event.message_id,
+                                                  None, display_metadata_for_event(event))
+            db.append_messages_batch(sid, [_db_flush_row(agent, message, True)])
+    finally:
+        db.close()
+    code, sink, error, _ = _capture(capsys, monkeypatch, "transcript", sid="allowed")
+    assert code == 0 and not error
+    _verify(sink, "session_transcript", 1)
+    row = sink.rows[0]["message"]
+    assert row["origin"] == "verified_human" and row["content"] == directive
+    assert row["platform_message_id"] == row["event"] == "allowed"
+    assert row["principal"] == "1" and row["authored_spans"] == [[0, len(directive)]]
+    code, sink, error, _ = _capture(capsys, monkeypatch, "transcript", sid="oversize")
+    assert code == 1 and error and sink.footer is None
+    with sqlite3.connect(tmp_path / "state.db") as writer:
+        writer.execute("ALTER TABLE messages DROP COLUMN absorbed_message_uids")
+    code, sink, error, _ = _capture(capsys, monkeypatch, "transcript", sid="allowed")
+    assert code == 1 and error and sink.header is None and sink.footer is None

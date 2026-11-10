@@ -88,16 +88,21 @@ def acquisition_preflight(conn, session_id, policy):
             raise EvidenceUnavailable("cyclic affected component; acquisition held")
         chain.add(current)
         current = parents[current]
+    # Validate the metadata-only projection before the CLI emits a transcript header.
+    conn.execute(_origin_query() + " LIMIT 0", (MAX_ORIGIN_BYTES, session_id)).close()
 
 
-def _origin_rows(conn, session_id):
+def _origin_query():
     # Only this reserved namespace is inspected, and only after structural admission.
     # Do not materialize unrelated display metadata or any content column for origin guessing.
     origin = """, CASE WHEN octet_length(display_metadata) <= ? AND json_valid(display_metadata)
         THEN json_extract(display_metadata, '$._hermes_source_origin') END AS source_origin FROM """
     sql = _bounded_projection("messages", ORIGIN_COLUMNS).replace(" FROM ", origin, 1)
-    sql += " WHERE session_id = ? COLLATE BINARY AND role IN ('user', 'assistant') ORDER BY id"
-    for row in conn.execute(sql, (MAX_ORIGIN_BYTES, session_id)):
+    return sql + " WHERE session_id = ? COLLATE BINARY AND role IN ('user', 'assistant') ORDER BY id"
+
+
+def _origin_rows(conn, session_id):
+    for row in conn.execute(_origin_query(), (MAX_ORIGIN_BYTES, session_id)):
         result = dict(row)
         if not result.pop("_fits"):
             raise EvidenceUnavailable("origin identity row exceeds source byte limit")

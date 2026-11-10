@@ -12,7 +12,10 @@ _SENTENCE = re.compile(r".+?(?:[.!?](?=\s|$)|\n|$)")
 
 
 def authentication_values(text):
-    return tuple(match.group("value").strip("`") for match in _VALUE.finditer(text or ""))
+    # Natural-language status words are ambiguous, not values to erase elsewhere.
+    return tuple(match.group("value").strip("`") for match in _VALUE.finditer(text or "")
+                 if any(char.isdigit() or char in "`_+/-" for char in match.group("value"))
+                 or ":" in match.group("label") or "=" in match.group("label"))
 
 
 def exclude_authentication_material(text):
