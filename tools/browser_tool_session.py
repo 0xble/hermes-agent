@@ -887,7 +887,7 @@ def _dispatch_browser_command(
     # shared agent-browser's default daemon, so one task's snapshot refs or close hit the others.
     # Engine injection keys off the resolved session backend, not global provider
     # state: hybrid routing can create a local sidecar while a cloud provider stays configured.
-    engine = _engine_override or _cloud._get_browser_engine()
+    engine = "auto" if session_info.get("external_task_browser") else _engine_override or _cloud._get_browser_engine()
     backend_args = ["--session", session_info["session_name"]]
     if session_info.get("cdp_url"):
         backend_args += ["--cdp", session_info["cdp_url"]]
