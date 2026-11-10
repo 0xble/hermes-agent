@@ -42,4 +42,3 @@ def test_offline_update_fails_loudly_and_changes_nothing(leg, provider):
     turn = leg.run("-z", "turn after a failed update")
     assert turn.returncode == 0 and provider.default_text in turn.stdout, H.describe(turn)
     assert len(provider.main_requests()) == n + 1
-

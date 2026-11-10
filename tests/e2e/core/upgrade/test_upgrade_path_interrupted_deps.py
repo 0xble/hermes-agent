@@ -31,4 +31,3 @@ def test_kill_before_deps_then_retry_heals(leg, provider):
     _age_git_locks(leg.install)
     final = _update(leg)
     assert_healthy_at_head(leg, provider, final)
-

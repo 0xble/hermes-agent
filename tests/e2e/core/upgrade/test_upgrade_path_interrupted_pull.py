@@ -54,4 +54,3 @@ def test_kill_mid_pull_then_retry_heals(leg, provider, torn):
         "name ... from 'utils'), so nothing can heal the install without manual git") if torn else contextlib.nullcontext()
     with gate:
         assert_healthy_at_head(leg, provider, final)
-

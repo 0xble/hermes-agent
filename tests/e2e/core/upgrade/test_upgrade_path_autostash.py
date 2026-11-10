@@ -46,4 +46,3 @@ def test_update_with_local_edits_and_orphan_autostash(leg, provider):
         "my_notes.txt" in _git("show", "--name-only", "--format=", f"{c}^3", cwd=leg.install, check=False)
         for c in stash_commits if c != orphan)
     assert untracked_ok, "untracked user file lost by the update"
-
