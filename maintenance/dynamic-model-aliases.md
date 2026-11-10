@@ -35,3 +35,9 @@ Old GPT preset aliases use native openai-codex with no paid fallback. The option
 Retire this seam when upstream persists and resolves alias names at all these
 boundaries. Contract tests: tests/hermes_cli/test_model_alias_migration.py and
 tests/tools/test_dynamic_model_aliases.py.
+
+Known effort gap: the retained explicit-session-reasoning inheritance patch gives
+an explicit parent pick precedence over a model_map route's effort. There is no
+configuration switch to reverse it. Route defaults work when the parent has no
+explicit pick. A parent pick of max can therefore override these non-max routes.
+No core precedence change is included in this migration.

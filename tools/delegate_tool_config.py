@@ -663,11 +663,6 @@ def _child_reasoning(parent_agent, delegation_cfg: dict, route_effort: Any) -> A
     thinking, not coerce to "" and inherit."""
     if isinstance(route_effort, ResolvedReasoning):
         return route_effort.config
-    if route_effort not in (None, ""):
-        from hermes_constants import parse_reasoning_effort
-        parsed = parse_reasoning_effort(route_effort)
-        if parsed is not None:
-            return parsed
     parent_override = explicit_parent_reasoning(parent_agent)
     if parent_override is not None:
         return parent_override
