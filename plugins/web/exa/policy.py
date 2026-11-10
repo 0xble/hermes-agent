@@ -1,4 +1,4 @@
-"""Exa's request-local quality policy. A standard hint never overrides protected research."""
+"""Exa's request-local quality policy: pause Lite by default; retain protected guards."""
 
 import re
 import unicodedata
@@ -41,8 +41,10 @@ _PROTECTED = re.compile(
 )
 
 
-def select_search_policy(query: str, stakes: str | None = None) -> tuple[str, str]:
-    """Trust the agent's low-stakes judgment unless the protected guard fires."""
+def select_search_policy(query: str, stakes: str | None = None, *, lite_paused: bool = True) -> tuple[str, str]:
+    """Keep all searches on Auto while Lite is paused; otherwise retain guarded hints."""
+    if lite_paused:
+        return "auto", "lite_paused"
     if stakes == "high":
         return "auto", "hint_high"
     if stakes != "standard":
