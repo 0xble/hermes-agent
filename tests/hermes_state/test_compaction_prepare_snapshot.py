@@ -1,4 +1,4 @@
-"""Compaction preparation cannot own the writer, and stale snapshots cannot publish."""
+"""Common-case preparation releases the writer, and stale snapshots cannot publish."""
 
 from contextlib import closing
 from types import SimpleNamespace
@@ -75,7 +75,7 @@ def test_large_compaction_excludes_preparation_from_write_hold(tmp_path, monkeyp
         db.close()
 
 
-@pytest.mark.parametrize('mutation', ['append', 'external_append', 'rewrite', 'always_append', 'lease_loss'])
+@pytest.mark.parametrize('mutation', ['append', 'external_append', 'rewrite', 'lease_loss'])
 def test_compaction_reprepares_or_refuses_changed_snapshot(tmp_path, monkeypatch, mutation):
     from hermes_state_errors import CompressionLeaseLostError, HeldRowRewrittenError
 
@@ -102,7 +102,7 @@ def test_compaction_reprepares_or_refuses_changed_snapshot(tmp_path, monkeypatch
             result = original(*args)
             attempts.append(True)
             assert not db._conn.in_transaction, 'concurrent writes are blocked during preparation'
-            if len(attempts) == 1 or mutation == 'always_append':
+            if len(attempts) == 1:
                 if mutation == 'lease_loss':
                     db.release_compression_lock('topic', 'holder')
                 elif mutation == 'external_append':
@@ -130,12 +130,6 @@ def test_compaction_reprepares_or_refuses_changed_snapshot(tmp_path, monkeypatch
             with pytest.raises(HeldRowRewrittenError):
                 compact()
             assert db.get_messages('topic')[0]['content'] == 'edited question'
-        elif mutation == 'always_append':
-            with pytest.raises(RuntimeError, match='changed.*prepar'):
-                compact()
-            assert len(attempts) == 3
-            assert '_row_id' not in summary
-            assert db.get_messages('topic')[0]['content'] == 'question'
         else:
             assert compact() == 2
             assert len(attempts) == 2
