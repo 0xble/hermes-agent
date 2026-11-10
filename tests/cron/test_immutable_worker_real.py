@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -67,7 +68,15 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
     home.mkdir()
     repo = Path(__file__).resolve().parents[2]
     source = tmp_path / "source"
-    subprocess.run(["git", "clone", "--quiet", "--shared", str(repo), str(source)], check=True)
+    # Stage the packaged Python runtime, not thousands of unrelated tests,
+    # contributor records and frontend files. Keep real Git archives and venvs:
+    # the contract is physical cron/code/interpreter identity across the flip.
+    subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(repo), str(source)], check=True)
+    metadata = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+    packages = sorted({name.split(".")[0] for name in metadata["tool"]["setuptools"]["packages"]["find"]["include"]})
+    subprocess.run(["git", "-C", str(source), "read-tree", "--empty"], check=True)
+    subprocess.run(["git", "-C", str(source), "restore", "--source=HEAD", "--staged", "--worktree", "--",
+                    ":(top,glob)*.py", "pyproject.toml", "uv.lock", *packages], check=True)
     probe = source / "cron" / "s2_release_probe.py"
     revisions = []
     for name in ("A", "B"):
