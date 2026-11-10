@@ -85,9 +85,9 @@ def n1_tag() -> str:
     head = git("rev-parse", "HEAD").stdout.strip()
 
     def eligible(sha: str) -> bool:
-        return (sha != head and git("cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
-                and git("merge-base", "--is-ancestor", sha, head).returncode == 0
-                and git("merge-base", "--is-ancestor", FORK_RELEASE_FLOOR, sha).returncode == 0)
+        return (sha != head and git("merge-base", "--is-ancestor", sha, head).returncode == 0
+                and (sha == FORK_RELEASE_FLOOR
+                     or git("merge-base", "--is-ancestor", FORK_RELEASE_FLOOR, sha).returncode == 0))
 
     try:
         refs = git("ls-remote", "--heads", "origin", "refs/heads/deploy/nightly-*")

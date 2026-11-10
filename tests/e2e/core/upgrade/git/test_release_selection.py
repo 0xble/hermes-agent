@@ -115,3 +115,22 @@ def test_passive_checks_have_three_distinct_releases_after_a_recent_promotion(re
     assert len(checks) == len(set(checks)) == 3
     assert run["head1"] == run["target"] == checks[-1]
     assert _git(source, "merge-base", "--is-ancestor", commits[-1], run["target"]) == ""
+
+
+def test_local_floor_validation_fits_the_budget_with_slow_git_process_launches(release_repo, monkeypatch):
+    G, source, remote, commits = release_repo
+    _git(source, "remote", "set-url", "origin", str(remote / "unavailable"))
+    clock = [0.0]
+    real_run = subprocess.run
+
+    def slow_launch(argv, **kwargs):
+        # Model process launch latency without sleeping or changing real Git's answers.
+        if kwargs.get("timeout", 30) < 2:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        result = real_run(argv, **kwargs)
+        clock[0] += 2
+        return result
+
+    monkeypatch.setattr(G.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(subprocess, "run", slow_launch)
+    assert G.n1_tag() == commits[1]
