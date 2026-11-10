@@ -1260,8 +1260,10 @@ class SessionDB(
         """``fetchall()`` of one read-only statement via ``_read_ctx``."""
         return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchall())
 
-    def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T], *, read_context=None) -> T:
         """Run an idempotent SELECT through ``_read_ctx``, retrying a transient SQLITE_IOERR.
+
+        ``read_context`` selects an independent snapshot reader when writer fallback is deferred.
 
         A warm ``mode=ro`` pooled reader can hit the same millisecond-wide WAL transition window as a
         read-only OPEN (#100436) when its statement executes or steps: a sibling process's checkpoint /
@@ -1272,7 +1274,7 @@ class SessionDB(
         never quarantined (busy is not broken). A persistent IOERR exhausts the budget and propagates."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
-                with self._read_ctx() as conn:
+                with (read_context or self._read_ctx)() as conn:
                     from hermes_state_search_runtime import search_stage
                     with search_stage(self, "sql_ms"):
                         return fn(conn)
