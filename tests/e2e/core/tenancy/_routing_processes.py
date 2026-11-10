@@ -20,6 +20,8 @@ def case_processes(root: Path) -> list[psutil.Process]:
             if (proc.info["username"] != username
                     or proc.info["status"] == psutil.STATUS_ZOMBIE):
                 continue
+            # Pin the discovered handle's identity before proving its case home.
+            proc.create_time()
             home = proc.environ().get("HERMES_HOME")
             if not home:
                 continue
@@ -34,26 +36,40 @@ def case_processes(root: Path) -> list[psutil.Process]:
     return owned
 
 
+def _same_live_process(proc: psutil.Process) -> bool:
+    # Process.create_time() is cached: a fresh handle must supply the current PID identity.
+    return (psutil.Process(proc.pid).create_time() == proc.create_time()
+            and proc.status() not in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD))
+
+
+def _needs_waiting(proc: psutil.Process) -> bool:
+    try:
+        return _same_live_process(proc)
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
+        return True
+
+
 def _signal_case_process(proc: psutil.Process, root: Path, signal: str) -> bool:
     """Return whether the handle still needs waiting, without signalling an unproved owner."""
     try:
-        if proc.status() == psutil.STATUS_ZOMBIE:
+        if not _same_live_process(proc):
             return False
         home = proc.environ().get("HERMES_HOME")
-        assert home and Path(home).resolve().is_relative_to(root), (
+        if not home:
+            # Linux can release mm before publishing the zombie state.
+            return _needs_waiting(proc)
+        assert Path(home).resolve().is_relative_to(root), (
             f"refusing PID {proc.pid} outside case {root}: HERMES_HOME={home!r}")
+        if not _same_live_process(proc):
+            return False
         getattr(proc, signal)()
     except psutil.NoSuchProcess:
         return False
     except psutil.AccessDenied:
-        # Linux may release mm before publishing the zombie state. Recheck liveness,
-        # but never reuse an earlier environment read as authority to signal.
-        try:
-            return proc.status() != psutil.STATUS_ZOMBIE
-        except psutil.NoSuchProcess:
-            return False
-        except psutil.AccessDenied:
-            return True
+        # Neither unavailable form carries fresh ownership authority to signal.
+        return _needs_waiting(proc)
     return True
 
 
