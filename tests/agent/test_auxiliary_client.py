@@ -155,8 +155,8 @@ def test_route_health_store_errors_fail_open(monkeypatch):
     aux._reset_aux_unhealthy_cache()
 
 
-@pytest.mark.parametrize("strict_chain", [False, True])
-def test_exhaustion_warning_is_not_suppressed_when_route_health_store_fails(monkeypatch, caplog, strict_chain):
+@pytest.mark.parametrize("reason", ["auth error", "provider unavailable"])
+def test_exhaustion_warning_is_not_suppressed_when_route_health_store_fails(monkeypatch, caplog, reason):
     """A local-only quarantine still emits its exhaustion warning when shared state is unavailable."""
     def unavailable(*args, **kwargs):
         raise OSError("read-only state directory")
@@ -176,11 +176,10 @@ def test_exhaustion_warning_is_not_suppressed_when_route_health_store_fails(monk
     key = aux._unhealthy_cache_key("custom", route.base_info, "model")
     aux._aux_unhealthy_reason[key] = "invalid provider response"
 
-    aux._warn_auxiliary_route_once(route, "provider unavailable", RuntimeError("offline"), strict_chain=strict_chain)
+    aux._warn_auxiliary_route_once(route, reason, RuntimeError("offline"))
 
-    expected_chain = "per-call fallback_chain" if strict_chain else "fallback_chain + main agent model"
     assert any(
-        f"all fallbacks exhausted ({expected_chain})" in record.getMessage()
+        f"{reason} on custom and all fallbacks exhausted" in record.getMessage()
         for record in caplog.records
     )
 
@@ -192,6 +191,7 @@ def test_primary_rate_limit_uses_short_lane_hold(monkeypatch):
     monkeypatch.setattr(aux, "_try_payment_fallback", lambda *a, **kw: (None, None, ""))
     monkeypatch.setattr(aux, "_try_configured_fallback_chain", lambda *a, **kw: (None, None, ""))
     monkeypatch.setattr(aux, "_try_main_fallback_chain", lambda *a, **kw: (None, None, ""))
+    monkeypatch.setattr(aux, "_try_main_agent_model_fallback", lambda *a, **kw: (None, None, ""))
     err = Exception("Rate limit exceeded")
     err.status_code = 429
     route = aux._LadderRoute(
@@ -201,9 +201,8 @@ def test_primary_rate_limit_uses_short_lane_hold(monkeypatch):
         final_model="m", main_runtime=None, route_info=None, timeout=30.0,
     )
 
-    ladder = aux._ladder_provider_fallback(err, route)
-    with contextlib.suppress(StopIteration, TypeError):
-        next(ladder)
+    ladder = aux._ladder_provider_fallback(aux._failure(route, err), route)
+    assert list(ladder) == []
 
     assert marks and marks[0]["ttl"] == 60.0 and marks[0]["reason"] == "rate limit"
 

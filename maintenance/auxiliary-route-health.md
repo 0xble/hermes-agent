@@ -16,6 +16,11 @@ After expiry, exactly one caller across processes claims a recovery probe for up
 
 Skip and exhaustion notices are claimed once per route epoch across processes. Extending the same lane keeps the epoch; a new lane opens one new notice.
 
+The v0.23.1 integration uses upstream's classified recovery failures. Preset-only
+per-call strict-chain selection and its notice argument retired with model presets.
+Store-failure warning coverage still checks auth and provider-unavailable exhaustion,
+and rate limits retain the short 60-second lane hold.
+
 This state is independent of the main-agent primary cooldown (`shared-primary-cooldown`) and of compression state. Resetting auxiliary health never touches either.
 
 ## Provenance and patches
