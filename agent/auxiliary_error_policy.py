@@ -78,6 +78,23 @@ def benches_provider(verdict: ClassifiedError) -> bool:
     return verdict.reason is _R.billing or bool(verdict.error_context.get("quota_exhausted"))
 
 
+def _http_fallback_label(failure: Failure) -> Optional[str]:
+    """Preserve relay status evidence when its body also names an upstream failure."""
+    verdict = failure.verdict
+    text = str(failure.error).lower()
+    if verdict.status_code == 503 and ("auth_unavailable" in text or "no auth available" in text):
+        return "auth unavailable"
+    if verdict.status_code == 500 and any(marker in text for marker in ("tls handshake", "handshake upstream", ": eof")):
+        return "connection error"
+    timeout = "timeout" in type(failure.error).__name__.lower() or any(word in text for word in ("timed out", "timeout"))
+    if verdict.status_code == 408 and not timeout:
+        return "provider unavailable"
+    if (verdict.status_code is not None and 500 <= verdict.status_code < 600
+            and verdict.reason in {_R.server_error, _R.overloaded}):
+        return "provider unavailable"
+    return None
+
+
 def fallback_label(failure: Failure, *, rung_spent: bool = False) -> Optional[str]:
     """Why another provider should take this request, or None when the failure would follow it anywhere.
     ``rung_spent``: a parameter rung already changed the request and it still failed."""
@@ -86,12 +103,8 @@ def fallback_label(failure: Failure, *, rung_spent: bool = False) -> Optional[st
     structured = "structured provider error" if context.get("statusless_structured") else None
     if context.get("hook_declines_fallback"):
         return None
-    if reason is _R.server_error:
-        text = str(failure.error).lower()
-        if verdict.status_code == 503 and ("auth_unavailable" in text or "no auth available" in text):
-            return "auth unavailable"
-        if verdict.status_code == 500 and any(marker in text for marker in ("tls handshake", "handshake upstream", ": eof")):
-            return "connection error"
+    if status_label := _http_fallback_label(failure):
+        return status_label
     if benches_provider(verdict):
         return PAYMENT_ERROR
     if reason is _R.timeout:

@@ -314,6 +314,16 @@ def cdp_guard(monkeypatch, local_backend):
     return functools.partial(browser_cdp_tool._browser_cdp_private_guard, endpoint="ws://x", target_id="T")
 
 
+def test_raw_cdp_local_sidecar_allows_lan_but_keeps_metadata_floor(monkeypatch):
+    from tools import browser_cdp_tool, browser_session_cloud
+
+    monkeypatch.setattr(browser_session_cloud, "is_local_backend", lambda: False)
+    monkeypatch.setattr(browser_session_cloud, "allow_private_urls", lambda: False)
+    guard = functools.partial(browser_cdp_tool._browser_cdp_private_guard, task_id="task::local")
+    assert guard(method="Network.loadNetworkResource", params={"url": PRIVATE_URL}) is None
+    assert "cloud metadata" in guard(method="Network.loadNetworkResource", params={"url": METADATA_URL})
+
+
 @pytest.mark.parametrize("local_backend", [False, True])
 def test_raw_cdp_url_params_are_screened_even_when_the_open_page_is_public(cdp_guard, local_backend):
     """A public page does not vouch for a call's own URLs: unlisted resource-loading methods keep the metadata

@@ -251,9 +251,9 @@ def _browser_cdp_private_guard(*, method: str, params: dict[str, Any], endpoint:
     is always refused. When private-network guarding is active, the actual CDP
     target must be verified before page-reading methods run.
     """
-    from tools.browser_tool_eval_policy import _eval_ssrf_guard_active
-    from tools.browser_url_policy import literal_targets_metadata, url_blocked
-    guard_active = _eval_ssrf_guard_active(task_id)
+    from tools.browser_session import is_local_sidecar_key
+    from tools.browser_url_policy import eval_ssrf_guard_active, literal_targets_metadata, url_blocked
+    guard_active = eval_ssrf_guard_active() and not is_local_sidecar_key(task_id)
     guard = _METHOD_PARAM_GUARDS.get(method)
     if guard_active and guard is not None:
         probe, template = guard

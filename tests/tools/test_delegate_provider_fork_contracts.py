@@ -61,7 +61,7 @@ def test_default_backend_uses_configured_route_through_real_builder(config_file)
     assert route.call_args.args[0].name == "default"
     assert route.call_args.args[4]["max_iterations"] == 19
     assert (built["model"], built["provider"], built["base_url"]) == (
-        SOL, "custom:openai-proxy", "https://pinned.test/v1",
+        SOL, "custom", "https://pinned.test/v1",
     )
     assert built["reasoning_config"] == HIGH
 

@@ -62,7 +62,7 @@ def test_unknown_database_alias_refuses_before_rewriting_json_store(tmp_path, mo
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _seed(tmp_path, model="@missing")
     path = tmp_path / "cron/jobs.json"
-    path.parent.mkdir()
+    path.parent.mkdir(exist_ok=True)
     path.write_text('{"jobs": [{"id": "one", "model": "@attended"}]}')
     before = path.read_bytes()
     with pytest.raises(ValueError, match="unknown model alias"):

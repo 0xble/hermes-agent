@@ -10,6 +10,7 @@ import httpx
 import openai
 import pytest
 
+from agent import auxiliary_error_policy as aux_errors
 from agent.auxiliary_client import _try_openrouter, async_call_llm, call_llm
 from agent.credential_pool import CredentialPool, PooledCredential as Key
 from agent.error_classifier import FailoverReason
@@ -942,3 +943,30 @@ def test_a_walk_where_every_entry_fails_tries_each_lane_once(is_async):
     outcome, sent, marked = _refreshed_candidate_walk(is_async, 503)
     assert outcome == 503 and marked == [True, False]
     assert [request for request in sent if request[0] != "sk-primary"] == _REFRESHED_WALK
+
+
+class TestFallbackLabels:
+    def test_persistent_5xx_is_a_fallback_reason(self):
+        class ServerError(Exception):
+            status_code = 503
+        exc = ServerError("upstream internal error")
+        verdict = aux_errors.classify_attempt(exc, None)
+        assert aux_errors.same_provider_retry(verdict)
+        assert aux_errors.fallback_label(aux_errors.Failure(exc, verdict)) == "provider unavailable"
+
+    def test_timed_out_408_keeps_the_timeout_label(self):
+        class RequestTimeout(Exception):
+            status_code = 408
+        class RequestRejected(Exception):
+            status_code = 408
+        for exc, expected in ((RequestTimeout("request timed out"), "request timed out"),
+                              (RequestRejected("request rejected"), "provider unavailable")):
+            verdict = aux_errors.classify_attempt(exc, None)
+            assert aux_errors.fallback_label(aux_errors.Failure(exc, verdict)) == expected
+
+    def test_wrapped_auth_unavailable_503_is_a_fallback_reason(self):
+        class RelayAuthUnavailable(Exception):
+            status_code = 503
+        exc = RelayAuthUnavailable("auth_unavailable: no auth available; last upstream error: rate_limit_error")
+        verdict = aux_errors.classify_attempt(exc, None)
+        assert aux_errors.fallback_label(aux_errors.Failure(exc, verdict)) == "auth unavailable"

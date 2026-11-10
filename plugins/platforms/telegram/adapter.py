@@ -396,7 +396,7 @@ def check_telegram_requirements() -> bool:
 _MULTI_TICK_CODE_SPAN_RE = re.compile(r'(?<![`\\])(?P<ticks>`{2,})(?!`)(?P<body>[^\n]+?)(?<!`)(?P=ticks)(?!`)')
 _MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
 # MarkdownV2 escaping and the bare-bracket safety net live once, in telegram_markdown.py.
-from plugins.platforms.telegram.telegram_markdown import _escape_bare_bracket, _escape_mdv2
+from plugins.platforms.telegram.telegram_markdown import _EXPANDABLE_QUOTE, _escape_bare_bracket, _escape_mdv2
 
 
 def _strip_mdv2(text: str) -> str:
@@ -6879,7 +6879,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
         text = _MDV2_FENCE_RE.sub(_protect_fenced, text)
         # 2) Protect inline code; escape \ inside it per MarkdownV2 spec.
-        text = re.sub(r'(`[^`]+`)', lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
+        text = re.sub(r'(`[^`\r\n]+`)', lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
         # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.
         text = _degrade_unsupported_markdown_links(text, preserve_citation_brackets=False)
 
@@ -6910,6 +6910,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             return _ph(f'*{_escape_mdv2(inner)}*')
 
         text = re.sub(r'^#{1,6}\s+(.+)$', _convert_header, text, flags=re.MULTILINE)
+        text = re.sub(r'(?m)^\*\*(?=>{1,3} )', _EXPANDABLE_QUOTE, text)
         # Resolve nested/multiline asterisk emphasis before the final escaping pass.
         from plugins.platforms.telegram.emphasis import protect_asterisk_emphasis
 
@@ -6923,14 +6924,18 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # 7) Strikethrough ~~text~~ → ~text~; 8) Spoiler ||text|| kept as-is.
         text = re.sub(r'~~(.+?)~~', _ph_wrap('~', '~'), text)
         text = re.sub(r'\|\|(.+?)\|\|', _ph_wrap('||', '||'), text)
-        # 9) Blockquotes: protect leading > from escaping; expandable quotes (**> starts, trailing || ends).
+        # An expandable quote closes only on the last line of its own quote block.
         def _convert_blockquote(m):
-            prefix, content = m.group(1), m.group(2)  # prefix: >, >>, >>>, **>, **>> …
-            if prefix.startswith('**') and content.endswith('||'):
-                return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
-            return _ph(f'{prefix} {_escape_mdv2(content)}')
+            lines = [line.split(' ', 1) for line in m.group(0).split('\n')]
+            expandable = lines[0][0].startswith(_EXPANDABLE_QUOTE)
+            lines[0][0] = lines[0][0].replace(_EXPANDABLE_QUOTE, '**')
+            last = len(lines) - 1 if expandable and lines[-1][1].endswith('||') else -1
+            return '\n'.join(_ph(f'{p} {_escape_mdv2(c[:-2])}||' if i == last else f'{p} {_escape_mdv2(c)}')
+                             for i, (p, c) in enumerate(lines))
 
-        text = re.sub(r'^((?:\*\*)?>{1,3}) (.+)$', _convert_blockquote, text, flags=re.MULTILINE)
+        text = re.sub(rf'^(?:{_EXPANDABLE_QUOTE})?>{{1,3}} .+$(?:\n>{{1,3}} .+$)*', _convert_blockquote, text,
+                      flags=re.MULTILINE)
+        text = text.replace(_EXPANDABLE_QUOTE, '**')
         # 10) Escape remaining special characters in plain text
         text = _escape_mdv2(text)
         # 11) Restore placeholders in reverse insertion order so nested placeholders resolve.

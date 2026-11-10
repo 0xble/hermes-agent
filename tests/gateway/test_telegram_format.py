@@ -264,7 +264,8 @@ class TestFormatMessageCodeBlocks:
         result = adapter.format_message(text)
 
         assert "*Раздел*" in result
-        assert r"\`\` `код` \`\`" in result
+        # A CommonMark double-tick span keeps its nested ticks as literal code content.
+        assert r"`\`код\``" in result
         assert r"`**`" in result
         _assert_balanced_mdv2_code_entities(result)
 

@@ -23,8 +23,6 @@ from agent.auxiliary_client import (
     async_call_llm,
     _build_call_kwargs,
     _resolve_codex_credential_and_base,
-    _is_server_error,
-    _is_auth_unavailable_error,
     _refresh_nous_recommended_model,
     _normalize_aux_provider,
     _try_payment_fallback,
@@ -1505,24 +1503,6 @@ class TestRefreshNousRecommendedModel:
             vision=False, stale_model=_NOUS_MODEL)
         assert out is None
 
-    def test_persistent_5xx_is_a_fallback_reason(self):
-        class ServerError(Exception):
-            status_code = 503
-        assert _is_server_error(ServerError("upstream internal error")) is True
-
-    def test_timed_out_408_keeps_the_timeout_label(self):
-        class RequestTimeout(Exception):
-            status_code = 408
-        class RequestRejected(Exception):
-            status_code = 408
-        assert _is_server_error(RequestTimeout("request timed out")) is False
-        assert _is_server_error(RequestRejected("request rejected")) is True
-
-    def test_wrapped_auth_unavailable_503_is_a_fallback_reason(self):
-        class RelayAuthUnavailable(Exception):
-            status_code = 503
-        exc = RelayAuthUnavailable("auth_unavailable: no auth available; last upstream error: rate_limit_error")
-        assert _is_auth_unavailable_error(exc) is True
 
 
 class TestTryPaymentFallback:
