@@ -110,12 +110,14 @@ def test_missing_home_rechecks_identity_and_liveness(tmp_path, process, signal, 
     def environ():
         if after_read == "reused":
             current.create_time.return_value = 200.0
-        elif after_read == "gone":
-            proc.status.side_effect = psutil.NoSuchProcess(proc.pid)
-        elif after_read == "denied":
-            proc.status.side_effect = psutil.AccessDenied(proc.pid)
-        elif after_read in ("zombie", "dead"):
-            proc.status.return_value = getattr(psutil, f"STATUS_{after_read.upper()}")
+        proc.status.side_effect = {
+            "gone": psutil.NoSuchProcess(proc.pid),
+            "denied": psutil.AccessDenied(proc.pid),
+        }.get(after_read)
+        proc.status.return_value = {
+            "zombie": psutil.STATUS_ZOMBIE,
+            "dead": psutil.STATUS_DEAD,
+        }.get(after_read, psutil.STATUS_RUNNING)
         return environment
 
     proc.environ.side_effect = environ
