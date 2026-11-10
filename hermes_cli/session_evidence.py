@@ -114,7 +114,7 @@ def cmd_session_evidence(args) -> int:
         return 0
     except BrokenPipeError:
         # Discard buffered output so interpreter shutdown cannot flush into the closed pipe.
-        with open(os.devnull, "w") as sink:
+        with open(os.devnull, "wb") as sink:
             os.dup2(sink.fileno(), sys.stdout.fileno())
         return 1
     except KeyboardInterrupt:
