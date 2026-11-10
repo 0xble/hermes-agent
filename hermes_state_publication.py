@@ -1,6 +1,6 @@
 """Content-free timing for a compaction's publication on its worker thread.
 
-Row changes include SQLite triggers/FTS and rolled-back attempts. These totals
+Rows reported by sqlite3 rowcount exclude triggers/FTS and include rolled-back attempts. These totals
 complement the transcript writer's individual phase timings.
 """
 
@@ -14,6 +14,65 @@ from contextvars import ContextVar
 logger = logging.getLogger(__name__)
 
 _metrics: ContextVar[dict | None] = ContextVar("compaction_publication_metrics", default=None)
+
+
+class _PublicationCursor(sqlite3.Cursor):
+    completed_rows = 0
+    closed = False
+
+    def _complete(self):
+        self.completed_rows = self.written_rows()
+
+    def execute(self, *args, **kwargs):
+        self._complete()
+        return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        self._complete()
+        return super().executemany(*args, **kwargs)
+
+    def close(self):
+        self._complete()
+        self.closed = True
+        return super().close()
+
+    def written_rows(self):
+        # RETURNING's rowcount settles after fetching. Read it at the next
+        # execution or transaction settlement, without another SQL statement.
+        return self.completed_rows + (0 if self.closed else max(0, self.rowcount))
+
+
+class PublicationConnection(sqlite3.Connection):
+    """Count direct statement rows only while compaction telemetry is active.
+
+    Preserve connection identity, which display-fold freshness tokens require.
+    Ordinary writes delegate to sqlite3's shortcuts and allocate no counters.
+    """
+
+    publication_cursors = None
+
+    def cursor(self, *args, **kwargs):
+        if self.publication_cursors is None:
+            return super().cursor(*args, **kwargs)
+        if args or kwargs:
+            raise TypeError("publication row counting requires the default cursor factory")
+        cursor = super().cursor(factory=_PublicationCursor)
+        self.publication_cursors.append(cursor)
+        return cursor
+
+    def execute(self, *args, **kwargs):
+        if self.publication_cursors is None:
+            return super().execute(*args, **kwargs)
+        return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        if self.publication_cursors is None:
+            return super().executemany(*args, **kwargs)
+        return self.cursor().executemany(*args, **kwargs)
+
+
+def publication_is_active():
+    return _metrics.get() is not None
 
 
 class LocalStateLockTimeout(sqlite3.OperationalError):
