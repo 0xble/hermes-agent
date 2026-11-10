@@ -262,7 +262,7 @@ def _native(authority, tmp_path, user):
 
 @pytest.mark.asyncio
 async def test_an_old_compressed_transcript_reads_across_its_lineage_without_adoption(tmp_path, monkeypatch):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     import hermes_state
 
@@ -294,7 +294,7 @@ async def test_an_old_compressed_transcript_reads_across_its_lineage_without_ado
 async def test_an_old_row_is_judged_at_its_tip_whichever_lineage_id_is_asked(tmp_path, monkeypatch):
     """Another principal's stamp on the tip refuses the list, resume and every read of the lineage,
     the root's id included (the stored list and resume judge the tip)."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     store, db, runner = _legacy_owner(tmp_path, monkeypatch)
     db._write_sql("UPDATE sessions SET user_id='alice' WHERE id='tui-tip'", ())

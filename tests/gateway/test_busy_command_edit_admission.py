@@ -26,10 +26,10 @@ async def test_edited_busy_command_is_queued_as_its_own_turn(monkeypatch, comman
 
 @pytest.mark.asyncio
 async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
-    """The same rebuild on the idle path: ``/goal`` kicks off with the command's message id, so an
-    edited ``/goal`` (a replaced goal) needs the edit's revision on its kickoff turn too."""
+    """Bare goal edits preserve the active objective. An edit that starts a cleared goal gets its
+    own kickoff admission, carrying the edit revision rather than replaying the original input."""
     from gateway.platforms.event import MessageEvent, MessageType
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
     from tests.gateway.test_messaging_slash_command_fifo import _owner
 
@@ -55,11 +55,25 @@ async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
         return not adapter._active_sessions and not runner._is_session_running(key)
     await adapter.handle_message(MessageEvent(text='hello', source=source, message_id='H'))
     await async_wait_until(lambda: ran and idle(), what='a session for the goal')
-    for turns, (text, revision) in enumerate((('/goal write a haiku', None), ('/goal write a sonnet', 'u7')), 2):
+    for turns, (text, revision) in enumerate((('/goal write a haiku', None), ('/goal write a sonnet', 'u8')), 2):
+        if revision:
+            await adapter.handle_message(MessageEvent(text='/goal write an ode', message_type=MessageType.COMMAND,
+                                                      source=source, message_id='G', edit_revision='u7'))
+            async def updated_goal():
+                mgr, _entry = await runner._get_goal_manager_for_event(MessageEvent(text='', source=source))
+                return mgr.state is not None and mgr.state.goal == 'write an ode'
+            await async_wait_until(updated_goal, what='the edited goal command to finish')
+            assert len(ran) == 2 and _rows(rig) == ['H', 'G']
+            await adapter.handle_message(MessageEvent(text='/goal clear', message_type=MessageType.COMMAND,
+                                                      source=source, message_id='clear'))
+            async def cleared_goal():
+                mgr, _entry = await runner._get_goal_manager_for_event(MessageEvent(text='', source=source))
+                return not mgr.has_goal()
+            await async_wait_until(cleared_goal, what='the clear goal command to finish')
         await adapter.handle_message(MessageEvent(text=text, message_type=MessageType.COMMAND,
                                                   source=source, message_id='G', edit_revision=revision))
         await async_wait_until(lambda: len(ran) >= turns and idle() or any('admission_conflict' in s for s in sent),
                                what=f'{text} kicked off')
     assert not [s for s in sent if 'admission_conflict' in s or 'RuntimeStoreError' in s], sent
-    assert _rows(rig) == ['H', 'G', 'G:edit:u7'], _rows(rig)
+    assert _rows(rig) == ['H', 'G', 'G:edit:u8'], _rows(rig)
     assert 'write a sonnet' in ran[-1], ran

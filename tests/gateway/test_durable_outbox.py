@@ -516,6 +516,9 @@ def _final_fixture(home, sends):
         def _admit_bot_message_for_source(self, source):
             return True
 
+        def _admit_bot_chain(self, event):
+            return True
+
         def _resolve_profile_home_for_source(self, source):
             return home
 

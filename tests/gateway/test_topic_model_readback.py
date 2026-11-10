@@ -75,6 +75,7 @@ async def test_topic_readback_uses_runtime_precedence(home, monkeypatch, operati
             config["model"]["idle_revert_minutes"] = 15
             runner.session_store.mark_user_activity(key, datetime.now(UTC))
         else:
+            config["model_aliases"] = {"attended": dict(config["model"]["attended"])}
             runner.session_store.set_model_role(key, "attended")
         expected_model, expected_provider, expected_effort = "attended-model", "attended-provider", "high"
     if operation == "create":
@@ -200,9 +201,10 @@ async def test_readback_failure_preserves_successful_topic_operation(home, monke
 
         runner._set_session_model_role = set_role
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda *_: {
-            "model": {"default": "base", "attended": {"model": "attended-model"}},
+            "model": {"default": "base"},
+            "model_aliases": {"attended": {"model": "attended-model"}},
         })
-    spec = TopicSpec(name="Room", icon="💡", message="start here", model="@attended" if failure == "role" else "")
+    spec = TopicSpec(name="Room", icon="💡", message="start here", model="attended" if failure == "role" else "")
     if operation == "create":
         result = await create_topic_session(runner, _source(), spec)
         assert result["brief_delivered"] is True
@@ -278,3 +280,18 @@ async def test_readback_failure_preserves_turn_state(home, monkeypatch, scenario
         source=source, session_key=key, user_config=config,
     )
     assert (result["effective_model"], result["effective_provider"]) == (model, runtime.get("provider"))
+
+
+@pytest.mark.asyncio
+async def test_a_topic_alias_cannot_borrow_an_explicit_provider(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from gateway.telegram_topic_sessions import TopicRequestError, _resolve_model
+
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {
+        "model_aliases": {"worker": {"model": "sol", "provider": "custom:proxy"}}})
+    resolve = AsyncMock(return_value=(None, None, None))
+    runner = SimpleNamespace(resolve_session_model_selection=resolve)
+    with pytest.raises(TopicRequestError, match="carries its own provider"):
+        await _resolve_model(runner, None, TopicSpec(model="worker", provider="custom:other"))
+    resolve.assert_not_awaited()

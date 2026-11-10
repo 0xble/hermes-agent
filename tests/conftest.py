@@ -1206,7 +1206,7 @@ def _processes_with_hermes_home_under(roots) -> list[int]:
             continue
         try:
             home = proc.environ().get("HERMES_HOME")
-        except (psutil.Error, OSError):
+        except (psutil.Error, OSError, SystemError):
             continue
         if not home:
             continue

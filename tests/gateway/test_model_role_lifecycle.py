@@ -31,6 +31,8 @@ def lane(tmp_path, monkeypatch):
             "model": "attended-model", "provider": "attended-provider", "idle_revert_minutes": 1,
         }},
         "model_aliases": {
+            "default": {"model": "base", "provider": "baseline"},
+            "attended": {"model": "attended-model", "provider": "attended-provider"},
             "fast": {"model": "first", "provider": "provider-a", "reasoning_effort": "low"},
             "other": {"model": "second", "provider": "provider-b", "reasoning_effort": "high"},
         },
@@ -242,6 +244,12 @@ async def test_same_turn_destination_reasoning_precedence_and_disabled_values(la
         "automatic": ("attended-model", "attended-provider"),
     }[route]
     lane.path.write_text(yaml.safe_dump(lane.cfg))
+    if route == "deleted":
+        turn, agent = _turn(lane)
+        with pytest.raises(ValueError, match="Stored model alias 'deleted' is unavailable; request refused"):
+            await _boundary(turn, agent)
+        assert agent.model == "base"
+        return
     turn, agent = _turn(lane)
     monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", _switch)
     for raw, expected in [
@@ -279,6 +287,10 @@ async def test_role_declared_and_session_effort_outrank_destination_inheritance(
     lane.cfg["model_aliases"]["fast"]["reasoning_effort"] = "ultra"
     lane.path.write_text(yaml.safe_dump(lane.cfg))
     assert (await _boundary(turn, agent))[2] == {"enabled": False}
+    lane.cfg["model_aliases"]["fast"]["reasoning_effort"] = "hgih"
+    lane.path.write_text(yaml.safe_dump(lane.cfg))
+    with pytest.raises(ValueError, match="Unknown reasoning effort 'hgih'"):
+        await _boundary(turn, agent)
 
 
 @pytest.mark.asyncio
@@ -289,7 +301,7 @@ async def test_temporary_concrete_pick_expires_back_to_named_hold(lane, monkeypa
                           restore_snapshot=None, model_override_scope="temporary", pick_ttl_hours=0.0)
     result = SimpleNamespace(new_model="temporary", target_provider="provider-b", api_key="fixture",
                              base_url="", api_mode="chat_completions", request_overrides={},
-                             runtime_capabilities={}, provider_label="B")
+                             runtime_capabilities={}, provider_label="B", alias_endpoint_applied=False)
     await runner._record_model_switch(result, ctx, source=lane.source, one_turn=False, picker=False)
     assert runner.session_store.get_model_role(lane.key) == "fast"
     runner._session_state(lane.key).conversation.last_user_activity_at = time.time() - 3600
@@ -369,13 +381,13 @@ def test_failed_bulk_snapshot_does_not_publish_or_leak_on_later_save(lane, monke
 
 
 @pytest.mark.parametrize("role", ["attended", "deleted"])
-def test_invalid_hold_uses_channel_default_even_with_recent_activity(role):
+def test_invalid_hold_refuses_even_with_channel_default_and_recent_activity(role):
     cfg = {"model": {"attended": {"provider": "attended-provider"}}}
-    decision = resolve_attended_model({"model_role": role, "last_user_activity_at": time.time(),
-                                      "default_model": "base", "default_provider": "baseline",
-                                      "channel_model": "channel", "channel_provider": "channel-provider"},
-                                     time.time(), cfg)
-    assert (decision.model, decision.provider, decision.reason) == ("channel", "channel-provider", "default")
+    with pytest.raises(ValueError, match=f"Stored model alias '{role}' is unavailable; request refused"):
+        resolve_attended_model({"model_role": role, "last_user_activity_at": time.time(),
+                                "default_model": "base", "default_provider": "baseline",
+                                "channel_model": "channel", "channel_provider": "channel-provider"},
+                               time.time(), cfg)
 
 
 def _guard_selection(lane, monkeypatch, guard):
@@ -478,9 +490,10 @@ async def test_invalid_hold_does_not_keep_previous_automatic_attended_route(lane
     assert state.last_attended_decision.reason == "attended"
     await runner._set_session_model_role(lane.key, role)
     cfg["model"]["attended"]["model"] = ""
-    decision = runner._attended_resolution_for_session(
-        session_key=lane.key, source=lane.source, user_config=cfg, allow_switch_back=False)
-    assert (decision.model, decision.provider, decision.reason) == ("base", "baseline", "default")
+    cfg["model_aliases"].pop(role, None)
+    with pytest.raises(ValueError, match=f"Stored model alias '{role}' is unavailable; request refused"):
+        runner._attended_resolution_for_session(
+            session_key=lane.key, source=lane.source, user_config=cfg, allow_switch_back=False)
 
 
 @pytest.mark.asyncio

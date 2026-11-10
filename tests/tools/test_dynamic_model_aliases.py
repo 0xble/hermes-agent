@@ -67,3 +67,22 @@ def test_stored_cron_alias_uses_new_definition_each_fire(tmp_path, monkeypatch):
         path.write_text(yaml.safe_dump({"model_aliases": {"worker": {"model": model, "provider": "custom:proxy"}}}))
         assert _load_cron_job_config(job, job["id"], job["name"]).model == model
     assert job["model"] == "worker"
+
+
+def test_main_model_pinned_job_keeps_the_selected_alias_through_edits(tmp_path, monkeypatch):
+    from cron import jobs, scheduler
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "config.yaml"
+    config = {"model": "worker", "model_aliases": {
+        "worker": {"model": "first", "provider": "custom:proxy"}}}
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    job = jobs.create_job(prompt="scheduled work", schedule="every 1h", deliver="local", pinned=True)
+    assert job["model"] == "worker" and not job.get("provider")
+    for model in ("first", "second"):
+        config["model_aliases"]["worker"]["model"] = model
+        path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        stored = jobs.get_job(job["id"])
+        assert stored["model"] == "worker"
+        route = scheduler._load_cron_job_config(stored, stored["id"], stored["name"])
+        assert route.model == model and route.cron_default_provider == "custom:proxy"

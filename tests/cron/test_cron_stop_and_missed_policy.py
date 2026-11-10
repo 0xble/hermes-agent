@@ -115,17 +115,22 @@ def test_a_profile_distribution_carries_the_jobs_missed_run_policy(home):
     assert merged["catch_up"] is False
 
 
-def test_one_shot_past_grace_skips_by_default_and_fires_once_when_opted_in(home):
+def test_one_shot_past_grace_keeps_payloads_held_even_with_catch_up(home):
     run_at = (jobs._hermes_now() + timedelta(hours=1)).isoformat()
     skipped = jobs.create_job(prompt="stale reminder", schedule=run_at, deliver="local")
     kept = jobs.create_job(prompt="late reminder", schedule=run_at, deliver="local", catch_up=True)
     for job in (skipped, kept):
         _park(job["id"], 3600)
 
-    assert [j["id"] for j in jobs.get_due_jobs()] == [kept["id"]]
-    assert jobs.get_job(skipped["id"]) is None
-    assert [r["status"] for r in _ledger(skipped["id"])] == ["missed"]
-    assert _ledger(kept["id"]) == []
+    assert jobs.get_due_jobs() == []
+    # The decided held-payload policy applies even to deliver=local and catch_up=True.
+    for original in (skipped, kept):
+        held = jobs.get_job(original["id"])
+        assert held["prompt"] == original["prompt"]
+        assert held["state"] == "missed" and not held["enabled"]
+        assert [r["status"] for r in _ledger(original["id"])] == ["failed"]
+        assert "Missed one-shot" in _ledger(original["id"])[0]["error"]
+    assert jobs.get_due_jobs() == []
 
 
 def test_catch_up_rejects_non_boolean(home):
@@ -149,7 +154,7 @@ def test_a_pre_existing_ledger_is_widened_without_losing_rows(home):
              claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT)""")
     conn.execute(
         "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at) "
-        "VALUES ('old', 'j1', 'builtin', 'p', 1, 'completed', '2026-01-01T00:00:00+00:00')")
+        "VALUES ('old', 'j1', 'builtin', 'p', 1, 'completed', ?)", (jobs._hermes_now().isoformat(),))
     conn.commit()
     conn.close()
 

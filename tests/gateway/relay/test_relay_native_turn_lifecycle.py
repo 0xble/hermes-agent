@@ -78,7 +78,7 @@ async def _relay(runner, *, refusing_chats=()):
 
 @asynccontextmanager
 async def _gateway(tmp_path, instance, **relay):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
     authority = await initialize_session_authority(runner, profile_id='default', instance_id=instance)
     try:
@@ -277,7 +277,7 @@ async def test_pre_gateway_dispatch_still_fires_once_and_the_turn_is_acknowledge
         fired.append(event.message_id)
 
     manager = get_plugin_manager()
-    manager._discovered = True
+    manager._discovered = manager._discovery_complete = True
     manager._hooks.setdefault('pre_gateway_dispatch', []).append(hook)
     async with _gateway(tmp_path, 'relay-lifecycle-hook') as (runner, _authority, send, outgoing, _adapter):
         executed = _stub_model(runner, monkeypatch)

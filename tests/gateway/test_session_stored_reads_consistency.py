@@ -159,7 +159,7 @@ async def test_a_compaction_committing_inside_a_lineage_read_drops_nothing(tmp_p
     """A rotated lineage reads its display rows and its removed rows' identities; a compaction that carries
     the tip's last reply commits between those two statements. Both must see one generation."""
     from agent.context_compressor import SUMMARY_PREFIX
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from tests.gateway.test_session_stored_reads import _legacy_owner, _native
 
     store, db, runner = _legacy_owner(tmp_path, monkeypatch)

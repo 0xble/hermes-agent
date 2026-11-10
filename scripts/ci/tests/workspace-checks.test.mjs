@@ -95,3 +95,43 @@ test('unmatched or all-unit skips cannot report success', () => {
   assert.equal(run('--skip', 'missing').status, 1)
   assert.equal(run('--skip', 'packages/').status, 1)
 })
+
+test('drops vitest history before checks while retaining installed packages and Vite transforms', () => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-history-'))
+  try {
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ private: true }))
+    writeFileSync(join(root, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n')
+    const unit = join(root, 'packages', 'probe')
+    mkdirSync(unit, { recursive: true })
+    writeFileSync(join(unit, 'package.json'), JSON.stringify({
+      name: 'probe', version: '1.0.0', scripts: { check: 'node check.mjs' },
+    }))
+    const setup = spawnSync(pnpm, ['install', '--offline', '--ignore-scripts'], {
+      cwd: root, encoding: 'utf8', env: { ...process.env, CI: 'false' },
+    })
+    assert.equal(setup.status, 0, setup.stdout + setup.stderr)
+    for (const base of [root, unit]) {
+      for (const rel of ['.vite/vitest/results.json', '.vite/deps/_metadata.json', 'left-pad/package.json']) {
+        const file = join(base, 'node_modules', rel)
+        mkdirSync(dirname(file), { recursive: true })
+        writeFileSync(file, '{}')
+      }
+    }
+    writeFileSync(join(unit, 'check.mjs'), `
+      import assert from 'node:assert/strict'
+      import { existsSync } from 'node:fs'
+      import { join } from 'node:path'
+      for (const base of [process.cwd(), '../..']) {
+        assert.equal(existsSync(join(base, 'node_modules/.vite/vitest')), false)
+        assert.ok(existsSync(join(base, 'node_modules/.vite/deps/_metadata.json')))
+        assert.ok(existsSync(join(base, 'node_modules/left-pad/package.json')))
+      }
+      console.log('history cleared before check')
+    `)
+    const result = spawnSync(process.execPath, [runner], { cwd: root, encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(result.stdout, /history cleared before check/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})

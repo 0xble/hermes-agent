@@ -70,7 +70,8 @@ class GatewayProcessEventSourcesMixin:
                     return self._restored_source(entry)
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
-            cached_source = self._get_cached_session_source(session_key)
+            from gateway.session_detached import detached_live_source
+            cached_source = detached_live_source(self, session_key) or self._get_cached_session_source(session_key)
             if cached_source is not None:
                 return _stamp_profile(cached_source)
             derived = _parse_session_key(session_key) or {}

@@ -13,7 +13,8 @@ async def test_completion_uses_logical_owner_after_route_restore(tmp_path, monke
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session import SessionEntry
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_automation import completion_admission
     from gateway.session_ingress_context import native_callback
     from hermes_constants import get_hermes_home

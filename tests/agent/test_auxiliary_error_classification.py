@@ -47,9 +47,8 @@ def test_wrapped_transport_500_uses_connection_quarantine(body, reason, ttl):
     from agent.auxiliary_health import fallback_candidate_quarantine_ttl
 
     exc = _Err(body, 500)
-    assert ac._is_connection_error(exc) is (reason == "connection error")
-    assert ac._is_server_error(exc) is (reason == "provider unavailable")
-    assert next(label for predicate, label in ac._FALLBACK_REASONS if predicate(exc)) == reason
+    failure = aux_errors.Failure(exc, aux_errors.classify_attempt(exc, "custom"))
+    assert aux_errors.fallback_label(failure) == reason
     assert fallback_candidate_quarantine_ttl(reason) == ttl
 
 

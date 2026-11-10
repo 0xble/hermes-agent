@@ -843,11 +843,11 @@ def pm_setup_phase(phase: str, env: dict[str, str], *args: str) -> None:
         exports[destination] = str(path)
     run([sys.executable, 'scripts/ci/setup_toolchain.py', phase, '--toolchain', 'all',
          '--home', str(STATE / 'pm-home'), *args], env={**env, **exports})
-    for line in Path(exports['GITHUB_ENV']).read_text(encoding='utf-8').splitlines():
+    for line in Path(exports['GITHUB_ENV']).read_text(encoding='utf-8-sig').splitlines():
         name, value = line.split('=', 1)
         env[name] = value
     # setup_toolchain writes these in reverse because Actions prepends each line.
-    paths = Path(exports['GITHUB_PATH']).read_text(encoding='utf-8').splitlines()
+    paths = Path(exports['GITHUB_PATH']).read_text(encoding='utf-8-sig').splitlines()
     env['PATH'] = os.pathsep.join([*reversed(paths), env['PATH']])
     for name in ('uv', 'node', 'npm', 'pnpm'):
         executable = shutil.which(name + ('.exe' if os.name == 'nt' and name == 'pnpm' else ''), path=env['PATH'])
@@ -877,12 +877,12 @@ def setup(env: dict[str, str]) -> None:
          'import json, sys; from pathlib import Path; from pm import ensure_environment; '
          'p = ensure_environment("ci-docs", ["ascii-guard==2.3.0", "ruamel.yaml==0.18.16"], '
          'root=Path(sys.argv[1]), explicit=True); Path(sys.argv[2]).write_text(json.dumps(str(p)))',
-         str(STATE / 'docs-environment'), str(STATE / 'docs-python.json')], env=env)
+         str(STATE / 'environments' / 'docs'), str(STATE / 'docs-python.json')], env=env)
 
 
 def docs_python() -> Path:
     if (STATE / 'docs-python.json').is_file():
-        return Path(json.loads((STATE / 'docs-python.json').read_text(encoding='utf-8')))
+        return Path(json.loads((STATE / 'docs-python.json').read_text(encoding='utf-8-sig')))
     return STATE / 'docs-venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
 
 
@@ -946,6 +946,8 @@ def static(env: dict[str, str]) -> None:
         [py, 'scripts/ci/check_os_marker_fakes.py'],
         [py, 'scripts/check-case-collisions.py'],
         [py, 'scripts/ci/check_profile_archive_boundary.py'],
+        [py, 'scripts/ci/check_lazy_deps_imports.py'],
+        [py, 'scripts/ci/check_blob_size.py', '--base', git('merge-base', 'origin/main', 'HEAD').strip(), '--head', 'HEAD'],
         [py, 'scripts/ci/check_dependency_bounds.py', '--repo', '.'],
         [py, 'scripts/check_fork_patches.py', '--repo', '.', '--source-only'],
         [py, 'scripts/validate_plugin_catalog.py', 'plugin-catalog/'],

@@ -424,3 +424,5 @@ full Node, documentation, Rust and container lint. The hosted gate keeps its
 bounded static/Node partition because its qualification job separately requires
 the Python shard matrix. A local receipt has no hosted matrix to supply that
 coverage, so its gate must execute the complete source profile itself.
+
+The v0.23.1 reusable `repo-guards.yml` had no caller after the fork replaced upstream `ci.yaml`. The fork gate calls it on the exact PR head with every guard lane enabled, and qualification requires its success. It uses the same standard Ubuntu runner and pinned checkout action as the fork gate, without an external runner service. The reusable-workflow caller regression remains. Static also invokes upstream's lazy-dependency-import and blob-size guards. Two tests of lane orchestration isolate bootstrap-tool lookup while preserving real lane aggregation/retry assertions; dedicated resolver tests still exercise exact, missing and mismatched pins. PM docs generations sit under `.ci/environments/docs`, keeping PM's stable parent lock inside ignored checkout state instead of creating `.locks/.ci.lock` in source.

@@ -2,6 +2,15 @@
 from __future__ import annotations
 from gateway.config import Platform
 
+
+def _raise_invalid_alias(exc: Exception) -> None:
+    """Keep stored-alias failures out of the caller's ordinary refresh recovery."""
+    from hermes_cli.model_alias_runtime import ModelAliasError
+
+    if isinstance(exc, ModelAliasError):
+        raise exc
+
+
 def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, str, bool]:
     """Return chat text, failure reason and retryability for pre-turn resolution failures."""
     from gateway.run_turn_runner import (t)

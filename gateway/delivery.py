@@ -178,6 +178,15 @@ async def _ensure_named_dm_topic(
     return str(thread_id)
 
 
+def telegram_topic_owner_options(metadata: dict) -> dict:
+    """The same automation owner and parallel-lane policy for text and attachments."""
+    owner_key = metadata.get("telegram_topic_owner_key")
+    if not owner_key and metadata.get("job_id"):
+        owner_key = f"cron:{metadata['job_id']}"
+    return {"owner_key": str(owner_key) if owner_key else None,
+            "allow_parallel": bool(metadata.get("telegram_topic_allow_parallel"))}
+
+
 class DeliveryRouter:
     """Resolves delivery targets and dispatches messages to platform adapters."""
 
@@ -316,12 +325,9 @@ class DeliveryRouter:
 
         # Caller-supplied thread routing always wins over target.thread_id.
         named_topic: Optional[str] = None  # named topic requested for this send
-        topic_owner_key: Optional[str] = None
-        topic_allow_parallel = bool(send_metadata.get("telegram_topic_allow_parallel"))
-        if send_metadata.get("telegram_topic_owner_key"):
-            topic_owner_key = str(send_metadata["telegram_topic_owner_key"])
-        elif send_metadata.get("job_id"):
-            topic_owner_key = f"cron:{send_metadata['job_id']}"
+        topic_options = telegram_topic_owner_options(send_metadata)
+        topic_owner_key = topic_options["owner_key"]
+        topic_allow_parallel = topic_options["allow_parallel"]
         thread_id = target.thread_id
         # A configured numeric destination borrows that live session's topic. Its
         # historical cron owner may name a retired lane, so it must not override
@@ -366,7 +372,7 @@ class DeliveryRouter:
             error = _send_result_error(result)
             if retry or error is None or not named_topic or "thread not found" not in error.lower():
                 break
-            if topic_owner_key and not topic_allow_parallel:
+            if topic_owner_key:
                 mark_unresolved = getattr(adapter, "mark_telegram_topic_owner_unresolved", None)
                 if callable(mark_unresolved):
                     mark_unresolved(target.chat_id, topic_owner_key, reason="remote_topic_unavailable")

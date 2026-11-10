@@ -20,7 +20,7 @@ async def _gateway(monkeypatch):
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.base import SendResult
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
     from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -170,7 +170,7 @@ async def test_an_app_prompt_queued_for_the_old_conversation_runs_after_a_restar
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.run_runtime import recover_profile_native_sessions
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Submission
     runner, adapter, authority, source, sent, _ran, _gates = await _gateway(monkeypatch)
     await _chat(adapter, source, sent, 'hello')

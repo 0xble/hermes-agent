@@ -326,7 +326,8 @@ def test_turn_start_attended_notice_is_delivered_persistently_once(monkeypatch, 
     monkeypatch.setattr(turn, "_append_auto_media_tags", lambda final_response, *_args: final_response)
     monkeypatch.setattr(turn, "_sync_session_after_run", lambda *_args: (False, "sid", 0))
 
-    with patch.dict(sys.modules, {"gateway.run": SimpleNamespace(_current_max_iterations=lambda: 1)}):
+    with patch.dict(sys.modules, {"gateway.run": SimpleNamespace(
+            _current_max_iterations=lambda: 1, _reload_runtime_env_preserving_config_authority=lambda: None)}):
         turn.run_sync()
         turn.run_sync()
 
@@ -343,7 +344,7 @@ def test_conversation_loop_orders_route_hooks_around_destination_preflight(monke
         user_message="hello", original_user_message="hello", messages=[{"role": "user", "content": "hello"}],
         conversation_history=[], active_system_prompt="system", effective_task_id="task", turn_id="turn",
         should_review_memory=False, plugin_user_context="", ext_prefetch_cache="", current_turn_user_idx=0,
-        preflight_compression_blocked=False,
+        preflight_compression_blocked=False, plugin_block_message=None,
     )
     budget = SimpleNamespace(remaining=1)
     agent = SimpleNamespace(

@@ -8567,7 +8567,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
         token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
     extra = getattr(pconfig, "extra", None) or {}
-    from tools.send_message_tool import _send_telegram
+    from tools.send_message_senders import _send_telegram
     return await _send_telegram(
         token, chat_id, message, media_files=media_files, thread_id=thread_id,
         disable_link_previews=bool(extra.get("disable_link_previews")), force_document=force_document,

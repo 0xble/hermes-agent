@@ -1171,9 +1171,8 @@ class GatewayBusySessionMixin:
         """
         leftover_steer = (result.get("pending_steer") or "").strip()
         if leftover_steer:
-            steer_prompt, steer_source = self._pinned_channel_inputs(session_key, None, source, internal=True)
             self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
-            pending_event = MessageEvent(text=leftover_steer, source=steer_source, channel_prompt=steer_prompt)
+            pending_event = self._carry_over_event(session_key, source, leftover_steer)
         adapter._pending_messages[session_key] = pending_event
         logger.info("Deferring queued follow-up for session %s until after its compression-exhausted reset", session_key)
 
@@ -1212,16 +1211,10 @@ class GatewayBusySessionMixin:
                     session_key, pending[:40],
                 )
             elif pending and not pending_event:
-                from gateway.platforms.base import MessageEvent
                 # A deferred steer continues the active channel context, just like an
                 # eventless follow-up. Reuse its pins without marking the user as internal.
-                steer_prompt, steer_source = self._pinned_channel_inputs(
-                    session_key, None, source, internal=True,
-                )
-                steer_event = MessageEvent(
-                    text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
-                )
                 if session_key:
+                    steer_event = self._carry_over_event(session_key, source, leftover_steer)
                     self._enqueue_fifo(session_key, steer_event, adapter)
                 logger.debug(
                     "Enqueued leftover /steer behind pending message for session %s: '%s...'",

@@ -16,7 +16,7 @@ from tools import web_tools_extract as extract
 
 
 @pytest.fixture
-def offline(monkeypatch, tmp_path):
+def offline(monkeypatch, tmp_path, public_dns):
     def denied(*args, **kwargs):
         raise AssertionError("External network is forbidden in extraction tests")
 

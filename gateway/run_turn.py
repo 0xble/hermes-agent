@@ -34,7 +34,7 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent, turn_origin_for_event
 from gateway.platforms.typing_state import call_typing_with_metadata
-from gateway.session_context import bound_turn_origin, set_turn_origin
+from gateway.session_context import bound_turn_origin, scoped_turn_actor, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_turn_pending import _drain_leftover_steer
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -346,13 +346,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         if not session_key:
             return None
         cfg = parse_attended_config(user_config or {})
-        state = self._session_state(session_key)
-        conversation = state.conversation
+        state = self._peek_session_state(session_key)
+        conversation = state.conversation if state is not None else None
         assignment = assignment or {}
         model_role = assignment.get("model_role", getattr(conversation, "model_role", None))
         override = assignment.get("override", override)
         if not cfg.enabled and not model_role:
             return None
+        state = state if state is not None else self._session_state(session_key)
+        conversation = state.conversation
         new_session_pending = bool(new_session or getattr(conversation, "attended_new_session", False))
         new_session = new_session_pending and cfg.start_new_sessions
         stamp = conversation.last_user_activity_at
@@ -3099,20 +3101,23 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             try:
                 bind_agent_start(pending_event)
                 _followup_receipt = current_receipt()
-                followup_result = await self._run_agent(
-                    message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
-                    source=next_source, session_id=session_id, session_key=next_session_key,
-                    run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id, inbound_message_id=next_inbound_id,
-                    recovery_id=getattr(pending_event, "_hermes_recovery_id", None),
-                    channel_prompt=next_channel_prompt, message_type=next_message_type,
-                    persist_user_message=next_persist_message,
-                    _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
-                    persist_user_display_kind=next_display_kind,
-                    reply_expected=next_reply_expected,
-                    persist_user_display_metadata={
-                        **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
-                )
+                actor_scope = (scoped_turn_actor(pending_event, self._session_state(next_session_key).turn)
+                               if pending_event is not None else nullcontext())
+                with actor_scope:
+                    followup_result = await self._run_agent(
+                        message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
+                        source=next_source, session_id=session_id, session_key=next_session_key,
+                        run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id, inbound_message_id=next_inbound_id,
+                        recovery_id=getattr(pending_event, "_hermes_recovery_id", None),
+                        channel_prompt=next_channel_prompt, message_type=next_message_type,
+                        persist_user_message=next_persist_message,
+                        _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
+                        persist_user_display_kind=next_display_kind,
+                        reply_expected=next_reply_expected,
+                        persist_user_display_metadata={
+                            **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                    )
                 from gateway.run import _should_clear_resume_pending_after_turn
                 for consumed_event in _consumed_events:
                     consumed_event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(followup_result)

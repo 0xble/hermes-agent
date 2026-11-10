@@ -111,7 +111,7 @@ def test_heic_screenshot_is_cached_as_png(tmp_path, monkeypatch):
     buf = BytesIO()
     pillow_heif.from_pillow(Image.new("RGB", (4, 4), "red")).save(buf, format="HEIF")
     heic = buf.getvalue()
-    assert heic[4:8] == b"ftyp" and not base._looks_like_image(heic)
+    assert heic[4:8] == b"ftyp" and base._looks_like_image(heic)
 
     path = Path(base.cache_image_from_bytes(heic, ".heic"))
 

@@ -18,7 +18,7 @@ async def test_restoring_a_current_live_route_does_not_wait_on_the_store_lock(tm
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from gateway.session_local_recovery import restore_local_session

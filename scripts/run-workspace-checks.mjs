@@ -22,7 +22,7 @@
 // checkout because the build stamp has no branch to record.
 
 import { execFileSync, spawn } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
 import { join, relative } from 'node:path'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
@@ -141,6 +141,11 @@ async function main() {
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
   for (const u of units) console.log(`  ${u.pkg} :: ${u.script}`)
   console.log('')
+
+  // Cached vitest timings must not force the slowest suites to start cold together.
+  for (const pkg of new Set(['.', ...units.map((unit) => unit.pkg)])) {
+    rmSync(join(pkg, 'node_modules', '.vite', 'vitest'), { recursive: true, force: true })
+  }
 
   const queue = [...units]
   /** @type {{unit: {pkg: string, script: string}, code: number, output: string, ms: number}[]} */

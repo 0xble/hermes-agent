@@ -247,16 +247,22 @@ async def deliver_resolved(authority, admission_id, *, owed):
     await deliver_settled(authority, admission_id)
 
 
-def _take_post_delivery(authority, admission_id, source, route):
+def _take_post_delivery(authority, admission_id, source, route, *, native=False):
     """Move the turn's post-delivery slot off its adapter onto this admission. A native waiter (the
     messaging adapter task that sends the reply) runs it after its own send instead. A runner or
     adapter without the seam (a webhook sink, a bare test double) holds none."""
     resolve = getattr(authority.runner, '_adapter_for_source', None)
-    native = admission_id in authority.native_waiters
-    slots = getattr(resolve(source), '_post_delivery_callbacks', None) if resolve and source and not native else None
-    entry = slots.pop(route, None) if slots is not None else None
+    native = native or admission_id in authority.native_waiters
+    adapter = resolve(source) if resolve and source and not native else None
+    slots, key = getattr(adapter, '_post_delivery_callbacks', None), route
+    if slots is not None and route not in slots:
+        owned = getattr(adapter, '_post_delivery_callbacks_by_generation', {})
+        keys = [key for key in owned if key[0] == route]
+        if len(keys) == 1:
+            slots, key = owned, keys[0]
+    entry = slots.pop(key, None) if slots is not None else None
     if entry is not None:
-        _registry(authority, 'post_delivery')[admission_id] = (slots, route, entry)
+        _registry(authority, 'post_delivery')[admission_id] = (slots, key, entry)
 
 
 def _hand_back_post_delivery(authority, admission_id):
@@ -343,6 +349,7 @@ async def _handle_compression_deferred_admission(authority, ref, row, event, cap
     """
     runner = authority.runner
     live = authority.sessions[ref.session_id]
+    claimed_route = live.route
     original_text = event.text
     while True:
         # Preparation can enrich event.text (auto skills). Replaying an unexecuted
@@ -362,14 +369,14 @@ async def _handle_compression_deferred_admission(authority, ref, row, event, cap
             # accepted during either await must win before handler re-entry.
             stopped = authority.pending_stops.get(ref.session_id) == row['generation']
             draining = runner._draining or authority.retiring
-            replaced = authority.sessions.get(ref.session_id) is not live or live.superseded
+            replaced = authority.sessions.get(ref.session_id) is not live or live.route != claimed_route
             if stopped or draining or replaced:
                 result = {'final_response': '', 'messages': [], 'interrupted': True, 'api_calls': 0}
                 if draining and not stopped:
                     # Existing shutdown settlement requeues a zero-model native
                     # claim, preserving its admission id for restart recovery.
                     result['interrupt_message'] = runner._shutdown_interrupt_reason()
-                captured['result'] = result
+                captured['result'] = captured['terminal_result'] = result
                 return None
             if not held:
                 break
@@ -405,6 +412,7 @@ async def execute_admission(authority, ref, row):
     if policy is not None:
         return await admit_managed(authority, ref, row, policy)
     live = authority.sessions[ref.session_id]
+    route = live.route
     native = row['admission_id'] in authority.native_waiters
     authority.native_waiters.discard(row['admission_id'])
     if 'native_text_v1' in row['payload']:
@@ -510,6 +518,7 @@ async def execute_admission(authority, ref, row):
             await _hand_over_turn_marker(authority, row['admission_id'], event)
             return response
     finally:
+        _take_post_delivery(authority, row['admission_id'], event.source, route, native=native)
         post_delivery = captured.get('post_delivery')
         waiter = authority.waiters.get(row['admission_id'])
         if post_delivery is not None and native and waiter is not None and not waiter.done():

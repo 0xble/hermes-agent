@@ -123,7 +123,10 @@ def test_store_failure_preserves_one_shot_and_wake_gate(
         script.assert_called_once()
         agent_class.assert_not_called()
         assert current["last_status"] == "ok"
-        assert current["repeat"]["completed"] == 1
+        # This explicit manual fire is extra: it cannot consume the scheduled occurrence.
+        assert current["repeat"]["completed"] == 0
+        assert current["next_run_at"] == job["next_run_at"]
+        assert current["enabled"] and current["state"] == "scheduled"
     else:
         acquire.assert_called()
         script.assert_not_called()

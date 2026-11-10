@@ -548,7 +548,20 @@ class LeftCoreFeature:
     notice: Callable[..., str] = _no_notice
 
 
+def advanced_delegation_in_use(home: Path, *, process_env: bool = False) -> bool:
+    """The migrated backend, or fork routes an update has not converted yet."""
+    delegation = _read_config(home).get("delegation")
+    return isinstance(delegation, dict) and (
+        delegation.get("backend") in {"model_map", "profile_routes"}
+        or any(key in delegation for key in ("model_preset", "by_parent", "subagents")))
+
+
 LEFT_CORE: tuple[LeftCoreFeature, ...] = (
+    LeftCoreFeature(
+        plugin="advanced-delegation", label="Advanced Delegation", in_use=advanced_delegation_in_use,
+        unchanged="your migrated model_aliases and model_map routes remain configured; "
+                  "named delegation routes now use the official plugin",
+    ),
     LeftCoreFeature(
         plugin="homeassistant", label="Home Assistant", in_use=homeassistant_in_use,
         unchanged="HASS_TOKEN/HASS_URL, platforms.homeassistant and the ha_* tool names are unchanged",

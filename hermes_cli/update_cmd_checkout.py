@@ -82,7 +82,7 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
     file no longer compiles (a bad admin-merge past CI must not brick the CLI)."""
     from hermes_cli.update_cmd import (
         Path, _UPDATE_CRITICAL_FILES, _commit, _m, _roll_back_broken_update,
-        _validate_critical_files_syntax,
+        _validate_python_files_syntax,
     )
     pyproject = Path(_m().PROJECT_ROOT) / "pyproject.toml"
     if pyproject.is_file() and _commit.requires_other_python(pyproject.read_bytes()):
@@ -90,7 +90,7 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
         broken = _commit.tree_syntax_error(_m().PROJECT_ROOT, _UPDATE_CRITICAL_FILES)
         syntax_ok, failing_path, syntax_error = (broken is None, *(broken or (None, None)))
     else:
-        syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
+        syntax_ok, failing_path, syntax_error = _validate_python_files_syntax(_m().PROJECT_ROOT, _UPDATE_CRITICAL_FILES)
     if not syntax_ok:
         _roll_back_broken_update(git_cmd, pre_pull_sha, failing_path, syntax_error, rollback_branch=rollback_branch,
                                  _windows_gateway_resume=_windows_gateway_resume)

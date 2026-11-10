@@ -676,42 +676,117 @@ class GatewayTurnPersistenceMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
-        if diagnostic_wake_muted(event):
-            return None
+        # Evaluation needs the model's raw output, including explicit emptiness and control
+        # markers, not a normalized display notice. The non-streamed return value is display
+        # text; post-turn hooks prefer the model copy (see _final_text_for_post_turn_hooks).
+        with suppress(Exception):
+            from hermes_cli.goal_turn_outcome import model_final_response
+            event._agent_final_response = model_final_response(agent_result)
+        from gateway.cron_review import private_turn_response
+        private, captured_response = private_turn_response(event, agent_result, response)
+        if private:
+            return captured_response
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
+            from gateway.reply_latency import record_no_reply
+            record_no_reply(event)
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
         adapter = self._delivery_adapter_for(source)
-        # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
+        from gateway.platforms.base import EphemeralReply
+        is_ephemeral_response = isinstance(response, EphemeralReply) or bool(
+            agent_result.get("is_ephemeral_response", getattr(event, "_is_ephemeral_response", False)))
+        ephemeral_ttl = getattr(response, "ttl_seconds", None)
+        if isinstance(response, EphemeralReply):
+            response = response.text
+        if ephemeral_ttl is None:
+            try:
+                ephemeral_ttl = int(agent_result.get("ephemeral_ttl", getattr(event, "_ephemeral_ttl", 0)) or 0)
+            except (TypeError, ValueError):
+                ephemeral_ttl = 0
+        from gateway.copy_blocks import render_copy_blocks_inline, split_copy_blocks_for
+        response_without_copy, copy_blocks = split_copy_blocks_for(adapter, response) if response else (response, [])
+        if agent_result.get("interrupted") and response:
+            # An interrupted model may end inside a copy block. Never promote that partial
+            # fragment to a separate copy message; inline degradation also keeps markers hidden.
+            response_without_copy, copy_blocks = render_copy_blocks_inline(response), []
+        # Copy blocks are separate finals even when the ordinary body was streamed.
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
+        # Paste-ready text is read, never spoken, on every platform.
+        from gateway.copy_blocks import strip_copy_blocks
+        from gateway.stream_recovery import unmark_recovered_reply
+        _spoken = strip_copy_blocks(unmark_recovered_reply(response, agent_result)) if response else response
         if not _streaming_tts_done and self._should_send_voice_reply(
-            event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
+            event, _spoken, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response)
+            await self._send_voice_reply(event, _spoken)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
-            if response and adapter and not agent_result.get("media_already_delivered"):
-                await self._deliver_media_from_response(response, event, adapter)
+            media_delivered = False
+            copy_failed = False
+            copy_delivered = False
+            if (adapter and copy_blocks and not agent_result.get("interrupted")
+                    and not agent_result.get("copy_already_delivered")):
+                copy_results = []
+                await adapter._send_copy_blocks(
+                    event, session_key, copy_blocks, self._event_thread_metadata(event, source) or {},
+                    copy_results.append, is_ephemeral_response=is_ephemeral_response,
+                    ephemeral_ttl=ephemeral_ttl,
+                )
+                copy_delivered = any(getattr(result, "success", False) for result in copy_results)
+                copy_failed = any(not getattr(result, "success", False) for result in copy_results)
+            # Interrupted copy fragments already appeared inline in the stream;
+            # never append a second unquoted copy of those partial bodies.
+            if copy_failed:
+                agent_result["failed"] = True
+                agent_result["error"] = "one or more [[copy]] blocks failed to deliver"
+            if response_without_copy and adapter and not agent_result.get("media_already_delivered"):
+                # Attachments come only from text outside copy blocks: a body is literal text.
+                from gateway.copy_blocks import strip_copy_blocks
+                media_delivered = bool(await self._deliver_media_from_response(
+                    strip_copy_blocks(response), event, adapter))
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter and not _intentional_silence:
                 try:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
-            # Return None so the body isn't sent twice; stash the delivered text on the event for the
+            # Reconcile the restart note only on a confirmed answer: streamed visible text, or a
+            # confirmed upload for an attachment-only answer. A failed upload keeps the note so a
+            # later delivery can still reconcile it (the queued lane reconciles its own uploads).
+            if adapter and hasattr(adapter, "_reconcile_restart_note_after_delivery"):
+                streamed_text = False
+                if response_without_copy:
+                    try:
+                        from gateway.run import _strip_response_attachments_for_direct_send
+                        streamed_text = bool(_strip_response_attachments_for_direct_send(response, adapter))
+                    except Exception:
+                        logger.debug("Could not classify streamed response attachments", exc_info=True)
+                        streamed_text = True  # fail open to the historical unconditional reconcile
+                if streamed_text or media_delivered or (copy_delivered and not copy_failed):
+                    await adapter._reconcile_restart_note_after_delivery(event, session_key)
+            # Return None so the body isn't sent twice; stash the raw text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
-                event._streamed_final_response = str(response or "")
+                from gateway.stream_recovery import unmark_recovered_reply
+                event._streamed_final_response = unmark_recovered_reply(
+                    str(agent_result.get("final_response") or ""), agent_result)
             return None
 
+        if agent_result.get("interrupted") and response:
+            # The adapter renders the blocks inline, keeping each body opaque to directive
+            # extraction, instead of promoting a possibly partial block to its own message.
+            with suppress(Exception):
+                event._copy_blocks_inline_only = True
         return response
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own

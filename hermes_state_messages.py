@@ -21,7 +21,7 @@ from agent.message_sanitization import _sanitize_surrogates, coalesce_tool_call_
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
-    _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
+    _MERGE_DISPLAY_META, _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_tool_copy_sql
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_todo import SessionTodoResultMixin
@@ -884,7 +884,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         time (before the agent ran) and the turn prologue then rewrote the prompt it persists (@-file
         expansion, native image parts, a ``pre_llm_call`` veto's placeholder): the early row must show what
         the transcript will replay, not the raw keystrokes, and the turn must not append a second row for
-        the same input. ``display_metadata``, when given, replaces the row's (and clears ``api_content``)."""
+        the same input. ``display_metadata``, when given, is merge-patched in (``None`` deletes; reactions survive)."""
         if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
             return 0
         if display_metadata is None:
@@ -892,7 +892,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
                 f"UPDATE messages SET content = ? WHERE {_VISIBLE_MESSAGE_SQL} AND id = ? AND session_id = ? AND role = 'user' AND active = 1",
                 (self._encode_content(content), row_id, session_id), session_ids=(session_id,))
         return self._write_rowcount(
-            "UPDATE messages SET content = ?, api_content = NULL, display_metadata = ? "
+            f"UPDATE messages SET content = ?, api_content = NULL, display_metadata = {_MERGE_DISPLAY_META} "
             f"WHERE {_VISIBLE_MESSAGE_SQL} AND id = ? AND session_id = ? AND role = 'user' AND active = 1",
             (self._encode_content(content), self._encode_display_metadata(display_metadata), row_id, session_id),
             session_ids=(session_id,))
@@ -965,7 +965,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         first_by_uid.setdefault(uid, key)
         return key
 
-    def _dedupe_display_generations(self, rows, *, drop_removed: bool = False):
+    def _dedupe_display_generations(self, rows, *, drop_removed: bool = False, first_ids: Optional[dict] = None):
         """Collapse compaction generations so each logical message appears once (the protected tail is copied
         into each generation: same role/content/timestamp, different ``active``/id); prefer the live row, then
         the newest. The ONE definition every display projection shares. *rows* must be ordered by ``id``.
@@ -973,13 +973,15 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         *drop_removed*: *rows* also hold the removed rows (``active=0, compacted=0``: rewound, or replaced by a
         newer copy) and ``compacted``. A message whose newest copy is removed is not shown, so a rewind in a
         compression child never brings back the parent's copy. Copies share the display key or ``message_uid``
-        (a micro-compaction merge also stands for the rows it absorbed)."""
+        (a micro-compaction merge also stands for the rows it absorbed). *first_ids* maps each kept
+        row's id to its first durable row, including a removed original carried through compaction."""
         seen: dict[tuple[Any, ...], Any] = {}
         first_id: dict[tuple[Any, ...], int] = {}
         uid_key: dict[Any, tuple[Any, ...]] = {}  # message_uid -> the display key of its first copy
         removed: dict[Any, bool] = {}  # copy identity -> its newest copy is removed (rows come in id order)
         identities: dict[tuple[Any, ...], list[Any]] = {}
         removed_ts: set[Any] = set()
+        removed_first: dict[Any, int] = {}
         rows = rows if isinstance(rows, list) else list(rows)
         later_copies = later_tool_copy_ids(self, rows)  # a compacted tool result paints once, as its original
         if drop_removed:
@@ -1001,6 +1003,8 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
                     ("uid", uid) for uid in (row["message_uid"], *_uid_list(row["absorbed_message_uids"])) if uid)]
                 removed.update(dict.fromkeys(copies, gone))
                 if gone:
+                    for copy in copies:
+                        removed_first.setdefault(copy, row["id"])
                     continue
             if self._is_model_only_row(row) or row["id"] in later_copies:
                 continue
@@ -1018,6 +1022,9 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         keys = sorted(seen, key=first_id.__getitem__)
         if drop_removed:
             keys = [key for key in keys if not any(removed[copy] for copy in identities[key])]
+        if first_ids is not None:
+            first_ids.update((seen[key]["id"], min([first_id[key], *(
+                removed_first[copy] for copy in identities[key] or () if copy in removed_first)])) for key in keys)
         return [seen[key] for key in keys]
 
 
@@ -1109,13 +1116,14 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
 
     @staticmethod
     def _display_rows_from_conn(conn, session_id: str, *, limit: Optional[int] = None,
-                                offset: int = 0, latest: bool = False):
-        """One display-history projection for normal reads and transactional verification."""
+                                offset: int = 0, latest: bool = False, after: Optional[int] = None):
+        """One display-history projection, optionally past a display-order key (before it when latest)."""
         direction = "DESC" if latest else "ASC"
+        keyset = "" if after is None else f" AND display_order {'<' if latest else '>'} {int(after)}"
         return conn.execute(
             f"""WITH page AS (
                    SELECT display_order FROM messages
-                   WHERE {_VISIBLE_MESSAGE_SQL} AND session_id = ? AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}{not_a_later_tool_copy_sql("messages")}
+                   WHERE {_VISIBLE_MESSAGE_SQL} AND session_id = ? AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}{not_a_later_tool_copy_sql("messages")}{keyset}
                    GROUP BY display_order ORDER BY display_order {direction}
                    LIMIT ? OFFSET ?
                )

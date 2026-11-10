@@ -25,8 +25,10 @@ newly created topic rows.
 
 The migration installs the decided worker, explorer and coder options, enables
 advanced-delegation, and leaves 5 Claude options commented until the proxy protects
-Brian's 25% reserve. Install the official plugin in the target profile before
-activation. The supplied custom proxy IDs and fallback IDs are preserved. The
+Brian's 25% reserve. The existing update/startup plugin migration installs the
+official Advanced Delegation plugin when legacy routing or the migrated backend
+requires it. A later explicit plugin removal remains respected. The supplied
+custom proxy IDs and fallback IDs are preserved. The
 shared proxy's paid API-key pool remains an activation blocker for a strict
 subscription-only guarantee. Isolated proofs use a disposable OAuth-only proxy.
 Old GPT preset aliases use native openai-codex with no paid fallback. The optional

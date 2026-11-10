@@ -820,6 +820,7 @@ try {
             stack.enter_context(patch.object(ci, 'STATE', Path(directory)))
             stack.enter_context(patch.object(ci, 'require_case_sensitive_tmpdir'))
             stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
+            stack.enter_context(patch.object(ci, 'resolve_local_toolchain', side_effect=lambda env: env))
             stack.enter_context(patch.object(sys, 'argv', ['bin/ci']))
             seen = []
             stack.enter_context(patch.object(ci, 'setup', side_effect=lambda env: seen.append('setup')))
@@ -958,6 +959,7 @@ try {
             stack.enter_context(patch.object(ci, 'STATE', root / 'state'))
             stack.enter_context(patch.object(ci, 'require_case_sensitive_tmpdir'))
             stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
+            stack.enter_context(patch.object(ci, 'resolve_local_toolchain', side_effect=lambda env: env))
             stack.enter_context(patch.object(sys, 'argv', ['bin/ci', 'check', '--lane', 'python', '--workers', '1']))
             # Keep the actual lane, shell harness and pytest subprocesses. Only
             # narrow discovery and bypass unrelated installed-tool qualification.

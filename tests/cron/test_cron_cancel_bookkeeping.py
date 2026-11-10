@@ -156,7 +156,8 @@ def test_monitoring_reports_stops_and_misses_as_themselves(monkeypatch):
     assert project_execution_event({"status": "missed", "job_id": "j"}).status == "missed"
 
     sent: list = []
-    monkeypatch.setattr(metrics, "_submit", lambda emit, mark, fields, **kw: sent.append(fields(**kw)))
+    monkeypatch.setattr(metrics, "_submit", lambda fn, *args, **kw: fn(*args, **kw))
+    monkeypatch.setattr(metrics, "_emit", lambda mark, fields, **kw: sent.append(fields(**kw)))
     metrics.record_cron_finish({"id": "e1", "status": "cancelled", "started_at": "2026-01-01T00:00:00",
                                 "finished_at": "2026-01-01T00:00:05"})
     assert sent[0]["outcome"] == "cancelled"

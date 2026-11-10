@@ -23,7 +23,7 @@ def authority_for(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
 
     async def build(profile_id, instance_id):

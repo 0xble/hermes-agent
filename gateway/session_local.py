@@ -68,6 +68,11 @@ class LocalSessionAdapter(BasePlatformAdapter):
         if key == source.chat_id and source.platform == Platform.LOCAL:
             self.policies.pop(key, None)
             self._post_delivery_callbacks.pop(route, None)
+            owned = self._post_delivery_callbacks_by_generation
+            for slot in [key for key in owned if key[0] == route]:
+                owned.pop(slot)
+            claims = getattr(self, '_post_delivery_claims', set())
+            claims.difference_update([key for key in claims if key[0] == route])
 
     async def connect(self, *, is_reconnect=False):
         return True

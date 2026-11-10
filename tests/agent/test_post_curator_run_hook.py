@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import threading
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 
@@ -126,26 +125,35 @@ def test_dry_run_pass_fires_flagged_with_the_hooks_test_payload_shape(curator_en
     assert set(received[0]) - {"telemetry_schema_version"} == set(_DEFAULT_PAYLOADS["post_curator_run"])
 
 
-def test_hook_waits_for_in_flight_discovery_once_not_on_every_call(monkeypatch):
-    """A hook fired mid-discovery sees the plugins it loads; a scan hung in a plugin's register()
-    costs one bounded wait, not one per hook call."""
+def test_hook_refuses_incomplete_discovery_then_delivers_without_another_wait(monkeypatch):
+    """A partial plugin registry cannot deliver hooks, even after an earlier bounded wait expired."""
+    from hermes_cli.plugins_dispatch import PluginDiscoveryIncomplete
+
     plugins = _plugins()
     manager = plugins.get_plugin_manager()
     manager._discovered = True
-    received, joins, release = [], [], threading.Event()
+    manager._discovery_complete = False
+    received, joins = [], []
+    manager._hooks.setdefault("post_curator_run", []).append(lambda **kw: received.append(kw))
 
-    class _Scan(threading.Thread):
+    class _Scan:
+        complete = False
+
+        def is_alive(self):
+            return not self.complete
+
         def join(self, timeout=None):
             joins.append(timeout)
-            manager._hooks.setdefault("post_curator_run", []).append(lambda **kw: received.append(kw))
 
-    hung = _Scan(target=release.wait, daemon=True)
-    hung.start()
-    monkeypatch.setattr(plugins, "_background_discovery_thread", hung)
-    monkeypatch.setattr(plugins, "_delivery_join_abandoned", False, raising=False)
-    try:
-        plugins.invoke_hook("post_curator_run", run_dir="d")
-        plugins.invoke_hook("post_curator_run", run_dir="d")
-    finally:
-        release.set()
-    assert (len(joins), len(received)) == (1, 2)
+    scan = _Scan()
+    monkeypatch.setattr(plugins, "_background_discovery_thread", scan)
+    monkeypatch.setattr(plugins, "_background_discovery_error", None)
+    for _ in range(2):
+        with pytest.raises(PluginDiscoveryIncomplete, match="refusing partial registry"):
+            plugins.invoke_hook("post_curator_run", run_dir="d")
+    assert len(joins) == 2 and received == []
+
+    scan.complete = manager._discovery_complete = True
+    plugins.invoke_hook("post_curator_run", run_dir="d")
+    plugins.invoke_hook("post_curator_run", run_dir="d")
+    assert len(joins) == 2 and len(received) == 2

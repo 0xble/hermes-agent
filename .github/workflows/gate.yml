@@ -7,6 +7,18 @@ concurrency:
   group: repository-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 jobs:
+  repository-guards:
+    uses: ./.github/workflows/repo-guards.yml
+    with:
+      commit: ${{ github.event.pull_request.head.sha }}
+      event_name: pull_request
+      python: true
+      catalog: true
+      scan: true
+      deps: true
+      npm_lock: true
+      uv_lock: true
+      docker_meta: true
   linux:
     name: Static and Node gate
     runs-on: ubuntu-latest
@@ -115,7 +127,7 @@ jobs:
       contents: read
   qualification:
     if: always()
-    needs: [linux, python-shard, prompt-surface]
+    needs: [linux, python-shard, prompt-surface, repository-guards]
     runs-on: ubuntu-latest
     steps:
       - name: Require every gate job

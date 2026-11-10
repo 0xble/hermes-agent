@@ -56,9 +56,8 @@ def _seed_old_stopping_cross_profile_task(mux, room_id='room'):
 @pytest.mark.parametrize('admission_state', ['queued', 'unknown'])
 def test_cross_profile_stopping_recovery(mux, admission_state):
     from gateway import hosted_room_driver as tasks
-    from hermes_state_runtime import (
-        begin_runtime_epoch, claim_session_input, list_session_admissions, recover_session_inputs,
-    )
+    from hermes_state_runtime import claim_session_input, list_session_admissions, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     service, binding, identity, rpc, sid = _seed_old_stopping_cross_profile_task(mux)
     runner, homes, _, _ = mux
@@ -94,7 +93,8 @@ def test_cross_profile_stopping_recovery(mux, admission_state):
 def test_recovered_group_loads_and_answers_the_next_message_without_replaying_old_work(mux, monkeypatch):
     from gateway import hosted_room_driver as tasks, hosted_rooms, session_finite
     from gateway.session_authority import SessionAuthority
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input, recover_session_inputs
+    from hermes_state_runtime import claim_session_input, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tests.waiting import wait_until
 
     service, binding, identity, rpc, sid = _seed_old_stopping_cross_profile_task(mux)
@@ -165,7 +165,8 @@ def test_saved_stop_finishes_before_slow_preparation_of_its_own_room(mux, monkey
 @pytest.mark.parametrize('mismatch', ['task', 'generation', 'active'])
 def test_recovered_stop_does_not_discard_a_different_canonical_attempt(mux, monkeypatch, mismatch):
     from gateway import hosted_room_driver as tasks
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input, list_session_admissions, recover_session_inputs
+    from hermes_state_runtime import claim_session_input, list_session_admissions, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     service, binding, identity, rpc, sid = _seed_old_stopping_cross_profile_task(mux)
     runner, homes, _, _ = mux

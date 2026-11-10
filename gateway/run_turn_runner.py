@@ -7,9 +7,8 @@ keeps intercepting them at call time.
 
 from __future__ import annotations
 from gateway.run_turn_runner_resolution import (
-    _resolution_failure_reply
+    _resolution_failure_reply, _raise_invalid_alias
 )
-
 
 import asyncio
 import dataclasses
@@ -1011,7 +1010,8 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
                 ))
             if ctx.session_key:
                 _handoff(conversation={"pending_attended_notice": None})
-        except Exception:
+        except Exception as exc:
+            _raise_invalid_alias(exc)
             logger.warning("attended model refresh before API call failed; keeping current route", exc_info=True)
 
     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,

@@ -23,6 +23,21 @@ def _detached(env_home, marker):
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def test_environment_scan_continues_after_native_process_read_failure(tmp_path, monkeypatch):
+    import psutil
+
+    class Unreadable:
+        pid = os.getpid() + 1
+
+        def environ(self):
+            raise SystemError("proc_environ returned a result with an exception set")
+
+    owned = SimpleNamespace(pid=os.getpid() + 2, environ=lambda: {"HERMES_HOME": str(tmp_path / "owned")})
+    unrelated = SimpleNamespace(pid=os.getpid() + 3, environ=lambda: {"HERMES_HOME": str(tmp_path.parent / "other")})
+    monkeypatch.setattr(psutil, "process_iter", lambda: iter([Unreadable(), unrelated, owned]))
+    assert suite_conftest._processes_with_hermes_home_under([tmp_path]) == [owned.pid]
+
+
 @pytest.mark.platforms("linux", "macos")
 @pytest.mark.live_system_guard_bypass  # signals only the two children this test spawned
 def test_session_teardown_terminates_daemons_under_the_session_basetemp_only(tmp_path):

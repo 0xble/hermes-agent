@@ -16,7 +16,8 @@ def _config():
             "delegation-sol": {"provider": "custom:codex", "model": "sol-wire", "reasoning_effort": "high",
                                "fallbacks": [{"provider": "openai", "model": "paid"}]},
         },
-        "delegation": {"model_preset": "delegation-sol", "by_parent": {"@uncensored": "inherit"}},
+        "delegation": {"model_preset": "delegation-sol", "by_parent": {"@uncensored": "inherit"},
+                       "inherit_service_tier": True},
     }
 
 
@@ -30,6 +31,7 @@ def test_config_retirement_keeps_aliases_and_plugin_policy_without_mutating_inpu
     assert "model_preset" not in after["delegation"]
     route = after["delegation"]["backends"]["model_map"]
     assert route["default"] == "worker"
+    assert after["delegation"]["inherit_service_tier"] is False
     assert [(o["name"], after["model_aliases"][o["model"]]["model"], o["reasoning_effort"]) for o in route["options"]] == [
         ("worker", "gpt-6-luna", "low"), ("explorer", "gpt-6.1-terra", "medium"),
         ("coder", "gpt-6.1-sol", "high"),

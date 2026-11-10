@@ -6,6 +6,7 @@ import os
 from typing import Optional
 
 from agent.i18n import t
+from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.session import SessionSource
@@ -130,13 +131,30 @@ class GatewayBackgroundMixin:
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
             header = t("gateway.background.complete_header", preview=preview)
             images, media_files, text_content = [], [], ""
+            from gateway.copy_blocks import restore_inline_copy_bodies, split_copy_blocks_protected
+            response, copy_blocks, inline_bodies = split_copy_blocks_protected(adapter, response)
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
+                text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
-            elif not images and not media_files:
+                content = header + text_content
+                if source.platform == Platform.SLACK and not (result or {}).get("error"):
+                    from agent.notice_style import notice_metadata
+                    await adapter.send(chat_id=source.chat_id, content=header,
+                                       metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
+                    content = text_content
+                await adapter.send(chat_id=source.chat_id, content=content, metadata=_thread_metadata)
+            for copy_block in copy_blocks:
+                copy_metadata = dict(_thread_metadata or {})
+                copy_metadata["copy_block"] = True
+                copy_metadata["plain"] = True
+                copy_result = await adapter.send(chat_id=source.chat_id, content=copy_block, metadata=copy_metadata)
+                if not getattr(copy_result, "success", False):
+                    logger.error("Background copy block delivery failed for %s: %s", source.chat_id,
+                                 getattr(copy_result, "error", None) or "no result")
+            if not text_content and not copy_blocks and not images and not media_files:
                 await adapter.send(
                     chat_id=source.chat_id, content=header + t("gateway.background.no_response"), metadata=_thread_metadata,
                 )

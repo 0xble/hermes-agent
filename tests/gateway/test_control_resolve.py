@@ -144,6 +144,7 @@ def test_an_absent_or_stale_owner_has_no_socket_to_ask(layout):
     import socket
     from gateway.control_socket import resolve_server_socket_path
     bind_path, pointer = resolve_server_socket_path(solo)  # where a gateway for this home listens
+    created_parent = pointer is not None and not bind_path.parent.exists()
     if pointer is not None:
         bind_path.parent.mkdir(mode=0o700, exist_ok=True)
         pointer.write_text(str(bind_path), encoding="utf-8")
@@ -158,6 +159,8 @@ def test_an_absent_or_stale_owner_has_no_socket_to_ask(layout):
     finally:
         bind_path.unlink(missing_ok=True)
         if pointer is not None:
+            pointer.unlink(missing_ok=True)
+        if created_parent:
             bind_path.parent.rmdir()
 
 

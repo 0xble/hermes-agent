@@ -19,7 +19,7 @@ async def _local_session(tmp_path, monkeypatch):
     from gateway import run, session_local
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import SessionActor
     from hermes_state_local import local_receipt
     monkeypatch.setattr(run, '_load_gateway_config', dict)
@@ -28,8 +28,8 @@ async def _local_session(tmp_path, monkeypatch):
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
                              _cached_agent_for=lambda *a, **k: None, _evict_cached_agent=lambda *a, **k: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
-    actor = SessionActor('owner', 'fixture', frozenset({'session:create', 'session:read', 'session:control'}), 'sock')
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
+    actor = SessionActor('owner', str(tmp_path), frozenset({'session:create', 'session:read', 'session:control'}), 'sock')
     ref = session_local.create_local_session(authority, actor, dict(
         request_id='resume', source='gui', cwd=str(tmp_path), model='frozen', toolsets=[]))
     return authority, actor, ref, local_receipt(authority.db, ref.session_id)['entry']['session_id']

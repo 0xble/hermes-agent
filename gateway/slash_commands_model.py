@@ -781,7 +781,8 @@ class GatewayModelCommandsMixin:
             self._publish_role_edit(session_key, role)
 
     def _publish_role_edit(self, session_key: str, role: Optional[str]) -> None:
-        self._pending_one_turn_model_restores.pop(session_key, None)
+        if (state := self._peek_session_state(session_key)) is not None:
+            state.conversation.one_turn_restore = None
         # Running turns retain their assignment snapshot. The next turn sees this state.
         self._apply_role_memory(session_key, role)
 
@@ -852,8 +853,6 @@ class GatewayModelCommandsMixin:
         if role:
             state.conversation.model_override = None
             state.conversation.reasoning_override = None
-            self._session_model_overrides.pop(session_key, None)
-            self._session_reasoning_overrides.pop(session_key, None)
         self._evict_cached_agent(session_key)
 
     async def _reset_all_session_overrides(self) -> int:

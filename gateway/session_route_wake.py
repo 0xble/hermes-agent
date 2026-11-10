@@ -20,7 +20,7 @@ async def admit_route_wake_receipt(runner, adapter, source, text, producer, meta
     from gateway.session_local_recovery import restore_completion_route
     authority = active_authority(runner)
     key = runner._session_key_for_source(source)
-    restore_completion_route(runner, key)  # a closed local session boot left unrestored has no store entry yet
+    await restore_completion_route(runner, key)  # a closed local session boot left unrestored has no store entry yet
     if authority is None:
         return None
     identity = identity or json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
@@ -54,10 +54,11 @@ def _capture(authority, adapter, source, text, key, identity, metadata, event):
     from gateway.session_envelope import restore_native
     from gateway.session_synthetic import project_synthetic, restore_synthetic
     runner = authority.runner
-    entry = runner.session_store.lookup_by_session_key(key)
+    from gateway.session_detached import detached_route_of, route_entry
+    entry = route_entry(authority, key)
     if entry is None:
         return None
-    if source.platform != Platform.LOCAL:
+    if source.platform != Platform.LOCAL and not detached_route_of(source):
         envelope = committed_route_envelope(authority, entry)
         if envelope is None:
             return None

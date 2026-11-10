@@ -10,7 +10,8 @@ import pytest
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_bot_state import bot_chat_state
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
+from hermes_state_runtime import admit_session_input, claim_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tools import approval, clarify_gateway
 from tools.approval_gateway_wait import _ApprovalEntry
 

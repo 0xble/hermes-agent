@@ -150,8 +150,6 @@ class GatewayAgentCacheMixin:
         if session_key in (getattr(self, "_running_agents", {}) or {}):
             return
         pending.discard(session_key)
-        self._session_model_overrides.pop(session_key, None)
-        self._session_reasoning_overrides.pop(session_key, None)
         state = self._peek_session_state(session_key)
         if state is not None:
             state.conversation.model_override = None

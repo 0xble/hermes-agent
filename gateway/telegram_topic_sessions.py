@@ -153,13 +153,12 @@ def _resolve_topic_model_ref(raw: str, source: Optional[SessionSource] = None, r
 async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session_key: str = ""):
     if not (spec.model or spec.provider):
         return None
-    from hermes_cli.model_alias_runtime import alias_name
-    if not spec.provider and _resolve_topic_model_ref(spec.model.strip(), source, runner).name:
+    route = _resolve_topic_model_ref(spec.model.strip(), source, runner) if spec.model else None
+    if route is not None and route.name:
         if spec.provider:
             raise TopicRequestError(
                 f"model {spec.model.strip()!r} is a role, which carries its own provider. "
                 "Drop provider, or pass a concrete model.")
-        route = _resolve_topic_model_ref(spec.model.strip(), source, runner)
         if route.model:
             _ctx, _result, error = await runner.resolve_session_model_selection(
                 source, route.model, route.provider, session_key=session_key,
@@ -266,7 +265,7 @@ async def _session_settings_readback(runner, dest: SessionSource, entry, selecti
         readback.update(model=result.new_model, provider=result.target_provider)
     try:
         if isinstance(selection, tuple) and selection and selection[0] == "role":
-            route = await asyncio.to_thread(_resolve_topic_model_ref, "@" + selection[1], dest, runner)
+            route = await asyncio.to_thread(_resolve_topic_model_ref, selection[1], dest, runner)
             readback.update(model=route.model, provider=route.provider)
         async with runner._async_profile_scope_for_source(dest):
             profile_home = runner._profile_scope_key_for_source(dest)

@@ -102,6 +102,7 @@ def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None
     settings = role_settings()
     config["delegation"].setdefault("backends", {})["model_map"] = settings
     config["delegation"]["backend"] = "model_map"
+    config["delegation"]["inherit_service_tier"] = False
     config["delegation"]["fallback_providers"] = []
     for option in settings["options"]:
         name = option["name"]

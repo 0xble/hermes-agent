@@ -1026,6 +1026,8 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         if thread_id:
             media_metadata["thread_id"] = thread_id
 
+    media_metadata.update({key: route_metadata[key] for key in (
+        "job_id", "telegram_topic_owner_key", "telegram_topic_allow_parallel") if key in route_metadata})
     # Relay egress discriminators (scope_id / user_id) from the persisted origin: the adapter's caches are cold
     # after a restart. See cron/scheduler_delivery_origin.py.
     _origin.stamp_origin_discriminators(t, route_metadata, media_metadata)
@@ -1187,9 +1189,10 @@ def _resolve_named_dm_topic(t: _TargetDelivery, topic_name: str, metadata: dict,
     adapter, so after a text send this is the id that send used), writing it to ``t.thread_id``
     (mirroring/seeding key on the numeric id) and ``metadata``. False = media dropped, never General."""
     from agent.async_utils import safe_schedule_threadsafe
-    from gateway.delivery import _ensure_named_dm_topic
+    from gateway.delivery import _ensure_named_dm_topic, telegram_topic_owner_options
     future = safe_schedule_threadsafe(
-        _ensure_named_dm_topic(t.runtime_adapter, str(t.chat_id), topic_name, refresh=refresh), t.loop)
+        _ensure_named_dm_topic(t.runtime_adapter, str(t.chat_id), topic_name, refresh=refresh,
+                               **telegram_topic_owner_options(metadata)), t.loop)
     try:
         if future is None:
             raise RuntimeError("gateway loop unavailable")
@@ -1220,10 +1223,17 @@ def _live_send_media(
         t.runtime_adapter, t.chat_id, media_files, routed_media_metadata or None, t.loop, t.job,
         platform=t.platform,
     )
-    if (topic_name and len(media_files) == sum("thread not found" in e.lower() for e in _media_errors)
+    from gateway.delivery import telegram_topic_owner_options
+    topic_options = telegram_topic_owner_options(routed_media_metadata)
+    missing_topic = bool(_media_errors) and len(media_files) == sum("thread not found" in e.lower() for e in _media_errors)
+    if topic_name and missing_topic and topic_options["owner_key"]:
+        mark_unresolved = getattr(t.runtime_adapter, "mark_telegram_topic_owner_unresolved", None)
+        if callable(mark_unresolved):
+            mark_unresolved(t.chat_id, topic_options["owner_key"], reason="remote_topic_unavailable")
+    elif (topic_name and missing_topic
             and _resolve_named_dm_topic(t, topic_name, routed_media_metadata, delivery_errors,
                                         len(media_files), refresh=True)):
-        # The named topic vanished (a media-only job never runs the router's text refresh): recreate once.
+        # Only legacy unowned targets may recreate a missing topic.
         _media_errors = _send_media_via_adapter(
             t.runtime_adapter, t.chat_id, media_files, routed_media_metadata, t.loop, t.job,
             platform=t.platform)

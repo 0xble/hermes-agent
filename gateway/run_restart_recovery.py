@@ -664,6 +664,8 @@ class RestartRecoveryMixin:
             state = self._session_state(entry.session_key)
             state.turn.agent = _AGENT_PENDING_SENTINEL
             state.turn.started_ts = time.time()
+            from hermes_cli.observability.shared_metrics_busy import note_running_chat_owner
+            note_running_chat_owner(self, entry.session_key, source)
             self._persist_active_agents()
             resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
             event = self._build_startup_resume_event(source, resume_marker)

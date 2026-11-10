@@ -29,6 +29,8 @@ def record_external_worker_outcome(
         return False
     execution = scheduler.get_execution(str(execution_key))
     status = execution.get("status") if execution else None
+    if status == "cancelled":
+        return worker_exited  # the firer already booked the operator stop and job state
     if not execution or status not in ("completed", "failed", "unknown"):
         return False
     if status in ("completed", "failed") and not worker_exited:

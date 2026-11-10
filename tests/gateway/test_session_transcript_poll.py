@@ -130,7 +130,7 @@ async def test_rows_written_and_compacted_between_two_polls_reset_the_poller(tmp
 
 @pytest.mark.asyncio
 async def test_a_rotation_between_polls_resets_the_poller_onto_the_new_segment(tmp_path, monkeypatch):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     store, db, runner = _legacy_owner(tmp_path, monkeypatch)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')

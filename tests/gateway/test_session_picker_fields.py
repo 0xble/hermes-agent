@@ -48,7 +48,7 @@ async def test_stored_rows_carry_picker_fields_and_filter_by_repo_root(tmp_path,
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))

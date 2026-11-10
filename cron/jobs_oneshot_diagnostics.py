@@ -7,9 +7,10 @@ logger = logging.getLogger("cron.jobs")
 
 
 def _write(job: dict[str, Any], text: str, what: str) -> bool:
-    """Best-effort operator-visible trace in the job's output dir; never breaks the caller."""
-    from cron.jobs import save_job_output
-
+    """Durably queue the owner failure before retirement; save the local trace best-effort."""
+    from cron.oneshot_retirement import queue_retirement_alert
+    from cron.jobs import _hermes_now, save_job_output
+    queue_retirement_alert(job, text, what, now=_hermes_now())
     try:
         save_job_output(job.get("id", ""), text)
         return True
@@ -22,16 +23,14 @@ def write_wedged(job: dict[str, Any]) -> None:
     """Trace for a wedged one-shot removal: dispatch was claimed but mark_job_run never ran
     (interrupted mid-run); removing it silently would leave no output, error, or record.
 
-    A finite one-shot whose dispatch was claimed (``repeat.completed`` >= ``repeat.times``) but which never
-    reached ``mark_job_run`` (``last_run_at`` is null) was interrupted mid-run — scheduler restart, gateway
-    kill, or a non-Exception escape (#73973). The recovery guards remove such jobs so they stop appearing
-    due, but a silent removal leaves the user with no output, no error, and no job record. Write a small
-    diagnostic file into the job's output directory so the removal is observable and debuggable.
+    A spent dispatch without a current-arm completion may have partial effects. Leave an alert
+    and local trace when recovery retires it, rather than replaying it (#73973).
     """
+    from cron.jobs_oneshot import occurrence_finished, occurrence_started
     from cron.jobs import _hermes_now
 
-    if job.get("last_run_at") is not None:
-        return  # a prior run was recorded — normal completion race, not a wedge
+    if not occurrence_started(job) or occurrence_finished(job):
+        return  # Only a current-arm interrupted dispatch needs a partial-effects warning.
     repeat = job.get("repeat") or {}
     claim = job.get("run_claim") or {}
     written = _write(
@@ -43,7 +42,7 @@ def write_wedged(job: dict[str, Any]) -> None:
         f"- run claimed at: {claim.get('at', 'unknown')} by {claim.get('by', 'unknown')}\n"
         f"- removed at: {_hermes_now().isoformat()}\n\n"
         "This one-shot job's dispatch was claimed, but the run never "
-        "completed (`last_run_at` was never written) — the scheduler "
+        "completed for this occurrence (no current completion stamp) — the scheduler "
         "process was most likely killed or restarted mid-execution. The "
         "job has been removed to stop it re-firing; recreate it to run "
         "again.\n",
@@ -74,4 +73,30 @@ def write_missed(job: dict[str, Any], next_run: str) -> None:
         "enforced at create/update/resume time. The job was removed "
         "without running; recreate it (or use the Run button) to "
         "schedule it again.\n",
+        "missed-oneshot")
+
+
+def write_retired(
+    job: dict[str, Any], next_run: str, *, dispatch_limit: bool = False,
+) -> None:
+    """Route both retirement gates through the same interrupted-versus-unrun diagnostic."""
+    from cron.jobs_oneshot import occurrence_finished, occurrence_started
+    from cron.jobs import _hermes_now, ONESHOT_GRACE_SECONDS
+
+    if occurrence_started(job) and not occurrence_finished(job):
+        # A consumed, unfinished dispatch may already have side effects.
+        write_wedged(job)
+        return
+    reason = "dispatch limit reached" if dispatch_limit else "run time outside grace window"
+    _write(
+        job,
+        f"# Cron job removed before firing ({reason})\n\n"
+        f"- job id: {job.get('id')}\n"
+        f"- name: {job.get('name')}\n"
+        f"- scheduled run time: {next_run}\n"
+        f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
+        f"- removed at: {_hermes_now().isoformat()}\n\n"
+        f"This one-shot was removed without running: {reason}. "
+        "A re-armed record may have consumed its dispatch budget on a prior run. "
+        "Recreate it (or use the Run button) to schedule it again.\n",
         "missed-oneshot")

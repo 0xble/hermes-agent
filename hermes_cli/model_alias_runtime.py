@@ -23,12 +23,14 @@ class AliasRoute:
 
 def normalize_route_reasoning_effort(value: Any) -> Any:
     from hermes_constants import parse_reasoning_effort
-    if value in (None, ""):
+    if value is None or value is True or value == "" or value == {}:
         return ""
     parsed = parse_reasoning_effort(value)
     if parsed is None:
         raise ModelAliasError(f"Unknown reasoning effort {value!r}")
-    return value if isinstance(value, (str, dict)) else parsed
+    if not parsed["enabled"]:
+        return "none"
+    return parsed if isinstance(value, dict) else parsed["effort"]
 
 
 def alias_name(value: Any, config: Mapping[str, Any] | None = None) -> str | None:

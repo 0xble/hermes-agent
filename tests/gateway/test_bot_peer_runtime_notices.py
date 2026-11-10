@@ -89,7 +89,7 @@ def test_status_and_notice_callbacks_stay_quiet_for_a_bot_peer():
     turn_runner = object.__new__(TurnRunner)
     turn_runner._schedule = MagicMock()
     turn_runner._ctx = SimpleNamespace(
-        mute_notification_reply=False, source=_source(True), _status_adapter=object(),
+        mute_notification_reply=False, persist_user_display_kind=None, source=_source(True), _status_adapter=object(),
         _run_still_current=lambda: True, user_config={}, _status_chat_id="dm",
         _status_thread_metadata=None, _cleanup_progress=False)
 

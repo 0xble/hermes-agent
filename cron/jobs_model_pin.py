@@ -29,6 +29,11 @@ def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
     model = _normalize_job_optional_text(model)
     if not model:
         return None, None
+    from hermes_cli.model_alias_runtime import alias_name, resolve_model_alias
+    if name := alias_name(model, cfg):
+        resolve_model_alias(name, cfg, required=True)
+        # Pin the chosen label, so its next request follows later alias edits.
+        return None, name
     provider = None
     with contextlib.suppress(Exception):
         from hermes_cli.runtime_provider import resolve_runtime_provider

@@ -40,9 +40,9 @@ async def test_repeated_prompt_after_slash_command_is_new_work(tmp_path, monkeyp
                              _handle_message=answer, _adapter_for_source=lambda source: None,
                              _cached_agent_for=lambda route: None,
                              _resolve_session_agent_runtime=lambda **kwargs: ('frozen', {}))
-    authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner')
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
     wire = SlashWire(asyncio.get_running_loop())
-    wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor', 'profile_id': 'p'})
+    wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor', 'profile_id': str(tmp_path)})
     s = create_local_session(authority, wire.viewer.actor, {'request_id': 'editor', 'source': 'acp',
                                                            'cwd': str(tmp_path), 'model': 'frozen',
                                                            'toolsets': []}).session_id

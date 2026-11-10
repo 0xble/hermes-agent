@@ -15,7 +15,7 @@ from tests.waiting import async_wait_until
 async def _owner(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_state import SessionDB
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -63,6 +63,7 @@ async def test_local_turn_runs_its_post_delivery_callbacks_after_settling(tmp_pa
             await async_wait_until(lambda: text in [t for t, _ in fired], timeout=10, what=f"the {text} turn")
         adapter = runner._delivery_adapter_for(live.source)
         assert adapter._post_delivery_callbacks == {}
+        assert adapter._post_delivery_callbacks_by_generation == {}
     finally:
         db.close()
     # Once each, after the turn's outcome committed: the reply was out before they ran.
@@ -93,6 +94,7 @@ async def test_post_delivery_is_taken_by_the_key_the_turn_registered_under(tmp_p
         await authority.submit(_viewer(), Submission("answers", ref, {"text": "answers"}, "queue"))
         await async_wait_until(lambda: fired == ["answers"], timeout=10, what="the post-delivery callback")
         assert runner._delivery_adapter_for(live.source)._post_delivery_callbacks == {}
+        assert runner._delivery_adapter_for(live.source)._post_delivery_callbacks_by_generation == {}
     finally:
         db.close()
 
@@ -119,7 +121,8 @@ async def test_deleted_local_session_leaves_nothing_on_the_local_adapter(tmp_pat
         assert result.get("deleted_ids") == [refs[1].session_id]
         assert set(adapter.sources) == set(adapter.policies) == set(authority.launch_sources) == {
             refs[0].session_id}
-        assert set(adapter._post_delivery_callbacks) == {kept.route}
+        assert adapter._post_delivery_callbacks == {}
+        assert set(adapter._post_delivery_callbacks_by_generation) == {(kept.route, 1)}
         assert adapter.authorize_source(kept.source)
     finally:
         db.close()

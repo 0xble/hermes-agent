@@ -218,6 +218,8 @@ def _check_restored_live(live, adapter, prepared):
 def _restore_local_entry(authority, prepared, *, existing):
     receipt, source, _, entry = prepared
     store, route, target = authority.runner.session_store, entry.session_key, entry.session_id
+    if existing and _route_already_restored(store, route, target, receipt.get('lineage', [source.chat_id])):
+        return
     with store._lock:
         if not existing:
             store._ensure_loaded_locked()
@@ -245,6 +247,12 @@ def _restore_local_entry(authority, prepared, *, existing):
                 raise RuntimeStoreError('admission_conflict')
             else:
                 current.session_id = target
+
+
+def _route_already_restored(store, route, target, lineage):
+    """An already-current lineage needs no write. Other shapes recheck under the store lock."""
+    current = store._entries.get(route)
+    return current is not None and current.session_id == target and target in lineage
 
 
 def _publish_local_session(authority, sid, adapter, prepared, live):

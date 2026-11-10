@@ -4143,11 +4143,11 @@ def _quarantine_fallback_candidate(
     """The candidate cannot serve this walk (``reason`` = its ``aux_errors.fallback_label``,
     None = dead token): mark it unhealthy so the ordered re-walk skips it and the caller moves on to
     the next entry. Transient classes get a short hold, payment/quota and dead tokens the long one;
-    a model the route lacks or refuses marks only that ``model``, its siblings stay eligible."""
+    a transient throttle or a model the route lacks/refuses marks only that ``model``; siblings stay eligible."""
     _mark_provider_unhealthy(
         fb_provider or fb_label, ttl=fallback_candidate_quarantine_ttl(reason),
         base_url=base_url, reason=reason or "stale fallback credential",
-        model=model if reason in (aux_errors.MODEL_NOT_FOUND, aux_errors.MODEL_INCOMPATIBLE) else None)
+        model=model if reason in ("rate limit", aux_errors.MODEL_NOT_FOUND, aux_errors.MODEL_INCOMPATIBLE) else None)
     why = f"is out of capacity ({reason})" if reason else "has a stale/unrefreshable credential"
     logger.warning("Auxiliary %s%s: fallback candidate %s %s (%s) — skipping to next fallback",
                    task or "call", tag, fb_label, why, fb_err)

@@ -345,7 +345,7 @@ def _turn_agent(*, display_kind=None, platform="telegram", recall_synthetic_turn
 def test_turn_start_skips_recall_for_a_delegation_result_but_still_notifies_providers():
     agent = _turn_agent(display_kind="internal_notification")
 
-    assert _memory_turn_start_and_prefetch(agent, _delegation_notice()) == ""
+    assert _memory_turn_start_and_prefetch(agent, _delegation_notice(), turn_author=None, previous_message="") == ""
     agent._memory_manager.prefetch_all.assert_not_called()
     agent._memory_manager.on_turn_start.assert_called_once()
 
@@ -353,14 +353,14 @@ def test_turn_start_skips_recall_for_a_delegation_result_but_still_notifies_prov
 def test_turn_start_recalls_on_the_human_suffix_only():
     agent = _turn_agent(display_kind=None)
 
-    _memory_turn_start_and_prefetch(agent, _goal_prompt() + "\n\n" + HUMAN)
+    _memory_turn_start_and_prefetch(agent, _goal_prompt() + "\n\n" + HUMAN, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_called_once_with(HUMAN, session_id="s-1")
 
 
 def test_turn_start_skips_recall_for_text_merged_into_a_runtime_notification():
     agent = _turn_agent(display_kind="internal_notification")
 
-    _memory_turn_start_and_prefetch(agent, _process_notice() + "\n\n" + HUMAN)
+    _memory_turn_start_and_prefetch(agent, _process_notice() + "\n\n" + HUMAN, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_not_called()
 
 
@@ -368,7 +368,7 @@ def test_turn_start_honors_the_recall_synthetic_turns_switch():
     agent = _turn_agent(recall_synthetic_turns=True)
     prompt = _goal_prompt()
 
-    _memory_turn_start_and_prefetch(agent, prompt)
+    _memory_turn_start_and_prefetch(agent, prompt, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_called_once_with(prompt.strip(), session_id="s-1")
 
 

@@ -112,7 +112,8 @@ def test_fill_is_password_blind_and_redaction_registered(real_profile):
          patch("tools.browser_real_profile_logins.resolve_login_password", return_value=_PASSWORD), \
          patch("tools.browser_session_real_profile.real_profile_cdp", return_value=("ws://x", None)), \
          patch("agent.redact.register_vault_redaction_value", side_effect=registered.append), \
-         patch("tools.browser_vault_tool._bound_page_origin", return_value="https://example.com"), \
+         patch("tools.browser_vault_tool._focus_bound_origin", return_value="https://example.com"), \
+         patch("tools.browser_vault_tool._current_page_origin", return_value="https://example.com"), \
          patch("tools.browser_vault_tool._eval_js", return_value={"success": True, "result": json.dumps(
              [{"index": 0, "tag": "input", "type": "password", "name": "password", "autocomplete": "current-password"}])}), \
          patch("tools.browser_vault_tool._eval_js_secret", return_value={"success": True, "result": json.dumps({"filled": 1})}):
@@ -617,7 +618,7 @@ def test_list_refreshes_when_pin_changed_and_browser_is_running(tmp_path, monkey
         return ("ws://relaunched", None)
 
     monkeypatch.setattr("tools.browser_session_cloud.use_real_profile", lambda: True)
-    monkeypatch.setattr("tools.browser_lightpanda.using_lightpanda_engine", lambda: False)
+    monkeypatch.setattr("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", lambda: False)
     monkeypatch.setattr("tools.browser_launcher.get_browser", fake_get_browser)
     monkeypatch.setattr("tools.browser_launcher.stop_browser", fake_stop_browser)
     monkeypatch.setattr(rpf, "_launch", fake_launch)

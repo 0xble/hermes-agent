@@ -12,7 +12,7 @@ from gateway import hosted_room_driver as tasks
 from gateway import hosted_rooms
 from gateway.runtime_ownership import ProfileOwnership
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.fixture

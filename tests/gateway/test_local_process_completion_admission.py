@@ -9,7 +9,7 @@ notification.
 
 import pytest
 
-from gateway.session_contract import Principal
+from gateway.session_contract import SessionActor
 from hermes_state_runtime import list_session_admissions
 from tests.gateway.test_automation_notification_category import _authority
 
@@ -21,7 +21,7 @@ async def test_local_completion_admits_when_the_origin_is_rebuilt(tmp_path, monk
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     runner, authority = await _authority(tmp_path, monkeypatch)
-    actor = Principal(
+    actor = SessionActor(
         'test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'fixture')
     token = set_hermes_home_override(tmp_path)
     monkeypatch.setattr('gateway.run._hermes_home', tmp_path)

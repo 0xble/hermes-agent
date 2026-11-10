@@ -952,6 +952,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 # Claimed meanwhile (stale_generation): it runs as main's post-claim race does.
                 with suppress(RuntimeStoreError):
                     await authority.cancel_queued(actor, ref, row['admission_id'])
+        handle = authority._handle(ref)
+        if handle.execution_state == 'running':
+            # The claim can settle between the snapshot and this generation-fenced Stop.
+            with suppress(RuntimeStoreError):
+                await authority.interrupt(actor, ref, handle.execution_generation)
 
     def _hm_busy_telegram_grace_queue(
         self, event: MessageEvent, source: SessionSource, _quick_key: str, effective_busy_input_mode: str

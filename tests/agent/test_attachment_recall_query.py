@@ -53,7 +53,7 @@ def test_gateway_reply_and_trigger_wrappers_do_not_hide_attachment_caption(
     assert auto_recall_query(prompt, platform=platform) == expected
     assert human_prompt_text(prompt) == prompt
     agent = _turn_agent()
-    _memory_turn_start_and_prefetch(agent, prompt)
+    _memory_turn_start_and_prefetch(agent, prompt, turn_author=None, previous_message="")
     if expected:
         assert agent._memory_manager.prefetch_all.call_args.args[0] == expected
     else:
@@ -84,7 +84,7 @@ def test_reply_context_delimiter_collision_preserves_the_quote_and_caption(enric
     pointer = prompt.split('[Replying to: ', 1)[1].split(']\n\n', 1)[0]
     assert json.loads(pointer) == quoted
     immediate = _turn_agent(platform=platform)
-    _memory_turn_start_and_prefetch(immediate, prompt)
+    _memory_turn_start_and_prefetch(immediate, prompt, turn_author=None, previous_message="")
     immediate._memory_manager.prefetch_all.assert_called_once_with(REQUEST, session_id=immediate.session_id)
     queued = _post_turn_agent(display_kind=None, platform=platform)
     queued._sync_external_memory_for_turn(
@@ -360,7 +360,7 @@ def test_native_multimodal_turn_recalls_the_complete_caption(monkeypatch, captio
     api_copy = runner._preprocess_anthropic_content(json.loads(json.dumps(turn)), "user")
     assert api_copy.index(caption) > 800
     agent = _turn_agent()
-    _memory_turn_start_and_prefetch(agent, turn)
+    _memory_turn_start_and_prefetch(agent, turn, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_called_once_with(caption, session_id="s-1")
     agent = _post_turn_agent(display_kind=None)
     agent._sync_external_memory_for_turn(original_user_message=turn, final_response="Answer.", interrupted=False)
@@ -369,7 +369,7 @@ def test_native_multimodal_turn_recalls_the_complete_caption(monkeypatch, captio
 
 def test_native_image_only_turn_has_no_recall_query():
     agent = _turn_agent()
-    _memory_turn_start_and_prefetch(agent, _multimodal_turn("", images=2))
+    _memory_turn_start_and_prefetch(agent, _multimodal_turn("", images=2), turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_not_called()
 
 
@@ -416,7 +416,7 @@ def test_unknown_or_incomplete_attachment_lookalike_is_preserved():
 def test_both_real_memory_call_sites_use_the_caption(enrich):
     prompt = enrich(REQUEST)
     agent = _turn_agent()
-    _memory_turn_start_and_prefetch(agent, prompt)
+    _memory_turn_start_and_prefetch(agent, prompt, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_called_once_with(REQUEST, session_id="s-1")
     agent = _post_turn_agent(display_kind=None)
     agent._sync_external_memory_for_turn(original_user_message=prompt, final_response="Answer.", interrupted=False)

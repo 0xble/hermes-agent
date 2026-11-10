@@ -661,7 +661,7 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     """Save raw image bytes to the cache and return the absolute path; raises
     ValueError when *data* isn't an image (e.g. an upstream HTML error page)."""
     validate_inbound_media_size(len(data), media_type="image")
-    if not _looks_like_image(data):
+    if data[4:8] == b"ftyp" or not _looks_like_image(data):
         # iPhone and macOS screenshots arrive as HEIC, Chromium ones as AVIF. Store them as PNG so
         # every consumer (vision tools, re-sends, model input) gets a format it can read.
         png = _transcode_raster_to_png(data)

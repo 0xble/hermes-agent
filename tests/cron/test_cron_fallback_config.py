@@ -165,18 +165,18 @@ def test_main_model_pin_is_empty_when_the_resolved_route_has_no_model(tmp_path, 
     from cron.jobs import _main_model_pin
 
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": {"provider": "openrouter"}}))
-    monkeypatch.setattr("cron.jobs.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     assert _main_model_pin() == (None, None)
 
 
-def test_main_model_pin_resolves_a_preset_default(tmp_path, monkeypatch):
+def test_main_model_pin_keeps_an_alias_name(tmp_path, monkeypatch):
     from cron.jobs import _main_model_pin
 
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({
         "model": "coding",
         "model_aliases": {"coding": {"provider": "OpenRouter", "model": "coding-model"}},
     }))
-    monkeypatch.setattr("cron.jobs.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-    assert _main_model_pin() == ("openrouter", "coding-model")
+    assert _main_model_pin() == (None, "coding")

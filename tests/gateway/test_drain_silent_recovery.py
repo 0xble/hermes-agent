@@ -139,7 +139,7 @@ async def test_queued_interrupt_placeholder_does_not_send_before_followup():
     source = make_restart_source()
     ctx = SimpleNamespace(
         session_key="agent:main:telegram:dm:123456", stream_consumer_holder=[None],
-        mute_notification_reply=False, persist_user_display_kind=None, source=source,
+        mute_notification_reply=False, persist_user_display_kind=None, reply_expected=None, source=source,
         _status_thread_metadata=None, event_message_id=None, inbound_message_id="101",
     )
     result = {"final_response": "Operation interrupted: waiting for model response (1.3s elapsed).",
@@ -173,7 +173,7 @@ async def test_queued_model_echo_of_interrupt_diagnostic_never_sends_before_foll
     runner._refresh_agent_cache_message_count = AsyncMock()
     ctx = SimpleNamespace(
         session_key=key, session_id="sid", source=source, stream_consumer_holder=[None],
-        mute_notification_reply=False, persist_user_display_kind=None,
+        mute_notification_reply=False, persist_user_display_kind=None, reply_expected=None,
         _status_thread_metadata=None, event_message_id=None, inbound_message_id="101",
         run_generation=1, _interrupt_depth=0, history=[], context_prompt=None,
         result_holder=[None], _post_delivery_adapter=None,
