@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from typing import Optional
@@ -193,7 +194,8 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
-    except (KeyError, ValueError, OSError) as exc:
+    # Lock contention deliberately counts against the card's failure budget.
+    except (KeyError, ValueError, OSError, sqlite3.Error) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1
 
