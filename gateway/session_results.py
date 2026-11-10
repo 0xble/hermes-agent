@@ -61,6 +61,10 @@ def _redacted(value):
     """The stored result is a state.db copy of the model's answer and history: redacted at this
     storage boundary like every transcript row (``security.redact_secrets``). The live viewer
     prints the completion event, never this copy."""
+    from agent.source_origin import NativeOrigin
+    if isinstance(value, NativeOrigin):
+        # Durable replay cannot carry a process-local authority receipt.
+        return None
     if isinstance(value, str):
         from agent.redact import redact_sensitive_text
         return redact_sensitive_text(value)
