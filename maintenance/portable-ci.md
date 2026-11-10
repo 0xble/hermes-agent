@@ -396,7 +396,7 @@ The bounded smoke manifest remains partial. It is never substituted for these
 full Python roots. Historical outcomes in `fork-ci.md` remain historical, not
 current qualification. No installed Hermes runtime is checked or promoted here.
 
-The documentation environment bootstrap preserves its existing checkout-local venv with `uv venv --allow-existing`, so running setup before gate or repeating gate does not fail merely because `.ci/docs-venv` exists. Pinned documentation packages are installed on every setup.
+The v0.23.1 setup uses upstream `scripts/ci/setup_toolchain.py` for verified PM tools and the locked dev/test side environment. Existing local mise pins are bootstrap inputs only. Actual Python, uv, Node, npm and pnpm come from `pm/lock.json`; lane checks validate those exact versions. `scripts/build/node-deps.mjs` prepares every selected pnpm workspace with its frozen lock and native dependency receipt. The standalone website retains `npm ci`. Documentation tools use a PM-owned isolated dependency generation, with its interpreter recorded under `.ci/`, rather than raw uv mutations. Repeated setup reuses only validated generations and dependency receipts. The root npm guard is preserved, and no root npm lockfile is generated.
 
 
 ## Pre-Tip Checkpoint Adaptation (2026-09-30)

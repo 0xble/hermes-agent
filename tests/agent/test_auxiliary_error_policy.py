@@ -62,7 +62,7 @@ def run_ladder(error, *, provider="openrouter", retries=1, is_async=False, fallb
         patch("agent.auxiliary_client._transient_retry_count", return_value=retries),
         patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
         patch("agent.auxiliary_client._recoverable_pool_provider", return_value=pool.provider if pool else "openrouter"),
-        patch("agent.auxiliary_client._mark_provider_unhealthy", side_effect=lambda *a, **kw: marks.append(a)),
+        patch("agent.auxiliary_client._mark_provider_unhealthy", side_effect=lambda *a, **kw: marks.append((a, kw))),
         patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(None, None, "")),
         patch("agent.auxiliary_client._try_main_fallback_chain", return_value=(None, None, "")),
         patch("agent.auxiliary_client._try_payment_fallback", return_value=(fallback, "fb", "fallback")),
@@ -83,7 +83,8 @@ def run_ladder(error, *, provider="openrouter", retries=1, is_async=False, fallb
     return SimpleNamespace(attempts=getattr(primary.chat.completions.create, "call_count", None),
                            fallback_attempts=fallback.chat.completions.create.call_count,
                            fell_back=fallback.chat.completions.create.call_count > 0,
-                           unhealthy=bool(marks), rotated=bool(rotations), refreshed=refreshes, result=result)
+                           unhealthy=any(kw.get("model") is None for _, kw in marks),
+                           route_holds=marks, rotated=bool(rotations), refreshed=refreshes, result=result)
 
 
 def _gemini_prompt_block():
@@ -161,6 +162,9 @@ BEHAVIOUR = [
 def test_behaviour(case, error, provider, expected):
     outcome = run_ladder(error, provider=provider)
     assert {key: getattr(outcome, key) for key in expected} == expected, (case, outcome.result)
+    if case in {"429-resource-exhausted", "429-rate-limit-with-billing-words", "openrouter-upstream-quota"}:
+        # A short model hold is distinct from a provider-wide quota/payment bench.
+        assert [(kw["ttl"], kw["model"], kw["reason"]) for _, kw in outcome.route_holds] == [(60.0, "m", "rate limit")]
 
 
 # (case id, summary request's error, compression aborts with the transcript intact): the ladder hands a safety

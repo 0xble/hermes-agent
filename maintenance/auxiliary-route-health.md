@@ -19,7 +19,7 @@ Skip and exhaustion notices are claimed once per route epoch across processes. E
 The v0.23.1 integration uses upstream's classified recovery failures. Preset-only
 per-call strict-chain selection and its notice argument retired with model presets.
 Store-failure warning coverage still checks auth and provider-unavailable exhaustion,
-and rate limits retain the short 60-second lane hold.
+and rate limits retain the short 60-second lane hold. Upstream error-policy fixtures distinguish a short model hold from a provider-wide quota/payment bench, and assert the exact TTL, model and reason. Backend tags on rebuilt auto clients identify the actual health owner, while explicit custom endpoints retain endpoint isolation. The synchronous public call retains upstream's Relay scope decorator so each physical error is classified once and observers see the original provider error.
 
 This state is independent of the main-agent primary cooldown (`shared-primary-cooldown`) and of compression state. Resetting auxiliary health never touches either.
 

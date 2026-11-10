@@ -28,6 +28,8 @@ STATE = ROOT / '.ci'
 # Checkout-owned npm and ripgrep at the exact pins; host tools only bootstrap them.
 TOOLCHAIN = STATE / 'toolchain'
 PINS = json.loads((ROOT / 'scripts/ci/toolchain.json').read_text(encoding='utf-8-sig'))
+PM_PINS = {name: item['version'].partition('+')[0] for name, item in
+           json.loads((ROOT / 'pm/lock.json').read_text(encoding='utf-8-sig'))['packages'].items()}
 EXTRAS = ('all', 'messaging', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'parallel-web', 'hindsight')
 LANES = {
     'static': 'Blocking lint, source policies, attribution, history and lock consistency',
@@ -779,21 +781,23 @@ def msvc_linker_environment(tools: Path, source: Mapping[str, str]) -> dict[str,
 
 
 def require_tools(names: tuple[str, ...], env: dict[str, str]) -> None:
+    pins = {**PINS, **PM_PINS} if env.get('HERMES_RUNTIME_DIR') else PINS
     for name in names:
         output = subprocess.check_output([windows_command(name, env), '--version'], env=env, text=True, encoding='utf-8', errors='replace')
         match = re.search(r'(?<!\d)(\d+\.\d+\.\d+)\b', output)
-        if not match or match.group(1) != PINS[name]:
-            raise RuntimeError(f'{name}: require {PINS[name]}, found {output.strip()} (see scripts/ci/toolchain.json)')
+        if not match or match.group(1) != pins[name]:
+            raise RuntimeError(f'{name}: require {pins[name]}, found {output.strip()} (see CI and PM toolchain locks)')
 
 
 def python(env: dict[str, str]) -> str:
     require_checkout_venv_isolation()
-    executable = ROOT / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    executable = Path(env['HERMES_PYTHON']) if env.get('HERMES_PYTHON') else ROOT / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     if not executable.is_file():
         raise RuntimeError('Checkout Python environment missing. Run bin/ci setup first.')
     output = subprocess.check_output([str(executable), '--version'], env=env, text=True, encoding='utf-8', errors='replace').strip()
-    if output != f"Python {PINS['python']}":
-        raise RuntimeError(f"Require checkout Python {PINS['python']}, found {output}. Run bin/ci setup.")
+    pin = PM_PINS['python'] if env.get('HERMES_RUNTIME_DIR') else PINS['python']
+    if output != f'Python {pin}':
+        raise RuntimeError(f'Require checkout Python {pin}, found {output}. Run bin/ci setup.')
     return str(executable)
 
 
@@ -830,6 +834,27 @@ def provision_rg(env: dict[str, str]) -> None:
         env=rust_environment(env))
 
 
+def pm_setup_phase(phase: str, env: dict[str, str], *args: str) -> None:
+    """Use the same PM provisioning and dependency owner as upstream hosted CI."""
+    exports = {}
+    for destination in ('GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_PATH'):
+        path = STATE / f'pm-{phase}-{destination.lower()}'
+        path.write_text('', encoding='utf-8')
+        exports[destination] = str(path)
+    run([sys.executable, 'scripts/ci/setup_toolchain.py', phase, '--toolchain', 'all',
+         '--home', str(STATE / 'pm-home'), *args], env={**env, **exports})
+    for line in Path(exports['GITHUB_ENV']).read_text(encoding='utf-8').splitlines():
+        name, value = line.split('=', 1)
+        env[name] = value
+    # setup_toolchain writes these in reverse because Actions prepends each line.
+    paths = Path(exports['GITHUB_PATH']).read_text(encoding='utf-8').splitlines()
+    env['PATH'] = os.pathsep.join([*reversed(paths), env['PATH']])
+    for name in ('uv', 'node', 'npm', 'pnpm'):
+        executable = shutil.which(name + ('.exe' if os.name == 'nt' and name == 'pnpm' else ''), path=env['PATH'])
+        if executable:
+            env[f'HERMES_CI_PINNED_{name.upper()}'] = executable
+
+
 def setup(env: dict[str, str]) -> None:
     ensure_setup_free_space()
     require_checkout_venv_isolation()
@@ -840,14 +865,24 @@ def setup(env: dict[str, str]) -> None:
     resolve_local_toolchain(env)
     provision_rg(env)
     require_tools(('npm', 'rg'), env)
-    run(['uv', 'sync', '--locked', '--python', PINS['python'], '--group', 'dev', '--group', 'test', *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)
-    run(['npm', 'ci', '--no-audit', '--no-fund'], env=env)
+    pm_setup_phase('install', env)
+    env.update(HERMES_HOME=str(STATE / 'pm-home'), HERMES_RUNTIME_DIR=str(STATE / 'pm-home/tools'))
+    pm_setup_phase('dependencies', env, '--extras', json.dumps(EXTRAS), '--test-environment')
+    require_tools(('uv', 'node', 'npm', 'pnpm'), env)
+    run(['node', 'scripts/build/node-deps.mjs', '--source', str(ROOT), '--reuse',
+         *[arg for workspace in ('apps/desktop', 'ui-tui', 'ui-tui/packages/hermes-ink', 'web', 'tests-js')
+           for arg in ('--workspace', workspace)]], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=ROOT / 'website', env=env)
-    run(['uv', 'venv', '--allow-existing', '--python', PINS['python'], str(STATE / 'docs-venv')], env=env)
-    run(['uv', 'pip', 'install', '--python', str(docs_python()), 'ascii-guard==2.3.0', 'ruamel.yaml==0.18.16'], env=env)
+    run([python(env), '-c',
+         'import json, sys; from pathlib import Path; from pm import ensure_environment; '
+         'p = ensure_environment("ci-docs", ["ascii-guard==2.3.0", "ruamel.yaml==0.18.16"], '
+         'root=Path(sys.argv[1]), explicit=True); Path(sys.argv[2]).write_text(json.dumps(str(p)))',
+         str(STATE / 'docs-environment'), str(STATE / 'docs-python.json')], env=env)
 
 
 def docs_python() -> Path:
+    if (STATE / 'docs-python.json').is_file():
+        return Path(json.loads((STATE / 'docs-python.json').read_text(encoding='utf-8')))
     return STATE / 'docs-venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
 
 
@@ -1013,7 +1048,7 @@ def node_gate(env: dict[str, str], workers: int) -> None:
     # Admit fast cross-workspace checks on every PR; the full nine-unit Node
     # profile, including desktop UI and TUI suites, runs in nightly.
     env = dict(env, HERMES_PYTHON=python(env))
-    require_tools(('node', 'npm'), env)
+    require_tools(('node', 'pnpm'), env)
     run(['node', '--test', 'scripts/ci/tests/workspace-checks.test.mjs'], env=env)
     command = ['node', 'scripts/run-workspace-checks.mjs', '--concurrency', str(workers),
                '--skip', 'check:test:ui', '--skip', 'check:test:desktop:all',
@@ -1025,7 +1060,7 @@ def node_gate(env: dict[str, str], workers: int) -> None:
 
 def node(env: dict[str, str], workers: int) -> None:
     env = dict(env, HERMES_PYTHON=python(env))
-    require_tools(('node', 'npm'), env)
+    require_tools(('node', 'pnpm'), env)
     run(['node', '--test', 'scripts/ci/tests/workspace-checks.test.mjs'], env=env)
     command = ['node', 'scripts/run-workspace-checks.mjs', '--concurrency', str(workers), '--skip', 'check:test:desktop:all']
     if sys.platform.startswith('linux'):

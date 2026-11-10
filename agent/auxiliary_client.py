@@ -127,6 +127,7 @@ def aux_probe_mode():
 
 from agent.credential_pool import load_pool
 from agent.credential_pool_model_cooldowns import pool_failure_reason
+from agent.auxiliary_wire import record_route_info
 from agent.custom_entry_pool import entry_scoped_pool, pool_for_aux_provider
 from agent.message_metadata import data_use_requirement
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
@@ -2612,15 +2613,6 @@ def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode
     context["api_mode"] = str(api_mode or "chat_completions")
 
 
-def _record_route_info(
-    route_info: Optional[dict[str, str]], provider: Optional[str], model: Optional[str]
-) -> None:
-    """Expose the concrete route selected for one auxiliary call."""
-    if route_info is not None:
-        route_info["provider"] = provider or "auto"
-        route_info["model"] = model or "default"
-
-
 def _relay_auxiliary_metadata(
     *, provider: str | None = None, api_mode: str | None = None
 ) -> tuple[str, str, dict[str, Any]] | None:
@@ -4808,6 +4800,9 @@ def _health_provider_for_route(
         or _normalize_aux_provider(effective_raw) == "custom"
     ):
         return "local/custom"
+    backend = getattr(client, "_hermes_aux_backend_provider", "")
+    if isinstance(backend, str) and backend:
+        return backend
     pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
     if pool_provider:
         return pool_provider
@@ -7653,7 +7648,7 @@ def _prepare_aux_request(
     if no_progress_timeout is not None:
         kwargs["no_progress_timeout"] = no_progress_timeout
     _set_relay_auxiliary_route(request_provider, final_model, resolved_api_mode)
-    _record_route_info(route_info, _fallback_provider_from_label(request_provider), final_model)
+    record_route_info(route_info, _fallback_provider_from_label(request_provider), final_model)
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
@@ -8073,7 +8068,7 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
         if lane in tried_lanes:
             break
         tried_lanes.add(lane)
-        _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
+        record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
         fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
         if fb_resp is not None:
             if route.route_info is not None:  # tell the caller its own route failed, not only where it landed
@@ -8176,6 +8171,7 @@ def _stamp_latency_once(latency_info: Optional[dict[str, int]], key: str, starte
         latency_info[key] = _elapsed_ms(started_at)
 
 
+@_relay_auxiliary_call
 def call_llm(
     task: str | None = None, *, provider: str | None = None, model: str | None = None, base_url: str | None = None,
     api_key: str | None = None, main_runtime: Optional[dict[str, Any]] = None, messages: list,

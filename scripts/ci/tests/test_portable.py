@@ -671,6 +671,7 @@ try {
             stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=ci.free_space_floor_bytes() + 1))
             stack.enter_context(patch.object(ci, 'require_tools'))
             stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'pm_setup_phase'))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
             run = stack.enter_context(patch.object(ci, 'run'))
@@ -735,7 +736,17 @@ try {
             stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=ci.free_space_floor_bytes() + 1))
             stack.enter_context(patch.object(ci, 'run', side_effect=install))
             stack.enter_context(patch.object(ci, 'provision_rg'))
-            ci.setup(env)
+            def managed_phase(phase, managed_env, *args):
+                if phase == 'install':
+                    # The bootstrap npm was selected before PM supplied its newer tools.
+                    ci.require_tools(('npm',), managed_env)
+                    write_executable(uv_bin / 'uv', 'uv ' + ci.PM_PINS['uv'])
+                    write_executable(node_bin / 'node', 'v' + ci.PM_PINS['node'])
+                    write_executable(toolchain / 'node_modules/.bin/npm', ci.PM_PINS['npm'])
+                    write_executable(node_bin / 'pnpm', ci.PM_PINS['pnpm'])
+
+            with patch.object(ci, 'pm_setup_phase', side_effect=managed_phase), patch.object(ci, 'python', return_value=sys.executable):
+                ci.setup(env)
 
             npm = toolchain / 'node_modules' / '.bin' / 'npm'
             self.assertEqual(ci.windows_command('npm', env), str(npm.resolve()))
@@ -744,6 +755,35 @@ try {
             self.assertEqual(Path(found or '').resolve(), npm.resolve())
             ci.require_tools(('npm',), env)
             self.assertEqual(commands[0][:2], ['npm', 'install'])
+
+    def test_pm_setup_exports_selected_environment_and_tool_precedence(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            state = root / 'state'
+            state.mkdir()
+            npm_dir, node_dir = root / 'npm', root / 'node'
+            npm_dir.mkdir()
+            node_dir.mkdir()
+            for path in (npm_dir / 'npm', node_dir / 'node'):
+                path.touch()
+                path.chmod(0o755)
+            env = {'PATH': str(root / 'host')}
+
+            def provision(argv, **kwargs):
+                exported = kwargs['env']
+                Path(exported['GITHUB_ENV']).write_text('HERMES_PYTHON=/isolated/test/bin/python\n', encoding='utf-8')
+                Path(exported['GITHUB_PATH']).write_text(str(node_dir) + '\n' + str(npm_dir) + '\n', encoding='utf-8')
+
+            stack.enter_context(patch.object(ci, 'STATE', state))
+            command = stack.enter_context(patch.object(ci, 'run', side_effect=provision))
+            ci.pm_setup_phase('dependencies', env, '--extras', '["all"]', '--test-environment')
+            self.assertEqual(env['HERMES_PYTHON'], '/isolated/test/bin/python')
+            self.assertEqual(env['PATH'].split(os.pathsep)[:2], [str(npm_dir), str(node_dir)])
+            self.assertEqual(env['HERMES_CI_PINNED_NODE'], str(node_dir / 'node'))
+            self.assertIn('--test-environment', command.call_args.args[0])
+            command.side_effect = subprocess.CalledProcessError(1, 'PM failed')
+            with self.assertRaises(subprocess.CalledProcessError):
+                ci.pm_setup_phase('install', env)
 
     def test_setup_provisions_pinned_npm_and_rg_ahead_of_host_tools(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -1167,6 +1207,8 @@ with ci.checkout_lock():
             stack.enter_context(patch.object(ci, 'volume_free_bytes', side_effect=lambda path: next(free)))
             stack.enter_context(patch.object(ci, 'require_tools'))
             stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'pm_setup_phase'))
+            stack.enter_context(patch.object(ci, 'python', return_value=sys.executable))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
             run = stack.enter_context(patch.object(ci, 'run'))
@@ -1285,6 +1327,8 @@ with patch.dict(reclaim.__globals__, {
                 ci, 'reclaim_finished_generated_dirs', side_effect=AssertionError('reclaim on a roomy volume')))
             stack.enter_context(patch.object(ci, 'require_tools'))
             stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'pm_setup_phase'))
+            stack.enter_context(patch.object(ci, 'python', return_value=sys.executable))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
             run = stack.enter_context(patch.object(ci, 'run'))
