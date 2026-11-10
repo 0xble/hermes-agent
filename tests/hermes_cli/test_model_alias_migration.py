@@ -106,3 +106,9 @@ def test_migration_persists_disabled_routes_as_comments_through_config_writer(tm
     saved = yaml.safe_load(text)
     assert len(saved["delegation"]["backends"]["model_map"]["options"]) == 3
     assert migrate_document(saved)[0] == saved
+    preview = "\n".join(line.replace("# ", "", 1) if line.lstrip().startswith(("# - name:", "#   ")) else line
+                        for line in text.splitlines())
+    options = yaml.safe_load(preview)["delegation"]["backends"]["model_map"]["options"]
+    assert {entry["name"] for entry in options} == {
+        "worker", "explorer", "coder", "critical", "planner", "designer", "visual", "writer",
+    }

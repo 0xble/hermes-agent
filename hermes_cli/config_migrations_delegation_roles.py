@@ -92,7 +92,10 @@ options:
 
 
 def role_settings():
-    return roundtrip_yaml().load(ROLE_SETTINGS)
+    # Ruamel preserves absolute comment columns when this block is nested in
+    # delegation.backends.model_map. Its option entries start at column 8.
+    nested = "\n".join("      " + line if line.startswith("  #") else line for line in ROLE_SETTINGS.splitlines())
+    return roundtrip_yaml().load(nested)
 
 
 def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None:
