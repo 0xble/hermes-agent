@@ -945,16 +945,6 @@ def start_background_plugin_discovery() -> None:
         _background_discovery_thread.start()
 
 
-def _join_background_discovery(timeout: float = 30.0) -> bool:
-    """Wait for an in-flight background discovery (no-op from its own thread or a plugin-load worker it
-    spawned — that worker's parent is blocked waiting on it). True when the wait timed out."""
-    t = _background_discovery_thread
-    if t is None or not t.is_alive() or t is threading.current_thread() or in_plugin_load_worker():
-        return False
-    t.join(timeout=timeout)
-    return t.is_alive()
-
-
 def _plugin_toolset_keys_cache_path() -> Path:
     return get_hermes_home() / "cache" / "plugin_toolset_keys.json"
 
@@ -1000,25 +990,6 @@ def get_plugin_toolset_keys_nowait() -> set[str]:
 def get_portable_mcp_server_names_nowait() -> set[str]:
     """Portable MCP server names; same contract as :func:`get_plugin_toolset_keys_nowait`."""
     return _nowait_plugin_set("portable_mcp", lambda m: set(m.get_portable_mcp_servers()))
-
-
-_delivery_join_abandoned = False
-
-
-def _delivery_manager() -> PluginManager:
-    """Active manager, lazily discovering if it never ran — delivery must not depend on WHICH
-    surface imported us (dashboards/TUI/cron never import model_tools: #50776, #64178).
-    ``getattr`` default ``True`` leaves test doubles untouched."""
-    global _delivery_join_abandoned
-    manager = get_plugin_manager()
-    # ``_discovered`` flips when a scan STARTS (re-entrancy guard), so an in-flight background scan
-    # must be joined first or a hook fired during startup sees a half-loaded registry. A scan still
-    # running after one full join is hung (a plugin's register() blocked): later hooks stop waiting.
-    if not _delivery_join_abandoned:
-        _delivery_join_abandoned = _join_background_discovery()
-    if not getattr(manager, "_discovered", True):
-        manager.discover_and_load()
-    return manager
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> list[Any]:

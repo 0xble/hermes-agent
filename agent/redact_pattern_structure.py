@@ -55,3 +55,22 @@ def _pattern_structure(pattern: str) -> tuple[bool, bool]:
                 i = pattern.find("}", i)  # skip the {m,} body
         i += 1
     return top_level_alt, nested
+
+
+def _extract_literal_prefix(pattern: str) -> str:
+    """Leading literal chars of a regex (up to the first metacharacter)."""
+    meta = "[(\\.?*+|{^$"
+    for i, ch in enumerate(pattern):
+        if ch in meta:
+            return pattern[:i]
+    return pattern
+
+
+
+def _has_top_level_alternation(pattern: str) -> bool:
+    return _pattern_structure(pattern)[0]
+
+
+
+def _has_nested_unbounded_repeat(pattern: str) -> bool:
+    return _pattern_structure(pattern)[1]

@@ -1,6 +1,9 @@
 """Topical helpers extracted from agent/conversation_loop.py."""
 from __future__ import annotations
 from typing import Any
+import logging
+
+logger = logging.getLogger("agent.conversation_loop")
 
 def _close_durable_failed_turn(agent, result: Any) -> None:
     """Append a Hermes-authored assistant boundary when a failed turn left its durable tail open
@@ -26,10 +29,7 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
     is keyed on the DURABLE tail (``SessionDB.latest_conversation_role``), so a redelivery or a tail
     already closed by another writer is a no-op, and the gateway's own closer then no-ops in turn.
     """
-    from agent.conversation_loop import (FAILED_TURN_DISPLAY_KIND, OPEN_TURN_TAIL_ROLES, _failed_turn_display_metadata, append_message, failed_turn_notice, logger)
-    from agent.conversation_loop import (
-        Any
-    )
+    from agent.conversation_loop import (FAILED_TURN_DISPLAY_KIND, OPEN_TURN_TAIL_ROLES, _failed_turn_display_metadata, append_message, failed_turn_notice)
     try:
         if not isinstance(result, dict) or result.get("completed") is True:
             return

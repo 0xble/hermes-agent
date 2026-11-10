@@ -5,7 +5,8 @@ last 4 characters for debuggability.
 """
 
 from agent.redact_pattern_structure import (
-    _skip_char_class, _unbounded_quantifier_follows, _pattern_structure
+    _skip_char_class, _unbounded_quantifier_follows, _pattern_structure,
+    _extract_literal_prefix, _has_top_level_alternation, _has_nested_unbounded_repeat
 )
 
 from agent.redact_commands import (
@@ -1869,16 +1870,6 @@ _HERMES_HOME_PREFIXES = ("$HERMES_HOME/", "${HERMES_HOME}/")
 _HOME_PREFIXES = ("$HOME/", "${HOME}/")
 
 
-
-
-
-
-
-
-
-
-
-
 REDACTION_UNAVAILABLE = "[redaction-unavailable]"
 # The opaque branch needs a 20-char floor (the floor the gateway/A2A sweeps always had): without it the
 # English word "bearer" turns "the bearer of bad news" into "Bearer [redacted] bad news" on every chat
@@ -1901,32 +1892,8 @@ def redact_for_egress(text: str) -> str:
     return text
 
 
-
-
 # --- Prefix pre-screen: derived from _PREFIX_PATTERNS so a new prefix can't
 # silently break the gate (every match contains its pattern's literal prefix).
-
-def _extract_literal_prefix(pattern: str) -> str:
-    """Leading literal chars of a regex (up to the first metacharacter)."""
-    meta = "[(\\.?*+|{^$"
-    for i, ch in enumerate(pattern):
-        if ch in meta:
-            return pattern[:i]
-    return pattern
-
-
-
-
-
-
-
-
-def _has_top_level_alternation(pattern: str) -> bool:
-    return _pattern_structure(pattern)[0]
-
-
-def _has_nested_unbounded_repeat(pattern: str) -> bool:
-    return _pattern_structure(pattern)[1]
 
 
 _PREFIX_SUBSTRINGS = tuple(_extract_literal_prefix(p) for p in _PREFIX_PATTERNS)

@@ -68,12 +68,6 @@ async def _busy_accepted() -> None:
         await hook()
 
 
-
-
-
-
-
-
 class GatewayBusySessionMixin:
     """Busy-session queueing, slot claims, slash dispatch tables, destructive-slash confirmation."""
 
@@ -171,7 +165,6 @@ class GatewayBusySessionMixin:
             if event._admitted_before_drain is True:
                 return overflow.pop(index)
         return None
-
 
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
