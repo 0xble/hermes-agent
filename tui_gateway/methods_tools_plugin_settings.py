@@ -4,7 +4,7 @@ from __future__ import annotations
 def _plugins_settings(rid, params):
     """Write manifest-declared settings (``values`` = ``{key: value}``) through the same writer as
     ``ctx.set_config``; secrets are refused here (the client stores them via the ``.env`` route)."""
-    from tui_gateway.methods_tools import (Path, _err, _ok, _plugin_rows, _portable_server_names, _tools_mod)
+    from tui_gateway.server import (Path, _err, _ok, _plugin_rows, _portable_server_names, _tools_mod)
     key = (params.get("key") or params.get("name") or "").strip()
     values = params.get("values")
     if not key or not isinstance(values, dict):
@@ -38,11 +38,11 @@ def _plugins_settings(rid, params):
 
 def _plugins_onboarding(rid, params):
     """Catalog plugins curated for the onboarding card that this OS runs, each with its app state."""
-    from tui_gateway.methods_tools import (_ok, _tools_mod)
+    from tui_gateway.server import (_ok, _tools_mod)
     return _ok(rid, {"onboarding": _tools_mod("hermes_cli.plugin_catalog_presence").onboarding_entries()})
 
 
 def _plugins_presence(rid, params):
     """Named catalog plugins this OS runs, in the order asked, each with its app state and disclosure."""
-    from tui_gateway.methods_tools import (_ok, _tools_mod)
+    from tui_gateway.server import (_ok, _tools_mod)
     return _ok(rid, {"presence": _tools_mod("hermes_cli.plugin_catalog_presence").presence_for(params.get("names") or [])})

@@ -5,6 +5,7 @@ import plistlib
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 import venv
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import gateway, gateway_launchd, gateway_service_owner
+from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
 from hermes_cli.immutable_releases import promote
 from tests.hermes_cli.immutable_launchd_cleanup import (
     install_probe_process_dependency,
@@ -88,14 +90,19 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
     # Dependency isolation is out of scope here: the .pth reuses the runner's
     # site-packages. Real _build_venv coverage lives in test_immutable_releases.py:354 and :913.
     monkeypatch.setattr(releases, "_build_venv", _build_test_venv)
-    # Both commits contain the real S2 tree. A pre-S2 fixture would be refused by
-    # the candidate smoke check and would not prove an installable release.
+    # Both revisions contain the packaged Python runtime and use real Git
+    # archives and venvs. Frontend/test/contributor files do not participate in
+    # this launchd interpreter, code-identity and rollback contract.
     source = tmp_path / "source-revisions"
-    # Borrow local objects instead of negotiating the entire partial-clone
-    # history through upload-pack. Only these two disposable revisions matter.
-    subprocess.run(["git", "clone", "--shared", "--quiet",
-                    str(Path(__file__).resolve().parents[2]), str(source)],
-                   check=True, timeout=60)
+    repo = Path(__file__).resolve().parents[2]
+    subprocess.run(["git", "clone", "--shared", "--quiet", "--no-checkout",
+                    str(repo), str(source)], check=True, timeout=60)
+    metadata = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+    packages = sorted({name.split(".")[0] for name in
+                       metadata["tool"]["setuptools"]["packages"]["find"]["include"]})
+    subprocess.run(["git", "-C", str(source), "read-tree", "--empty"], check=True)
+    subprocess.run(["git", "-C", str(source), "restore", "--source=HEAD", "--staged", "--worktree", "--",
+                    ":(top,glob)*.py", "pyproject.toml", "uv.lock", *packages], check=True)
     # This source install has no optional features. A real source-owned Python
     # prevents staging from inheriting every extra installed in the test runner.
     venv.EnvBuilder(with_pip=False).create(source / ".venv")
@@ -129,7 +136,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
     # only the gateway payload with a bounded, no-credential process probe.
     python = str(home / "current" / ".venv" / "bin" / "python")
     logs = home / "logs"
-    plist["ProgramArguments"] = gateway_launchd.launchd_program_arguments(
+    plist["ProgramArguments"] = launchd_program_arguments(
         [python, "-m", "probe"], logs / "stdout.log", logs / "stderr.log"
     )
     plist["EnvironmentVariables"]["S2_PROBE_OUTPUT"] = str(output)

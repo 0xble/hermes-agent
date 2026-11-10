@@ -338,8 +338,9 @@ def test_legacy_selection_carries_extras_the_main_era_venv_lazily_installed(monk
 
 
 @pytest.mark.parametrize("provider_source", ["bundled", "catalog", "bundled-with-user-copy"])
+@pytest.mark.parametrize("install_kind", ["legacy-release", "immutable-release", "sealed-payload"])
 def test_immutable_release_first_generation_keeps_provider_deps_without_extra(
-    monkeypatch, tmp_path, provider_source,
+    monkeypatch, tmp_path, provider_source, install_kind,
 ):
     """First-generation selection keeps leaf extras; the selected plugin owns its deps."""
     import json
@@ -399,6 +400,17 @@ def test_immutable_release_first_generation_keeps_provider_deps_without_extra(
     site = site_packages(candidate / ".venv")
     for module in ("fal_client", "hindsight_client", "telegram"):
         (site / module).mkdir(parents=True)
+    if install_kind != "legacy-release":
+        from pm.environment import PM_BUILT_KEY
+
+        (candidate / ".venv" / "pyvenv.cfg").write_text(f"{PM_BUILT_KEY} = true\n", encoding="utf-8")
+    if install_kind == "immutable-release":
+        for name in (".release-ready", ".hermes_build_sha"):
+            (candidate / name).write_text(candidate.name + "\n", encoding="utf-8")
+    elif install_kind == "sealed-payload":
+        (candidate / "manifest.json").write_text(
+            json.dumps({"repo": ".", "venv": ".venv"}), encoding="utf-8",
+        )
     facts = Facts(runtime_facts_path(candidate), strict=True)
     assert facts.get("venv") is None, "this must exercise a brand-new install key"
     package = Venv(candidate)
@@ -435,6 +447,7 @@ def test_immutable_release_first_generation_keeps_provider_deps_without_extra(
 
 def test_core_dependency_anchors_do_not_infer_optional_extras(monkeypatch, tmp_path):
     """Core fastapi/Pillow in a payload must not manufacture web/vision selections."""
+    import json
     site = tmp_path / "venv" / "lib" / "python3.11" / "site-packages"
     (site / "fastapi").mkdir(parents=True)
     (site / "PIL").mkdir()
@@ -448,7 +461,9 @@ def test_core_dependency_anchors_do_not_infer_optional_extras(monkeypatch, tmp_p
         encoding="utf-8",
     )
     monkeypatch.setattr(extras, "_PLATFORM_GATES", {})
-    monkeypatch.setattr("pm.environments.base_venv", lambda _root: tmp_path / "venv")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"repo": ".", "venv": "venv"}), encoding="utf-8",
+    )
     monkeypatch.setattr("pm.environments.site_packages", lambda _venv: site)
 
     assert "web" not in extras.installed_selection(tmp_path)

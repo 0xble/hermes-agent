@@ -275,8 +275,6 @@ def load_cli_config() -> dict[str, Any]:
         live_path = get_hermes_home() / 'config.yaml'
         if config_exists(live_path):
             config_path = live_path
-    if not config_exists(config_path) or os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
-        config_path = Path(__file__).parent / 'cli-config.yaml'
 
     defaults = _cli_config_defaults()
 

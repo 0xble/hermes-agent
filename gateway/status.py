@@ -566,7 +566,7 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
             return None
         tokens = [t.lower() for t in cased_tokens]
         basenames = [t.rsplit("/", 1)[-1] for t in tokens]
-    # The launchd job's osascript wrapper (gateway_launchd.launchd_program_arguments) carries the gateway argv
+    # The launchd job's osascript wrapper (gateway_launchd_runtime.launchd_program_arguments) carries the gateway argv
     # inside one JXA script string; the gateway itself is its child and is matched on its own command line.
     if basenames[0] == "osascript":
         return None

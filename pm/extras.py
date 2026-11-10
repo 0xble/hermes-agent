@@ -416,10 +416,19 @@ def installed_selection(project_root: Path) -> list[str]:
     them into the process doing the replacement. Anchors already explained by
     core dependencies are not evidence of an optional extra.
     """
-    from pm.environments import base_venv, site_packages
+    from pm.environments import base_venv, payload_venv, site_packages
 
     try:
-        tree = site_packages(base_venv(Path(project_root)))
+        root = Path(project_root).resolve()
+        environment = base_venv(root)
+        if payload_venv(root) is None and _built_by_pm(environment):
+            # Immutable releases ship PM-built venvs too. Their ready markers
+            # distinguish installed state from a contributor's build output.
+            if not all((root / name).is_file()
+                       and (root / name).read_text(encoding="utf-8-sig").strip() == root.name
+                       for name in (".release-ready", ".hermes_build_sha")):
+                return []
+        tree = site_packages(environment)
     except (OSError, RuntimeError, ValueError):
         return []
     return _selection_from_trees(Path(project_root), [tree], include_all=False)

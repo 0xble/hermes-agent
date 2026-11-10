@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 from hermes_cli.plugins_capability_ctx import PluginCapabilityCtxMixin
 from hermes_cli.plugins_dispatch import DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS
 from hermes_cli.plugins_ledger import PluginRegistration
+from hermes_cli.plugin_injection import GatewayInjectionHandle
 from hermes_cli.plugins_loader import _serialized_replacement
 from hermes_cli.plugins_manifest import PluginManifest
 from hermes_cli.plugins_registrars import register_scoped_provider, scoped_provider_registrar
@@ -293,6 +294,7 @@ class PluginContext(PluginCapabilityCtxMixin):
             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
             override=override, scope=scope, eager=eager,
+            incognito_safe=self.manifest.incognito_safe is True,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         handle = None
@@ -395,11 +397,17 @@ class PluginContext(PluginCapabilityCtxMixin):
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         origin: Mapping[str, Any] | None = None,
-    ) -> bool:
-        """Queue *content* for a session (``session_key``) or a chat in this plugin's own profile
-        (``origin``); ``True`` means a host accepted it. Contract: plugins_injection.py, plugin docs."""
+        await_dispatch: bool = False, correlation_id: str | None = None,
+    ) -> bool | GatewayInjectionHandle:
+        """Queue content in this plugin's profile. The default Boolean acknowledges scheduling.
+
+        ``await_dispatch=True`` returns a correlated admission handle, not a turn result.
+        Timeout or cancellation after a possible commit is indeterminate and not retry-safe.
+        Contract: plugins_injection.py and the plugin injection docs.
+        """
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin,
+                                     await_dispatch=await_dispatch, correlation_id=correlation_id)
 
     def session_cwd(self) -> str:
         """The calling session's recorded cwd, never the gateway's own (``plugin_session``)."""
@@ -745,6 +753,9 @@ class PluginContext(PluginCapabilityCtxMixin):
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
         """Register behavior-changing middleware (request kinds rewrite the payload, execution kinds
         wrap the callback). Unknown kinds warn but are stored."""
+        from hermes_cli.plugins_incognito import protect_execution_callback
+        if kind in {"llm_execution", "tool_execution"}:
+            callback = protect_execution_callback(self.manifest, callback)
         return self._track_callback(
             "middleware", kind, callback, self._manager._middleware, _facade().VALID_MIDDLEWARE
         )
@@ -764,7 +775,10 @@ class PluginContext(PluginCapabilityCtxMixin):
             _facade().logger.warning("Plugin '%s' registered unknown %s '%s' (valid: %s)", self.manifest.name, kind,
                                      key, ", ".join(sorted(valid)))
         mapping.setdefault(key, []).append(callback)
-        handle = self._track(kind, key, lambda: self._manager._remove_callback(mapping, key, callback))
+        from hermes_cli.plugins_incognito import track_callback
+        release = track_callback(self._manager, self.manifest, callback,
+                                 lambda: self._manager._remove_callback(mapping, key, callback))
+        handle = self._track(kind, key, release)
         _facade().logger.debug("Plugin %s registered %s: %s", self.manifest.name, kind, key)
         return handle
 
@@ -790,6 +804,7 @@ class PluginContext(PluginCapabilityCtxMixin):
             raise ValueError(f"system prompt section {id!r} is already registered by plugin {existing.plugin!r}")
         section = _facade().PluginSystemPromptSection(
             id=id, content=content, position=position, max_chars=max_chars, plugin=self.plugin_id,
+            incognito_safe=self.manifest.incognito_safe is True,
         )
         return self._register_entry("system_prompt_section", id, self._manager._system_prompt_sections,
                                     section, "Plugin %s registered system prompt section: %s", id,
@@ -821,7 +836,8 @@ class PluginContext(PluginCapabilityCtxMixin):
         emitting is namespace-gated). Owner-tagged so unload removes zombie callbacks."""
         if not event or not isinstance(event, str):
             raise ValueError(f"Plugin '{self.manifest.name}' subscribe() requires a non-empty event name")
-        self._manager._subscribe_event(self.plugin_id, event, callback)
+        self._manager._subscribe_event(self.plugin_id, event, callback,
+                                       incognito_safe=self.manifest.incognito_safe is True)
         _facade().logger.debug("Plugin %s subscribed to event: %s", self.manifest.name, event)
 
     from hermes_cli.plugins_content import register_automation_blueprint, register_skill

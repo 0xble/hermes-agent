@@ -24,6 +24,7 @@ def client(monkeypatch, _isolate_hermes_home):
     (home / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: home)
     monkeypatch.setattr(profiles, "_get_profiles_root", lambda: home / "profiles")
+    monkeypatch.setattr(profiles, "_get_wrapper_dir", lambda: home / "bin")
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
     c = TestClient(app)
     c.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN

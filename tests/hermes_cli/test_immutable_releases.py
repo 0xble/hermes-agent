@@ -142,6 +142,7 @@ def _copy_pm_builder(candidate: Path) -> None:
     package.mkdir(exist_ok=True)
     (package / "__init__.py").touch()
     shutil.copyfile(root / "hermes_cli" / "runtime_state.py", package / "runtime_state.py")
+    shutil.copyfile(root / "hermes_cli" / "macos_signing.py", package / "macos_signing.py")
 
 
 def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, monkeypatch):

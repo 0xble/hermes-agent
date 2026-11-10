@@ -114,6 +114,37 @@ def test_a_graceful_stop_releases_the_routers_group(monkeypatch, tmp_path):
         process_identity.release_process_groups([sup.proc.pid])
 
 
+def _crashed_router_and_model(receipt):
+    """Kill an owned router only after its real model child can be identified."""
+    from hermes_cli import process_identity
+
+    router = subprocess.Popen(  # detached-spawn: ok — disposable owned router group
+        [sys.executable, "-c",
+         "import subprocess, sys; c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']);"
+         f" open({str(receipt)!r}, 'w').write(str(c.pid)); sys.stdin.read(1)"],
+        stdin=subprocess.PIPE, start_new_session=True)
+    process_identity.own_process_groups([router.pid])
+    try:
+        model = psutil.Process(int(wait_until(lambda: receipt.exists() and receipt.read_text(encoding="utf-8"),
+                                              what="model child receipt")))
+        assert os.getpgid(model.pid) == router.pid
+        assert router.poll() is None
+        # The signal boundary verifies the live subtree before reparenting.
+        router.kill()
+        router.wait(timeout=30)
+        return router, model
+    except BaseException:
+        if router.poll() is None:
+            router.kill()
+            router.wait(timeout=30)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(router.pid, 9)  # windows-footgun: ok — posix-marked test
+        process_identity.release_process_groups([router.pid])
+        raise
+    finally:
+        router.stdin.close()
+
+
 def test_stop_after_a_router_crash_still_stops_its_surviving_model_child(monkeypatch, tmp_path):
     """The watcher's restart backoff: the router died, its model child (same group) still runs."""
     from hermes_cli import process_identity
@@ -122,17 +153,9 @@ def test_stop_after_a_router_crash_still_stops_its_surviving_model_child(monkeyp
     monkeypatch.setattr(supervisor, "runtimes_root", lambda: tmp_path)
     sup = supervisor.LlamaServerSupervisor(tmp_path, tmp_path, port=59997)
     receipt = tmp_path / "model.pid"
-    sup.proc = subprocess.Popen(  # detached-spawn: ok — test router stand-in; its group is killed below
-        [sys.executable, "-c",
-         "import subprocess, sys; c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']);"
-         f" open({str(receipt)!r}, 'w').write(str(c.pid))"],
-        stdin=subprocess.DEVNULL, start_new_session=True)
-    process_identity.own_process_groups([sup.proc.pid])
+    sup.proc, model = _crashed_router_and_model(receipt)
     pgid = sup.proc.pid
     try:
-        sup.proc.wait(timeout=30)  # the router "crashed"; the model child is still in its group
-        model = psutil.Process(int(wait_until(lambda: receipt.exists() and receipt.read_text(encoding="utf-8"),
-                                              what="model child receipt")))
         assert os.getpgid(model.pid) == pgid
         sup.stop()
         wait_until(lambda: not model.is_running() or model.status() == psutil.STATUS_ZOMBIE, timeout=10,
@@ -156,16 +179,8 @@ def test_a_crash_restart_stops_the_old_routers_survivors_and_releases_its_group(
     monkeypatch.setattr(sup, "_wait_health", lambda timeout: None)
     monkeypatch.setattr(sup, "_spawn", lambda: setattr(sup, "proc", None))  # the replacement; ends the watch
     receipt = tmp_path / "model.pid"
-    old = subprocess.Popen(  # detached-spawn: ok — test router stand-in; its group is killed below
-        [sys.executable, "-c",
-         "import subprocess, sys; c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']);"
-         f" open({str(receipt)!r}, 'w').write(str(c.pid))"],
-        stdin=subprocess.DEVNULL, start_new_session=True)
-    process_identity.own_process_groups([old.pid])
+    old, model = _crashed_router_and_model(receipt)
     try:
-        old.wait(timeout=30)  # the router crashed; its model child is still in its group
-        model = psutil.Process(int(wait_until(lambda: receipt.exists() and receipt.read_text(encoding="utf-8"),
-                                              what="model child receipt")))
         sup.proc = old
         sup._watch()
         wait_until(lambda: not model.is_running() or model.status() == psutil.STATUS_ZOMBIE, timeout=10,
