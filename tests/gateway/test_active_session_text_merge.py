@@ -250,7 +250,7 @@ async def test_control_and_clarify_messages_bypass_text_debounce():
 
 @pytest.mark.asyncio
 async def test_debounced_origin_binds_latest_event_and_keeps_chunk_references(tmp_path):
-    from agent.source_origin import NativeOrigin, ORIGIN_KEY, classify_origin
+    from agent.source_origin import NativeOrigin, classify_origin, native_origin
     from gateway.source_origin import source_origin_metadata
     from hermes_state import SessionDB
 
@@ -267,7 +267,7 @@ async def test_debounced_origin_binds_latest_event_and_keeps_chunk_references(tm
         merged = _debounced_event(adapter, key)
         assert merged.message_id == second_id
         metadata = source_origin_metadata(merged, merged.text)
-        receipt = metadata[ORIGIN_KEY]
+        receipt = native_origin(metadata)
         assert receipt.event == second_id
         assert {ref[2] for ref in receipt.references} == {first_id, second_id}
         db = SessionDB(tmp_path / "fictional.db")

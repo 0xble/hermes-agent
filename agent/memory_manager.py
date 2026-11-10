@@ -161,8 +161,11 @@ def _redact_for_provider(*values: Any) -> Any:
 
     scrubbed = [walk(v, scrub) for v in values]
     if learned:
-        pattern = re.compile(r"(?<!\w)(?:" + "|".join(
-            re.escape(t) for t in sorted(learned, key=len, reverse=True)) + r")(?!\w)")
+        # Only short numeric codes need token boundaries. Learned passwords/keys must
+        # still be removed when repeated inside an identifier, prefix or URL.
+        pattern = re.compile("|".join(
+            r"(?<!\w)" + re.escape(t) + r"(?!\w)" if t.isdecimal() and len(t) < 8 else re.escape(t)
+            for t in sorted(learned, key=len, reverse=True)))
         scrubbed = [walk(v, lambda t: pattern.sub("[redacted]", t) if pattern.search(t) else t) for v in scrubbed]
     return scrubbed[0] if len(scrubbed) == 1 else tuple(scrubbed)
 

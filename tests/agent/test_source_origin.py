@@ -19,7 +19,7 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
         manager.sync_all(text, "Completed, permanently fixed.", messages=[
             {"role": "user", "content": text, "display_metadata": {"author": "Brian"}}])
     assert retained == []
-    from agent.source_origin import NativeOrigin, classify_origin, human_spans
+    from agent.source_origin import NativeOrigin, classify_origin, human_spans, native_origin
     from agent.memory_manager import _redact_for_provider
     from gateway.platforms.event import MessageEvent
     from gateway.source_origin import stamp_telegram_person, source_origin_metadata
@@ -33,7 +33,7 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
     native = SimpleNamespace(from_user=SimpleNamespace(id=1, is_bot=False), text=directive,
                              forward_origin=None, via_bot=None, sender_chat=None)
     event = stamp_telegram_person(MessageEvent(text=directive, message_id="event-1"), native)
-    assert source_origin_metadata(event, directive)["_hermes_source_origin"].decision(directive).status == "verified_human"
+    assert native_origin(source_origin_metadata(event, directive)).decision(directive).status == "verified_human"
     forwarded = stamp_telegram_person(MessageEvent(text=directive, message_id="forward-1"),
         SimpleNamespace(from_user=native.from_user, forward_origin="quoted", via_bot=None, sender_chat=None))
     assert not source_origin_metadata(forwarded, directive)
@@ -41,11 +41,11 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
     relay = stamp_telegram_person(MessageEvent(text=relay_text, message_id="relay-1"),
         SimpleNamespace(**{**native.__dict__, "text": relay_text}))
     assert relay._native_origin is None
-    assert source_origin_metadata(relay, relay_text)["_hermes_source_origin"].decision(relay_text).status == "generated"
+    assert native_origin(source_origin_metadata(relay, relay_text)).decision(relay_text).status == "generated"
     control = MessageEvent(text=generated + "\n" + directive, message_id="wake-1")
     control.absorb_reply_expected(event)
     assert human_spans(control.text, control._native_origin.decision(control.text)) == directive
-    assert source_origin_metadata(control, control.text)["_hermes_source_origin"].references[0][2] == "event-1"
+    assert native_origin(source_origin_metadata(control, control.text)).references[0][2] == "event-1"
     assert not source_origin_metadata(forwarded, directive)
     try:
         for text in (directive, correction):

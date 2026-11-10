@@ -19,7 +19,8 @@ def test_status_labels_do_not_poison_neighboring_payload(label, neighbor):
     assert cleaned[1]["content"] == neighbor
 
 
-def test_authentication_values_are_removed_on_token_boundaries():
+def test_only_short_numeric_codes_require_word_boundaries():
+    # A short numeric code must match a whole token, not part of an unrelated identifier.
     safe = _redact_for_provider("Recovery code: 482913.", "482913 and x482913y.",
                                 "API key: AbCdEfGhJkLmNpQrStUvWxYz", "AbCdEfGhJkLmNpQrStUvWxYz")
     assert safe[1] == "[redacted] and x482913y."
@@ -32,6 +33,14 @@ def test_authentication_values_are_removed_on_token_boundaries():
     assert "482913" not in json.dumps(safe_messages)
     assert "Keep notices off." in safe_messages[0]["content"]
     assert messages[0]["display_metadata"]["_hermes_source_origin"] is receipt
+
+
+@pytest.mark.parametrize("secret", ["hunter2zz9", "AbCdEfGhJkLmNpQrStUvWxYz", "7xQ2aZ", "12345678"])
+def test_learned_secrets_are_removed_inside_other_tokens(secret):
+    safe = _redact_for_provider("Password: " + secret,
+                               {"content": f"token_{secret} {secret}abc https://fictional.test/{secret}/end"})
+    assert secret not in json.dumps(safe)
+    assert safe[1]["content"] == "token_[redacted] [redacted]abc https://fictional.test/[redacted]/end"
 
 
 def test_native_origin_cannot_silently_serialize_as_empty_metadata():

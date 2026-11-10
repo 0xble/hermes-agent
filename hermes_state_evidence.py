@@ -22,7 +22,6 @@ GRAPH_COLUMNS = (
 )
 
 
-
 class EvidenceUnavailable(ValueError):
     """The source cannot satisfy the exact evidence contract, with no successful footer."""
 

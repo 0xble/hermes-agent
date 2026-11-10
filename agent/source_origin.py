@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from typing import Literal
+import weakref
 
 ORIGIN_KEY = "_hermes_source_origin"
 MAX_ORIGIN_BYTES = 8192
@@ -60,6 +61,38 @@ class NativeOrigin:
 
 class _NativeRecord(dict):
     """Only the native occurrence writer may serialize a reserved stamp."""
+
+
+class _OriginReference(dict):
+    """An empty JSON value, whose exact live identity anchors an out-of-band receipt."""
+    __slots__ = ("__weakref__",)
+
+
+_origin_receipts: dict[int, tuple[weakref.ReferenceType, NativeOrigin]] = {}
+
+
+def origin_metadata(receipt, metadata=None):
+    """Keep native authority off the message graph, including the receipt's original text.
+
+    Shallow history/metadata copies retain the anchor. JSON and deep copies cannot mint
+    evidence, and releasing the last live anchor releases its process-local receipt.
+    """
+    anchor = _OriginReference()
+    key = id(anchor)
+    _origin_receipts[key] = (weakref.ref(anchor, lambda ref: _origin_receipts.pop(key, None)), receipt)
+    return {**(metadata or {}), ORIGIN_KEY: anchor}
+
+
+def native_origin(metadata):
+    """Resolve only a native adapter input or the exact still-live origin anchor."""
+    value = metadata.get(ORIGIN_KEY) if isinstance(metadata, dict) else None
+    if isinstance(value, NativeOrigin):
+        return value
+    if isinstance(value, _OriginReference):
+        entry = _origin_receipts.get(id(value))
+        if entry is not None and entry[0]() is value:
+            return entry[1]
+    return None
 
 
 class _StoredRecord(dict):
@@ -118,14 +151,15 @@ def persistence_metadata(metadata, message, session_id, encoded_content=None):
     if not isinstance(metadata, dict):
         return metadata
     result = reserve_metadata(metadata)
-    receipt = metadata.get(ORIGIN_KEY)
-    if isinstance(receipt, _StoredRecord):
+    record = metadata.get(ORIGIN_KEY)
+    if isinstance(record, _StoredRecord):
         binding = (session_id, message.get("message_uid"), message.get("role"),
                    message.get("platform_message_id") or message.get("message_id"), encoded_content)
-        if receipt.binding != binding or not receipt.unchanged():
+        if record.binding != binding or not record.unchanged():
             result.pop(ORIGIN_KEY, None)
         return result
     content = message.get("_replay_persisted_content", message.get("content"))
+    receipt = native_origin(metadata)
     if isinstance(receipt, NativeOrigin) and encoded_content is not None and encoded_content != receipt.text:
         receipt = None
     if not isinstance(receipt, NativeOrigin) and isinstance(content, str):
@@ -218,7 +252,7 @@ def retention_user_text(text, messages):
         if message.get("content") != text:
             return None
         metadata = message.get("display_metadata") or {}
-        receipt = metadata.get(ORIGIN_KEY) if isinstance(metadata, dict) else None
+        receipt = native_origin(metadata)
         if not isinstance(receipt, NativeOrigin):
             return None
         decision = receipt.decision(text)
@@ -234,11 +268,15 @@ def stamp_runtime_origin(message, platform):
     from agent.synthetic_prompt import is_runtime_prompt
     text = message.get("content")
     producer = session_source_for(platform)
-    receipt = (message.get("display_metadata") or {}).get(ORIGIN_KEY)
+    metadata = message.get("display_metadata") or {}
+    receipt = native_origin(metadata)
+    if isinstance(metadata.get(ORIGIN_KEY), NativeOrigin):
+        message["display_metadata"] = origin_metadata(receipt, metadata)
     if (isinstance(receipt, NativeOrigin) and receipt.decision(text).status == "verified_human"
             and receipt.spans != ((0, len(text)),)):
         return
     if isinstance(text, str) and (is_runtime_prompt(display_kind=message.get("display_kind"), platform=platform)
             or producer in {"oneshot", "tool", "subagent", "a2a", "relay", "goal", "loop", "process"}):
-        message["display_metadata"] = {**(message.get("display_metadata") or {}), ORIGIN_KEY:
-            NativeOrigin.generated(text, producer=producer, event=message.get("message_uid") or "native_turn")}
+        message["display_metadata"] = origin_metadata(
+            NativeOrigin.generated(text, producer=producer, event=message.get("message_uid") or "native_turn"),
+            metadata)
