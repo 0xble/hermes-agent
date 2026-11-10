@@ -14,3 +14,10 @@ remain supported at persisted boundaries by [dynamic aliases](dynamic-model-alia
 The automatic v54 migration and its dry-run command carry old configuration
 and JSON cron/topic references to those owners. This historical identity stays
 here so published Fork-Patch trailers retain an accountable retirement record.
+
+The historical named Custom Subagents implementation from commit
+`2a56de65fd8d2ee561eaae10663babaaa302486c` is also retired. Its named-role
+selection is replaced by upstream delegation backends and Advanced Delegation
+`model_map` options or `profile_routes`. No configured named custom roles need
+translation. Parent-only durable knowledge writes and child lifecycle ownership
+remain with upstream's core lifecycle rather than custom route definitions.

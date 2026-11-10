@@ -1721,7 +1721,7 @@ def _resolve_cron_job_config(job: dict, cfg: dict) -> _CronJobConfig:
     _job_route_provider = ""
     _route = None
     from hermes_cli.model_alias_runtime import resolve_model_alias
-    # Resolve @ routes from the freshly read config on every fire. Do not persist the
+    # Resolve upstream alias names from the freshly read config on every fire. Do not persist the
     # concrete model in the job or resolve it during cron creation.
     from hermes_cli.model_alias_runtime import alias_name
     if alias_name(model, _cfg):

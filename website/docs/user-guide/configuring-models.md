@@ -23,63 +23,59 @@ On a brand-new install the bundled default config has `model: ""` (an empty stri
 
 ## Reusing a named route
 
-Use `model_presets` to name a provider/model route and refer to it with the canonical
-`model_preset: NAME` form or the `@NAME` shorthand. Presets are expanded at the point each consumer runs.
-
-The `@NAME` shorthand is a preset reference only when the whole value is `@` followed by letters, digits,
-`_` or `-`. A value containing `/`, `.` or `:` is a literal model ID and is passed through unchanged with its
-own provider and `base_url`, so IDs such as `@cf/meta/llama-3.3-70b-instruct-fp8-fast` and `@hf/...` work
-as written. An unknown bare name such as `@missing` is still an error. Saving the config keeps `@NAME`
-strings exactly as you wrote them.
-Cron jobs re-read and resolve their route at fire time. Editing a preset affects the next use
-of that config without rewriting the stored job.
+Use upstream `model_aliases` as the single registry of model labels. Store the
+bare alias name in a topic, cron job or delegation option. Each request resolves
+that name from the current profile configuration, so an alias edit updates later
+requests without rewriting the stored references.
 
 ```yaml
-model_presets:
-  attended-fast:
-    provider: openrouter
-    model: google/gemini-3-flash-preview
-    reasoning_effort: medium
+model_aliases:
   coding:
-    provider: openrouter
-    model: anthropic/claude-sonnet-4.6
-    fallbacks:
-      - provider: openai
-        model: gpt-5.4
+    provider: openai-codex
+    model: gpt-6.1-sol
+    reasoning_effort: high
 
-model:
-  model_preset: coding
-# Equivalent shorthand in supported model slots: model: "@coding"
 delegation:
-  model_preset: coding
+  backend: model_map
+  fallback_providers: []
+  backends:
+    model_map:
+      default: coding
+      options:
+        - name: coding
+          description: Software implementation and debugging.
+          provider: openai-codex
+          model: coding
+          reasoning_effort: high
+          service_tier: normal
+          fallback_providers: []
 ```
 
-Presets must define `provider` and `model`. Definitions are flat, with no nested preset references.
-The names `attended` and `default` are reserved for the runtime config resolver. Unknown names,
-nested references and conflicting inline route fields are rejected. A concrete `/model` selection
-replaces the preset reference while preserving unrelated settings and comments.
+Install and enable the official Advanced Delegation plugin with
+`hermes plugins install advanced-delegation` and
+`hermes plugins enable advanced-delegation`. Its `model_map` backend exposes
+named options to `delegate_task`, and `profile_routes` selects complete profile
+routes when separate credentials, identity or terminal policy are needed.
+Unknown options are refused before child construction. Results report the route,
+resolved model, reasoning effort and service tier.
+
+The `openai-codex` provider uses the Codex subscription. The explicit empty
+fallback chain keeps a failed subscription request from falling back to a paid
+API provider. Provision OAuth credentials for the selected profile before use.
 
 ## Topic Model Roles
 
-In the gateway, `/model @coding` stores the role name, not a concrete route.
-`/model @attended` follows `model.attended`, and `/model @default` follows the
-configured default. Every API boundary resolves the role from the topic's
-current profile config. Changes to presets take effect on the next request,
-including within a long turn, without rewriting sessions. Fallback routes never
-replace the stored role.
+In the gateway, `/model coding` stores the alias name in `model_role`. The
+`telegram_topic` tool accepts the same bare name. Every API boundary resolves it
+from the topic's owning profile. Fallbacks never replace the stored alias.
+Explicit session and one-turn picks take precedence. `/model reset`,
+`/model reset --all` and `/new` clear the held alias.
 
-A held role is immune to attended idle expiry and does not emit switch cards.
-Explicit session and one-turn picks take precedence. A durable concrete pick
-replaces the role, while `--once` leaves it available after that turn. `/model
-reset`, `/model reset --all` and `/new` clear role state. Role picks cannot be
-combined with model-selection flags.
-
-The `telegram_topic` tool accepts the same `@NAME` values for create and edit.
-It reads route and reasoning from the routed profile, not the gateway's launch
-profile. `/status` shows the held role. The admin command `/model --all attended`
-converts existing concrete Telegram topic picks to `@attended` under the session
-store lock, writes one routing snapshot, and returns the converted session keys.
-It skips sessions already following a role and does not interrupt active agents.
+Legacy preset configuration and stored references are migrated automatically by
+config migration v54. Preview a selected home's migration with
+`python -m hermes_cli.config_migrations_model_aliases --home HOME --dry-run`,
+then apply it by omitting `--dry-run`. This rewrites JSON cron and topic stores
+without opening a session database.
 
 ## The Models page
 
