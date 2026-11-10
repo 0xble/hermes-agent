@@ -47,6 +47,7 @@ from tests.e2e.core.parity._helpers import (
     check_invariants,
     collect_observation,
     describe_pids,
+    failure_log_tail,
     kill_tagged,
     mcp_pids,
     start_provider,
@@ -125,7 +126,8 @@ def _run_row(entrypoint: str, root: Path) -> Row:
             f"  surviving MCP-tree pids: {describe_pids(survivors)} (mcp pid log {pids})\n"
             f"  final text: {(result.final_text or '')[-300:]!r}\n"
             f"  host exit code: {result.extra.get('exit_code')}\n"
-            f"  host stderr tail: {stderr_tail[-1500:]}"
+            f"  host stderr tail: {stderr_tail[-1500:]}\n"
+            f"  plugin/discovery/hook log tail:\n{failure_log_tail(ph)}"
         )
     except Exception as exc:
         row.error = f"{type(exc).__name__}: {exc}"[:4000]
