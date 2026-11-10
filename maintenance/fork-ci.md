@@ -1098,6 +1098,21 @@ runtime change. Retire when the accepted upstream case teardown handles the same
 race without weakening ownership or survivor checks. Rollback reverts this helper
 and its regression, with no runtime or stored-state migration.
 
+## Classic command output synchronization
+
+The classic PTY harness shares its existing 45-second screen poll between
+`send()` and assertions for separately painted output. Bare `/title` prints
+`Session ID:` before reading the session and painting `Title:`. Seeing the ID
+does not prove the title line is visible. The title and retry assertions wait
+for their own text without changing deadlines, command completion markers, or
+the requirement to observe a new occurrence of a command acknowledgement.
+
+`tests/hermes_cli/test_gateway_chat_title_repaint.py` holds the real CLI's
+title paint behind a FIFO until the harness captures an incomplete frame.
+It fails with the original immediate assertion and passes with the shared
+screen wait. No runtime behavior changes. Retire this synchronization only
+when the renderer supplies an atomic command-output completion boundary.
+
 ## Pinned tool archive caches
 
 `.github/actions/cache-pinned-tool` restores exact SHA-pinned `actions/cache`

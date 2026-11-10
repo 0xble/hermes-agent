@@ -60,6 +60,15 @@ def classic_session(tmp_path):
     def composer_shows(text):
         return any(row.startswith("❯") and text in row for row in screen().splitlines())
 
+    def until(text, timeout=45, *, seen=0, line=None):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = screen()
+            if current.count(text) > seen:
+                return current
+            time.sleep(.1)
+        raise AssertionError((line, text, screen(), (home / "gw.log").read_text()))
+
     def send(line, expect, timeout=45, composer=None):
         """``composer``: text the CLI itself put in the composer (``/undo``'s prefill), awaited like
         typed text. An Enter within 50 ms of any buffer change is a newline (#10994's paste guard,
@@ -75,13 +84,7 @@ def classic_session(tmp_path):
                 time.sleep(.1)
             time.sleep(1)  # health: allow HX013 -- main drops an Enter sent in the same burst as the text (probe_pty.py); the gap is the input timing
         tmux("send-keys", "-t", "chat", "Enter")
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            current = screen()
-            if current.count(expect) > seen:
-                return current
-            time.sleep(.1)
-        raise AssertionError((line, expect, screen(), (home / "gw.log").read_text()))
+        return until(expect, timeout, seen=seen, line=line)
 
     def db(sql, *args):
         with sqlite3.connect(f"file:{home / 'state.db'}?mode=ro", uri=True) as conn:
@@ -113,7 +116,7 @@ def classic_session(tmp_path):
             while not ("Welcome to Hermes Agent" in screen() and composer_shows("")):
                 assert time.monotonic() < deadline, (screen(), (home / "gw.log").read_text())
                 time.sleep(.1)
-            yield send, screen, db, session_id
+            yield send, until, db, session_id
             send("/quit", "CLI_RC=0")
         finally:
             tmux("kill-server")
@@ -130,12 +133,13 @@ def classic_session(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_classic_view_title_and_usage_match_main(tmp_path):
-    with classic_session(tmp_path) as (send, screen, db, session_id):
+    with classic_session(tmp_path) as (send, until, db, session_id):
         send("first question", "RECOVERY_ACK_first question")
         send("second question", "RECOVERY_ACK_second question")
         send("/title View Title", "Session title set: View Title")
         sid = session_id()
-        assert "Title: View Title" in screen()
+        # Bare /title paints the ID and title separately; the ID can arrive first.
+        until("Title: View Title")
         assert db("SELECT title FROM sessions WHERE id=?", sid) == [("View Title",)]
         send("/usage", "Session Token Usage")
         active = [r[0] for r in db("SELECT content FROM messages WHERE session_id=? AND active=1 AND role='user'", sid)]
@@ -144,12 +148,12 @@ def test_classic_view_title_and_usage_match_main(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_classic_view_retry_undo_new_match_main(tmp_path):
-    with classic_session(tmp_path) as (send, screen, db, session_id):
+    with classic_session(tmp_path) as (send, until, db, session_id):
         send("first question", "RECOVERY_ACK_first question")
         send("second question", "RECOVERY_ACK_second question")
         sid = session_id()
         send("/retry", "RECOVERY_ACK_second question")
-        assert 'Retrying: "second question"' in screen()
+        until('Retrying: "second question"')
         # Main confirms a destructive command; Enter takes "Approve Once".
         send("/undo", "destroys conversation state")
         send("", "Undid 1 turn")
@@ -166,7 +170,7 @@ def test_classic_view_retry_undo_new_match_main(tmp_path):
 def test_classic_view_plan_and_goal_run_on_the_gateway(tmp_path):
     """/plan queues main's plan-mode turn; /goal sets the session's goal and kicks it off. Both reach
     the model as normal turns of this session (the loopback model echoes the user text)."""
-    with classic_session(tmp_path) as (send, _screen, db, session_id):
+    with classic_session(tmp_path) as (send, _until, db, session_id):
         send("first question", "RECOVERY_ACK_first question")
         send("/plan add a cache", "RECOVERY_ACK_[/plan")
         send("/goal ship the cache", "Goal set")
