@@ -9,6 +9,11 @@ read-only probes and failed-read fallback. Signatures are process-local: their
 encoding is not a database or wire format. Keep binary doubles exact and avoid
 object-reference-dependent serialization; never deserialize database input.
 
+The bounded session-change journal is installed by writable schema setup, never
+by the read-only watcher. Retain full scans for legacy stores or an untrusted,
+incomplete journal. Incremental and rebuilt digests must agree, including after
+replacement deletes, journal truncation, rowid changes and VACUUM.
+
 Recent session lists must choose their ordered page before transcript preview
 projection. Compression-lineage recency, search filters, pagination and pinned
 backfill retain their existing contracts. CR/LF normalization preserves character
@@ -22,7 +27,8 @@ large shared store: the 0.5-second watcher repeatedly rendered every metadata ro
 while sidebar/project refreshes projected previews for discarded sort candidates
 and normalized full messages. Config reads were already signature-cached.
 
-Owning surfaces are `tui_gateway/change_watcher.py`, `hermes_state_common.py` and
+Owning surfaces are `tui_gateway/change_watcher.py`,
+`hermes_state_session_signature.py`, `hermes_state_common.py` and
 `SessionDB.list_sessions_rich` in `hermes_state_sessions.py`. Deterministic cost
 and semantic regressions live in `tests/tui_gateway/test_change_watcher_sessions.py`
 and `tests/hermes_cli/test_session_skill_previews.py`; existing lineage, paging,

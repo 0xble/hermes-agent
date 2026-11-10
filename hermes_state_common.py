@@ -12,6 +12,7 @@ from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
 from hermes_state_keys import CRON_PRINCIPAL_ID
+from hermes_state_session_signature import SESSION_SIGNATURE_TABLE_SQL, SESSION_SIGNATURE_TRIGGER_SQL
 from hermes_state_pidns import persistent_record_pidns_checkable, pid_namespace_id
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
 from agent.context_compressor import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
@@ -834,7 +835,7 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
-"""
+""" + SESSION_SIGNATURE_TABLE_SQL
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
 # sessions_runtime_ledger_delete_guard: every delete path in this release retires a session's ledger rows
@@ -974,7 +975,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity
 CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started
     ON sessions(created_source, started_at DESC)
     WHERE source = 'local';
-"""
+""" + SESSION_SIGNATURE_TRIGGER_SQL
 
 
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──
