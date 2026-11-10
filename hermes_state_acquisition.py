@@ -90,6 +90,7 @@ def acquisition_preflight(conn, session_id, policy):
         current = parents[current]
     # Validate the metadata-only projection before the CLI emits a transcript header.
     conn.execute(_origin_query() + " LIMIT 0", (MAX_ORIGIN_BYTES, session_id)).close()
+    return rows
 
 
 def _origin_query():

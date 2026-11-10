@@ -55,14 +55,15 @@ def source_origin_metadata(event, text):
     from gateway.platforms.event import turn_origin_for_event
     producer = turn_origin_for_event(event)
     origin = getattr(event, "_native_origin", None)
+    if isinstance(origin, NativeOrigin) and origin.decision(text).status == "verified_human" and event.message_id:
+        origin = NativeOrigin.person(text, platform=origin.platform, principal=origin.principal,
+                                     event=str(event.message_id), authored=origin.spans, references=origin.references)
     if (isinstance(origin, NativeOrigin) and origin.decision(text).status == "verified_human"
             and origin.spans != ((0, len(text)),)):
         return {ORIGIN_KEY: origin}
     if event.internal or producer in {"relay", "process", "goal_loop", "cron"}:
         origin = NativeOrigin.generated(text, producer=producer if producer != "unknown" else "gateway_runtime",
                                        event=str(event.message_id or "wake"))
-    else:
-        origin = getattr(event, "_native_origin", None)
     return {ORIGIN_KEY: origin} if isinstance(origin, NativeOrigin) and origin.decision(text).status != "unknown" else {}
 
 

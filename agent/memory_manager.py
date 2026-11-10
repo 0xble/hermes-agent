@@ -158,7 +158,8 @@ def _redact_for_provider(*values: Any) -> Any:
 
     scrubbed = [walk(v, scrub) for v in values]
     if learned:
-        pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
+        pattern = re.compile(r"(?<!\w)(?:" + "|".join(
+            re.escape(t) for t in sorted(learned, key=len, reverse=True)) + r")(?!\w)")
         scrubbed = [walk(v, lambda t: pattern.sub("[redacted]", t) if pattern.search(t) else t) for v in scrubbed]
     return scrubbed[0] if len(scrubbed) == 1 else tuple(scrubbed)
 
@@ -620,6 +621,8 @@ class MemoryManager:
             requires_origin = getattr(provider, "requires_verified_origin", False) is True
             retained_user = origin_user if requires_origin else clean_user_content
             if not retained_user:
+                if requires_origin:
+                    logger.debug("Skipping automatic retention for %s: no verified origin", provider.name)
                 return
             retained_user = _redact_for_provider(retained_user)
             kwargs: dict[str, Any] = {"session_id": session_id}

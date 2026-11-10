@@ -1,5 +1,7 @@
 """Exclude authentication values independently of speaker origin and known secret keys."""
 
+from collections import Counter
+from math import log2
 import re
 
 # Context is essential: ordinary counts, dates and identifiers are not authentication values.
@@ -12,10 +14,15 @@ _SENTENCE = re.compile(r".+?(?:[.!?](?=\s|$)|\n|$)")
 
 
 def authentication_values(text):
-    # Natural-language status words are ambiguous, not values to erase elsewhere.
-    return tuple(match.group("value").strip("`") for match in _VALUE.finditer(text or "")
-                 if any(char.isdigit() or char in "`_+/-" for char in match.group("value"))
-                 or ":" in match.group("label") or "=" in match.group("label"))
+    # A label does not turn status words or source-code identifiers into credentials.
+    values = []
+    for match in _VALUE.finditer(text or ""):
+        value = match.group("value").strip("`")
+        entropy = -sum((count / len(value)) * log2(count / len(value))
+                       for count in Counter(value).values())
+        if any(char.isdigit() for char in value) or (len(value) >= 16 and entropy >= 3.5):
+            values.append(value)
+    return tuple(values)
 
 
 def exclude_authentication_material(text):

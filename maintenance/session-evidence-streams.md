@@ -16,6 +16,8 @@ The narrow snapshot bypasses the general `SessionDB` constructor's FTS `SELECT *
 
 ## Update And Verification
 
+Automatic Hindsight retention now runs only on verified-origin turns. Missing verified origin skips retention and emits a debug log.
+
 Contract tests: `tests/hermes_cli/test_session_evidence_stream.py`.
 
 Streaming requires an existing WAL journal mode. Non-WAL stores are refused before output because a stalled consumer could otherwise block writers. The read-only command never changes journal mode. Routing identities (`user_id`, `chat_id`, `session_key`) that need redaction are refused rather than rewritten. Closed output pipes exit unsuccessfully without shutdown flush noise.

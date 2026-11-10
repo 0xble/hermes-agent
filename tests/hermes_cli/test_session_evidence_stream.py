@@ -455,7 +455,8 @@ def test_routing_identity_is_refused_rather_than_masked(store, field, operation,
 
 
 def test_closed_output_pipe_has_no_shutdown_flush_noise(store, tmp_path):
-    command, env, _ = _selected_entrypoint(store, tmp_path, False)
+    _, env, _ = _selected_entrypoint(store, tmp_path, False)
+    command = [sys.executable, "-m", "hermes_cli.main", "sessions", "state", "inventory"]
     read_fd, write_fd = os.pipe()
     os.close(read_fd)
     try:

@@ -21,16 +21,14 @@ class OriginDecision:
     references: tuple[tuple[int, int, str], ...] = ()
 
 
-class NativeOrigin(dict):
+class NativeOrigin:
     """Process-local adapter receipt, deliberately not accepted from serialized client metadata.
 
     An adapter calls person only after its transport positively identifies a person. Other
     surfaces remain unknown. Capturing the exact text invalidates receipts after merges/edits.
     """
     def __init__(self, text, status, platform, principal, event, spans, references=()):
-        # Generic JSON export intentionally carries no authority. Only the native writer
-        # expands this process-local receipt after binding the exact durable occurrence.
-        super().__init__()
+        # Only the native writer can serialize a receipt bound to a durable occurrence.
         self.text, self.status, self.platform = text, status, platform
         self.principal, self.event, self.spans, self.references = principal, event, spans, references
 
@@ -60,11 +58,46 @@ class _NativeRecord(dict):
     """Only the native occurrence writer may serialize a reserved stamp."""
 
 
-def reserve_metadata(metadata):
-    """Imports, client metadata and display edits cannot mint origin evidence."""
-    result = dict(metadata)
-    if not isinstance(result.get(ORIGIN_KEY), _NativeRecord):
+class _StoredRecord(dict):
+    """A native read retains its original bytes and occurrence binding across metadata edits."""
+    def __init__(self, record, binding):
+        super().__init__(record)
+        self.sealed = json.dumps(record, sort_keys=True)
+        self.binding = binding
+
+    def unchanged(self):
+        return json.dumps(self, sort_keys=True) == self.sealed
+
+
+def stored_origin_metadata(metadata, row=None, *, session_id=None):
+    """Called only on metadata acquired from a stored row, never client/import input."""
+    result = dict(metadata or {})
+    record = result.get(ORIGIN_KEY)
+    if isinstance(record, dict):
+        binding = None
+        if row is not None:
+            binding = (row["session_id"] if "session_id" in row.keys() else session_id,
+                       row["message_uid"], row["role"], row["platform_message_id"], row["content"])
+        result[ORIGIN_KEY] = _StoredRecord(record, binding)
+    return result
+
+
+def reserve_metadata(metadata, stored_metadata=None):
+    """Imports and client metadata cannot mint origin evidence. Stored records may survive."""
+    result = dict(metadata or {})
+    receipt = result.get(ORIGIN_KEY)
+    if not (isinstance(receipt, _NativeRecord)
+            or isinstance(receipt, _StoredRecord) and receipt.unchanged()):
         result.pop(ORIGIN_KEY, None)
+    if stored_metadata:
+        if isinstance(stored_metadata, str):
+            try:
+                stored_metadata = json.loads(stored_metadata)
+            except ValueError:
+                return result
+        record = stored_metadata.get(ORIGIN_KEY) if isinstance(stored_metadata, dict) else None
+        if isinstance(record, dict):
+            result[ORIGIN_KEY] = _NativeRecord(record)
     return result
 
 
@@ -80,6 +113,12 @@ def persistence_metadata(metadata, message, session_id, encoded_content=None):
         return metadata
     result = reserve_metadata(metadata)
     receipt = metadata.get(ORIGIN_KEY)
+    if isinstance(receipt, _StoredRecord):
+        binding = (session_id, message.get("message_uid"), message.get("role"),
+                   message.get("platform_message_id") or message.get("message_id"), encoded_content)
+        if receipt.binding != binding or not receipt.unchanged():
+            result.pop(ORIGIN_KEY, None)
+        return result
     content = message.get("_replay_persisted_content", message.get("content"))
     if isinstance(receipt, NativeOrigin) and encoded_content is not None and encoded_content != receipt.text:
         receipt = None

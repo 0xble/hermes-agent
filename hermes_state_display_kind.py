@@ -30,13 +30,13 @@ class SessionDisplayKindMixin:
         if not session_id or not content or not display_kind:
             return False
         def _do(conn):
-            row = conn.execute(f"SELECT id FROM messages WHERE {_VISIBLE_MESSAGE_SQL} AND session_id = ? AND role = ? "
+            row = conn.execute(f"SELECT id, display_metadata FROM messages WHERE {_VISIBLE_MESSAGE_SQL} AND session_id = ? AND role = ? "
                 "AND content = ? AND active = 1 ORDER BY id DESC LIMIT 1",
                 (session_id, role, self._encode_content(content))).fetchone()
             if row is None:
                 return False
             conn.execute("UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
-                (_scrub_surrogates(display_kind), self._encode_display_metadata(display_metadata), row[0]))
+                (_scrub_surrogates(display_kind), self._encode_display_metadata(display_metadata, stored_metadata=row[1]), row[0]))
             return True
         return self._execute_write(_do, session_ids=(session_id,), skip_result=False)
 

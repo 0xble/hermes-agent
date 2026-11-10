@@ -79,7 +79,8 @@ def _capture(stream: _Stream, *, home, profile: str, session_id: str | None, pol
         from hermes_state_acquisition import ACQUISITION_COLUMNS, acquire_rows, acquisition_preflight
         validate_projection(conn)
         if transcript:
-            acquisition_preflight(conn, session_id, policy)
+            for routing in acquisition_preflight(conn, session_id, policy):
+                _redact_row(routing)
         origin = {"id": session_id} if transcript else None
         header = {
             "type": "header", "version": 1,
