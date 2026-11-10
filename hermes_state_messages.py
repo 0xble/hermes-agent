@@ -207,7 +207,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             logger.warning("Ignoring unexpected display metadata type on write: %s", type(display_metadata).__name__)
             return None
         from agent.source_origin import reserve_metadata
-        return json.dumps(reserve_metadata(display_metadata, stored_metadata))
+        metadata = reserve_metadata(display_metadata, stored_metadata)
+        return json.dumps(metadata) if metadata else None
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[dict[str, Any]]:
