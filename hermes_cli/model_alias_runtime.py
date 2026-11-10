@@ -18,7 +18,6 @@ class AliasRoute:
     model: str = ""
     reasoning_effort: Any = ""
     base_url: str = ""
-    fallbacks: tuple = ()
     api_key: str = ""
 
 

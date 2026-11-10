@@ -43,3 +43,5 @@ explicit pick. A parent pick of max can therefore override these non-max routes.
 No core precedence change is included in this migration.
 
 Gateway model confirmation and reasoning status use the same `AliasRoute` value for an empty default route. The retired preset DTO is not retained as a compatibility shim. Existing model-confirmation and reasoning-command tests exercise these consumers.
+
+Preset-local cron fallback metadata and its unused route field are retired. Cron retains its existing explicit `cron.fallback_providers` and pinned-job fallback policy. Named delegation options use the official plugin fallback schema.

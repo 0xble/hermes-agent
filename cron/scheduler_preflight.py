@@ -95,7 +95,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict, jc=None) -> Optional[str
     """
     try:
         jc = jc if jc is not None else _sched._resolve_cron_job_config(job, cfg)
-        if _sched._job_fallback_chain(job, jc.cfg, jc.route):
+        if _sched._job_fallback_chain(job, jc.cfg):
             return None  # execution can rescue a missing primary credential
         kwargs = _sched._cron_runtime_kwargs(job, jc)
     except Exception:

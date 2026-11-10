@@ -109,11 +109,11 @@ def _job_route_pinned(job: dict) -> bool:
     return any(isinstance(job.get(k), str) and job[k].strip() for k in ("provider", "model", "base_url"))
 
 
-def _job_fallback_chain(job: dict, cfg: Any, route: Any = None) -> Optional[list]:
+def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     """The fallback chain this job may walk, at credential resolution AND mid-run (#100437).
 
     A pinned job never borrows the global chain, but can use an explicitly declared
-    ``cron.fallback_providers`` chain, or the fallbacks of the ``@preset`` route it names.
+    ``cron.fallback_providers`` chain.
     Same-provider credential-pool rotation still applies.
     """
     cron = cfg.get("cron") if isinstance(cfg, dict) else None
@@ -122,8 +122,6 @@ def _job_fallback_chain(job: dict, cfg: Any, route: Any = None) -> Optional[list
         # Unlike a delegated child's malformed override, an explicit cron override
         # never silently restores the global chain (including legacy fallback_model).
         return get_cron_fallback_chain(cfg) or None
-    if route is not None and getattr(route, "fallbacks", None):
-        return get_fallback_chain({"fallback_providers": list(route.fallbacks)}) or None
     return scoped_fallback_chain(
         get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
 
@@ -546,7 +544,7 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str, route: Any =
             return parsed
     if route is not None:
         # A selected route without effort defers to per-model/global policy,
-        # not the primary preset, even when both providers use the same model ID.
+        # not the primary route, even when both providers use the same model ID.
         cfg = {**cfg, "model": {"default": route.model, "provider": route.provider}}
     return resolve_reasoning_config(cfg if isinstance(cfg, dict) else {}, str(model))
 
@@ -1712,7 +1710,7 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
-    route: Any = None  # AliasRoute when the run's model came from an ``@preset`` reference
+    route: Any = None  # AliasRoute when the run's model came from a stored alias name
 
 
 def _resolve_cron_job_config(job: dict, cfg: dict) -> _CronJobConfig:
@@ -1920,7 +1918,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        chain = _job_fallback_chain(job, jc.cfg, jc.route) or []
+        chain = _job_fallback_chain(job, jc.cfg) or []
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), %s",
             job_id, "auth" if is_auth else "transient network", resolve_exc,
@@ -2479,7 +2477,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     )
     # Mid-run provider ladder: same rule as resolution above. A pinned job cannot
     # borrow the global chain, but may use the explicitly declared cron chain.
-    setup.fallback_model = _job_fallback_chain(job, _cfg, jc.route)
+    setup.fallback_model = _job_fallback_chain(job, _cfg)
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)
