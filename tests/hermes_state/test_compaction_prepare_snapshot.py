@@ -158,3 +158,12 @@ def test_snapshot_fences_every_proof_column_without_retaining_payload(tmp_path, 
             writer.execute(f'UPDATE messages SET {column} = ? WHERE session_id = ?', (value, 'topic'))
         with pytest.raises(CompactionSnapshotChanged):
             prepared.validate(db._conn)
+        if column == 'content':
+            from hermes_state_errors import HeldRowRewrittenError
+
+            rejected = snapshot_compaction(db, 'topic', dict(covered_ids=[held[0]['_row_id']],
+                unresolved_held=[], watermark=None, held_messages=held, held_for_cas=held))
+            assert isinstance(rejected.error, HeldRowRewrittenError)
+            assert rejected.error.__traceback__ is None
+            assert rejected.error.__context__ is None
+            assert rejected.error.__cause__ is None
