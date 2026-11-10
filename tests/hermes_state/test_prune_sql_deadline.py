@@ -87,6 +87,29 @@ def test_one_expensive_statement_releases_writer_without_waiting_for_pass_end(tm
         db.set_meta("foreground", "ok")
 
 
+def test_transcript_dump_sweep_stops_between_unlinks_and_resumes(tmp_path, monkeypatch):
+    import hermes_state_prune_budget as budgets
+    from hermes_state_deletion import remove_session_files
+    sid = "literal[1]"
+    for name in [f"{sid}.json", f"{sid}.jsonl", f"session_{sid}.json",
+                 *[f"request_dump_{sid}_{i}.json" for i in range(10)], "request_dump_other_1.json"]:
+        (tmp_path / name).write_text("private transcript")
+    budget = budgets.PruneBudget(max_seconds=10)
+    real_unlink = type(tmp_path).unlink
+    calls = []
+    def unlink(path, *args, **kwargs):
+        real_unlink(path, *args, **kwargs)
+        calls.append(path.name)
+        if len(calls) == 4:
+            budget.deadline = 0
+    monkeypatch.setattr(type(tmp_path), "unlink", unlink)
+    with pytest.raises(budgets.PruneBudgetExpired), budgets.prune_budget(budget):
+        remove_session_files(tmp_path, sid)
+    assert len(calls) == 4
+    remove_session_files(tmp_path, sid)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["request_dump_other_1.json"]
+
+
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True, "10"])
 def test_invalid_runtime_cap_rejected_without_selection(tmp_path, value):
     with closing(SessionDB(tmp_path / "state.db")) as db:

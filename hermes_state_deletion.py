@@ -86,6 +86,27 @@ def _delete_page(conn, sid, selected, key, marker):
     return True
 
 
+def remove_session_files(sessions_dir, session_id):
+    """Sweep historical transcript names lazily, checking the pass before each unlink."""
+    import glob
+    from itertools import chain
+    from hermes_state_prune_budget import check_prune_budget
+    if sessions_dir is None:
+        return
+    targets = [sessions_dir / f"{session_id}{suffix}" for suffix in (".json", ".jsonl")]
+    targets.append(sessions_dir / f"session_{session_id}.json")
+    try:
+        dumps = sessions_dir.glob(f"request_dump_{glob.escape(session_id)}_*.json")
+        for path in chain(targets, dumps):
+            check_prune_budget()
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def finish_pending_deletes(db, *, required_ids=()):
     """Finish committed deletes on the next explicit delete/prune, never at read time.
 
