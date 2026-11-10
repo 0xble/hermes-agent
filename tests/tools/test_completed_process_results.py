@@ -178,7 +178,7 @@ def test_headless_terminal_result_survives_cli_exit(tmp_path, request):
     # The canonical CLI detaches from a long-lived daemon. Own that daemon in
     # the fixture so it cannot outlive the temporary profile/SQLite files.
     from tests.gateway.fixtures.local_recovery_probe import daemon
-    owner = daemon(REPO_ROOT, home, env, barrier=False)
+    owner = daemon(REPO_ROOT, home, env, barrier=True, fixture="headless_terminal_exit_daemon.py")
     owner.__enter__()
     request.addfinalizer(lambda: owner.__exit__(None, None, None))
     try:
@@ -220,7 +220,8 @@ def test_headless_terminal_result_survives_cli_exit(tmp_path, request):
     # process ...] event, not an [ASYNC DELEGATION ...] event, and no turn ran for it.
     assert follow_ups == [], follow_ups
     notes = _completion_notes(home)
-    assert len(notes) == 1, notes
+    exit_order = (home / "terminal-exit-order.json").read_text(encoding="utf-8")
+    assert len(notes) == 1, (notes, exit_order)
     assert notes[0][0].startswith(f"[IMPORTANT: Background process {process_id} exited (exit code 7).")
     assert "SYNTHETIC_REVIEW_COMPLETE" in notes[0][0] and notes[0][1] == "process_complete"
 
