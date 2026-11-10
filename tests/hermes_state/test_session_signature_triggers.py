@@ -85,3 +85,48 @@ def test_settle_replaces_broad_projection_trigger_and_then_stays_read_only(tmp_p
         with sqlite3.connect(path, timeout=0.05) as reader:
             SessionDB._execute_ddl_skipping_settled_triggers(reader.cursor(), SESSION_SIGNATURE_TRIGGER_SQL)
         assert conn.execute("PRAGMA schema_version").fetchone()[0] == schema
+
+
+@pytest.mark.parametrize("opener", ["startup", "reconcile"])
+@pytest.mark.parametrize("stale_trigger", [False, True])
+def test_reconcile_restores_projection_trigger_after_adding_columns(tmp_path, opener, stale_trigger):
+    from hermes_state_schema import apply_declared_schema, reconcile_state_schema
+
+    path = tmp_path / "state.db"
+    missing = ("archived", "pinned", "last_read_at")
+    with SessionDB(path) as db:
+        db.create_session("kept", source="cli")
+        db.append_message("kept", role="user", content="history survives")
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TRIGGER sessions_projection_update")
+        for field in missing:
+            conn.execute(f"ALTER TABLE sessions DROP COLUMN {field}")
+        # SQLite accepts CREATE TRIGGER with unresolved old/new columns. An earlier
+        # schema settle may have installed it on a store that is still behind.
+        if stale_trigger:
+            conn.executescript(SESSION_SIGNATURE_TRIGGER_SQL)
+            with pytest.raises(sqlite3.OperationalError, match="no such column: old.archived"):
+                conn.execute("UPDATE sessions SET title = 'blocked'")
+        else:
+            conn.commit()
+        if opener == "reconcile":
+            conn.execute("BEGIN")
+            apply_declared_schema(conn.cursor())
+            conn.rollback()
+            assert not set(missing) & {row[1] for row in conn.execute("PRAGMA table_xinfo(sessions)")}
+            if stale_trigger:
+                with pytest.raises(sqlite3.OperationalError, match="no such column: old.archived"):
+                    conn.execute("UPDATE sessions SET title = 'still blocked'")
+            reconcile_state_schema(conn)
+    if opener == "startup":
+        with SessionDB(path):
+            pass
+    with sqlite3.connect(path) as conn:
+        assert set(missing) <= {row[1] for row in conn.execute("PRAGMA table_xinfo(sessions)")}
+        assert conn.execute("SELECT content FROM messages").fetchall() == [("history survives",)]
+        conn.execute("DELETE FROM session_projection_changes")
+        conn.execute("UPDATE sessions SET last_activity_at = 200, title = title")
+        assert conn.execute("SELECT COUNT(*) FROM session_projection_changes").fetchone()[0] == 0
+        for field in missing:
+            conn.execute(f"UPDATE sessions SET {field} = 1")
+        assert conn.execute("SELECT COUNT(*) FROM session_projection_changes").fetchone()[0] == len(missing)

@@ -18,6 +18,11 @@ constant. Heartbeats, transcript revisions and no-op updates write no journal
 rows. Rowid aliases have a separate, disjoint trigger that records both keys
 when a row moves. Existing stores replace the broad trigger on schema settle,
 while settled definitions avoid acquiring a write lock again.
+Column reconciliation drops an invalid metadata trigger before adding missing
+signature columns. Both writable startup and raw schema catch-up restore the
+narrowed trigger afterwards. Legacy-store fixtures remove column-dependent
+triggers before dropping columns, without changing browse ownership, integrity
+or reconciliation expectations.
 
 Canonical rowid moves stay incremental. VACUUM invalidates the schema identity,
 so the watcher rebuilds once and then resumes changed-row reads. SQLite may
