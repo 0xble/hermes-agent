@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from tools.tool_backend_helpers import selection_error, selection_exists
 from tools.url_safety import normalize_url_for_request
@@ -73,11 +74,111 @@ def _refuse_all(error: str):
     return None, None, None, json.dumps({"success": False, "error": error})
 
 
+def _extract_identity_key(url: Any) -> Optional[tuple]:
+    """Compare provider canonicalizations without changing fetch targets or cache keys."""
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return (url,)
+    scheme = parts.scheme.lower()
+    if (scheme, port) in (("http", 80), ("https", 443)):
+        port = None
+    # HTTP upgrades identify the same resource, but distinct hosts (including
+    # www), non-default ports, path case and query values are not aliases.
+    transport = "http(s)" if scheme in ("http", "https") else scheme
+    return (transport, parts.hostname, port, parts.path.rstrip("/"),
+            parts.query, parts.username, parts.password)
+
+
+def _extract_result_identity(result: dict, requested: set[str], keys: dict) -> Optional[str]:
+    metadata = result.get("metadata")
+    source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+    # sourceURL owns a redirect even when its final URL is another requested URL.
+    for candidate in (source, result.get("url")):
+        if isinstance(candidate, str) and candidate in requested:
+            return candidate
+        identities = keys.get(_extract_identity_key(candidate), set())
+        if identities:
+            return next(iter(identities)) if len(identities) == 1 else None
+    return None
+
+
+def _infer_extract_redirect(result: dict, keys: dict) -> bool:
+    metadata = result.get("metadata")
+    source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+    final = _extract_identity_key(result.get("url"))
+    # A canonical collision is not an unknown redirect, even with one slot left.
+    return bool(final and final not in keys and (not source or _extract_identity_key(source) == final))
+
+
+def _match_extract_results(urls: list[str], results: list[dict]) -> list[dict]:
+    """Only successes fill slots; errors remain replaceable by a lone redirect."""
+    requested = set(urls)
+    keys = {}
+    for url in requested:
+        keys.setdefault(_extract_identity_key(url), set()).add(url)
+    successes, errors = {}, {}
+    unmatched = []
+    for result in results:
+        identity = _extract_result_identity(result, requested, keys)
+        if result.get("error"):
+            if identity is not None:
+                errors.setdefault(identity, result)
+        elif identity is None:
+            unmatched.append(result)
+        else:
+            successes.setdefault(identity, result)
+    remaining = requested - successes.keys()
+    # Provider placeholders do not consume slots or compete with real content.
+    # Infer only a lone success/request pair without conflicting source evidence;
+    # multiple leftovers remain errors rather than risk positional misattribution.
+    if len(remaining) == 1 and len(unmatched) == 1:
+        result = unmatched[0]
+        if _infer_extract_redirect(result, keys):
+            successes[remaining.pop()] = result
+    matched = {**errors, **successes}
+    ordered = []
+    for url in urls:
+        result = dict(matched[url]) if url in matched else _result_entry(url, _NO_RESULT_ERROR)
+        if not result.get("url"):
+            result["url"] = url
+        if result["url"] != url:
+            result["requested_url"] = url
+        ordered.append(result)
+    return ordered
+
+
+def _cache_extract_results(
+    provider_name: str, urls: list[str], results: list[dict],
+    format: Optional[str], direct_fallbacks: set[str],
+) -> None:
+    from tools.web_extract_html import MIN_DIRECT_CHARS
+    from tools.web_result_cache import extract_cache_put
+
+    for url, fetched in zip(urls, results):
+        content = fetched.get("raw_content", "") or fetched.get("content", "")
+        metadata = fetched.get("metadata")
+        rescued = isinstance(metadata, dict) and metadata.get("rescued_from")
+        if not content or fetched.get("error") or rescued:
+            continue
+        # Direct misses may be walls/previews. Cache the paid replacement only
+        # when it supplies substantial text, never the thin direct response.
+        if url in direct_fallbacks and len(content.strip()) < MIN_DIRECT_CHARS:
+            continue
+        cache_fields: dict[str, Any] = {"result_url": fetched["url"]} if fetched.get("url") != url else {}
+        if url in direct_fallbacks:
+            _attribute_direct_fallbacks([fetched], provider_name)
+            cache_fields["provenance"] = {key: fetched[key] for key in ("fallback_from", "extract_backend", "direct_fetch_error")}
+        extract_cache_put(url, content, fetched.get("title", ""), format=format, provider=provider_name, **cache_fields)
+
+
 def _merge_in_order(
     total: int, fixed: dict[int, dict], fetch_positions: list[int], fetch_urls: list[str], results: list[dict]
 ) -> list[dict]:
-    """Rebuild a ``total``-long result list: *fixed* entries by position, fetched *results* at
-    *fetch_positions* (a short provider list yields ``_NO_RESULT_ERROR`` entries for the rest)."""
+    """Merge fixed entries and already identity-aligned dispatch results by request position."""
     merged = dict(fixed)
     for pos, position in enumerate(fetch_positions):
         missing = _result_entry(fetch_urls[pos], _NO_RESULT_ERROR)
@@ -153,7 +254,6 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
     failed (backend outage, not per-page problems). Rescued batches are never cached.
     """
     import inspect
-    from tools.web_result_cache import extract_cache_put
     timeout = _extract_timeout_seconds()
     try:
         if inspect.iscoroutinefunction(provider.extract):
@@ -171,28 +271,19 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
                   for u in fetch_urls]
         if not _rescue_eligible(provider):
             return failed
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
+        return _match_extract_results(fetch_urls, await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed))
     except Exception as exc:
-        if not _rescue_eligible(provider):
-            raise
+        logger.warning("web_extract provider %s failed: %s", provider.name, exc,
+                       exc_info=logger.isEnabledFor(logging.DEBUG))
         failed = [_result_entry(u, str(exc)) for u in fetch_urls]
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
+        if not _rescue_eligible(provider):
+            return failed
+        return _match_extract_results(fetch_urls, await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed))
     if results and all(r.get("error") for r in results) and _rescue_eligible(provider):
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results)
+        return _match_extract_results(fetch_urls, await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results))
 
-    # Cache each successful fetch under the REQUESTED url it reports as its own — never by list
-    # position: providers omit failed URLs or return successes out of request order, and a positional
-    # write filed one page's text under another URL's key for the whole TTL. ``metadata.sourceURL``
-    # counts because Keenable/Firecrawl put the requested URL there when ``url`` is the redirect target.
-    # An entry naming no requested URL is served but not cached (a miss re-fetches; a mis-key poisons).
-    requested = set(fetch_urls)
-    for fetched in results:
-        meta = fetched.get("metadata")
-        source = meta.get("sourceURL") if isinstance(meta, dict) else None
-        url = next((u for u in (fetched.get("url"), source) if u in requested), None)
-        _content = fetched.get("raw_content", "") or fetched.get("content", "")
-        if url and _content and not fetched.get("error") and url not in (direct_fallbacks or set()):
-            extract_cache_put(url, _content, fetched.get("title", ""), format=format, provider=provider.name)
+    results = _match_extract_results(fetch_urls, results)
+    _cache_extract_results(provider.name, fetch_urls, results, format, direct_fallbacks or set())
     return results
 
 
@@ -278,7 +369,7 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
                 direct_fallbacks.add(url)
         hit = extract_cache_get(url, format=format, provider=provider.name) if policy_block is None else None
         if hit is not None:
-            if url in direct_fallbacks:
+            if url in direct_fallbacks or hit.get("fallback_from") == "direct_http":
                 _attribute_direct_fallbacks([hit], provider.name + "_cache")
             fixed[position] = hit
         else:
@@ -292,6 +383,4 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
         results = await _dispatch_extract_groups(provider, fetch_urls, format, direct_fallbacks)
     else:
         results = await _dispatch_extract(provider, fetch_urls, format)
-    if not fixed:
-        return results
     return _merge_in_order(len(safe_urls), fixed, fetch_positions, fetch_urls, results)

@@ -78,7 +78,11 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
                 return keyless_extract("Exa", "exa", urls, logger)
             logger.info("Exa extract: %d URL(s)", len(urls))
             response = _get_exa_client().get_contents(urls, text=True)
-            return [document(r.url or "", r.title or "", r.text or "") for r in response.results or []]
+            # /contents preserves the response id separately from its final URL.
+            # Only a requested URL is an identity: opaque IDs must not imply a redirect.
+            return [document(r.url or "", r.title or "", r.text or "",
+                             source_url=r.id if getattr(r, "id", None) in urls else None)
+                    for r in response.results or []]
 
         return run_extract("Exa", logger, urls, _body, sdk=True)
 
