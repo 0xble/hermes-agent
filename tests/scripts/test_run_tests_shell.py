@@ -164,7 +164,7 @@ def test_shell_runner_preserves_only_explicit_download_caches(tmp_path):
     env.pop("__HERMES_ACTIVATED", None)
     result = subprocess.run(
         ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
-        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -201,6 +201,6 @@ def test_shell_runner_refuses_real_account_download_caches(tmp_path, location):
     env.pop("__HERMES_ACTIVATED", None)
     result = subprocess.run(
         ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
-        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
