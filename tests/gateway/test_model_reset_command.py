@@ -45,12 +45,14 @@ async def test_reset_clears_a_persisted_override_after_restart(tmp_path, monkeyp
 
     reply = await runner._handle_model_command(_event("/model reset", source))
 
-    assert "cfg-model" in reply
+    from agent.i18n import t
+    assert reply == t("gateway.model.reset_done", model="cfg-model")
     assert store.get_model_override(key) is None
     assert runner._session_model_overrides.get(key) is None
     assert runner._session_state(key).conversation.one_turn_restore is None  # an armed --once can't re-plant it
     assert evicted == [key]
     assert "pinned-model" in runner._pending_model_notes[key]
+    assert "cfg-model" in runner._pending_model_notes[key]
 
     again = await runner._handle_model_command(_event("/model reset", source))
     assert again != reply and "cfg-model" in again  # nothing left to clear: the "none active" copy

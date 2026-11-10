@@ -12,6 +12,7 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
+from hermes_cli.model_switch import ModelSwitchResult
 
 
 @pytest.fixture
@@ -41,7 +42,7 @@ def harness(tmp_path, monkeypatch):
         runner._switch_cached_agent_model = lambda *_a: None
         runner._record_switch_metrics = lambda *_a: None
         runner._model_selection_warning = AsyncMock(return_value=None)
-        result = SimpleNamespace(new_model="picked", target_provider="openai", api_key="test-only",
+        result = ModelSwitchResult(success=True, new_model="picked", target_provider="openai", api_key="test-only",
                                  base_url=runtime["base_url"], api_mode="chat_completions", provider_label="OpenAI",
                                  request_overrides={}, runtime_capabilities={}, model_info=None, warning_message=None)
         runner._perform_model_switch = AsyncMock(return_value=(result, None))

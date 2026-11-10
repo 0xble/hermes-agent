@@ -1824,6 +1824,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         except ImportError:
             return self._proxy_error_result(t("gateway.proxy.requires_aiohttp", hint=install_hint("messaging")))
 
+        from gateway.platforms.base import describe_proxy_error, safe_proxy_url_for_log
         proxy_url = self._get_proxy_url()
         if not proxy_url:
             return self._proxy_error_result(t("gateway.proxy.url_missing"))
@@ -1917,7 +1918,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 async with session.post(f"{proxy_url}/v1/chat/completions", json=body, headers=headers) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
-                        logger.warning("Proxy error (%d) from %s: %s", resp.status, proxy_url, error_text[:500])
+                        logger.warning("Proxy error (%d) from %s: %s", resp.status, safe_proxy_url_for_log(proxy_url), error_text[:500])
                         return self._proxy_error_result(t("gateway.proxy.http_error", status=resp.status, error=error_text[:300]))
 
                     buffer = ""
@@ -1948,16 +1949,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                         # presenting the truncation as a complete answer.
                         logger.warning(
                             "Proxy SSE stream from %s ended without [DONE] — response may be truncated "
-                            "(%d chars received)", proxy_url, len(full_response),
+                            "(%d chars received)", safe_proxy_url_for_log(proxy_url), len(full_response),
                         )
                         if not full_response:
                             return self._proxy_error_result(t("gateway.proxy.closed_early"))
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("Proxy connection error to %s: %s", proxy_url, e)
+            shown = describe_proxy_error(e, proxy_url) or str(e)
+            logger.error("Proxy connection error to %s: %s", safe_proxy_url_for_log(proxy_url), shown)
             if not full_response:
-                return self._proxy_error_result(t("gateway.proxy.connection_error", error=e))
+                return self._proxy_error_result(t("gateway.proxy.connection_error", error=shown))
             # Partial response — return what we got
         finally:
             if _stream_consumer:
@@ -1973,7 +1975,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             return _stale_result("result")
         logger.info(
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
-            proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
+            safe_proxy_url_for_log(proxy_url), (session_id or "")[:20], _elapsed, len(full_response),
         )
         return {
             "final_response": full_response or t("gateway.proxy.no_response"),

@@ -93,6 +93,7 @@ def _make_runner(
         chat_type="group",
     )
     store.load_transcript.return_value = []
+    store.get_model_role.return_value = None
     store.has_platform_message_id.return_value = False
     if durable_prompt_pin is not None:
         def _get_prompt_pin(_key, *, expected_session_id=None):

@@ -20,7 +20,7 @@ def _queued_member_turn(hosted_owner, monkeypatch, task_id, prompt):
     service = getattr(authority, 'hosted_room_service', None)
     if service is None:
         service = authority.hosted_room_service = CanonicalHostedRoomService(authority, loop)
-        monkeypatch.setattr(service, 'profile_homes', lambda: {'default': Path(authority.profile_id)})
+        monkeypatch.setattr(service, 'profile_homes', lambda: {'default': Path(authority.db.db_path).parent})
         service.authorize_room('alice', 'room', create=True)
         create_room(authority.db.db_path, room_id='room', name='Room', authority_gateway_id=local_authority_gateway_id(),
                     members=[{'member_id': 'one', 'profile': 'default', 'handle': 'one'}])

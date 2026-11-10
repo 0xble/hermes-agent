@@ -48,7 +48,8 @@ def test_config_retirement_keeps_aliases_and_plugin_policy_without_mutating_inpu
     assert again == after and changes == []
 
 
-def test_store_dry_run_and_apply_rewrite_jobs_and_topics(tmp_path, monkeypatch):
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_store_dry_run_and_apply_rewrite_jobs_and_topics(tmp_path, monkeypatch, encoding):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     cfg, _ = migrate_document(_config())
     paths = {"cron/jobs.json": {"revision": "keep", "jobs": [{"id": "one", "model": "@attended", "provider": "stale"}]},
@@ -56,7 +57,7 @@ def test_store_dry_run_and_apply_rewrite_jobs_and_topics(tmp_path, monkeypatch):
     for relative, document in paths.items():
         path = tmp_path / relative
         path.parent.mkdir(parents=True)
-        path.write_text(json.dumps(document), encoding="utf-8")
+        path.write_text(json.dumps(document), encoding=encoding)
     before = {relative: (tmp_path / relative).read_bytes() for relative in paths}
     assert migrate_stores(tmp_path, cfg["model_aliases"], dry_run=True)
     assert all((tmp_path / relative).read_bytes() == body for relative, body in before.items())
@@ -114,3 +115,21 @@ def test_migration_persists_disabled_routes_as_comments_through_config_writer(tm
     assert {entry["name"] for entry in options} == {
         "worker", "explorer", "coder", "critical", "planner", "designer", "visual", "writer",
     }
+
+
+def test_cli_dry_run_reads_bom_config_and_grant_without_writing(tmp_path, monkeypatch, capsys):
+    import time
+    from hermes_cli.config_migrations_model_aliases import main
+
+    config = tmp_path / "config.yaml"
+    config.write_text(json.dumps(_config()), encoding="utf-8-sig")
+    grant = tmp_path / "cached-grant.json"
+    grant.write_text(json.dumps({"type": "codex", "access_token": "fixture",
+                                 "refresh_token": "fixture"}), encoding="utf-8-sig")
+    monkeypatch.setattr("hermes_cli.auth_constants._decode_jwt_claims", lambda _: {"exp": time.time() + 7200})
+    monkeypatch.setattr("hermes_cli.auth_codex._save_codex_tokens",
+                        lambda *args, **kwargs: pytest.fail("dry run wrote credentials"))
+    before = {path: path.read_bytes() for path in (config, grant)}
+    assert main(["--home", str(tmp_path), "--dry-run", "--codex-auth-source", str(grant)]) == 0
+    assert "DRY RUN" in capsys.readouterr().out
+    assert all(path.read_bytes() == body for path, body in before.items())

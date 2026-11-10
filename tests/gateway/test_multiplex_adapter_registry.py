@@ -256,6 +256,7 @@ def _install_secondary_reconnect_context(
         yield
 
     monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_scope)
+    monkeypatch.setattr("gateway.run_startup.recover_left_core_in", lambda *args, **kwargs: False)
     monkeypatch.setattr(
         "hermes_cli.profiles.get_profile_dir", lambda name: Path("/profiles") / name
     )

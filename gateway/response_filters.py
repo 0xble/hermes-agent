@@ -637,7 +637,7 @@ def silence_allowed(
     Marker recognition stays with the caller. Extra health restrictions apply only to the new
     room permission, preserving the established internal/unaddressed semantics.
     """
-    if is_machinery_display_kind(display_kind) or reply_expected is False:
+    if reaction_answered(agent_result) or is_machinery_display_kind(display_kind) or reply_expected is False:
         return True
     return (allow_silence is True and isinstance(agent_result, dict)
             and not any(agent_result.get(k) for k in ("failed", "partial", "interrupted", "error"))

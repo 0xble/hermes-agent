@@ -149,7 +149,7 @@ def migrate_stores(home: Path, aliases: dict, *, dry_run: bool) -> list[str]:
         path = home / relative
         if not path.is_file():
             continue
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
         updated = rewrite_references(raw, aliases, changes, relative)
         if updated != raw:
             pending.append((path, updated))
@@ -194,12 +194,12 @@ def main(argv=None) -> int:
     token = set_hermes_home_override(str(args.home.resolve()))
     try:
         path = args.home / "config.yaml"
-        before = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        before = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
         after, changes = migrate_document(before)
         if args.codex_auth_source:
             import time
             from hermes_cli.auth_constants import _decode_jwt_claims
-            grant = json.loads(args.codex_auth_source.read_text(encoding="utf-8"))
+            grant = json.loads(args.codex_auth_source.read_text(encoding="utf-8-sig"))
             if (grant.get("type") != "codex" or grant.get("disabled")
                     or not grant.get("refresh_token")
                     or _decode_jwt_claims(grant.get("access_token", "")).get("exp", 0) < time.time() + 3600):

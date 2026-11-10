@@ -182,11 +182,18 @@ class GatewayTurnPersistenceMixin:
             # processed" lines are new inbound messages for its turn loop (#137027).
             if automatic_notices_allowed(source):
                 response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
-            response = _sanitize_gateway_final_response(source.platform, response)
+            if agent_result.get("failed"):
+                from agent.incognito import log_private_failure
+                log_private_failure(logger, operation="agent turn", reason=agent_result.get("failure_reason"),
+                                    session_id=getattr(session_entry, "session_id", None))
+            response = _sanitize_gateway_final_response(
+                source.platform, response, interrupted=bool(agent_result.get("interrupted")))
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
-        if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
+        from agent.incognito import is_incognito
+        private = getattr(session_entry, "incognito", False) or is_incognito(session_entry.session_id)
+        if not private and agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
             if session_entry.session_id == _run_start_session_id:
                 session_entry.session_id = agent_result["session_id"]
                 # The held turn lease follows the rotation (persistence writes to the NEW id).
@@ -333,19 +340,42 @@ class GatewayTurnPersistenceMixin:
             return PARTIAL_FAILED_TURN_NOTICE
         return FAILED_TURN_NOTICE
 
-    async def _hmwa_close_failed_turn(self, session_id, notice):
+    async def _hmwa_close_failed_turn(self, session_id, notice, own_boundary_row_id=None):
         """Append the gateway-owned assistant boundary iff the durable tail is open (a user row, or the
         tool row of a call that ran before the failure).
 
         The tail, not "did the gateway write the user row", is the key: on the primary path the
         agent's turn-start flush already persisted the row (so the platform-id dedupe skips the
         gateway write), and a platform redelivery of an already-closed turn must not stack a
-        second assistant row."""
+        second assistant row.
+
+        ``own_boundary_row_id``: the row the agent's core closer flushed for THIS turn. When the
+        gateway owns better copy (the supervisor's normalized status), that boundary is rewritten in
+        place while it is still the live tail, so the transcript keeps one boundary saying what was
+        delivered; an earlier turn's boundary or any later row is never touched."""
         if await self.async_session_store.transcript_tail_role(session_id) not in OPEN_TURN_TAIL_ROLES:
+            if own_boundary_row_id is not None:
+                await self.async_session_store.replace_failed_turn_boundary(
+                    session_id, own_boundary_row_id, notice)
             return
         await self.async_session_store.append_to_transcript(session_id, {
             "role": "assistant", "content": notice, "timestamp": time.time(), "display_kind": FAILED_TURN_DISPLAY_KIND,
         })
+
+
+    def _hmwa_own_failed_boundary_row_id(self, agent_result):
+        """Row id of the failed-turn boundary the agent's core closer flushed for THIS turn (the last
+        message, typed ``failed_turn``, after the turn's start), or ``None`` when it wrote none."""
+        messages = agent_result.get("messages") or []
+        start = agent_result.get("current_turn_user_idx", agent_result.get("history_offset"))
+        if not messages or not isinstance(start, int) or not 0 <= start < len(messages) - 1:
+            return None
+        tail = messages[-1]
+        if not isinstance(tail, dict) or tail.get("role") != "assistant" or tail.get(
+                "display_kind") != FAILED_TURN_DISPLAY_KIND:
+            return None
+        row_id = tail.get("_row_id")
+        return row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None
 
     def _hmwa_classify_turn_failure(self, agent_result, history, session_entry):
         """Classify a finished turn for transcript persistence. Returns
@@ -501,8 +531,8 @@ class GatewayTurnPersistenceMixin:
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
     ):
-        """Persist this turn to the transcript (session_meta on first turn, user-only on transient
-        failure, nothing on context overflow), update last_prompt_tokens, and re-baseline the
+        """Persist this turn to the transcript (session_meta on first turn, closed failed turn on
+        transient failure, nothing on context overflow), update last_prompt_tokens, and re-baseline the
         cached agent's message count."""
         from gateway.run import _resolve_gateway_model
         ts = time.time()  # Unix epoch float — consistent with DB storage
@@ -519,7 +549,26 @@ class GatewayTurnPersistenceMixin:
         # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
         # into a gateway-side write by returning False.
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+        from agent.incognito import is_incognito
+        if is_incognito(sid):
+            if not (agent_failed_early or hidden_reasoning_incomplete or is_context_overflow_failure):
+                # The provider may have compressed the full history in-place. RAM replaces
+                # the private transcript without creating a persistent child or summary.
+                await self.async_session_store.rewrite_transcript(sid, agent_messages)
+                await self._hmwa_store_turn_prompt_tokens(
+                    store, session_entry.session_key, session_key, agent_result.get("last_prompt_tokens", 0),
+                    getattr(prepared, "hygiene_adoption_epoch", 0),
+                    touch_activity=not bool(getattr(event, "internal", False)),
+                )
+                await self._refresh_agent_cache_message_count(session_key, sid)
+                return
+            agent_persisted = False
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
+        _proxy_user_row_persisted = bool(agent_result.get("_gateway_user_turn_persisted"))
+        if _proxy_user_row_persisted:
+            # A proxy turn ran remotely and never wrote this gateway's session DB; the pre-dispatch
+            # user row went to the DB, so the assistant side must too (skip_db=False).
+            agent_persisted = False
 
         if is_context_overflow_failure:
             pass  # Skip all transcript writes — don't grow a broken session
@@ -549,10 +598,12 @@ class GatewayTurnPersistenceMixin:
                     "timestamp": ts,
                 })
             if agent_failed_early or hidden_reasoning_incomplete:
-                # Transient failure / hidden-reasoning incomplete: persist only the user message (the
-                # assistant error text is a gateway hint, not model output). Dedupe on platform
+                # Transient failure / hidden-reasoning incomplete: persist the user message without
+                # the provider error text (a gateway hint, not model output). Dedupe on platform
                 # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
+                if _proxy_user_row_persisted:
+                    pass
+                elif event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
                     logger.info(
                         "Skipping duplicate user turn (message_id=%s) in session %s",
                         event.message_id, sid,
@@ -561,15 +612,23 @@ class GatewayTurnPersistenceMixin:
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
-                await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
+                supervisor_status = bool(response) and agent_result.get(
+                    "queued_terminal_display_kind", prepared.persist_user_display_kind) == "supervisor_checkin"
+                notice = response if supervisor_status else self._hmwa_failed_turn_notice(agent_result)
+                await self._hmwa_close_failed_turn(
+                    sid, notice, self._hmwa_own_failed_boundary_row_id(agent_result) if supervisor_status else None)
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
                 # counts session_meta entries stripped before the agent saw them.
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 if not new_messages:
-                    # Edge case: fall back to simple user/assistant rows.
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    # Edge case: fall back to simple user/assistant rows. The recovered-reply
+                    # marker labels delivery only; the transcript keeps the model's answer.
+                    from gateway.stream_recovery import unmark_recovered_reply
+                    response = unmark_recovered_reply(response, agent_result)
+                    if not _proxy_user_row_persisted:
+                        await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                     if response:
                         await store.append_to_transcript(
                             sid, {"role": "assistant", "content": response, "timestamp": ts},
@@ -579,9 +638,13 @@ class GatewayTurnPersistenceMixin:
                     # Attach the inbound platform message_id to the first user entry so platform-level
                     # quote-resolution (e.g. Yuanbao) can find earlier @bot messages by original id.
                     _user_msg_id_attached = False
+                    _proxy_user_row_skipped = False
                     for msg in new_messages:
                         if msg.get("role") == "system":
                             continue  # rebuilt each run
+                        if _proxy_user_row_persisted and msg.get("role") == "user" and not _proxy_user_row_skipped:
+                            _proxy_user_row_skipped = True
+                            continue
                         entry = {**msg, "timestamp": ts}
                         if (
                             not _user_msg_id_attached
@@ -594,8 +657,9 @@ class GatewayTurnPersistenceMixin:
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
-        await store.update_session(
-            session_entry.session_key, last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+        await self._hmwa_store_turn_prompt_tokens(
+            store, session_entry.session_key, session_key, agent_result.get("last_prompt_tokens", 0),
+            getattr(prepared, "hygiene_adoption_epoch", 0),
             touch_activity=not bool(getattr(event, "internal", False)),
         )
 
@@ -804,6 +868,9 @@ class GatewayTurnPersistenceMixin:
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # Other private records are redacted whole. Keep only the code-derived failure class.
+        from agent.incognito import log_private_failure
+        log_private_failure(logger, e, operation="agent turn", session_id=getattr(session_entry, "session_id", None))
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same

@@ -739,3 +739,17 @@ def test_rollback_acknowledgement_probe_spends_the_run_deadline(tmp_path, monkey
     monkeypatch.setattr(immutable_releases, "acknowledge_running_release", acknowledge)
     assert guardian._run(home, plist, label, grace=0, domain=None, deadline=103.0) == "healthy"
     assert seen == [3.0]
+
+
+@pytest.mark.platforms("macos")
+def test_status_uses_launchd_account_home_instead_of_profile_home(tmp_path, monkeypatch, capsys):
+    account = tmp_path / "account"
+    path = account / "Library/LaunchAgents" / f"{guardian.GUARDIAN_LABEL}.plist"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"fixture")
+    monkeypatch.setattr(hermes_cli.gateway, "_launchd_account_home", lambda: account)
+    monkeypatch.setattr(guardian, "get_hermes_home", lambda: tmp_path / "profile")
+    monkeypatch.setattr(guardian, "enabled", lambda _: False)
+    assert guardian.cli(["status", "--gateway-plist", str(tmp_path / "gateway.plist"),
+                         "--gateway-label", "test", "--domain", "gui/1"]) == 0
+    assert "installed=True" in capsys.readouterr().out

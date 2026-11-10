@@ -650,8 +650,7 @@ def cli(argv: list[str] | None = None) -> int:
     target = args.gateway_plist or gateway.get_launchd_plist_path()
     label = args.gateway_label or gateway.get_launchd_label()
     args.domain = args.domain or _domain(GUARDIAN_LABEL if args.action == "uninstall" else label)
-    import pwd
-    path = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
+    path = gateway._launchd_account_home() / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
     if args.action == "status":
         print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()} domain={args.domain}")
         return 0

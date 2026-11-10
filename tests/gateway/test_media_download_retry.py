@@ -103,9 +103,24 @@ class TestCacheImageFromBytes:
         """iPhone photos sent as files are HEIC; image_routing transcodes them for vision."""
         monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
         from gateway.platforms.base import cache_image_from_bytes
-        data = b"\x00\x00\x00\x18ftyp" + brand + b"\x00\x00\x00\x00mif1heic" + b"\x00" * 64
-        path = cache_image_from_bytes(data, ext)
-        assert path.endswith(ext)
+        from io import BytesIO
+        from pathlib import Path
+        import pillow_heif
+        from PIL import Image
+
+        image = Image.new("RGB", (4, 4), "red")
+        encoded = BytesIO()
+        if brand == b"avif":
+            image.save(encoded, format="AVIF")
+        else:
+            pillow_heif.from_pillow(image).save(encoded, format="HEIF")
+        data = encoded.getvalue()
+        if brand == b"mif1":
+            data = data[:8] + brand + data[12:]
+        path = Path(cache_image_from_bytes(data, ext))
+        assert path.suffix == ".png"
+        with Image.open(path) as cached:
+            assert cached.format == "PNG" and cached.size == image.size
 
     def test_rejects_isobmff_video(self, tmp_path, monkeypatch):
         """An MP4 shares the ftyp container but is not an image."""

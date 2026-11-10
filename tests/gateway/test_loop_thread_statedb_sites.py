@@ -57,7 +57,8 @@ async def test_stale_topic_binding_prune_runs_off_the_loop(tmp_path):
         adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
         adapter._session_store = SimpleNamespace(_db=db)
         adapter._bot = SimpleNamespace(send_message=AsyncMock(side_effect=[
-            BadRequest("Message thread not found"), SimpleNamespace(message_id=120)]))
+            BadRequest("Message thread not found"), BadRequest("Message thread not found"),
+            SimpleNamespace(message_id=120)]))
         _arm()
         result = await adapter._send_with_retry(
             chat_id="2027045491", content="Completed response", reply_to="150565",
@@ -66,6 +67,7 @@ async def test_stale_topic_binding_prune_runs_off_the_loop(tmp_path):
         )
         hermes_loop_guard.set_loop_thread(None)
         assert result.success is True
+        assert adapter._bot.send_message.await_count == 3
         # On the loop the guarded delete raised inside the best-effort prune and the row survived.
         assert db.get_telegram_topic_binding(chat_id="2027045491", thread_id="150565") is None
     finally:

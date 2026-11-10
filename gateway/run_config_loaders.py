@@ -113,7 +113,7 @@ class GatewayConfigLoadersMixin:
     def _silence_allowed_for_source(self, source, display_kind, reply_expected, agent_result) -> bool:
         """Evaluate existing exemptions before consulting the optional room permission."""
         from gateway.response_filters import silence_allowed
-        return silence_allowed(display_kind, reply_expected) or silence_allowed(
+        return silence_allowed(display_kind, reply_expected, agent_result=agent_result) or silence_allowed(
             display_kind, reply_expected, allow_silence=self._room_allow_silence(source),
             agent_result=agent_result)
 

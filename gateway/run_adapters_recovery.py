@@ -229,7 +229,8 @@ class GatewaySecondaryReconnectMixin:
             carry_inbound_dedup(predecessor, adapter)
             try:
                 self._configure_profile_adapter(adapter, profile_name, platform)
-                success = await self._connect_adapter_with_timeout(adapter, platform, is_reconnect=True)
+                success = await self._connect_adapter_with_timeout(
+                    adapter, platform, is_reconnect=True, predecessor=predecessor)
             except BaseException:
                 # Caller never sees this adapter; release its partial resources and return its held inbound.
                 await self._safe_adapter_disconnect(adapter, platform)

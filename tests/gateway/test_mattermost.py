@@ -736,6 +736,7 @@ def test_bot_turn_does_not_publish_runtime_status():
     turn_runner._schedule = MagicMock()
     turn_runner._ctx = SimpleNamespace(
         mute_notification_reply=False,
+        persist_user_display_kind=None,
         source=SimpleNamespace(platform=Platform.MATTERMOST, is_bot=True),
         _status_adapter=object(),
         _run_still_current=lambda: True,
