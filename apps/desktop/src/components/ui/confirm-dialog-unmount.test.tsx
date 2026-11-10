@@ -1,9 +1,12 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.useRealTimers()
+})
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -54,4 +57,22 @@ test('the close timer does not fire after unmount', async () => {
 
   expect(onClose).not.toHaveBeenCalled()
   vi.useRealTimers()
+})
+
+test.each([false, true])('a confirmation resolving after unmount cannot close its former owner (dismiss=%s)', async dismissOnConfirm => {
+  vi.useFakeTimers()
+  let finish!: () => void
+  const onClose = vi.fn()
+  const onConfirm = vi.fn(() => new Promise<void>(resolve => { finish = resolve }))
+  const view = render(
+    <ConfirmDialog dismissOnConfirm={dismissOnConfirm} onClose={onClose} onConfirm={onConfirm} open title="Confirm action" />
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+  expect(onConfirm).toHaveBeenCalledOnce()
+  view.unmount()
+  await act(async () => finish())
+  await act(async () => vi.advanceTimersByTime(600))
+
+  expect(onClose).not.toHaveBeenCalled()
 })
