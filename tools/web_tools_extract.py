@@ -88,6 +88,8 @@ def _extract_identity_key(url: Any) -> Optional[tuple]:
         port = None
     # HTTP upgrades identify the same resource, but distinct hosts (including
     # www), non-default ports, path case and query values are not aliases.
+    # www/apex pairing is a separate 1:1 step, so consuming one alias cannot
+    # leave a leftover page to be inferred onto another requested URL.
     transport = "http(s)" if scheme in ("http", "https") else scheme
     return (transport, parts.hostname, port, parts.path.rstrip("/"),
             parts.query, parts.username, parts.password)
@@ -114,6 +116,70 @@ def _infer_extract_redirect(result: dict, keys: dict) -> bool:
     return bool(final and final not in keys and (not source or _extract_identity_key(source) == final))
 
 
+def _strip_www_label(hostname: str) -> Optional[str]:
+    """Drop one leading www label. ``www.example.com`` becomes ``example.com``."""
+    if hostname.startswith("www.") and hostname.count(".") >= 2:
+        return hostname[4:]
+    return None
+
+
+def _www_apex_pair(left: Any, right: Any) -> bool:
+    """True when the URLs differ only by a single leading www label.
+
+    Transport, port, path, query and userinfo must already match. http and https
+    share a transport in the identity key, so a scheme change does not block the
+    pair. Distinct non-www hosts stay distinct.
+    """
+    a = _extract_identity_key(left)
+    b = _extract_identity_key(right)
+    if not a or not b or len(a) != len(b) or a[0] != b[0] or a[2:] != b[2:]:
+        return False
+    left_host, right_host = a[1], b[1]
+    if not isinstance(left_host, str) or not isinstance(right_host, str) or left_host == right_host:
+        return False
+    return _strip_www_label(left_host) == right_host or _strip_www_label(right_host) == left_host
+
+
+def _aliasable_result_url(result: dict) -> Optional[str]:
+    """Final URL safe to www/apex-pair, or None when source evidence names a third host."""
+    final = result.get("url")
+    if not isinstance(final, str) or not final:
+        return None
+    metadata = result.get("metadata")
+    source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+    if isinstance(source, str) and source and not (
+        _extract_identity_key(source) == _extract_identity_key(final) or _www_apex_pair(source, final)
+    ):
+        return None
+    return final
+
+
+def _pair_unique_www_apex(remaining: set[str], unmatched: list[dict]) -> dict[str, dict]:
+    """Pair only when one remaining request and one result share path+query after www/apex normalization."""
+    usable = []
+    for result in unmatched:
+        final = _aliasable_result_url(result)
+        if final is not None:
+            usable.append((result, final))
+    request_hits = {url: [] for url in remaining}
+    result_hits = {id(result): [] for result, _final in usable}
+    for url in remaining:
+        for result, final in usable:
+            if _www_apex_pair(url, final):
+                request_hits[url].append(result)
+                result_hits[id(result)].append(url)
+    paired = {}
+    for url, hits in request_hits.items():
+        if len(hits) == 1 and len(result_hits[id(hits[0])]) == 1:
+            paired[url] = hits[0]
+    return paired
+
+
+_AMBIGUOUS_MATCH_ERROR = (
+    "provider returned results that could not be matched to this URL; retry it alone"
+)
+
+
 def _match_extract_results(urls: list[str], results: list[dict]) -> list[dict]:
     """Only successes fill slots; errors remain replaceable by a lone redirect."""
     requested = set(urls)
@@ -133,16 +199,23 @@ def _match_extract_results(urls: list[str], results: list[dict]) -> list[dict]:
             successes.setdefault(identity, result)
     remaining = requested - successes.keys()
     # Provider placeholders do not consume slots or compete with real content.
-    # Infer only a lone success/request pair without conflicting source evidence;
-    # multiple leftovers remain errors rather than risk positional misattribution.
-    if len(remaining) == 1 and len(unmatched) == 1:
-        result = unmatched[0]
-        if _infer_extract_redirect(result, keys):
-            successes[remaining.pop()] = result
+    # Infer only a lone success/request pair without conflicting source evidence.
+    # Do not run that inference after a partial www/apex pairing: the leftover
+    # page would be attributed to the other requested URL.
+    if len(remaining) == 1 and len(unmatched) == 1 and _infer_extract_redirect(unmatched[0], keys):
+        successes[remaining.pop()] = unmatched[0]
+        unmatched = []
+    elif remaining and unmatched:
+        for url, result in _pair_unique_www_apex(remaining, unmatched).items():
+            successes[url] = result
+            remaining.discard(url)
+            unmatched.remove(result)
     matched = {**errors, **successes}
+    ambiguous = bool(unmatched)
     ordered = []
     for url in urls:
-        result = dict(matched[url]) if url in matched else _result_entry(url, _NO_RESULT_ERROR)
+        result = dict(matched[url]) if url in matched else _result_entry(
+            url, _AMBIGUOUS_MATCH_ERROR if ambiguous else _NO_RESULT_ERROR)
         if not result.get("url"):
             result["url"] = url
         if result["url"] != url:
