@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from pathlib import Path
+import logging
 import sqlite3
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionStoreOwners(AbstractContextManager):
@@ -43,6 +46,7 @@ class ExecutionStoreOwners(AbstractContextManager):
         try:
             self.retain(home)
         except BaseException as exc:
+            logger.debug("Deferring cron WAL owner failure until after housekeeping", exc_info=True)
             error = exc
         result = action(**kwargs)
         if error is not None:
