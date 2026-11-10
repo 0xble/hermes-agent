@@ -27,7 +27,9 @@ def _redact_row(row: dict) -> dict:
     for key, value in row.items():
         cleaned = redact_sensitive_text(value, force=True) if isinstance(value, str) else value
         if key in _IDENTITY_FIELDS and cleaned != value:
-            raise EvidenceUnavailable("source identity requires redaction, exact stream unavailable")
+            session = redact_sensitive_text(str(row.get("session_id", row.get("id", "unknown"))), force=True)
+            raise EvidenceUnavailable(
+                f"source identity requires redaction for field {key} in session {session!r}; exact stream unavailable")
         result[key] = cleaned
     return result
 

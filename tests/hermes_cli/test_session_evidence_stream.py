@@ -445,6 +445,7 @@ def test_stream_refuses_non_wal_before_output(store, operation, journal, capsys,
     store.execute(f"PRAGMA journal_mode={journal}")
     code, sink, error, _ = _capture(capsys, monkeypatch, operation)
     assert code == 1 and "WAL" in error
+    assert "expected on hosts that keep DELETE mode" in error
     assert sink.header is None and sink.footer is None
     assert store.execute("PRAGMA journal_mode").fetchone()[0] == journal
 
@@ -456,6 +457,8 @@ def test_routing_identity_is_refused_rather_than_masked(store, field, operation,
     store.commit()
     code, sink, error, _ = _capture(capsys, monkeypatch, operation)
     assert code == 1 and "source identity requires redaction" in error
+    assert f"field {field}" in error and "session 'root'" in error
+    assert "+12025550198" not in error + json.dumps(sink.rows)
     assert sink.footer is None
 
 

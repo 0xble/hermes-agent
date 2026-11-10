@@ -55,7 +55,9 @@ def evidence_snapshot(db_path):
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
         if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
-            raise EvidenceUnavailable("session evidence streaming requires WAL journal mode; source unchanged")
+            raise EvidenceUnavailable(
+                "session evidence streaming requires WAL journal mode; "
+                "refusal is expected on hosts that keep DELETE mode; source unchanged")
         conn.execute("BEGIN")
         try:
             yield conn
