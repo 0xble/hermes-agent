@@ -225,7 +225,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         if not isinstance(meta, dict):
             logger.warning("Ignoring non-object display metadata on message row")
             return None
-        return meta
+        from agent.source_origin import stored_origin_metadata
+        return stored_origin_metadata(meta)
 
     @staticmethod
     def _reasoning_json_text(value: Any) -> Optional[str]:

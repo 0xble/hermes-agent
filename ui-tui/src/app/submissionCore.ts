@@ -5,6 +5,7 @@ import type { InputDetectDropResponse, PromptSubmitResponse, SessionActivateResp
 import type { QueueItem } from '../hooks/useQueue.js'
 import { t } from '../i18n/runtime.js'
 import { stageImagePath } from '../lib/imageAttachments.js'
+import { verifiedTypedInput } from '../lib/nativeInputOrigin.js'
 import { pendingInputOwner, savePendingInput } from '../lib/pendingInputs.js'
 import type { Msg } from '../types.js'
 
@@ -313,6 +314,7 @@ async function submitLegacy(
         patchUiState({ status: t('canonical.submit.statusDeliveryUnconfirmed') })
       }
     }
+
     return accepted
   } catch (error) {
     item.settle?.(false)
@@ -321,6 +323,7 @@ async function submitLegacy(
       deps.sys(t('canonical.submit.legacyUnconfirmedWith', error instanceof Error ? error.message : String(error)))
       patchUiState({ status: t('canonical.submit.statusDeliveryUnconfirmed') })
     }
+
     return false
   }
 }
@@ -353,6 +356,7 @@ export function submitPrompt(
 
   if (!sid) {
     deps.sys('session not ready yet')
+
     return Promise.resolve(false)
   }
 
@@ -375,6 +379,7 @@ export function submitPrompt(
 
   const readmit = (item: QueueItem) => {
     readmitAsPrompt(item)
+
     return submitPrompt(text, deps, showUserMessage, displayOverride, {
       behindTurn: true,
       destination,
@@ -405,8 +410,8 @@ export function submitPrompt(
     }
 
     retireCanonicalControls(deps.gw, sid)
-    return deps.gw
-      .request<PromptSubmitResponse>(
+
+    const send = () => deps.gw.request<PromptSubmitResponse>(
         item?.controlMethod ?? 'prompt.submit',
         { ...submitParams(
           sid,
@@ -418,13 +423,24 @@ export function submitPrompt(
         ),
           ...(opts.moaToken ? { moa_token: opts.moaToken } : {}) }
       )
-      .then(r => {
+
+    const typedInput = item?.submissionId && show && !item.controlMethod && !item.moaToken && !submitText.startsWith('/') &&
+      verifiedTypedInput(item.nativeOrigin, submitText) && voiceTranscript !== submitText.trim() && destination.storedSid
+      ? { home: destination.profileHome, session: destination.storedSid, request: item.submissionId, text: submitText }
+      : undefined
+
+    return (typedInput && deps.gw.withTypedInput
+      ? deps.gw.withTypedInput(typedInput, send)
+      : send()).then(r => {
         if (r?.status === 'dropped' && r.reason === 'deferred_moa_unavailable') {
           item?.settle?.(true)
+
           if (focused()) {
             deps.sys(r.message || 'Deferred MoA request was cancelled; prompt dropped.')
+
             if (ownsTurn()) { patchUiState({ busy: false, status: 'ready' }) }
           }
+
           return false
         }
 
@@ -464,6 +480,7 @@ export function submitPrompt(
         if (item) {
           return settleAdmissionReply(item, r, { deps, destination, focused, owner, sid })
         }
+
         return true
       })
       .catch(async (e: Error & { code?: number }) => {
@@ -506,6 +523,7 @@ export function submitPrompt(
           patchUiState({ busy: true, status: 'queued for next turn' })
 
           deps.sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
+
           return false
         }
 
@@ -515,6 +533,7 @@ export function submitPrompt(
 
         deps.sys(`error: ${e.message}`)
         patchUiState({ busy: false, status: 'ready' })
+
         return false
       })
   }
@@ -544,6 +563,7 @@ export function submitPrompt(
       return stageImagePath(text, deps.gw, destination)
         .then(image => {
           opts.attachments = [{ path: image.path, mime: image.mime }]
+
           return startSubmit(text, image.remainder || 'What do you see in this image?', showUserMessage)
         })
         .catch((error: Error) => {
@@ -556,6 +576,7 @@ export function submitPrompt(
               patchUiState({ busy: false, status: t('canonical.submit.statusImageNotSubmitted') })
             }
           }
+
           return false
         })
     }

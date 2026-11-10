@@ -93,8 +93,9 @@ def test_row_is_typed_by_the_turn_start_persist(agent_db):
     # Typed before the turn ran — a crash from here on still reads as an event.
     assert row["display_kind"] == "auto_continue"
     assert row["display_metadata"]["attempt"] == 2
-    assert row["display_metadata"]["_hermes_source_origin"]["status"] == "generated"
-    assert set(row["display_metadata"]) == {"attempt", "_hermes_source_origin"}
+    from agent.source_origin import classify_origin
+    assert classify_origin(db.get_messages(sid)[0], session_id=sid).status == "generated"
+    assert row["display_metadata"] == {"attempt": 2}
     # The model's copy is untouched: same role, same content.
     assert row["content"] == NOTE
 

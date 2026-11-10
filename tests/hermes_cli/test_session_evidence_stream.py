@@ -22,6 +22,15 @@ def _args(*argv):
     return parser.parse_args(["sessions", "state", *argv])
 
 
+def test_acquisition_without_manifest_names_flag_and_docs_before_store_read(capsys, monkeypatch):
+    from hermes_cli.session_evidence import cmd_session_evidence
+    args = _args("transcript", "--session-id", "fictional")
+    monkeypatch.setattr("hermes_cli.session_evidence._capture", lambda *a, **kw: pytest.fail("store opened"))
+    assert cmd_session_evidence(args) == 1
+    error = capsys.readouterr().err
+    assert "--control-roots-file" in error and "#session-graph-and-audit-streams" in error
+
+
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

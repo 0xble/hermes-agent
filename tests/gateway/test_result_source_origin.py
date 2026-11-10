@@ -32,7 +32,7 @@ def test_durable_result_omits_native_receipt_and_preserves_live_messages(owner, 
     assert saved["result"]["final_response"] == "The setting is saved."
     assert saved["usage"] == {"input_tokens": 3}
     assert saved["result"]["messages"][0] == {
-        "role": "user", "content": text, "display_metadata": {ORIGIN_KEY: None, "other": "preserved"}}
+        "role": "user", "content": text, "display_metadata": {"other": "preserved"}}
     assert message["display_metadata"][ORIGIN_KEY] is receipt
     assert result["result"]["messages"][0] is message
     assert retention_user_text(text, saved["result"]["messages"]) is None

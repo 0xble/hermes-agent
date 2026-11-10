@@ -104,7 +104,26 @@ def bootstrap(start: bool, recover: bool = False) -> dict:
             "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id}
 
 
-if __name__ == "__main__":
+def typed_input_pipe():
+    """The native composer's private child pipe, never an RPC or metadata import."""
+    from pm.environments import activate_dependencies
+    activate_dependencies(python_root())
+    from agent.source_origin import typed_input_message
+    from agent.source_origin_ingress import publish_input
+    from hermes_constants import get_hermes_home
+    record = json.loads(sys.stdin.readline(1_000_001))
+    if (not isinstance(record, dict) or set(record) != {"session", "request", "text"}
+            or not all(isinstance(value, str) and value for value in record.values())):
+        raise ValueError("invalid native input")
+    message = typed_input_message(record["text"], "tui")
+    with publish_input(get_hermes_home(), record["session"], record["request"], message, record["text"]):
+        print("ready", flush=True)
+        sys.stdin.read()  # Pipe closure retires this one submission's private receipt.
+
+
+if __name__ == "__main__" and "--typed-input" in sys.argv:
+    typed_input_pipe()
+elif __name__ == "__main__":
     try:
         with contextlib.redirect_stdout(sys.stderr):
             result = bootstrap("--start" in sys.argv, recover="--recover" in sys.argv)

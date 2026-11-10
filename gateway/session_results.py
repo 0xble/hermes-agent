@@ -69,7 +69,8 @@ def _redacted(value):
         from agent.redact import redact_sensitive_text
         return redact_sensitive_text(value)
     if isinstance(value, dict):
-        return {k: _redacted(v) for k, v in value.items()}
+        from agent.source_origin import ORIGIN_KEY
+        return {k: _redacted(v) for k, v in value.items() if k != ORIGIN_KEY}
     if isinstance(value, list):
         return [_redacted(v) for v in value]
     return value

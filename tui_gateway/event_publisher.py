@@ -69,7 +69,8 @@ class WsPublisherTransport:
         if self._dead or self._ws is None or self._worker is None:
             return False
         try:
-            self._q.put_nowait(json.dumps(obj, ensure_ascii=False))
+            from agent.source_origin import public_origin_projection
+            self._q.put_nowait(json.dumps(public_origin_projection(obj), ensure_ascii=False))
             return True
         except queue.Full:
             return False

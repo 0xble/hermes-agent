@@ -134,7 +134,7 @@ def _redact_for_provider(*values: Any) -> Any:
     changed containers as shallow copies. One value in → one value out; several → a tuple.
     """
     from agent.authentication_material import authentication_values, exclude_authentication_material
-    from agent.source_origin import NativeOrigin
+    from agent.source_origin import NativeOrigin, ORIGIN_KEY
     learned: set = set()
 
     def walk(value: Any, fix) -> Any:
@@ -143,8 +143,8 @@ def _redact_for_provider(*values: Any) -> Any:
         if isinstance(value, str):
             return value if not value or value.startswith("data:") else fix(value)
         if isinstance(value, dict):
-            out = {k: walk(v, fix) for k, v in value.items()}
-            return value if all(out[k] is value[k] for k in value) else out
+            out = {k: walk(v, fix) for k, v in value.items() if k != ORIGIN_KEY}
+            return value if out.keys() == value.keys() and all(out[k] is value[k] for k in value) else out
         if isinstance(value, (list, tuple)):
             items = [walk(v, fix) for v in value]
             if all(new is old for new, old in zip(items, value)):
@@ -267,6 +267,7 @@ class MemoryManager:
                  read_only: bool = False) -> None:
         self.read_only = bool(read_only)
         self._providers: list[MemoryProvider] = []
+        self._retention_origin_skips: dict[str, int] = {}
         # Host policy (memory.recall_synthetic_turns): whether Hermes-generated turns may key
         # automatic recall. Read by the turn-start and post-turn prefetch gates.
         self.recall_synthetic_turns = recall_synthetic_turns
@@ -630,7 +631,12 @@ class MemoryManager:
             retained_user = origin_user if requires_origin else clean_user_content
             if not retained_user:
                 if requires_origin:
-                    logger.debug("Skipping automatic retention for %s: no verified origin", provider.name)
+                    from agent.session_source import session_source_for
+                    surface = session_source_for(platform) if platform else "unknown"
+                    count = self._retention_origin_skips.get(surface, 0) + 1
+                    self._retention_origin_skips[surface] = count
+                    logger.info("Skipping automatic retention for %s: missing verified origin surface=%s count=%d",
+                                provider.name, surface, count)
                 return
             kwargs: dict[str, Any] = {"session_id": session_id}
             for keyword, value in optional_kwargs.items():

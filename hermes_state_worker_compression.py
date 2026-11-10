@@ -201,10 +201,12 @@ def worker_history(db, conn, sid, payload):
         # The owner's live-replay rule: an already-corrupt session names each message_uid once.
         from hermes_state_identity import _newest_message_uid_rows
         rows = _newest_message_uid_rows(rows)
-    return {'messages': db._rows_to_conversation(rows, session_id=target,
+    messages = db._rows_to_conversation(rows, session_id=target,
         include_ancestors=payload['include_ancestors'], repair_alternation=payload['repair_alternation'],
         include_row_ids=payload['include_row_ids'],
-        include_summary_markers=payload['repair_alternation'])}
+        include_summary_markers=payload['repair_alternation'])
+    from agent.source_origin_worker import pack_stored_history
+    return pack_stored_history(messages)
 
 
 

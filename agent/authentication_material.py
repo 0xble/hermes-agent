@@ -1,28 +1,33 @@
 """Exclude authentication values independently of speaker origin and known secret keys."""
 
-from collections import Counter
-from math import log2
 import re
 
 # Context is essential: ordinary counts, dates and identifiers are not authentication values.
 _LABEL = (r"(?:(?:recovery|backup|verification|authentication|one[ -]time|login|sign[ -]in|2fa)\s+"
           r"(?:code|token|password)s?|otp|password|passphrase|api[ _-]?key|secret[ _-]?key)")
-_VALUE = re.compile(r"(?P<label>\b" + _LABEL + r"\s*(?:is\s+|are\s+|[:=]\s*))"
-                    r"(?P<value>`?[A-Za-z0-9][A-Za-z0-9_+/-]{3,127}`?)", re.IGNORECASE)
-_AUTH = re.compile(r"\b" + _LABEL + r"\s*(?:[:=]|\bis\b|\bare\b|\s+[`'\"]?\d{4,})", re.IGNORECASE)
+_VALUE = re.compile(
+    r"(?P<label>\b" + _LABEL + r"(?:\s*(?:is|are)\s+|\s*[:=]\s*|\s+(?=[`'\"]?\d{4,})))"
+    r"(?P<value>`[^`\n]+`|\"[^\"\n]+\"|'[^'\n]+'|\S+(?:(?<=[,;])\s+\d{4,}[.,;]?)*)", re.IGNORECASE)
 _SENTENCE = re.compile(r".+?(?:[.!?](?=\s|$)|\n|$)")
+_STATUS_WORDS = frozenset({"wrong", "required", "none", "missing", "needed", "unset", "unavailable",
+                           "incorrect", "invalid", "expired", "enabled", "disabled", "optional",
+                           "correct", "set", "stored", "configured", "available", "secure", "insecure",
+                           "safe", "unsafe", "strong", "weak", "long", "short"})
+
+
+def _values(text):
+    """The same value grammar decides what is held and what later repeats must hide."""
+    for match in _VALUE.finditer(text or ""):
+        raw = match.group("value").rstrip(".,;")
+        items = re.split(r"[,;]\s*", raw) if re.fullmatch(r"\d{4,}(?:[,;]\s*\d{4,})+", raw) else [raw]
+        for item in items:
+            value = item.strip().strip("`'\"")
+            if value and (raw[:1] in "`'\"" or value.lower() not in _STATUS_WORDS):
+                yield match, value
 
 
 def authentication_values(text):
-    # A label does not turn status words or source-code identifiers into credentials.
-    values = []
-    for match in _VALUE.finditer(text or ""):
-        value = match.group("value").strip("`")
-        entropy = -sum((count / len(value)) * log2(count / len(value))
-                       for count in Counter(value).values())
-        if any(char.isdigit() for char in value) or (len(value) >= 16 and entropy >= 3.5):
-            values.append(value)
-    return tuple(values)
+    return tuple(value for _, value in _values(text))
 
 
 def exclude_authentication_material(text):
@@ -31,14 +36,25 @@ def exclude_authentication_material(text):
     No values or value-derived identifiers enter evidence records. Neighboring sentences and
     speaker roles stay intact. This does not attempt to classify human authorship.
     """
-    def hold(match):
-        sentence = match.group()
-        if not _AUTH.search(sentence):
+    def hold(sentence):
+        matches = list(_values(sentence))
+        if not matches:
             return sentence
-        value = _VALUE.search(sentence)
+        value = matches[0][0]
         # A partial token, quoted phrase or list is ambiguous. Withhold that sentence
         # rather than certifying the first token while leaking the remainder.
-        if value is None or sentence[value.end():].strip(" .!?\n"):
+        if sentence[value.end():].strip(" .!?\n"):
             return " [authentication span held]" + ("\n" if sentence.endswith("\n") else "")
-        return _VALUE.sub(lambda m: m.group("label") + "[authentication withheld]", sentence)
-    return _SENTENCE.sub(hold, text or "")
+        for value in reversed(list({match.start(): match for match, _ in matches}.values())):
+            sentence = sentence[:value.start("value")] + "[authentication withheld]" + sentence[value.end():]
+        return sentence
+    text = text or ""
+    boundaries = list(text)
+    # Quoted values may contain sentence punctuation. Segment outside their full span,
+    # otherwise the held prefix could leave the rest of a password in clear text.
+    for match, _ in _values(text):
+        if match.group("value")[:1] in "`\"'":
+            for index in range(*match.span("value")):
+                if boundaries[index] in ".!?":
+                    boundaries[index] = "\0"
+    return "".join(hold(text[match.start():match.end()]) for match in _SENTENCE.finditer("".join(boundaries)))

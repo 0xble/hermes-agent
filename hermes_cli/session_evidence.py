@@ -145,6 +145,10 @@ def cmd_session_evidence(args) -> int:
 def _load_policy(path):
     from pathlib import Path
     from hermes_state_acquisition import AcquisitionPolicy
+    if not path:
+        raise EvidenceUnavailable(
+            "acquisition requires --control-roots-file; see website/docs/reference/cli-commands.md "
+            "#session-graph-and-audit-streams (Session Graph And Audit Streams)")
     with Path(path).open("rb") as source:
         raw = source.read(65537)
     if len(raw) > 65536:

@@ -8,6 +8,7 @@ import type { GatewayClient } from '../gatewayClient.js'
 import type { ShellExecResponse } from '../gatewayTypes.js'
 import { queueItem, type QueueItem } from '../hooks/useQueue.js'
 import { t } from '../i18n/runtime.js'
+import { nativeTypedInput } from '../lib/nativeInputOrigin.js'
 import { asRpcResult } from '../lib/rpc.js'
 import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js'
 import type { Msg } from '../types.js'
@@ -127,7 +128,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { moaToken?: string; literal?: boolean; attachments?: Array<{ path: string; mime: string }>; skipDetectDrop?: boolean; destination?: SubmissionDestination; queueItem?: QueueItem; behindTurn?: boolean } = {}
+      submitOpts: { moaToken?: string; literal?: boolean; attachments?: Array<{ path: string; mime: string }>; skipDetectDrop?: boolean; destination?: SubmissionDestination; queueItem?: QueueItem; behindTurn?: boolean; nativeOrigin?: object } = {}
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
@@ -137,6 +138,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
       const item =
         submitOpts.queueItem ?? (destination.sid ? composerActions.stage?.(text, displayText, destination, submitOpts.attachments) : undefined)
+
+      if (item && submitOpts.nativeOrigin) { item.nativeOrigin = submitOpts.nativeOrigin }
 
       return submitPrompt(
         text,
@@ -293,7 +296,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
         if (opts.fallbackToFront) {
           composerActions.prependQueue(item, destination)
         } else {
-          composerActions.enqueue(item.text, item.display, destination)
+          const queued = composerActions.enqueue(item.text, item.display, destination)
+
+          if (queued) { queued.nativeOrigin = item.nativeOrigin }
         }
       }
 
@@ -315,6 +320,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         staged.controlMethod ??= mode === 'steer' ? 'session.steer' : 'session.redirect'
         staged.executionGeneration ??= executionGeneration
         staged.attachments ??= item.attachments
+        staged.nativeOrigin ??= item.nativeOrigin
 
         return send(item.text, true, item.display, value => value, {
           destination, behindTurn: true, queueItem: staged, attachments: item.attachments })
@@ -326,7 +332,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
         // running turn. Legacy gateways keep the renderer-side queue.
         if (gw.isCanonical) {
           return send(item.text, true, item.display, value => value, {
-            destination, behindTurn: true, queueItem: item.settle ? item : undefined, attachments: item.attachments })
+            destination, behindTurn: true, queueItem: item.settle ? item : undefined, attachments: item.attachments,
+            nativeOrigin: item.nativeOrigin })
         }
 
         return enqueueText()
@@ -340,7 +347,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // the agent is in model generation, tool execution, or an older runtime.
       // Reuse the normal submit pipeline so the correction gets its user bubble
       // and file-drop interpolation exactly once.
-      send(item.text, true, item.display, value => value, { destination, queueItem: item.settle ? item : undefined, attachments: item.attachments })
+      send(item.text, true, item.display, value => value, { destination, queueItem: item.settle ? item : undefined, attachments: item.attachments,
+        nativeOrigin: item.nativeOrigin })
     },
     [composerActions, gw, send]
   )
@@ -360,11 +368,13 @@ export function useSubmission(opts: UseSubmissionOptions) {
       if (moaToken) {
         composerActions.pushHistory(full)
         const live = getUiState()
+
         if (!live.sid || live.busy) {
           handleBusyInput(queueItem(full, full, moaToken))
         } else {
           send(full, true, full, value => value, { literal: true, moaToken, skipDetectDrop: true })
         }
+
         composerActions.clearIn()
 
         return
@@ -433,6 +443,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       }
 
       const live = getUiState()
+      const nativeOrigin = nativeTypedInput(submission.text)
 
       // No session yet (boot, or the socket is down): the input joins the local queue and the
       // sid/connected drain effect sends it once the session is bound. On an attached gateway
@@ -442,7 +453,13 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
       if (unbound) {
         composerActions.pushHistory(toHistory)
-        journaled(() => composerActions.enqueue(submission.text, submission.display, destination, submission.attachments))
+        journaled(() => {
+          const queued = composerActions.enqueue(submission.text, submission.display, destination, submission.attachments)
+
+          if (queued) { queued.nativeOrigin = nativeOrigin }
+
+          return queued
+        })
 
         return
       }
@@ -468,6 +485,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
             return
           }
 
+          item.nativeOrigin = nativeOrigin
+
           if (editedWhileBusy) {
             // 'interrupt' / 'steer' should reach the live turn instead of
             // silently going back to the queue.  handleBusyInput resolves
@@ -487,7 +506,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
       if (getUiState().busy) {
         return void journaled(() =>
-          handleBusyInput({ ...queueItem(submission.text, submission.display), attachments: submission.attachments }))
+          handleBusyInput({ ...queueItem(submission.text, submission.display), attachments: submission.attachments, nativeOrigin }))
       }
 
       if (shouldInterpolateSubmission(full)) {
@@ -509,7 +528,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         )
       }
 
-      journaled(() => send(submission.text, true, submission.display, value => value, { attachments: submission.attachments }))
+      journaled(() => send(submission.text, true, submission.display, value => value, { attachments: submission.attachments, nativeOrigin }))
     },
     [
       appendMessage,

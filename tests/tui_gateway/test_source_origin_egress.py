@@ -139,7 +139,13 @@ def test_native_human_and_generated_turns_survive_every_history_json_egress(boun
     history = human["history"] + generated["history"]
     event = {"type": "history", "session_id": "fictional", "messages": history}
     decoded = _HISTORY_EGRESS[boundary](event)
-    assert "error" not in decoded and decoded["messages"] == history
+    assert "error" not in decoded
+    if boundary in {"raw-history", "worker-journal"}:
+        assert decoded["messages"] == history
+    else:
+        from agent.source_origin import public_origin_projection
+        assert decoded["messages"] == public_origin_projection(history)
+        assert ORIGIN_KEY not in json.dumps(decoded)
     assert retention_user_text(text, human["history"]) == text
     assert retention_user_text(text, json.loads(json.dumps(human["history"]))) is None
     assert retention_user_text(text, generated["history"]) is None

@@ -79,6 +79,8 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
     return {'version': 1, 'home': authority.profile_id, 'scope': scope,
             'policy': asdict(hydrated), 'api_key': route_launch_key(authority, policy, config),
             'text': row['payload']['text'] if text is None else text, 'route': live.route,
+            **({'source_origin_v1': row['payload']['source_origin_v1'], 'input_event': row['admission_id']}
+               if row['payload'].get('source_origin_v1') else {}),
             **({'attachments_v1': row['payload']['attachments_v1']} if 'attachments_v1' in row['payload'] else {}),
             'user_id': live.source.user_id, 'chat_id': live.source.chat_id,
             'turn_author': row_turn_author(policy, row),

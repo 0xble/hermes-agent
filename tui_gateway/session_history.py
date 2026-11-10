@@ -372,7 +372,8 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
         messages.append(msg)
-    return project_history_commentary(messages, home=profile_home)
+    from agent.source_origin import public_origin_projection
+    return public_origin_projection(project_history_commentary(messages, home=profile_home))
 
 
 def _coerce_seed_history(value: Any) -> list[dict]:

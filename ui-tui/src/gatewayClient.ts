@@ -23,7 +23,7 @@ import type { AnyGatewayEvent } from './gatewayTypes.js'
 import { t } from './i18n/runtime.js'
 import { CircularBuffer } from './lib/circularBuffer.js'
 import { recordParentLifecycle } from './lib/parentLog.js'
-import { bootstrapLocalGateway, isTerminalBootstrapFailure, type LocalGatewayGrant } from './localGatewayBootstrap.js'
+import { bootstrapLocalGateway, isTerminalBootstrapFailure, type LocalGatewayGrant, type TypedInput, withNativeTypedInput } from './localGatewayBootstrap.js'
 
 const MAX_GATEWAY_LOG_LINES = 200
 const MAX_LOG_LINE_BYTES = 4096
@@ -509,6 +509,7 @@ export class GatewayClient extends EventEmitter {
 
   hydrateSharedPrompts(snapshot: unknown) {
     if (!this.isCanonical) { return }
+
     const result = snapshot as { session_id: string; authority_epoch: number; prompts?: Array<Record<string, unknown>>;
       open_requests?: Array<{ id: string; method: string; params?: Record<string, unknown> }> | null }
 
@@ -895,6 +896,10 @@ export class GatewayClient extends EventEmitter {
   private requestOverWebSocket<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
     return this.ensureAttachedWebSocket(method).then(() =>
       this.channel.request<T>(method, params, timeoutMs, undefined, () => this.notConnected(method)))
+  }
+
+  withTypedInput<T>(input: TypedInput, send: () => Promise<T>): Promise<T> {
+    return resolveGatewayAttachUrl() ? send() : withNativeTypedInput(input, send)
   }
 
   request<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {

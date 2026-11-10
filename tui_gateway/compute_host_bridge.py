@@ -61,12 +61,16 @@ def _compute_host_turn_frame(
     if queue_token:
         record = pending_moa.get(session, queue_token)
         pending_record = dict(record) if isinstance(record, dict) else None
+    from agent.source_origin import native_origin, public_origin_projection
+    from agent.source_origin_worker import pack_origin
+    origin = pack_origin(native_origin(display_metadata))
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
         **({"display_kind": display_kind} if display_kind else {}), "history": history,
         **({"user_turn": True} if user_turn else {}),
-        **({"display_metadata": display_metadata} if display_metadata else {}),
+        **({"display_metadata": public_origin_projection(display_metadata)} if display_metadata else {}),
+        **({"native_input_origin": origin} if origin else {}),
         **({"queue_token": queue_token} if queue_token else {}),
         **({"pending_moa_record": dict(pending_record)} if pending_record else {}),
         "history_version": history_version, "cols": int(session.get("cols", 80) or 80),

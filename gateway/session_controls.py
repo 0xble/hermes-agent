@@ -724,8 +724,10 @@ class AuthorityConnection:
             self._record_voice_stop(ref, params)
             return {'voice_stopped': True}
         # The interactive WS is the one surface a restart's after-turn wait admits (#139041).
-        receipt = await self.authority.submit(self.actor, self.submission(ref, params),
-                                              queue_while_restarting=self._operator is True)
+        from agent.source_origin_ingress import acquire_input
+        with acquire_input(self, ref, params):
+            receipt = await self.authority.submit(self.actor, self.submission(ref, params),
+                                                  queue_while_restarting=self._operator is True)
         return asdict(receipt)
 
     def _voice_stop_key(self, ref, params):

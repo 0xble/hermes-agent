@@ -86,7 +86,8 @@ def serialize_frame(obj: dict, peer: str, log: logging.Logger) -> str:
     the original id. Shared by every transport: without it the TypeError escaped from a pool
     worker (the executor swallows it), so the client waited forever with no log line (#92506)."""
     try:
-        return json.dumps(obj, ensure_ascii=False)
+        from agent.source_origin import public_origin_projection
+        return json.dumps(public_origin_projection(obj), ensure_ascii=False)
     except (TypeError, ValueError) as exc:
         rid = obj.get("id") if isinstance(obj, dict) else None
         log.error("frame serialization failed peer=%s id=%s error_type=%s error=%s",

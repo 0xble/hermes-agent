@@ -1828,6 +1828,8 @@ These JSONL commands open only the selected home's existing `state.db` with SQLi
 
 `transcript` now requires an owner-approved control coverage manifest. Version 2 refuses before preparing a body-column expression unless the manifest names complete seed coverage and the structural inventory matches its frozen digest. For example:
 
+Omitting `--control-roots-file` reports an acquisition error that points to this section. An explicit `"roots": []` attests that there are no designated control roots. It still requires `coverage_complete: true` and the exact inventory digest, and native control source markers still exclude their components. Do not add a placeholder root.
+
 ```json
 {
   "version": 1,

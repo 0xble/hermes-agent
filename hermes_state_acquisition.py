@@ -35,7 +35,7 @@ def graph_identity(rows):
 
 
 def excluded_component(rows, policy):
-    if policy.coverage_complete is not True or not policy.roots:
+    if policy.coverage_complete is not True:
         raise EvidenceUnavailable("control seed coverage is unproven; acquisition held")
     graph = {}
     for row in rows:

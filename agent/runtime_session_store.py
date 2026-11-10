@@ -383,6 +383,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('permission_denied')
 
     def _apply(self, operation, payload, *, best_effort=False):
+        from agent.source_origin_worker import pack_worker_payload
+        payload = pack_worker_payload(operation, payload)
         with self.lock:
             if self.failure:
                 raise WorkerPersistenceError(self.failure)

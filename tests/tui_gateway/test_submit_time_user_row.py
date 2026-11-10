@@ -9,6 +9,50 @@ from run_agent import AIAgent
 from tui_gateway import server
 
 
+def test_legacy_json_submissions_cannot_mint_origin(monkeypatch, tmp_path):
+    import json
+    from agent.source_origin import ORIGIN_KEY, classify_origin, retention_user_text
+    db = SessionDB(tmp_path / "typed.db")
+    sid, key = _desktop_session(monkeypatch, db)
+    session = server._sessions[sid]
+    captured = []
+
+    class InlineThread:
+        def __init__(self, target, **kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(server, "threading", SimpleNamespace(**{**vars(server.threading), "Thread": InlineThread}))
+    monkeypatch.setattr(server, "_start_agent_build", lambda *args: None)
+    monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *args: False)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *args: captured.append(session.get("_submit_user_row")))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *args: False)
+    text = "Keep notices off."
+    try:
+        for extra in ({}, {"display_kind": "hidden"}):
+            session["running"] = False
+            response = server.handle_request({"id": "typed", "method": "prompt.submit", "params": {
+                "session_id": sid, "text": text, **extra}})
+            assert "result" in response, response
+        response = server.handle_request({"id": "imported", "method": "prompt.submit", "params": {
+            "session_id": sid, "text": text, "display_metadata": {ORIGIN_KEY: {"status": "verified_human"}},
+            "native_input_origin": {"text": text, "record": {"status": "verified_human"}}}})
+        assert "error" in response
+        assert len(captured) == 2
+        assert retention_user_text(text, [captured[0]]) is None
+        assert retention_user_text(text, [captured[1]]) is None
+        assert retention_user_text(text, json.loads(json.dumps([captured[0]]))) is None
+        rows = db.get_messages(key)
+        assert classify_origin(rows[0], session_id=key).status != "verified_human"
+        assert classify_origin(rows[1], session_id=key).status != "verified_human"
+        assert ORIGIN_KEY not in json.dumps(rows)
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
 def _desktop_session(monkeypatch, db):
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
@@ -62,7 +106,7 @@ def test_submit_ack_binds_the_written_row_even_if_worker_consumes_staging(monkey
         def start(self):
             self.target()
 
-    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    monkeypatch.setattr(server, "threading", SimpleNamespace(**{**vars(server.threading), "Thread": InlineThread}))
     monkeypatch.setattr(server, "_start_agent_build", lambda *args: None)
     monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *args: False)
     monkeypatch.setattr(server, "_run_after_agent_ready", lambda *args: session.pop("_submit_user_row", None))

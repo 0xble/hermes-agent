@@ -780,7 +780,11 @@ class GatewayAgent:
                 params = self._submit_params(user_message, persist_user_message, turn_author)
                 if self._stop(turn)():
                     raise CallStopped("prompt.submit")
-                receipt = self.connection.call("prompt.submit", **{**params, "session_id": turn.session_id})
+                from agent.source_origin_ingress import publish_input
+                from hermes_constants import get_hermes_home
+                with publish_input(get_hermes_home(), turn.session_id, params["submission_id"],
+                                   self._pending_cli_user_message, params["text"]):
+                    receipt = self.connection.call("prompt.submit", **{**params, "session_id": turn.session_id})
             except CallStopped:  # main moved on (a later turn, /new, Ctrl-C's bound) before the submit
                 self._give_back_turn_route()  # nothing was sent: the pick is still owed
                 return self._failed(history, user_message, "Stopped before the prompt was sent; nothing was sent.")

@@ -8,6 +8,25 @@ from hermes_state import SessionDB
 from hermes_state_evidence import EvidenceUnavailable, evidence_snapshot, inventory_rows
 
 
+def test_explicit_empty_control_roots_still_excludes_native_control_components(tmp_path):
+    import json
+    from hermes_cli.session_evidence import _load_policy
+    from hermes_state_acquisition import acquisition_preflight, graph_identity
+    path = tmp_path / "fictional.db"
+    with SessionDB(path) as db:
+        db.create_session("allowed", source="tui")
+        db.create_session("control", source="audit_control")
+    with evidence_snapshot(path) as conn:
+        manifest = tmp_path / "roots.json"
+        manifest.write_text(json.dumps({"version": 1, "owner": "fictional", "roots": [],
+            "coverage_complete": True, "inventory_sha256": graph_identity(list(inventory_rows(conn)))}))
+        policy = _load_policy(manifest)
+        assert policy.roots == ()
+        assert acquisition_preflight(conn, "allowed", policy)
+        with pytest.raises(EvidenceUnavailable, match="control component"):
+            acquisition_preflight(conn, "control", policy)
+
+
 def test_control_closure_and_origin_preflight_precede_all_body_queries(tmp_path):
     from agent.source_origin import NativeOrigin
     from hermes_state_acquisition import AcquisitionPolicy, acquire_rows, graph_identity

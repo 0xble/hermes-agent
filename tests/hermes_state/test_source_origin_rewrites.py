@@ -25,7 +25,7 @@ def test_origin_survives_only_unchanged_stored_occurrences(tmp_path, rewrite):
             if rewrite == "seen":
                 assert db.take_unseen_reactions("fixture", author="agent")
         elif rewrite == "display_kind":
-            forged = {**json.loads(json.dumps(row["display_metadata"][ORIGIN_KEY])), "principal": "forged"}
+            forged = {**json.loads(json.dumps(row["display_metadata"].origin)), "principal": "forged"}
             assert db.set_latest_matching_message_display_kind(
                 "fixture", role="user", content=text, display_kind="chat", display_metadata={ORIGIN_KEY: forged})
         else:
@@ -39,7 +39,7 @@ def test_origin_survives_only_unchanged_stored_occurrences(tmp_path, rewrite):
                 "changed_role": {"role": "assistant"},
             }.get(rewrite, {}))
             if rewrite == "tampered_record":
-                messages[0]["display_metadata"][ORIGIN_KEY]["principal"] = "forged"
+                messages[0]["display_metadata"].origin["principal"] = "forged"
             if rewrite == "batch":
                 db.archive_and_compact("fixture", messages)
             else:

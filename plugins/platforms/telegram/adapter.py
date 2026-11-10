@@ -8946,13 +8946,15 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         _chat_id_str = str(chat.id)
         channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
         event = MessageEvent(
-            text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
+            text=message.text or message.caption or "", message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
             edit_revision=self._edit_revision(message, update_id), timestamp=message.date)
         from gateway.source_origin import stamp_telegram_person
-        return stamp_telegram_person(event, message)
+        stamp_telegram_person(event, message)
+        event.text = expand_link_entities(message, origin_event=event)
+        return event
 
     @staticmethod
     def _edit_revision(message, update_id: Optional[int]) -> Optional[str]:

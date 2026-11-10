@@ -58,7 +58,8 @@ def replay_epoch() -> str:
 
 def _freeze_params(params: dict) -> bytes:
     """Serialize one replay snapshot before the caller can mutate its object graph."""
-    return json.dumps(params, ensure_ascii=False, separators=(",", ":")).encode(
+    from agent.source_origin import public_origin_projection
+    return json.dumps(public_origin_projection(params), ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8", errors="surrogatepass"
     )
 

@@ -32,6 +32,7 @@ def test_only_short_numeric_codes_require_word_boundaries():
     safe_messages = _redact_for_provider(messages)
     assert "482913" not in json.dumps(safe_messages)
     assert "Keep notices off." in safe_messages[0]["content"]
+    assert "_hermes_source_origin" not in json.dumps(safe_messages)
     assert messages[0]["display_metadata"]["_hermes_source_origin"] is receipt
 
 
@@ -50,7 +51,25 @@ def test_native_origin_cannot_silently_serialize_as_empty_metadata():
         json.dumps({"origin": receipt})
 
 
-def test_missing_origin_retention_skip_is_debug_logged(monkeypatch, caplog):
+@pytest.mark.parametrize(("text", "repeat", "secret"), [
+    ("The OTP 482913 arrived, keep notices off.", "Code 482913", "482913"),
+    ("My password is P@ssw0rd!", "Use P@ssw0rd! later", "P@ssw0rd!"),
+    ("Recovery codes: 482913, 573024.", "Code 573024", "573024"),
+    ("Password: P@ss,w0rd!", "Use P@ss,w0rd! later", "P@ss,w0rd!"),
+    ('My password is "Abc! xyz".', "Use Abc! xyz later", "xyz"),
+])
+def test_every_held_value_is_learned_across_payloads(text, repeat, secret):
+    assert secret not in json.dumps(_redact_for_provider(text, repeat))
+
+
+@pytest.mark.parametrize("text", ["My password is wrong.", "The API key is required for login.",
+                                   "My password is correct.", "The API key is configured."])
+def test_authentication_labels_without_values_pass_unchanged(text):
+    assert _redact_for_provider(text) == text
+    assert _redact_for_provider({"content": text}, text) == ({"content": text}, text)
+
+
+def test_missing_origin_retention_skip_is_info_logged_by_surface(monkeypatch, caplog):
     from agent.memory_manager import MemoryManager
 
     class FictionalArchive:
@@ -64,6 +83,9 @@ def test_missing_origin_retention_skip_is_debug_logged(monkeypatch, caplog):
     manager._providers = [FictionalArchive()]
     monkeypatch.setattr(manager, "_owner_allows", lambda hook: True)
     monkeypatch.setattr(manager, "_submit_background", lambda fn: fn())
-    with caplog.at_level("DEBUG", logger="agent.memory_manager"):
-        manager.sync_all("Keep notices off.", "Acknowledged.", messages=[])
-    assert "Skipping automatic retention for fictional: no verified origin" in caplog.text
+    with caplog.at_level("INFO", logger="agent.memory_manager"):
+        manager.sync_all("Keep notices off.", "Acknowledged.", messages=[], platform="slack")
+        manager.sync_all("Keep notices off.", "Acknowledged.", messages=[], platform="slack")
+        manager.sync_all("Keep notices off.", "Acknowledged.", messages=[], platform="tui")
+    assert "missing verified origin surface=slack count=2" in caplog.text
+    assert "missing verified origin surface=tui count=1" in caplog.text

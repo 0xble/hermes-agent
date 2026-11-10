@@ -24,6 +24,32 @@ def stamp_telegram_person(event, message):
     return event
 
 
+def insert_event_context(event, text, offset, addition):
+    """Update the receipt at the formatter's insertion boundary, never by substring search."""
+    receipt = getattr(event, "_native_origin", None)
+    if isinstance(receipt, NativeOrigin) and receipt.text == text:
+        event._native_origin = receipt.insert(offset, addition)
+    return text[:offset] + addition + text[offset:]
+
+
+def stamp_slack_person(event, native, authored_text, *, verified_person=False):
+    """Only the adapter's native message event can witness the flat authored body."""
+    user = native.get("user")
+    if (verified_person is not True or not isinstance(user, str) or not user or native.get("bot_id") or native.get("bot_profile")
+            or (native.get("app_id") and not native.get("client_msg_id"))
+            or native.get("subtype") not in (None, "file_share", "thread_broadcast")
+            or native.get("_hermes_force_process") or event.internal
+            or (native.get("user_profile") or {}).get("is_bot")
+            or not event.message_id or not authored_text or not event.text.startswith(authored_text)):
+        return event
+    from agent.source_origin import authored_text_spans
+    spans = authored_text_spans(authored_text)
+    if spans:
+        event._native_origin = NativeOrigin.person(event.text, platform="slack", principal=user,
+                                                  event=str(event.message_id), authored=spans)
+    return event
+
+
 def _telegram_authored_spans(text, entities):
     """Telegram quotes use UTF-16 offsets. Their body is context, not a new assertion."""
     quoted = []

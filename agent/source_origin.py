@@ -58,6 +58,22 @@ class NativeOrigin:
                 "characters": len(self.text), "session_id": session_id, "message_uid": message_uid,
                 "references": self.references}
 
+    def insert(self, offset, addition):
+        """A formatter inserts context without certifying the inserted characters."""
+        if not addition:
+            return self
+        spans, references = [], []
+        for left, right, event in self.references:
+            if left < offset < right:
+                spans.extend(((left, offset), (offset + len(addition), right + len(addition))))
+                references.extend(((left, offset, event), (offset + len(addition), right + len(addition), event)))
+            else:
+                shift = len(addition) if left >= offset else 0
+                spans.append((left + shift, right + shift))
+                references.append((left + shift, right + shift, event))
+        return NativeOrigin(self.text[:offset] + addition + self.text[offset:], self.status,
+                            self.platform, self.principal, self.event, tuple(spans), tuple(references))
+
 
 class _NativeRecord(dict):
     """Only the native occurrence writer may serialize a reserved stamp."""
@@ -95,6 +111,51 @@ def native_origin(metadata):
     return None
 
 
+def public_origin_projection(value):
+    """Client projections never expose reserved evidence, even its empty anchor."""
+    if isinstance(value, dict):
+        return {key: public_origin_projection(item) for key, item in value.items() if key != ORIGIN_KEY}
+    if isinstance(value, (list, tuple)):
+        return [public_origin_projection(item) for item in value]
+    return value
+
+
+def bind_turn_origin(message, platform, persisted_content=None):
+    """Bind the durable variant and native typed event before the shared producer guard."""
+    if persisted_content is not None and persisted_content != message.get("content"):
+        message["_replay_persisted_content"] = persisted_content
+    receipt = native_origin(message.get("display_metadata"))
+    if (receipt is not None and receipt.platform in {"cli", "tui"}
+            and receipt.text == message.get("_replay_persisted_content", message.get("content"))):
+        message["platform_message_id"] = receipt.event
+    stamp_runtime_origin(message, platform)
+
+
+def typed_input_message(text, platform):
+    """Called only where an interactive surface accepts typed text, never by turn builders."""
+    import getpass
+    from uuid import uuid4
+    event = "typed:" + uuid4().hex
+    return {"role": "user", "content": text, "platform_message_id": event,
+            "display_metadata": origin_metadata(NativeOrigin.person(
+                text, platform=platform, principal=getpass.getuser(), event=event, authored=authored_text_spans(text)))}
+
+
+def authored_text_spans(text):
+    """Plain-text quote lines remain references on native interactive surfaces."""
+    spans, offset = [], 0
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith((">>>", "&gt;&gt;&gt;")):
+            break  # Slack's multiline quotation covers the rest of the body.
+        if not line.lstrip().startswith((">", "&gt;")):
+            if spans and spans[-1][1] == offset:
+                spans[-1] = (spans[-1][0], offset + len(line))
+            else:
+                spans.append((offset, offset + len(line)))
+        offset += len(line)
+    return tuple(spans)
+
+
 class _StoredRecord(dict):
     """A native read retains its original bytes and occurrence binding across metadata edits."""
     def __init__(self, record, binding):
@@ -106,25 +167,37 @@ class _StoredRecord(dict):
         return json.dumps(self, sort_keys=True) == self.sealed
 
 
+class _StoredMetadata(dict):
+    """Public metadata with the native row's origin kept off every JSON projection."""
+    def __deepcopy__(self, memo):
+        from copy import deepcopy
+        return deepcopy(dict(self), memo)
+
+    def __bool__(self):
+        return bool(len(self)) or hasattr(self, "origin")
+
+
 def stored_origin_metadata(metadata, row=None, *, session_id=None):
     """Called only on metadata acquired from a stored row, never client/import input."""
     if metadata is None:
         return None
-    result = dict(metadata)
-    record = result.get(ORIGIN_KEY)
+    result = _StoredMetadata(metadata)
+    record = getattr(metadata, "origin", result.pop(ORIGIN_KEY, None))
     if isinstance(record, dict):
         binding = None
         if row is not None:
             binding = (row["session_id"] if "session_id" in row.keys() else session_id,
                        row["message_uid"], row["role"], row["platform_message_id"], row["content"])
-        result[ORIGIN_KEY] = _StoredRecord(record, binding)
+        result.origin = _StoredRecord(record, binding)
     return result
 
 
 def reserve_metadata(metadata, stored_metadata=None):
     """Imports and client metadata cannot mint origin evidence. Stored records may survive."""
     result = dict(metadata or {})
-    receipt = result.get(ORIGIN_KEY)
+    receipt = getattr(metadata, "origin", result.get(ORIGIN_KEY))
+    if isinstance(metadata, _StoredMetadata) and isinstance(receipt, _StoredRecord):
+        result[ORIGIN_KEY] = receipt
     if not (isinstance(receipt, _NativeRecord)
             or isinstance(receipt, _StoredRecord) and receipt.unchanged()):
         result.pop(ORIGIN_KEY, None)
@@ -151,7 +224,7 @@ def persistence_metadata(metadata, message, session_id, encoded_content=None):
     if not isinstance(metadata, dict):
         return metadata
     result = reserve_metadata(metadata)
-    record = metadata.get(ORIGIN_KEY)
+    record = getattr(metadata, "origin", metadata.get(ORIGIN_KEY))
     if isinstance(record, _StoredRecord):
         binding = (session_id, message.get("message_uid"), message.get("role"),
                    message.get("platform_message_id") or message.get("message_id"), encoded_content)
@@ -213,7 +286,7 @@ def classify_origin(message, *, session_id):
             metadata = json.loads(metadata)
         except ValueError:
             return OriginDecision("unknown")
-    record = metadata.get(ORIGIN_KEY) if isinstance(metadata, dict) else None
+    record = getattr(metadata, "origin", metadata.get(ORIGIN_KEY)) if isinstance(metadata, dict) else None
     if not isinstance(record, dict):
         from agent.synthetic_prompt import is_runtime_prompt
         return OriginDecision("generated" if is_runtime_prompt(display_kind=message.get("display_kind")) else "unknown")
@@ -249,7 +322,7 @@ def retention_user_text(text, messages):
     for message in reversed(messages or ()):
         if message.get("role") != "user":
             continue
-        if message.get("content") != text:
+        if message.get("_replay_persisted_content", message.get("content")) != text:
             return None
         metadata = message.get("display_metadata") or {}
         receipt = native_origin(metadata)

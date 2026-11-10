@@ -6048,8 +6048,7 @@ class TestDisplayMetadataPersistence:
         )
         conv = db.get_messages_as_conversation("s1")
         assert conv[0]["display_kind"] == "async_delegation_complete"
-        assert {k: v for k, v in conv[0]["display_metadata"].items() if k != "_hermes_source_origin"} == meta
-        assert conv[0]["display_metadata"]["_hermes_source_origin"]["status"] == "generated"
+        assert conv[0]["display_metadata"] == meta
 
     def test_replace_messages_preserves_display_metadata(self, db):
         db.create_session("s1", source="cli")
@@ -6065,7 +6064,8 @@ class TestDisplayMetadataPersistence:
         db.replace_messages("s1", conv)
         reloaded = db.get_messages_as_conversation("s1")
         assert reloaded[0]["display_kind"] == "async_delegation_complete"
-        assert {k: v for k, v in reloaded[0]["display_metadata"].items() if k != "_hermes_source_origin"} == meta
+        assert reloaded[0]["display_metadata"] == meta
+
 
 
 class TestDisplayMetadataReadPaths:
@@ -6109,9 +6109,8 @@ class TestDisplayMetadataReadPaths:
     @pytest.mark.parametrize("reader", READERS)
     def test_every_reader_decodes_display_metadata(self, db, reader):
         message_id, anchor_id = self._seed(db)
-        metadata = self._read(db, reader, message_id, anchor_id)["display_metadata"]
-        assert {k: v for k, v in metadata.items() if k != "_hermes_source_origin"} == self.META
-        assert metadata["_hermes_source_origin"]["status"] == "generated"
+        assert self._read(db, reader, message_id, anchor_id)["display_metadata"] == self.META
+
 
     @pytest.mark.parametrize("reader", READERS)
     @pytest.mark.parametrize("raw", ["", "{not-json", "[]", '"text"', "0"])
@@ -6143,10 +6142,11 @@ class TestDisplayMetadataReadPaths:
         target = SessionDB(db_path=tmp_path / "imported.db")
         try:
             target.import_sessions([json.loads(json.dumps(blob))])
-            assert {k: v for k, v in target.get_messages_as_conversation("s1")[0]["display_metadata"].items() if k != "_hermes_source_origin"} == self.META
-            assert {k: v for k, v in target.get_messages("s1")[0]["display_metadata"].items() if k != "_hermes_source_origin"} == self.META
+            assert target.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
+            assert target.get_messages("s1")[0]["display_metadata"] == self.META
         finally:
             target.close()
+
 
 class TestUnknownBlobColumnSurvivesRead:
     """A `messages` column added by a future migration must not take every reader down with it.

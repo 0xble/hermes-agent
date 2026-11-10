@@ -363,6 +363,8 @@ async def execute_admission(authority, ref, row):
         from gateway.session_ingress_media import restore_attachments
         event = MessageEvent(text=row['payload']['text'], source=live.source,
                              message_id=row['admission_id'], **restore_attachments(row['payload']))
+        from agent.source_origin_ingress import restore_input
+        event._native_origin = restore_input(row['payload'].get('source_origin_v1'), event.text, event.message_id)
         if 'local_automation_v1' in row['payload']:
             from gateway.session_automation import restore_local_automation
             event = restore_local_automation(authority, ref, row)
