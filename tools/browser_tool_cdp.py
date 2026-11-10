@@ -167,7 +167,9 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
     snapshots just lack ``pending_dialogs`` / ``frame_tree``.
     """
     _bt = _origin()
-    cdp_url = _get_cdp_override()
+    from tools.browser_task_cdp import task_browser_url
+    attached = task_browser_url(task_id)
+    cdp_url = _resolve_cdp_override(attached) if attached else _get_cdp_override()
     if not cdp_url:
         with _bt._cleanup_lock:
             session_info = _bt._active_sessions.get(task_id, {})

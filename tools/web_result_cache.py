@@ -590,13 +590,20 @@ def extract_cache_get(url: str, format: Optional[str] = None, provider: str = ""
         content = file_path.read_text(encoding="utf-8-sig")
     except Exception:
         return None
-    # The body file and its index entry are separate writes; serve only the body the entry (and its
-    # ``final_url``) was recorded for. Entries from before the digest carry no ``final_url`` either.
+    # The body file and its index are separate writes: provenance/final URL must describe this body.
     if ("content_sha256" in entry or "final_url" in entry) and entry.get("content_sha256") != _content_sha(content):
         return None
+    provenance = entry.get("provenance", {})
+    if not isinstance(provenance, dict):
+        return None
     logger.info("web_extract cache hit: %s", url)
-    return {"url": url, "title": entry.get("title", ""), "content": content, "error": None, "cached": True,
-            "final_url": entry.get("final_url") or url}
+    result = {"url": entry.get("result_url", url), "title": entry.get("title", ""), "content": content, "error": None, "cached": True,
+            "final_url": entry.get("final_url") or entry.get("result_url") or url}
+    if result["url"] != url:
+        result["requested_url"] = url
+    result.update({key: value for key, value in provenance.items()
+                   if key in ("fallback_from", "extract_backend", "direct_fetch_error")})
+    return result
 
 
 def _content_sha(content: str) -> str:
@@ -623,7 +630,8 @@ def extract_cache_record_final_url(
 
 
 def extract_cache_put(
-    url: str, content: str, title: str = "", format: Optional[str] = None, provider: str = ""
+    url: str, content: str, title: str = "", format: Optional[str] = None, provider: str = "",
+    *, result_url: Optional[str] = None, provenance: Optional[dict] = None
 ) -> bool:
     """Store one successful extraction's full clean text for TTL reuse; pages over the truncate-store
     ceiling are not cached (serving a capped copy back as if whole would silently lose the tail).
@@ -643,6 +651,10 @@ def extract_cache_put(
                 "url": url, "file": str(file_path), "title": title or "", "fetched_at": time.time(),
                 "content_sha256": _content_sha(content),
             }
+            if provenance:
+                index[_url_digest(url, format, provider)]["provenance"] = provenance
+            if result_url and result_url != url:
+                index[_url_digest(url, format, provider)]["result_url"] = result_url
             _save_index(index)
         return True
     except Exception as exc:

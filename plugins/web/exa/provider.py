@@ -83,8 +83,11 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
                 return keyless_extract("Exa", "exa", urls, logger)
             logger.info("Exa extract: %d URL(s)", len(urls))
             response = _get_exa_client().get_contents(urls, text=True)
-            results = [document(r.url or "", r.title or "", r.text or "") for r in response.results or []]
-            # A URL Exa could not fetch is absent from ``results``; its reason is in ``statuses``.
+            # /contents preserves requested identity separately from the final URL.
+            # Opaque IDs must not imply a redirect, while per-page statuses remain typed errors.
+            results = [document(r.url or "", r.title or "", r.text or "",
+                                source_url=r.id if getattr(r, "id", None) in urls else None)
+                       for r in response.results or []]
             return results + [
                 vendor_error_entry(s.id or "", status=_crawl_status(s.error), reason=getattr(s.error, "tag", None))
                 for s in getattr(response, "statuses", None) or [] if s.status == "error"
