@@ -27,6 +27,7 @@ from registration_lifecycle import replacement_coordinator
 from hermes_cli.plugins_discovery import ENTRY_POINTS_GROUP, _select_entry_point_group
 from hermes_cli.plugins_manifest import PluginManifest, manifest_key, portable_mcp_server_name, validate_config_schema
 from hermes_cli.plugins_state import _plugin_settings_entry
+from hermes_cli.plugins_identity import PluginSourceCapture, PluginSourceLoader, registration_sources
 
 if TYPE_CHECKING:  # pragma: no cover
     from hermes_cli.plugins import LoadedPlugin, PluginContext
@@ -280,6 +281,19 @@ def installed_in_selected_environment(requirements: list[str]) -> bool:
 
 
 class PluginLoaderMixin:
+    def list_plugins(self) -> list[dict[str, Any]]:
+        """Return registration state without importing, dispatching or reading source files."""
+        return [
+            {
+                "name": p.manifest.name, "key": manifest_key(p.manifest), "kind": p.manifest.kind,
+                "version": p.manifest.version, "description": p.manifest.description,
+                "source": p.manifest.source, "enabled": p.enabled, "tools": len(p.tools_registered),
+                "hooks": len(p.hooks_registered), "middleware": len(p.middleware_registered),
+                "commands": len(p.commands_registered), "error": p.error,
+                "code_identity": dict(p.code_identity) if p.code_identity is not None else None,
+            } for _key, p in sorted(self._plugins.items())
+        ]
+
     def on_plugin_loaded(self, callback: Callable[[list[dict[str, Any]]], Any]) -> Callable[[], None]:
         """Subscribe to "a discovery sweep loaded plugins this process did not have": fires from INSIDE
         :meth:`discover_and_load` (never emitted by an install RPC) with one
@@ -461,8 +475,9 @@ class PluginLoaderMixin:
             # adapter later must reuse it rather than execute it twice.
             loaded.module = module
             self._predeclared_modules[lookup_key] = module
-            tools_module = importlib.import_module(f"{module.__name__}.tools")
-            register_tools = getattr(tools_module, "register_tools", None)
+            with registration_sources(module):
+                tools_module = importlib.import_module(f"{module.__name__}.tools")
+                register_tools = getattr(tools_module, "register_tools", None)
             if register_tools is None:
                 logger.warning(
                     "Plugin '%s' declares provides_tools %s but its tools.py "
@@ -470,7 +485,8 @@ class PluginLoaderMixin:
                     "available in CLI/TUI sessions.", lookup_key, declared,
                 )
                 return
-            register_tools(PluginContext(manifest, self))
+            with registration_sources(module):
+                register_tools(PluginContext(manifest, self))
             registered = _credit()
             logger.debug(
                 "Deferred platform '%s': pre-registered %d client tool(s) %s", lookup_key, len(registered),
@@ -569,21 +585,21 @@ class PluginLoaderMixin:
         ctx = PluginContext(manifest, self)
         in_host = self._runs_in_plugin_host(manifest)
 
-        def _import_and_register() -> bool:
+        def _import_and_register() -> tuple[bool, dict[str, Any] | None]:
             """Import + register() — the part a plugin controls, so the part the deadline covers."""
             # Declared language packs register before any plugin code runs, inside the same ledger slice
             # so a failing register() unwinds them too.
             self._register_declared_locales(manifest, ctx)
             if in_host and not self._is_manifest_only_language_pack(manifest):
-                self._plugin_host().load(manifest, ctx, module_name=module_name,
-                                         entrypoint=manifest.source not in {"user", "project"})
-                return True
+                result = self._plugin_host().load(manifest, ctx, module_name=module_name,
+                                                entrypoint=manifest.source not in {"user", "project"})
+                return True, (result or {}).get("code_identity")
             # Reuse a deferred platform's already-imported package so its body doesn't run twice.
             # See #78050.
             module = self._predeclared_modules.pop(plugin_key, None)
             if module is None and manifest.source in {"user", "project", "bundled"}:
                 if self._is_manifest_only_language_pack(manifest):
-                    return True  # pure pack: locales/ is the whole plugin, no register() to run
+                    return True, None  # pure pack: locales/ is the whole plugin, no register() to run
                 module = self._load_directory_module(manifest, module_name=module_name)
             elif module is None:
                 module = self._load_entrypoint_module(manifest)
@@ -599,17 +615,20 @@ class PluginLoaderMixin:
             if register_fn is None:
                 loaded.error = "no register() function"
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
-                return False
-            register_fn(ctx)
-            return True
+                return False, None
+            with registration_sources(module) as capture:
+                register_fn(ctx)
+            return True, capture.identity(manifest.version) if capture is not None else None
 
         try:
-            if run_with_load_deadline(plugin_key, ctx, _import_and_register):
+            registered, identity = run_with_load_deadline(plugin_key, ctx, _import_and_register)
+            if registered:
                 self._attribute_registrations(loaded, plugin_key, registration_start)
                 loaded.enabled = True
                 from hermes_cli.plugins_ledger import _hook_source_of
 
                 self._drop_fallback_hooks(_hook_source_of(manifest.name, loaded.module))
+                loaded.code_identity = identity
         except (Exception, SystemExit) as exc:
             # SystemExit too: a plugin module with an unguarded ``main()``/``sys.exit()`` must not take the
             # whole process (and every other plugin's registry) down with it; KeyboardInterrupt still propagates.
@@ -808,8 +827,10 @@ class PluginLoaderMixin:
         # cached as "module_name.sub" and resolve from sys.modules first, so a stale submodule would keep
         # serving the previous load's code/state.
         _evict_modules(module_name)
+        capture = PluginSourceCapture(module_name, plugin_dir)
         spec = importlib.util.spec_from_file_location(
-            module_name, init_file, submodule_search_locations=[str(plugin_dir)])
+            module_name, init_file, loader=PluginSourceLoader(module_name, str(init_file), capture),
+            submodule_search_locations=[str(plugin_dir)])
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot create module spec for {init_file}")
         module = importlib.util.module_from_spec(spec)
@@ -817,7 +838,8 @@ class PluginLoaderMixin:
         module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
         sys.modules[module_name] = module
         try:
-            spec.loader.exec_module(module)
+            with capture:
+                spec.loader.exec_module(module)
         except BaseException:
             # Don't leave a half-initialized module (or its partially imported relative submodules) cached — a
             # retry or a same-slug plugin in another profile would inherit broken state.
@@ -830,5 +852,7 @@ class PluginLoaderMixin:
         the referenced attribute (normally ``register``) for the ``module:function`` form."""
         for ep in _select_entry_point_group(importlib.metadata.entry_points(), ENTRY_POINTS_GROUP):
             if ep.name == manifest.name:
-                return ep.load()
+                prefix = ep.value.partition(":")[0].partition(".")[0]
+                with PluginSourceCapture(prefix):
+                    return ep.load()
         raise ImportError(f"Entry point '{manifest.name}' not found in group '{ENTRY_POINTS_GROUP}'")

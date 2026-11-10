@@ -223,7 +223,7 @@ class PluginHost:
                 proc.wait(timeout=_SHUTDOWN_GRACE_SECS)
 
     # -- loading ------------------------------------------------------------------------------------
-    def load(self, manifest: Any, ctx: Any, *, module_name: Optional[str], entrypoint: bool) -> str:
+    def load(self, manifest: Any, ctx: Any, *, module_name: Optional[str], entrypoint: bool) -> dict[str, Any]:
         """Import ``manifest``'s plugin in the host and replay its registrations onto ``ctx``."""
         from hermes_cli.plugins import PluginContext, manifest_key
         channel = self.ensure_started()
@@ -247,7 +247,7 @@ class PluginHost:
         finally:
             self._loading = None
         ctx.on_unload(functools.partial(self._unload, plugin_key))
-        return str((result or {}).get("module") or module_name or "")
+        return result
 
     def load_instance(self, plugin_dir: Path, *, module_name: str, base_ref: str, capture: str,
                       ctx: Any = None, before_reload: Optional[Callable[[], None]] = None) -> Any:

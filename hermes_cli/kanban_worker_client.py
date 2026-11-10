@@ -8,6 +8,8 @@ except ModuleNotFoundError as exc:
         raise
 
 import asyncio
+from contextlib import closing
+import logging
 import os
 from pathlib import Path
 import sys
@@ -102,6 +104,18 @@ def _submit():
         params = {'board': os.environ['HERMES_KANBAN_BOARD'], 'task_id': os.environ['HERMES_KANBAN_TASK'],
             'run_id': int(os.environ['HERMES_KANBAN_RUN_ID']), 'claim_lock': os.environ['HERMES_KANBAN_CLAIM_LOCK']}
         board_db = os.environ['HERMES_KANBAN_DB']
+        # A dispatcher killed after spawn may never record our PID. Unlike the
+        # CLI's best-effort bridge, owner admission requires confirmed adoption.
+        try:
+            from hermes_cli import kanban_db_connect as kbc, kanban_db_dispatch as kbd
+            with closing(kbc.connect(Path(board_db))) as conn:
+                adopted = kbd.adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid())
+        except Exception:
+            logging.getLogger(__name__).exception('Kanban owner refused: worker registration failed')
+            return 1
+        if not adopted:
+            print('Kanban owner refused: run already reclaimed', file=sys.stderr)
+            return 1
         # Owner startup must never inherit this worker's task/tool/goal identity.
         for key in list(os.environ):
             # The busy timeout is a host tuning knob, not task identity: the answer budget reads it.

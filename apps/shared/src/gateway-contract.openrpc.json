@@ -22233,6 +22233,17 @@
             ],
             "default": null,
             "title": "Error"
+          },
+          "code_identity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PluginCodeIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -27683,6 +27694,35 @@
         ],
         "title": "PluginCatalogLookupStatus",
         "type": "string"
+      },
+      "PluginCodeIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "title": "Digest",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          },
+          "loaded_at": {
+            "title": "Loaded At",
+            "type": "string"
+          },
+          "module_count": {
+            "title": "Module Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "digest",
+          "version",
+          "loaded_at",
+          "module_count"
+        ],
+        "title": "PluginCodeIdentity",
+        "type": "object"
       },
       "PluginLiveNow": {
         "additionalProperties": false,

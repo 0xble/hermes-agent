@@ -4426,6 +4426,13 @@ export interface LegacyPluginRow {
   hooks?: number | null
   commands?: number | null
   error?: string | null
+  code_identity?: PluginCodeIdentity | null
+}
+export interface PluginCodeIdentity {
+  digest: string
+  version: string
+  loaded_at: string
+  module_count: number
 }
 export interface PluginToolsetRow {
   key: string

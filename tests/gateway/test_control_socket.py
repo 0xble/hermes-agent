@@ -137,6 +137,69 @@ def test_server_answers_identify_and_status(home: Path):
     assert status == {"gateway_state": "running"}
 
 
+def test_status_preserves_role_when_plugin_rows_raise(home, monkeypatch, caplog):
+    from gateway import control_socket
+    from hermes_cli import plugins
+
+    monkeypatch.setattr(control_socket, "_plugins_error_logged", False)
+    manager = plugins.get_plugin_manager()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(manager, "list_plugins", lambda: (_ for _ in ()).throw(ValueError("row read failed")))
+    monkeypatch.setattr("gateway.status.read_runtime_status", lambda: {"gateway_state": "running"})
+    role = {"slot": "b", "standby": True, "ready": False}
+    monkeypatch.setattr("gateway.zero_cut_standby.readiness", lambda: role)
+    server = GatewayControlServer(home)
+    for _ in range(2):
+        response = json.loads(server.handle_request_line(b'{"verb":"status"}'))
+        assert response["ok"] is True
+        result = response["result"]
+        assert all(result[key] == value for key, value in role.items())
+        assert result["gateway_state"] == "running"
+        assert result["answering_pid"] > 0 and result["protocol"] == CONTROL_PROTOCOL_VERSION
+        assert result["plugins"] is None
+        assert "row read failed" in result["plugins_error"]
+    assert sum("row read failed" in record.message for record in caplog.records) == 1
+
+
+def test_status_does_not_read_partial_plugins_during_discovery(home, monkeypatch):
+    import threading
+    from hermes_cli import plugins
+
+    manager = plugins.get_plugin_manager()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    rows = [{"key": "complete", "name": "complete", "code_identity": None}]
+    monkeypatch.setattr(manager, "list_plugins", lambda: rows)
+    server = GatewayControlServer(home)
+
+    def status():
+        response = json.loads(server.handle_request_line(b'{"verb":"status"}'))
+        assert response["ok"] is True
+        return response["result"]
+
+    assert status()["plugins"] == rows
+    locked, release = threading.Event(), threading.Event()
+
+    def discovery():
+        with manager._discovery_lock:
+            rows.append({"key": "partial"})
+            locked.set()
+            release.wait(5)
+            rows.pop()
+
+    thread = threading.Thread(target=discovery)
+    thread.start()
+    try:
+        assert locked.wait(5)
+        result = status()
+        assert result["plugins"] is None
+        assert not release.is_set()
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert status()["plugins"] == rows
+
+
 def test_unknown_verb_and_malformed_request(home: Path):
     async def scenario():
         server = GatewayControlServer(
