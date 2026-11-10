@@ -105,7 +105,10 @@ async def test_display_kind_is_a_closed_producer_set(tmp_path, monkeypatch):
     assert automation_display_metadata(trusted) == trusted
     event = MessageEvent(text='notice', internal=True, metadata=dict(trusted))
     assert display_kind_for_event(event) == 'process_complete'
-    assert display_metadata_for_event(event) == {'display_text': trusted['display_text']}
+    metadata = display_metadata_for_event(event)
+    assert metadata['display_text'] == trusted['display_text']
+    assert metadata['_hermes_source_origin'].decision(event.text).status == 'generated'
+    assert set(metadata) == {'display_text', '_hermes_source_origin'}
     assert display_kind_for_event(MessageEvent(text='x', metadata=dict(trusted))) is None
     for bad in ({'display_kind': 'hidden', 'display_text': 'x'}, {'display_kind': 'process_complete'},
                 {'display_text': 'x'}, {'display_kind': 'process_complete', 'display_text': ''},

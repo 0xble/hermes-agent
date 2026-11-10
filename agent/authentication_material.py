@@ -3,10 +3,11 @@
 import re
 
 # Context is essential: ordinary counts, dates and identifiers are not authentication values.
-_LABEL = r"(?:recovery|backup|verification|authentication|one[ -]time|login|sign[ -]in|2fa|otp)\s+(?:code|token|password)s?"
+_LABEL = (r"(?:(?:recovery|backup|verification|authentication|one[ -]time|login|sign[ -]in|2fa)\s+"
+          r"(?:code|token|password)s?|otp|password|passphrase|api[ _-]?key|secret[ _-]?key)")
 _VALUE = re.compile(r"(?P<label>\b" + _LABEL + r"\s*(?:is\s+|are\s+|[:=]\s*))"
                     r"(?P<value>`?[A-Za-z0-9][A-Za-z0-9_+/-]{3,127}`?)", re.IGNORECASE)
-_AUTH = re.compile(r"\b" + _LABEL + r"\b", re.IGNORECASE)
+_AUTH = re.compile(r"\b" + _LABEL + r"\s*(?:[:=]|\bis\b|\bare\b|\s+[`'\"]?\d{4,})", re.IGNORECASE)
 _SENTENCE = re.compile(r"[^.!?\n]+[.!?]?")
 
 

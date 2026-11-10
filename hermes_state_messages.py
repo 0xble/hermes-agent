@@ -307,7 +307,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             # Writers that copy a fixed field list (/branch) carry the key, not display_metadata.
             display_metadata = {**(display_metadata or {}), DATA_USE: list(msg[DATA_USE])}
         from agent.source_origin import persistence_metadata
-        display_metadata = self._encode_display_metadata(persistence_metadata(display_metadata, msg, session_id))
+        display_metadata = self._encode_display_metadata(persistence_metadata(display_metadata, msg, session_id, encoded_content))
         identity_row = {
             "role": role, "content": encoded_content, "timestamp": message_timestamp,
             "tool_call_id": msg.get("tool_call_id"), "tool_calls": encoded_tool_calls,

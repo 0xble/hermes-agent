@@ -6,6 +6,19 @@ from hermes_state import SessionDB
 
 
 def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_path, monkeypatch):
+    from agent.memory_manager import MemoryManager
+    from plugins.memory.hindsight import HindsightMemoryProvider
+
+    provider, manager, retained = HindsightMemoryProvider(), MemoryManager(), []
+    manager._providers = [provider]
+    monkeypatch.setattr(manager, "_owner_allows", lambda hook: True)
+    monkeypatch.setattr(manager, "_submit_background", lambda fn: fn())
+    monkeypatch.setattr(provider, "sync_turn", lambda *args, **kwargs: retained.append(args))
+    for text in ("Keep project progress notices off.",
+                 "Goal contract: finish Lantern notice routing\nCompleted, permanently fixed."):
+        manager.sync_all(text, "Completed, permanently fixed.", messages=[
+            {"role": "user", "content": text, "display_metadata": {"author": "Brian"}}])
+    assert retained == []
     from agent.source_origin import NativeOrigin, classify_origin, human_spans
     from agent.memory_manager import _redact_for_provider
     from gateway.platforms.event import MessageEvent
@@ -17,7 +30,7 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
     directive = "Keep project progress notices off."
     correction = "No, progress notices stay off. I did not say the routing goal was finished."
     generated = "Goal contract: finish Lantern notice routing\nCompleted, permanently fixed."
-    native = SimpleNamespace(from_user=SimpleNamespace(id="person-1", is_bot=False),
+    native = SimpleNamespace(from_user=SimpleNamespace(id=1, is_bot=False), text=directive,
                              forward_origin=None, via_bot=None, sender_chat=None)
     event = stamp_telegram_person(MessageEvent(text=directive, message_id="event-1"), native)
     assert source_origin_metadata(event, directive)["_hermes_source_origin"].decision(directive).status == "verified_human"
@@ -30,7 +43,7 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
     assert source_origin_metadata(control, control.text)["_hermes_source_origin"].references[0][2] == "event-1"
     assert not source_origin_metadata(forwarded, directive)
     try:
-        for text in (directive, correction, generated):
+        for text in (directive, correction):
             proof = NativeOrigin.person(text, platform="fictional", principal="person-1", event="event-1")
             uid = "occurrence-" + str(len(text))
             db.append_message("allowed", "user", text, message_uid=uid, platform_message_id="event-1",
@@ -75,13 +88,14 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
         # A genuinely human recovery intent can receive generated credentials. Keep its role,
         # adjacent preference and ordinary numbers before any provider gets the exchange.
         clean = _redact_for_provider([
-            {"role": "user", "content": "Help recover my account. Keep notices off. I have 3 projects."},
+            {"role": "user", "content": "Help recover my password. Keep notices off. I have 3 projects."},
             {"role": "assistant", "content": "Recovery code: 482913. Keep notices off. The limit is 12."},
         ])
         assert [m["role"] for m in clean] == ["user", "assistant"]
         assert "482913" not in clean[1]["content"]
         assert "Keep notices off." in clean[1]["content"] and "12" in clean[1]["content"]
         assert "3 projects" in clean[0]["content"]
+        assert "Help recover my password." in clean[0]["content"]
         assert "482913" not in json.dumps(_redact_for_provider("Recovery code: 482913", "482913"))
         from agent.memory_manager import MemoryManager
         retained = []

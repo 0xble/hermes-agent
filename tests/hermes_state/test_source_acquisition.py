@@ -21,15 +21,19 @@ def test_control_closure_and_origin_preflight_precede_all_body_queries(tmp_path)
              ("cycle-a", "cycle-b"), ("cycle-b", "cycle-a"), ("allowed", None),
              ("marked-control", None), ("marked-child", "marked-control")]
     for sid, parent in graph:
-        db.create_session(sid, source="oneshot" if sid == "control" else "telegram", parent_session_id=parent)
+        db.create_session(sid, source="oneshot" if sid == "control" else "telegram")
         db.append_message(sid, "user", "Goal contract: finish Lantern notice routing\nCompleted, permanently fixed.")
     directive = "Keep project progress notices off."
     for sid in ("allowed", "control"):
         proof = NativeOrigin.person(directive, platform="fictional", principal="person-1", event="event-positive")
         db.append_message(sid, "user", directive, platform_message_id="event-positive",
                           display_metadata={"_hermes_source_origin": proof})
+    db.append_message("allowed", "user", "generated relay", display_metadata={"_hermes_source_origin":
+        NativeOrigin.generated("generated relay", producer="relay", event="relay-1")})
     db.close()
     with sqlite3.connect(path) as writer:
+        # Legacy malformed lineage cannot be created with the native FK-checked writer.
+        writer.executemany("UPDATE sessions SET parent_session_id=? WHERE id=?", ((parent, sid) for sid, parent in graph))
         writer.execute("UPDATE sessions SET hidden=1, archived=1, profile_name='foreign' WHERE id='foreign'")
         writer.execute("UPDATE sessions SET created_source='audit_control' WHERE id='marked-control'")
         writer.execute("UPDATE messages SET active=0, compacted=1 WHERE session_id='compacted'")
@@ -62,6 +66,7 @@ def test_control_closure_and_origin_preflight_precede_all_body_queries(tmp_path)
         rows = list(acquire_rows(conn, "allowed", policy))
         assert [row.get("content") for row in rows if row["disposition"] == "eligible"] == [directive]
         assert rows[0]["disposition"] == "unresolved" and rows[0]["origin"] == "unknown"
+        assert any(row["origin"] == "generated" and row["disposition"] == "ineligible" and "content" not in row for row in rows)
     # An earlier successful inventory cannot authorize a later body snapshot after graph drift.
     with sqlite3.connect(path) as writer:
         writer.execute("UPDATE sessions SET parent_session_id='control' WHERE id='allowed'")

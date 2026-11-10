@@ -7,10 +7,11 @@ def stamp_telegram_person(event, message):
     user = getattr(message, "from_user", None)
     # A forwarded message, channel post, or bot-mediated payload is not this person's authored span.
     if (user is not None and getattr(user, "is_bot", None) is False
+            and type(getattr(user, "id", None)) is int and user.id > 0
             and not any(getattr(message, name, None) for name in ("forward_origin", "via_bot", "sender_chat"))
             and isinstance(event.text, str) and event.text and event.message_id):
         raw = getattr(message, "text", None) or getattr(message, "caption", None)
-        if raw is not None and raw != event.text:
+        if not isinstance(raw, str) or raw != event.text:
             return event
         spans = _telegram_authored_spans(event.text, getattr(message, "entities", None)
                                         or getattr(message, "caption_entities", None) or ())

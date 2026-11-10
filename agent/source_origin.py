@@ -68,7 +68,7 @@ def reserve_metadata(metadata):
     return result
 
 
-def persistence_metadata(metadata, message, session_id):
+def persistence_metadata(metadata, message, session_id, encoded_content=None):
     if isinstance(metadata, str):
         try:
             metadata = json.loads(metadata)
@@ -81,6 +81,8 @@ def persistence_metadata(metadata, message, session_id):
     result = reserve_metadata(metadata)
     receipt = metadata.get(ORIGIN_KEY)
     content = message.get("_replay_persisted_content", message.get("content"))
+    if isinstance(receipt, NativeOrigin) and encoded_content is not None and encoded_content != receipt.text:
+        receipt = None
     if not isinstance(receipt, NativeOrigin) and isinstance(content, str):
         from agent.synthetic_prompt import is_runtime_prompt
         if is_runtime_prompt(display_kind=message.get("display_kind")):
