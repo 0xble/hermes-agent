@@ -41,21 +41,31 @@ Runtime session resolution and the shared compression/branch/reset child-row pub
 
 `tests/hermes_state/test_session_delete_batches.py` covers a 1,025-message single/chain/prune regression, another SQLite writer committing between pages, interruption immediately after retirement and after a committed page, restart/next-prune recovery, invisibility through FTS and LIKE, propagated database errors, pending-marker expiry, snapshot fences, and message-byte bounds. Existing guard, cascade, compression, retirement, media and prune tests remain authoritative.
 
-Contract tests: `tests/hermes_state/test_compaction_prepare_snapshot.py`.
+Contract tests: `tests/hermes_state/test_compaction_prepare_snapshot.py`, `tests/hermes_state/test_compaction_prepare_fallback.py`.
 
 ## Compaction Attribution
 
 The existing slow-write warning retains `compaction_prepare`. For
 `SessionDB.archive_and_compact`, held-summary checks, held-row CAS and coverage
 proof run in an independent read-only snapshot before `BEGIN IMMEDIATE`.
-The writer connection's existing `(connection, total_changes, data_version)`
-freshness token is captured before that snapshot and compared before any
-mutation. A changed token rolls back the attempt and repeats preparation outside
-the writer lock, for at most 3 total attempts, then raises rather than publishing stale state.
-The token deliberately covers the whole database, so unrelated commits can
-cause retries. Each attempt refreshes the display-fold plan outside the lock as
-well, so a retry does not force full display-index enumeration. Count/max-id alone would miss in-place edits. Reader exhaustion
-fails explicitly instead of falling back to preparation on the locked writer.
+The freshness token is captured in that same snapshot and covers only the target
+session: its transcript/runtime revisions and generation, active row count and
+highest id, and raw CAS-owned row values plus role, timestamp and durable identity.
+Comparing raw values avoids decoding and hashing payloads inside the writer lock,
+while fencing edits to fields the transcript revision trigger does not cover,
+including summary markers. Unrelated session writes cannot invalidate the proof.
+A changed token rolls back the attempt and repeats preparation outside the writer
+lock. After 2 optimistic attempts, the final attempt prepares inside the writer
+transaction, preserving the original compaction's progress under contention.
+Each attempt refreshes the display-fold plan outside the lock as well.
+A SQLite transaction retry that rolled back all mutations can reuse the session
+proof. Its writer-wide display hint may be stale, so the existing full-fold
+fallback remains authoritative, with the same output as the incremental path.
+
+Independent snapshot reads use the reader pool's IOERR retry and storage-error
+classification. Reader exhaustion or a persistent read failure falls back to
+transactional preparation. Actual writer-side errors still propagate through the
+normal transaction policy.
 
 Lease expiry/ownership and model-config merging remain transactional. The
 receipt-owned `archive_on_connection` entry point retains preparation on its
