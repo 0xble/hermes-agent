@@ -32,10 +32,13 @@ class PruneBudget:
         self.deadline = math.inf if max_seconds is None else time.monotonic() + max_seconds
         if within_window:
             import hermes_time
-            from hermes_cli.maintenance_window import deletion_window_spec, window_contains
+            from hermes_cli.maintenance_window import deletion_window_open, deletion_window_spec, window_contains
             now, spec = hermes_time.now(), deletion_window_spec()
             if not window_contains(spec, now):
-                self.deadline = time.monotonic()
+                # Admission belongs to the same policy the caller checked. A closed
+                # fallback spec must not cancel an admitted always-open policy.
+                if not deletion_window_open():
+                    self.deadline = time.monotonic()
             elif spec is not None and str(spec).strip():
                 # Find the first closed minute, including windows crossing midnight.
                 minute = now.replace(second=0, microsecond=0)

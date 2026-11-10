@@ -25,6 +25,26 @@ def _slow_delete(db):
     """))
 
 
+@pytest.mark.parametrize("spec", [None, "", "02:00-05:00"])
+def test_admitted_prune_has_no_expired_fallback_deadline(tmp_path, monkeypatch, spec):
+    """An always-open admission policy must not inherit a closed fallback window."""
+    import hermes_time
+    import hermes_cli.maintenance_window as window
+
+    monkeypatch.setattr(window, "deletion_window_spec", lambda: spec)
+    monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 11, 10, 6))
+    transcripts = tmp_path / "configured-transcripts"
+    transcripts.mkdir()
+    transcript = transcripts / "old.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        _old_ended(db, "old")
+        assert db.prune_sessions(older_than_days=90, sessions_dir=transcripts,
+                                 within_deletion_window=True) == 1
+        assert db.get_session("old") is None
+        assert not transcript.exists()
+
+
 @pytest.mark.parametrize("pending", [False, True])
 def test_window_end_interrupts_inflight_cleanup_and_next_pass_resumes(tmp_path, monkeypatch, pending):
     import hermes_time
