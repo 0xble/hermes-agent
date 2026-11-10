@@ -2221,6 +2221,7 @@ def try_activate_fallback(
     """
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     from agent.fallback_notice import buffer_fallback_route_notice, resolved_route
+    from agent.fallback_session_route import mark_fallback_route
     shared_adoption = isinstance(_shared_cooldown_record, dict)
     new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
     if new_fallback_episode and not shared_adoption:
@@ -2274,6 +2275,7 @@ def try_activate_fallback(
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
             _finalize_fallback_route(agent, fb_provider)
+            mark_fallback_route(agent, fb_model)
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
