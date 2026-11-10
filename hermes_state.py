@@ -84,7 +84,7 @@ from hermes_state_maintenance import SessionMaintenanceMixin
 from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
-from hermes_state_transactions import settle_write_transaction
+from hermes_state_transactions import finish_write_maintenance, settle_write_transaction
 from hermes_state_write_stalls import observe_write, write_attempt
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
@@ -1156,12 +1156,7 @@ class SessionDB(
                         result = settle_write_transaction(conn, fn, clock=time, logger=logger,
                             warn_s=self._WRITE_LOCK_WARN_S, acquire_s=time.monotonic() - acquisition_started,
                             session_id=session_id, input_rows=input_rows)
-                # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if budget is None and self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if budget is None and self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
+                finish_write_maintenance(self, bounded=budget is not None)
                 return result
             except SessionCompressionInProgressError as exc:
                 raise_if_nonretryable_contention(exc)

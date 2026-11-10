@@ -57,6 +57,17 @@ def execute_transcript_write(
         raise
 
 
+def finish_write_maintenance(db: Any, *, bounded: bool) -> None:
+    """Count committed writes without admitting checkpoint/FTS work during retention."""
+    db._write_count += 1
+    if bounded:
+        return
+    if db._write_count % db._CHECKPOINT_EVERY_N_WRITES == 0:
+        db._try_wal_checkpoint()
+    if db._write_count % db._FTS_MERGE_EVERY_N_WRITES == 0:
+        db._try_incremental_merge_fts()
+
+
 def settle_write_transaction(
     conn: sqlite3.Connection, fn: Callable[[sqlite3.Connection], T], *, clock: ModuleType,
     logger: logging.Logger, warn_s: float, acquire_s: float,
