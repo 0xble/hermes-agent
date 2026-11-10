@@ -225,8 +225,8 @@ class PortableGateTests(unittest.TestCase):
                 config = root / 'gitconfig'
                 bound = ci.git_environment(config_path=config)
                 unbound = ci.git_environment(root=None, config_path=root / 'unbound')
-            self.assertEqual(Path(probe.read_text(encoding='utf-8')), root.resolve())
-            self.assertIn(f'directory = {root.resolve().as_posix()}', config.read_text(encoding='utf-8'))
+            self.assertEqual(Path(probe.read_text(encoding='utf-8-sig')), root.resolve())
+            self.assertIn(f'directory = {root.resolve().as_posix()}', config.read_text(encoding='utf-8-sig'))
             self.assertEqual(bound['GIT_CONFIG_GLOBAL'], config.resolve().as_posix())
             self.assertEqual(unbound['GIT_CONFIG_GLOBAL'], os.devnull)
             self.assertFalse((root / 'unbound').exists())
