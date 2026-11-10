@@ -11,8 +11,8 @@ from tests.e2e.core.upgrade.test_upgrade_path import (
     _update,
     _upgrade_prerequisites,
     install_cache,
-    leg,
-    provider,
+    leg as leg,
+    provider as provider,
     snapshot_state,
     template_home,
 )
