@@ -38,6 +38,8 @@ async def test_deleted_private_topic_delivers_final_at_chat_root():
     assert root["reply_to_message_id"] is None
     assert root.get("message_thread_id") is None and root.get("direct_messages_topic_id") is None
     assert root["text"].startswith("Recovered response from a deleted Telegram topic:")
+    assert result.raw_response["thread_fallback"] is True
+    assert str(result.raw_response["requested_thread_id"]) == "150565"
     assert adapter.is_dm_topic_stale("2027045491", "150565") is True
 
     send_message.reset_mock(side_effect=True)
