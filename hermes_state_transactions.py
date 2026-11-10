@@ -74,6 +74,17 @@ def finish_write_maintenance(db: Any, *, bounded: bool) -> None:
         db._try_incremental_merge_fts()
 
 
+def finish_prune_maintenance(db: Any) -> None:
+    """Pay the deferred FTS cadence once, while the pass still has time."""
+    from hermes_state_prune_budget import PruneBudgetExpired, current_budget
+    budget = current_budget()
+    try:
+        budget.check()
+    except PruneBudgetExpired:
+        return
+    db._try_incremental_merge_fts()
+
+
 def settle_write_transaction(
     conn: sqlite3.Connection, fn: Callable[[sqlite3.Connection], T], *, clock: ModuleType,
     logger: logging.Logger, warn_s: float, acquire_s: float,

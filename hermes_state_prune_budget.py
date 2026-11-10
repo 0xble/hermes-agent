@@ -35,10 +35,12 @@ class PruneBudget:
     TRANSACTION_SECONDS = 0.25
     MIN_UNIT_CEILING_SECONDS = 2.0
 
-    def __init__(self, within_window=False, max_seconds=None):
+    def __init__(self, within_window=False, max_seconds=None, *, db_path=None):
         validate_max_seconds(max_seconds)
         self.deadline = math.inf if max_seconds is None else time.monotonic() + max_seconds
         self.deferred_ids = set()
+        self.db_path = db_path
+        self.next_contention_warning = time.monotonic() + 30
         if within_window:
             import hermes_time
             from hermes_cli.maintenance_window import deletion_window_open, deletion_window_spec, window_contains
@@ -65,6 +67,16 @@ class PruneBudget:
         self.check()
         time.sleep(min(seconds, max(0, self.deadline - time.monotonic())))
         self.check()
+
+    def warn_contention(self, label):
+        now = time.monotonic()
+        if math.isfinite(self.deadline) or now < self.next_contention_warning:
+            return
+        self.next_contention_warning = now + 30
+        from hermes_state_lockowners import state_db_write_lock_holders
+        holders = state_db_write_lock_holders(self.db_path) if self.db_path is not None else []
+        logger.warning("Session prune %r continues retrying a foreign SQLite writer: %s",
+                       label, " | ".join(holders) or "write-lock holder unavailable")
 
 
 @contextmanager
@@ -108,6 +120,7 @@ def run_prune_write(attempt, *, shrink=None, minimum_seconds=None, defer=None, l
         try:
             return attempt()
         except PruneWriteContended:
+            budget.warn_contention(unit_label)
             pacer.pause(0)
             continue
         except PruneBudgetExpired:

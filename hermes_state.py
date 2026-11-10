@@ -1665,7 +1665,7 @@ class SessionDB(
         ``self._lock`` so it pairs with the WAL lock guard exactly like a writer reopen."""
         if self._checkpoint_conn is not None and self._checkpoint_conn_writer is self._conn:
             return self._checkpoint_conn
-        with self._lock:
+        with state_lock(self._lock, db_path=self.db_path):
             if self._conn is None or self.read_only:
                 return None
             stale, self._checkpoint_conn = self._checkpoint_conn, None

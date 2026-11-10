@@ -374,12 +374,15 @@ class SessionMaintenanceMixin:
         if within_deletion_window and not deletion_window_open():
             raise DeletionWindowClosedError("session prune refused: maintenance.deletion_window is closed")
         from hermes_state_prune_budget import PruneBudget, PruneBudgetExpired, prune_budget
+        from hermes_state_transactions import finish_prune_maintenance
         removed_ids = []
-        budget = PruneBudget(within_deletion_window, max_seconds)
+        budget = PruneBudget(within_deletion_window, max_seconds, db_path=self.db_path)
         try:
             with prune_pass(self.db_path), prune_budget(budget):
-                return self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
-                                                 removed_ids, within_deletion_window, filters)
+                result = self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
+                                                   removed_ids, within_deletion_window, filters)
+                finish_prune_maintenance(self)
+                return result
         except PruneBudgetExpired as exc:
             logger.info("%s", exc)
             return len(removed_ids)

@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 # A page bounds trigger work by rows AND serialized input. An oversized message
 # must make progress alone. Window-bound retention interrupts SQLite VM work
 # (including one trigger); SQLite cannot preempt an OS fsync.
-DELETE_ROWS = 16
-DELETE_BYTES = 64 * 1024
+DELETE_ROWS = 64
+DELETE_BYTES = 256 * 1024
+RETENTION_DELETE_ROWS = 16
+RETENTION_DELETE_BYTES = 64 * 1024
 DELETE_SECONDS = 0.1
 
 
@@ -46,17 +48,22 @@ def stage_delete(conn, session_ids, sessions_dir=None):
                       RETIRED_PREFIX + sid))
 
 
-def _page_ids(db, sid, max_rows=DELETE_ROWS):
+def _page_ids(db, sid, max_rows=None):
     # Enumerate lengths on a reader, outside the writer lock. Retired transcripts
     # reject appends, so another cleaner can only remove these candidates.
     from hermes_state_messages import _MESSAGE_WRITE_COLUMNS
+    from hermes_state_prune_budget import current_budget
+    bounded = current_budget() is not None
+    if max_rows is None:
+        max_rows = RETENTION_DELETE_ROWS if bounded else DELETE_ROWS
+    max_bytes = RETENTION_DELETE_BYTES if bounded else DELETE_BYTES
     lengths = " + ".join(f"COALESCE(length(CAST({column} AS BLOB)),0)" for column in _MESSAGE_WRITE_COLUMNS)
     rows = db._read_all(
         f"SELECT id, {lengths} FROM messages WHERE session_id=? ORDER BY id LIMIT ?", (sid, max_rows))
     selected, size = [], 0
     for row_id, row_size in rows:
         row_size = row_size or 0
-        if selected and size + row_size > DELETE_BYTES:
+        if selected and size + row_size > max_bytes:
             break
         selected.append(row_id)
         size += row_size
@@ -65,6 +72,7 @@ def _page_ids(db, sid, max_rows=DELETE_ROWS):
 
 def _delete_page(conn, sid, selected, key, marker):
     from hermes_state_media import retire_spillover
+    from hermes_state_prune_budget import current_budget
     # A delayed cleaner must not touch a later incarnation after another cleaner
     # completed this marker and its sweep fence eventually expired.
     if conn.execute("SELECT 1 FROM state_meta WHERE key=? AND value=?", (key, marker)).fetchone() is None:
@@ -78,7 +86,7 @@ def _delete_page(conn, sid, selected, key, marker):
         return False
     started = time.monotonic()
     # Small SQL steps let the time target shorten a page on a contended host.
-    for chunk in _id_chunks(selected, size=1):
+    for chunk in _id_chunks(selected, size=1 if current_budget() is not None else 8):
         retire_spillover(conn, [sid], message_ids=chunk)
         conn.execute(f"DELETE FROM messages WHERE session_id=? AND id IN ({_placeholders(chunk)})", (sid, *chunk))
         if time.monotonic() - started >= DELETE_SECONDS:
@@ -129,7 +137,9 @@ def _finish_delete(db, sid, key, value):
         value = updated
         cleanup = json.loads(value)["cleanup"]
     from hermes_state_prune_pacing import PrunePacer
-    pacer = PrunePacer(max_size=1 if cleanup.get("attempts") else DELETE_ROWS)
+    bounded = current_budget() is not None
+    page_rows = (1 if cleanup.get("attempts") else RETENTION_DELETE_ROWS) if bounded else DELETE_ROWS
+    pacer = PrunePacer(max_size=page_rows)
     while True:
         check_prune_budget()
         page = [None, 0]
@@ -145,7 +155,7 @@ def _finish_delete(db, sid, key, value):
                 return 0
             if cleanup.get("attempts"):
                 return PruneBudget.MIN_UNIT_CEILING_SECONDS
-            return PruneBudget.TRANSACTION_SECONDS * max(1, size / DELETE_BYTES)
+            return PruneBudget.TRANSACTION_SECONDS * max(1, size / RETENTION_DELETE_BYTES)
         started = time.monotonic()
         progress = run_prune_write(attempt, shrink=shrink, minimum_seconds=seconds, label=sid,
                                    defer=lambda: _defer_expired_delete(db, sid, key, value))
@@ -153,11 +163,10 @@ def _finish_delete(db, sid, key, value):
             return
         if not progress:
             break
-        pause = min(2.0, max(0.05, time.monotonic() - started))
         if budget := current_budget():
-            budget.pause(pause)
+            budget.pause(min(2.0, max(0.05, time.monotonic() - started)))
         else:
-            time.sleep(pause)
+            time.sleep(0.01)
     if progress is None:
         return
     check_prune_budget()
