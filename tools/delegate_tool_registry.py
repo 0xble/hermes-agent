@@ -317,7 +317,7 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
         )
     return payload
 
-def _owns_durable_delegation(record: Dict[str, Any], parent_agent: Any) -> bool:
+def _owns_durable_delegation(record: dict[str, Any], parent_agent: Any) -> bool:
     """True when *parent_agent*'s conversation owns a DURABLE delegation row.
 
     Same durable spine as :func:`_owns_subagent_record` tier 2 (the live weakref

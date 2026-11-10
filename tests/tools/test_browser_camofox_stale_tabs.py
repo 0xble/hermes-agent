@@ -14,7 +14,7 @@ def server(monkeypatch):
     monkeypatch.setattr(bt, "_is_camofox_mode", lambda: True)
     monkeypatch.setattr(cf, "get_vnc_url", lambda: None)
     monkeypatch.setattr(policy, "_eval_ssrf_guard_active", lambda task_id: False)
-    monkeypatch.setattr(cf, "_get_camofox_config", lambda: {})
+    monkeypatch.setattr(cf, "_get_camofox_config", dict)
     calls = []
     failures = {}
     created = [0]
@@ -186,7 +186,7 @@ def test_stale_adopted_tab_releases_its_lease(server, monkeypatch):
 
 
 def test_new_tabs_open_without_url_so_the_target_loads_once(server):
-    calls, failures = server
+    calls, _failures = server
     _open()
     creates = [kw.get("json", {}) for m, p, kw in calls if m == "post" and p == "/tabs"]
     # Camofox rejects non-http(s) create URLs (about:blank → 400) after registering the tab.
@@ -196,7 +196,7 @@ def test_new_tabs_open_without_url_so_the_target_loads_once(server):
 
 
 def test_stale_snapshot_after_navigate_warns_the_model(server):
-    calls, failures = server
+    _calls, failures = server
     session = _open()
     failures[f"/tabs/{session['tab_id']}/snapshot"] = {"status": 410, "body": {"code": "tab_timeout"}}
     result = json.loads(bt.browser_navigate("https://example.test", task_id="stale"))

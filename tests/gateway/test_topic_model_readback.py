@@ -4,13 +4,13 @@ import asyncio
 import copy
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 
 import pytest
 
 from gateway.config import ChannelOverride, Platform
 from gateway.telegram_topic_sessions import TopicSpec, create_topic_session, edit_topic_session
-from tests.gateway.test_telegram_topic_tool import FakeTelegram, _runner, _seed_caller, _source, home as home
+from tests.gateway.test_telegram_topic_tool import FakeTelegram, _runner, _seed_caller, _source, home
 
 
 def _runtime(monkeypatch, runner, config):
@@ -72,7 +72,7 @@ async def test_topic_readback_uses_runtime_precedence(home, monkeypatch, operati
                                            "reasoning_effort": "high"}
         if route == "attended":
             config["model"]["idle_revert_minutes"] = 15
-            runner.session_store.mark_user_activity(key, datetime.now(timezone.utc))
+            runner.session_store.mark_user_activity(key, datetime.now(UTC))
         else:
             runner.session_store.set_model_role(key, "attended")
         expected_model, expected_provider, expected_effort = "attended-model", "attended-provider", "high"

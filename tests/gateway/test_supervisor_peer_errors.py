@@ -2,7 +2,7 @@
 import pytest
 
 from gateway import run_checkins
-from tests.gateway.test_supervisor_checkins import fixture  # noqa: F401 -- native scheduler fixture
+from tests.gateway.test_supervisor_checkins import fixture
 
 
 def unavailable(*args):

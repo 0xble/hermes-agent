@@ -305,7 +305,6 @@ async def test_slow_send_anchors_deadline_by_adapter(monkeypatch, adapter_kind, 
         clock[0] += 1.2  # well inside the 1.5s send timeout, so not a timed-out tick
         if len(started_at) == 2:
             stop_event.set()
-        return None
 
     adapter.send_typing = slow_typing
     monkeypatch.setattr(base_module.asyncio, "get_running_loop", lambda: _Clock())

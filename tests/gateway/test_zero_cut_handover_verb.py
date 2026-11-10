@@ -242,6 +242,6 @@ async def test_handover_owner_runs_a_mid_turn_followup_instead_of_spooling_it(mo
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c", user_id="u", chat_type="dm")
     key = build_session_key(source)
     runner._enqueue_fifo(key, MessageEvent(text="follow-up", source=source, message_id="m2"), adapter)
-    event, text = await runner._run_agent_drain_pending({"final_response": "done"}, adapter, source, key)
+    _event, text = await runner._run_agent_drain_pending({"final_response": "done"}, adapter, source, key)
     assert (text == "follow-up") is runs_here
     assert (spooled == []) is runs_here

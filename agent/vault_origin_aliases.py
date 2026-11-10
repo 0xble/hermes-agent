@@ -90,7 +90,7 @@ def _normalize_alias_origin(value: Any) -> str | None:
         return None
 
 
-def _configured_aliases() -> Dict[str, tuple[str, ...]]:
+def _configured_aliases() -> dict[str, tuple[str, ...]]:
     """Read and validate ``vault.origin_aliases`` from the active profile config."""
     from hermes_cli.config import load_config_readonly
 
@@ -104,7 +104,7 @@ def _configured_aliases() -> Dict[str, tuple[str, ...]]:
     if not isinstance(raw_aliases, dict):
         return {}
 
-    aliases: Dict[str, tuple[str, ...]] = {}
+    aliases: dict[str, tuple[str, ...]] = {}
     for raw_key, raw_origins in raw_aliases.items():
         key = raw_key.strip() if isinstance(raw_key, str) else ""
         if not key:
@@ -183,7 +183,7 @@ def _alias_keys(meta: VaultItemMeta) -> tuple[str, ...]:
 
 
 def _meta_with_origin_aliases(
-    meta: VaultItemMeta, configured: Dict[str, tuple[str, ...]]
+    meta: VaultItemMeta, configured: dict[str, tuple[str, ...]]
 ) -> VaultItemMeta:
     """Augment one login's exact allowed origins without changing its vault item."""
     if meta.kind != "login" or not meta.origin:

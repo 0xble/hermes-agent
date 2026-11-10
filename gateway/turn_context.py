@@ -21,7 +21,7 @@ _GATEWAY_SILENCE_RETRY_NOTE = (
 
 
 @contextmanager
-def silence_retry_prompt(agent: Any, ctx: "TurnContext"):
+def silence_retry_prompt(agent: Any, ctx: TurnContext):
     """Scope recovery guidance and its provider-only continuation cue to one execution.
 
     Neither value enters the stable prompt or durable history: the note is appended to the
@@ -139,6 +139,8 @@ class TurnContext:
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
+    # The chat's resolved display.interim_assistant_messages. Turn-shaped gates (scheduled heartbeat, hold_stream,
+    # finite viewer) apply in TurnRunner; a fresh agent's delegation.gateway_mode reads this session-shaped value.
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False
     AIAgent: Any = None

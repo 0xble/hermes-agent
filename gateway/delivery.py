@@ -162,7 +162,17 @@ async def _ensure_named_dm_topic(
     kwargs = {"force_create": True} if refresh else {}
     if owner_key:
         kwargs.update({"owner_key": owner_key, "allow_parallel": allow_parallel})
-    thread_id = await ensure_dm_topic(chat_id, name, **kwargs)
+    from hermes_constants import get_routing_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    owner = getattr(adapter, "_owner_profile", None)
+    if isinstance(owner, str) and owner:
+        from hermes_cli.profiles import get_profile_dir
+        token = set_hermes_home_override(get_profile_dir(owner))
+    else:
+        token = set_hermes_home_override(get_routing_process_hermes_home())
+    try:
+        thread_id = await ensure_dm_topic(chat_id, name, **kwargs)
+    finally:
+        reset_hermes_home_override(token)
     if not thread_id:
         raise RuntimeError(f"Telegram adapter returned no thread for named topic {name!r}")
     return str(thread_id)

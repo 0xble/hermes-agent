@@ -547,6 +547,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not sid:
             return None
         await self._warm_goals_session_db(label)
+        # The manager loads its state from state.db on construction: off the loop, in this scope.
         return await self._run_in_executor_with_context(factory, sid)
 
     async def _pause_goal_for_stop(
@@ -863,16 +864,16 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 )
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
-        self._publish_local_control(source, only_if_present=True)
+        await self._publish_local_control(source, only_if_present=True)
 
-    def _publish_local_control(self, source: Any, *, only_if_present: bool = False) -> None:
+    async def _publish_local_control(self, source: Any, *, only_if_present: bool = False) -> None:
         """A local (Desktop/Ink) session's goal or loop state just moved here: repaint its viewers' cards,
         whose loop countdown runs off the snapshot's ``next_due_at``."""
         if getattr(source, "platform", None) != Platform.LOCAL:
             return
         from gateway.session_authorities import active_authority
-        from gateway.session_control_actions import publish
-        publish(active_authority(self), source.chat_id, only_if_present=only_if_present)
+        from gateway.session_control_actions import publish_async
+        await publish_async(active_authority(self), source.chat_id, only_if_present=only_if_present)
 
     @staticmethod
     def _turn_failed() -> bool:
@@ -1296,7 +1297,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                         mgr.abandon_tick, tick=tick, owns_turn=_turn_owner_exists,
                     )
         # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
-        self._publish_local_control(source)
+        await self._publish_local_control(source)
 
     async def _goal_wakeup_fire_one(self, sid: str) -> None:
         """Resume one idle parked /goal whose wait barrier has lifted.

@@ -131,7 +131,7 @@ class ChatOutboundBudget:
     def __init__(self, *, gap_override: Optional[float] = None, clock: Callable[[], float] = time.monotonic):
         self._gap_override = gap_override
         self._clock = clock
-        self._chats: Dict[str, _ChatState] = {}
+        self._chats: dict[str, _ChatState] = {}
 
     def _state(self, key: str) -> _ChatState:
         state = self._chats.get(key)
@@ -277,7 +277,7 @@ class MeteredBot:
     """Wrap a plain ``telegram.Bot`` (or a test double) so each coroutine method passes through a
     :class:`ChatBudgetRateLimiter`, for lanes that do not build an ``ExtBot`` (the standalone sender)."""
 
-    def __init__(self, bot: Any, limiter: "ChatBudgetRateLimiter"):
+    def __init__(self, bot: Any, limiter: ChatBudgetRateLimiter):
         self._metered_bot = bot
         self._metered_limiter = limiter
 
@@ -316,7 +316,7 @@ class ChatBudgetRateLimiter:
         penalty_remaining: Optional[Callable[[str], Optional[float]]] = None,
         on_retry_after: Optional[Callable[[str, float], None]] = None,
         counter: Optional[DailyCallCounter] = None,
-        daily: Optional["DailyQuota"] = None,
+        daily: Optional[DailyQuota] = None,
     ):
         self.budget = budget
         self.daily = daily
@@ -406,7 +406,7 @@ TRIGGER_UNTAGGED = "untagged"  # cron delivery, outbox replay, standalone lane, 
 TRIGGER_TYPED = "typed"
 _TRIGGER: ContextVar[str] = ContextVar("telegram_call_trigger", default=TRIGGER_UNTAGGED)
 # First-line prefixes of the gateway's self-injected turns, most specific first.
-_TRIGGER_PREFIXES: Tuple[Tuple[str, str], ...] = (
+_TRIGGER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("[Continuing toward your standing goal", "goal"),
     ("[/loop wakeup", "loop"),
     ("[relay", "relay"),
@@ -414,7 +414,7 @@ _TRIGGER_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("[ASYNC DELEGATION", "delegation"),
     ("[System note: Resume the pending turn.", "restart"),  # gateway.run.RESUME_NOTE_PREFIX
 )
-_TRIGGER_FRAGMENTS: Tuple[Tuple[str, str], ...] = (
+_TRIGGER_FRAGMENTS: tuple[tuple[str, str], ...] = (
     ("background process", "process"),
     ("background subagent delegation", "delegation"),
     ("background delegation", "delegation"),
@@ -496,7 +496,7 @@ class DailyCallCounter:
         self._flush_interval = flush_interval
         self._log_interval = log_interval
         self._lock = threading.Lock()
-        self._dirty: Dict[Tuple[float, str, str, str], int] = {}
+        self._dirty: dict[tuple[float, str, str, str], int] = {}
         self._pending_logs: list = []
         self._work = threading.Event()
         self._worker: Optional[threading.Thread] = None
@@ -617,7 +617,7 @@ class DailyCallCounter:
                     for key, count in pending.items():
                         self._dirty[key] = self._dirty.get(key, 0) + count
 
-    def window(self, chat: Optional[str] = None, *, since: Optional[float] = None) -> Dict[str, Any]:
+    def window(self, chat: Optional[str] = None, *, since: Optional[float] = None) -> dict[str, Any]:
         """Totals from ``since`` (default: 24h ago), flushed and unflushed together.
 
         Counts are hourly buckets, so the window starts at the first WHOLE hour at or after
@@ -626,7 +626,7 @@ class DailyCallCounter:
         with self._db_lock:  # no concurrent flush can hold counts in flight while we read
             return self._window_locked(chat, since)
 
-    def _window_locked(self, chat: Optional[str], since: Optional[float]) -> Dict[str, Any]:
+    def _window_locked(self, chat: Optional[str], since: Optional[float]) -> dict[str, Any]:
         self.flush()
         since = self._wall() - _DAY if since is None else since
         floor = since if since % _HOUR == 0 else since - (since % _HOUR) + _HOUR
@@ -642,7 +642,7 @@ class DailyCallCounter:
                     rows = conn.execute(query + " GROUP BY 1,2,3", params).fetchall()
             except (OSError, sqlite3.Error):
                 logger.debug("Could not read Telegram call counts", exc_info=True)
-        chats: Dict[str, Dict[str, Any]] = {}
+        chats: dict[str, dict[str, Any]] = {}
         # Counts the flush could not write (locked or unreadable DB) still belong in the window.
         with self._lock:
             unflushed = [(c, e, t, n) for (hour, c, e, t), n in self._dirty.items()
@@ -654,7 +654,7 @@ class DailyCallCounter:
             entry["triggers"][trigger] = entry["triggers"].get(trigger, 0) + count
         return {"since": floor, "chats": chats, "total": sum(c["total"] for c in chats.values())}
 
-    def log_summary(self, chat: Optional[str] = None, *, reason: str = "hourly") -> Dict[str, Any]:
+    def log_summary(self, chat: Optional[str] = None, *, reason: str = "hourly") -> dict[str, Any]:
         summary = self.window(chat)
         since = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(summary["since"]))
         for chat_id, entry in sorted(summary["chats"].items(), key=lambda kv: -kv[1]["total"]):
@@ -663,11 +663,11 @@ class DailyCallCounter:
         return summary
 
 
-def _top(counts: Dict[str, int], n: int = 8) -> str:
+def _top(counts: dict[str, int], n: int = 8) -> str:
     return json.dumps(dict(sorted(counts.items(), key=lambda kv: -kv[1])[:n]), separators=(",", ":"))
 
 
-_COUNTERS: Dict[str, DailyCallCounter] = {}
+_COUNTERS: dict[str, DailyCallCounter] = {}
 _COUNTERS_LOCK = threading.Lock()
 
 

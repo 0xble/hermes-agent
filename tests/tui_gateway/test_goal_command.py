@@ -855,7 +855,7 @@ def test_goal_draft_uses_session_profile_without_blocking_rpc_reader(
 
 @pytest.mark.parametrize("hidden", [False, True])
 def test_isolated_submit_keeps_preview_separate_from_user_provenance(server, session, monkeypatch, hidden):
-    sid, _, record = session
+    sid, _, _record = session
     seen = []
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a: True)
     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a: None)

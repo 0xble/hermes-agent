@@ -128,8 +128,8 @@ def observations(monkeypatch):
     from tools import async_delegation, delegation_resume
 
     monkeypatch.setattr(delegation, "_active_subagents", {})
-    monkeypatch.setattr(async_delegation, "list_async_delegations", lambda: [])
-    monkeypatch.setattr(delegation_resume, "list_retry_pending", lambda: [])
+    monkeypatch.setattr(async_delegation, "list_async_delegations", list)
+    monkeypatch.setattr(delegation_resume, "list_retry_pending", list)
     clock = SimpleNamespace(now=1000.0)
     monkeypatch.setattr(delegation, "_now", lambda: clock.now)
     return clock

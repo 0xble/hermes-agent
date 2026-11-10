@@ -81,8 +81,15 @@ _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _OPAQUE_HOLD_OPEN, _OPAQUE_HOLD_CLOSE = "", ""
 _LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^()\s]+(?:\([^()]*\)[^()\s]*)*)\)")
 # Slack mrkdwn autolink: <scheme:target> or <scheme:target|label>.
-# Mentions (<@U…>, <#C…>, <!here>) have no scheme: and stay as text.
 _SLACK_LINK_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^>|]+)(?:\|([^>]+))?>")
+# Slack mention tokens carry no scheme: <@U…> (user), <#C…> (channel, with an
+# optional |name label), <!subteam^S…> (usergroup) and <!here|!channel|!everyone>
+# (broadcast). rich_text does not interpret mrkdwn, so these must become
+# user/channel/broadcast/usergroup elements — as plain text Slack renders the
+# token literally.
+_SLACK_MENTION_RE = re.compile(
+    r"<(@[A-Z0-9]+|#[A-Z0-9]+|!subteam\^[A-Z0-9]+|!(?:here|channel|everyone))(?:\|[^>]*)?>"
+)
 _BOLD_RE = re.compile(r"(?:\*\*|__)(.+?)(?:\*\*|__)")
 # Delimiters must not touch a word character outside the span, so snake_case, file_names and
 # 2*3 arithmetic stay literal (CommonMark's rule for ``_``; agents rarely use intraword ``*``).
@@ -90,6 +97,23 @@ _ITALIC_RE = re.compile(
     r"(?<![\w*_])(?:\*|_)(?![\*_\s])(.+?)(?<![\*_\s])(?:\*|_)(?![\w*_])"
 )
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
+
+
+def _mention_element(body: str) -> Optional[dict[str, Any]]:
+    """Map a Slack mention token body (without the angle brackets) to a rich_text element.
+
+    ``@U…`` -> user, ``#C…`` -> channel, ``!subteam^S…`` -> usergroup,
+    ``!here``/``!channel``/``!everyone`` -> broadcast.
+    Returns None for anything else, so the caller can emit the raw token as text."""
+    if body.startswith("@"):
+        return {"type": "user", "user_id": body[1:]}
+    if body.startswith("#"):
+        return {"type": "channel", "channel_id": body[1:]}
+    if body.startswith("!subteam^"):
+        return {"type": "usergroup", "usergroup_id": body[len("!subteam^"):]}
+    if body.startswith("!"):
+        return {"type": "broadcast", "range": body[1:]}
+    return None
 
 
 def _inline_elements(text: str) -> list[dict[str, Any]]:
@@ -145,6 +169,11 @@ def _inline_elements(text: str) -> list[dict[str, Any]]:
             kind, value, url = h
             if kind == "code":
                 _emit_plain(value, {**(style or {}), "code": True})
+            elif kind == "mention":
+                # Slack rejects styled mentions, even when emphasis surrounds the token.
+                element = _mention_element(value)
+                if element is not None:
+                    elements.append(element)
             else:
                 link_el: dict[str, Any] = {"type": "link", "url": url, "text": value}
                 if style:
@@ -190,6 +219,7 @@ def _inline_elements(text: str) -> list[dict[str, Any]]:
     s = _INLINE_CODE_RE.sub(lambda m: _hold("code", m.group(1)), text)
     s = _LINK_RE.sub(_hold_md_link, s)
     s = _SLACK_LINK_RE.sub(_hold_slack_link, s)
+    s = _SLACK_MENTION_RE.sub(lambda m: _hold("mention", m.group(1)), s)
     _walk_emphasis(s, {})
     return elements or [{"type": "text", "text": text}]
 

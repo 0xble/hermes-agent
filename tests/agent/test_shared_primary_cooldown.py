@@ -184,9 +184,9 @@ def test_primary_success_after_reset_clears_outage_with_one_recovery_notice(tmp_
 
 # ── Notice ownership (P2): never silently drop a rate-limit fallback notice ─────────────────
 
-from unittest.mock import MagicMock, patch  # noqa: E402
+from unittest.mock import MagicMock, patch
 
-from agent.error_classifier import FailoverReason  # noqa: E402
+from agent.error_classifier import FailoverReason
 
 
 def _agent_with_chain(chain):
@@ -242,7 +242,6 @@ def test_rate_limit_notice_survives_shared_write_failure(failure):
     def _broken(*_args, **_kwargs):
         if failure == "raises":
             raise OSError("read-only state dir")
-        return None
 
     with patch("agent.shared_primary_cooldown.arm_cooldown", side_effect=_broken):
         _activate(agent, reset_at=time.time() + 7200)
@@ -366,7 +365,7 @@ print(json.dumps(arm_cooldown(route_from_record({short!r}), reason="rate_limit",
 
 # ── Stale outages (review round 2, P2-1) ─────────────────────────────────────────────────────
 
-from agent import shared_primary_cooldown as spc  # noqa: E402
+from agent import shared_primary_cooldown as spc
 
 _ROUTE = ("custom:fixture", "http://127.0.0.1:8317/v1", "primary")
 

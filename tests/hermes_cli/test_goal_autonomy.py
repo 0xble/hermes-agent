@@ -7,7 +7,7 @@ import pytest
 
 # User-message persistence reaches the runtime bootstrap. Load it before the
 # per-test real-home guard, as the application entry point does.
-import hermes_bootstrap  # noqa: F401
+import hermes_bootstrap
 
 from hermes_cli import goals, session_controls
 from hermes_cli.goal_command import dispatch_goal_command

@@ -1018,11 +1018,7 @@ def _unlock_owned_worktree(repo_root: str, worktree_path: str, timeout: int = 10
         elif reason == "initializing" and initializing_before is not None:
             if not _initializing_worktree_is_dead(worktree_path, initializing_before):
                 return False
-        elif _HERMES_LOCK_RE.fullmatch(reason) is None:
-            return False
-        elif failed_add and reason.split(" ", 2)[1] != f"pid={os.getpid()}":
-            return False
-        elif dead_only and _worktree_lock_is_live(repo_root, worktree_path, timeout) != "dead":
+        elif _HERMES_LOCK_RE.fullmatch(reason) is None or failed_add and reason.split(" ", 2)[1] != f"pid={os.getpid()}" or dead_only and _worktree_lock_is_live(repo_root, worktree_path, timeout) != "dead":
             return False
         # The holder probe may take time; a foreign takeover must still win.
         if _worktree_lock_reason(repo_root, worktree_path, timeout) != (found, reason):

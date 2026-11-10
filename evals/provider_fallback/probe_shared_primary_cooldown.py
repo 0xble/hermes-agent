@@ -156,7 +156,7 @@ def run_child(role: str) -> dict:
     completed = subprocess.run(
         [sys.executable, "-c", CHILD, role, URL], cwd=ROOT, env=env,
         capture_output=True, text=True, timeout=300,
-    )
+     check=False)
     if completed.returncode != 0:
         raise AssertionError(f"{role} child failed ({completed.returncode}):\n{completed.stdout}\n{completed.stderr}")
     result = json.loads(completed.stdout.strip().splitlines()[-1])

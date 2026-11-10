@@ -22,11 +22,11 @@ from tests.e2e.core.upgrade.git._hostile_post import (
     contextlib,
     json,
     re,
-    w as w,
+    w,
 )
 from tests.e2e.core.upgrade.git._hostile_diagnostics import (
-    hostile_cell as hostile_cell,
-    hostile_diagnostics as hostile_diagnostics,
+    hostile_cell,
+    hostile_diagnostics,
 )
 
 pytestmark = C.pytestmark

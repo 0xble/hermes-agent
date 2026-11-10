@@ -260,7 +260,6 @@ def _make_runner(adapter):
     runner._fallback_model = None
     runner._session_db = None
     runner._running_agents = {}
-    runner._session_run_generation = {}
     runner.session_store = SimpleNamespace(
         _entries={}, _save=lambda: None, get_model_role=lambda _key: None,
         get_model_override=lambda _key: None, get_model_override_scope=lambda _key: "session",

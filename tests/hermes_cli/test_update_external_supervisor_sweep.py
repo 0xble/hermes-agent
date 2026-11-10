@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import hermes_cli.gateway as gateway
+from hermes_cli import gateway
 import hermes_cli.update_cmd_fleet as fleet
 
 

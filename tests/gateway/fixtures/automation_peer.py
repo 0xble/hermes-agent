@@ -147,6 +147,9 @@ async def probe(root, base, mode):
             cfg = {'gateway': {'multiplex_profiles': False, 'completion_notification_batch_window_seconds': 0},
                 'model': {'provider': 'custom', 'default': 'local-fixture', 'base_url': url},
                 'streaming': {'enabled': False}, 'terminal': {'cwd': str(home)},
+                # The follower must queue behind the held turn: under the default ``interrupt`` a relay
+                # follow-up redirects the running turn instead of taking its own FIFO row.
+                'display': {'busy_input_mode': 'queue'},
                 'approvals': {'mode': 'off'},
                 'auxiliary': {'title_generation': {'enabled': False}}}
             (home / 'config.yaml').write_text(json.dumps(cfg))

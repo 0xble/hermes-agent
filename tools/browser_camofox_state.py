@@ -63,7 +63,7 @@ def get_camofox_account_aliases() -> tuple:
     return tuple(aliases) or CAMOFOX_ACCOUNT_ALIASES
 
 
-def get_camofox_account_identity(account: str, task_id: Optional[str] = None) -> Dict[str, str]:
+def get_camofox_account_identity(account: str, task_id: Optional[str] = None) -> dict[str, str]:
     """Return a stable identity for one named operator account.
 
     The server's alias registry owns persistent userIds. Client-local paths must

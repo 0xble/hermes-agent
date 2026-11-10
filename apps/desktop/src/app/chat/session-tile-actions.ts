@@ -363,6 +363,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
     // Frontend busy clears immediately; gateway wind-down can lag (#83855).
     markSessionRecentlyInterrupted(sessionId)
+    flushStreamDeltas(sessionId)
 
     update(state => ({
       ...state,

@@ -93,7 +93,7 @@ assert not Path(sys.argv[3]).exists(), Path(sys.argv[3]).read_text()
     result = subprocess.run(
         [sys.executable, "-c", probe, entry, str(tmp_path), str(calls)],
         cwd=repo, env=env, capture_output=True, text=True, timeout=30,
-    )
+     check=False)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -242,7 +242,7 @@ def _check_cli_sibling_consumers(monkeypatch, module, expected):
     assert observed[-1]["x-api-key"] == "probe-key"
     assert observed[-1]["anthropic-version"] == "2023-06-01"
     monkeypatch.setattr(config, "get_env_value", lambda name: "probe-key" if name == "GITHUB_TOKEN" else "")
-    monkeypatch.setattr(config, "load_env", lambda: {})
+    monkeypatch.setattr(config, "load_env", dict)
     assert not doctor_connectivity._probe_github_token().issues
     assert observed[-1]["user-agent"] == expected
     assert observed[-1]["authorization"] == "Bearer probe-key"

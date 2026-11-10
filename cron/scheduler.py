@@ -31,8 +31,6 @@ except ImportError:
         msvcrt = None
 from pathlib import Path
 from typing import Any, Callable, Optional
-from cron.scheduler_cancel import _CancelEventLike, _CombinedCancelEvent
-from cron.scheduler_bookkeeping import _classify_delivery_outcome
 from cron.scheduler_worker_exit import (
     ExternalWorkerExitTimeout as _ExternalWorkerExitTimeout,
     TERMINAL_EXIT_GRACE_SECONDS as _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
@@ -45,7 +43,10 @@ _LOADED_CODE_ROOT = Path(__file__).resolve().parent.parent
 
 # Must precede repo-level imports: standalone invocations (e.g. module reload after
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
-sys.path.insert(0, str(_LOADED_CODE_ROOT))
+_checkout_root = _LOADED_CODE_ROOT
+# Append the physically loaded release without shadowing installed packages.
+if str(_checkout_root) not in sys.path:
+    sys.path.append(str(_checkout_root))
 
 from hermes_cli import immutable_releases
 from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot
@@ -56,6 +57,7 @@ from cron.scheduler_diagnostics import dispatch_context, note_dispatch_stage, ru
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     load_config, load_config_readonly)
+from hermes_cli.config_backend import ConfigBackendUnavailable
 from hermes_cli.fallback_config import get_cron_fallback_chain, get_fallback_chain, scoped_fallback_chain
 from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt
@@ -555,12 +557,16 @@ from cron.jobs import (
 from cron import store_health
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
-    _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
+    FIRER_FINISHED_STATES, _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
     record_delivery_outcome, recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
 from cron.scheduler_review import enqueue_review, record_review_suppression
 from cron.scheduler_worker_failure import finish_interrupted_run
+from cron.scheduler_bookkeeping import _classify_delivery_outcome
+from cron.cancellation import (CancelRequest, _CancelEventLike, _CombinedCancelEvent, cancel_reason,
+                               clear_cancel, finish_lost_execution,
+                               run_job_unless_cancelled as _run_job_unless_cancelled)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -699,7 +705,7 @@ _INFLIGHT_MIN_ALLOWANCE_MINUTES = 30.0
 _interrupted_job_ids: set = set()
 
 
-def get_running_job_ids() -> "frozenset[str]":
+def get_running_job_ids() -> frozenset[str]:
     """Thread-safe snapshot of executing job IDs (dispatch until ``_process_job`` returns). Read by
     the gateway shutdown drain, otherwise blind to cron work (runs outside ``_running_agents``).
 
@@ -1592,16 +1598,6 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
-def _job_doc_header(job_name: str, job_id: str, now_iso: str, mode: str) -> str:
-    """Common markdown header for the short-circuit run docs (no_agent / monitor)."""
-    return (
-        f"# Cron Job: {job_name}\n\n"
-        f"**Job ID:** {job_id}\n"
-        f"**Run Time:** {now_iso}\n"
-        f"**Mode:** {mode}\n"
-    )
-
-
 def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
     """Configured job workdir, or None when unset / no longer a directory (logged)."""
     workdir = (job.get("workdir") or "").strip() or None
@@ -1714,7 +1710,7 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
-    route: Any = None  # ModelPresetRoute when the run's model came from an ``@preset`` reference
+    route: Any = None  # AliasRoute when the run's model came from an ``@preset`` reference
 
 
 def _resolve_cron_job_config(job: dict, cfg: dict) -> _CronJobConfig:
@@ -1724,17 +1720,16 @@ def _resolve_cron_job_config(job: dict, cfg: dict) -> _CronJobConfig:
     _cron_default_provider = ""
     _job_route_provider = ""
     _route = None
-    from hermes_cli.model_preset_runtime import resolve_model_ref
+    from hermes_cli.model_alias_runtime import resolve_model_alias
     # Resolve @ routes from the freshly read config on every fire. Do not persist the
     # concrete model in the job or resolve it during cron creation.
-    from hermes_cli.model_presets import preset_ref_name
-    if preset_ref_name(model):
-        _route = resolve_model_ref(model.strip(), _cfg)
+    from hermes_cli.model_alias_runtime import alias_name
+    if alias_name(model, _cfg):
+        _route = resolve_model_alias(model.strip(), _cfg)
         model = _route.model
         if not job.get("provider"):
             _cron_default_provider = _job_route_provider = _route.provider
-    from hermes_cli.model_presets import expand_model_presets
-    _runtime_cfg = expand_model_presets(_cfg)
+    _runtime_cfg = _cfg
     _effective_cfg = _runtime_cfg
     # Coerce null to {} so a falsy default never clobbers a resolved env value.
     _model_cfg = _runtime_cfg.get("model") or {}
@@ -1742,13 +1737,13 @@ def _resolve_cron_job_config(job: dict, cfg: dict) -> _CronJobConfig:
     _cron_default_model = ""
     if isinstance(_cron_cfg_for_model, dict):
         _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
-        # A job's own @route provider outranks the fleet default; an unset
+        # A job's own alias provider outranks the fleet default; an unset
         # cron.model_provider must never erase it.
         _cron_provider_cfg = str(_cron_cfg_for_model.get("model_provider") or "").strip()
         if _cron_provider_cfg and not _job_route_provider:
             _cron_default_provider = _cron_provider_cfg
-        if preset_ref_name(_cron_default_model) and not job.get("model"):
-            _route = resolve_model_ref(_cron_default_model, _cfg)
+        if alias_name(_cron_default_model, _cfg) and not job.get("model"):
+            _route = resolve_model_alias(_cron_default_model, _cfg)
             _cron_default_model = _route.model
             if not _cron_provider_cfg and not _job_route_provider:
                 _cron_default_provider = _route.provider
@@ -1761,6 +1756,10 @@ def _resolve_cron_job_config(job: dict, cfg: dict) -> _CronJobConfig:
                 _model_cfg.get("default") or _model_cfg.get("model") or _model_cfg.get("name")
                 if isinstance(_model_cfg, dict) else "")
             model = str(_main or "").strip() or model
+            if alias_name(model, _cfg):
+                _route = resolve_model_alias(model, _cfg, required=True)
+                model = _route.model
+                _cron_default_provider = _route.provider
     from hermes_cli.anon_auth import trial_model
     model = (model if isinstance(model, str) else "").strip() or trial_model()
     return _CronJobConfig(_effective_cfg, model, _model_cfg, _cron_default_provider, _route)
@@ -1771,6 +1770,7 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
     from hermes_cli.config_backend import config_exists
     cfg: dict = {}
     try:
+        from hermes_cli.config_backend import config_exists
         from hermes_cli.config_effective import load_user_config_effective
         cfg_path = _get_hermes_home() / "config.yaml"
         if config_exists(cfg_path):
@@ -1806,6 +1806,10 @@ def _cron_runtime_kwargs(job: dict, jc: _CronJobConfig) -> dict:
     }
     if job.get("base_url"):
         kwargs["explicit_base_url"] = job["base_url"]
+    elif jc.route is not None and jc.route.base_url:
+        kwargs["explicit_base_url"] = jc.route.base_url
+        if jc.route.api_key:
+            kwargs["explicit_api_key"] = jc.route.api_key
     return kwargs
 
 
@@ -1950,8 +1954,8 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 runtime["_fallback_notice"] = pre_agent_fallback_notice(
                     requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else ""),
                     model, runtime.get("provider"), fb_model)
-                from hermes_cli.model_presets import ModelPresetRoute, normalize_route_reasoning_effort
-                runtime["_selected_route"] = ModelPresetRoute(
+                from hermes_cli.model_alias_runtime import AliasRoute, normalize_route_reasoning_effort
+                runtime["_selected_route"] = AliasRoute(
                     "", runtime["provider"], fb_model,
                     normalize_route_reasoning_effort(entry.get("reasoning_effort")))
                 return runtime, fb_model
@@ -2041,14 +2045,15 @@ def _run_agent_with_watchdog(
     def _abort_if_fire_claim_lost() -> None:
         if cancel_event is None or not cancel_event.is_set():
             return
+        reason = cancel_reason(cancel_event)
         if agent is not None and hasattr(agent, "interrupt"):
             request_hard_interrupt(
-                agent, "Cron run cancelled or fire claim ownership lost", tool_reason="cron run cancelled")
+                agent, f"Cron run stopped: {reason}", tool_reason="cron run cancelled")
         with _running_lock:
             control = _running_cancel_events.get(_inflight_key(job_id))
         if control is not None and control.is_set():
             raise RuntimeError(_CANCELLED_INTERRUPTED)
-        raise RuntimeError(f"Cron job '{job_name}' lost its durable fire claim ownership")
+        raise RuntimeError(f"Cron job '{job_name}' was stopped: {reason}")
 
     def _heartbeat_run_claim_if_due():
         nonlocal _last_claim_heartbeat
@@ -2725,7 +2730,7 @@ def run_job(
         _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
         return True, output, final_response, None
 
-    except Exception as e:
+    except (Exception, ConfigBackendUnavailable) as e:
         if isinstance(e, CronSessionStoreUnavailable):
             job["_session_store_unavailable"] = True
         error_msg = f"{type(e).__name__}: {e!s}"
@@ -2834,7 +2839,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         if not execution_id:
             return
         try:
-            finish_execution(execution_id, success=False, error=error)
+            finish_lost_execution(execution_id, error)
         except Exception:
             logger.warning(
                 "Job '%s': failed to close unstarted execution ledger row",
@@ -3076,7 +3081,7 @@ def _record_fire_ownership_lost(
     if schedule_cancelled(job_id, fire_owner):
         if fire_owner is not None:
             record_cancelled_run(job_id, fire_owner, _CANCELLED_INTERRUPTED)
-        finish_execution(execution_id, success=False, error=_CANCELLED_INTERRUPTED)
+        finish_lost_execution(execution_id, _CANCELLED_INTERRUPTED)
         return
     if fire_owner is not None and owns_terminal_claim(job_id, fire_owner) and mark_job_run(
         job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
@@ -3084,9 +3089,8 @@ def _record_fire_ownership_lost(
     ):
         finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
     else:
-        finish_execution(
-            execution_id, success=False,
-            error="Fire claim ownership lost; stale result was discarded.")
+        finish_lost_execution(
+            execution_id, "Fire claim ownership lost; stale result was discarded.")
 
 
 def _compose_run_delivery(
@@ -3151,6 +3155,7 @@ class _FireOwnership:
     def __init__(
         self, job: dict, claim_lost: Optional[_CancelEventLike] = None,
         transport_cancel: Optional[_CancelEventLike] = None,
+        operator_cancel: Optional[_CancelEventLike] = None,
     ):
         self.job = job
         # Two handles: the heartbeat's raw ``lost_ownership`` event and the caller's transport
@@ -3158,16 +3163,23 @@ class _FireOwnership:
         # ``set()`` would propagate into the transport event this run does not own (#105861).
         self.claim_lost = claim_lost
         self.transport_cancel = transport_cancel
-        # What ``run_job`` receives as its ``cancel_event``: either source cancels the run.
+        self.operator_cancel = operator_cancel
+        # ``operator_cancel`` (``hermes cron cancel``) is a THIRD source, deliberately not folded
+        # into ``transport_cancel``: only a transport cancel counts as claim loss for bookkeeping,
+        # while an operator cancel is a real outcome this run records itself.
+        # What ``run_job`` receives as its ``cancel_event``: any source cancels the run.
         self.cancel_event: Optional[_CancelEventLike] = (
-            _CombinedCancelEvent(claim_lost, transport_cancel)
-            if claim_lost is not None or transport_cancel is not None
+            _CombinedCancelEvent(claim_lost, transport_cancel, operator_cancel)
+            if claim_lost is not None or transport_cancel is not None or operator_cancel is not None
             else None)
         claim = job.get("fire_claim")
         self.owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
 
     def transport_cancelled(self) -> bool:
         return self.transport_cancel is not None and self.transport_cancel.is_set()
+
+    def operator_cancelled(self) -> bool:
+        return self.operator_cancel is not None and self.operator_cancel.is_set()
 
     def side_effect_fence(self):
         if self.owner is None:
@@ -3562,16 +3574,18 @@ def _run_one_job_body(
     transport_cancel: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None, hard_wall_fence=None,
 ) -> bool:
-    fence = _FireOwnership(job, claim_lost, transport_cancel)
-    fire_owner = fence.owner
-    _side_effect_fence = fence.side_effect_fence
-    _fire_claim_ownership_lost = fence.lost
-
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
     job = dict(job, execution_id=execution_id)
+    # The execution id is resolved BEFORE the fence so ``hermes cron cancel`` can join the same
+    # cancel seam: the marker it writes is polled by whichever process owns this attempt.
+    fence = _FireOwnership(job, claim_lost, transport_cancel, CancelRequest(execution_id))
+    fire_owner = fence.owner
+    _side_effect_fence = fence.side_effect_fence
+    _fire_claim_ownership_lost = fence.lost
+
     delivery_attempted = False
     delivery_error = None
     committed = False
@@ -3640,14 +3654,11 @@ def _run_one_job_body(
             "execution_id": execution_id}
         if fence.cancel_event is not None:
             _run_kwargs["cancel_event"] = fence.cancel_event
-        try:
-            success, output, final_response, error = run_job(job, **_run_kwargs)
-
-        except BaseException:
-            # run_job hands back the agent even when raising; tear down so a failed run never leaks.
-            # BaseException so KeyboardInterrupt/SystemExit mid-run still trigger teardown.
-            _teardown_deferred()
-            raise
+        outcome = _run_job_unless_cancelled(
+            run_job, job, _run_kwargs, _teardown_deferred, fence, execution_id, fire_owner)
+        if outcome is None:  # an operator cancel stopped it and is already booked
+            return True
+        success, output, final_response, error = outcome
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()
@@ -3769,6 +3780,8 @@ def _run_one_job_body(
                                 require_running=True) is None:
                 return False
             committed = True
+        # A config backend outage (a SystemExit by design) fails this fire, never the ticker.
+        contained = isinstance(e, (Exception, ConfigBackendUnavailable))
         logger.error(
             "Error processing job %s: %s",
             job["id"],
@@ -3778,7 +3791,7 @@ def _run_one_job_body(
         # Owner fencing: a stale worker whose claim was taken over (or transport-cancelled) must not
         # send a failure alert on top of the replacement run's; fall through to fenced bookkeeping.
         if (
-            isinstance(e, Exception)
+            contained
             and not delivery_attempted
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
@@ -3793,7 +3806,7 @@ def _run_one_job_body(
                 mark_kwargs = {}
                 if fire_owner is not None:
                     mark_kwargs["expected_fire_owner"] = fire_owner
-                if isinstance(e, Exception):
+                if contained:
                     mark_kwargs["delivery_error"] = delivery_error
                 from cron.unreachable_retry import is_retry_run
                 if is_retry_run(job):
@@ -3811,12 +3824,15 @@ def _run_one_job_body(
                     execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)
         except Exception as record_err:
             logger.error("Failed to finish execution record for job %s: %s", job["id"], record_err)
-        if not isinstance(e, Exception):
+        if not contained:
             raise
         return False
     finally:
         # Function-level on purpose: must scope delivery, deferred teardown, claim-loss handling and
         # bookkeeping — not just run_job. Do not move into the run block's finally.
+        # The attempt is over either way, so its cancel marker goes with it — an unread marker
+        # would otherwise sit in the cancels dir until the TTL prune.
+        clear_cancel(execution_id)
         exit_cron_execution(_identity_token)
         if _fire_scope_tokens is not None:
             _reset_fire_secret_scope(_fire_scope_tokens)
@@ -4181,6 +4197,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_fd,
+                # detached-spawn: ok — restart-safe cron worker, must survive a gateway restart (#101940)
                 start_new_session=True,
                 creationflags=windows_hide_flags(),
             )
@@ -4943,7 +4960,7 @@ from cron.scheduler_script import (
 from cron.scheduler_prompt import (
     _PROMPT_FRAME, _PROMPT_HEADING, _PROMPT_SEPARATOR, _RESPONSE_FRAME, _RESPONSE_HEADING,
     _RESPONSE_TERMINATOR, _block_and_pause_job, _build_job_prompt, _guard_job_credential_exfil,
-    _parse_wake_gate,
+    _job_doc_header, _parse_wake_gate,
 )
 from cron.scheduler_preflight import (
     BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,

@@ -52,7 +52,7 @@ from hermes_state_guard import (
 )
 from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
 from hermes_state_sessions import SessionSessionsMixin
-from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
+from hermes_state_fts import SessionFtsSetupMixin
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_profile_repair import SessionProfileRepairMixin
@@ -79,6 +79,7 @@ from hermes_state_wal import (
 )
 from hermes_state_repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from hermes_state_titles import SessionTitlesMixin
+from hermes_state_prompt_refresh import SessionPromptRefreshMixin
 from hermes_state_usage import SessionUsageMixin
 from hermes_state_maintenance import SessionMaintenanceMixin
 from hermes_state_gateway import SessionGatewayMixin
@@ -498,6 +499,7 @@ class SessionDB(
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
     SessionMessagesMixin, SessionPruneRewriteMixin, SessionApiContentMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin,
+    SessionPromptRefreshMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 
@@ -688,9 +690,7 @@ class SessionDB(
         self._db_corrupt, self._db_corrupt_reason = False, ""  # sticky quarantine (StateDbCorruptError)
         self._fts_usermerge_floor_applied = False  # one-shot usermerge-floor write guard
         self._fts_enabled = self._fts_stale = self._trigram_available = False
-        # _fts_cjk_loaded: tokenizer on the writer connection; _fts_cjk_available: messages_fts_cjk
-        # is queryable AND not marked stale.
-        self._fts_cjk_loaded = self._fts_cjk_available = self._fts_unavailable_warned = False
+        self._fts_unavailable_warned = False
         self._conn = None
         # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.
         self._token_queue: deque = deque()
@@ -852,7 +852,7 @@ class SessionDB(
             raise sqlite3.DatabaseError(msg)
 
     def _open_writer_conn(self) -> sqlite3.Connection:
-        """Connect + WAL/pragma/tokenizer setup for a writer connection (no schema init). Short timeout:
+        """Connect + WAL/pragma setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
         conn = _connect_tracked_db(
@@ -873,7 +873,6 @@ class SessionDB(
             _secure_state_db_files(self.db_path)
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
-            self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
         except BaseException:
             self._close_connection_quietly(conn)
             raise
@@ -942,10 +941,8 @@ class SessionDB(
         try:
             conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
             apply_database_pragmas(conn, db_label="state.db")
-            if self._fts_cjk_loaded:  # registers in the connection, not the file: ro is fine
-                load_fts5_cjk_extension(conn)
         except BaseException as exc:
-            # A half-open connection (open ok, extension load failed) is a live tracked descriptor,
+            # A half-open connection (open ok, pragmas failed) is a live tracked descriptor,
             # the leak shape this pool exists to fix; a stranded permit would shrink the read
             # path by one slot forever. (Not _close_read_conn: callers release their own permit.)
             if conn is not None:
@@ -999,14 +996,16 @@ class SessionDB(
         self._close_read_conn(conn)
 
     @contextmanager
-    def _read_ctx(self, *, reopen: bool = True, resident_only: bool = False) -> Iterator[sqlite3.Connection]:
+    def _read_ctx(self, *, reopen: bool = True, resident_only: bool = False, pooled_only: bool = False) -> Iterator[sqlite3.Connection]:
         """Yield a connection for read-only statements: a pooled read-only
         connection with NO lock under WAL; otherwise (non-WAL, open failure,
         ceiling reached) the writer connection under self._lock — deliberate
         degradation: slower beats EMFILE, which the supervisor cannot see. A search
         scope overrides that fallback for all of its reads, including hydration.
         ``reopen=False``: a read after ``close()`` raises instead of reopening the
-        writer (an optional reader must not hold a home that is being deleted)."""
+        writer. Pinned snapshots and search operations retain their own connection.
+        ``pooled_only`` yields None when no independent reader is available.
+        """
         if resident_only:
             if not self._lock.acquire(blocking=False):
                 raise RuntimeError("Resident session read unavailable")
@@ -1022,12 +1021,19 @@ class SessionDB(
         if operation is not None:
             yield operation.connection
             return
+        pinned = self._pinned_read_conn()
+        if pinned is not None:
+            yield pinned
+            return
         conn = self._checkout_read_conn()
         if conn is not None:
             try:
                 yield conn
             finally:
                 self._return_read_conn(conn)
+            return
+        if pooled_only:
+            yield None
             return
         with state_lock(self._lock, db_path=self.db_path):
             if self._conn is None:  # close() raced a still-unwinding reader

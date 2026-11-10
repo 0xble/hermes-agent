@@ -193,7 +193,7 @@ class TestRunJobScript:
 
     def test_script_subprocess_env_drops_session_identity(self, cron_env, monkeypatch):
         """A sessionless cron worker must not pass its launcher's stale session mirror to a script."""
-        import gateway.session_context as session_context
+        from gateway import session_context
         from cron.scheduler_script import _run_job_script
 
         saved_context = {var: var.get() for var in session_context._VAR_MAP.values()}

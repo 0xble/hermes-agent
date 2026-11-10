@@ -182,7 +182,7 @@ class TestPluginClaimedFailureNotice:
             seen.append((name, kw))
             return [result]
 
-        import hermes_cli.plugins as plugins
+        from hermes_cli import plugins
         monkeypatch.setattr(plugins, "has_hook", lambda name: name == "subagent_failure_notice")
         monkeypatch.setattr(plugins, "invoke_hook", _invoke)
         return seen
@@ -207,7 +207,7 @@ class TestPluginClaimedFailureNotice:
         assert len(captured) == 1 and "429" in captured[0]
 
     def test_hook_error_keeps_the_notice(self, monkeypatch):
-        import hermes_cli.plugins as plugins
+        from hermes_cli import plugins
         monkeypatch.setattr(plugins, "has_hook", lambda name: True)
 
         def _boom(name, **kw):
@@ -234,7 +234,7 @@ class TestClaimEvaluatedOncePerFailure:
         ([None, {"action": "suppress"}], 1),  # a second call would have hidden a real failure
     ])
     def test_hook_runs_once_and_its_first_decision_wins(self, monkeypatch, answers, delivered):
-        import hermes_cli.plugins as plugins
+        from hermes_cli import plugins
         calls = []
 
         def _invoke(name, **kw):

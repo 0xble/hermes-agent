@@ -55,7 +55,7 @@ def test_carry_keeps_payload_only_extra_in_first_committed_generation(tmp_path, 
             f'find-links=[{json.dumps(wheels.as_posix())}]\n', encoding="utf-8",
         )
         locked = subprocess.run([uv, "lock", "--python", sys.executable], cwd=release,
-                                capture_output=True, text=True, timeout=60)
+                                capture_output=True, text=True, timeout=60, check=False)
         assert locked.returncode == 0, locked.stderr
 
     monkeypatch.setattr(paths, "repo_root", lambda: previous)
@@ -83,7 +83,7 @@ def test_carry_keeps_payload_only_extra_in_first_committed_generation(tmp_path, 
     probe = subprocess.run(
         [str(project_python(candidate)), "-I", "-c", f"import {distribution}, slack_bolt"],
         capture_output=True, text=True, timeout=30,
-    )
+     check=False)
     assert probe.returncode == 0, probe.stderr
     # A satisfied candidate must not rebuild every time the preflight re-enters.
     facts_before = runtime_facts_path(candidate).read_bytes()

@@ -7,7 +7,7 @@ proven that (``authorize_local_source`` plus the ``session:control`` capability)
 admin-only.
 """
 import asyncio
-import hermes_bootstrap  # noqa: F401 -- initialize dependencies before the real-home I/O guard
+import hermes_bootstrap
 import json
 import signal
 import threading

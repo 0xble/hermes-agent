@@ -41,10 +41,10 @@ def _queue_declined_followup(runner, data, path, reason, source, adapter, recove
         return False
     event = _recovered_followup_event(
         data, source, data.get("source_user_id") or data.get("user_id") or getattr(source, "user_id", None))
-    setattr(event, "_hermes_recovered_followup", True)
-    setattr(event, "_hermes_recovered_declined", True)
-    setattr(event, "_hermes_recovery_decline_reason", reason)
-    setattr(event, "_hermes_recovery_spool", path)
+    event._hermes_recovered_followup = True
+    event._hermes_recovered_declined = True
+    event._hermes_recovery_decline_reason = reason
+    event._hermes_recovery_spool = path
     # No _hermes_recovery_session_key: a declined input never runs, so it must not displace
     # the predecessor's own resume decision the way an accepted follow-up does.
     if recovered_events is not None:
@@ -72,9 +72,9 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
            for event in getattr(runner, "_startup_restore_queue", ())):
         return OTHER_PLATFORM_PENDING  # claimed by this process already
     store = runner.session_store
-    with store._lock:  # noqa: SLF001 — inspect the same snapshot as the breaker
-        store._ensure_loaded_locked()  # noqa: SLF001
-        entry = store._entries.get(key)  # noqa: SLF001
+    with store._lock:
+        store._ensure_loaded_locked()
+        entry = store._entries.get(key)
         if breaker_tripped and entry and entry.resume_pending and entry.session_id == session_id:
             return None
         if drain_deferred:
@@ -155,12 +155,12 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
     """Queue the rebuilt follow-up for replay, unless an earlier boot's turn already owns it."""
     followup = data.get("shutdown_follow_up") is True
     event = _recovered_followup_event(data, source, author_id)
-    setattr(event, "_hermes_recovered_followup", True)
-    setattr(event, "_hermes_recovery_spool", path)
+    event._hermes_recovered_followup = True
+    event._hermes_recovery_spool = path
     if followup:
-        setattr(event, "_hermes_recovery_session_key", key)
-        setattr(event, "_hermes_recovery_session_id", session_id)
-        setattr(event, "_hermes_recovery_spool_ts", data.get("_recovery_spool_ts"))
+        event._hermes_recovery_session_key = key
+        event._hermes_recovery_session_id = session_id
+        event._hermes_recovery_spool_ts = data.get("_recovery_spool_ts")
     if recovered_events is not None:
         recovered_events.append(event)
     else:
@@ -251,9 +251,9 @@ def _recovered_followup_event(data, source, author_id):
     if (not isinstance(receipt, (int, float)) or isinstance(receipt, bool)
             or (isinstance(receipt, float) and not math.isfinite(receipt))):
         receipt = None
-    setattr(event, "_attended_activity_received_at", receipt)
+    event._attended_activity_received_at = receipt
     if recovery_id is not None:
-        setattr(event, "_hermes_recovery_id", recovery_id)
+        event._hermes_recovery_id = recovery_id
     return event
 
 

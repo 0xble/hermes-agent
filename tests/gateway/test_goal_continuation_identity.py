@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.gateway.test_session_control_watcher import _runner, state as state
+from tests.gateway.test_session_control_watcher import _runner, state
 
 
 async def _control_event(runner, record):

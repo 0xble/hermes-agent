@@ -28,7 +28,7 @@ async def test_busy_followup_keeps_its_marker_until_the_reply_is_ledgered(monkey
     adapter = Adapter()
     adapter.gateway_runner = runner  # as GatewayRunner._create_adapter binds every adapter
     runner.adapters = {Platform.TELEGRAM: adapter}
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    _authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='busy-chat', chat_type='dm', user_id='fixture-user')
     key = runner.session_store._generate_session_key(source)

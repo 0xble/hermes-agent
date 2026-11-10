@@ -519,7 +519,7 @@ class RestartRecoveryMixin:
                 return False
             # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
             with suppress(Exception):
-                setattr(event, "_hermes_startup_restore_replay", True)
+                event._hermes_startup_restore_replay = True
             # A normal return can be an admission refusal. Retire the only
             # durable copy only after this replay acquires an explicit receipt.
             event._gateway_accepted = False

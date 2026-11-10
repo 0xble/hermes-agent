@@ -98,9 +98,7 @@ def _make_disconnect_adapter(monkeypatch, *, enabled: bool, events: list[str]):
     monkeypatch.setattr(adapter, "_cancel_pending_delivery_tasks", lambda: asyncio.sleep(0))
 
     async def bounded(awaitable, _timeout, step):
-        if step == "updater.stop()":
-            await awaitable
-        elif asyncio.iscoroutine(awaitable):
+        if step == "updater.stop()" or asyncio.iscoroutine(awaitable):
             await awaitable
         events.append(step)
         return True
@@ -211,7 +209,7 @@ def test_disconnect_flag_on_releases_lock_when_quota_flush_cancels(monkeypatch):
             started.set()
             unblock.wait(1)
 
-    setattr(adapter, "_telegram_daily_quota", Quota())
+    adapter._telegram_daily_quota = Quota()
 
     async def scenario():
         task = asyncio.create_task(adapter.disconnect())
@@ -274,7 +272,7 @@ def test_disconnect_flag_on_cancels_and_releases_when_updater_stop_times_out(mon
             stop_cancelled.append(True)
             raise
 
-    setattr(adapter._app, "updater", SimpleNamespace(running=True, stop=wedged_stop))
+    adapter._app.updater = SimpleNamespace(running=True, stop=wedged_stop)
     monkeypatch.setattr(adapter, "_await_disconnect_step", TelegramAdapter._await_disconnect_step.__get__(adapter))
     monkeypatch.setattr("plugins.platforms.telegram.adapter._UPDATER_STOP_TIMEOUT", 0.05)
     monkeypatch.setattr("plugins.platforms.telegram.adapter._DISCONNECT_STEP_TIMEOUT", 0.05)

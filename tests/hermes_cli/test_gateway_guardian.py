@@ -4,14 +4,14 @@ import json
 import os
 import plistlib
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 
 import pytest
 
 # The facade re-exports gateway_launchd's functions by value at its first import. Load it before any
 # test patches a gateway_launchd function, or the facade keeps that test's stub for the whole process.
-import hermes_cli.gateway  # noqa: F401
+import hermes_cli.gateway
 from hermes_cli import gateway_guardian as guardian
 
 
@@ -106,7 +106,7 @@ def test_unrelated_invalid_update_key_does_not_block_repair(tmp_path, monkeypatc
 
 @pytest.mark.platforms("macos")
 def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     assert guardian.run_once(home, plist, label, grace=0.000001) == "repaired"
@@ -118,7 +118,7 @@ def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypa
 
 @pytest.mark.platforms("macos")
 def test_stop_marker_never_fights_unloaded_service(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
     guardian.set_intent(home, stopped=True)
     assert guardian.run_once(home, plist, label) == "stopped"
@@ -199,7 +199,7 @@ def test_unloaded_service_is_not_bootstrapped_beside_withdrawn_leftovers(tmp_pat
 
 @pytest.mark.platforms("macos")
 def test_loaded_service_does_not_bootstrap(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label, loaded=True)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     assert guardian.run_once(home, plist, label) == "healthy"
@@ -208,7 +208,7 @@ def test_loaded_service_does_not_bootstrap(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_attempt_cap_and_lock_prevent_repair(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
     for n in range(3):
         guardian.receipt(home, "bootstrap", "attempt", label=label)
@@ -222,7 +222,7 @@ def test_attempt_cap_and_lock_prevent_repair(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_corrupt_current_pointer_reports_without_source_fallback(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     (home / "current").unlink()
     (home / "current").symlink_to(home / "missing")
     calls = fake_launchctl(monkeypatch, label)
@@ -232,7 +232,7 @@ def test_corrupt_current_pointer_reports_without_source_fallback(tmp_path, monke
 
 @pytest.mark.platforms("macos")
 def test_source_checkout_plist_is_never_bootstrapped(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     definition = plistlib.loads(plist.read_bytes())
     definition["WorkingDirectory"] = str(tmp_path / "source")
     plist.write_bytes(plistlib.dumps(definition))
@@ -243,7 +243,7 @@ def test_source_checkout_plist_is_never_bootstrapped(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_pending_failed_switch_archived_before_rollback(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, _plist, _label, a, b = layout(tmp_path)
     txn = {"version": 1, "operation": "promote", "candidate": str(b),
            "previous_intended": str(a), "current_original": str(a),
            "previous_original": str(b), "requires_reload": True,
@@ -259,7 +259,7 @@ def test_pending_failed_switch_archived_before_rollback(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_acknowledged_or_mismatched_switch_is_not_abandoned(tmp_path):
-    home, plist, label, a, b = layout(tmp_path)
+    home, _plist, _label, a, b = layout(tmp_path)
     from hermes_cli.immutable_releases import abandon_failed_switch
     txn = {"version": 1, "operation": "promote", "candidate": str(b),
            "previous_intended": str(a), "current_original": str(a),
@@ -278,7 +278,7 @@ def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch
     calls = fake_launchctl(monkeypatch, label, loaded=True)
     monkeypatch.setattr(guardian, "healthy", lambda *args: False)
     txn = {"version": 1, "operation": "promote", "candidate": str(b),
-           "previous_intended": str(a), "reload_issued": {"at": datetime.now(timezone.utc).isoformat()}}
+           "previous_intended": str(a), "reload_issued": {"at": datetime.now(UTC).isoformat()}}
     last = home / "release-last-txn.json"
     last.write_text(json.dumps(txn), encoding="utf-8")
     monkeypatch.setattr(guardian, "rollback_switch", lambda *args, **kwargs: pytest.fail("premature rollback"))
@@ -298,7 +298,7 @@ def test_configured_release_ack_grace_delays_guardian_rollback(tmp_path, monkeyp
         "version": 1, "operation": "promote", "candidate": str(b),
         "previous_intended": str(a),
         "reload_issued": {"at": datetime.fromtimestamp(
-            datetime.now(timezone.utc).timestamp() - 240, timezone.utc).isoformat()},
+            datetime.now(UTC).timestamp() - 240, UTC).isoformat()},
     }), encoding="utf-8")
     calls = fake_launchctl(monkeypatch, label)
     assert guardian.run_once(home, plist, label) == "waiting"
@@ -309,7 +309,7 @@ def test_configured_release_ack_grace_delays_guardian_rollback(tmp_path, monkeyp
 def test_stale_runtime_status_is_not_healthy(tmp_path, monkeypatch):
     from hermes_cli import gateway_launchd
     import psutil
-    home, plist, label, a, b = layout(tmp_path)
+    home, _plist, label, _a, b = layout(tmp_path)
     (home / "gateway_state.json").write_text(json.dumps({
         "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
         "updated_at": "2020-01-01T00:00:00+00:00",
@@ -325,10 +325,10 @@ def test_health_probe_spends_only_the_remaining_guardian_budget(tmp_path, monkey
     # startup/rollback bound: the probe gets what is left of the deadline, not a fixed 10s.
     from hermes_cli import gateway_launchd
     import psutil
-    home, plist, label, a, b = layout(tmp_path)
+    home, _plist, label, _a, b = layout(tmp_path)
     (home / "gateway_state.json").write_text(json.dumps({
         "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }), encoding="utf-8")
     monkeypatch.setattr(guardian.time, "monotonic", lambda: 100.0)
     seen = []
@@ -371,7 +371,7 @@ def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch
     calls = fake_launchctl(monkeypatch, label)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     txn = {"version": 1, "operation": operation, "candidate": str(b),
-           "previous_intended": str(a), "reload_issued": {"at": datetime.now(timezone.utc).isoformat()}}
+           "previous_intended": str(a), "reload_issued": {"at": datetime.now(UTC).isoformat()}}
     (home / "release-last-txn.json").write_text(json.dumps(txn))
     assert guardian.run_once(home, plist, label, grace=180, domain="gui/501") == "waiting"
     assert not any(row[1] == "bootstrap" for row in calls)
@@ -402,10 +402,10 @@ def test_guardian_rollback_inherits_the_run_startup_deadline(tmp_path, monkeypat
 def test_health_proof_finished_after_the_deadline_does_not_count(tmp_path, monkeypatch):
     from hermes_cli import gateway_launchd
     import psutil
-    home, plist, label, a, b = layout(tmp_path)
+    home, _plist, label, _a, b = layout(tmp_path)
     (home / "gateway_state.json").write_text(json.dumps({
         "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
     }), encoding="utf-8")
     clock = {"now": 100.0}
     monkeypatch.setattr(guardian.time, "monotonic", lambda: clock["now"])
@@ -502,7 +502,7 @@ def test_launchd_restart_clears_stopped_intent(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, a, _b = layout(tmp_path)
     calls = []
     from hermes_cli import gateway_launchd
     import psutil
@@ -602,7 +602,7 @@ def test_repeated_alerts_are_deduplicated_and_old_receipts_pruned(tmp_path):
 
 @pytest.mark.platforms("macos")
 def test_healthy_rollback_is_acknowledged_on_subsequent_run(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, b = layout(tmp_path)
     fake_launchctl(monkeypatch, label, loaded=True)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     pending = home / "release-txn.json"
@@ -620,7 +620,7 @@ def test_healthy_rollback_is_acknowledged_on_subsequent_run(tmp_path, monkeypatc
 @pytest.mark.platforms("macos")
 @pytest.mark.parametrize("domain", ["gui", "user"])
 def test_guardian_resolves_existing_gateway_domain(tmp_path, monkeypatch, domain):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     import os
     selected = f"{domain}/{os.getuid()}"
     calls = []
@@ -642,7 +642,7 @@ def test_guardian_resolves_existing_gateway_domain(tmp_path, monkeypatch, domain
 
 @pytest.mark.platforms("macos")
 def test_user_domain_stays_healthy_when_gui_probe_errors(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     calls = []
     def run(argv, **kwargs):
         calls.append(argv)
@@ -657,7 +657,7 @@ def test_user_domain_stays_healthy_when_gui_probe_errors(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_unknown_launchctl_failure_is_alert_not_bootstrap(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, _b = layout(tmp_path)
     calls = []
     def run(argv, **kwargs):
         calls.append(argv)
@@ -674,7 +674,7 @@ def test_failed_switch_rolls_back_only_verified_previous(tmp_path, monkeypatch):
            "current_original": str(a), "previous_original": str(b), "requires_reload": True,
            "reload_issued": {"at": "2020-01-01T00:00:00+00:00"}}
     (home / "release-last-txn.json").write_text(json.dumps(txn))
-    calls = fake_launchctl(monkeypatch, label, loaded=True)
+    _calls = fake_launchctl(monkeypatch, label, loaded=True)
     monkeypatch.setattr(guardian, "healthy", lambda *args: False)
     done = []
     monkeypatch.setattr(guardian, "rollback_switch", lambda *args, **kwargs: done.append(True) or True)
@@ -722,7 +722,7 @@ def test_expired_deadline_aborts_leftover_inspection(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_rollback_acknowledgement_probe_spends_the_run_deadline(tmp_path, monkeypatch):
-    home, plist, label, a, b = layout(tmp_path)
+    home, plist, label, _a, b = layout(tmp_path)
     fake_launchctl(monkeypatch, label, loaded=True)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     pending = home / "release-txn.json"

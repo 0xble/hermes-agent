@@ -6,7 +6,7 @@ import pytest
 
 from gateway import admission_canary
 from hermes_state_runtime import list_session_admissions
-from tests.gateway.test_automation_upgrade_admission import upgraded_chat as upgraded_chat
+from tests.gateway.test_automation_upgrade_admission import upgraded_chat
 
 
 @pytest.mark.asyncio

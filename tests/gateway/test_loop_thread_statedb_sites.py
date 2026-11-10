@@ -75,7 +75,7 @@ async def test_stale_topic_binding_prune_runs_off_the_loop(tmp_path):
 
 @pytest.mark.asyncio
 async def test_goal_continuation_recheck_runs_off_the_loop(monkeypatch):
-    import hermes_cli.session_controls as session_controls
+    from hermes_cli import session_controls
     from gateway.turn_context import TurnContext
 
     runner = object.__new__(GatewayRunner)
@@ -83,7 +83,6 @@ async def test_goal_continuation_recheck_runs_off_the_loop(monkeypatch):
 
     def refresh(event, session_id):
         threads.append(threading.get_ident())
-        return None
 
     monkeypatch.setattr(session_controls, "refresh_goal_continuation", refresh)
 
@@ -167,7 +166,6 @@ async def test_process_watcher_lookup_runs_off_the_loop(tmp_path, monkeypatch):
         def get(self, session_id):
             # A finished process falls back to retained results, whose ownership check opens state.db.
             threads.append(threading.get_ident())
-            return None
 
     monkeypatch.setattr(pr_module, "process_registry", _Registry())
     runner = GatewayRunner(GatewayConfig())

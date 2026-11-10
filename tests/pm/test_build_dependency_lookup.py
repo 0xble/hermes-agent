@@ -10,7 +10,7 @@ from pm.lock import Lockfile
 from pm.package import InstallError, Package
 from pm.registry import _packages, get_package
 from pm.store import current_target
-from tests.pm._fixtures import make_tar, served as served
+from tests.pm._fixtures import make_tar, served
 
 
 @pytest.fixture

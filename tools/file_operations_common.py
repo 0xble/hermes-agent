@@ -124,7 +124,11 @@ class SearchResult:
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
-
+    # Unreadable paths behind the "Skipped N unreadable path(s)" sentence in ``warning``,
+    # plus the diagnostics dropped past the runner's cap: a multi-root merge recomposes
+    # one sentence from this data instead of parsing the text. Never serialized.
+    skipped_paths: list[str] = field(default_factory=list)
+    skipped_omitted: int = 0
     resolved_path: Optional[str] = None
     resolved_cwd: Optional[str] = None
     nearest_existing_parent: Optional[str] = None

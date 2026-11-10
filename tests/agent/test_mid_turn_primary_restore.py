@@ -599,7 +599,7 @@ def test_stay_limit_only_reclaims_earlier_backups_quietly(
     agent._fallback_index = start_index
     assert agent._try_activate_fallback(reason=FailoverReason.rate_limit)
     original_model = agent.model
-    original_client = agent.client
+    _original_client = agent.client
     original_cooldown = agent._shared_primary_cooldown_record.copy()
     agent._pending_fallback_notice = []
     requested = []

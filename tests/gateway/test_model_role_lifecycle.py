@@ -30,7 +30,7 @@ def lane(tmp_path, monkeypatch):
         "model": {"default": "base", "provider": "baseline", "attended": {
             "model": "attended-model", "provider": "attended-provider", "idle_revert_minutes": 1,
         }},
-        "model_presets": {
+        "model_aliases": {
             "fast": {"model": "first", "provider": "provider-a", "reasoning_effort": "low"},
             "other": {"model": "second", "provider": "provider-b", "reasoning_effort": "high"},
         },
@@ -86,7 +86,7 @@ def _wire_role_provider(lane, monkeypatch, server):
     import agent.model_metadata as metadata
 
     lane.cfg["model"].update(provider="custom", attended={})
-    for preset in lane.cfg["model_presets"].values():
+    for preset in lane.cfg["model_aliases"].values():
         preset["provider"] = "custom"
     lane.cfg["platform_toolsets"] = {"telegram": ["memory"]}
     lane.path.write_text(yaml.safe_dump(lane.cfg))
@@ -195,17 +195,17 @@ async def test_same_turn_reads_owning_profile_at_each_api_boundary(lane, monkeyp
     turn, agent = _turn(lane)
     monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", _switch)
     assert await _boundary(turn, agent) == ("first", "provider-a", {"enabled": True, "effort": "low"})
-    lane.cfg["model_presets"]["fast"] = {
+    lane.cfg["model_aliases"]["fast"] = {
         "model": "edited", "provider": "provider-c", "reasoning_effort": "none",
     }
     lane.path.write_text(yaml.safe_dump(lane.cfg))
     assert await _boundary(turn, agent) == ("edited", "provider-c", {"enabled": False})
-    assert turn._ctx.user_config["model_presets"]["fast"]["model"] == "first"
+    assert turn._ctx.user_config["model_aliases"]["fast"]["model"] == "first"
 
 
 @pytest.mark.asyncio
 async def test_same_turn_inherits_fresh_destination_reasoning(lane, monkeypatch):
-    lane.cfg["model_presets"]["fast"].pop("reasoning_effort")
+    lane.cfg["model_aliases"]["fast"].pop("reasoning_effort")
     lane.cfg["agent"] = {"reasoning_effort": "medium", "reasoning_overrides": {"first": "high"}}
     lane.path.write_text(yaml.safe_dump(lane.cfg))
     await lane.runner._set_session_model_role(lane.key, "fast")
@@ -220,7 +220,7 @@ async def test_same_turn_inherits_fresh_destination_reasoning(lane, monkeypatch)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["fast", "default", "attended", "deleted", "channel", "automatic"])
 async def test_same_turn_destination_reasoning_precedence_and_disabled_values(lane, monkeypatch, route):
-    lane.cfg["model_presets"]["fast"].pop("reasoning_effort")
+    lane.cfg["model_aliases"]["fast"].pop("reasoning_effort")
     lane.cfg["agent"] = {"reasoning_effort": "medium", "reasoning_overrides": {}}
     if route in {"deleted", "channel"}:
         from gateway.config import ChannelOverride, PlatformConfig
@@ -264,19 +264,19 @@ async def test_same_turn_destination_reasoning_precedence_and_disabled_values(la
 @pytest.mark.asyncio
 async def test_role_declared_and_session_effort_outrank_destination_inheritance(lane, monkeypatch):
     lane.cfg["agent"] = {"reasoning_effort": "medium", "reasoning_overrides": {"first": "high"}}
-    lane.cfg["model_presets"]["fast"]["reasoning_effort"] = False
+    lane.cfg["model_aliases"]["fast"]["reasoning_effort"] = False
     lane.path.write_text(yaml.safe_dump(lane.cfg))
     await lane.runner._set_session_model_role(lane.key, "fast")
     turn, agent = _turn(lane)
     monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", _switch)
     assert (await _boundary(turn, agent))[2] == {"enabled": False}
-    lane.cfg["model_presets"]["fast"]["reasoning_effort"] = "low"
+    lane.cfg["model_aliases"]["fast"]["reasoning_effort"] = "low"
     lane.path.write_text(yaml.safe_dump(lane.cfg))
     assert (await _boundary(turn, agent))[2] == {"enabled": True, "effort": "low"}
     lane.runner._set_session_reasoning_override(lane.key, {"enabled": False})
     turn, agent = _turn(lane)
     assert (await _boundary(turn, agent))[2] == {"enabled": False}
-    lane.cfg["model_presets"]["fast"]["reasoning_effort"] = "ultra"
+    lane.cfg["model_aliases"]["fast"]["reasoning_effort"] = "ultra"
     lane.path.write_text(yaml.safe_dump(lane.cfg))
     assert (await _boundary(turn, agent))[2] == {"enabled": False}
 
@@ -324,7 +324,7 @@ async def test_busy_role_assignment_waits_for_next_turn_but_config_stays_live(la
         assert status["model_status"] == "queued"
         assert status["model_effective_when"] == "next_turn"
     if not bulk:
-        lane.cfg["model_presets"]["fast"]["model"] = "edited-first"
+        lane.cfg["model_aliases"]["fast"]["model"] = "edited-first"
         lane.path.write_text(yaml.safe_dump(lane.cfg))
         assert (await _boundary(turn, agent))[:2] == ("edited-first", "provider-a")
     runner._running_agents.pop(lane.key)
@@ -381,7 +381,7 @@ def test_invalid_hold_uses_channel_default_even_with_recent_activity(role):
 def _guard_selection(lane, monkeypatch, guard):
     runner = lane.runner
     model = "llama-contributor" if guard == "data_policy" else "first"
-    lane.cfg["model_presets"]["fast"].update(model=model, provider="openrouter")
+    lane.cfg["model_aliases"]["fast"].update(model=model, provider="openrouter")
     lane.path.write_text(yaml.safe_dump(lane.cfg))
     info = SimpleNamespace(provider_id="openrouter", has_cost_data=lambda: True,
                            cost_input=50 if guard == "cost" else 1, cost_output=1)
@@ -404,10 +404,10 @@ async def test_slash_role_uses_shared_guard_and_confirmation_keeps_name(lane, mo
         callbacks.append(kwargs["handler"])
         return "confirm required"
     monkeypatch.setattr(runner, "_request_slash_confirm", confirm)
-    reply = await runner._handle_model_command_locked(MessageEvent(text="/model @fast", source=lane.source))
+    reply = await runner._handle_model_command_locked(MessageEvent(text="/model fast", source=lane.source))
     assert reply == "confirm required"
     assert runner.session_store.get_model_role(lane.key) is None
-    assert "@fast" in await callbacks[0]("always")
+    assert "fast" in await callbacks[0]("always")
     assert runner.session_store.get_model_role(lane.key) == "fast"
     assert runner.session_store.get_model_override(lane.key) is None
     runner._perform_model_switch.assert_awaited_once()
@@ -418,7 +418,7 @@ async def test_slash_role_uses_shared_guard_and_confirmation_keeps_name(lane, mo
 async def test_topic_role_uses_shared_selection_guard(lane, monkeypatch, guard):
     runner = _guard_selection(lane, monkeypatch, guard)
     with pytest.raises(TopicRequestError, match="confirmation"):
-        await _resolve_model(runner, lane.source, TopicSpec(model="@fast"), lane.key)
+        await _resolve_model(runner, lane.source, TopicSpec(model="fast"), lane.key)
     assert runner.session_store.get_model_role(lane.key) is None
     runner._perform_model_switch.assert_awaited_once()
 

@@ -8,7 +8,7 @@ import pytest
 
 from tools import delegate_tool as delegate
 from tools import delegate_tool_routes as routes
-from tests.tools.test_delegate_by_parent import (
+from tests.tools.alias_route_fixtures import (
     HIGH,
     MEDIUM,
     SOL,
@@ -61,10 +61,7 @@ def test_default_backend_selects_by_parent_before_native_provider_and_real_build
         built, _ = _spawn(parent)
     assert provider.call_count == route.call_count == runtime.call_count == 1
     assert route.call_args.args[0].name == "default"
-    selected = route.call_args.args[4]
-    assert "provider" not in selected and "model" not in selected
-    assert selected["max_iterations"] == 19
-    assert runtime.call_args.args[1] == selected
+    assert route.call_args.args[4]["max_iterations"] == 19
     assert (built["model"], built["provider"], built["base_url"]) == (
         VENICE, parent.provider, parent.base_url,
     )

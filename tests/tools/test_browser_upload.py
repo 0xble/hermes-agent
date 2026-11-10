@@ -135,7 +135,7 @@ def test_named_trigger_refused_when_top_page_has_file_input(mock_post, monkeypat
 def test_named_trigger_refused_when_top_level_count_unknown(
         mock_post, monkeypatch, tmp_path, trigger, evaluate_reply):
     from tools.registry import registry
-    import tools.browser_tool  # noqa: F401 (registers real upload dispatch)
+    import tools.browser_tool
 
     monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
     monkeypatch.setenv("CAMOFOX_UPLOADS_DIR", str(tmp_path / "uploads"))
@@ -227,7 +227,7 @@ def test_nt_namespace_path_rejected_before_resolve(mock_post, monkeypatch, tmp_p
 def test_registered_only_for_camofox_and_in_browser_toolset(monkeypatch):
     import toolsets
     from tools.registry import registry
-    import tools.browser_tool  # noqa: F401  (registers browser tools)
+    import tools.browser_tool
 
     assert "browser_upload" in toolsets.TOOLSETS["browser"]["tools"]
     entry = registry.get_entry("browser_upload")

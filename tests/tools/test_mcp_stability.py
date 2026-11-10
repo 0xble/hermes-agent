@@ -18,7 +18,7 @@ def _track_fake_incarnation(pid, monkeypatch, pgid=None):
     proc.children.return_value = []
     proc.send_signal.side_effect = lambda sig: os.kill(pid, sig)
     _mcp_lifecycle._stdio_processes[pid] = {pid: proc}
-    monkeypatch.setattr("psutil.process_iter", lambda: [])
+    monkeypatch.setattr("psutil.process_iter", list)
     monkeypatch.setattr("psutil.wait_procs", lambda procs, **kwargs: ([], procs))
     if pgid is not None:
         existing = getattr(os, "getpgid", lambda _: None)
@@ -162,8 +162,6 @@ class TestStdioPidTracking:
                  patch("tools.mcp_tool_config._resolve_stdio_command",
                        return_value=("echo", {})), \
                  patch("tools.mcp_tool_config._write_stderr_log_header"), \
-                 patch("tools.mcp_tool._get_mcp_stderr_log",
-                       return_value=None), \
                  patch("tools.mcp_tool.check_package_for_malware",
                        return_value=None, create=True), \
                  patch("tools.osv_check.check_package_for_malware",
@@ -502,7 +500,7 @@ class TestStdioPgroupReaping:
         @asynccontextmanager
         async def sdk_stdio(*args, **kwargs):
             nonlocal parent, captured_before_eof
-            parent = subprocess.Popen(
+            parent = await asyncio.to_thread(subprocess.Popen,
                 [sys.executable, str(parent_script)], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, text=True, start_new_session=True,
             )

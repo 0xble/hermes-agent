@@ -8,7 +8,7 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.session_results import execution_result
 from hermes_cli.checkins import CheckinConfig, CheckinManager
-from tests.gateway.test_supervisor_checkins import fixture as fixture
+from tests.gateway.test_supervisor_checkins import fixture
 
 
 @pytest.mark.asyncio

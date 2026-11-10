@@ -6,9 +6,10 @@ import subprocess
 
 import pytest
 
-import hermes_cli.gateway  # noqa: F401  (load the facade before patching gateway_launchd)
+import hermes_cli.gateway
 from hermes_cli import gateway_guardian as guardian
 from tests.hermes_cli.test_gateway_guardian import layout
+from datetime import UTC
 
 
 def _op_on(tmp_path):
@@ -115,7 +116,7 @@ def test_pinned_op_binary_satisfies_the_preflight(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_failure_before_the_gateway_stops_still_fails_closed(tmp_path, monkeypatch):
-    home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    home, plist, label, a, _b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
 
     def rollback(*args, **kwargs):
         raise RuntimeError("rollback gateway is not owned by the selected launchd service")
@@ -156,7 +157,7 @@ def _record_activations(monkeypatch, home):
 
 @pytest.mark.platforms("macos")
 def test_exception_after_bootout_restores_the_serving_release(tmp_path, monkeypatch):
-    home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    home, plist, label, a, b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     monkeypatch.setattr(guardian, "rollback", _failing_rollback(home, a, raise_after_bootout=True))
     activations = _record_activations(monkeypatch, home)
     monkeypatch.setattr(guardian, "healthy", lambda home_, label_, release, *rest: release == b)
@@ -169,7 +170,7 @@ def test_exception_after_bootout_restores_the_serving_release(tmp_path, monkeypa
 @pytest.mark.platforms("macos")
 def test_slow_rollback_target_gets_its_own_startup_window(tmp_path, monkeypatch):
     """A rollback target still starting when the run deadline ends is not booted out."""
-    home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    home, plist, label, a, b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     from hermes_cli import gateway_launchd
     monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
     monkeypatch.setattr(guardian, "rollback", _failing_rollback(home, a))
@@ -193,7 +194,7 @@ def test_slow_rollback_target_gets_its_own_startup_window(tmp_path, monkeypatch)
 
 @pytest.mark.platforms("macos")
 def test_running_but_unhealthy_target_is_not_replaced(tmp_path, monkeypatch):
-    home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    home, plist, label, a, b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     from hermes_cli import gateway_launchd
     monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
     monkeypatch.setattr(guardian, "rollback", _failing_rollback(home, a))
@@ -209,7 +210,7 @@ def test_running_but_unhealthy_target_is_not_replaced(tmp_path, monkeypatch):
 @pytest.mark.platforms("macos")
 def test_never_proven_serving_release_is_not_restored(tmp_path, monkeypatch):
     """An expired, never-acknowledged switch may never have started: do not reinstate it."""
-    home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    home, plist, label, a, _b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     monkeypatch.setattr(guardian, "rollback", _failing_rollback(home, a))
     activations = _record_activations(monkeypatch, home)
     monkeypatch.setattr(guardian, "healthy", lambda *args: False)
@@ -224,7 +225,7 @@ def test_restore_leaves_an_operator_rollback_available(tmp_path, monkeypatch):
     """Real rollback() and activate_release(): a restore is not a completed rollback."""
     from datetime import datetime, timezone
     from hermes_cli import immutable_releases as releases
-    home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    home, plist, label, a, b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     serving = str(b.resolve())
 
     def acknowledge(home_, **_):
@@ -233,7 +234,7 @@ def test_restore_leaves_an_operator_rollback_available(tmp_path, monkeypatch):
         record = releases._read_txn(paths)
         if not record or record.get("candidate") != serving:
             return False
-        record["reload_ack"] = {"at": datetime.now(timezone.utc).isoformat(), "gateway_pid": 1}
+        record["reload_ack"] = {"at": datetime.now(UTC).isoformat(), "gateway_pid": 1}
         record["reload_done"] = True
         releases._write_txn(paths, record)
         releases._finish_txn(paths, record)

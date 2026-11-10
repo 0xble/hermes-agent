@@ -264,7 +264,7 @@ async def test_an_earlier_deadline_wakes_the_parked_sweep(tmp_path):
     _defer(store, "sooner", 0.05)
     await _schedule_retry(store, adapter)
     await _until(lambda: adapter.sends == ["sooner"])
-    assert list(outbox._SWEEPS.values())[0][0] is task  # still the one sweep, parked for "later"
+    assert next(iter(outbox._SWEEPS.values()))[0] is task  # still the one sweep, parked for "later"
 
 
 @pytest.mark.asyncio

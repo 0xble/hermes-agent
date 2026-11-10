@@ -6,6 +6,7 @@ from collections.abc import Callable
 from markdown_it import MarkdownIt
 from markdown_it.rules_inline.emphasis import tokenize
 from markdown_it.rules_inline.escape import escape as tokenize_escape
+import itertools
 
 
 def _asterisks_only(state, silent):
@@ -36,7 +37,7 @@ def protect_asterisk_emphasis(
             boundaries.update(block.map)
     boundaries = sorted(boundaries)
     parts = []
-    for start, end in zip(boundaries, boundaries[1:]):
+    for start, end in itertools.pairwise(boundaries):
         tokens = []
         parser.inline.parse("".join(lines[start:end]), parser, {}, tokens)
         depth = {"*": 0, "**": 0}

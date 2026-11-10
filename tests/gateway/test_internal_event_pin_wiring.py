@@ -740,7 +740,7 @@ async def test_held_role_cache_lifetime_through_real_turns(monkeypatch, outcome)
 
     user_config = {
         "model": {"default": "base", "provider": "openrouter"},
-        "model_presets": {"fast": {"model": "first", "provider": "openrouter"}},
+        "model_aliases": {"fast": {"model": "first", "provider": "openrouter"}},
     }
     config = GatewayConfig()
     config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True)

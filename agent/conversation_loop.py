@@ -6,6 +6,10 @@ retries, fallbacks, compression, post-turn hooks). Symbols that callers patch on
 ``_ra`` so those patches keep working."""
 
 from __future__ import annotations
+from agent.conversation_loop_failed_turn import (
+    _close_durable_failed_turn
+)
+
 
 import inspect
 import json
@@ -23,6 +27,7 @@ from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_su
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_builder import RUNTIME_ENVIRONMENT_END, RUNTIME_ENVIRONMENT_HEADING
+from agent.prompt_refresh import rebuild_for_refresh, requested_epoch, stamp_prompt_epoch, stored_prompt_refresh_epoch
 from agent.prompt_caching import (
     build_prompt_cache_plan,
     effective_cache_ttl,
@@ -34,7 +39,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
-from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
+from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON, PreflightCompressionTimedOut, build_turn_context
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from hermes_cli.plugins_dispatch import held_stream_transforms
 from agent.turn_retry_state import TurnRetryState
@@ -830,6 +835,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id,
             )
             agent._session_title_hint = "Bot Chat"
+            # Read BEFORE the build: this rebuild also satisfies any pending prompt refresh.
+            refresh_request = requested_epoch(agent)
             # The skills index cache (LRU + disk snapshot) does not watch the skills
             # dir; a capability refresh must rebuild THROUGH it or new skills are lost.
             try:
@@ -851,6 +858,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "(session=%s): %s. The refresh will re-fire next turn.",
                 persist_tools=True,
             )
+            stamp_prompt_epoch(agent, refresh_request)
+            return
+        refresh_epoch = stored_prompt_refresh_epoch(agent, session_row)
+        if refresh_epoch:
+            # `hermes sessions refresh-prompts` ran after this prompt was built. Pin tools[] first
+            # (the refresh is about instructions; the frozen tool array stays), then rebuild once.
+            _restore_pinned_tools(agent, session_row)
+            rebuild_for_refresh(agent, system_message, conversation_history, refresh_epoch)
             return
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
@@ -902,6 +917,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # surface's own build (the -q footprint, its tool_search catalog) would otherwise be
     # persisted over the pin below. Pinned first, so the prompt describes the tools sent.
     built_for_this_surface = _restore_pinned_tools(agent, session_row)
+    # Read before the build: a refresh request landing mid-build still fires next turn.
+    refresh_epoch = requested_epoch(agent)
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
     if conversation_history:
         record_prompt_rebuild(agent, stored_prompt, stored_state, agent._cached_system_prompt)
@@ -938,6 +955,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         "rebuild the system prompt and miss the prefix cache.",
         persist_tools=True,
     )
+    stamp_prompt_epoch(agent, refresh_epoch)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
@@ -1129,15 +1147,21 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
 
 
 def _content_policy_blocked_result(
-    messages: list[dict], api_call_count: int, *, final_response: str, error_detail: str
+    messages: list[dict], api_call_count: int, *, final_response: str, error_detail: str,
+    boundary_row_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Terminal turn result for a content-policy block (deterministic for the unchanged
-    prompt, so no retry); shared by the HTTP-200 and exception paths."""
-    return {
+    prompt, so no retry); shared by the HTTP-200 and exception paths. ``messages`` is the
+    CLEAN pre-refusal history (the refused turn is dropped from it). ``boundary_row_id`` is
+    the durable row that started the refused run, so the owner drops the exact turn."""
+    result = {
         "final_response": final_response, "messages": messages, "api_calls": api_call_count,
         "completed": False, "failed": True, "error": f"content_policy_blocked: {error_detail}",
         "failure_reason": "content_policy_blocked", "failure_retryable": False,
     }
+    if boundary_row_id is not None:
+        result["refused_turn_boundary_row_id"] = boundary_row_id
+    return result
 
 
 def _partial_turn_result(
@@ -1621,6 +1645,25 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
     return None
 
 
+def _finalize_from_state(agent: Any, s: _LoopState) -> dict[str, Any]:
+    """Post-loop finalization (agent/turn_finalizer.finalize_turn) fed from the loop state."""
+    return finalize_turn(agent, **{
+        name: getattr(s, name)
+        for name in inspect.signature(finalize_turn).parameters if name != "agent"
+    })
+
+
+def _turn_without_loop(agent: Any, s: _LoopState, block_message: str) -> Optional[dict[str, Any]]:
+    """The turn's result when it never enters the generic loop, else None. A ``pre_llm_call``
+    veto finalizes with no inference request (the block message closes the transcript pair);
+    the opt-in codex app-server runtime runs the whole turn in its subprocess
+    (agent/transports/codex_app_server_session.py)."""
+    if block_message:
+        s.final_response, s._turn_exit_reason = block_message, PRE_LLM_BLOCK_EXIT_REASON
+        return _finalize_from_state(agent, s)
+    return _codex_app_server_turn(agent, s) if agent.api_mode == "codex_app_server" else None
+
+
 def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     """The codex app-server's result for this turn, or None when its failure activated a fallback and the
     generic loop retries the same user turn."""
@@ -1744,10 +1787,8 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
-    # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
-    # app-server subprocess (see agent/transports/codex_app_server_session.py).
-    if agent.api_mode == "codex_app_server" and (codex_result := _codex_app_server_turn(agent, s)) is not None:
-        return codex_result
+    if (early_result := _turn_without_loop(agent, s, _ctx.plugin_block_message)) is not None:
+        return early_result
 
     _prelude_action, _prelude_result = play_prelude(agent, s, prelude)
     if _prelude_action == "return":
@@ -1821,11 +1862,7 @@ def _run_conversation_turn(
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
                 break
 
-    # Post-loop finalization lives in agent/turn_finalizer.finalize_turn.
-    result = finalize_turn(agent, **{
-        name: getattr(s, name)
-        for name in inspect.signature(finalize_turn).parameters if name != "agent"
-    })
+    result = _finalize_from_state(agent, s)
     if s._compression_timeout_exhausted:
         # Reuse the gateway's context-recovery contract: transcript stays intact while
         # future input can move to a clean session (#98722).
@@ -1952,51 +1989,6 @@ def _redact_display_metadata(metadata: dict) -> dict:
     return {k: _redact(v) for k, v in metadata.items()}
 
 
-def _close_durable_failed_turn(agent, result: Any) -> None:
-    """Append a Hermes-authored assistant boundary when a failed turn left its durable tail open
-    (``OPEN_TURN_TAIL_ROLES``: the accepted ``user`` row, or a ``tool`` row when a call ran before
-    the failure), in place on ``result["messages"]`` and in SessionDB.
-
-    The terminal-failure paths (content-policy refusal, ``_Trunc.end_turn``, retry exhaustion,
-    interrupt before any assistant text) persist the accepted user row and return without
-    reaching ``finalize_turn``; the next prompt then appends a second user row and
-    ``repair_message_sequence`` merges the failed request into the new one. The gateway
-    compensates with ``_hmwa_close_failed_turn``; CLI, TUI/Desktop and ACP hosts hand
-    ``result["messages"]`` straight back as history, so the seam is here.
-
-    Excluded: the context-pressure classes (``compression_exhausted``, ``compression_deferred``,
-    ``failure_reason == "context_overflow"``) — appending to an already-oversized session is the
-    #1630 growth loop; their repair is rotation or a retry. Idempotence is keyed on the DURABLE
-    tail (``SessionDB.latest_conversation_role``), so a redelivery or a tail already closed by
-    another writer is a no-op, and the gateway's own closer then no-ops in turn.
-    """
-    try:
-        if not isinstance(result, dict) or result.get("completed") is True:
-            return
-        if (
-            result.get("compression_exhausted") or result.get("compression_deferred")
-            or result.get("failure_reason") == "context_overflow"
-        ):
-            return
-        messages = result.get("messages")
-        db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-        if not isinstance(messages, list) or not messages or db is None or not session_id:
-            return
-        if getattr(agent, "_persist_disabled", False) or db.latest_conversation_role(session_id) not in OPEN_TURN_TAIL_ROLES:
-            return
-        # Scope the "did a tool run" scan to this turn when its boundary is proven; otherwise
-        # hedge over the whole list rather than under-report a possible side effect.
-        start = result.get("current_turn_user_idx")
-        turn_messages = messages[start:] if isinstance(start, int) and 0 <= start < len(messages) else messages
-        boundary = {
-            "role": "assistant", "content": failed_turn_notice(turn_messages), "display_kind": FAILED_TURN_DISPLAY_KIND,
-        }
-        if failure := _failed_turn_display_metadata(agent, result):
-            boundary["display_metadata"] = failure
-        append_message(messages, boundary)
-        agent._flush_messages_to_session_db(messages)
-    except Exception:
-        logger.debug("failed-turn boundary not written", exc_info=True)
 
 
 __all__ = ["run_conversation"]

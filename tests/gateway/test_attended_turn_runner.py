@@ -136,7 +136,7 @@ def test_queued_turn_stages_notice_only_after_a_committed_idle_route(route_activ
     from gateway.run_turn import GatewayTurnMixin
 
     decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
-    turn, runner, state = _runner(decision)
+    _turn, runner, state = _runner(decision)
     state.conversation.pending_attended_notice = None
     # The committed API-route marker survives queued turns and worker handoffs. Model
     # resolution alone can still have a stale model snapshot from before the switch.
@@ -160,7 +160,7 @@ def test_snapshot_route_state_is_used_without_a_loop_store_read(route_active):
     from gateway.run_turn import GatewayTurnMixin
 
     decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
-    turn, runner, state = _runner(decision)
+    _turn, runner, state = _runner(decision)
     state.conversation.pending_attended_notice = None
 
     def _loop_read(_key):

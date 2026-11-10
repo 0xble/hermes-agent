@@ -9,7 +9,7 @@ alternative. The exhausted branch stays terse — the chain is intact and the
 problem is provider-side, so no config command applies.
 """
 
-import cron.scheduler as scheduler
+from cron import scheduler
 from cron.scheduler import _summarize_cron_failure_for_delivery
 
 

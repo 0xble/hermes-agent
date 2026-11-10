@@ -153,7 +153,7 @@ async def test_turn_storage_contention_keeps_loop_live(path, monkeypatch, tmp_pa
                 "gateway.run._resolve_runtime_agent_kwargs_for_provider",
                 lambda *args, **kwargs: {"api_key": "test-key", "provider": "probe"},
             )
-            monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+            monkeypatch.setattr("gateway.run._load_gateway_config", dict)
 
     async def operation():
         if path == "goal":

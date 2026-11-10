@@ -47,7 +47,7 @@ def test_archive_restores_all_stashes_or_fails_closed(tmp_path, damage_restore):
         env.update(PATH=str(tools) + os.pathsep + env["PATH"], ARCHIVE_TEST_GIT=real_git)
     script = Path(__file__).resolve().parents[2] / "scripts/archive_legacy_fork.sh"
     result = subprocess.run(["bash", str(script), "--legacy", str(repo), "--out", str(tmp_path / "archives")],
-                            text=True, capture_output=True, env=env)
+                            text=True, capture_output=True, env=env, check=False)
     assert git("stash", "list", "--format=%H") == before
     if damage_restore:
         assert result.returncode != 0 and "archive: " not in result.stdout

@@ -144,7 +144,7 @@ async def telegram_topic_tool(args: dict, **_kwargs: Any) -> str:
                     if expected_generation and expected_generation != attached:
                         return tool_error("Retirement preparation generation does not match this turn.")
                     expected_generation = attached
-        make_coro = lambda: request(  # noqa: E731
+        make_coro = lambda: request(
             runner, source, target=str(args["target"]) if "target" in args else None, now=bool(args.get("now")),
             cancel=action == "cancel_retire", owners=args.get("owners"),
             reason=str(args.get("reason") or ""), generation=expected_generation,
@@ -152,12 +152,12 @@ async def telegram_topic_tool(args: dict, **_kwargs: Any) -> str:
     elif action == "create":
         if not spec.name:
             return tool_error("name is required for action=create.")
-        make_coro = lambda: create_topic_session(runner, source, spec)  # noqa: E731
+        make_coro = lambda: create_topic_session(runner, source, spec)
     else:
         if spec.message:
             return tool_error("message is only for action=create; relay to an existing topic's session instead.")
         thread_id = str(args.get("thread_id") or "").strip()
-        make_coro = lambda: edit_topic_session(runner, source, thread_id, spec)  # noqa: E731
+        make_coro = lambda: edit_topic_session(runner, source, thread_id, spec)
     try:
         result = await _dispatch_on_gateway_loop(runner, make_coro, "telegram_topic: failed to schedule on gateway loop")
     except ValueError as exc:  # TopicRequestError and title validation: caller-correctable

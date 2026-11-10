@@ -6,6 +6,10 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 """
 
 from __future__ import annotations
+from gateway.run_startup_handoff import (
+    GatewayStartupHandoffMixin
+)
+
 
 import asyncio
 import dataclasses
@@ -74,10 +78,13 @@ def recover_left_core_at_gateway_start() -> None:
         recover_left_core_in(root)
 
 
-from gateway.run_startup_secrets import _own_policy_envs as _own_policy_envs
+from gateway.run_startup_secrets import _own_policy_envs
 
 
-class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
+from gateway.run_startup_obligations import GatewayStartupMixin as GatewayStartupObligationsMixin
+
+
+class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupObligationsMixin, GatewayStartupSecretsMixin, RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
     @staticmethod
@@ -126,7 +133,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             queue = self._startup_restore_queue = []
         # Keep source order independent of scheduler priority and dropped-item callback order.
         sequence = self._startup_restore_sequence = getattr(self, "_startup_restore_sequence", 0) + 1
-        setattr(event, "_hermes_startup_restore_order", -sequence if front else sequence)
+        event._hermes_startup_restore_order = -sequence if front else sequence
         if front:
             queue.insert(0, event)
         else:
@@ -145,7 +152,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             restore_keys = self._startup_restore_keys = {}
         restore_keys[key] = restore_keys.get(key, 0) + 1
         with suppress(Exception):
-            source = event.source
+            _source = event.source
             kind = (
                 "recovered_followup"
                 if getattr(event, "_hermes_recovered_followup", False)
@@ -761,10 +768,10 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""
         try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            with self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
                 candidates = ResumeCandidates([
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
+                    entry for entry in self.session_store._entries.values()
                     if entry.resume_pending
                     and not entry.suspended
                     and entry.origin is not None
@@ -795,7 +802,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                 candidates.breaker_tripped = _rlg.check_and_record(
                     _max_restarts, _window, max_gap_seconds=_max_gap, planned_restart=_planned_restart,
                 )
-            except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
+            except Exception as exc:
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
 
@@ -815,7 +822,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         if resume_marker:
             # Keep the transport reply anchor for threading, but admit each interruption marker
             # under its own outbox identity so one marker resumes at most once.
-            setattr(event, "_outbox_admission_id", f"resume:{resume_marker}")
+            event._outbox_admission_id = f"resume:{resume_marker}"
         return event
 
     async def _drop_queued_resume(self, session_key: str) -> None:
@@ -985,7 +992,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
     def _snapshot_active_turns_for_recovery(self) -> list:
         """Read active-turn recovery rows under the store lock off the gateway loop."""
         with self.session_store._lock:
-            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            self.session_store._ensure_loaded_locked()
             return [
                 (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
                  e.transport_profile)
@@ -1007,8 +1014,9 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
+            decision = await self.async_session_store.get_session_metadata(key, "room_silence_decision", {})
             text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                          started, origin)
+                                          started, origin, silence_decision=decision, active_token=token)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
@@ -1053,7 +1061,9 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                 owed.append((ref, content))
         return owed
 
-    def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
+    def _crash_left_reply(
+        self, history: list, started: float, origin, *, silence_decision=None, active_token=None,
+    ) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
         persisted a final reply after *started*; ``""`` when nothing would have been presented (a
         silence marker on a machinery turn or on a turn the adapter reported as not addressed to the
@@ -1062,6 +1072,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         from gateway.platforms.base import _strip_media_directives
         from gateway.response_filters import (
             is_intentional_silence_response, is_machinery_display_kind, silence_allowed,
+            strip_trailing_silence_marker,
         )
         from gateway.run import _sanitize_gateway_final_response
         from gateway.run_turn import _unexpected_silence_reply
@@ -1083,8 +1094,13 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                 if diagnostic_turn_muted(prompt.get("display_metadata"), origin.platform):
                     return ""
         if is_intentional_silence_response(last["content"]):
+            decision = silence_decision or {}
+            proven_silent = (active_token is not None and decision.get("token") == active_token
+                             and decision.get("timestamp") == last.get("timestamp")
+                             and decision.get("silent") is True)
             silent_ok = silence_allowed(
-                prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"))
+                prompt.get("display_kind"), (prompt.get("display_metadata") or {}).get("reply_expected"),
+                allow_silence=proven_silent, agent_result={})
             return "" if silent_ok else _unexpected_silence_reply()
         # The ledger redelivers text only, so a reply that carries attachments is not settled here:
         # it stays marked and resumes, instead of being redelivered with its attachments dropped.
@@ -1101,7 +1117,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         # Sanitize first (provider terminal tokens), then hide the /loop marker, matching the
         # normal and queued delivery lanes. Markers stay so redelivery can split or inline them.
         sanitized = strip_trailing_loop_complete_marker(
-            _sanitize_gateway_final_response(origin.platform, last["content"]))
+            _sanitize_gateway_final_response(origin.platform, strip_trailing_silence_marker(last["content"])))
         return map_outside_copy_blocks(sanitized, _strip_media_directives, keep_markers=True).strip() or None
 
     @staticmethod
@@ -1378,6 +1394,26 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             logger.warning("relay adapter registration failed at gateway startup", exc_info=True)
         GatewayStartupMixin._register_launch_profile_config_hooks()
 
+    def _start_relay_provision_retry(self) -> None:
+        """Keep provisioning in the background when the boot attempt left the relay without
+        credentials; cancelled with ``_background_tasks`` at shutdown. Never raises."""
+        try:
+            from gateway.relay import relay_provision_pending, retry_self_provision
+            if relay_provision_pending():
+                self._retain_background_task(asyncio.create_task(
+                    retry_self_provision(self._on_relay_provisioned), name="relay-provision-retry"))
+        except Exception:
+            logger.warning("relay self-provision retry could not start", exc_info=True)
+
+    def _on_relay_provisioned(self) -> None:
+        """Credentials arrived after boot: the reconnect watcher builds every relay adapter from
+        the live env, so pull its queued retry forward instead of waiting out the backoff.
+        ``retry_now`` keeps it forward if a pass that began without them is still dialing."""
+        info = getattr(self, "_failed_platforms", {}).get(Platform.RELAY)
+        if info is not None:
+            info["next_retry"] = 0.0
+            info["retry_now"] = True
+
     @staticmethod
     def _register_launch_profile_config_hooks() -> None:
         """The launch profile's ``hooks:`` block, registered under ITS runtime scope when multiplexing.
@@ -1529,7 +1565,6 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
         from gateway.run import _platform_has_bot_credential
-        from gateway.run_adapters import _adapter_unavailable_message
         enabled_platform_count = 0
         _multiplex_on = self._multiplex_on()
         _multiplex_skipped_platforms: list[Platform] = []
@@ -1565,12 +1600,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                 # Only a platform that can heal on its own is queued for the reconnect watcher; either way
                 # flag it so the unserved enabled platform is visible.
                 heals = self._adapter_may_heal(platform, platform_config)
-                self._update_platform_runtime_status(
-                    platform.value, platform_state="retrying" if heals else "fatal",
-                    error_code="adapter_unavailable",
-                    error_message=_adapter_unavailable_message(platform, retrying=heals),
-                    needs_attention=True,
-                )
+                self._mark_adapter_unavailable(platform.value, platform, retrying=heals, needs_attention=True)
                 if heals:
                     self._failed_platforms[platform] = self._startup_retry_entry(platform, None, platform_config)
                 continue
@@ -1715,7 +1745,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         path = self._transient_exit_streak_path()
         try:
             previous = int(path.read_text(encoding="utf-8-sig").strip() or 0)
-        except Exception:  # noqa: BLE001 — absent or unreadable means no streak yet
+        except Exception:
             previous = 0
         # Clamp: a negative or absurd value in the file (corruption, a stray write, a
         # directory in the way) must not buy an unbounded number of restarts, which is
@@ -1723,7 +1753,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         streak = min(max(previous, 0), _TRANSIENT_EXIT_STREAK_LIMIT) + 1
         try:
             path.write_text(str(streak), encoding="utf-8")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Unwritable means the streak can never advance, so the bound silently fails
             # open. Say so once rather than looping forever with no explanation.
             logger.warning(
@@ -2103,6 +2133,7 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
         # Register plugins, the relay adapter, and hooks before creating platform adapters. Relay
         # self-provisioning may disable direct platforms, leaving Platform.RELAY as the only ingress.
         await asyncio.to_thread(self._start_register_plugins_relay_hooks)
+        self._start_relay_provision_retry()
         # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
         with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
             from hermes_cli.plugins import get_plugin_manager
@@ -2276,6 +2307,9 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             user_name="Handoff", thread_id=effective_thread_id, profile=profile_name,
             scope_id=scope_id,
         )
+        # The handoff turn answers through the queuing profile's own bot; naming it keeps the
+        # turn's authorization home and the saved receiving bot on that profile, not a primary guess.
+        self._canonicalize(dest_source, transport_profile=profile_name)
         return self._HandoffDestination(
             platform=platform, platform_name=platform_name, transport=transport, home=home,
             home_chat_id=home_chat_id, effective_thread_id=effective_thread_id, source=dest_source,
@@ -2318,65 +2352,3 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
             dest.source, group_sessions_per_user=extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
-
-    async def _handoff_repoint(self, dest, session_key: str, cli_session_id: str) -> None:
-        """Point the destination route at the handed-off conversation; ``switch_session`` ends the
-        route's prior session and reopens this one. A handoff carries the conversation the user is
-        looking at: a local chat's latest ``/new`` segment, then that segment's compression tip
-        (``handoff_head``), so its whole chain moves onto the lane together with the local receipt
-        that guards it, and a viewer still holding it open (the Desktop that ran /handoff) follows
-        it (#143286)."""
-        from gateway.session_route_recovery import conversation_head, follow_hand_off
-        authority, local_owner, target = await conversation_head(self, cli_session_id)
-        # Ensure a session_store entry exists for this key; switch_session then re-points it.
-        await self.async_session_store.get_or_create_session(dest.source)
-        switched = await self.async_session_store.switch_session(session_key, target, preserve_prompt_pin=False)
-        if switched is None:
-            raise RuntimeError(f"could not switch session key {session_key} → {target}")
-        if authority is not None:
-            follow_hand_off(authority, dest.source, session_key, authority.logical_owner(target), local_owner)
-
-    async def _process_handoff(self, row: dict[str, Any], profile_name: Optional[str] = None) -> None:
-        """Execute one handoff row; raises on failure (caller marks failed). ``profile_name`` (None =
-        root) is the profile whose store queued it — load-bearing under multiplex: secondaries live in
-        ``_profile_adapters`` and the key must be namespaced ``agent:<profile>:...`` or nobody reads it."""
-        cli_session_id = row["id"]
-        dest = await self._handoff_resolve_destination(row, profile_name)
-        session_key = self._handoff_session_key(dest, profile_name)
-        await self._handoff_repoint(dest, session_key, cli_session_id)
-        # Evict the cached AIAgent (rebuild against the CLI session_id, like /resume) and clear stale
-        # running-agent state so the synthetic turn isn't queued behind it.
-        self._evict_cached_agent(session_key)
-        self._release_running_agent_state(session_key)
-        cli_title = row.get("title") or cli_session_id[:8]
-        synthetic_event = MessageEvent(
-            text=(
-                f"[Session was just handed off from CLI (\"{cli_title}\") to this "
-                f"channel. The full prior conversation history is loaded above. "
-                f"Briefly confirm you're working here and summarize what we were "
-                f"working on, so the user can continue from this device.]"
-            ),
-            source=dest.source,
-            internal=True,
-        )
-        logger.info(
-            "Handoff: dispatching synthetic turn for CLI session %s → %s "
-            "(home=%s, thread=%s, session_key=%s)",
-            cli_session_id, dest.platform_name, dest.home.chat_id, dest.effective_thread_id, session_key,
-        )
-        # Inline _handle_message keeps success/failure observable (handle_message would detach it).
-        response_text = await self._handle_message(synthetic_event)
-        if not response_text:
-            # Streaming may have delivered inline; the agent ran without raising — success.
-            return
-        # Reply into the new thread (else the home channel) via the resolved transport, so a relay-fronted
-        # logical platform is stamped on the outbound frame.
-        send_metadata = {"thread_id": dest.effective_thread_id} if dest.effective_thread_id else None
-        try:
-            result = await dest.transport.send(
-                dest.platform, str(dest.home.chat_id), response_text, send_metadata,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"adapter.send failed: {exc}") from exc
-        if not getattr(result, "success", True):
-            raise RuntimeError(f"adapter.send failed: {_send_error(result)}")

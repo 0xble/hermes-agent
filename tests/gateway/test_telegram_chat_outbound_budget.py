@@ -15,6 +15,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
+import itertools
 
 
 class _Clock:
@@ -211,7 +212,7 @@ async def test_concurrent_deliveries_share_the_slot_and_are_never_dropped():
     await asyncio.gather(*(limiter.process_request(callback, (), {}, "sendMessage", {"chat_id": 5}, None)
                            for _ in range(6)))
     assert len(fired) == 6
-    gaps = [b - a for a, b in zip(fired, fired[1:])]
+    gaps = [b - a for a, b in itertools.pairwise(fired)]
     assert min(gaps) >= 0.05 - 0.01
 
 

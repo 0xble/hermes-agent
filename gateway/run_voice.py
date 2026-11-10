@@ -423,7 +423,7 @@ class GatewayVoiceMixin:
         return not (is_voice_input and not already_sent)
 
     async def _echo_stt_transcripts(
-        self, adapter, source: SessionSource, transcripts: List[str], *, event: MessageEvent,
+        self, adapter, source: SessionSource, transcripts: list[str], *, event: MessageEvent,
         metadata=None, log_context: str = "Transcript",
     ) -> None:
         """Echo successful STT without changing quota priority or stream-finalization metadata."""

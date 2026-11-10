@@ -379,7 +379,7 @@ def test_randomized_capacity_stress_never_exceeds_slot_cap():
     for thread in threads:
         thread.join(timeout=15)
     assert all(not thread.is_alive() for thread in threads)
-    for index, handle in list(handles):
+    for index, handle in handles:
         if index in cancel_indexes and handle["status"] == "queued":
             ad.interrupt_delegation(handle["delegation_id"], reason="stress cancel")
     release.set()

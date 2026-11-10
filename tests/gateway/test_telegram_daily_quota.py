@@ -32,7 +32,7 @@ class Wall:
 
 
 def _utc(s: str) -> float:
-    return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
+    return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.UTC).timestamp()
 
 
 def test_counts_every_endpoint_and_each_created_message(tmp_path):
@@ -886,7 +886,7 @@ async def test_failed_initial_tool_send_can_retry_but_only_accepts_one_bubble(tm
 
 @pytest.mark.asyncio
 async def test_deferred_initial_tool_send_spends_slot_and_preserves_native_replay_class(tmp_path, monkeypatch):
-    import gateway.outbox as outbox
+    from gateway import outbox
     from gateway.platforms.base import OUTBOUND_TOOL_PROGRESS
     from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
 

@@ -794,6 +794,25 @@ try {
             self.assertEqual(ci.main(), 1)
             self.assertEqual(seen, ['setup', 'static', ('tests',), 'e2e', 'node', 'docs', 'rust', 'container_lint'])
 
+    def test_local_exact_gate_owns_full_coverage_while_hosted_uses_matrix_partition(self):
+        for hosted in ('', 'true'):
+            with self.subTest(hosted=hosted), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {'GITHUB_ACTIONS': hosted}))
+                stack.enter_context(patch.object(ci, 'STATE', Path(directory)))
+                stack.enter_context(patch.object(ci, 'require_case_sensitive_tmpdir'))
+                stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
+                stack.enter_context(patch.object(ci, 'assert_exact_checkout'))
+                stack.enter_context(patch.object(ci, 'setup'))
+                stack.enter_context(patch.object(ci, 'environment', return_value={}))
+                stack.enter_context(patch.object(ci, 'resolve_local_toolchain', side_effect=lambda env: env))
+                stack.enter_context(patch.object(sys, 'argv', ['bin/ci', 'gate', 'a' * 40]))
+                seen = []
+                for name in ('static', 'node', 'node_gate', 'docs', 'rust', 'container_lint', 'python_tests', 'e2e_tests'):
+                    stack.enter_context(patch.object(ci, name, side_effect=lambda *args, name=name: seen.append(name)))
+                self.assertEqual(ci.main(), 0)
+                self.assertEqual(seen, ['static', 'node_gate'] if hosted else
+                                 ['static', 'python_tests', 'e2e_tests', 'node', 'docs', 'rust', 'container_lint'])
+
     def test_e2e_lane_bounds_only_the_upgrade_suite_higher_and_runs_both_parts(self):
         calls = []
 

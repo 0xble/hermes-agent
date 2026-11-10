@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -71,7 +71,7 @@ def _message(*, rich=None, text=None, caption=None, chat_type="private", **kwarg
         from_user=SimpleNamespace(id=42, full_name="Brian", username="brian", is_bot=False),
         sender_chat=None, business_connection_id=None, text=text, caption=caption,
         entities=[], caption_entities=[], message_thread_id=None, direct_messages_topic=None,
-        is_topic_message=False, reply_to_message=None, quote=None, date=datetime.now(timezone.utc),
+        is_topic_message=False, reply_to_message=None, quote=None, date=datetime.now(UTC),
         forum_topic_created=None, photo=None, document=None, video=None, audio=None, voice=None,
         sticker=None, api_kwargs=MappingProxyType({"rich_message": rich} if rich is not None else {}),
     )

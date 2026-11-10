@@ -205,15 +205,17 @@ def parse_attended_config(config: Mapping[str, Any] | None) -> AttendedConfig:
         enabled = False
     model = str(attended_raw.get("model") or "").strip()
     provider = str(attended_raw.get("provider") or "").strip()
-    from hermes_cli.model_presets import normalize_route_reasoning_effort
-    effort = normalize_route_reasoning_effort(attended_raw.get("reasoning_effort"))
-    # The attended route is live too. Resolve @attended/model_preset at request time
-    # from the raw config rather than freezing a concrete model in SessionStore.
-    from hermes_cli.model_presets import preset_ref_name
-    if preset_ref_name(model) or attended_raw.get("model_preset"):
+    from hermes_cli.model_alias_runtime import normalize_route_reasoning_effort
+    try:
+        effort = normalize_route_reasoning_effort(attended_raw.get("reasoning_effort"))
+    except ValueError:
+        effort = ""
+    # Resolve upstream alias labels from the request snapshot.
+    from hermes_cli.model_alias_runtime import alias_name
+    if alias_name(model, config):
         try:
-            from hermes_cli.model_preset_runtime import resolve_model_ref
-            route = resolve_model_ref(model or {"model_preset": attended_raw.get("model_preset")}, config or {})
+            from hermes_cli.model_alias_runtime import resolve_model_alias
+            route = resolve_model_alias(model, config or {}, required=True)
             model = route.model
             provider = provider or route.provider
             if effort == "":
@@ -277,7 +279,7 @@ def is_active(last_user_activity_at: Any, *, now: Optional[float], idle_revert_m
 
 def _effort_label(value: Any) -> str | dict[str, Any]:
     """Keep ordinary effort labels compatible without dropping typed provider-specific policy."""
-    from hermes_cli.model_presets import normalize_route_reasoning_effort
+    from hermes_cli.model_alias_runtime import normalize_route_reasoning_effort
     from hermes_constants import parse_reasoning_effort
 
     effort = normalize_route_reasoning_effort(value)
@@ -314,14 +316,13 @@ def resolve_attended_model(
     model_role = str(get("model_role", "") or "").strip()
     role_route = None
     if model_role:
-        from hermes_cli.model_preset_runtime import resolve_model_ref
+        from hermes_cli.model_alias_runtime import resolve_model_alias
         try:
-            role_route = resolve_model_ref("@" + model_role, config=config or {})
+            role_route = resolve_model_alias(model_role, config=config or {}, required=True)
             if not role_route.model:
                 raise ValueError("role has no configured model")
         except (ValueError, TypeError) as exc:
-            logger.warning("model_role @%s fallback=default: %s", model_role, exc)
-            role_route = None
+            raise ValueError(f"Stored model alias {model_role!r} is unavailable; request refused: {exc}") from exc
     # An invalid hold has an explicit default fallback, not automatic attended routing.
     active = not (model_role and role_route is None) and cfg.enabled and (new_session or is_active(
         get("last_user_activity_at"), now=now_value, idle_revert_minutes=cfg.idle_revert_minutes, pinned=get("attended_pinned") is True, pin_until=get("attended_pin_until")

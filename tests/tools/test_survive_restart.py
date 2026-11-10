@@ -535,7 +535,7 @@ def test_real_wrapper_survives_producer_exit_and_reports_one_recovered_result(tm
         assert registry.kill_all(source="gateway_shutdown") == 0
         print(session.id, flush=True)
         os._exit(0)
-    """)], capture_output=True, text=True, timeout=10)
+    """)], capture_output=True, text=True, timeout=10, check=False)
     assert producer.returncode == 0, producer.stderr
     session_id = producer.stdout.strip()
     checkpoint = (home / "processes.json").read_text(encoding="utf-8-sig")
@@ -605,7 +605,7 @@ def test_survivor_concurrent_drainers_deliver_exactly_once(tmp_path, monkeypatch
     import threading
 
     home = _home(monkeypatch, tmp_path)
-    session, successors = _ready_successors(home, monkeypatch, count=4)
+    _session, successors = _ready_successors(home, monkeypatch, count=4)
     barrier = threading.Barrier(len(successors))
     delivered = []
 
@@ -639,7 +639,7 @@ def test_survivor_claim_by_crashed_owner_is_reclaimed_once(tmp_path, monkeypatch
         assert registry.get({session.id!r})._completion_event.wait(5)
         assert len(registry.drain_notifications(session_key="session")) == 1
         os._exit(0)  # crash after claim, before render/acknowledgement
-    """)], capture_output=True, text=True, timeout=20)
+    """)], capture_output=True, text=True, timeout=20, check=False)
     assert crashed.returncode == 0, crashed.stderr
     claim = json.loads((home / "process-runs" / session.id / "delivered").read_text(encoding="utf-8-sig"))
     assert claim["state"] == "claimed"

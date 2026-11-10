@@ -52,7 +52,7 @@ def fixed_daily_quota_wall(monkeypatch):
     """
     from plugins.platforms.telegram.daily_quota import DailyQuota
 
-    fixed = dt.datetime(2026, 11, 3, 23, 59, 59, tzinfo=dt.timezone.utc).timestamp()
+    fixed = dt.datetime(2026, 11, 3, 23, 59, 59, tzinfo=dt.UTC).timestamp()
 
     def wall():
         return fixed
@@ -70,7 +70,23 @@ def fixed_daily_quota_wall(monkeypatch):
 # Bootstrap selects the checkout's dependencies at process start. Gateway tests
 # also reach it through lazy imports, after the per-test real-home I/O guard is
 # active, so initialize it once here while the collection sandbox is in force.
-import hermes_bootstrap  # noqa: F401
+import hermes_bootstrap
+
+
+@pytest.fixture(autouse=True)
+def _join_api_turn_workers():
+    """Join the API turn workers a test left running, as its loop's teardown used to.
+
+    API turns ran on the loop's default executor, which each test's loop teardown joined. They now
+    run on ``api_server_runs``' own executor, which only an adapter disconnect retires, and most
+    API-server tests never disconnect: a worker still finishing would raise the process-global
+    ``api_worker_live_count`` inside the next test (the shutdown close-gate tests read it).
+    """
+    yield
+    runs = sys.modules.get("gateway.platforms.api_server_runs")
+    executor = runs.retire_api_turn_executor() if runs is not None else None
+    for thread in list(getattr(executor, "_threads", ())):
+        thread.join(30)
 
 
 @pytest.fixture
@@ -288,6 +304,11 @@ def _ensure_discord_mock() -> None:
         def __init__(self, timeout=None):
             self.timeout = timeout
             self.children = []
+            self._finished = False
+        def stop(self):
+            self._finished = True
+        def is_finished(self):
+            return self._finished
         def add_item(self, item):
             self.children.append(item)
         def clear_items(self):
@@ -724,7 +745,7 @@ def hosted_owner(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from tests.fakes.runtime_owner import initialize_session_authority
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway import run, session_policy
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}})
     monkeypatch.setattr(run, '_resolve_gateway_model', lambda cfg: 'fixture')
@@ -746,7 +767,7 @@ def hosted_owner(tmp_path, monkeypatch):
     thread.start()
     authority = asyncio.run_coroutine_threadsafe(initialize_session_authority(runner, profile_id='owned', instance_id='first'), loop).result()
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
-    principal = Principal('durable-room-owner', 'owned', frozenset({'session:create', 'session:read', 'session:submit', 'session:control', 'session:approve'}), 'room-worker')
+    principal = SessionActor('durable-room-owner', 'owned', frozenset({'session:create', 'session:read', 'session:submit', 'session:control', 'session:approve'}), 'room-worker')
     yield authority, loop, principal, agent
     loop.call_soon_threadsafe(loop.stop)
     thread.join()

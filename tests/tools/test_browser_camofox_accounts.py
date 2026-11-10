@@ -173,7 +173,7 @@ def test_named_account_close_drops_local_handle_without_deleting_profile(tmp_pat
 
 
 def test_account_schema_is_gated_to_camofox(monkeypatch):
-    import tools.browser_tool as browser_tool
+    from tools import browser_tool
 
     with patch.object(browser_tool, "_is_camofox_mode", return_value=False):
         assert "account" not in browser_tool._camofox_account_schema_override().get("parameters", {}).get("properties", {})
@@ -189,7 +189,7 @@ def test_company_profile_narrows_advertised_aliases(tmp_path, monkeypatch):
     offering ``brianle`` would let one turn open a session under the wrong identity.
     """
     import tools.browser_camofox_state as state
-    import tools.browser_tool as browser_tool
+    from tools import browser_tool
     from tools.browser_camofox import _resolve_account
 
     monkeypatch.setattr(state, "load_config", None, raising=False)
@@ -243,7 +243,7 @@ def test_configured_aliases_keep_distinct_stable_identities(tmp_path, monkeypatc
 
 
 def test_handoff_adopts_tab_for_followup_tools(tmp_path, monkeypatch):
-    import tools.browser_tool as browser_tool
+    from tools import browser_tool
     from tools import browser_camofox as camofox
     from tools.registry import registry
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

@@ -162,7 +162,7 @@ async def test_permanent_rejection_uses_one_clean_fallback(monkeypatch, caplog):
 ])
 @pytest.mark.parametrize("event_type", ["tool.started", "tool.completed"])
 def test_executable_previews_never_become_progress_titles(monkeypatch, tool_name, preview, event_type):
-    runner, state, _ = make_runner(monkeypatch, failure_method="unused", error=TimeoutError())
+    _runner, state, _ = make_runner(monkeypatch, failure_method="unused", error=TimeoutError())
     state.apply_event({"type": event_type, "tool_call_id": "script", "tool_name": tool_name,
                        "preview": preview})
     title = state.tasks["script"]["title"]

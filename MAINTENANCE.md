@@ -6,13 +6,13 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v0.22.5 + matured-main checkpoint`, `69f73ec5f11f5a945cc864f29c4e2ad2307eaec3`.
-The checkpoint contains stable release `v0.22.5`
-(`bf0203a794a07aac3ff764972ab9087baa4e4f4e`) and follows Brian's matured-main
-selection policy. Fork policy checks classify only changes beyond this immutable
-upstream baseline. Exact-head tests, independent review and protected landing
-remain required before adoption. This contract authorizes source maintenance,
-not runtime installation or promotion.
+`v0.23.1`, `3b421578588243f920886e6fe79a6faa87ea026e`.
+Brian selected this release explicitly for the sync/v0.23.1-prep candidate.
+Fork policy checks classify only changes beyond this immutable upstream baseline.
+The candidate still requires its exact-head full gate before draft publication.
+This source-preparation contract authorizes no landing, promotion, installation,
+Hermes update or restart. The previous matured-main checkpoint
+`69f73ec5f11f5a945cc864f29c4e2ad2307eaec3` remains an ancestor.
 The prior baselines `v0.22.2` (`d923a5eb487a17c0a68801bba9ef0f56c81040a8`) and
 `v0.22.0` (`e06df9c2eae6901f4c88f464e0ae6e753c0428b8`) remain ancestors. The earlier `v0.21.6` baseline
 (`818c13be1dc4fd28987e1e881a9408224afd4535`) also remains an ancestor.
@@ -179,7 +179,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Subagent process handoff route | A handed-off background process delivers its completion to the parent's chat and session: route key, spawning session id, notify intent and watcher move with ownership and survive checkpoints | `process_manage(action='handoff')`, `transfer_ownership`, watcher route following, or process checkpoint routes | [Subagent process handoff route](maintenance/subagent-process-handoff-route.md) |
 | Delegation durable retry | Every background delegation ends delivered or durably settled; routine stops stay quiet, only a gone-parent undeliverable result is gateway-sent; transient failures and lost owners retry durably within a 6-attempt/24h lineage budget | Delegation failure classification, retry scheduling, `action='resume'`, retry notices, or `async_delegations` retention | [Delegation durable retry](maintenance/delegation-durable-retry.md) |
 | Background delegation restart survival | Completed results win shutdown races; unfinished cut work retains owed delivery/retry, per-child one-shot recovery, and one explicit continuation notice with bounded expiry | Restart-cut lifecycle state, resumable retention, child recovery claims, or cut completion notices | [Background delegation restart survival](maintenance/delegation-restart-survival.md) |
-| Delegation routes by parent | Select child routes from the live parent model, preserving pure inheritance, unmatched pinned routes, and internal review routing | `delegation.by_parent`, model preset expansion/persistence, child reasoning, or plugin lifecycle launches | [Delegation routes by parent](maintenance/delegation-routes-by-parent.md) |
+| Retired parent routing map | Historical retirement and the remaining uncensored inheritance exception | Reviewing old parent routing trailers | [Retired parent routing](maintenance/delegation-routes-by-parent.md) |
 | Delegation service tier | Opt-in inheritance of the parent's Fast mode (route-independent, re-derived for the child's route) and of an explicit session reasoning pick, plus the `capabilities.fast_mode` custom-provider opt-in | `delegation.inherit_service_tier`, `capabilities.fast_mode`, `delegation.reasoning_effort`, `agent.reasoning_override` or child runtime/request-override resolution | [Delegation service tier](maintenance/delegation-service-tier.md) |
 | Async delegation capacity admission | Async-capable background delegation never falls back to blocking inline execution at pool capacity; bounded pending work is queued, cancellable, routed, and truthfully surfaced on restart | `delegate_task(background=true)`, async admission/capacity, `action='list'`, stop/session teardown, or completion routing changes | [Async delegation capacity admission](maintenance/async-delegation-capacity.md) |
 | Bounded request-debug artifacts | Cap each diagnostic JSON and prune old timestamped dumps without touching session artifacts | Request-dump serialization, writes, or retention changes | [Bounded request-debug artifacts](maintenance/bounded-request-dumps.md) |
@@ -194,7 +194,8 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Live gateway inference controls | Apply busy `/reasoning` and `/fast` at the live agent's next model request without eviction | Gateway inference controls, agent request overrides, or cache wiring | [Live inference controls](maintenance/live-inference-controls.md) |
 | Attended model switching | Route genuine user activity to the configured attended model while preserving the default route when unset | Attended model configuration, activity clocks, model routing, or attended turn transitions | [Attended model switching](maintenance/attended-model-switching.md) |
 | First-reply latency metrics | Correlate genuine receipt with the first confirmed assistant text without sharing clocks across turns | Gateway receipt, stream acknowledgements, final delivery, or responsiveness log-contract changes; load attended activity and preview crash ownership before moving those boundaries | [First-reply latency metrics](maintenance/reply-latency-metrics.md) |
-| Model presets | Shared flat preset authoring, route/reasoning readers and concrete-selection persistence | Preset/config loaders, model selection writers, or new model config consumers | [Model presets](maintenance/model-presets.md) |
+| Dynamic model aliases | Persist upstream alias names and resolve them per request | Alias migration, topics, cron or plugin routes | [Dynamic aliases](maintenance/dynamic-model-aliases.md) |
+| Retired model presets | Historical retirement of preset expansion and Custom Subagents | Reviewing old preset trailers | [Retired presets](maintenance/model-presets.md) |
 | Session reasoning persistence | Persist session `/reasoning` picks in the routing entry so a gateway restart keeps them, like `/model` pins | Session reasoning override storage, rehydration, or conversation-boundary clears | [Session reasoning persistence](maintenance/session-reasoning-persistence.md) |
 | Session-scoped Fast expiry | Switch session `/fast fast` and `/fast ultrafast` overrides to explicit normal after a configurable wall-clock deadline | `agent.fast_expiry_seconds`, session tier resolution, cached-agent request overrides, or Fast status/notice changes | [Session-scoped Fast expiry](maintenance/session-fast-expiry.md) |
 | Native Telegram topic tool | Let an agent create or edit a Telegram DM topic and bind its settings, opening brief, and relay address to a native Hermes session | `telegram_topic`, Telegram DM topic creation/editing, topic bindings, or opening-brief delivery | [Native Telegram topic tool](maintenance/telegram-topic-tool.md) |

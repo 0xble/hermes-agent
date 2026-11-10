@@ -14,6 +14,7 @@ from gateway.run_turn_runner import TurnRunner
 from plugins.platforms.telegram import daily_quota as dq
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+import itertools
 
 CHAT = "2027045491"
 
@@ -164,7 +165,7 @@ async def test_flood_batch_retries_transient_failures_with_backoff(tmp_path, mon
     times = [at for at, _ in attempts]
     assert len(attempts) == 5  # The isolated batch retries through recovery, without new events.
     assert times[1] >= times[0] + 12
-    assert [b - a for a, b in zip(times[1:], times[2:])] == [10, 20, 40]
+    assert [b - a for a, b in itertools.pairwise(times)] == [10, 20, 40]
     assert all(text == "first\nsecond\nthird" for _, text in attempts[1:])
     assert adapter._bot.send_message.await_count == 1
 

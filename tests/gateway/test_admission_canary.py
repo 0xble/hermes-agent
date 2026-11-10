@@ -7,8 +7,8 @@ import os
 import pytest
 
 from gateway import admission_canary, status
-from tests.gateway.test_synthetic_native_admission import goal_prompt, native_chat as native_chat
-from tests.hermes_cli.test_admission_canary import switched as switched
+from tests.gateway.test_synthetic_native_admission import goal_prompt, native_chat
+from tests.hermes_cli.test_admission_canary import switched
 
 
 @pytest.fixture
@@ -80,7 +80,7 @@ async def test_retries_of_one_refused_producer_identity_count_once_per_window(
     """A requeued notice retried on backoff is one failed admission, not one per retry."""
     from hermes_state_runtime import RuntimeStoreError
 
-    runner, adapter, authority, source, sent, turns = native_chat
+    runner, adapter, authority, source, _sent, _turns = native_chat
     entry = runner.session_store.lookup_by_session_key(runner._session_key_for_source(source))
     clock = [1000.0]
     monkeypatch.setattr(admission_canary.time, "time", lambda: clock[0])
@@ -113,7 +113,7 @@ async def test_producer_preparation_and_nested_authority_refusal_count_once(
     from hermes_state_runtime import RuntimeStoreError
 
     monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _: prepares)
-    runner, adapter, authority, source, sent, turns = native_chat
+    _runner, adapter, _authority, source, sent, turns = native_chat
     before = list(sent)
     for index in range(5):
         event = MessageEvent(text="notice", source=source)
@@ -150,7 +150,7 @@ async def test_real_goal_wake_refusal_spike_fails_canary_and_rolls_back_once(
     from tests.waiting import async_wait_until
 
     home, _, _, old, candidate, clock, rollbacks = async_switched
-    runner, adapter, authority, source, sent, turns = native_chat
+    runner, adapter, _authority, source, sent, turns = native_chat
     monkeypatch.setattr(status, "_get_runtime_status_path", lambda: home / "gateway_state.json")
     last = home / "release-last-txn.json"
     record = json.loads(last.read_text())

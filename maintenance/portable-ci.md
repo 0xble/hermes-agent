@@ -418,3 +418,9 @@ Release-publication corruption tests call the actual `scripts.bundles.release_ar
 Host-specific cases use one native `platforms` marker. Real profile and adapter constructors, explicit selected-payload ownership, an empty completion-parent venv, interpreter-reported base prefixes, and event-controlled probes replace obsolete environment assumptions. Concurrent local transfer fixtures use a threaded HTTP server, preserving the production resolver's IPv4/IPv6 connection behavior. Memory tests exercise actual provider SDK admission and the Hindsight no-install hot-path contract instead of removed dependency bookkeeping. These are fixture adaptations, not waivers of the portable gate or native qualification.
 
 The startup-gate config read uses the repository-required `utf-8-sig` decoding policy. Its safe YAML parser already accepts a BOM, so this correction is a source-policy alignment, not a reproduced runtime decoding failure. The existing public A→B→A startup invariant exercises BOM and BOM-less configurations. Mutable startup-gate fixtures use upstream's `hermes_yaml` owner rather than the removed PyYAML dependency. The historical frozen outbox fixture remains unchanged and its child receives the actual `pyyaml==6.0.3` dependency from that release in a disposable local dependency directory. It does not restore PyYAML to the current runtime or substitute a fake module.
+
+Local exact-SHA `bin/ci gate` runs every source lane, including Python, E2E,
+full Node, documentation, Rust and container lint. The hosted gate keeps its
+bounded static/Node partition because its qualification job separately requires
+the Python shard matrix. A local receipt has no hosted matrix to supply that
+coverage, so its gate must execute the complete source profile itself.

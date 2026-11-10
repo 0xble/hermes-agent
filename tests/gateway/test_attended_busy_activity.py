@@ -439,7 +439,7 @@ async def test_steered_receipt_retries_failed_store_write(busy_activity, tmp_pat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["runner", "adapter"])
 async def test_cancelled_receipt_does_not_retry_persistence(busy_activity, monkeypatch, path):
-    runner, event, key, state = busy_activity
+    runner, event, _key, state = busy_activity
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -466,7 +466,7 @@ async def test_cancelled_receipt_does_not_retry_persistence(busy_activity, monke
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", ["disabled", "no_session", "no_key", "automation", "older_receipt"])
 async def test_terminal_receipt_does_not_retry(busy_activity, monkeypatch, terminal):
-    runner, event, key, state = busy_activity
+    runner, event, key, _state = busy_activity
     load_config = Mock(return_value={} if terminal == "disabled" else CONFIG)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", load_config)
     if terminal == "no_session":

@@ -27,6 +27,7 @@ from hermes_cli import gateway_service_owner
 from hermes_cli.gateway_launchd_lifetime import (
     configured_launchd_domain, migrate_launchd_domain, uninstall_launchd_lifetime,
 )
+from agent.deadline import poll_until
 
 
 def _gw():
@@ -380,6 +381,7 @@ def _spawn_detached_gateway() -> bool:
                 _timestamped_stderr_gateway_command(log_dir / "gateway.error.log"),
                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
                 env=child_env,
+                # detached-spawn: ok — foreground-less gateway launch, a service meant to outlive the CLI
                 **windows_detach_popen_kwargs(),
             )
     except OSError:
@@ -1056,14 +1058,11 @@ def _wait_for_launchd_service_pid(
 ) -> bool:
     """Poll ``domain/label`` (0.5s) until it runs on a fresh PID or ``timeout`` passes — KeepAlive respawn
     isn't instantaneous. launchctl ``TimeoutExpired`` propagates; callers own failure accounting."""
-    deadline = time.monotonic() + max(timeout, 0.5)
-    while True:
-        _loaded, pid = _gw()._launchd_print_service_pid(domain, label)
-        if pid is not None and pid > 0 and pid != old_pid:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.5)
+    def _fresh_pid() -> bool:
+        pid = _gw()._launchd_print_service_pid(domain, label)[1]
+        return pid is not None and pid > 0 and pid != old_pid
+
+    return poll_until(_fresh_pid, max(timeout, 0.5), 0.5)
 
 
 def launchd_restart():
@@ -1205,14 +1204,11 @@ def wait_for_launchd_gateway_supervision(
         return True
 
     label = label or _gw().get_launchd_label()
-    deadline = time.monotonic() + max(timeout, 0.0)
-    while True:
+    def _supervised() -> bool:
         pid = _gw()._launchctl_supervised_pid(label)
-        if pid is not None and pid != old_pid:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(max(poll_interval, 0.01))
+        return pid is not None and pid != old_pid
+
+    return poll_until(_supervised, max(timeout, 0.0), max(poll_interval, 0.01))
 
 
 def launchd_status(deep: bool = False):
@@ -1316,3 +1312,36 @@ def bootout_launchd_label(label: str, *, domain: str | None = None, runner=None)
     """Boot out exactly ``label`` from one launchd domain."""
     runner = runner or (lambda argv: subprocess.run(["launchctl", *argv], check=True, timeout=30))
     runner(["bootout", f"{domain or _default_launchd_gui_domain()}/{label}"])
+
+
+def _rewrite_stale_launchd_plist() -> bool:
+    """Write the generated plist over a stale installed one this home owns; True when written."""
+    plist_path = _gw().get_launchd_plist_path()
+    if not plist_path.exists() or _gw().launchd_plist_is_current():
+        return False
+    # Runs on every gateway start/restart: a plist pinning another home is another install's gateway.
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home
+    if not definition_belongs_to_home(plist_path, _gw().get_hermes_home(), "rewrite"):
+        return False
+
+    new_plist = _gw().generate_launchd_plist()
+    if gateway_service_owner.refuse_temp_home_service_write(new_plist, "launchd plist"):
+        return False
+
+    _gw()._prepare_service_launcher()
+    plist_path.write_text(new_plist, encoding="utf-8")
+    return True
+
+
+
+def refresh_unloaded_launchd_plist() -> bool:
+    """Rewrite a stale plist of a job launchd does not hold; the next bootstrap reads it.
+
+    A loaded job is left to ``refresh_launchd_plist_if_needed`` (its restart path), which must
+    still see the file stale to reload the job."""
+    if _gw()._locate_launchd_gateway_service(_gw().get_launchd_label())[0] is not None:
+        return False
+    if not _rewrite_stale_launchd_plist():
+        return False
+    print(f"  ↻ Updated {_gw().get_launchd_plist_path().name} to match the current Hermes install")
+    return True

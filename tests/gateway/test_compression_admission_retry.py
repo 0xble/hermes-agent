@@ -202,7 +202,7 @@ async def test_native_compression_deferral_keeps_claim_until_commit(monkeypatch,
 async def test_compression_wait_honors_control_before_any_model_call(monkeypatch, tmp_path, control):
     from gateway.run_runtime import recover_profile_native_sessions
 
-    runner, adapter, owner, source, ref, key = await _owner(monkeypatch, tmp_path)
+    runner, adapter, owner, source, ref, _key = await _owner(monkeypatch, tmp_path)
     db, sid = owner.db, ref.session_id
     db.append_message(sid, 'assistant', 'earlier turn')
     assert db.try_acquire_compression_lock(sid, 'fixture-compressor')

@@ -16,12 +16,12 @@ from tests.e2e.core.upgrade.git._hostile_commit import (
     _tracked_dirty,
     _update,
     _zip_killed_at,
-    provider as provider,
-    world as world,
+    provider,
+    world,
 )
 from tests.e2e.core.upgrade.git._hostile_diagnostics import (
-    hostile_cell as hostile_cell,
-    hostile_diagnostics as hostile_diagnostics,
+    hostile_cell,
+    hostile_diagnostics,
 )
 
 pytestmark = C.pytestmark

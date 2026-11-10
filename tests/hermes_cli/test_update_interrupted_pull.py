@@ -22,7 +22,7 @@ from hermes_cli import update_cmd
 
 def _git(root: Path, *args: str) -> str:
     result = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
-                            text=True, encoding="utf-8")
+                            text=True, encoding="utf-8", check=False)
     assert result.returncode == 0, f"git {args}: {result.stderr}"
     return result.stdout.strip()
 
@@ -740,7 +740,7 @@ def test_an_unmarked_rollback_that_fails_never_reports_the_install_unchanged(che
     root, a, b = checkout
     _git(root, "reset", "-q", "--hard", b)
     er.interrupted_pull_marker(root).mkdir()
-    monkeypatch.setattr(update_cmd, "_validate_critical_files_syntax", lambda _root: (False, "utils.py", "SyntaxError"))
+    monkeypatch.setattr(update_cmd._commit, "tree_syntax_error", lambda _root, _files: ("utils.py", "SyntaxError"))
     real = update_cmd._git_run
 
     def hard_reset_fails(git_cmd, args, *rest, **kw):

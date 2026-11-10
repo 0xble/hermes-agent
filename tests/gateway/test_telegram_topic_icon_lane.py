@@ -192,7 +192,7 @@ async def test_explicit_title_skips_rename_when_topic_is_rebound_during_icon_pic
 async def test_explicit_title_renames_without_icon_when_pick_overruns_deadline(tmp_path, monkeypatch):
     import threading
 
-    import gateway.run_topics as run_topics
+    from gateway import run_topics
     runner, adapter, _ = _runner(tmp_path, extra={"auto_topic_icons": True})
     release = threading.Event()
     monkeypatch.setattr(run_topics, "_EXPLICIT_TITLE_ICON_TIMEOUT_S", 0.2)

@@ -894,8 +894,8 @@ class TestStreamTtsToSpeaker:
 
     def test_none_sentinel_flushes_buffer(self, monkeypatch):
         """None sentinel causes remaining buffer to be spoken."""
-        import tools.tts_tool as tts_tool
-        import tools.voice_mode as voice_mode
+        from tools import tts_tool
+        from tools import voice_mode
         from tools.tts_tool_speaker import stream_tts_to_speaker
 
         text_q = queue.Queue()

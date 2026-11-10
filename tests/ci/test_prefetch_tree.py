@@ -70,7 +70,7 @@ def _prepare(repo, **kwargs):
     env = {**os.environ, **kwargs.pop("env", {}), "RUNNER_TEMP": str(runner_temp)}
     return subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", prepare], cwd=repo, env=env, **kwargs,
-    )
+     check=False)
 
 
 def test_prefetch_batches_only_base_tree_and_allows_offline_measurement(partial_base, tmp_path):

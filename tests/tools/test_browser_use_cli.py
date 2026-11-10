@@ -1311,7 +1311,8 @@ class TestExecHybridPrivateUrlRouting:
 
     @staticmethod
     def _dns(monkeypatch, first_ip, later_ip):
-        """A rebinding host: ``first_ip`` for the first lookup, ``later_ip`` for every later one."""
+        """A rebinding host: ``first_ip`` for the first lookup, ``later_ip`` for every later one.
+        Address literals resolve to themselves, as they do without DNS."""
         lookups = []
 
         def fake_getaddrinfo(host, *a, **kw):

@@ -1,4 +1,4 @@
-"""@role holds: persistence, reset, concrete-pick precedence, and cards."""
+"""role holds: persistence, reset, concrete-pick precedence, and cards."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def _attended_cfg(**attended):
             "provider": "nous",
             "attended": {"model": "claude-opus-5-5", "provider": "custom:claude", **attended},
         },
-        "model_presets": {
+        "model_aliases": {
             "fast": {"provider": "openrouter", "model": "fast-model", "reasoning_effort": "minimal"},
         },
     }
@@ -81,7 +81,7 @@ def test_role_preset_reasoning_applies_when_attended_is_unconfigured(tmp_path, m
 
     cfg = {
         "model": {"default": "gpt-6.1-sol", "provider": "nous"},
-        "model_presets": {
+        "model_aliases": {
             "fast": {"provider": "openrouter", "model": "fast-model", "reasoning_effort": "minimal"},
         },
     }
@@ -170,7 +170,7 @@ def test_custom_preset_role_follows_a_preset_edit():
     state = {"default_model": "gpt-6.1-sol", "model_role": "fast"}
     first = resolve_attended_model(state, time.time(), _attended_cfg())
     edited = _attended_cfg()
-    edited["model_presets"]["fast"]["model"] = "faster-model"
+    edited["model_aliases"]["fast"]["model"] = "faster-model"
     second = resolve_attended_model(state, time.time(), edited)
     assert first.model == "fast-model"
     assert second.model == "faster-model"
@@ -257,10 +257,10 @@ async def test_model_role_rejects_flags(tmp_path, monkeypatch, flag):
     runner, _states = _runner(store)
     monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
 
-    reply = await runner._handle_model_command_locked(_event(f"/model @fast {flag}"))
+    reply = await runner._handle_model_command_locked(_event(f"/model fast {flag}"))
 
     assert reply.startswith("❌")
-    assert "@role" in reply
+    assert "role" in reply
     assert store.get_model_role(entry.session_key) is None
 
 
@@ -275,9 +275,9 @@ async def test_model_role_alone_sets_hold(tmp_path, monkeypatch):
         new_model="fast-model", target_provider="openrouter", model_info=None, api_key="", base_url="",
     ), None))
     runner._model_selection_warning = AsyncMock(return_value=None)
-    reply = await runner._handle_model_command_locked(_event("/model @fast"))
+    reply = await runner._handle_model_command_locked(_event("/model fast"))
 
-    assert "@fast" in reply and reply.startswith("✓")
+    assert "fast" in reply and reply.startswith("✓")
     assert store.get_model_role(entry.session_key) == "fast"
 
 

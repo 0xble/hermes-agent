@@ -16,7 +16,7 @@ IDENTITY = "hermes_camofox_" + "f" * 24
 @pytest.fixture
 def peer(monkeypatch, tmp_path):
     from tools import browser_camofox as camofox
-    import tools.browser_tool  # noqa: F401
+    import tools.browser_tool
     from tools.registry import registry
 
     state = SimpleNamespace(calls=[], downloads=[], status=200, error=None, count=0, tab="transfer-tab")
@@ -35,7 +35,7 @@ def peer(monkeypatch, tmp_path):
             self.end_headers()
             self.wfile.write(data)
 
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             parsed = urlsplit(self.path)
             query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
             state.calls.append(("GET", parsed.path, query))
@@ -54,7 +54,7 @@ def peer(monkeypatch, tmp_path):
                 return self.send({"tabId": state.tab, "downloads": records}, state.status)
             return self.send({}, 404)
 
-        def do_POST(self):  # noqa: N802
+        def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.calls.append(("POST", self.path, body))
             if self.path == "/tabs":

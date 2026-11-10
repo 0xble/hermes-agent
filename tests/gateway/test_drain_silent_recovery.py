@@ -315,7 +315,6 @@ async def test_adapter_drain_preserves_one_turn_without_reentering_handler(
         async def active_handler(first):
             entered.set()
             await active.wait()
-            return None
 
         adapter.set_message_handler(active_handler)
         await adapter.handle_message(MessageEvent(text="existing turn", source=source, user_id="u1"))
@@ -629,7 +628,7 @@ def test_ordinary_queued_head_precedes_later_drain_spool(tmp_path, monkeypatch):
 
 def test_failed_drain_authorization_keeps_spool_for_next_pass(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    runner, adapter = make_restart_runner()
+    runner, _adapter = make_restart_runner()
     source = make_restart_source()
     key = runner._session_key_for_source(source)
     event = MessageEvent(text="keep", source=source, user_id="u1")
@@ -658,7 +657,7 @@ def test_failed_drain_authorization_keeps_spool_for_next_pass(tmp_path, monkeypa
 @pytest.mark.asyncio
 async def test_reconnect_during_drain_does_not_claim_arrival(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    runner, adapter = make_restart_runner()
+    runner, _adapter = make_restart_runner()
     source = make_restart_source()
     key = runner._session_key_for_source(source)
     event = MessageEvent(text="later", source=source, user_id="u1")

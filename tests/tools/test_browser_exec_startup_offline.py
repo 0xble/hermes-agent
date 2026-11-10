@@ -48,7 +48,7 @@ def test_browser_exec_schema_returns_while_catalog_dns_is_blocked(tmp_path):
     result = subprocess.run(
         [sys.executable, "-c", _COLD_SCHEMA], cwd=Path(__file__).resolve().parents[2],
         env=home.env(), capture_output=True, text=True, timeout=30,
-    )
+     check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "BROWSER_EXEC_SCHEMA_READY" in result.stdout
 

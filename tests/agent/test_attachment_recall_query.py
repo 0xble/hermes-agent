@@ -153,7 +153,7 @@ def test_untranscribed_voice_fallback_note_is_not_the_recall_query(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _no_stt)
     mixin = object.__new__(GatewayInboundMixin)
     mixin.config = SimpleNamespace(stt_enabled=True)
-    enrich = getattr(mixin, "_enrich_message_with_transcription")
+    enrich = mixin._enrich_message_with_transcription
     prompt, _ = asyncio.run(enrich(REQUEST, ["/cache/audio/voice.ogg"]))
     assert prompt.startswith("[voice message could not be transcribed]")
     assert auto_recall_query(prompt) == REQUEST
@@ -356,7 +356,7 @@ def test_native_multimodal_turn_recalls_the_complete_caption(monkeypatch, captio
         return_value=json.dumps({"analysis": DESCRIPTION})))
     turn = _multimodal_turn(caption, images)
     runner = VisionMessagePrepMixin()
-    setattr(runner, "_anthropic_image_fallback_cache", {})
+    runner._anthropic_image_fallback_cache = {}
     api_copy = runner._preprocess_anthropic_content(json.loads(json.dumps(turn)), "user")
     assert api_copy.index(caption) > 800
     agent = _turn_agent()

@@ -3,7 +3,7 @@
 from hermes_cli import lifecycle
 from hermes_cli.observability import relay_shared_metrics
 from tests.hermes_cli.test_relay_shared_metrics_runtime import (
-    direct_runtime as direct_runtime,
+    direct_runtime,
     _finish_desktop_task,
     _join_export_workers,
     _stored_values,

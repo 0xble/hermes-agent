@@ -2,7 +2,7 @@
   "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_conformance_vectors.py; the native renderers are the oracle (executable spec).",
   "oracle": {
     "repo": "NousResearch/hermes-agent",
-    "commit": "d8d416c69e17f8f5d27f581ed957f1d0425a22f9",
+    "commit": "b7c20448cff9f284c44e1d2bcc0f50076b850ab9",
     "generator": "scripts/generate_conformance_vectors.py",
     "generator_version": 1
   },

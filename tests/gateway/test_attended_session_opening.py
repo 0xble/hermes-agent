@@ -111,7 +111,6 @@ async def test_opening_turn_finalizes_before_later_switch_in(opening, monkeypatc
             raise RuntimeError("opening failed")
         if outcome == "interrupt":
             await continue_request.wait()
-        return None
 
     monkeypatch.setattr(runner, "_prepare_profile_scoped_inbound_message_text", prepare_message)
     prepare_turn = runner._hmwa_prepare_turn

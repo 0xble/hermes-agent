@@ -47,7 +47,7 @@ class ReleasePaths:
     previous: Path
 
     @classmethod
-    def for_home(cls, home: str | Path) -> "ReleasePaths":
+    def for_home(cls, home: str | Path) -> ReleasePaths:
         home = Path(home).expanduser().resolve()
         return cls(home, home / "releases", home / "current", home / "previous")
 
@@ -520,7 +520,7 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
         result = subprocess.run(
             [str(python), "-m", "hermes_cli.immutable_releases", "--smoke-imports"],
             cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
-        )
+         check=False)
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
             raise RuntimeError(f"candidate plugin smoke failed: {detail}")
@@ -1104,7 +1104,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
             # service; ordinary recovery is strictly observation-only.
             assert plist is not None and "intended_sha256" in plist
             record["reload_issued"] = {
-                "at": datetime.now(timezone.utc).isoformat(),
+                "at": datetime.now(UTC).isoformat(),
                 "plist_sha256": plist["intended_sha256"],
                 "attempt": 1,
             }
@@ -1331,7 +1331,7 @@ def _source_python_valid(python: Path, source: Path) -> bool:
     try:
         return subprocess.run([str(python), "-c", probe, str(source)],
                               capture_output=True, timeout=15,
-                              env=_release_subprocess_env()).returncode == 0
+                              env=_release_subprocess_env(), check=False).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 

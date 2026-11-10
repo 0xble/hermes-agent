@@ -131,7 +131,7 @@ if __name__ == '__main__':
 ''', encoding='utf-8')
             subprocess.run(['git', 'init', '-q', str(root)], check=True)
             env = dict(os.environ, HOME=str(root / 'home'), HERMES_TEST_SCRATCH_ROOT=str(scratch), OPENAI_API_KEY='must-not-forward', HERMES_PYTHON=str(root / '.venv/bin/python'))
-            result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=root, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
+            result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=root, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('1 tests passed', result.stdout)
             self.assertTrue(scratch.is_dir())
@@ -164,7 +164,7 @@ if __name__ == '__main__':
             env['HOME'] = str(Path(directory) / 'home')
             env['HERMES_PYTHON'] = str(primary / '.venv/bin/python')
             result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=worktree, env=env,
-                                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60, check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('1 tests passed', result.stdout)
 

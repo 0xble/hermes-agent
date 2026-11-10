@@ -139,7 +139,7 @@ async def test_unrun_rollback_only_undoes_the_tick_the_wake_carried(hermes_home,
     runner = _runner(monkeypatch, tmp_path)
     sid = runner.session_store.get_or_create_session.return_value.session_id
     event = _fired_loop_wake(runner, sid)
-    time.sleep(0.01)
+    await asyncio.sleep(0.01)
     newer = LoopManager(session_id=sid)
     newer.set("a different loop", interval_seconds=300, route=_ROUTE)
     newer.state.next_due_at = 0

@@ -15,7 +15,7 @@ def agent_runtime(monkeypatch):
     import hermes_cli.env_loader
     import hermes_cli.runtime_provider
 
-    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(scheduler, "load_config", dict)
     monkeypatch.setattr(scheduler, "_get_session_db_timeout", lambda: 0.2)
     monkeypatch.setattr(scheduler, "_init_cron_mcp_tools", lambda *_: None)
     monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda *_: False)

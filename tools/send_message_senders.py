@@ -7,7 +7,6 @@ import inspect
 import logging
 import os
 import re
-import time
 
 from agent.redact import redact_sensitive_text
 
@@ -16,12 +15,12 @@ logger = logging.getLogger("tools.send_message_tool")
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".m2a", ".wav", ".m4a", ".flac"}
+_TELEGRAM_SEND_AUDIO_EXTS = {".mp3", ".m4a", ".flac"}
+_TELEGRAM_CAPTION_LIMIT = 1024
 _VOICE_EXTS = {".ogg", ".opus"}
-_TELEGRAM_SEND_AUDIO_EXTS = {".mp3", ".m4a"}  # sendAudio accepts only these; other audio -> sendVoice / document
 # Captionable on the media bubble; voice/audio notes excluded (a caption there reads as a separate label).
 _CAPTIONABLE_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | {".pdf", ".doc", ".docx", ".txt", ".md", ".csv", ".xlsx", ".zip"}
-# Native caption limits (chars): Telegram caps photo/video at 1024; one conservative shared ceiling elsewhere.
-_TELEGRAM_CAPTION_LIMIT = 1024
+# Native caption limit (chars): one conservative shared ceiling (Telegram's 1024 lives in its plugin).
 _DEFAULT_CAPTION_LIMIT = 4096
 
 
@@ -29,8 +28,8 @@ def _media_caption_split(text, media_files, *, max_caption_len):
     """Single chokepoint deciding whether text rides on the media bubble as its caption:
     ``(caption, "")`` only for exactly one captionable file (not a voice/audio note) whose
     text fits ``max_caption_len``, else ``(None, text)`` — multi-file caption→file association
-    is ambiguous. Length is codepoints (never under-counts Telegram's UTF-16 units for BMP
-    text); the Telegram sender re-checks the *formatted* caption since escaping inflates it."""
+    is ambiguous. Length is codepoints. The Telegram plugin's standalone sender keeps its own copy
+    (it re-checks the *formatted* caption in UTF-16 units, since escaping inflates it)."""
     stripped = (text or "").strip()
     media = media_files or []
     if (not stripped or len(media) != 1 or len(stripped) > max_caption_len or media[0][1]
@@ -509,6 +508,23 @@ def _plugin_standalone_sender(platform_name, *, label=None, discover=True):
     return entry.standalone_sender_fn, None
 
 
+def _accepts_kwarg(fn, name):
+    """True when ``fn`` takes keyword ``name`` (named or through ``**kwargs``); an uninspectable
+    callable is assumed to (the documented contract). Uncached: a plugin's sender may be an
+    unhashable callable object, and one signature read per send is cheap."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(p.kind is p.VAR_KEYWORD or (p.name == name and p.kind is not p.POSITIONAL_ONLY) for p in params)
+
+
+def _optional_sender_kwargs(sender, **kwargs):
+    """``kwargs`` minus the optional ones ``sender`` does not take: a ``standalone_sender_fn``
+    written to the earlier contract (no ``notify``) keeps working. ``None`` values are dropped too."""
+    return {k: v for k, v in kwargs.items() if v is not None and _accepts_kwarg(sender, k)}
+
+
 async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
     """One-shot text send through a plugin's ``standalone_sender_fn``."""
     sender, err = _plugin_standalone_sender(platform_name)
@@ -526,9 +542,10 @@ async def _resolve_slack_user_target(token, chat_id):
     except ImportError:
         return None, {"error": "aiohttp not installed. Run: "
                       f"{install_hint('messaging')}"}
+    from gateway.platforms.base import describe_proxy_error, resolve_proxy_url, proxy_kwargs_for_aiohttp
+    proxy = resolve_proxy_url()
     try:
-        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
-        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(resolve_proxy_url())
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(proxy)
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             async def post_api(method, payload):
@@ -562,7 +579,8 @@ async def _resolve_slack_user_target(token, chat_id):
             dm_id = (opened.get("channel") or {}).get("id")
             return (dm_id, None) if dm_id else (None, _error("Slack conversations.open did not return a DM channel ID"))
     except Exception as e:
-        return None, _error(f"Slack DM resolution failed: {e}")
+        # aiohttp echoes a malformed proxy URL (password included) as the InvalidURL text.
+        return None, _error(f"Slack DM resolution failed: {describe_proxy_error(e, proxy) or e}")
 
 
 # "ephemeral connect (may re-init E2EE per send, see #46310)",

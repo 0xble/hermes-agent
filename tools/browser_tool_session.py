@@ -233,7 +233,7 @@ def _popen_agent_browser(argv: list[str], env: dict[str, str], socket_dir: str, 
         _popen_extra = {"creationflags": windows_hide_flags(), "close_fds": True, "startupinfo": _si}
     proc = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             env=env, bufsize=0, **_popen_extra)
-    setattr(proc, "_hermes_browser_capture", BrowserOutputCapture(proc))
+    proc._hermes_browser_capture = BrowserOutputCapture(proc)
     return proc
 
 

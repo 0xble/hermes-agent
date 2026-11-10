@@ -192,7 +192,7 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     argv = gateway_run._resolve_update_hermes_bin(home)
     assert argv is not None and argv[0] == sys.executable
     launched = subprocess.run([*argv, "probe"], cwd=release,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, check=False)
     assert launched.returncode == 0, launched.stderr
     assert launched.stdout.strip() == str(release / "hermes_cli" / "main.py")
 
@@ -499,7 +499,7 @@ def test_normal_update_without_layout_opt_in_does_not_touch_release_or_plist(tmp
     plist = tmp_path / "service.plist"
     plist.write_bytes(b"original")
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {})
+    monkeypatch.setattr(update_cmd, "_updates_config", dict)
     monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", lambda: pytest.fail("launchd touched"))
     monkeypatch.setattr(releases, "stage_release", lambda *a, **kw: pytest.fail("release staged"))
     assert update_cmd._activate_immutable_release()
@@ -538,7 +538,7 @@ def test_outstanding_release_is_promoted_before_catchup_restart(tmp_path, monkey
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
-    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", list)
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
     attempted = []
     def stage(*args, **kwargs):
@@ -575,7 +575,7 @@ def test_noop_update_promotes_before_pending_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
     monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: (b, "existing"))
-    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", list)
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
     monkeypatch.setattr(update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a: None)
     def restart(*, defer, checkout_complete):
@@ -767,7 +767,7 @@ def test_nonready_current_refuses_legacy_update_before_build(tmp_path, monkeypat
     releases.promote(home, broken)
     (broken / ".release-ready").unlink()
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {})
+    monkeypatch.setattr(update_cmd, "_updates_config", dict)
     with pytest.raises(RuntimeError, match="current release is not ready"):
         update_cmd._immutable_release_enabled()
 

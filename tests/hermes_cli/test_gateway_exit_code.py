@@ -28,6 +28,6 @@ cli_main.main()
         [sys.executable, "-c", program],
         cwd=Path(__file__).resolve().parents[2],
         capture_output=True, text=True, encoding="utf-8", timeout=60,
-    )
+     check=False)
     assert "fixture gateway handler ran" in result.stdout, result.stdout + result.stderr
     assert result.returncode == expected_status, result.stdout + result.stderr

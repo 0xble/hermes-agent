@@ -167,8 +167,8 @@ def assert_exact_checkout(expected: str) -> None:
     actual = git('rev-parse', 'HEAD').strip()
     if actual != expected:
         raise RuntimeError(f'Checkout SHA mismatch: expected {expected}, got {actual}')
-    if subprocess.run(['git', 'diff', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment(root=ROOT)).returncode != 0 or \
-       subprocess.run(['git', 'diff', '--cached', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment(root=ROOT)).returncode != 0:
+    if subprocess.run(['git', 'diff', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment(root=ROOT), check=False, timeout=120).returncode != 0 or \
+       subprocess.run(['git', 'diff', '--cached', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment(root=ROOT), check=False, timeout=120).returncode != 0:
         raise RuntimeError('Tracked checkout differs from the committed SHA')
 
 
@@ -521,7 +521,7 @@ def _clonefile_supported(directory: Path) -> bool:
             dest = source.with_name(f'{source.name}-copy')
             probe.write(b'x')
         command = ['cp', '-c', str(source), str(dest)]
-        return subprocess.run(command, capture_output=True).returncode == 0 and dest.is_file()
+        return subprocess.run(command, capture_output=True, check=False, timeout=30).returncode == 0 and dest.is_file()
     except OSError:
         return False
     finally:
@@ -888,8 +888,8 @@ def history_policy() -> None:
     if missing:
         raise RuntimeError('Missing contributor mappings: ' + ', '.join(missing))
     offenders = [p for p in git('ls-files', '-z').split('\0')
-                 if re.search(r'(^|/)(infograph|infograf)[^/]*/', p, re.I)
-                 and re.search(r'\.(png|jpe?g|webp|gif)$', p, re.I)]
+                 if re.search(r'(^|/)(infograph|infograf)[^/]*/', p, re.IGNORECASE)
+                 and re.search(r'\.(png|jpe?g|webp|gif)$', p, re.IGNORECASE)]
     if offenders:
         raise RuntimeError('Tracked PR infographics: ' + ', '.join(offenders))
 
@@ -931,7 +931,7 @@ SQLITE_WAL_PROBE = ("import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite
 
 def require_wal_capable_sqlite(py: str, env: dict[str, str]) -> None:
     probe = subprocess.run([py, '-c', SQLITE_WAL_PROBE], cwd=ROOT, env=env, capture_output=True,
-                           text=True, encoding='utf-8', errors='replace')
+                           text=True, encoding='utf-8', errors='replace', check=False, timeout=30)
     if probe.returncode != 0:
         detail = (probe.stdout + probe.stderr).strip()
         raise RuntimeError(f'Checkout Python must link a WAL-capable SQLite, or WAL tests silently skip: {detail}')
@@ -1078,7 +1078,7 @@ def rust_environment(env: dict[str, str]) -> dict[str, str]:
     # Resolve an installed rustup toolchain before entering the isolated HOME.
     # Only its executable directory is shared, never rustup config or credentials.
     if shutil.which('rustup'):
-        result = subprocess.run(['rustup', 'which', 'rustc'], capture_output=True, text=True, encoding='utf-8', errors='replace')
+        result = subprocess.run(['rustup', 'which', 'rustc'], capture_output=True, text=True, encoding='utf-8', errors='replace', check=False, timeout=30)
         if result.returncode == 0:
             env['PATH'] = str(Path(result.stdout.strip()).parent) + os.pathsep + env['PATH']
     require_tools(('rustc',), env)
@@ -1194,7 +1194,7 @@ def main() -> int:
             'native-os': lambda: native_os(env, args.workers),
         }
         selected = (['python-shard'] if args.shard else args.lane or
-                    (list(GATE_LANES) if args.command == 'gate' else
+                    (list(GATE_LANES) if args.command == 'gate' and os.environ.get('GITHUB_ACTIONS') == 'true' else
                      ['native-os'] if args.command == 'nightly-native' else list(LANES)))
         if args.shard:
             lanes['python-shard'] = lambda: python_shard(env, args.workers, shard_index, shard_count)

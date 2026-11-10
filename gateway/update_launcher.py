@@ -6,7 +6,7 @@ import contextlib
 import json
 import os
 from uuid import uuid4
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable
 
@@ -236,7 +236,7 @@ def make_agent_update_handler(
             "platform": route["source"], "chat_id": route["chat_id"],
             "chat_type": route.get("chat_type"), "user_id": route.get("user_id"),
             "session_key": route.get("session_key"), "thread_id": route.get("thread_id"),
-            "timestamp": datetime.now(timezone.utc).isoformat(), "reason": reason,
+            "timestamp": datetime.now(UTC).isoformat(), "reason": reason,
             "parent_session_id": parent_session_id, "parent_route": route,
         }
         if profile_home is not None:

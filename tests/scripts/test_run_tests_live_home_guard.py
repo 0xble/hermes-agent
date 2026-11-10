@@ -7,6 +7,7 @@ refuse, write nothing, and tell the caller how to rebuild the checkout venv
 or point ``HERMES_HOME`` at a scratch directory.
 """
 from pathlib import Path
+import json
 import os
 import shutil
 import subprocess
@@ -96,7 +97,7 @@ def _mark(home: Path, kind: str) -> None:
         (home / "gateway_state.json").write_text("{}\n", encoding="utf-8")
     elif kind == "running-pid":
         proc = subprocess.Popen(["sleep", "60"])
-        (home / "gateway.pid").write_text('{"pid": %d}\n' % proc.pid, encoding="utf-8")
+        (home / "gateway.pid").write_text(json.dumps({'pid': proc.pid})+'\n', encoding="utf-8")
         home.joinpath(".sleep-pid").write_text(str(proc.pid), encoding="utf-8")
     elif kind == "bare-pid":
         proc = subprocess.Popen(["sleep", "60"])
@@ -106,7 +107,7 @@ def _mark(home: Path, kind: str) -> None:
         proc = subprocess.Popen(["sleep", "60"])
         proc.kill()
         proc.wait(timeout=5)
-        (home / "gateway.pid").write_text('{"pid": %d}\n' % proc.pid, encoding="utf-8")
+        (home / "gateway.pid").write_text(json.dumps({'pid': proc.pid})+'\n', encoding="utf-8")
     elif kind == "not-a-pointer":
         (home / "current").write_text("not a release pointer\n", encoding="utf-8")
     elif kind == "scratch":

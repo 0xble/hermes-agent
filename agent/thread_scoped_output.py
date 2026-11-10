@@ -16,7 +16,14 @@ import threading
 from typing import Any, Iterator, TextIO
 
 __all__ = [
-    "thread_scoped_silence", "is_routing_stream", "adopt_routing_proxy", "delegate_getattr", "is_stdio_wrapper", "resolve_stdio", "stdio_chain", "stdio_install_lock", ]
+    "adopt_routing_proxy",
+    "delegate_getattr",
+    "is_routing_stream",
+    "is_stdio_wrapper",
+    "resolve_stdio",
+    "stdio_chain",
+    "stdio_install_lock",
+    "thread_scoped_silence", ]
 
 _install_lock = threading.Lock()
 # Every installer that rebinds sys.stdout/sys.stderr holds this, so a concurrent agent build
@@ -152,7 +159,7 @@ class _ThreadRoutingStream:
         return delegate_getattr(self, name, ())
 
 
-def adopt_routing_proxy(attr: str, current: object, fallback: object = None) -> "_ThreadRoutingStream | None":
+def adopt_routing_proxy(attr: str, current: object, fallback: object = None) -> _ThreadRoutingStream | None:
     """Collapse ``current``'s chain onto the routing proxy in it, if any, and return that proxy.
 
     The proxy goes back on top as ``sys.<attr>`` and its passthrough is rebound to the resolved
@@ -171,7 +178,7 @@ def adopt_routing_proxy(attr: str, current: object, fallback: object = None) -> 
     return None
 
 
-def _routing_stream_under(stream: object) -> "_ThreadRoutingStream | None":
+def _routing_stream_under(stream: object) -> _ThreadRoutingStream | None:
     """The routing proxy at ``stream`` or directly under a single transparent wrapper."""
     if isinstance(stream, _ThreadRoutingStream):
         return stream

@@ -519,7 +519,7 @@ class TestGatewayRedeliverySweep:
         for oid, content in (("ob-1", "first"), ("ob-2", "second"), ("ob-3", "third")):
             _record(oid, content=content)
             _orphan(oid)
-            time.sleep(0.002)  # distinct created_at, so replay order is the recorded order
+            await asyncio.sleep(0.002)  # distinct created_at, so replay order is the recorded order
         adapter = self._adapter(success=False)
         runner = self._runner(adapter)
 
@@ -594,7 +594,7 @@ class TestGatewayRedeliverySweep:
                 obligation_id=dl.compute_obligation_id(key, ref, content), session_key=key,
                 platform="telegram", chat_id="C9", thread_id=None, content=content, since=started,
                 part=True)
-            time.sleep(0.002)
+            await asyncio.sleep(0.002)
         sends = []
         refuse = {"two": 1}
 

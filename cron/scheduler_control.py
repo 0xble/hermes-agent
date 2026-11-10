@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 
 from agent.interrupt_scope import InterruptScope
 
@@ -75,7 +75,7 @@ def start_control(job_id: str) -> None:
     with sched._running_lock:
         control = sched._running_cancel_events.get(sched._inflight_key(job_id))
         if control is not None:
-            control.started_at = datetime.now(timezone.utc).isoformat()
+            control.started_at = datetime.now(UTC).isoformat()
 
 
 def note_completed_delivery(job_id: str) -> None:

@@ -89,11 +89,12 @@ def _unhealthy_cache_key(
     provider: str, base_url: Optional[str] = None, model: Optional[str] = None,
 ) -> tuple[str, str, str, str]:
     """Return a profile/endpoint/model-scoped, non-secret route key."""
-    from agent.auxiliary_client import _normalize_chain_label
+    from agent.auxiliary_client import _normalize_chain_label, _normalize_resolved_model
     label = _normalize_chain_label(provider)
     endpoint = normalize_route_base_url(_custom_health_base_url(provider, base_url))
+    normalized_model = str(_normalize_resolved_model(model, provider) or "").strip().lower()
     return AuxiliaryRouteIdentity(
-        home=hermes_home_key(), provider=label, endpoint=endpoint, model=str(model or "").strip(),
+        home=hermes_home_key(), provider=label, endpoint=endpoint, model=normalized_model,
     ).as_key()
 
 
@@ -413,23 +414,21 @@ def reset_health_state() -> None:
         _write_state(path, state)
 
 
-def fallback_candidate_unavailable_reason(exc: Exception) -> Optional[str]:
-    """Why a fallback candidate cannot serve this walk, or None."""
-    from agent.auxiliary_client import _FALLBACK_REASONS
-    return next(
-        (label for predicate, label in _FALLBACK_REASONS if label != "auth error" and predicate(exc)),
-        None,
-    )
-
-
+# Quarantine hold per unavailable-reason label. Payment/quota depletion and a dead credential
+# last hours, so those keep the long default TTL (None); a per-minute 429, a dropped connection or
+# a garbled body clears in seconds — holding the lane for 10 minutes process-wide would hide a
+# healthy fallback from every aux task over one transient blip.
 _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS = 60.0
 _CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
     "rate limit": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "connection error": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "invalid provider response": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    "provider overloaded": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    "server error": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
 }
 
 
 def fallback_candidate_quarantine_ttl(reason: Optional[str]) -> Optional[float]:
-    """Seconds to hide a fallback candidate for ``reason``; None means the long default TTL."""
+    """Seconds to hide a fallback candidate for ``reason`` (a ``fallback_label`` label, or None
+    for a stale credential); None means the long default TTL."""
     return _CANDIDATE_QUARANTINE_TTL.get(reason or "")

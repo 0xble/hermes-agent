@@ -234,18 +234,52 @@ def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -
 def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> TaskRoute:
     if route.get("profile"):
         return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
+    if route.get("model"):
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.model_alias_runtime import alias_name, resolve_model_alias
+        config = load_config_readonly() or {}
+        required_alias = backend == "model_map" and route.get("label") == route["model"]
+        if required_alias or alias_name(route["model"], config):
+            alias = resolve_model_alias(route["model"], config, required=True)
+            # A stored alias owns its current endpoint and provider. Old expanded fields
+            # must not pin an earlier alias definition or borrow its credential.
+            route = {**route, "model": alias.model, "provider": alias.provider}
+            for key in ("base_url", "api_key", "api_mode"):
+                route.pop(key, None)
+            if alias.base_url:
+                route.update(base_url=alias.base_url, api_key=alias.api_key)
+            if "reasoning_effort" not in route and alias.reasoning_effort != "":
+                route["reasoning_effort"] = alias.reasoning_effort
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):
         from tools.delegate_tool_tuning import task_service_tier
         creds = {**creds, **task_service_tier(str(route["service_tier"]), creds, parent_agent)}
-    return TaskRoute(creds, route, route.get("reasoning_effort"), None, None, backend)
+    return TaskRoute(creds, route, route.get("reasoning_effort") if backend != "default" else None, None, None, backend)
+
+
+def inherits_parent_alias(config: Mapping[str, Any], parent_agent: Any) -> bool:
+    """The one legacy exception the plugin cannot infer from its JSON task input."""
+    names = config.get("inherit_parent_aliases") or []
+    if not isinstance(names, list):
+        raise DelegationRouteError("delegation.inherit_parent_aliases must list model alias names")
+    if not names:
+        return False
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.model_alias_runtime import resolve_model_alias
+    current = load_config_readonly() or {}
+    for name in names:
+        alias = resolve_model_alias(name, current, required=True)
+        if (alias.model == getattr(parent_agent, "model", None)
+                and alias.provider == getattr(parent_agent, "provider", None)):
+            return True
+    return False
 
 
 def _route_to_task_route(route: dict[str, Any], parent_agent: Any, cache: dict[str, TaskRoute],
                          config: Optional[Mapping[str, Any]] = None, backend: str = "default") -> TaskRoute:
     label = route.get("label") if isinstance(route.get("label"), str) else None
-    route = _with_inherited_fallback(route, config or {})
+    route = _with_inherited_fallback(route, {} if label == "inherit" else config or {})
     # The label is display-only: two labels on one route (or one profile) resolve once.
     key = json.dumps({k: v for k, v in route.items() if k != "label"}, sort_keys=True, default=str)
     if key not in cache:
@@ -316,8 +350,6 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
     from agent.delegation_backends import pinned_backend
     if pinned := pinned_backend(parent_agent):
         config = {**config, "backend": pinned}
-    from tools.delegate_tool import _select_routing_cfg
-    config = _select_routing_cfg(config, parent_agent)
     try:
         provider = _active_provider(config)
     except DelegationRouteError as exc:
@@ -327,10 +359,17 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
     routes: list[TaskRoute] = []
     for i, task in enumerate(task_list):
         try:
+            if provider.name == "model_map" and not task.get("option"):
+                default = provider.settings(config).get("default")
+                options = declared.get("option", {}).get("enum", [])
+                if default and default not in options:
+                    raise DelegationRouteError(f"Unknown default model_map route {default!r}; no child started.")
             route = _route_one(provider, declared, i, task, config)
+            if not any(task.get(name) is not None for name in declared) and inherits_parent_alias(config, parent_agent):
+                route = {"label": "inherit"}
             _check_backend_effort(i, route, config)
             resolved = _route_to_task_route(route, parent_agent, cache, config, provider.name)
-            routes.append(replace(resolved, reasoning_cfg=dict(config)))
+            routes.append(replace(resolved, reasoning_cfg=dict(resolved.routing_cfg)))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
             routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
     return routes, None
