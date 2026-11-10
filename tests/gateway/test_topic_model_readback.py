@@ -10,7 +10,8 @@ import pytest
 
 from gateway.config import ChannelOverride, Platform
 from gateway.telegram_topic_sessions import TopicSpec, create_topic_session, edit_topic_session
-from tests.gateway.test_telegram_topic_tool import FakeTelegram, _runner, _seed_caller, _source, home
+from tests.gateway.test_telegram_topic_tool import FakeTelegram, _runner, _seed_caller, _source, home as _home_fixture
+home = _home_fixture
 
 
 def _runtime(monkeypatch, runner, config):

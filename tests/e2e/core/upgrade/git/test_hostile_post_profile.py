@@ -6,16 +6,8 @@ The module-scoped real install is shared only within this bounded file.
 from __future__ import annotations
 
 from tests.e2e.core.upgrade.git import _hostile_post as C
-from tests.e2e.core.upgrade.git._hostile_post import (
-    G,
-    H,
-    PROFILE,
-    _clear_toggles,
-    _facts,
-    _update_log,
-    json,
-    w,
-)
+from tests.e2e.core.upgrade.git._hostile_post import G, H, PROFILE, _clear_toggles, _facts, _update_log, json, w as _w_fixture
+w = _w_fixture
 from tests.e2e.core.upgrade.git._hostile_diagnostics import (
     hostile_cell,
     hostile_diagnostics,

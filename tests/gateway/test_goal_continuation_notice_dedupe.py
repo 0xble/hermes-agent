@@ -20,7 +20,8 @@ from gateway.platforms.event import MessageEvent, MessageType
 from hermes_cli import goals
 from hermes_cli.goals import GoalManager
 from tests.gateway.test_goal_continuation_silence import _runner_with_goal
-from tests.gateway.test_goal_continuation_drain import hermes_home
+from tests.gateway.test_goal_continuation_drain import hermes_home as _hermes_home_fixture
+hermes_home = _hermes_home_fixture
 
 REASON = "The release still needs live validation"
 

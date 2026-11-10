@@ -2,7 +2,7 @@
 
 The public module command supports a read-only dry run against a selected home.
 The config registry uses the same transformation during an authorized update.
-No session database is opened by this migration.
+Only the selected home's mutable routing rows are changed. Transcripts are untouched.
 """
 from __future__ import annotations
 
@@ -162,7 +162,10 @@ def migrate_stores(home: Path, aliases: dict, *, dry_run: bool) -> list[str]:
         updated = rewrite_references(raw, aliases, changes, relative)
         if updated != raw:
             pending.append((path, updated))
+    from hermes_cli.config_migrations_alias_routing import plan_routing_migration, apply_routing_migration
+    routing = plan_routing_migration(home, aliases, changes)
     if not dry_run:
+        apply_routing_migration(home, routing)
         for path, updated in pending:
             if path.name == "jobs.json":
                 from cron.jobs import save_jobs_document, use_cron_store

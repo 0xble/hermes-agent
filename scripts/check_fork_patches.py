@@ -105,7 +105,7 @@ def _git_raw(*args: str) -> str:
 
 
 def _is_git_checkout() -> bool:
-    return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True, check=False).returncode == 0
+    return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True, check=False, timeout=30).returncode == 0
 
 
 def _has_revision(revision: str) -> bool:

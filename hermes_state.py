@@ -85,6 +85,7 @@ from hermes_state_maintenance import SessionMaintenanceMixin
 from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
+from hermes_state_stored_reads import SessionStoredReadsMixin
 from hermes_state_transactions import settle_write_transaction
 from hermes_state_write_stalls import observe_write, write_attempt
 
@@ -499,7 +500,7 @@ class SessionDB(
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
     SessionMessagesMixin, SessionPruneRewriteMixin, SessionApiContentMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin,
-    SessionPromptRefreshMixin,
+    SessionPromptRefreshMixin, SessionStoredReadsMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 

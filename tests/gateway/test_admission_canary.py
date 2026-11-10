@@ -7,8 +7,10 @@ import os
 import pytest
 
 from gateway import admission_canary, status
-from tests.gateway.test_synthetic_native_admission import goal_prompt, native_chat
-from tests.hermes_cli.test_admission_canary import switched
+from tests.gateway.test_synthetic_native_admission import goal_prompt, native_chat as _native_chat_fixture
+native_chat = _native_chat_fixture
+from tests.hermes_cli.test_admission_canary import switched as _switched_fixture
+switched = _switched_fixture
 
 
 @pytest.fixture

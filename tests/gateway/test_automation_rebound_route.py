@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from tests.gateway.test_synthetic_native_admission import native_chat
+from tests.gateway.test_synthetic_native_admission import native_chat as _native_chat_fixture
+native_chat = _native_chat_fixture
 
 
 def _rebind(runner, source):

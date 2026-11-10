@@ -313,7 +313,7 @@ def _surface_reader(db):
 
 
 def _cmd_list(db, args):
-    from hermes_state_sessions import workspace_key as _ws_key
+    from hermes_state_sessions_workspace import workspace_key as _ws_key
     # LIMIT lives in the query, so probe one row past the cap: it is the only way to know the
     # page was cut without a second COUNT query (``--limit 0`` is ``LIMIT 0``: no rows, no probe).
     limit = args.limit

@@ -6,28 +6,8 @@ The module-scoped real install is shared only within this bounded file.
 from __future__ import annotations
 
 from tests.e2e.core.upgrade.git import _hostile_post as C
-from tests.e2e.core.upgrade.git._hostile_post import (
-    BREAK_DEPS,
-    BREAK_WEB,
-    DEPS_FAULT_TEXT,
-    DEPS_OWED,
-    G,
-    WEB_FAULT_TEXT,
-    _clear_toggles,
-    _config_version,
-    _edit_config,
-    _facts,
-    _followup_steps,
-    _followups,
-    _pending_markers,
-    _publish_deps_fault_release,
-    _publish_web_release,
-    _read,
-    _toggle,
-    _update_log,
-    _warn_lines,
-    w,
-)
+from tests.e2e.core.upgrade.git._hostile_post import BREAK_DEPS, BREAK_WEB, DEPS_FAULT_TEXT, DEPS_OWED, G, WEB_FAULT_TEXT, _clear_toggles, _config_version, _edit_config, _facts, _followup_steps, _followups, _pending_markers, _publish_deps_fault_release, _publish_web_release, _read, _toggle, _update_log, _warn_lines, w as _w_fixture
+w = _w_fixture
 from tests.e2e.core.upgrade.git._hostile_diagnostics import (
     hostile_cell,
     hostile_diagnostics,

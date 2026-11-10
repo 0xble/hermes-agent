@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.gateway.test_session_control_watcher import _runner, state
+from tests.gateway.test_session_control_watcher import _runner, state as _state_fixture
+state = _state_fixture
 
 
 async def _accept(_adapter, event):

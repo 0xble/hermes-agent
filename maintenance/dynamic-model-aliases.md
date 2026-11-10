@@ -14,8 +14,13 @@ validation, profile isolation and actual-route result reporting.
 
 Migration: `python -m hermes_cli.config_migrations_model_aliases --home HOME --dry-run`,
 then the same command without `--dry-run`. Automatic config migration v54 shares
-the transformation. It rewrites copied cron/jobs.json and legacy sessions JSON,
-retains bare authoritative model_role names and never opens a session database.
+the transformation. It rewrites cron/jobs.json, the legacy sessions JSON mirror
+and authoritative gateway_routing topic rows in the selected home's state.db.
+Dry run opens an existing selected database read-only without initializing it.
+Apply uses the native SessionDB writer guard and one transaction, comparing each
+original routing row so a concurrent edit aborts rather than being overwritten.
+No transcript or schema change is made. The live state.db was never opened in
+this preparation run. Isolated database proof uses newly created topic rows.
 Subscription worker options carry an explicit empty fallback chain.
 The real OpenAI proxy also exposes paid API-key accounts. GPT model routes are
 therefore migrated to native `openai-codex` OAuth, with no paid-provider fallback.

@@ -7,6 +7,10 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 """
 
 from __future__ import annotations
+from hermes_cli.goals_relay_receipts import (
+    _relay_sender, _relay_receipt_id
+)
+
 
 import asyncio
 import hashlib
@@ -2449,27 +2453,6 @@ _ANY_RELAY_HEADER_RE = re.compile(
 )
 _USER_MESSAGES_MAX = 20
 _USER_MESSAGES_MAX_CHARS = 8000
-
-
-def _relay_sender(content: str) -> Optional[tuple[str, str]]:
-    """Return ``(profile, session_id)`` from a Hermes relay header on the first or last non-empty line."""
-    if not isinstance(content, str):
-        return None
-    lines = [line.strip() for line in _unwrap_steer(content).splitlines() if line.strip()]
-    for line in (lines[-1:] + lines[:1]) if lines else []:
-        match = _RELAY_HEADER_RE.fullmatch(line)
-        if match:
-            return match.group("profile"), match.group("session")
-    return None
-
-
-def _relay_receipt_id(content: str) -> str:
-    lines = [line.strip() for line in _unwrap_steer(str(content or "")).splitlines() if line.strip()]
-    for line in (lines[-1:] + lines[:1]) if lines else []:
-        match = re.search(r"\breceipt=([^\s\]]+)", line) if _RELAY_HEADER_RE.fullmatch(line) else None
-        if match:
-            return match.group(1)
-    return ""
 
 
 def _relay_ledger_receipts(receipt_ids: Iterable[str]) -> dict[str, dict[str, Any]]:

@@ -8,9 +8,6 @@ def _strip_slot(text: str, slot: str) -> Optional[str]:
     The ``:``-delimited slot layout is ``build_session_key``'s: an id that merely starts with another
     must never match, so a whole-slot comparison is what every caller here uses. A text that IS the
     slot yields ``""``."""
-    from gateway.run_busy import (
-        Optional
-    )
     if text == slot:
         return ""
     if text.startswith(slot + ":"):
@@ -35,10 +32,6 @@ def _same_chat_key_slots(
     without it still names the same chat; a key carrying a DIFFERENT known scope is another
     workspace's chat. ``tail`` is ``""`` when the key ends at the chat id.
     """
-    from gateway.run_busy import (Optional)
-    from gateway.run_busy import (
-        Optional
-    )
     if not key.startswith(prefix):
         return None
     chat_type, _, rem = key[len(prefix):].partition(":")

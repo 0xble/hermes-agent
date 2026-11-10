@@ -37,7 +37,7 @@ def fill_picker_fields(db, items):
     """Set the picker fields on each ``(row, root, segment, listed)``: *listed* is the segment's
     ``list_sessions_rich`` row (its ``preview`` / ``last_active`` / branch / pin), None to read them."""
     from hermes_state_common import _shape_preview
-    from hermes_state_sessions import workspace_key
+    from hermes_state_sessions_workspace import workspace_key
     roots, segments, replies = db.picker_session_facts(
         [root for _, root, _, _ in items], [segment for _, _, segment, listed in items if listed is None],
         [segment for _, _, segment, _ in items])

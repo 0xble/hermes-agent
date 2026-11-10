@@ -74,8 +74,10 @@ Explicit session and one-turn picks take precedence. `/model reset`,
 Legacy preset configuration and stored references are migrated automatically by
 config migration v54. Preview a selected home's migration with
 `python -m hermes_cli.config_migrations_model_aliases --home HOME --dry-run`,
-then apply it by omitting `--dry-run`. This rewrites JSON cron and topic stores
-without opening a session database.
+then apply it by omitting `--dry-run`. This rewrites the cron store, legacy topic
+mirror and authoritative topic routing in the selected home's database. Dry run
+reads existing routing rows without initializing the database. Apply refuses a
+concurrent topic edit and leaves transcript history intact.
 
 ## The Models page
 
