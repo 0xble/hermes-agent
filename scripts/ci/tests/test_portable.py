@@ -194,6 +194,43 @@ class PortableGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'Tracked checkout'):
                     ci.assert_exact_checkout(sha)
 
+    def test_git_commands_honor_the_current_module_root(self):
+        original = ci.ROOT.resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = clean_git_env()
+            subprocess.run(['git', 'init', '-q', str(root)], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.email', 'ci@example.invalid'], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'CI'], env=env, check=True)
+            (root / 'tracked.txt').write_text('fixture', encoding='utf-8')
+            subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'fixture'], env=env, check=True)
+            expected = subprocess.check_output(
+                ['git', '-C', str(root), 'rev-parse', 'HEAD'], env=env, text=True).strip()
+            original_head = subprocess.check_output(
+                ['git', '-C', str(original), 'rev-parse', 'HEAD'], env=env, text=True).strip()
+            self.assertNotEqual(expected, original_head)
+            probe = root / 'cwd.txt'
+            with patch.object(ci, 'ROOT', root):
+                actual = ci.git('rev-parse', 'HEAD').strip()
+                self.assertEqual(
+                    actual, expected,
+                    f'git() ran against {actual}, the definition-time checkout {original_head}, not {expected}')
+                self.assertIn('tracked.txt', ci.source_files())
+                self.assertNotIn('scripts/ci/portable.py', ci.source_files())
+                ci.run([
+                    sys.executable, '-c',
+                    'from pathlib import Path; Path(r"%s").write_text(str(Path.cwd().resolve()))' % probe,
+                ])
+                config = root / 'gitconfig'
+                bound = ci.git_environment(config_path=config)
+                unbound = ci.git_environment(root=None, config_path=root / 'unbound')
+            self.assertEqual(Path(probe.read_text(encoding='utf-8')), root.resolve())
+            self.assertIn(f'directory = {root.resolve().as_posix()}', config.read_text(encoding='utf-8'))
+            self.assertEqual(bound['GIT_CONFIG_GLOBAL'], config.resolve().as_posix())
+            self.assertEqual(unbound['GIT_CONFIG_GLOBAL'], os.devnull)
+            self.assertFalse((root / 'unbound').exists())
+
     def test_preflight_fixture_cannot_mutate_inherited_git_repository(self):
         with tempfile.TemporaryDirectory() as directory:
             sentinel = Path(directory) / 'sentinel'

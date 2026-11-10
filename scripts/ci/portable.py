@@ -146,17 +146,32 @@ def nightly_only_e2e(env: dict[str, str], workers: int) -> None:
         raise failures[0]
 
 
-def git_environment(*, root: Path | None = ROOT, base: dict[str, str] | None = None,
+_CURRENT_ROOT = object()
+
+
+def git_environment(*, root: Path | None | object = _CURRENT_ROOT, base: dict[str, str] | None = None,
                     config_path: Path | None = None) -> dict[str, str]:
-    """Isolate repository selection while trusting only the requested checkout."""
+    """Isolate repository selection while trusting only the requested checkout.
+
+    An omitted root uses the current module ROOT. Passing root=None trusts no checkout.
+    """
+    checkout: Path | None
+    if root is _CURRENT_ROOT:
+        checkout = ROOT
+    elif isinstance(root, Path):
+        checkout = root
+    elif root is None:
+        checkout = None
+    else:
+        raise TypeError(f'git root must be a path or None, not {type(root).__name__}')
     source = os.environ if base is None else base
     env = {key: value for key, value in source.items() if not key.startswith('GIT_')}
-    if root is None:
+    if checkout is None:
         env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
         return env
     config = (config_path or STATE / 'gitconfig').resolve()
     config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(f'[safe]\n\tdirectory = {root.resolve().as_posix()}\n', encoding='utf-8')
+    config.write_text(f'[safe]\n\tdirectory = {checkout.resolve().as_posix()}\n', encoding='utf-8')
     env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=config.as_posix())
     return env
 
@@ -198,17 +213,20 @@ def windows_command(name: str, env: Mapping[str, str]) -> str:
     return name
 
 
-def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
+def run(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    cwd = ROOT if cwd is None else cwd
     argv = [windows_command(argv[0], env or os.environ), *argv[1:]]
     print('+ ' + ' '.join(map(str, argv)), flush=True)
     subprocess.run(argv, cwd=cwd, env=env, check=True)
 
 
-def git(*args: str, cwd: Path = ROOT) -> str:
+def git(*args: str, cwd: Path | None = None) -> str:
+    cwd = ROOT if cwd is None else cwd
     return subprocess.check_output(['git', *args], cwd=cwd, env=git_environment(root=cwd)).decode('utf-8', errors='surrogateescape')
 
 
-def source_files(root: Path = ROOT) -> list[str]:
+def source_files(root: Path | None = None) -> list[str]:
+    root = ROOT if root is None else root
     # Include unstaged/new source for contributor checks, but never dependency/build state.
     return sorted(set(git('ls-files', '-z', '--cached', '--others', '--exclude-standard', cwd=root).split('\0')) - {''})
 
