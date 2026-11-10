@@ -492,9 +492,10 @@ class SessionMaintenanceMixin:
             deleted_ids.extend(batch_removed)
             if batch_removed:
                 emit_session_deleted(self, batch_removed, reason="prune", sessions_dir=sessions_dir)
-            pacer.pause(held[0])
             finish_pending_deletes(self, required_ids=batch_removed)
             # finish_pending_deletes removes transcript files before clearing its marker.
+            if position < len(groups):
+                pacer.pause(held[0])
 
         if removed_count:
             while True:
