@@ -72,6 +72,28 @@ instead of losing every result to SIGKILL.
 
 Contract tests: `tests/e2e/core/upgrade/test_install_downloads.py` `tests/e2e/core/upgrade/test_install_cache.py`
 
+## Upgrade scenario scheduling
+
+The historical N-1 migration file previously ran 7 cases serially. On failing
+commit `80718d41`, its real Linux reproduction reached the sixth case at 14:39
+and was killed at 900 seconds. With bounded downloads on `56ff43da`, the first
+3 cases passed, the lock-only recovery exhausted the 840-second diagnostic
+budget, and the remaining 3 cases reported that budget exhaustion. The active
+subprocess reached HEAD runtime preparation, not a perpetual Git freeze seam.
+
+Schedule clean/long-scalar, autostash, interrupted-pull, interrupted-dependencies
+and offline cases in separate files, following the existing hostile-commit layout.
+All 6 complete test-function ASTs (7 parametrized cases), assertions, guards and
+historical base selection remain identical. Each file owns its provider, seed,
+installed environments and user state. Only explicit download caches are shared.
+This adds 4 seed builds while removing serial aggregation under 1 file watchdog.
+The nightly command discovers the whole directory with retries disabled. Both the
+840-second diagnostic deadline and 900-second watchdog remain unchanged.
+
+Retire this scheduling adaptation when the upstream harness schedules the same
+fresh-install scenarios within the existing finite budget. Rollback restores the
+original file grouping without changing product code or stored user state.
+
 ## Fork upgrade release contract
 
 Git-world N-1 means the newest `origin` `deploy/nightly-*` promotion that is a strict
