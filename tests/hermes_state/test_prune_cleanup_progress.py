@@ -2,6 +2,7 @@
 from contextlib import closing
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,8 +12,8 @@ from hermes_state_mutation_retirement import RETIRED_PREFIX, retire_prunable
 from tests.hermes_state.test_prune_pass_bounds import _old_ended
 
 
-@pytest.mark.parametrize("slow", [False, True])
-def test_default_prune_finishes_an_indivisible_three_mb_message(tmp_path, slow):
+@pytest.mark.parametrize("held_s", [None, 0.3])
+def test_default_prune_finishes_an_indivisible_three_mb_message(tmp_path, monkeypatch, held_s):
     with closing(SessionDB(tmp_path / "state.db")) as db:
         db.create_session("oversized", source="cron")
         at = time.time() - 200 * 86400
@@ -21,11 +22,26 @@ def test_default_prune_finishes_an_indivisible_three_mb_message(tmp_path, slow):
         db.end_session("oversized", "done")
         db._execute_write(lambda conn: conn.execute(
             "UPDATE sessions SET started_at=?,ended_at=?,last_activity_at=? WHERE id='oversized'", (at, at, at)))
-        # Fast hosts can delete 3 MB below 250 ms. Add the existing real-SQL VM
-        # workload to reproduce a slower FTS delete without faking the clock.
-        if slow:
-            from tests.hermes_state.test_prune_sql_deadline import _slow_delete
-            _slow_delete(db)
+        if held_s is not None:
+            import hermes_state_deletion as deletion
+            import hermes_state_prune_budget as budgets
+            delete_page, offset = deletion._delete_page, 0
+            # Observe the same 300 ms hold on every host. Real FTS deletion stays
+            # enabled; extra CPU work cannot reliably fit a bounded wall deadline.
+            monkeypatch.setattr(budgets, "time", SimpleNamespace(
+                monotonic=lambda: time.monotonic() + offset, sleep=time.sleep))
+            def observed_page(conn, sid, selected, key, marker):
+                nonlocal offset
+                result = delete_page(conn, sid, selected, key, marker)
+                if selected:
+                    offset = held_s
+                    # Drive the actual SQLite progress callback after the hold,
+                    # then the same pre-commit guard as transaction settlement.
+                    conn.execute("WITH RECURSIVE work(n) AS (SELECT 1 UNION ALL "
+                                 "SELECT n+1 FROM work WHERE n < 5000) SELECT sum(n) FROM work").fetchone()
+                    budgets.check_prune_transaction(held_s)
+                return result
+            monkeypatch.setattr(deletion, "_delete_page", observed_page)
 
         assert db.prune_sessions() == 1
         assert db._read_one("SELECT id FROM messages WHERE session_id='oversized'") is None
