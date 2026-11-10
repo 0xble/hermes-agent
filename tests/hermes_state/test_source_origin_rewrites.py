@@ -32,15 +32,13 @@ def test_origin_survives_only_unchanged_stored_occurrences(tmp_path, rewrite):
             messages = db.get_messages_as_conversation("fixture")
             if rewrite == "forged":
                 messages = json.loads(json.dumps(messages))
-            elif rewrite == "changed_content":
-                messages[0]["content"] = "X" * len(text)
-            elif rewrite == "changed_uid":
-                messages[0]["message_uid"] = "different-occurrence"
-            elif rewrite == "changed_event":
-                messages[0]["message_id"] = "different-event"
-            elif rewrite == "changed_role":
-                messages[0]["role"] = "assistant"
-            elif rewrite == "tampered_record":
+            messages[0].update({
+                "changed_content": {"content": "X" * len(text)},
+                "changed_uid": {"message_uid": "different-occurrence"},
+                "changed_event": {"message_id": "different-event"},
+                "changed_role": {"role": "assistant"},
+            }.get(rewrite, {}))
+            if rewrite == "tampered_record":
                 messages[0]["display_metadata"][ORIGIN_KEY]["principal"] = "forged"
             if rewrite == "batch":
                 db.archive_and_compact("fixture", messages)
