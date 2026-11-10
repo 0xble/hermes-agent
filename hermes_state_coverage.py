@@ -456,7 +456,8 @@ class SessionCoverageMixin:
                 for row in conn.execute(
                     "SELECT id, role, content FROM messages WHERE session_id = ? AND active = 1",
                     (session_id,)).fetchall():
-                    content_index.setdefault((row["role"], row["content"]), []).append(int(row["id"]))
+                    if row["role"] is not None:
+                        content_index.setdefault((row["role"], row["content"]), []).append(int(row["id"]))
             matches = [] if run else self._matching_active_ids(conn, session_id, message, content_index)
             if len(matches) > 1 or (
                     message.get(_DB_PERSISTED_MARKER) and len(matches) != 1 and not run):
