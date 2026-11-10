@@ -5,9 +5,9 @@ Fork patch identity: `dynamic-model-aliases`.
 Persist upstream model_aliases names in topic `model_role`, cron `model`, and
 Advanced Delegation model_map options. Resolve each name from the request's
 current profile config through upstream model_switch. Editing an alias changes
-later requests without rewriting every stored consumer. Role option models use
-alias names equal to their initial wire IDs, so the decided provider/model IDs
-remain exact while the upstream label registry owns subsequent changes.
+later requests without rewriting every stored consumer. Role options store role alias names. Their model_aliases entries contain the
+exact decided provider/model IDs. Keeping alias labels separate from wire IDs
+avoids redirecting main-chat models that happen to share the same wire ID.
 
 The fork retains only this persisted-name behavior. Core and the official plugin
 own lifecycle, routing schema, effort, tier and actual-route result reporting.

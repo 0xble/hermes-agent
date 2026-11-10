@@ -101,9 +101,9 @@ def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None
     config["delegation"]["backend"] = "model_map"
     config["delegation"]["fallback_providers"] = []
     for option in settings["options"]:
-        name = option["model"]
-        # An alias can start with the exact wire ID and still be edited later.
-        aliases.setdefault(name, {"provider": option["provider"], "model": name})
+        name = option["name"]
+        aliases[name] = {"provider": option["provider"], "model": option["model"]}
+        option["model"] = name
     plugins = config.setdefault("plugins", {})
     enabled = plugins.setdefault("enabled", [])
     if "advanced-delegation" not in enabled:

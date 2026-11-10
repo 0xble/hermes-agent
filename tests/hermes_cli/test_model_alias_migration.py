@@ -30,7 +30,7 @@ def test_config_retirement_keeps_aliases_and_plugin_policy_without_mutating_inpu
     assert "model_preset" not in after["delegation"]
     route = after["delegation"]["backends"]["model_map"]
     assert route["default"] == "worker"
-    assert [(o["name"], o["model"], o["reasoning_effort"]) for o in route["options"]] == [
+    assert [(o["name"], after["model_aliases"][o["model"]]["model"], o["reasoning_effort"]) for o in route["options"]] == [
         ("worker", "gpt-6-luna", "low"), ("explorer", "gpt-6.1-terra", "medium"),
         ("coder", "gpt-6.1-sol", "high"),
     ]
@@ -40,6 +40,7 @@ def test_config_retirement_keeps_aliases_and_plugin_policy_without_mutating_inpu
     assert "inherit_parent_aliases" not in after["delegation"]
     assert "advanced-delegation" in after["plugins"]["enabled"]
     assert after["model_aliases"]["attended"]["model"] == "opus"
+    assert "gpt-6.1-sol" not in after["model_aliases"]
     assert changes
     again, changes = migrate_document(after)
     assert again == after and changes == []
