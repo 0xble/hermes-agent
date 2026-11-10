@@ -1,5 +1,12 @@
 # Maintained fork patch register
 
+## kanban-submit-registration
+
+Register the spawned submitter atomically before owner admission so a dispatcher
+SIGKILL in the spawn/record gap cannot release its card beside live user work.
+Source-only draft candidate, activation held by the request. Contract, diagnosis,
+rollback and retirement: `maintenance/kanban-submit-registration.md`.
+
 ## cron-person-send-admission (candidate; activation held)
 
 - **Stack fit:** Existing Python scheduler admission, auxiliary executors,
