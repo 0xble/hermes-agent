@@ -21,16 +21,20 @@ class OriginDecision:
     references: tuple[tuple[int, int, str], ...] = ()
 
 
+@dataclass(frozen=True, repr=False)
 class NativeOrigin:
     """Process-local adapter receipt, deliberately not accepted from serialized client metadata.
 
     An adapter calls person only after its transport positively identifies a person. Other
     surfaces remain unknown. Capturing the exact text invalidates receipts after merges/edits.
     """
-    def __init__(self, text, status, platform, principal, event, spans, references=()):
-        # Only the native writer can serialize a receipt bound to a durable occurrence.
-        self.text, self.status, self.platform = text, status, platform
-        self.principal, self.event, self.spans, self.references = principal, event, spans, references
+    text: str
+    status: str
+    platform: str
+    principal: str
+    event: str
+    spans: tuple
+    references: tuple = ()
 
     @classmethod
     def person(cls, text, *, platform, principal, event, authored=None, references=None):

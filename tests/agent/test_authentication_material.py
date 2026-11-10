@@ -1,5 +1,6 @@
 """Authentication egress preserves status prose and complete unrelated tokens."""
 
+import copy
 import json
 
 import pytest
@@ -35,6 +36,7 @@ def test_authentication_values_are_removed_on_token_boundaries():
 
 def test_native_origin_cannot_silently_serialize_as_empty_metadata():
     receipt = NativeOrigin.person("fictional", platform="fictional", principal="person", event="event")
+    assert copy.deepcopy(receipt) == receipt
     with pytest.raises(TypeError):
         json.dumps({"origin": receipt})
 
