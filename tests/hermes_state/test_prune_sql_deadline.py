@@ -142,7 +142,8 @@ def test_invalid_runtime_cap_rejected_without_selection(tmp_path, value):
 
 
 @pytest.mark.parametrize("local", [False, True])
-def test_prune_yields_to_foreground_writer_instead_of_waiting_for_it(tmp_path, local):
+@pytest.mark.parametrize("release_foreground", [False, True])
+def test_prune_yields_to_foreground_writer_instead_of_waiting_for_it(tmp_path, local, release_foreground):
     with closing(SessionDB(tmp_path / "state.db")) as db:
         _old_ended(db, "old")
         held, release, yielded = threading.Event(), threading.Event(), threading.Event()
@@ -171,7 +172,7 @@ def test_prune_yields_to_foreground_writer_instead_of_waiting_for_it(tmp_path, l
             return real_pause(budget, seconds)
         def prune():
             try:
-                result.append(db.prune_sessions(older_than_days=90, max_seconds=5))
+                result.append(db.prune_sessions(older_than_days=90, max_seconds=5 if release_foreground else 0.2))
             except BaseException as exc:
                 errors.append(exc)
         with pytest.MonkeyPatch.context() as patch:
@@ -181,6 +182,9 @@ def test_prune_yields_to_foreground_writer_instead_of_waiting_for_it(tmp_path, l
             try:
                 # The pruner must yield while the foreground still owns the lock.
                 yielded_before_release = yielded.wait(2)
+                if not release_foreground:
+                    runner.join(2)
+                    assert not runner.is_alive()
             finally:
                 started = time.monotonic()
                 release.set()
@@ -190,7 +194,7 @@ def test_prune_yields_to_foreground_writer_instead_of_waiting_for_it(tmp_path, l
                 runner.join(5)
         assert not runner.is_alive()
         assert not errors
-        assert result == [1]
+        assert result == [int(release_foreground)]
         assert yielded_before_release
-        assert db.get_session("old") is None
+        assert (db.get_session("old") is None) == release_foreground
         assert db.get_meta("foreground") == "ok"

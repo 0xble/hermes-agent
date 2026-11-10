@@ -116,7 +116,9 @@ def _finish_delete(db, sid, key, value):
             if conn.execute("SELECT 1 FROM state_meta WHERE key=? AND value=?", (key, value)).fetchone() is None:
                 return False
             retire_sessions(conn, [sid], expiring=[sid] if json.loads(value).get("expires") else [], defer_messages=True)
-            conn.execute("UPDATE state_meta SET value=json_remove(value, '$.cleanup.retirement_pending') "
+            # The completed retirement unit's cost does not describe message pages.
+            conn.execute("UPDATE state_meta SET value=json_remove(value, '$.cleanup.retirement_pending', "
+                         "'$.cleanup.attempts', '$.cleanup.last_expired_at') "
                          "WHERE key=? AND value=?", (key, value))
             return conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0]
         updated = run_prune_write(lambda: db._execute_write(retire), label=sid,

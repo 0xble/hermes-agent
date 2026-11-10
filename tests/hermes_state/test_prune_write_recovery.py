@@ -4,6 +4,8 @@ import json
 import threading
 import time
 
+import pytest
+
 from hermes_state import SessionDB
 from hermes_state_mutation_retirement import RETIRED_PREFIX
 from tests.hermes_state.test_prune_pass_bounds import _old_ended
@@ -34,8 +36,6 @@ def test_slow_retirement_batch_shrinks_and_finishes_without_a_pass_limit(tmp_pat
         monkeypatch.setattr(retirement, "_mark_retired", marker)
         monkeypatch.setattr(state, "settle_write_transaction", settle)
         deleted = db.prune_sessions(exclude_active_write_guards=True)
-        if deleted < 25:
-            deleted += db.prune_sessions(exclude_active_write_guards=True)
         assert deleted == 25
         assert db._read_one("SELECT count(*) FROM sessions")[0] == 0
         assert max(holds) <= 2.0
@@ -54,6 +54,7 @@ def test_minimum_retirement_defers_one_session_and_continues(tmp_path, monkeypat
 
     with closing(SessionDB(tmp_path / "state.db")) as db:
         _old_ended(db, "stuck", "small-a", "small-b")
+        db.append_messages_batch("stuck", [{"role": "user", "content": "pending", "timestamp": 1.0}] * 20)
         monkeypatch.setattr(retirement, "retire_sessions", retire)
         db.prune_sessions(exclude_active_write_guards=True)
         assert db._read_one("SELECT count(*) FROM sessions WHERE id != 'stuck'")[0] == 0
@@ -63,6 +64,21 @@ def test_minimum_retirement_defers_one_session_and_continues(tmp_path, monkeypat
         assert cleanup["last_expired_at"] > 0
         assert "writer ceiling" in caplog.text and "stuck" in caplog.text
         monkeypatch.setattr(retirement, "retire_sessions", real_retire)
+        import hermes_state_deletion as deletion
+        real_page, page_sizes, interrupted = deletion._delete_page, [], False
+        def page(conn, sid, selected, key, marker):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise RuntimeError("stop after retirement resumes")
+            page_sizes.append(len(selected))
+            return real_page(conn, sid, selected, key, marker)
+        monkeypatch.setattr(deletion, "_delete_page", page)
+        with pytest.raises(RuntimeError, match="stop after retirement resumes"):
+            db.prune_sessions()
+        cleanup = json.loads(db.get_meta(RETIRED_PREFIX + "stuck"))["cleanup"]
+        assert not {"retirement_pending", "attempts", "last_expired_at"} & cleanup.keys()
         db.prune_sessions()
+        assert max(page_sizes) > 1
         assert db._read_one("SELECT count(*) FROM sessions")[0] == 0
         assert "cleanup" not in json.loads(db.get_meta(RETIRED_PREFIX + "stuck"))
