@@ -124,7 +124,7 @@ def check_sandbox_requirements() -> bool:
 # Per-tool stub templates: (signature, docstring, args_dict_expr — the JSON payload sent over RPC).
 _TOOL_STUBS = {
     "web_search": ("query: str, limit: int = 5, stakes: str = None",
-        '"""Search the web. Optional stakes="standard" marks low-stakes searches for Lite, subject to the protected-topic guard. Otherwise Auto. Returns dict with data.web list of {url, title, description}."""',
+        '"""Search the web. Optional quality hint. Exa Lite is paused by default: all Exa searches use full Auto regardless of this hint. If Lite is explicitly re-enabled, standard permits low-stakes lookups; high or omission retains Auto. Use high or omit for protected, time-sensitive or costly-if-wrong research. Returns dict with data.web list of {url, title, description}."""',
         '{"query": query, "limit": limit, "stakes": stakes}'),
     "web_extract": ("urls: list, char_limit: int = None",
         '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
