@@ -3495,7 +3495,6 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         from gateway.source_origin import SLACK_SYSTEM_USERS
         is_bot = bool(
             user_id in SLACK_SYSTEM_USERS
-            or user.get("is_app_user")
             or user.get("is_bot")
             or user.get("is_workflow_bot")
             or (isinstance(profile, dict) and profile.get("bot_id")))

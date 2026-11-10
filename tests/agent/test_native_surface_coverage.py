@@ -47,10 +47,10 @@ async def _slack():
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="fictional"))
     adapter._app = MagicMock()
     adapter._users_info_payload = AsyncMock(return_value={"ok": True, "user": {
-        "id": "U_PERSON", "is_bot": False, "profile": {"real_name": "Fictional person"}}})
+        "id": "U_PERSON", "is_bot": False, "is_app_user": True, "profile": {"real_name": "Fictional person"}}})
     adapter._resolve_channel_name = AsyncMock(return_value="Fictional channel")
     adapter._humanize_user_mentions = AsyncMock(side_effect=lambda text, **kw: text)
-    native = {"type": "message", "user": "U_PERSON", "text": TEXT, "ts": "event"}
+    native = {"type": "message", "user": "U_PERSON", "text": TEXT, "ts": "event", "is_app_user": True, "user_profile": {"is_app_user": True}}
     event = await adapter._build_message_event(
         native, text=TEXT + "\nGenerated attachment context.", original_text=TEXT,
         command_probe_text=TEXT, is_command_text=False, channel_id="C_CHANNEL", team_id="T_TEAM",
