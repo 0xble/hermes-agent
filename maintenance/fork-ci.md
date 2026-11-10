@@ -1,5 +1,20 @@
 # Fork CI reliability
 
+## Reset cleanup fixture scope
+
+The reset resource-cleanup probe has a cached agent but no persisted old
+conversation. Its mock route index stays empty so cold goal/loop retirement
+cannot consume the close-start window before resource cleanup begins. Keep the
+real reset handler, off-loop close, heartbeat and survivor assertions unchanged.
+The fixture correction reuses owner commit `42a358abfdd1183332132a178c19e6130b01318a`
+and changes no production behavior or wait bounds.
+
+The shared-metrics worker join retains its 10-second bound and assertion. On
+failure it dumps all thread stacks to distinguish a native flush wait from
+SQLite contention. The hosted database-locked warnings alone do not establish
+the worker's blocking point, and inserting another join between sessions would
+only split the time budget without diagnosing the stall.
+
 ## Historical git-install download isolation
 
 The shallow/partial clone suites retain smart HTTP, complete subject ancestry, historical
