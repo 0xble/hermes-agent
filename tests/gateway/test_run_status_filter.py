@@ -51,7 +51,8 @@ def test_blocked_overflow_warning_through_production_callback(chat_type):
         ctx._status_adapter = Transport()
         ctx._status_chat_id = "destination"
         ctx._status_thread_metadata = {"thread_id": "topic"}
-        runner = TurnRunner(None, ctx)
+        from types import SimpleNamespace
+        runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda _source: ctx._status_adapter), ctx)
 
         def emit():
             runner._status_callback_sync("warn", warning)

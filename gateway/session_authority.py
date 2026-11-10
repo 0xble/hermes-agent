@@ -1296,6 +1296,8 @@ class SessionAuthority:
         from gateway.session_managed_worker import ManagedExecutionUnknown
         try:
             try:
+                from gateway.session_open import settled
+                await settled(ref)
                 review = getattr(live.review, '_background_review_run', None)
                 if review is not None and not review.request_done.is_set():
                     # A cold /refine's review shares the session id, as the resident agent's does: cancel it

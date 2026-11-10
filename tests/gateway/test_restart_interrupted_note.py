@@ -1577,7 +1577,7 @@ async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monke
     runner._hmwa_classify_turn_failure = lambda *_args: (False, False, False)
     runner._hmwa_compression_exhaustion_reset = AsyncMock(return_value=("done", entry))
     runner._hmwa_persist_turn_transcript = AsyncMock()
-    runner._hmwa_deliver_turn_response = AsyncMock(return_value="done")
+    runner._hmwa_deliver_turn_response, runner._note_bot_reply = AsyncMock(return_value="done"), Mock()
     runner._clear_session_env = lambda _tokens: None
     clear_resume_pending = AsyncMock(side_effect=lambda key, **kwargs: store.clear_resume_pending(key, **kwargs))
     runner.async_session_store.clear_resume_pending = clear_resume_pending
@@ -1621,7 +1621,7 @@ async def test_post_delivery_clear_accepts_same_turn_drain_remark_but_not_succes
     runner._hmwa_classify_turn_failure = lambda *_args: (False, False, False)
     runner._hmwa_compression_exhaustion_reset = AsyncMock(return_value=("done", entry))
     runner._hmwa_persist_turn_transcript = AsyncMock()
-    runner._hmwa_deliver_turn_response = AsyncMock(return_value="done")
+    runner._hmwa_deliver_turn_response, runner._note_bot_reply = AsyncMock(return_value="done"), Mock()
     runner._clear_session_env = lambda _tokens: None
     monkeypatch.setattr(run_heartbeat_acceptance, "heartbeat_owner_is_current", lambda *_args: True)
 

@@ -122,6 +122,7 @@ async def test_streamed_reply_then_marker_shows_the_reply_once(monkeypatch, tmp_
                                               buffer_threshold=1, cursor="")
     runner.adapters = {platform: adapter}
     runner.session_store.get_model_override.return_value = None
+    runner.session_store.get_model_role.return_value = None
     source = SessionSource(platform=platform, chat_id="dm-composed", chat_type="dm", user_id="human")
     key = f"agent:main:{platform.value}:dm:dm-composed"
     entry = runner.session_store.get_or_create_session.return_value

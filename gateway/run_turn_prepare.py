@@ -169,6 +169,35 @@ def _session_override_snapshot(override: dict) -> dict:
     return runtime
 
 
+def resolve_stored_override(override: Optional[dict], model: str):
+    """Keep an explicit route intact while its owning OAuth store refreshes credentials."""
+    if not override:
+        return None
+    from gateway.run import _credential_pool_for_provider
+
+    runtime = _session_override_snapshot(override)
+    if _session_override_uses_managed_oauth(override):
+        try:
+            _resolve_session_override_runtime(override, managed_oauth=True)
+        except RuntimeError as exc:
+            logger.debug("Managed session credential refresh unavailable; retaining selected route: %s",
+                         type(exc).__name__)
+        else:
+            runtime.update(api_key=override["api_key"], credential_pool=override.get("credential_pool"))
+    elif runtime.get("api_key") and runtime.get("credential_pool") is None and not override.get("owns_credentials"):
+        runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
+    return (override.get("model", model), runtime) if runtime.get("api_key") else None
+
+
+def commit_stored_oauth_credentials(override: Optional[dict], runtime: dict) -> None:
+    """Publish refreshed credentials only after the caller accepts the route's snapshot epoch."""
+    if (_session_override_uses_managed_oauth(override)
+            and runtime.get("provider") == override["provider"]
+            and (runtime.get("base_url") or "").rstrip("/") == override["base_url"].rstrip("/")
+            and runtime.get("api_key")):
+        override.update(api_key=runtime["api_key"], credential_pool=runtime.get("credential_pool"))
+
+
 def _resolve_channel_runtime(runner, source, model, runtime_kwargs) -> tuple[str, dict]:
     from gateway.run import _get_channel_override, _resolve_runtime_agent_kwargs_for_provider
 

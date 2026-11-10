@@ -6,7 +6,7 @@ Import the real gateway, adapter and Telegram SDK; only Bot API I/O is fake.
 import asyncio
 import gc
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -37,16 +37,21 @@ async def test_gateway_status_belongs_to_turn_lane_and_event(
     status_adapter, monkeypatch, other_lane, other_generation, other_event, thread,
 ):
     pending = []
+    runners = {}
     monkeypatch.setattr(TurnRunner, "_schedule", lambda self, coro, message: pending.append(coro))
 
     async def emit(lane, generation, event="lifecycle", thread_id="1001"):
-        ctx = TurnContext(
-            source=SimpleNamespace(platform=Platform.TELEGRAM),
-            session_key=lane, run_generation=generation, _run_still_current=lambda: True,
-            _status_adapter=status_adapter, _status_chat_id="-100123",
-            _status_thread_metadata={"thread_id": thread_id}, user_config={},
-        )
-        TurnRunner(MagicMock(), ctx)._status_callback_sync(event, "Recalling memories")
+        key = (lane, generation)
+        if key not in runners:
+            ctx = TurnContext(
+                source=SimpleNamespace(platform=Platform.TELEGRAM, chat_id="-100123", chat_type="group"),
+                session_key=lane, run_generation=generation, _run_still_current=lambda: True,
+                _status_adapter=status_adapter, _status_chat_id="-100123",
+                _status_thread_metadata={"thread_id": thread_id}, user_config={},
+            )
+            owner = SimpleNamespace(_delivery_adapter_for=lambda _source: status_adapter)
+            runners[key] = TurnRunner(owner, ctx)
+        runners[key]._status_callback_sync(event, "Recalling memories")
         assert len(pending) == 1
         assert (await pending.pop()).success
 
@@ -60,13 +65,17 @@ async def test_gateway_status_belongs_to_turn_lane_and_event(
     assert bot.send_message.await_args.kwargs["message_thread_id"] == int(thread)
     await emit(other_lane, other_generation, other_event, thread)
     assert bot.edit_message_text.await_args.kwargs["message_id"] == 101
-    # Incomplete identities retain the legacy event-type fallback, including generation zero.
+    # Each real turn owns its token even when its legacy lane/generation fields are incomplete.
     await emit(None, 1)
-    await emit("topic-a", None)
     assert bot.send_message.await_count == 3
+    await emit(None, 1)
     assert bot.edit_message_text.await_args.kwargs["message_id"] == 102
-    await emit("topic-a", 0)
+    await emit("topic-a", None)
     assert bot.send_message.await_count == 4
+    await emit("topic-a", None)
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 103
+    await emit("topic-a", 0)
+    assert bot.send_message.await_count == 5
 
 
 @pytest.mark.asyncio

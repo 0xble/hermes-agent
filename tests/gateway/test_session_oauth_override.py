@@ -9,6 +9,7 @@ import pytest
 from gateway.run import GatewayRunner
 from hermes_cli.auth import PROVIDER_REGISTRY
 from hermes_cli.model_switch import ModelSwitchResult
+from gateway.slash_commands_model import _ModelSwitchContext
 
 
 def _runner(monkeypatch, tmp_path):
@@ -97,7 +98,8 @@ async def test_recorded_explicit_routes_keep_their_own_key(tmp_path, monkeypatch
     runner._session_db = None
     runner._async_session_store = SimpleNamespace(_store=None, set_model_override=AsyncMock())
     runner._evict_cached_agent = Mock()
-    ctx = SimpleNamespace(session_key="session", current_model="old-model", persist_global=False)
+    ctx = _ModelSwitchContext(session_key="session", source=None, config_path=None,
+                              current_model="old-model", persist_global=False)
     from hermes_cli.model_switch import DirectAlias
     monkeypatch.setattr("hermes_cli.model_switch.DIRECT_ALIASES", {
         alias: DirectAlias("selected-model", provider, endpoint, api_key="explicit-key")
@@ -140,7 +142,8 @@ async def test_catalog_alias_producer_keeps_managed_credential_ownership(tmp_pat
     runner._session_db = None
     runner._async_session_store = SimpleNamespace(_store=None, set_model_override=AsyncMock())
     runner._evict_cached_agent = Mock()
-    ctx = SimpleNamespace(session_key="session", current_model="old-model", persist_global=False)
+    ctx = _ModelSwitchContext(session_key="session", source=None, config_path=None,
+                              current_model="old-model", persist_global=False)
     await runner._record_model_switch(result, ctx, source=None, one_turn=False, picker=False)
     monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", lambda *a, **k: {
         "provider": provider, "api_key": "fresh-key", "base_url": endpoint, "credential_pool": None})

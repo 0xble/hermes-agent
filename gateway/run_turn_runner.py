@@ -280,6 +280,7 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         skipped_edits: int = 0
         progress_pause_logged: bool = False
         dirty: bool = False
+        owed_bubbles: list[tuple[Any, str]] = dataclasses.field(default_factory=list)
 
     # Default minimum seconds between progress edits. An adapter may raise it with
     # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
@@ -362,13 +363,6 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
     @staticmethod
     def _is_reset_marker(raw) -> bool:
         return isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__"
-
-    def _reset_progress_bubble(self, st) -> None:
-        """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
-        below it; else tool edits hit the ORIGINAL message above (out of order)."""
-        st.progress_msg_id, st.progress_lines = None, []
-        st.dirty = False
-        self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
 
     async def _progress_restore_typing(self, st) -> None:
         ctx = self._ctx
@@ -496,7 +490,8 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         ctx = self._ctx
         if ctx.mute_notification_reply or not self._status_live() or not automatic_notices_allowed(ctx.source):
             return
-        prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
+        prepared = _prepare_gateway_status_message(
+            ctx.source.platform, event_type, message, getattr(ctx.source, "chat_type", "dm"))
         if prepared is None:
             logger.debug(
                 "status_callback suppressed for %s/%s: %s",

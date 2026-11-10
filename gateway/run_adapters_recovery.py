@@ -288,11 +288,7 @@ class GatewaySecondaryReconnectMixin:
                             # What a primary reconnect replays too: the owed notice spans served profiles' home
                             # channels, and sessions boot skipped for this offline adapter wait for this call.
                             self._schedule_planned_restart_replay()
-                            try:
-                                self._schedule_resume_pending_sessions(platform=platform)
-                            except Exception:
-                                logger.debug("resume-pending reschedule after %s reconnect failed (profile: %s)",
-                                             platform.value, profile_name, exc_info=True)
+                            await self._recover_spool_after_reconnect(platform)
                             return
                     if adapter is not None:
                         # Not installed (newer reconnect won the slot, shutdown began, or connect failed):

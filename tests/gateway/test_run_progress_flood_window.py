@@ -113,7 +113,9 @@ async def test_flood_refused_finalize_edit_is_not_retried_as_plain_text():
 
     result = await adapter.edit_message("-1001", "7", "**progress** line", finalize=True)
 
-    assert result.error == "flood_control:30"
+    from gateway.delivery_ledger import flood_wait_seconds
+    assert flood_wait_seconds(result.error) == 30
+    assert result.retry_after == 30
     assert adapter._bot.edit_message_text.await_count == 1
 
 
@@ -149,7 +151,8 @@ class LongLastToolAgent:
         self.tool_progress_callback("tool.started", "web_search", "search 0", {})
         time.sleep(1.8)  # health: allow HX013 -- the gap must outlast the loop's real 1.5s edit throttle
         self.tool_progress_callback("tool.started", "terminal", "long build", {})
-        time.sleep(4.0)  # health: allow HX013 -- the busy tool outlives the 1 s flood window
+        from gateway.run_turn_runner import TurnRunner
+        time.sleep(2 * TurnRunner._PROGRESS_EDIT_INTERVAL + 1.0)  # health: allow HX013 -- outlive the production edit floor and the deferred retry
         LongLastToolAgent.finished_at = time.monotonic()
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
@@ -182,9 +185,9 @@ def _held_progress(edit_results):
     import queue
     from unittest.mock import AsyncMock
 
-    from gateway.run_turn_progress import GatewayTurnProgressMixin
+    from gateway.run_turn_runner import TurnRunner
 
-    loop = GatewayTurnProgressMixin()
+    loop = TurnRunner.__new__(TurnRunner)
     loop._ctx = SimpleNamespace(
         source=SimpleNamespace(chat_id="-1001"), _progress_metadata={}, _progress_reply_to=None, _cleanup_progress=False,
         _run_still_current=lambda: True, agent_holder=[SimpleNamespace(is_interrupted=False)],
@@ -193,7 +196,7 @@ def _held_progress(edit_results):
         name="fake", REQUIRES_EDIT_FINALIZE=False, edit_message=AsyncMock(side_effect=edit_results),
         send=AsyncMock(return_value=SendResult(success=True, message_id="m2")))
     st = loop._ProgressEditState(adapter, ["search 0", "long build"], "m1", True, len, 4000, False)
-    st.flood_pending, st.flood_until = True, 0.0
+    st.dirty, st.defer_until = True, 0.0
     return loop, st
 
 
@@ -203,7 +206,7 @@ async def test_progress_delivered_by_a_tool_event_is_not_resent_by_the_idle_retr
     loop, st = _held_progress([SendResult(success=False, error="message to edit not found")])
 
     await loop._progress_send_or_edit(st, "long build")
-    await loop._deliver_flood_pending_progress(st)
+    await loop._flush_progress_edit(st)
 
     assert [c.kwargs["content"] for c in st.adapter.send.await_args_list] == ["long build"]
 
@@ -216,27 +219,32 @@ async def test_held_progress_survives_a_transient_failure_of_its_idle_retry():
         SendResult(success=True, message_id="m1"),
     ])
 
-    assert await loop._deliver_flood_pending_progress(st)  # attempted: caller spaces the next try
-    await loop._deliver_flood_pending_progress(st)
-
+    await loop._flush_progress_edit(st)
+    assert st.dirty
+    await loop._flush_progress_edit(st)
     assert st.adapter.edit_message.await_count == 2
-    assert await loop._deliver_flood_pending_progress(st) is False  # landed: nothing left owed
+    assert not st.dirty
+    await loop._flush_progress_edit(st)
+    assert st.adapter.edit_message.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_held_progress_reaches_its_own_bubble_after_a_content_reset():
     """A content bubble landing inside the window closes the progress bubble; its held lines still land there."""
     loop, st = _held_progress([SendResult(success=True, message_id="m1")])
-    st.flood_until = time.monotonic() + 60
+    st.defer_until = time.monotonic() + 60
 
     loop._reset_progress_bubble(st)
-    assert await loop._deliver_flood_pending_progress(st) is False  # nothing fires into the open window
-    st.flood_until = 0.0  # the window closes while the agent works on
-    assert await loop._deliver_flood_pending_progress(st)
+    await loop._flush_progress_edit(st)
+    st.adapter.edit_message.assert_not_awaited()
+    st.defer_until = 0.0  # the window closes while the agent works on
+    await loop._flush_progress_edit(st)
 
     assert [(c.kwargs["message_id"], c.kwargs["content"]) for c in st.adapter.edit_message.await_args_list] == [
         ("m1", "search 0\nlong build")]
-    assert await loop._deliver_flood_pending_progress(st) is False  # landed: nothing left owed
+    assert not st.owed_bubbles
+    await loop._flush_progress_edit(st)
+    assert st.adapter.edit_message.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -245,17 +253,19 @@ async def test_a_closed_bubble_refused_again_stays_owed():
         SendResult(success=False, error="flood_control:5", retry_after=5.0), SendResult(success=True, message_id="m1")])
     loop._reset_progress_bubble(st)
 
-    assert await loop._deliver_flood_pending_progress(st)  # refused: a new window opens, the edit stays owed
-    assert await loop._deliver_flood_pending_progress(st) is False
-    st.flood_until = 0.0
-    assert await loop._deliver_flood_pending_progress(st)
+    await loop._flush_progress_edit(st)
+    assert st.owed_bubbles
+    await loop._flush_progress_edit(st)
+    assert st.adapter.edit_message.await_count == 1
+    st.defer_until = 0.0
+    await loop._flush_progress_edit(st)
 
     assert st.adapter.edit_message.await_count == 2 and not st.owed_bubbles
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("held", [
-    {"flood_pending": False},  # nothing was held back
+    {"dirty": False},  # nothing was held back
     {"can_edit": False},  # one message per tool: nothing to edit
     {"progress_msg_id": None},  # the bubble never landed
 ])
@@ -266,5 +276,6 @@ async def test_content_reset_owes_nothing_without_a_held_editable_bubble(held):
 
     loop._reset_progress_bubble(st)
 
-    assert await loop._deliver_flood_pending_progress(st) is False
+    await loop._flush_progress_edit(st)
+    assert not st.owed_bubbles
     st.adapter.edit_message.assert_not_awaited()

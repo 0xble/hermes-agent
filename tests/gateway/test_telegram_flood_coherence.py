@@ -397,10 +397,14 @@ async def test_short_media_flood_wait_holds_other_outbound_traffic(tmp_path):
         await asyncio.sleep(0.005)
     await adapter.send_typing("4242")
     follow_up = await asyncio.wait_for(adapter.send("4242", "text during the media wait"), timeout=5.0)
+    assert not follow_up.success and follow_up.error.startswith("flood_control:")
+    assert follow_up.retry_after > 0
+    assert "text" not in order
     result = await asyncio.wait_for(media, timeout=5.0)
 
     assert result.success is True and result.message_id == "99"
-    assert follow_up.success is True
+    retried = await asyncio.wait_for(adapter.send("4242", "text after the media wait"), timeout=5.0)
+    assert retried.success is True
     # Nothing reaches Telegram between the refusal and the retry. (send() may re-arm typing after its
     # own message, once the penalty is over; that is allowed.)
     assert order[:3] == ["animation", "animation", "text"], order

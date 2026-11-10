@@ -525,6 +525,8 @@ class GatewayTurnPersistenceMixin:
             _user_entry["display_metadata"] = display_metadata
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
+        elif getattr(event, "_hermes_recovery_id", None):
+            _user_entry["platform_message_id"] = str(event._hermes_recovery_id)
         return _user_entry
 
     async def _hmwa_persist_turn_transcript(

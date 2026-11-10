@@ -479,6 +479,8 @@ class GatewayTurnProgressMixin:
     def _reset_progress_bubble(self, st) -> None:
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
+        if st.dirty and st.can_edit and st.progress_msg_id is not None:
+            st.owed_bubbles.append((st.progress_msg_id, self._progress_text(st.progress_lines)))
         st.progress_msg_id, st.progress_lines = None, []
         st.dirty = False
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
@@ -496,7 +498,20 @@ class GatewayTurnProgressMixin:
         st.dirty = True
         return raw
 
+    async def _flush_owed_progress(self, st) -> bool:
+        """Retry the original bubble after a reset, without sending into its refusal window."""
+        if not st.owed_bubbles or self._progress_deferred(st):
+            return False
+        if not self._ctx._run_still_current() or self._agent_interrupted():
+            return False
+        result = await self._edit_progress_message(st, *st.owed_bubbles[0])
+        if not (result.raw_response or {}).get("skipped"):
+            if result.success or not self._edit_failure_is_deferrable(st, result):
+                st.owed_bubbles.pop(0)
+        return True
+
     async def _flush_progress_edit(self, st) -> None:
+        await self._flush_owed_progress(st)
         # A deferred bubble may still hold an unsplit, over-limit buffer: never send that as one edit.
         if st.dirty and st.can_edit and st.progress_lines and st.progress_msg_id and not self._progress_deferred(st):
             with suppress(Exception):
@@ -585,8 +600,10 @@ class GatewayTurnProgressMixin:
         """Keep refused edits buffered without spending calls on every consumer tick."""
         floor = cls._progress_edit_interval(st.adapter)
         if cls._is_flood_refusal(result):
+            from gateway.delivery_ledger import flood_wait_seconds
             st.retry_wait = 0.0
-            wait = max(float(getattr(result, "retry_after", None) or 0.0), floor)
+            stated = flood_wait_seconds(str(getattr(result, "error", "") or ""), default=floor)
+            wait = max(float(getattr(result, "retry_after", None) or stated), floor)
             st.defer_until = time.monotonic() + wait
             logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
             return True
@@ -631,7 +648,7 @@ class GatewayTurnProgressMixin:
         while self._ctx.progress_queue.empty():
             if not self._ctx._run_still_current():
                 return None
-            if st.defer_until and st.progress_lines and not self._agent_interrupted():
+            if (st.owed_bubbles or (st.defer_until and st.progress_lines)) and not self._agent_interrupted():
                 return None  # Retry a refused batch even if no further tool event arrives.
             await asyncio.sleep(0.3)
         return self._ctx.progress_queue.get_nowait()
@@ -678,6 +695,11 @@ class GatewayTurnProgressMixin:
                 if not ctx._run_still_current():
                     return
                 if self._agent_interrupted():
+                    continue
+                if await self._flush_owed_progress(st):
+                    last_edit_ts = time.monotonic()
+                    if st.progress_lines:
+                        st.defer_until = max(st.defer_until, last_edit_ts + self._progress_interval_for_chat(st.adapter))
                     continue
                 if not st.progress_lines:
                     continue
@@ -857,7 +879,8 @@ class GatewayTurnProgressMixin:
         if not automatic_notices_allowed(ctx.source):
             logger.debug("status_callback suppressed for bot-authored message: %s", event_type)
             return
-        prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
+        prepared = _prepare_gateway_status_message(
+            ctx.source.platform, event_type, message, getattr(ctx.source, "chat_type", "dm"))
         if prepared is None:
             logger.debug(
                 "status_callback suppressed for %s/%s: %s",

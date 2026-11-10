@@ -10,6 +10,7 @@ import pytest
 import gateway.run as gateway_run
 import hermes_yaml as yaml
 import run_agent
+from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
@@ -19,7 +20,7 @@ from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter
 
 real_loop = recovery.real_loop
 ANSWER = "Your meeting is at 3pm."
-WARNING = "The model returned only a silence marker"
+WARNING = t("gateway.errors.unexpected_silence")
 
 
 @pytest.mark.asyncio
@@ -39,6 +40,8 @@ async def test_real_loop_silence_delivery(monkeypatch, tmp_path, real_loop, plat
             recovery._call("todo_list", {"todos": []}, "call_todo"),
         ]))
     script.append(recovery._response("NO_REPLY"))
+    if not housekeeping:
+        script.append(recovery._response("NO_REPLY"))
     agent.client = MagicMock()
     agent.client.chat.completions.create.side_effect = lambda **_kw: script.pop(0)
 
@@ -56,6 +59,7 @@ async def test_real_loop_silence_delivery(monkeypatch, tmp_path, real_loop, plat
     runner = _runner(monkeypatch, tmp_path)
     runner.adapters = {platform: adapter}
     runner.session_store.get_model_override.return_value = None
+    runner.session_store.get_model_role.return_value = None
     source = SessionSource(platform=platform, chat_id="dm-composed", chat_type="dm", user_id="human")
     key = f"agent:main:{platform.value}:dm:dm-composed"
     entry = runner.session_store.get_or_create_session.return_value

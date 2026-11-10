@@ -639,6 +639,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         if skey:
             fields = {"pre_agent_fallback_notice": notice}
             conversation = self._session_state(skey).conversation
+            from gateway.run_turn_prepare import commit_stored_oauth_credentials
+            commit_stored_oauth_credentials(conversation.model_override, runtime)
             if getattr(conversation, "model_pick_expired", False):
                 from gateway.attended_model import friendly_model_name
                 fields["pending_attended_notice"] = t("gateway.model.pick_expired", model=friendly_model_name(model))
@@ -686,38 +688,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
     def _load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route=None):
         """Resolve a detached snapshot off-loop; all runner-state commits belong to the caller."""
         from gateway.run import (
-            _credential_pool_for_provider, _get_channel_override, _resolve_gateway_model,
+            _get_channel_override, _resolve_gateway_model,
             _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
         )
         from gateway.run_agent_cache import GatewayAgentCacheMixin
 
         notice = None
         model = _resolve_gateway_model(user_config)
-        if override:
-            override_model = override.get("model", model)
-            override_runtime = {
-                k: override.get(k) for k in (
-                    "provider", "requested_provider", "api_key", "base_url", "api_mode",
-                    "max_tokens", "credential_pool", "request_overrides", "capabilities",
-                )
-            }
-            override_runtime["capabilities"] = dict(override_runtime["capabilities"] or {})
-            if override_runtime.get("api_key"):
-                if override_runtime.get("credential_pool") is None:
-                    override_runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
-                logger.debug(
-                    "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
-                    skey or "", model, override_model, override_runtime.get("provider"),
-                )
-                return override_model, override_runtime, None, False
-            # No api_key on the override (credentials failed to re-resolve at rehydrate): resolve them
-            # for the override's own provider below, never layer it over the default provider's runtime.
-            logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
-                skey or "", model, override_model,
-            )
-        else:
-            logger.debug("No session model override: session=%s config_model=%s", skey or "", model)
+        from gateway.run_turn_prepare import resolve_stored_override
+        selected = resolve_stored_override(override, model)
+        if selected is not None:
+            return *selected, None, False
 
         runtime_kwargs, unavailable_override = None, None
         if override and override.get("provider"):
